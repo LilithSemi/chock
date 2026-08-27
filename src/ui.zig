@@ -1595,9 +1595,11 @@ pub const Layer = struct {
         /// today is a network config of `.host`, which is allowed only for an
         /// act a user approved.
         off,
-        /// This build's sandbox driver does not give this layer at all. Every
-        /// layer on Darwin is this, and the driver refuses to run anything
-        /// rather than run it unprotected.
+        /// This build's sandbox driver does not give this layer at all. On
+        /// Darwin this is the layers Seatbelt has no answer for, and not the
+        /// whole set: the paths, the network, the signals and the IPC are
+        /// measured there and read `on` when the profile applied. A build with
+        /// no driver at all is `LayerFamily.none`, never this.
         unsupported,
         /// The machine could give this layer and this process was not
         /// permitted. **Nothing produces this yet**, because no per layer

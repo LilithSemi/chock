@@ -39,6 +39,9 @@
 
 const std = @import("std");
 const chock_container = @import("chock-container");
+// `chock-sandbox` for one question only: the exit status the probe answers
+// with when this machine will not give it a sandbox at all.
+const sandbox = @import("chock-sandbox");
 
 const Image = chock_container.Image;
 const Runtime = chock_container.Runtime;
@@ -197,10 +200,18 @@ fn runInside(arranged: *const Arranged, allocator: std.mem.Allocator, argv: []co
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    return switch (result.term) {
-        .exited => |code| code,
+    const code: u8 = switch (result.term) {
+        .exited => |c| c,
         else => 255,
     };
+    // **A boundary that was never reached is not a boundary that held.** Every
+    // test below asks what a sandbox does with an image as its root, and a
+    // machine that will not give a sandbox measures nothing here. See
+    // `chock-sandbox`'s own `namespace.nothing_measured_exit_status`, and the
+    // CI job named "Sandbox", which runs this suite on a machine that can host
+    // one and fails rather than skips.
+    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+    return code;
 }
 
 test "a program out of the image runs in Chock's own sandbox, and its status comes back" {

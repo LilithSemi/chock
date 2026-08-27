@@ -141,8 +141,10 @@ pub const Kind = enum {
 /// The tool name a policy key carries when no tool call asked for the act.
 ///
 /// `chock_policy.table.Key` has a `tool` field, and `Broker.request` asserts
-/// that it is not empty, so every decision needs a name there. An agent asks
-/// for an act with the `request_action` tool and that name goes in the field.
+/// that it is not empty, so every decision needs a name there. The design is
+/// that an agent asks for an act with the `request_action` tool and that name
+/// goes in the field. **That tool is not built yet**, so nothing fills this
+/// from an agent's own call today.
 /// `chock run` also asks for `workspace.apply` after the agent loop has
 /// ended, on the session's behalf, and there is no tool call behind that one.
 /// It uses this name, which is the tool the agent would have called.

@@ -38,6 +38,26 @@ const probe_path = @import("lsp_probe_path").lsp_probe_path;
 const zls_probe_path = @import("lsp_probe_path").lsp_zls_probe_path;
 const zls_path: ?[]const u8 = @import("lsp_probe_path").zls_path;
 
+// `chock-sandbox` for one question only: the exit status a probe answers with
+// when this machine will not give it a sandbox at all.
+const sandbox = @import("chock-sandbox");
+
+/// Skip when a probe answered "this machine would not give me a sandbox".
+///
+/// **A boundary that was never reached is not a boundary that held.** The
+/// tests here need a real sandbox to run a real server inside, so a machine
+/// that refuses one measures nothing and must not report a pass. See
+/// `namespace.nothing_measured_exit_status`, and the CI job named "Sandbox",
+/// which runs this suite on a machine that can host one and fails rather than
+/// skips.
+fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
+    const code = switch (term) {
+        .exited => |c| c,
+        else => return,
+    };
+    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+}
+
 /// The absolute path of an already open directory. `std.testing.tmpDir` hands
 /// back a directory only a relative path reaches, and both paths this test
 /// passes down have to resolve the same way whatever the test binary's own
@@ -91,6 +111,7 @@ test "a real language server in a real sandbox puts a real diagnostic in a tool 
         .stderr = .inherit,
     });
     const term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -141,5 +162,6 @@ test "a real zls in a real sandbox reports a real Zig error, in the right place"
         .stderr = .inherit,
     });
     const term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(term);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }

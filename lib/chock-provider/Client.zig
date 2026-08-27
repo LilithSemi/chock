@@ -98,6 +98,30 @@ pub const Adapter = enum {
     }
 };
 
+/// Why the provider stopped a turn, in the provider's own words.
+///
+/// **`reason` is one short token, and the other two are whatever the provider
+/// chose to add.** The Anthropic wire sends the extra two in a `stop_details`
+/// object beside the reason, and it sends that object for one reason only,
+/// `refusal`. The OpenAI compatible wire has no such field and leaves both
+/// empty always.
+///
+/// **An empty `category` or `explanation` means the provider said nothing**,
+/// and never that there was nothing to say: both are nullable on the wire even
+/// on a real refusal. A refusal that arrives with neither is a different fact
+/// from one that arrives with them, and a reader that reports the two the same
+/// way loses that difference. See `anthropic.StopDetails`.
+pub const Stop = struct {
+    /// The provider's own word, for example "end_turn", "tool_use",
+    /// "max_tokens", or "refusal".
+    reason: []const u8,
+    /// A short token naming the class of a refusal, for example `cyber_harm`.
+    category: []const u8 = "",
+    /// The provider's own sentence about a refusal, for example "This request
+    /// was declined because it could enable cyber harm."
+    explanation: []const u8 = "",
+};
+
 /// One piece of a model's reply as it streams off the wire. Every field of
 /// every variant is a slice borrowed from whatever buffer `send` is
 /// currently parsing: it is valid only for the duration of the `on_delta`
@@ -133,19 +157,26 @@ pub const Delta = union(enum) {
     /// streams, so by the time the headers were read the provider had not
     /// counted anything yet.
     usage: message.Usage,
-    /// Why the provider stopped this turn, in the provider's own word, for
-    /// example "end_turn", "tool_use", "max_tokens", or "refusal". The
-    /// Anthropic wire sends it on `message_delta` and the OpenAI compatible
-    /// wire sends it as a choice's `finish_reason`, so both adapters produce
-    /// this and neither invents a value the provider did not say.
+    /// Why the provider stopped this turn, in the provider's own words. See
+    /// `Stop`. The Anthropic wire sends it on `message_delta` and the OpenAI
+    /// compatible wire sends the reason as a choice's `finish_reason`, so both
+    /// adapters produce this and neither invents a value the provider did not
+    /// say.
     ///
     /// **Kept because a reply with no content is only explainable by it.** A
     /// turn that returns nothing at all was measured on 2026-08-26: the log
     /// held 7367 input tokens, zero output tokens, an empty assistant
     /// message, and a session that ended `finished`. The provider had said
     /// why and this reader threw the word away, so Chock made up a reason of
-    /// its own. See `AssembledReply.stopReason`.
-    stop_reason: []const u8,
+    /// its own. The refusal case says the same thing one level deeper: the
+    /// word was "refusal", the provider sent a sentence explaining it in the
+    /// same event, and a reader that keeps only the word tells nobody
+    /// anything. See `AssembledReply.stopReason` and `AssembledReply.stop`.
+    ///
+    /// **All three parts arrive together, and the receiver replaces all three
+    /// together.** They describe one stop, so a fold that kept a refusal's
+    /// explanation beside a later reason would attach it to the wrong word.
+    stop_reason: Stop,
 };
 
 /// `on_delta`'s error set. Deliberately just allocation failure: a callback
@@ -1082,9 +1113,17 @@ fn streamBody(
                         // on. See `Delta.stop_reason`.
                         const reason = decoder.stopReason();
                         if (reason.len != 0 and !std.mem.eql(u8, reason, sent_stop_reason[0..sent_len])) {
-                            sent_len = @min(reason.len, max_stop_reason);
-                            @memcpy(sent_stop_reason[0..sent_len], reason[0..sent_len]);
-                            try on_delta(ctx, .{ .stop_reason = reason });
+                            sent_len = keepCut(&sent_stop_reason, reason);
+                            // The details of the same event, because the
+                            // decoder replaces them with the reason they
+                            // belong to and this is the one send that reason
+                            // gets. See `Stop`.
+                            const details = decoder.stopDetails();
+                            try on_delta(ctx, .{ .stop_reason = .{
+                                .reason = reason,
+                                .category = details.category,
+                                .explanation = details.explanation,
+                            } });
                         }
                         // Or, never a plain assignment: an end already seen
                         // must not be un-seen by a later event.
@@ -1192,8 +1231,12 @@ fn deliverDelta(
     // chunk whose `delta` is empty and whose `finish_reason` is the only thing
     // that says anything. Read before the delta, so a chunk this reader then
     // rejects has still handed the reason on. See `Delta.stop_reason`.
+    // This wire carries the word and nothing more: it has no `stop_details`,
+    // so the other two parts of `Stop` stay empty here.
     if (choice_value.object.get("finish_reason")) |v| {
-        if (v == .string and v.string.len != 0) try on_delta(ctx, .{ .stop_reason = v.string });
+        if (v == .string and v.string.len != 0) {
+            try on_delta(ctx, .{ .stop_reason = .{ .reason = v.string } });
+        }
     }
 
     const delta_value = choice_value.object.get("delta") orelse return error.MissingDelta;
@@ -1346,6 +1389,18 @@ pub const AssembledReply = struct {
     stop_reason_buffer: [max_stop_reason]u8 = @splat(0),
     /// How much of `stop_reason_buffer` the provider filled.
     stop_reason_len: usize = 0,
+    /// What more the provider said about that reason, cut to
+    /// `max_stop_category` and `max_stop_explanation`. Fixed buffers, for the
+    /// same reason `stop_reason_buffer` is one: a third and a fourth owned
+    /// slice here would be a third and a fourth way to leak. Read them with
+    /// `stop`. Both stay empty on every wire except a refusal on the Anthropic
+    /// one, and can stay empty there too: see `Stop`.
+    stop_category_buffer: [max_stop_category]u8 = @splat(0),
+    /// How much of `stop_category_buffer` the provider filled.
+    stop_category_len: usize = 0,
+    stop_explanation_buffer: [max_stop_explanation]u8 = @splat(0),
+    /// How much of `stop_explanation_buffer` the provider filled.
+    stop_explanation_len: usize = 0,
     /// What the provider reported. `cost` is `unknown` when it reported
     /// nothing, which is a different fact from free: see `message.Cost`.
     /// Every string field is owned by the caller and freed with `freeUsage`.
@@ -1374,6 +1429,18 @@ pub const AssembledReply = struct {
     pub fn stopReason(self: *const AssembledReply) []const u8 {
         return self.stop_reason_buffer[0..self.stop_reason_len];
     }
+
+    /// Why the provider stopped this turn, in all the words it used, which is
+    /// the reason `stopReason` gives plus whatever the provider said about it.
+    /// See `Stop`, and read its doc comment before reporting an empty
+    /// `category` or `explanation` as anything at all.
+    pub fn stop(self: *const AssembledReply) Stop {
+        return .{
+            .reason = self.stopReason(),
+            .category = self.stop_category_buffer[0..self.stop_category_len],
+            .explanation = self.stop_explanation_buffer[0..self.stop_explanation_len],
+        };
+    }
 };
 
 /// The longest `stop_reason` this reader keeps. Every value either wire sends
@@ -1382,6 +1449,27 @@ pub const AssembledReply = struct {
 /// length rather than dropped: a cut word still names the provider's reason,
 /// and an empty one names nothing at all.
 pub const max_stop_reason: usize = 64;
+
+/// The longest refusal category this reader keeps. Defined by the wire that
+/// sends one: see `anthropic.max_stop_category`.
+pub const max_stop_category: usize = anthropic.max_stop_category;
+
+/// The longest refusal explanation this reader keeps. Defined by the wire that
+/// sends one: see `anthropic.max_stop_explanation`, which says why prose gets
+/// a bound of its own rather than sharing `max_stop_reason`.
+pub const max_stop_explanation: usize = anthropic.max_stop_explanation;
+
+/// Copy as much of `text` as `buffer` holds, and answer how much that was.
+///
+/// The twin of `anthropic.keepCut`, and deliberately not shared with it: an
+/// adapter must not import this file, because that is a cycle, and neither
+/// file has a utility module between them to hold four lines. Both wires cut
+/// their own copy, so both need one.
+fn keepCut(buffer: []u8, text: []const u8) usize {
+    const kept = @min(text.len, buffer.len);
+    @memcpy(buffer[0..kept], text[0..kept]);
+    return kept;
+}
 
 /// Told about each delta as it arrives, on its way into the fold. See
 /// `sendAndAssembleWatching`.
@@ -1558,6 +1646,15 @@ const Collector = struct {
     stop_reason_buffer: [max_stop_reason]u8 = @splat(0),
     /// How much of `stop_reason_buffer` is in use.
     stop_reason_len: usize = 0,
+    /// What the stream said about that stop reason, cut to
+    /// `max_stop_category` and `max_stop_explanation`. Buffers and not owned
+    /// slices for the reason `AssembledReply.stop_category_buffer` gives.
+    stop_category_buffer: [max_stop_category]u8 = @splat(0),
+    /// How much of `stop_category_buffer` is in use.
+    stop_category_len: usize = 0,
+    stop_explanation_buffer: [max_stop_explanation]u8 = @splat(0),
+    /// How much of `stop_explanation_buffer` is in use.
+    stop_explanation_len: usize = 0,
     /// Told about each delta before it is folded. Null for a caller that only
     /// wants the finished message. See `sendAndAssembleWatching`.
     watcher: ?Watcher = null,
@@ -1596,6 +1693,10 @@ const Collector = struct {
             .usage = try self.takeUsage(),
             .stop_reason_buffer = self.stop_reason_buffer,
             .stop_reason_len = self.stop_reason_len,
+            .stop_category_buffer = self.stop_category_buffer,
+            .stop_category_len = self.stop_category_len,
+            .stop_explanation_buffer = self.stop_explanation_buffer,
+            .stop_explanation_len = self.stop_explanation_len,
         };
     }
 
@@ -1671,10 +1772,17 @@ const Collector = struct {
             .usage => |usage| try self.replaceUsage(usage),
             // The last word wins, the same way the last usage does: a wire
             // that revises its own stop reason means the later one.
-            .stop_reason => |reason| {
-                const keep = @min(reason.len, max_stop_reason);
-                @memcpy(self.stop_reason_buffer[0..keep], reason[0..keep]);
-                self.stop_reason_len = keep;
+            // All three parts of it, every time, because they describe one
+            // stop: keeping a refusal's explanation beside the reason that
+            // replaced it would report the wrong reason for the wrong word.
+            // See `Stop`.
+            .stop_reason => |stopped| {
+                self.stop_reason_len = keepCut(&self.stop_reason_buffer, stopped.reason);
+                self.stop_category_len = keepCut(&self.stop_category_buffer, stopped.category);
+                self.stop_explanation_len = keepCut(
+                    &self.stop_explanation_buffer,
+                    stopped.explanation,
+                );
             },
             .tool_call => |fragment| {
                 if (!self.seen_tool_indices.contains(fragment.index)) {

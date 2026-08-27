@@ -215,5 +215,23 @@ pub fn runProbe(
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    return child.wait(testing.io);
+    const term = try child.wait(testing.io);
+    try skipIfNothingMeasured(term);
+    return term;
+}
+
+/// Skip when the probe answered "this machine would not give me a sandbox".
+///
+/// **A boundary that was never reached is not a boundary that held.** Every
+/// caller of `runProbe` asks what a sandboxed process can and cannot do, so a
+/// machine that refuses a sandbox measures nothing and must not report a
+/// pass. See `namespace.nothing_measured_exit_status`, and the CI job named
+/// "Sandbox", which runs these suites on a machine that can host one and
+/// fails rather than skips.
+pub fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
+    const code = switch (term) {
+        .exited => |c| c,
+        else => return,
+    };
+    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }

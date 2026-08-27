@@ -449,8 +449,20 @@ fn readAllStdout(allocator: std.mem.Allocator, child: *std.process.Child) ![]u8 
     return buf.toOwnedSlice(allocator);
 }
 
+/// **A boundary that was never reached is not a boundary that held.** Every
+/// test here asks what a tool call can and cannot do inside a real sandbox,
+/// and a machine that will not give one measures nothing, so it must not
+/// report a row of passes. A skip is what says so, and it is read here
+/// because every one of these tests comes through this one function. See
+/// `namespace.nothing_measured_exit_status`, and the CI job named "Sandbox",
+/// which runs this suite on a machine that can host one and fails rather than
+/// skips.
 fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term, stdout: []u8) !ProbeOutcome {
     defer allocator.free(stdout);
+
+    if (term == .exited and term.exited == sandbox.namespace.nothing_measured_exit_status) {
+        return error.SkipZigTest;
+    }
 
     const exited_zero = switch (term) {
         .exited => |code| code == 0,
@@ -4659,6 +4671,13 @@ test "the scratchpad is writable, the task directory is not, and the harness sti
     defer allocator.free(record);
     const written = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, record, allocator, .limited(4096));
     defer allocator.free(written);
+    // **A boundary that was never reached is not a boundary that held.** The
+    // background task runs a tool call of its own, inside the sandbox, after
+    // the call that started it has already answered, so no exit status carries
+    // a machine that will not give one this far. What the harness wrote into
+    // the task's own file does. See `parseProbeOutcome`, which reads the same
+    // fact for every other test here.
+    if (std.mem.indexOf(u8, written, "NamespaceFailed") != null) return error.SkipZigTest;
     try std.testing.expectEqualStrings("the build failed\n", written);
 
     // 2. The agent's own write is refused. Same directory, same session, same

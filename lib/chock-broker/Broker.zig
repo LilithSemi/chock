@@ -11,6 +11,15 @@
 //! This file is steps 2 to 5. Step 6, the privileged work itself, is a later
 //! task, and step 1 is the tool that calls this one.
 //!
+//! **Step 1 is not built.** There is no `request_action` in
+//! `chock_core.tools.Tool`, so no tool call inside the sandbox reaches this
+//! file. `lib/chock-policy/ratchet.zig` says why: the approval wall that used
+//! to block it is gone, and this is waiting on the tool itself. Two callers
+//! reach `request` today, and neither is an agent: `chock run` asks for
+//! `workspace.apply` after the loop has ended, and the session arbiter asks
+//! for `policy.widen` while it runs. Read the list above as the design and
+//! not as what happens now.
+//!
 //! ## The table is the broker's own state
 //!
 //! A `Broker` holds a `*const chock_policy.table.Table`. Whichever process

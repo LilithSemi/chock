@@ -35,6 +35,32 @@ const outer_fault: u8 = 20;
 const spawn_refused: u8 = 21;
 const inner_missing: u8 = 22;
 const not_cancelled: u8 = 23;
+/// `sandbox_init` refused the profile, so the sandboxed program never started
+/// and no boundary was built. **This is its own code and it did not use to be
+/// one.** Measured on a real Mac on 2026-08-26: inside a `nix build`, where
+/// the builder already holds a Seatbelt profile, every operation here answers
+/// this. Before, it answered `spawn_refused` along with every other way
+/// `spawn` can fail, so a build log said only that the sandbox did not start
+/// and could not say that the machine had refused to nest a profile.
+const profile_refused: u8 = 24;
+/// The config named a path this platform cannot put where it was asked to.
+const not_expressible: u8 = 25;
+/// The profile could not be built: too long, or a rule holding a path that
+/// would match nothing. A fault in this code, and never in the machine.
+const profile_unbuildable: u8 = 26;
+
+/// What one `spawn` failure exits with.
+///
+/// **One code per cause, because saying only that the sandbox did not start is
+/// what let a whole CI failure go undiagnosed.** See `profile_refused`.
+fn exitFor(err: anyerror) u8 {
+    return switch (err) {
+        error.LandlockRestrictFailed => profile_refused,
+        error.NoMountNamespace => not_expressible,
+        error.LandlockInitFailed => profile_unbuildable,
+        else => spawn_refused,
+    };
+}
 
 /// How long a cancel is given to end a call that is sleeping. Generous, because
 /// a slow machine must not read as a broken cancel, and bounded, because a
@@ -135,7 +161,7 @@ fn runInside(
         .env = &.{},
         .network = network,
         .limits = limits,
-    }, inner_argv, null, null) catch return spawn_refused;
+    }, inner_argv, null, null) catch |err| return exitFor(err);
 
     return switch (term) {
         .exited => |code| code,
@@ -402,6 +428,9 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
         middle: sandbox.Middle = .{},
         term: std.process.Child.Term = undefined,
         failed: bool = false,
+        /// What the failure was, so the cancel path names a cause the same way
+        /// every other operation here does. See `exitFor`.
+        failure: u8 = spawn_refused,
         done: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
@@ -413,8 +442,9 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
                 .cwd = self.work,
                 .env = &.{},
                 .limits = sandbox.Sandbox.Limits.none,
-            }, &.{ self.self_path, "in-sleep", self.root }, null, &self.middle) catch {
+            }, &.{ self.self_path, "in-sleep", self.root }, null, &self.middle) catch |err| {
                 self.failed = true;
+                self.failure = exitFor(err);
                 self.done.store(true, .release);
                 return;
             };
@@ -433,7 +463,9 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
     }
     if (@atomicLoad(std.c.pid_t, &call.middle.pid, .acquire) == 0) {
         thread.join();
-        return spawn_refused;
+        // `spawn` never got as far as filling in the handle. When it failed it
+        // said why, and that answer is better than "the sandbox did not start".
+        return if (call.failed) call.failure else spawn_refused;
     }
 
     sandbox.signalMiddle(call.middle.fd, .KILL) catch {
@@ -452,7 +484,7 @@ fn runCancel(arena: std.mem.Allocator, work: []const u8, self_path: []const u8, 
     sandbox.closeMiddle(&call.middle);
 
     if (!finished) return not_cancelled;
-    if (call.failed) return spawn_refused;
+    if (call.failed) return call.failure;
     // A program that slept for two minutes and then exited 0 was not cancelled.
     // Only an ended-by-signal outcome proves the handle reached it.
     return switch (call.term) {

@@ -96,6 +96,12 @@ pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
 /// Seatbelt file directly.
 pub const confinedAlready = seatbelt.confinedAlready;
 
+/// The three states `confinedAlready` folds into two. A caller that must tell
+/// a machine which refuses to nest a profile from a profile this code built
+/// wrongly reads this instead. See `seatbelt.Nesting`.
+pub const nesting = seatbelt.nesting;
+pub const Nesting = seatbelt.Nesting;
+
 /// The longest profile this driver builds. A workspace, a dev shell closure and
 /// the deny list together are far below this; a config that is not is refused
 /// rather than truncated. See `seatbelt.Builder.finish`.

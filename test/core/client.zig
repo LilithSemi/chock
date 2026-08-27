@@ -1216,6 +1216,69 @@ test "an Anthropic reply with no content at all assembles to an empty message th
 
     defer freeUsage(allocator, reply.usage);
     try std.testing.expectEqualStrings("end_turn", reply.stopReason());
+    // Not a refusal, so the wire sent no `stop_details` and the fold holds
+    // none. See `chock_provider.Client.Stop`.
+    try std.testing.expectEqualStrings("", reply.stop().category);
+    try std.testing.expectEqualStrings("", reply.stop().explanation);
+    switch (reply.outcome) {
+        .status_error, .failed => return error.TestUnexpectedResult,
+        .message => |msg| {
+            defer freeAssembledMessage(allocator, msg);
+            try std.testing.expectEqual(@as(usize, 0), msg.content.len);
+        },
+    }
+}
+
+test "a refused Anthropic reply carries the category and the explanation through the fold" {
+    // `anthropic.Decoder` reads `stop_details`, and its own tests prove that.
+    // This one proves the value gets out of the decoder, through `streamBody`,
+    // through the fold, and into the reply the agent loop reads: three
+    // mechanisms in this project have shipped with green tests and no caller,
+    // and no unit test can catch that.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":" ++
+                    "{\"id\":\"msg_1\",\"role\":\"assistant\"," ++
+                    "\"usage\":{\"input_tokens\":41,\"output_tokens\":0}}}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk(
+                "event: message_delta\ndata: {\"type\":\"message_delta\"," ++
+                    "\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":" ++
+                    "{\"type\":\"refusal\",\"category\":\"cyber_harm\",\"explanation\":" ++
+                    "\"This request was declined because it could enable cyber harm.\"}}," ++
+                    "\"usage\":{\"output_tokens\":0}}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk(
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ) },
+            .{ .bytes = fake_provider.last_chunk },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.initAnthropic(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+
+    defer freeUsage(allocator, reply.usage);
+    const stopped = reply.stop();
+    try std.testing.expectEqualStrings("refusal", stopped.reason);
+    try std.testing.expectEqualStrings("cyber_harm", stopped.category);
+    try std.testing.expectEqualStrings(
+        "This request was declined because it could enable cyber harm.",
+        stopped.explanation,
+    );
     switch (reply.outcome) {
         .status_error, .failed => return error.TestUnexpectedResult,
         .message => |msg| {

@@ -40,11 +40,20 @@
 //!   1 - the operation was refused by the kernel.
 //!   2 - the command line is wrong, or the operation is not one this program
 //!       knows.
-//!   3 - the sandbox setup itself failed, or spawning it did, before the
-//!       probed operation ever ran. Never reused by 0 or 1: a setup failure
-//!       that answers the code a passing test asserts has shipped twice in
-//!       this project.
+//!   3 - this program could not build the config it was given, before any
+//!       sandbox was asked for. Never reused by 0 or 1: a setup failure that
+//!       answers the code a passing test asserts has shipped twice in this
+//!       project.
 //!   5 - the operation failed for a reason the design does not predict.
+//!  21 - `spawn` failed for a reason not named below.
+//!  24 - `sandbox_init` refused the profile, so no boundary was ever built.
+//!  25 - the config named a path this platform cannot put where it was asked.
+//!  26 - the profile could not be built at all.
+//!
+//! **21 and up did not use to exist, and every one of them answered 3.** So a
+//! build log could not tell a machine that refused to nest a Seatbelt profile
+//! from a blob this program failed to parse. The numbers match
+//! `test/sandbox/darwin_probe.zig`, so one vocabulary reads across both logs.
 
 const std = @import("std");
 const sandbox = @import("chock-sandbox");
@@ -54,6 +63,25 @@ const refused: u8 = 1;
 const bad_arguments: u8 = 2;
 const setup_failed: u8 = 3;
 const wrong_failure: u8 = 5;
+const spawn_refused: u8 = 21;
+const profile_refused: u8 = 24;
+const not_expressible: u8 = 25;
+const profile_unbuildable: u8 = 26;
+
+/// What one `spawn` failure exits with. **One code per cause**, because
+/// `setup_failed` used to cover both a refused profile and a blob this program
+/// could not read, and those two ask opposite things of whoever reads the log.
+/// Measured on a real Mac on 2026-08-26: inside a `nix build`, where the
+/// builder already holds a Seatbelt profile, `spawn` answers
+/// `LandlockRestrictFailed`, which is `profile_refused`.
+fn exitFor(err: anyerror) u8 {
+    return switch (err) {
+        error.LandlockRestrictFailed => profile_refused,
+        error.NoMountNamespace => not_expressible,
+        error.LandlockInitFailed => profile_unbuildable,
+        else => spawn_refused,
+    };
+}
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -96,7 +124,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .rules = rules,
         .cwd = cwd,
         .env = env,
-    }, inner, null, null) catch return setup_failed;
+    }, inner, null, null) catch |err| return exitFor(err);
 
     return switch (term) {
         .exited => |code| switch (code) {

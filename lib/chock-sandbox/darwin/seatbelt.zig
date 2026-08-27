@@ -490,59 +490,116 @@ pub fn apply(profile: [:0]const u8) Support {
     }
 }
 
+/// What a profile of Chock's own would meet on this process. **The three
+/// answers must never be collapsed into two**, because each one asks a
+/// different thing of the caller.
+pub const Nesting = enum {
+    /// A profile of Chock's own goes on this process. A test must run.
+    free,
+    /// A profile is on this process already and it refuses a second one, so
+    /// there is no boundary of Chock's own here to measure. A test must skip.
+    confined,
+    /// The trial profile was refused for a reason of its own, and not by a
+    /// profile above. **A test must not skip on this.** The fault is in this
+    /// code or in the machine, and a skip would report it as a pass.
+    trial_rejected,
+};
+
+/// The trial profile has the shape of a real one: a base denial, the four
+/// permissions every Chock profile carries, one path rule, and the network and
+/// signal lines. `/` is the path because the trial is never executed, and this
+/// keeps the profile free of any temporary directory.
+///
+/// **A permissive profile is the wrong question and it used to be the one that
+/// was asked.** `(version 1)(allow default)` shares no line with what `spawn`
+/// applies, so a macOS that took the first and refused the second would have
+/// been read as a machine where nesting works.
+const trial_options: Options = .{ .rules = &.{.{ .path = "/", .access = .read_write }} };
+
 /// Whether this process is already inside somebody else's profile, so no
 /// profile of its own can go on and no boundary of its own can be measured.
 ///
-/// **Measured on a real Mac on 2026-08-25, both halves on the same machine.**
-/// Run from a login shell, `sandbox_check` answered 0 and `sandbox_init`
-/// answered 0 for `(version 1)(allow default)` and for a profile that denies by
-/// default. Run inside a Nix build, where Nix on macOS puts every builder under
-/// `sandbox-exec`, `sandbox_check` answered 1 and `sandbox_init` answered -1
-/// with `EPERM` for those same two profiles. The profile text changes nothing:
-/// the enclosing sandbox refuses the call itself.
-///
-/// The cheap question comes first because it needs no child and says nothing on
-/// standard error. The refusal is then measured rather than assumed, so a macOS
-/// that one day permits nesting gives a real answer here instead of a skip.
+/// **`trial_rejected` answers false here on purpose.** The caller of this
+/// function skips a test when it answers true, and a profile refused for its
+/// own reason must fail a test rather than skip one.
 pub fn confinedAlready() bool {
-    if (builtin.os.tag == .macos) {
-        // `SANDBOX_FILTER_NONE`, with no operation named, asks whether the
-        // process has a profile at all rather than about one act.
-        if (sandbox_check(std.c.getpid(), null, 0) != 1) return false;
-        return !nestingWorks();
-    } else {
-        return false;
-    }
+    return nesting() == .confined;
 }
 
-/// Put a permissive profile on a child and read the answer off its exit status.
+/// Put a profile shaped like a real one on a child, and read off which of the
+/// three states this machine is in.
+///
+/// **Measured on a real Mac, macOS 15.7.9, on 2026-08-26, every state on the
+/// same machine.** From a login shell `sandbox_check` answered 0 and every
+/// well formed profile applied, while a profile that cannot compile answered
+/// `-1` with an error message and left `errno` at 0. Under
+/// `sandbox-exec -p '(version 1)(allow default)'`, and inside a real
+/// `nix build`, which is where Nix on macOS puts every builder under
+/// `sandbox-exec`, `sandbox_check` answered 1 and every profile was refused
+/// with `-1` and `EPERM`. So `EPERM` separates a refusal by the profile above
+/// from a refusal by the profile text, and neither the return value nor the
+/// message does.
+///
+/// **An outer profile refuses before it parses, so `trial_rejected` cannot be
+/// seen while confined.** Measured inside a real `nix build` on 2026-08-26: a
+/// deliberately unparseable profile was refused with `EPERM` there, exactly
+/// like a well formed one, where the same text outside a profile answered a
+/// parse error. This costs nothing, because a machine that refuses every
+/// profile is one where no boundary of Chock's own can be measured whatever
+/// the text says, and a skip is the right answer for it. What the split still
+/// buys is that a fork that failed, or a child the system killed, is never
+/// read as a machine that refuses to nest.
+pub fn nesting() Nesting {
+    if (builtin.os.tag != .macos) return .free;
+
+    // The cheap question first, and **it may only ever answer `free`**. A
+    // prediction that makes a test run is corrected by the test it lets run. A
+    // prediction that makes a test skip is corrected by nothing at all, so the
+    // skip is never taken on this answer alone.
+    if (sandbox_check(std.c.getpid(), null, 0) != 1) return .free;
+
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const trial = builder.finish(trial_options) catch return .trial_rejected;
+    return applyInChild(trial);
+}
+
+/// Apply `profile` in a child and answer what the child met.
 ///
 /// **A child, because `sandbox_init` may be called once per process.** Asking
 /// in this process would spend the one call its caller needs.
-fn nestingWorks() bool {
-    if (builtin.os.tag == .macos) {
-        const pid = std.c.fork();
-        if (pid < 0) return false;
-        if (pid == 0) {
-            // libsandbox prints its own refusal on standard error, and a test
-            // that writes there puts a `failed command:` line in the build log
-            // whatever it exits with. So the child sends it nowhere.
-            const quiet = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
-            if (quiet >= 0) _ = std.c.dup2(quiet, 2);
-            var message: ?[*:0]u8 = null;
-            const rc = sandbox_init("(version 1)(allow default)", 0, &message);
-            std.c._exit(if (rc == 0) 0 else 1);
-        }
-        var status: c_int = 0;
-        while (std.c.waitpid(pid, &status, 0) < 0) {
-            if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return false;
-        }
-        // Exited normally, with 0. Any signal or any other code is a child that
-        // answered nothing.
-        return status == 0;
-    } else {
-        return false;
+fn applyInChild(profile: [:0]const u8) Nesting {
+    if (builtin.os.tag != .macos) return .free;
+
+    const pid = std.c.fork();
+    if (pid < 0) return .trial_rejected;
+    if (pid == 0) {
+        // libsandbox prints its own refusal on standard error, and a test
+        // that writes there puts a `failed command:` line in the build log
+        // whatever it exits with. So the child sends it nowhere.
+        const quiet = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+        if (quiet >= 0) _ = std.c.dup2(quiet, 2);
+        var message: ?[*:0]u8 = null;
+        std.c._errno().* = 0;
+        const rc = sandbox_init(profile.ptr, 0, &message);
+        const failure = std.c._errno().*;
+        if (message) |text| sandbox_free_error(text);
+        if (rc == 0) std.c._exit(0);
+        std.c._exit(if (failure == @intFromEnum(std.c.E.PERM)) 1 else 2);
     }
+
+    var status: c_int = 0;
+    while (std.c.waitpid(pid, &status, 0) < 0) {
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return .trial_rejected;
+    }
+    // A child the system killed answered nothing, and a question that got no
+    // answer is not a skip.
+    if (!std.c.W.IFEXITED(@bitCast(status))) return .trial_rejected;
+    return switch (std.c.W.EXITSTATUS(@bitCast(status))) {
+        0 => .free,
+        1 => .confined,
+        else => .trial_rejected,
+    };
 }
 
 test "a profile puts every denial after every allowance" {
@@ -673,6 +730,49 @@ test "apply answers unsupported on a build that is not for macOS" {
     try std.testing.expectEqual(Support.Reason.not_darwin, support.unsupported);
 }
 
+test "a profile refused for its own reason is never read as a profile above" {
+    // **The state the old guard could not see, and the reason it could not.**
+    // It read every refusal of its trial profile as an outer profile, so a
+    // trial that stopped compiling would have skipped the whole Darwin suite
+    // and reported a boundary nobody measured as a pass.
+    //
+    // Measured on a real Mac, macOS 15.7.9, on 2026-08-26, and this is what
+    // tells the two apart: a profile that cannot compile answers -1 with a
+    // message and leaves `errno` at 0, while an outer profile answers -1 with
+    // `EPERM`. Both answers are the same -1 and both carry a message.
+    //
+    // **Asked only where it has an answer, and this test is the thing that
+    // measured why.** Written first without the guard below, it failed inside
+    // a real `nix build` with "expected .trial_rejected, found .confined": an
+    // outer profile refuses `sandbox_init` before it parses the text, so the
+    // unparseable profile came back `EPERM` like every other. There is nothing
+    // to tell apart on such a machine, and the skip `nesting` gives there is
+    // right whatever the text says.
+    //
+    // Mutation check: read the return value alone, and drop the `errno` test
+    // in `applyInChild`, and this fails.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (sandbox_check(std.c.getpid(), null, 0) == 1) return error.SkipZigTest;
+    try std.testing.expectEqual(Nesting.trial_rejected, applyInChild("(version 1) this is not sbpl ((("));
+}
+
+test "the trial profile this file measures with really compiles" {
+    // **A trial profile that cannot compile would answer `trial_rejected` on
+    // every machine**, which never skips and so never hides anything, but it
+    // would also mean `nesting` could never answer `confined` and the suite
+    // would fail everywhere instead of skipping. So the text is checked here,
+    // where a fault in it is one named failure rather than sixteen.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const trial = try builder.finish(trial_options);
+    try std.testing.expect(std.mem.startsWith(u8, trial, "(version 1)\n(deny default)\n"));
+    // The shape that makes it representative: it is not `(allow default)`.
+    try std.testing.expect(std.mem.indexOf(u8, trial, "(deny network*)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, trial, "(deny signal)") != null);
+    if (builtin.os.tag != .macos) return;
+    try std.testing.expect(applyInChild(trial) != .trial_rejected);
+}
+
 test "a process that already has a profile is told from one that has not" {
     // **The half that runs everywhere, a login shell and a Nix build alike**: a
     // child with a profile of its own must answer `true`, whatever this process
@@ -688,6 +788,17 @@ test "a process that already has a profile is told from one that has not" {
     const pid = std.c.fork();
     try std.testing.expect(pid >= 0);
     if (pid == 0) {
+        // **libsandbox prints its own refusal on standard error, and this
+        // child really does meet one inside a Nix builder**, where `apply`
+        // below is refused by the profile the builder already carries. A test
+        // binary that writes to standard error fails the build through
+        // `build.zig`'s own `failOnTestStderr`, whatever it exits with, so a
+        // passing test would have reddened macOS CI with a line of libsandbox
+        // output. Measured on a real Mac on 2026-08-26 under
+        // `sandbox-exec -p '(version 1)(allow default)'`, which prints
+        // "sandbox initialization failed: Operation not permitted".
+        const quiet = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY });
+        if (quiet >= 0) _ = std.c.dup2(quiet, 2);
         _ = apply("(version 1)(allow default)");
         std.c._exit(if (confinedAlready()) 0 else 1);
     }

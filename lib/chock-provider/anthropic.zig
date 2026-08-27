@@ -605,6 +605,65 @@ pub const DecodeError = std.mem.Allocator.Error || std.json.ParseError(std.json.
     BlockIndexInvalid,
 };
 
+/// What the `stop_details` beside a `stop_reason` said. **This wire sends
+/// `stop_details` for one stop reason only, `refusal`, and sends null for
+/// every other one.**
+///
+/// **Both fields can be null even on a real refusal**, so an empty one here
+/// means the provider said nothing, and a reader that fills that gap with a
+/// reason of its own throws away the only explanation anybody has and puts an
+/// invented one in its place. A refusal with neither field is a different fact
+/// from a refusal with them, and whatever reports this must keep the two
+/// different.
+pub const StopDetails = struct {
+    /// A short token naming the class of the refusal, for example
+    /// `cyber_harm`. Empty when the provider sent none.
+    category: []const u8 = "",
+    /// The provider's own sentence about the refusal, for example "This
+    /// request was declined because it could enable cyber harm." Empty when
+    /// the provider sent none.
+    explanation: []const u8 = "",
+};
+
+/// The longest `category` this reader keeps. It is one short token, the same
+/// shape a stop reason is, so it gets the length `Client.max_stop_reason`
+/// gives that one, and for the same reason: a cut token still names the class
+/// of the refusal, and an empty one names nothing at all. Written out here
+/// rather than read from there, because an adapter that imported `Client.zig`
+/// would close an import cycle.
+pub const max_stop_category: usize = 64;
+
+/// The longest `explanation` this reader keeps. This one is prose and not a
+/// token, so it needs a bound of its own: the longest the platform documents
+/// is 61 bytes, "This request was declined because it could enable cyber
+/// harm.", and this holds several sentences of that size. It is a fixed buffer
+/// in every `Decoder` and in every `Client.AssembledReply`, both of which are
+/// passed by value, which is what makes a bound necessary at all: the provider
+/// chooses this length, and Chock does not let it choose how big those structs
+/// get. A longer explanation is cut and not dropped, for the same reason a
+/// stop reason is.
+pub const max_stop_explanation: usize = 512;
+
+/// Read the `stop_details` object beside a `stop_reason`. An absent one, a
+/// null one, and one of the wrong type all read as "the provider said
+/// nothing", which is what an empty field means everywhere else in this
+/// reader.
+fn stopDetailsOf(delta: std.json.ObjectMap) StopDetails {
+    const value = delta.get("stop_details") orelse return .{};
+    if (value != .object) return .{};
+    return .{
+        .category = stringField(value.object, "category"),
+        .explanation = stringField(value.object, "explanation"),
+    };
+}
+
+/// Copy as much of `text` as `buffer` holds, and answer how much that was.
+fn keepCut(buffer: []u8, text: []const u8) usize {
+    const kept = @min(text.len, buffer.len);
+    @memcpy(buffer[0..kept], text[0..kept]);
+    return kept;
+}
+
 /// Reads the events of one `/messages` stream. Holds the small amount of
 /// state the wire forces a reader to keep: which content block index is
 /// carrying what, and the running usage counts.
@@ -632,6 +691,18 @@ pub const Decoder = struct {
     /// "end_turn". A copy, not a slice into `arena`, because it outlives the
     /// event it arrived on: read it with `stopReason`.
     stop_reason_text: std.ArrayList(u8) = .empty,
+    /// What the `stop_details` beside that `stop_reason` said, cut to
+    /// `max_stop_category` and `max_stop_explanation`. Copies, not slices into
+    /// `arena`, for the reason `stop_reason_text` gives, and fixed buffers
+    /// rather than a second and third `std.ArrayList` because the explanation
+    /// is prose whose length the provider chooses. Read them with
+    /// `stopDetails`.
+    stop_category_buffer: [max_stop_category]u8 = @splat(0),
+    /// How much of `stop_category_buffer` the provider filled.
+    stop_category_len: usize = 0,
+    stop_explanation_buffer: [max_stop_explanation]u8 = @splat(0),
+    /// How much of `stop_explanation_buffer` the provider filled.
+    stop_explanation_len: usize = 0,
     /// Whether `message_stop` has arrived. **This wire never sends the
     /// `[DONE]` line the OpenAI compatible wire ends with**, so a caller that
     /// waits for one calls every complete reply truncated. This is the fact
@@ -652,6 +723,18 @@ pub const Decoder = struct {
     /// until a `message_delta` says.
     pub fn stopReason(self: *const Decoder) []const u8 {
         return self.stop_reason_text.items;
+    }
+
+    /// What the provider said about the reason `stopReason` names. Both
+    /// fields stay empty until a `message_delta` carries a `stop_details` that
+    /// fills them, which this wire does for a refusal and for nothing else.
+    /// See `StopDetails`: empty means the provider said nothing, and never
+    /// that it said there was no reason.
+    pub fn stopDetails(self: *const Decoder) StopDetails {
+        return .{
+            .category = self.stop_category_buffer[0..self.stop_category_len],
+            .explanation = self.stop_explanation_buffer[0..self.stop_explanation_len],
+        };
     }
 
     /// Read one event's JSON body. **Every string in the returned `Piece` is
@@ -712,6 +795,21 @@ pub const Decoder = struct {
                     if (reason.len != 0) {
                         self.stop_reason_text.clearRetainingCapacity();
                         try self.stop_reason_text.appendSlice(self.allocator, reason);
+                        // **Replaced with the reason they belong to, always,
+                        // even when the event carried none.** The details of
+                        // an earlier stop reason describe that word and not
+                        // this one, and keeping them would report a refusal's
+                        // explanation beside the reason that replaced it. See
+                        // `StopDetails`.
+                        const details = stopDetailsOf(delta.object);
+                        self.stop_category_len = keepCut(
+                            &self.stop_category_buffer,
+                            details.category,
+                        );
+                        self.stop_explanation_len = keepCut(
+                            &self.stop_explanation_buffer,
+                            details.explanation,
+                        );
                     }
                 }
             }
@@ -1332,6 +1430,92 @@ test "cumulative message_delta usage gives the last value and not the sum" {
     try testing.expect(decoder.saw_usage);
     // 1200 + 150 + 800, once each. A summing parser reports more.
     try testing.expectEqual(@as(u64, 2150), decoder.usage.totalTokens());
+    // A stop reason that is not a refusal comes with `stop_details: null`, so
+    // there is nothing to keep beside the word. See `StopDetails`.
+    try testing.expectEqualStrings("", decoder.stopDetails().category);
+    try testing.expectEqualStrings("", decoder.stopDetails().explanation);
+}
+
+test "a refusal keeps the category and the explanation the wire sent with it" {
+    // The whole reason `stop_details` is read. "It stopped because of refusal"
+    // says nothing a person can act on, and the sentence that does say
+    // something arrives in the same event.
+    const allocator = testing.allocator;
+    var decoder = Decoder.init(allocator);
+    defer decoder.deinit();
+
+    _ = try feedEvent(&decoder,
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber_harm","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":12}}
+    );
+
+    try testing.expectEqualStrings("refusal", decoder.stopReason());
+    try testing.expectEqualStrings("cyber_harm", decoder.stopDetails().category);
+    try testing.expectEqualStrings(
+        "This request was declined because it could enable cyber harm.",
+        decoder.stopDetails().explanation,
+    );
+}
+
+test "a refusal with both details null keeps neither, and invents neither" {
+    // **A real shape, not a defensive one.** Both fields are nullable even on
+    // a refusal, and a reader that filled the gap here would put an invented
+    // reason in the log of the one turn nobody can explain any other way.
+    const allocator = testing.allocator;
+    var decoder = Decoder.init(allocator);
+    defer decoder.deinit();
+
+    _ = try feedEvent(&decoder,
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null,"explanation":null}},"usage":{"output_tokens":3}}
+    );
+
+    try testing.expectEqualStrings("refusal", decoder.stopReason());
+    try testing.expectEqualStrings("", decoder.stopDetails().category);
+    try testing.expectEqualStrings("", decoder.stopDetails().explanation);
+}
+
+test "a refusal with one detail null keeps the other one" {
+    const allocator = testing.allocator;
+    var decoder = Decoder.init(allocator);
+    defer decoder.deinit();
+
+    _ = try feedEvent(&decoder,
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":null,"explanation":"This request was declined."}},"usage":{"output_tokens":3}}
+    );
+    try testing.expectEqualStrings("", decoder.stopDetails().category);
+    try testing.expectEqualStrings("This request was declined.", decoder.stopDetails().explanation);
+
+    _ = try feedEvent(&decoder,
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber_harm","explanation":null}},"usage":{"output_tokens":4}}
+    );
+    try testing.expectEqualStrings("cyber_harm", decoder.stopDetails().category);
+    // **Cleared with the reason it belonged to.** The explanation above
+    // described the first refusal, and reporting it beside the second one
+    // would attach a reason to a word that never carried it.
+    try testing.expectEqualStrings("", decoder.stopDetails().explanation);
+}
+
+test "an explanation longer than the bound is cut, and never dropped" {
+    // A cut sentence still says why. An empty one says nothing at all, which
+    // is the fault this reader exists to fix. See `max_stop_explanation`.
+    const allocator = testing.allocator;
+    var decoder = Decoder.init(allocator);
+    defer decoder.deinit();
+
+    const long = "n" ** (max_stop_explanation + 200);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"refusal\"," ++
+            "\"stop_details\":{{\"type\":\"refusal\",\"category\":\"{s}\"," ++
+            "\"explanation\":\"{s}\"}}}}}}",
+        .{ "c" ** (max_stop_category + 8), long },
+    );
+    defer allocator.free(body);
+    _ = try feedEvent(&decoder, body);
+
+    const details = decoder.stopDetails();
+    try testing.expectEqual(max_stop_category, details.category.len);
+    try testing.expectEqual(max_stop_explanation, details.explanation.len);
+    try testing.expectEqualStrings(long[0..max_stop_explanation], details.explanation);
 }
 
 test "a provider that reports no usage leaves saw_usage false, so zero is not read as free" {

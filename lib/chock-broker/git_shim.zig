@@ -41,10 +41,13 @@
 //!
 //! An act that has to leave the sandbox, a push to a real remote or a commit
 //! into the user's own repository, cannot be done by saying yes here at all.
-//! The agent has to call `request_action` with an `actions.Action`, and then
-//! the broker does it, outside the sandbox, out of a payload that names the
-//! effect. `Ask.kind` names which act that would be, and `Ask.advice` is the
-//! sentence the agent is told.
+//! The design is that the agent calls `request_action` with an
+//! `actions.Action`, and the broker does it outside the sandbox, out of a
+//! payload that names the effect. **That tool is not built.** See
+//! `lib/chock-policy/ratchet.zig`, which says the same: the approval wall is
+//! gone and this is waiting on the tool itself. So `Ask.kind` names which act
+//! it would be, and `Ask.advice` tells the agent the effect cannot be had in
+//! this build, and does not name a tool it cannot call.
 //!
 //! **The shim cannot build that payload for the agent, and must not try.** The
 //! user approves the effect and never a shell line. An `actions.Action` holds a
@@ -125,7 +128,7 @@ pub const Ask = struct {
         );
         return std.fmt.allocPrint(
             gpa,
-            "an effect outside the sandbox needs the action {s}, asked for with request_action, and not this subcommand",
+            "an effect outside the sandbox needs the action {s}, and this build has no tool that asks for one, so this subcommand cannot have that effect here",
             .{kind.wireName()},
         );
     }
@@ -928,7 +931,11 @@ test "the shim tells the user what saying yes does, and never offers to do the a
 
     try testing.expect(std.mem.indexOf(u8, run.detail, "the subcommand runs inside the sandbox") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "the sandbox has no network") != null);
-    try testing.expect(std.mem.indexOf(u8, run.detail, "request_action") != null);
+    // **Never the name of a tool that does not exist.** `request_action` is
+    // designed and not built, so a message telling the agent to call it costs
+    // the agent a turn and teaches it a tool that is not in its list.
+    try testing.expect(std.mem.indexOf(u8, run.detail, "request_action") == null);
+    try testing.expect(std.mem.indexOf(u8, run.detail, "no tool that asks for one") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "git.push") != null);
 
     // The effect comes before the argument vector, so the first thing read

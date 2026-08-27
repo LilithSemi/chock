@@ -1090,7 +1090,7 @@ fn runTurn(
             // `chock_proto.event.SessionEndReason.empty_response` for the
             // measured session that made this necessary.
             if (!saidSomething(reply_message)) {
-                const detail = try emptyReplyDetail(allocator, reply.stopReason(), turn_index);
+                const detail = try emptyReplyDetail(allocator, reply.stop(), turn_index);
                 defer allocator.free(detail);
                 _ = try appendAndApply(allocator, io, locked, session, deps, .{
                     .session_end = .{ .reason = .empty_response, .detail = detail },
@@ -1175,11 +1175,29 @@ fn saidSomething(reply: chock_provider.message.Message) bool {
 
 /// What the log says about a turn that carried nothing. Caller owns the result.
 ///
-/// **The provider's own word first, when it sent one.** `stop_reason` is
+/// **The provider's own word first, when it sent one.** `stop.reason` is
 /// `end_turn`, `max_tokens`, `refusal`, or whatever else the provider said, and
 /// a Chock that invented a reason of its own while holding that word would be
 /// throwing away the only explanation anybody has. See
 /// `chock_provider.Client.Delta.stop_reason`.
+///
+/// **And every other word it sent, for the same reason.** A refusal carries a
+/// category and a sentence of the provider's own prose beside the word, and
+/// "it stopped because of refusal" tells the person reading the log nothing
+/// they can act on while the sentence that says why sits one field away. See
+/// `chock_provider.Client.Stop`.
+///
+/// **An empty category or explanation stays out of the sentence.** Both are
+/// nullable on the wire even on a real refusal, so empty means the provider
+/// said nothing, and a sentence that named a category the provider never sent
+/// would be the invented reason this whole function exists to stop. A refusal
+/// with neither reads exactly as a refusal always did, which is the honest
+/// report of a provider that gave one word and no more.
+///
+/// **Nothing here works around the refusal**, and nothing anywhere else does
+/// either. This function says what happened and the session ends. A harness
+/// that retried, changed model, or softened the words would be answering a
+/// safety decision by routing around it.
 ///
 /// **The turn number, because the first turn and a later one are different
 /// facts.** A session whose first turn carried nothing did no work at all. A
@@ -1190,23 +1208,40 @@ fn saidSomething(reply: chock_provider.message.Message) bool {
 /// the two they are reading.
 fn emptyReplyDetail(
     allocator: std.mem.Allocator,
-    stop_reason: []const u8,
+    stop: chock_provider.Client.Stop,
     turn_index: usize,
 ) std.mem.Allocator.Error![]u8 {
     const which = if (turn_index == 0)
         "the first turn of the session"
     else
         "a turn of the session";
-    return if (stop_reason.len == 0) std.fmt.allocPrint(
-        allocator,
-        "the model backend answered {s} with no text and no tool call, and gave no stop reason",
-        .{which},
-    ) else std.fmt.allocPrint(
-        allocator,
-        "the model backend answered {s} with no text and no tool call, and said it stopped " ++
-            "because of {s}",
-        .{ which, stop_reason },
-    );
+    const opening = "the model backend answered {s} with no text and no tool call";
+    if (stop.reason.len == 0) {
+        return std.fmt.allocPrint(allocator, opening ++ ", and gave no stop reason", .{which});
+    }
+    const because = opening ++ ", and said it stopped because of {s}";
+    if (stop.category.len != 0 and stop.explanation.len != 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            because ++ ", in the category {s}: {s}",
+            .{ which, stop.reason, stop.category, stop.explanation },
+        );
+    }
+    if (stop.category.len != 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            because ++ ", in the category {s}",
+            .{ which, stop.reason, stop.category },
+        );
+    }
+    if (stop.explanation.len != 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            because ++ ": {s}",
+            .{ which, stop.reason, stop.explanation },
+        );
+    }
+    return std.fmt.allocPrint(allocator, because, .{ which, stop.reason });
 }
 
 /// Send one turn's request, and send it again after a wait when the provider
@@ -1736,7 +1771,7 @@ fn refuseForBudget(
     );
     defer allocator.free(summary);
 
-    _ = try appendAndApply(allocator, io, locked, session, deps, .{
+    const request_id = try appendAndApply(allocator, io, locked, session, deps, .{
         .approval_request = .{
             .action = budget_action,
             .summary = summary,
@@ -1754,8 +1789,12 @@ fn refuseForBudget(
             .tool_call_id = "",
         },
     });
+    // **The id of the request written just above, and not zero.** An
+    // `Envelope.id` of zero means an event not yet written, so a zero here
+    // leaves the answer naming no question, and a reader that folds this log
+    // cannot join the two. `Broker.answer` has always carried the real id.
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .approval_response = .{
-        .request_id = 0,
+        .request_id = request_id,
         .decision = .expired,
         .responder = "",
         .action = budget_action,
@@ -4185,7 +4224,7 @@ test "an empty turn carries the provider's own stop reason into the log" {
     defer store.close(io);
 
     var fake_client = FakeClient{
-        .turns = &.{.{ .deltas = &.{.{ .stop_reason = "refusal" }} }},
+        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{ .reason = "refusal" } }} }},
     };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
@@ -4198,6 +4237,135 @@ test "an empty turn carries the provider's own stop reason into the log" {
     defer allocator.free(detail);
     // The provider's own word, and not a sentence Chock made up in its place.
     try testing.expect(std.mem.indexOf(u8, detail, "refusal") != null);
+    // A refusal the provider said nothing more about reads as one. Nothing
+    // here may name a category or a reason the provider never sent: see
+    // `emptyReplyDetail`.
+    try testing.expect(std.mem.indexOf(u8, detail, "category") == null);
+    try testing.expect(std.mem.endsWith(u8, detail, "because of refusal"));
+}
+
+test "a refusal carries the provider's own category and explanation into the log" {
+    // The fault one level deeper than the stop reason itself. The API sends
+    // `stop_details` beside the word, with the sentence that says why, and a
+    // log that holds only "refusal" tells the person reading it nothing they
+    // can act on. See `chock_provider.Client.Stop`.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{
+        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{
+            .reason = "refusal",
+            .category = "cyber_harm",
+            .explanation = "This request was declined because it could enable cyber harm.",
+        } }} }},
+    };
+    var fake_tools = FakeToolRunner{ .output = "unused" };
+
+    try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
+
+    const reason = try endReasonOf(allocator, io, store);
+    try testing.expectEqual(event.SessionEndReason.empty_response, std.meta.activeTag(reason));
+
+    const detail = try endDetailOf(allocator, io, store);
+    defer allocator.free(detail);
+    try testing.expectEqualStrings(
+        "the model backend answered the first turn of the session with no text and no tool " ++
+            "call, and said it stopped because of refusal, in the category cyber_harm: This " ++
+            "request was declined because it could enable cyber harm.",
+        detail,
+    );
+    // **The session ended, and nothing tried the request again.** A harness
+    // that retried, changed model, or reworded a refusal would be routing
+    // around a safety decision.
+    try testing.expectEqual(@as(usize, 1), fake_client.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+}
+
+test "a refusal with an explanation and no category names the explanation only" {
+    // Both fields of `stop_details` are nullable even on a real refusal, so
+    // this shape is one a real provider sends. The sentence must carry what
+    // arrived and must not name a category that did not.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{
+        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{
+            .reason = "refusal",
+            .explanation = "This request was declined.",
+        } }} }},
+    };
+    var fake_tools = FakeToolRunner{ .output = "unused" };
+
+    try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
+
+    const detail = try endDetailOf(allocator, io, store);
+    defer allocator.free(detail);
+    try testing.expectEqualStrings(
+        "the model backend answered the first turn of the session with no text and no tool " ++
+            "call, and said it stopped because of refusal: This request was declined.",
+        detail,
+    );
+}
+
+test "every shape of a stop reason gets its own sentence" {
+    // The five shapes the wire produces, side by side, because what separates
+    // them is what a person reading the log gets. A refusal with a sentence
+    // and a refusal without one must not read the same way, and neither may
+    // name anything the provider did not send. See `emptyReplyDetail`.
+    const allocator = testing.allocator;
+    const opening = "the model backend answered a turn of the session with no text and no tool call";
+
+    const cases = [_]struct { stop: chock_provider.Client.Stop, want: []const u8 }{
+        .{
+            .stop = .{ .reason = "" },
+            .want = opening ++ ", and gave no stop reason",
+        },
+        .{
+            .stop = .{ .reason = "refusal" },
+            .want = opening ++ ", and said it stopped because of refusal",
+        },
+        .{
+            .stop = .{ .reason = "refusal", .category = "cyber_harm" },
+            .want = opening ++ ", and said it stopped because of refusal, in the category cyber_harm",
+        },
+        .{
+            .stop = .{ .reason = "refusal", .explanation = "This request was declined." },
+            .want = opening ++ ", and said it stopped because of refusal: This request was declined.",
+        },
+        .{
+            .stop = .{
+                .reason = "refusal",
+                .category = "cyber_harm",
+                .explanation = "This request was declined.",
+            },
+            .want = opening ++ ", and said it stopped because of refusal, in the category " ++
+                "cyber_harm: This request was declined.",
+        },
+    };
+
+    for (cases) |case| {
+        const detail = try emptyReplyDetail(allocator, case.stop, 3);
+        defer allocator.free(detail);
+        try testing.expectEqualStrings(case.want, detail);
+    }
+
+    // The turn number is the other half of the sentence, and the first turn
+    // still reads as the first turn.
+    const first = try emptyReplyDetail(allocator, .{ .reason = "refusal" }, 0);
+    defer allocator.free(first);
+    try testing.expectEqualStrings(
+        "the model backend answered the first turn of the session with no text and no tool " ++
+            "call, and said it stopped because of refusal",
+        first,
+    );
 }
 
 test "a turn that carries only reasoning is empty, because nothing runs and nobody reads it" {
@@ -4295,7 +4463,7 @@ test "a final turn with text and no tool call still ends the session finished" {
     defer store.close(io);
 
     var fake_client = FakeClient{ .turns = &.{
-        .{ .deltas = &.{ .{ .text = "the build is green" }, .{ .stop_reason = "end_turn" } } },
+        .{ .deltas = &.{ .{ .text = "the build is green" }, .{ .stop_reason = .{ .reason = "end_turn" } } } },
     } };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
@@ -5558,6 +5726,8 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
 
     var saw_request = false;
     var saw_response = false;
+    // The id the request was written at, so the answer can be joined to it.
+    var request_id: u64 = 0;
     var end_detail: []const u8 = "";
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
@@ -5566,6 +5736,7 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
         switch (parsed.value.event) {
             .approval_request => |request| {
                 saw_request = true;
+                request_id = parsed.value.id;
                 try testing.expectEqualStrings(budget_action, request.action);
             },
             .approval_response => |response| {
@@ -5577,6 +5748,12 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
                     event.ApprovalDecision.expired,
                     std.meta.activeTag(response.decision),
                 );
+                // **The answer names the question.** A zero here reads as an
+                // event not yet written, which would leave this answer
+                // attached to nothing and unjoinable by a reader that folds
+                // the log. The request is written first, so its id is known.
+                try testing.expect(request_id != 0);
+                try testing.expectEqual(request_id, response.request_id);
             },
             .session_end => |ended| {
                 // A reason of its own, not `errored`: reaching a cap the user

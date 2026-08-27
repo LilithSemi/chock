@@ -47,6 +47,9 @@
 //!   1 - it ran and the answer was wrong. The reason is on standard error.
 //!   2 - the operation name on the command line is unknown.
 //!   3 - the setup itself failed before anything was proven.
+//!  63 - this machine would not give the sandbox its namespaces, so nothing
+//!       here was measured. **Not a pass and not a failure**: the caller
+//!       skips. See `namespace.nothing_measured_exit_status`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -70,6 +73,19 @@ const ascii_source = "const x = 1\n";
 const unicode_source = "const a = \"\u{1F363}\"; const x = 1\n";
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    return runOperation(init) catch |err| {
+        // **The machine, and not the feature.** A sandbox that cannot be
+        // built at all means nothing this program is about ever ran. Its own
+        // exit status, so the caller skips rather than read it as a wrong
+        // answer. Nothing is printed: `build.zig`'s own `failOnTestStderr`
+        // fails the build on a byte a test binary writes to standard error,
+        // and this program's descriptors are that binary's own.
+        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        return err;
+    };
+}
+
+fn runOperation(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -90,6 +106,17 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 /// text from and which the sandbox also carries, read only, at
 /// `sandbox_project`.
 fn drive(arena: std.mem.Allocator, root: []const u8, work: []const u8, zls: []const u8) !u8 {
+    // **A boundary that was never reached is not a boundary that held.** The
+    // session above this program is built to carry on when a language server
+    // does not start, on purpose, so a machine that will not give a sandbox
+    // reads here as a server that said nothing rather than as a machine that
+    // measured nothing. Asked first, and in a child, which is the only way to
+    // ask without spending this process's own one namespace: see
+    // `namespace.probeAvailability`.
+    if (!sandbox.namespace.probeAvailability().available()) {
+        return sandbox.namespace.nothing_measured_exit_status;
+    }
+
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();

@@ -516,6 +516,14 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
         // that is the same split `lib/chock-core/mcp.zig` records for a server.
         return error.SkipZigTest;
     }
+    // **A boundary that was never reached is not a boundary that held.** This
+    // test needs a real sandbox to put a real host process inside, and a
+    // machine that will not give one measures nothing here. Asked in a child,
+    // which is the only way to ask without spending this process's own one
+    // namespace: see `namespace.probeAvailability`. The CI job named "Sandbox"
+    // runs this suite on a machine that can host one and fails rather than
+    // skips.
+    if (!sandbox.namespace.probeAvailability().available()) return error.SkipZigTest;
 
     const gpa = testing.allocator;
     const io = testing.io;

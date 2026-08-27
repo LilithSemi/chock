@@ -78,7 +78,17 @@ pub const Error = error{
 
 /// Enter the namespaces. The caller must have one thread only, because the kernel
 /// refuses `CLONE_NEWUSER` from a process with more than one thread.
-pub fn enter(options: Options) Error!void {
+///
+/// `diag` is filled with the call the kernel refused and the errno it answered.
+/// **Every error out of this function needs it.** `error.NotPermitted` covers a
+/// machine whose policy turns off a user namespace for an ordinary user and a
+/// machine that has run out of them, and `error.MapFailed` covers five separate
+/// calls, so neither name alone says what a person must change. Measured on
+/// 2026-08-25: a CI runner answered `MapFailed`, and the log could not say
+/// which of the three map files, nor whether the open or the write, nor with
+/// what errno. See `probeAvailability`, which asks this same question in a
+/// child and reports the answer.
+pub fn enter(options: Options, diag: ?*?Diagnostic) Error!void {
     const uid = linux.getuid();
     const gid = linux.getgid();
 
@@ -102,42 +112,347 @@ pub fn enter(options: Options) Error!void {
 
     switch (linux.errno(linux.unshare(flags))) {
         .SUCCESS => {},
-        .PERM, .NOSPC => return error.NotPermitted,
-        .INVAL => return error.MultiThreaded,
-        else => return error.Unexpected,
+        // **Both of these are noted, not only the last case.** `EPERM` is a
+        // policy that refuses an unprivileged user namespace, and `ENOSPC` is
+        // a machine that permits one and has no room for another, because
+        // `max_user_namespaces` or the nesting depth is reached. The two need
+        // different answers from a person and share one error name.
+        .PERM, .NOSPC => |err| {
+            note(diag, .userns_unshare, err);
+            return error.NotPermitted;
+        },
+        .INVAL => {
+            note(diag, .userns_unshare, .INVAL);
+            return error.MultiThreaded;
+        },
+        else => |err| {
+            note(diag, .userns_unshare, err);
+            return error.Unexpected;
+        },
     }
 
-    try writeIdMaps(uid, gid);
+    try writeIdMaps(uid, gid, diag);
 }
 
 /// Map the user to itself inside the new user namespace. Without a map, the process has
 /// the overflow user and cannot own a file.
-pub fn writeIdMaps(uid: linux.uid_t, gid: linux.gid_t) Error!void {
+pub fn writeIdMaps(uid: linux.uid_t, gid: linux.gid_t, diag: ?*?Diagnostic) Error!void {
     var buffer: [64]u8 = undefined;
 
     // The write to setgroups must happen first. Without it the write to gid_map fails
     // with EPERM, because a user could otherwise drop a group to gain access.
-    try writeFile("/proc/self/setgroups", "deny");
+    try writeFile("/proc/self/setgroups", "deny", .setgroups_open, .setgroups_write, diag);
 
     const uid_line = std.fmt.bufPrint(&buffer, "{d} {d} 1", .{ uid, uid }) catch unreachable;
-    try writeFile("/proc/self/uid_map", uid_line);
+    try writeFile("/proc/self/uid_map", uid_line, .uid_map_open, .uid_map_write, diag);
 
     const gid_line = std.fmt.bufPrint(&buffer, "{d} {d} 1", .{ gid, gid }) catch unreachable;
-    try writeFile("/proc/self/gid_map", gid_line);
+    try writeFile("/proc/self/gid_map", gid_line, .gid_map_open, .gid_map_write, diag);
 }
 
 // Zig 0.16 moved the hosted file API behind std.Io, and this file already calls the
 // kernel by hand everywhere else, so a map line goes through linux.open/write/close
 // directly rather than pull std.Io into a namespace module.
-fn writeFile(path: [*:0]const u8, contents: []const u8) Error!void {
+//
+// `open_call` and `write_call` name the two halves separately, because they fail
+// for different reasons: an open that is refused is a `/proc` this process may
+// not write, and a write that is refused is a mapping the parent user namespace
+// does not hold. `error.MapFailed` alone cannot tell a reader which happened,
+// and this one function serves all three map files.
+fn writeFile(
+    path: [*:0]const u8,
+    contents: []const u8,
+    open_call: Diagnostic.Call,
+    write_call: Diagnostic.Call,
+    diag: ?*?Diagnostic,
+) Error!void {
     const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.MapFailed;
+    if (linux.errno(fd_rc) != .SUCCESS) {
+        note(diag, open_call, linux.errno(fd_rc));
+        return error.MapFailed;
+    }
     const fd: i32 = @intCast(fd_rc);
     defer _ = linux.close(fd);
 
     // One write must carry the whole line. The kernel refuses a partial map line.
     const written = linux.write(fd, contents.ptr, contents.len);
-    if (linux.errno(written) != .SUCCESS or written != contents.len) return error.MapFailed;
+    if (linux.errno(written) != .SUCCESS) {
+        note(diag, write_call, linux.errno(written));
+        return error.MapFailed;
+    }
+    // The kernel takes a map line whole or not at all, so a short write is a
+    // fault of its own with no errno behind it. `EIO` stands for it, the same
+    // way `makeNoticeFile` names a write of zero bytes, so the record carries
+    // a reason rather than the zero that means "nothing was carried this far".
+    if (written != contents.len) {
+        note(diag, write_call, .IO);
+        return error.MapFailed;
+    }
+}
+
+/// Whether this machine lets an ordinary user build the namespaces `enter`
+/// takes, and, when it does not, which call the kernel refused and with what
+/// errno.
+///
+/// **`unknown` is not a pass and must never be read as one.** It says the
+/// question was asked and no answer came back, which is a different fact from
+/// both `ok` and `unavailable`. A caller that folds it into either one reports
+/// a measurement it does not have. The same rule the whole project follows: a
+/// check that was not made is never a pass.
+pub const Availability = union(enum) {
+    /// A child really entered the namespaces. Every layer above them can be
+    /// built on this machine.
+    ok,
+    /// The kernel refused, and this is the call and the errno it refused with.
+    unavailable: Diagnostic,
+    /// The probe itself could not run to an answer.
+    unknown: Unknown,
+
+    /// Why no answer came back. Never a reason the kernel gave; every one of
+    /// these is the probe's own machinery.
+    pub const Unknown = enum {
+        /// The pipe the child answers on could not be made.
+        pipe_failed,
+        /// The child could not be started.
+        fork_failed,
+        /// The child ended by a signal, or could not be reaped.
+        child_died,
+        /// The child ended, and what it left on the pipe does not read as an
+        /// answer. Refused rather than guessed at, the same way
+        /// `readSetupReport` in the driver refuses a short record.
+        unreadable_answer,
+
+        /// What happened, as a phrase that reads after "the probe ".
+        pub fn text(self: Unknown) []const u8 {
+            return switch (self) {
+                .pipe_failed => "could not make the pipe its answer comes back on",
+                .fork_failed => "could not start the child that asks the kernel",
+                .child_died => "lost the child that asks the kernel",
+                .unreadable_answer => "got an answer it cannot read",
+            };
+        }
+    };
+
+    /// True only when a child really entered the namespaces.
+    pub fn available(self: Availability) bool {
+        return self == .ok;
+    }
+
+    pub fn format(self: Availability, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .ok => try writer.writeAll("this machine can enter the sandbox namespaces"),
+            .unavailable => |d| try writer.print("this machine cannot enter the sandbox namespaces: {f}", .{d}),
+            .unknown => |u| try writer.print("the namespaces were not measured: the probe {s}", .{u.text()}),
+        }
+    }
+};
+
+/// The exit status a helper program uses to say "this machine would not give
+/// me a sandbox, so nothing here was measured".
+///
+/// **It is not a pass and not a failure.** Every helper program in this
+/// project's own suite already reports what it measured through its exit
+/// status, and each one has a scheme of its own; this number is the one value
+/// they all share, so a suite can tell "the boundary held" from "the boundary
+/// was never reached" without reading text. The caller that reads it must skip
+/// and say why, and must never count it as a boundary that held.
+///
+/// 63 is far outside every scheme in use, so a number a helper already answers
+/// cannot be mistaken for this one.
+pub const nothing_measured_exit_status: u8 = 63;
+
+/// The answer the probe's child sends back. Fixed size, and always written by
+/// one `write` call far below `PIPE_BUF`, so the kernel carries it whole. The
+/// same shape, and for the same reason, as `SetupFailureRecord` in the driver.
+const ProbeRecord = extern struct {
+    call: u8,
+    errno: i32,
+};
+
+/// Ask the kernel whether the namespaces can be entered on this machine.
+///
+/// **A child, because entering a user namespace cannot be undone.** A process
+/// gets one `enter`, and every layer the caller is about to build sits on it,
+/// so asking in this process would spend the very thing the caller needs.
+/// `../darwin/seatbelt.zig`'s own `nestingWorks` forks for the same class of
+/// reason, and reads its answer off an exit status because one bit is all it
+/// needs. Two facts identify a fault here, the call and the errno, so the
+/// child sends a record back on a pipe and the exit status only says whether
+/// there is one to read.
+///
+/// **The child asks exactly what `spawn` asks**, with the default options,
+/// which is the user, pid, ipc, mount and network namespaces together. A
+/// smaller question could answer `ok` for a machine that then refuses the
+/// sandbox.
+///
+/// A second thread in the caller costs nothing here: `fork` gives the child one
+/// thread, whatever the parent had, so this is answerable from a process that
+/// could not call `enter` itself.
+pub fn probeAvailability() Availability {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+        return .{ .unknown = .pipe_failed };
+    }
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return .{ .unknown = .fork_failed };
+    }
+
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        var diag: ?Diagnostic = null;
+        if (enter(.{}, &diag)) |_| {
+            // Nothing on the pipe, and a zero status. The two together are
+            // what the parent reads as `ok`.
+            std.process.exit(0);
+        } else |_| {
+            if (diag) |d| {
+                const record = ProbeRecord{
+                    .call = @intFromEnum(d.call),
+                    .errno = @intFromEnum(d.errno),
+                };
+                const bytes = std.mem.asBytes(&record);
+                _ = linux.write(fds[1], bytes.ptr, bytes.len);
+            }
+            std.process.exit(1);
+        }
+    }
+
+    _ = linux.close(fds[1]);
+    var buffer: [@sizeOf(ProbeRecord)]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const rc = linux.read(fds[0], buffer[filled..].ptr, buffer.len - filled);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        filled += rc;
+    }
+    _ = linux.close(fds[0]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status)) {
+        return .{ .unknown = .child_died };
+    }
+
+    return readAnswer(linux.W.EXITSTATUS(status), buffer[0..filled]);
+}
+
+/// Turn what the child left behind into the answer.
+///
+/// A function of its own, with no syscall in it, so the branch a healthy
+/// machine never takes can still be driven by a test. `exit_code` is null when
+/// the child did not exit normally.
+///
+/// **Only one shape reads as `ok`**: nothing on the pipe and a zero status. A
+/// record with a zero status, or a status with no record, is two halves that
+/// disagree, and a disagreement is reported rather than resolved.
+fn readAnswer(exit_code: ?u32, bytes: []const u8) Availability {
+    const code = exit_code orelse return .{ .unknown = .child_died };
+    if (code == 0 and bytes.len == 0) return .ok;
+    if (code == 0 or bytes.len != @sizeOf(ProbeRecord)) {
+        return .{ .unknown = .unreadable_answer };
+    }
+
+    const record = std.mem.bytesToValue(ProbeRecord, bytes[0..@sizeOf(ProbeRecord)]);
+    // Read with `fromInt` and never with `@enumFromInt`: these bytes came over
+    // a pipe, and a number that names no call is dropped rather than turned
+    // into an invalid tag.
+    const call = std.enums.fromInt(Diagnostic.Call, record.call) orelse
+        return .{ .unknown = .unreadable_answer };
+    const errno = std.enums.fromInt(linux.E, record.errno) orelse
+        return .{ .unknown = .unreadable_answer };
+    return .{ .unavailable = .{ .call = call, .errno = errno } };
+}
+
+test "the probe reads the child's answer, and never reads silence as a pass" {
+    // **Every branch here is one a healthy machine never takes.** On a machine
+    // where the namespaces work, `probeAvailability` answers `ok` and proves
+    // nothing about the four answers below, which are exactly the ones that
+    // decide whether a suite skips. A skip that has only ever been seen not
+    // firing is not proved, so the decision is a function with no syscall in
+    // it and it is driven directly.
+    const record = ProbeRecord{
+        .call = @intFromEnum(Diagnostic.Call.uid_map_write),
+        .errno = @intFromEnum(linux.E.PERM),
+    };
+    const record_bytes = std.mem.asBytes(&record);
+
+    // The one shape that is a pass: the child exited zero and said nothing.
+    try std.testing.expect(readAnswer(0, &.{}).available());
+
+    // The CI failure of 2026-08-25, as this now reports it.
+    const refused = readAnswer(1, record_bytes);
+    try std.testing.expect(!refused.available());
+    try std.testing.expectEqual(Diagnostic.Call.uid_map_write, refused.unavailable.call);
+    try std.testing.expectEqual(linux.E.PERM, refused.unavailable.errno);
+
+    var line_buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "this machine cannot enter the sandbox namespaces: the write to /proc/self/uid_map failed: PERM",
+        try std.fmt.bufPrint(&line_buffer, "{f}", .{refused}),
+    );
+
+    // A child that was killed measured nothing. **Not a pass**, and not a
+    // refusal either: neither fact is in evidence.
+    const died = readAnswer(null, &.{});
+    try std.testing.expect(!died.available());
+    try std.testing.expectEqual(Availability.Unknown.child_died, died.unknown);
+
+    // The two halves that disagree. A status with no record, and a record with
+    // a status that says the child succeeded.
+    try std.testing.expectEqual(
+        Availability.Unknown.unreadable_answer,
+        readAnswer(1, &.{}).unknown,
+    );
+    try std.testing.expectEqual(
+        Availability.Unknown.unreadable_answer,
+        readAnswer(0, record_bytes).unknown,
+    );
+
+    // A truncated record, and a number that names no call. Both are dropped
+    // rather than read as some other fault.
+    try std.testing.expectEqual(
+        Availability.Unknown.unreadable_answer,
+        readAnswer(1, record_bytes[0 .. record_bytes.len - 1]).unknown,
+    );
+    const nonsense = ProbeRecord{ .call = 250, .errno = @intFromEnum(linux.E.PERM) };
+    try std.testing.expectEqual(
+        Availability.Unknown.unreadable_answer,
+        readAnswer(1, std.mem.asBytes(&nonsense)).unknown,
+    );
+}
+
+test "the probe answers for this machine, and asks in a child that is spent by asking" {
+    // The positive branch, and the one property that makes the probe usable at
+    // all: it can be called twice. A probe that entered the namespaces in this
+    // process would answer once and leave the caller with nothing to build on.
+    const first = probeAvailability();
+    const second = probeAvailability();
+    try std.testing.expectEqual(std.meta.activeTag(first), std.meta.activeTag(second));
+
+    // This process can still enter a namespace of its own afterwards, which is
+    // what "the child is spent, not this process" means. Asked in a child,
+    // because a test binary has more than one thread and `enter` refuses that.
+    if (!first.available()) return error.SkipZigTest;
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        var diag: ?Diagnostic = null;
+        enter(.{}, &diag) catch std.process.exit(1);
+        std.process.exit(0);
+    }
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u32, 0), linux.W.EXITSTATUS(status));
 }
 
 test "an id map line maps one id to itself" {
@@ -471,6 +786,13 @@ pub const Diagnostic = struct {
     /// what was being done, not for the system call alone, because `open` says
     /// much less than "open on a mount target".
     pub const Call = enum {
+        userns_unshare,
+        setgroups_open,
+        setgroups_write,
+        uid_map_open,
+        uid_map_write,
+        gid_map_open,
+        gid_map_write,
         proc_mask_file,
         proc_entry_stat,
         deny_notice_file,
@@ -491,6 +813,13 @@ pub const Diagnostic = struct {
         /// What was being done, as a phrase that reads after "chock: ".
         pub fn text(self: Call) []const u8 {
             return switch (self) {
+                .userns_unshare => "the unshare that makes the namespaces",
+                .setgroups_open => "open on /proc/self/setgroups",
+                .setgroups_write => "the write to /proc/self/setgroups",
+                .uid_map_open => "open on /proc/self/uid_map",
+                .uid_map_write => "the write to /proc/self/uid_map",
+                .gid_map_open => "open on /proc/self/gid_map",
+                .gid_map_write => "the write to /proc/self/gid_map",
                 .proc_mask_file => "open on the proc mask file",
                 .proc_entry_stat => "statx on a proc entry",
                 .deny_notice_file => "open on the deny notice file",
