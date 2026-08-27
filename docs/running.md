@@ -152,11 +152,18 @@ chock workspace clear
 | 8 | handed over to another process, so the work is not over |
 | 9 | a required audit sink still held none of the tail of the log |
 | 10 | the model backend answered a turn with nothing, so there is no answer |
+| 11 | the model backend refused the request, and said why |
 
 A session that changed files and never committed them exits `2`, and says so:
 only a commit is carried back. **A refusal is not a crash and must not look
 like one**, which is why `3` is a code of its own: a script that treated it as
 a fault would retry something a person already said no to.
+
+`11` is the model backend saying no, which is not `3` and not `2`: `3` is a
+person, or an approval nobody answered, refusing one act, and nothing broke.
+Asking again gets the same answer, so Chock stops and never retries, changes
+model, or resets the context on its own. The session log holds the provider's
+own category and explanation, when it sent them.
 
 ## What a session cost
 

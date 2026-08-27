@@ -1249,7 +1249,7 @@ test "a refused Anthropic reply carries the category and the explanation through
             .{ .bytes = fake_provider.httpChunk(
                 "event: message_delta\ndata: {\"type\":\"message_delta\"," ++
                     "\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":" ++
-                    "{\"type\":\"refusal\",\"category\":\"cyber_harm\",\"explanation\":" ++
+                    "{\"type\":\"refusal\",\"category\":\"cyber\",\"explanation\":" ++
                     "\"This request was declined because it could enable cyber harm.\"}}," ++
                     "\"usage\":{\"output_tokens\":0}}\n\n",
             ) },
@@ -1274,7 +1274,7 @@ test "a refused Anthropic reply carries the category and the explanation through
     defer freeUsage(allocator, reply.usage);
     const stopped = reply.stop();
     try std.testing.expectEqualStrings("refusal", stopped.reason);
-    try std.testing.expectEqualStrings("cyber_harm", stopped.category);
+    try std.testing.expectEqualStrings("cyber", stopped.category);
     try std.testing.expectEqualStrings(
         "This request was declined because it could enable cyber harm.",
         stopped.explanation,

@@ -39,6 +39,30 @@
 //! Each of those is learned by trying, and none of them is guessed from a
 //! platform name.
 //!
+//! ## The third state: a daemon that is there and answers nothing
+//!
+//! A machine has three answers and not two. There is no daemon, there is a
+//! daemon that speaks, and **there is a daemon that accepts the connection and
+//! closes it before it answers a byte**. The last one is what a CI runner and
+//! many locked down machines really are, and it was measured on GitHub's
+//! `ubuntu-latest` and `ubuntu-24.04-arm` images alike.
+//!
+//! The driver has one and only one name for it: `error.NotAuthorized` with
+//! `Failure.not_authorized`, set at the single place in
+//! `lib/chock-pcsc/linux/driver.zig` that reads a closed connection as
+//! something specific. `refusedBeforeAnswering` below reads exactly that pair
+//! and nothing else, so a transport fault stays `NoService`, a refused version
+//! stays `ProtocolMismatch`, and a framing fault still fails the way it
+//! always did. **A skip here says the daemon was never reached, which is not a
+//! pass and must never be counted as one.**
+//!
+//! Two things put a machine in that state and this file does not separate
+//! them: a `pcscd` whose polkit check refuses the client, and a
+//! `systemd-socket-activate` whose child never came up. Both leave the client
+//! waiting on a read of a connection nobody will write to, both are the
+//! machine and not this build, and neither can be told from the other from
+//! this side of the socket.
+//!
 //! **No test here needs a card or a reader.** The daemon is asked what is
 //! attached and whatever it says is fine: what is pinned is that the answer
 //! parses and that the connection is still framed correctly afterwards.
@@ -194,13 +218,57 @@ const Bench = struct {
     }
 };
 
+/// Whether the daemon closed the connection before it answered anything.
+///
+/// **One error and one failure, together, and nothing wider.** See this file's
+/// top comment for the state this names. The pair is what makes it narrow: the
+/// driver sets `Failure.not_authorized` at one place only, the read of the
+/// version reply, so a fault anywhere else keeps its own name and still fails
+/// the test that found it.
+fn refusedBeforeAnswering(err: anyerror, driver: *const chock_pcsc.Driver) bool {
+    if (err != error.NotAuthorized) return false;
+    const failure = driver.failure orelse return false;
+    return failure == .not_authorized;
+}
+
+/// Establish, or say this machine never let the daemon answer.
+///
+/// **Nothing is written anywhere on the skip path.** `build.zig` fails the
+/// build on a byte a test binary puts on standard error, so a sentence here
+/// would turn a machine that cannot run this test into a machine that cannot
+/// build. `error.SkipZigTest` is what the test runner already counts, so the
+/// probe and exit status pattern of
+/// `lib/chock-sandbox/linux/namespace.zig`'s `nothing_measured_exit_status`
+/// is not needed: that number exists for helper *programs*, which answer
+/// through an exit status and have no other way to say "not measured".
+fn establishOrSkip(driver: *chock_pcsc.Driver) !void {
+    driver.establish() catch |err| {
+        if (refusedBeforeAnswering(err, driver)) return error.SkipZigTest;
+        return err;
+    };
+}
+
+/// Offer a version the daemon must refuse, and pin that it refused.
+///
+/// The same skip as `establishOrSkip`, because a daemon that answers nothing
+/// refuses nothing either. **A daemon that accepted the offer fails**, which
+/// is the fault these two tests exist to catch.
+fn expectVersionRefusedOrSkip(driver: *chock_pcsc.Driver) !void {
+    driver.establish() catch |err| {
+        if (refusedBeforeAnswering(err, driver)) return error.SkipZigTest;
+        if (err == error.ProtocolMismatch) return;
+        return err;
+    };
+    return error.DaemonAcceptedAVersionItDoesNotSpeak;
+}
+
 test "the transport reaches a real pcscd, agrees a version and lists what is attached" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var bench = try Bench.init();
     defer bench.deinit();
 
-    try bench.driver.establish();
+    try establishOrSkip(&bench.driver);
 
     // The daemon's own numbers, read off the wire. `pcsc-lite` 2.4.1 is 4:5,
     // and a build that offered anything else would have been refused above.
@@ -263,7 +331,7 @@ test "a version the daemon refuses comes back naming both versions, not just mis
     // `SCARD_E_SERVICE_STOPPED` and its own numbers. This is the refusal path
     // inside `pcscd` and not one this build invented.
     bench.driver.offered = .{ .major = 4, .minor = 0 };
-    try testing.expectError(error.ProtocolMismatch, bench.driver.establish());
+    try expectVersionRefusedOrSkip(&bench.driver);
     try testing.expect(bench.driver.failure.? == .version_mismatch);
 
     var said: [256]u8 = undefined;
@@ -288,7 +356,7 @@ test "a daemon that answers success to a version it does not speak is refused an
     defer bench.deinit();
 
     bench.driver.offered = .{ .major = 9, .minor = 5 };
-    try testing.expectError(error.ProtocolMismatch, bench.driver.establish());
+    try expectVersionRefusedOrSkip(&bench.driver);
     try testing.expectEqual(wire.protocol_version, bench.driver.daemon_version.?);
 
     var said: [256]u8 = undefined;
@@ -297,16 +365,11 @@ test "a daemon that answers success to a version it does not speak is refused an
     try testing.expect(std.mem.indexOf(u8, text, "4:5") != null);
 }
 
-test "a daemon that is not there and a daemon with no reader are different answers" {
+test "a daemon that is not there, one that answers nothing, and one with no reader are three answers" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
     var bench = try Bench.init();
     defer bench.deinit();
-
-    // The daemon that is there. It answers a reader list, whatever is in it.
-    try bench.driver.establish();
-    var names: [4096]u8 = undefined;
-    _ = try bench.driver.pcsc().listReaders(&names);
 
     // A path in the same directory with nothing at it. **Not a guessed path**:
     // it is beside a socket this test made, so the only difference between the
@@ -321,7 +384,28 @@ test "a daemon that is not there and a daemon with no reader are different answe
     try testing.expectError(error.NoService, absent.establish());
     try testing.expect(absent.failure.? == .no_socket);
 
-    // The point of the pair: a machine with no daemon and a machine with a
+    // **This test knows the third state, and it measures the half of its own
+    // claim that state still allows.** A daemon that closes before it answers
+    // is neither of the two this test is named for, and the reason it belongs
+    // here rather than behind a plain skip is that separating the answers *is*
+    // the subject: a machine sent to start a service it is already running has
+    // been told the wrong thing.
+    bench.driver.establish() catch |err| {
+        if (!refusedBeforeAnswering(err, &bench.driver)) return err;
+        // The third state and the absent one do not read the same, and the
+        // second half of the pair was never reached. So this reports what it
+        // measured and then says the rest was not measured. See this file's
+        // top comment.
+        try testing.expect(bench.driver.failure.? != .no_socket);
+        try testing.expect(absent.failure.? != .not_authorized);
+        return error.SkipZigTest;
+    };
+
+    // The daemon that is there. It answers a reader list, whatever is in it.
+    var names: [4096]u8 = undefined;
+    _ = try bench.driver.pcsc().listReaders(&names);
+
+    // The point of the set: a machine with no daemon and a machine with a
     // daemon and no reader must never read the same way. One is a service to
     // start and the other is a reader to plug in.
     try testing.expect(bench.driver.failure == null);
