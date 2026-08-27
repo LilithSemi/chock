@@ -21,9 +21,56 @@ jobs:
     with:
       fail-fast: false
 
-  Release:
+  test-sandbox:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Permit the nested user namespace
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "before:"
+          cat /proc/sys/user/max_user_namespaces || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null \
+            || echo "no apparmor restriction on this runner"
+
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+          if ! unshare -Ur true; then
+            echo "::error::this runner refuses a user namespace, so the sandbox" \
+                 "tests cannot run here. NOT skipping: a check that was not" \
+                 "made is never a pass." >&2
+            exit 1
+          fi
+          echo "a user namespace can be made on this runner"
+
+      - name: Prove a Seatbelt profile can be entered
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          if ! /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true; then
+            echo "::error::this runner refuses a Seatbelt profile, so the" \
+                 "sandbox tests cannot run here. NOT skipping: a check that" \
+                 "was not made is never a pass." >&2
+            exit 1
+          fi
+          echo "a Seatbelt profile can be entered on this runner"
+
+      - name: Test the sandbox for real
+        run: nix develop --command zig build test --summary all
+
+  release:
     if: github.event_name != 'pull_request'
-    needs: DeterminateCI
+    needs: [DeterminateCI, test-sandbox]
     runs-on: ubuntu-latest
     permissions:
       contents: write
