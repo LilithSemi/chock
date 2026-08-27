@@ -534,8 +534,15 @@ fn runOne(
     };
 
     const outcome = live.call(request.index, request.arguments) catch |err| return .{
-        .text = std.fmt.allocPrint(arena, "the plugin could not run that tool: {t}", .{err}) catch
-            "the plugin could not run that tool",
+        // **The refusal's own sentence where there is one.**
+        // `error.EngineRefused` is answered from seven places in
+        // `plugin_engine.Runner`, and the name alone names none of them.
+        .text = if (live.refusal) |detail|
+            std.fmt.allocPrint(arena, "the plugin could not run that tool: {f}", .{detail}) catch
+                "the plugin could not run that tool"
+        else
+            std.fmt.allocPrint(arena, "the plugin could not run that tool: {t}", .{err}) catch
+                "the plugin could not run that tool",
         .is_error = true,
     };
     // **Copied out of the guest's memory before it is written.** The text

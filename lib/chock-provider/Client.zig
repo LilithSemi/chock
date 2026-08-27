@@ -115,11 +115,25 @@ pub const Stop = struct {
     /// The provider's own word, for example "end_turn", "tool_use",
     /// "max_tokens", or "refusal".
     reason: []const u8,
-    /// A short token naming the class of a refusal, for example `cyber_harm`.
+    /// A short token naming the class of a refusal, for example `cyber`.
     category: []const u8 = "",
     /// The provider's own sentence about a refusal, for example "This request
     /// was declined because it could enable cyber harm."
     explanation: []const u8 = "",
+
+    /// Whether the provider declined the request rather than stopping for any
+    /// other reason.
+    ///
+    /// **One token, matched exactly, and no second name for it.** `refusal` is
+    /// what the Anthropic wire sends. The OpenAI compatible wire has
+    /// `content_filter`, which reads like the same fact and is not measured to
+    /// be one: it arrives from a different mechanism, with no `stop_details`
+    /// beside it, and reading it as a refusal would end sessions on a guess.
+    /// A caller that learns the two are the same adds it here, once, with what
+    /// it measured.
+    pub fn isRefusal(self: Stop) bool {
+        return std.mem.eql(u8, self.reason, "refusal");
+    }
 };
 
 /// One piece of a model's reply as it streams off the wire. Every field of

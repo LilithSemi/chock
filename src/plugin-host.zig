@@ -220,6 +220,14 @@ fn load(
         &refused,
     ) catch |err| {
         if (refused) |detail| return try std.fmt.allocPrint(arena, "{f}", .{detail});
+        // **The engine's own answer and not the one word this host wraps it
+        // in.** `EngineRefused` is answered from seven places, so the error
+        // name alone leaves a reader with seven candidates and no way to
+        // choose. See
+        // `plugin_engine.Diagnostic`.
+        if (runner.refusal) |detail| {
+            return try std.fmt.allocPrint(arena, "the plugin would not start: {f}", .{detail});
+        }
         return try std.fmt.allocPrint(arena, "the plugin would not start: {t}", .{err});
     };
     return null;

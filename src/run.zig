@@ -8862,12 +8862,21 @@ const Printer = struct {
             // because nothing compacted at all then. Now that something does,
             // it says so, and it says the log kept everything.
             .compaction => |folded| {
-                self.open(.dim);
-                defer self.close(.dim);
+                // **A fold the model had no part in is not the ordinary case**,
+                // so it does not read as one. The reason decides the rank here
+                // the same way it does for a session that ended. See
+                // `chock_proto.event.Compaction.stand_in_reason`.
+                const rank: tty.Rank = if (folded.stand_in_reason.len != 0) .warn else .dim;
+                self.open(rank);
+                defer self.close(rank);
                 self.write("\nchock: the context was folded into a summary");
                 if (folded.model_alias.len != 0) {
                     self.write(", written by ");
                     self.write(folded.model_alias);
+                }
+                if (folded.stand_in_reason.len != 0) {
+                    self.write(", written by the harness, because ");
+                    self.write(folded.stand_in_reason);
                 }
                 self.write(". Every turn is still in the session log.\n");
             },

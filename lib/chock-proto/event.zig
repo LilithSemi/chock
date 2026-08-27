@@ -375,6 +375,34 @@ pub const SessionEndReason = union(enum) {
     /// and is not reasonable after a fault. `detail` carries the provider's own
     /// stop reason when it sent one, because the provider usually knows why.
     empty_response,
+    /// The provider refused the request: it answered with `stop_reason`
+    /// `refusal`, and said so in the same message. Whatever the model had
+    /// already written is in the log, because the refusal usually lands part
+    /// way through a turn and the words before it were real work.
+    ///
+    /// **Not `errored`.** Nothing faulted. The connection was good, the
+    /// request was accepted, and the status was 200. A refusal is an answer,
+    /// and a script that reads it as a crash retries a request that was
+    /// already answered.
+    ///
+    /// **Not `empty_response`, which is the one it is easiest to confuse with,
+    /// and the advice is the opposite.** An empty response is the provider
+    /// saying nothing, and asking again is reasonable there. Here the provider
+    /// said no, and asking again gets the same no: the platform is explicit
+    /// that a session which carries on without a reset is refused again and
+    /// again. The two look alike on the wire, one turn with no useful content,
+    /// and they must never be acted on alike.
+    ///
+    /// **Not `finished`.** The work did not finish. A session that ends here
+    /// answered nothing, and calling that a success is the false OK this
+    /// project refuses everywhere else.
+    ///
+    /// `detail` carries the provider's own words: the category and the
+    /// explanation from `stop_details` when it sent them, and nothing invented
+    /// when it sent neither. **Chock does not work around this ending**: it
+    /// does not retry, change model, reset the context, or reword what the
+    /// provider said.
+    refused_by_model,
     unknown: []const u8,
 
     pub const wireName = WireString(SessionEndReason).wireName;
@@ -845,8 +873,25 @@ pub const Compaction = struct {
     /// Ranges inside [from_id, through_id] that were kept verbatim, not
     /// folded, so a reader can show the user exactly what was dropped.
     kept_ranges: []const EventRange,
-    /// The model alias that produced the summary.
+    /// The model alias that produced the summary. Empty when the harness wrote
+    /// it, and `stand_in_reason` then says why.
     model_alias: []const u8,
+    /// Why the harness summary stood in for the model's own. Empty when the
+    /// model wrote the summary, which is the ordinary case and the one
+    /// `model_alias` already names.
+    ///
+    /// **A compaction happens either way, so without this the failure left no
+    /// trace at all.** The model call can be refused, answered with an error
+    /// status, cut off partway, or answered with no summary in it. Every one
+    /// of those ends with the same shorter context and the same harness
+    /// written summary, and a person reading the log saw a compaction that
+    /// looked ordinary. The provider's own words go here, including the
+    /// category and the explanation of a refusal.
+    ///
+    /// Empty for every log a build before this field wrote, which is
+    /// indistinguishable from a model written summary in those logs and is why
+    /// `model_alias` is still the field to read for who wrote it.
+    stand_in_reason: []const u8 = "",
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());

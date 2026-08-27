@@ -167,6 +167,20 @@ pub const Exit = enum(u8) {
     /// `no_progress` either: the agent did not give up on a task, it never said
     /// anything about one.
     empty_response = 10,
+    /// The model backend refused the request. It answered with `stop_reason`
+    /// `refusal` and said why in the same message, which the session log
+    /// carries. **Nothing broke and nobody was asked**, so this is neither
+    /// `faulted` nor `refused`: `refused` is a person, or an approval nobody
+    /// answered, saying no to one act, and this is the provider saying no to
+    /// the request itself.
+    ///
+    /// Not `empty_response`, which is the code it is nearest to and the one
+    /// with the opposite advice: a turn that carried nothing is worth asking
+    /// again, and a refusal asked again is refused again. A script that reads
+    /// this code must change the request or stop, and Chock itself does
+    /// neither on its own. See
+    /// `chock_proto.event.SessionEndReason.refused_by_model`.
+    model_refused = 11,
 
     pub fn code(self: Exit) u8 {
         return @intFromEnum(self);
@@ -200,6 +214,10 @@ pub fn exitFor(reason: chock_proto.event.SessionEndReason) Exit {
         // member: a turn that carried nothing ended the session `finished` and
         // exited 0. See `Exit.empty_response`.
         .empty_response => .empty_response,
+        // **Never `refused`, which is a person saying no, and never
+        // `errored`, because a refusal is an answer and not a fault.** See
+        // `Exit.model_refused`.
+        .refused_by_model => .model_refused,
         // A reason a newer Chock wrote and this one does not know. Never
         // `finished`: an absent answer is never a permissive answer, which is
         // the same rule a policy keeps.
@@ -721,11 +739,30 @@ test "each session end reason gets its own exit code, and none of them is zero e
         // A turn the provider answered with nothing. A script that read zero
         // here would report an answer nobody was given.
         .empty_response,
+        // A turn the provider refused. A script that read zero here would
+        // report work that was never done, on a request that was declined.
+        .refused_by_model,
         .{ .unknown = "some-newer-reason" },
     };
     for (not_finished) |reason| {
         try testing.expect(exitFor(reason).code() != 0);
     }
+}
+
+test "a model backend refusal is neither a fault nor a person saying no" {
+    // Three facts a script acts on differently: the provider declined the
+    // request, something broke, and a person refused one act. Before this,
+    // a refusal ended the session `finished` and exited 0. See
+    // `chock_proto.event.SessionEndReason.refused_by_model`.
+    const declined = exitFor(.refused_by_model);
+    try testing.expectEqual(Exit.model_refused, declined);
+    try testing.expect(declined != Exit.faulted);
+    try testing.expect(declined != Exit.refused);
+    try testing.expect(declined != Exit.finished);
+    // Nearest neighbour, opposite advice: asking again is reasonable after an
+    // empty turn and gets the same answer after a refusal.
+    try testing.expect(declined != Exit.empty_response);
+    try testing.expect(declined.code() != 0);
 }
 
 test "the agent giving up, running out of money, and crashing are three different exit codes" {
@@ -763,6 +800,7 @@ test "every session end reason has an exit code, so a new one cannot be forgotte
         .turn_limit,
         .handed_over,
         .empty_response,
+        .refused_by_model,
         .{ .unknown = "" },
     };
     try testing.expectEqual(
@@ -785,7 +823,7 @@ test "no two exit codes are the same, so a script can tell every outcome apart" 
         codes[count] = value.code();
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 11), count);
+    try testing.expectEqual(@as(usize, 12), count);
 }
 
 test {

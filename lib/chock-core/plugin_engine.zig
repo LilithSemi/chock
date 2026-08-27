@@ -242,6 +242,59 @@ pub const Engine = struct {
 /// `lib/chock-plugin-core/call.zig`, which both sides read it from.
 pub const arguments_symbol = core.call.arguments_symbol;
 
+/// Why a plugin would not run, for the sentence a person reads.
+///
+/// **`error.EngineRefused` is answered from seven different places**, and the
+/// name alone tells a reader none of them. A machine that runs a plugin and a
+/// machine that does not can then produce the same one word, which is what
+/// made an x86_64 failure of this project's own suite unreadable until the
+/// engine was measured by hand. So every refusal names the call it came out
+/// of, and carries the error the engine gave where there was one.
+///
+/// **The same shape as `namespace.Diagnostic` in
+/// `lib/chock-sandbox/linux/namespace.zig`**, and for the same reason: a
+/// `Call` that says what was being done, the underlying answer beside it, and
+/// a `format` that turns the pair into a sentence at the caller. This one owns
+/// no memory either.
+pub const Diagnostic = struct {
+    call: Call,
+    /// What the engine answered. **Null where this host refused before it
+    /// called the engine at all**, which is a different fact from an engine
+    /// that was asked and said no.
+    cause: ?anyerror = null,
+
+    /// The places a plugin can be refused. Named for what was being done and
+    /// not for the engine method, because `call3` says much less than "the
+    /// call to `chock_plugin_call`".
+    pub const Call = enum {
+        instantiate,
+        init_call,
+        before_instantiation,
+        tool_index,
+        arguments_call,
+        tool_call,
+        empty_answer,
+
+        /// What happened, as a sentence that reads after "chock: ".
+        pub fn text(self: Call) []const u8 {
+            return switch (self) {
+                .instantiate => "the engine would not instantiate the module",
+                .init_call => "the call to chock_plugin_init did not come back",
+                .before_instantiation => "a tool was called before the module was instantiated",
+                .tool_index => "a tool was called by an index the module never bound",
+                .arguments_call => "the call to chock_plugin_arguments did not come back",
+                .tool_call => "the call to chock_plugin_call did not come back",
+                .empty_answer => "chock_plugin_call answered that it has nothing to say",
+            };
+        }
+    };
+
+    pub fn format(self: Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll(self.call.text());
+        if (self.cause) |err| try writer.print(": {t}", .{err});
+    }
+};
+
 /// One plugin, instantiated, ready to be called.
 ///
 /// **Owned by the plugin host process.** One `Runner` is one module, and the
@@ -254,6 +307,14 @@ pub const Runner = struct {
     bound: u32 = 0,
     /// Whether the guest has been instantiated and initialised.
     ready: bool = false,
+    /// Why the last `error.EngineRefused` was answered.
+    ///
+    /// **The latest and not the first**, which is the opposite of
+    /// `namespace.note` and right here for a different reason: a `Runner`
+    /// serves one `load` and then any number of `call`s, and each one of those
+    /// is a whole operation of its own. A caller reads this straight after the
+    /// call that refused.
+    refusal: ?Diagnostic = null,
 
     /// Let the module through the gate, instantiate it, and bind its tools.
     ///
@@ -276,6 +337,12 @@ pub const Runner = struct {
         capabilities: []const []const u8,
         refused: ?*?Refused,
     ) Error!void {
+        // **Cleared first, so nothing here can be read as the reason for
+        // something else.** A `refusal` left over from an earlier operation
+        // would be a sentence about the wrong fault, which is worse than no
+        // sentence at all.
+        self.refusal = null;
+
         // **The gate, before the engine is told to build anything.** Nothing
         // of the guest has run at this point and nothing of it will if this
         // answers no.
@@ -289,10 +356,11 @@ pub const Runner = struct {
         // gate's order and the engine's own import order have to be
         // reconciled**, because the two lists are read by two different
         // walkers.
-        self.engine.instantiate(module, addresses[0..wanted.len]) catch
-            return error.EngineRefused;
+        self.engine.instantiate(module, addresses[0..wanted.len]) catch |err|
+            return self.refuse(.instantiate, err);
 
-        const bound = self.engine.call0(core.init_symbol) catch return error.EngineRefused;
+        const bound = self.engine.call0(core.init_symbol) catch |err|
+            return self.refuse(.init_call, err);
         if (bound != declared_tools) return error.ToolCountDisagrees;
 
         self.bound = bound;
@@ -304,7 +372,12 @@ pub const Runner = struct {
     ///
     /// `index` is the tool's position in the metadata's own tool list.
     pub fn call(self: *Runner, index: u32, arguments: []const u8) Error!plugin.Outcome {
-        if (!self.ready or index >= self.bound) return error.EngineRefused;
+        // See `load`: a `refusal` from an earlier call must never be read as
+        // the reason for this one.
+        self.refusal = null;
+
+        if (!self.ready) return self.refuse(.before_instantiation, null);
+        if (index >= self.bound) return self.refuse(.tool_index, null);
 
         const written = try self.writeArguments(arguments);
 
@@ -313,8 +386,8 @@ pub const Runner = struct {
             index,
             written.address,
             written.length,
-        ) catch return error.EngineRefused;
-        if (address == core.call.no_answer) return error.EngineRefused;
+        ) catch |err| return self.refuse(.tool_call, err);
+        if (address == core.call.no_answer) return self.refuse(.empty_answer, null);
 
         // **Every field of this is a number the guest chose**, and the engine
         // checked none of them. See `core.call.readAnswer`.
@@ -326,6 +399,17 @@ pub const Runner = struct {
             .text = core.call.textOf(memory, answer),
             .is_error = answer.outcome == .failure,
         };
+    }
+
+    /// Record why this refusal happened, and answer the one error every
+    /// refusal answers.
+    ///
+    /// **Every `error.EngineRefused` in this file comes out of here.** A
+    /// second way to answer it would be a seventh site with no diagnostic, and
+    /// that is the fault this type exists to remove.
+    fn refuse(self: *Runner, call_site: Diagnostic.Call, cause: ?anyerror) Error {
+        self.refusal = .{ .call = call_site, .cause = cause };
+        return error.EngineRefused;
     }
 
     /// Where the argument text went in the guest's memory, and how much of it.
@@ -342,8 +426,8 @@ pub const Runner = struct {
 
         // The guest owns the bound on its own buffer and answers zero when the
         // text does not fit, so this host never has to know how big it is.
-        const address = self.engine.call3(arguments_symbol, length, 0, 0) catch
-            return error.EngineRefused;
+        const address = self.engine.call3(arguments_symbol, length, 0, 0) catch |err|
+            return self.refuse(.arguments_call, err);
         if (address == 0) return error.ArgumentsTooLong;
 
         // **And the address the guest answered is checked anyway.** A guest
@@ -414,6 +498,10 @@ const FakeEngine = struct {
     arguments_at: u32 = 0,
     /// Whether `instantiate` refuses.
     refuses: bool = false,
+    /// The symbol whose call refuses, if any. **A name and not a flag**,
+    /// because the three guest symbols are three separate refusal sites and a
+    /// test has to be able to reach exactly one of them.
+    refusing_symbol: ?[]const u8 = null,
     /// How many addresses `instantiate` was handed, so a test can pin that the
     /// gate's answer really reaches the engine.
     supplied: usize = 0,
@@ -425,6 +513,12 @@ const FakeEngine = struct {
 
     fn engine(self: *FakeEngine) Engine {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Whether this call is the one the test asked to refuse.
+    fn refusesSymbol(self: *const FakeEngine, name: []const u8) bool {
+        const which = self.refusing_symbol orelse return false;
+        return std.mem.eql(u8, which, name);
     }
 
     const vtable = Engine.VTable{
@@ -447,13 +541,14 @@ const FakeEngine = struct {
     }
     fn call0Fn(ptr: *anyopaque, name: []const u8) anyerror!u32 {
         const self: *FakeEngine = @ptrCast(@alignCast(ptr));
-        _ = name;
+        if (self.refusesSymbol(name)) return error.Refused;
         return self.binds;
     }
     fn call3Fn(ptr: *anyopaque, name: []const u8, a0: u32, a1: u32, a2: u32) anyerror!u32 {
         const self: *FakeEngine = @ptrCast(@alignCast(ptr));
         _ = a1;
         _ = a2;
+        if (self.refusesSymbol(name)) return error.Refused;
         if (std.mem.eql(u8, name, arguments_symbol)) {
             _ = a0;
             return self.arguments_at;
@@ -598,6 +693,126 @@ test "a runner that never loaded refuses every call" {
     );
     try testing.expect(!runner.ready);
     try testing.expectError(error.EngineRefused, runner.call(0, ""));
+}
+
+test "every refusal names the call it came out of" {
+    // **The fault this pins is a log nobody can read.** `EngineRefused` is
+    // one word for seven places, and a CI run on a machine the owner does not
+    // have is exactly where that word costs the most: it says a plugin did
+    // not run and nothing about which step of running it stopped.
+    //
+    // Mutation check: answer `error.EngineRefused` anywhere in this file
+    // without going through `Runner.refuse` and one of these reads the
+    // refusal of an earlier line.
+    var guest: [1024]u8 = @splat(0);
+
+    {
+        var fake: FakeEngine = .{ .guest = &guest, .refuses = true };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try testing.expectError(
+            error.EngineRefused,
+            runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+        );
+        try testing.expectEqual(Diagnostic.Call.instantiate, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
+
+        // The same runner, still not ready, refuses a call for a different
+        // reason, and says so.
+        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try testing.expectEqual(Diagnostic.Call.before_instantiation, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
+    }
+
+    {
+        var fake: FakeEngine = .{ .guest = &guest, .refusing_symbol = core.init_symbol };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try testing.expectError(
+            error.EngineRefused,
+            runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+        );
+        try testing.expectEqual(Diagnostic.Call.init_call, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
+    }
+
+    {
+        stageAnswer(&guest, 16, .success, "unreachable");
+        var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(1, ""));
+        try testing.expectEqual(Diagnostic.Call.tool_index, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
+    }
+
+    {
+        var fake: FakeEngine = .{
+            .guest = &guest,
+            .answer_at = 16,
+            .arguments_at = 512,
+            .refusing_symbol = arguments_symbol,
+        };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(0, "{\"a\":1}"));
+        try testing.expectEqual(Diagnostic.Call.arguments_call, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
+    }
+
+    {
+        var fake: FakeEngine = .{
+            .guest = &guest,
+            .answer_at = 16,
+            .refusing_symbol = core.call_symbol,
+        };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try testing.expectEqual(Diagnostic.Call.tool_call, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
+    }
+
+    {
+        // `no_answer` is the address the guest answers when it has nothing,
+        // and it is what `FakeEngine` answers by default.
+        var fake: FakeEngine = .{ .guest = &guest, .answer_at = core.call.no_answer };
+        var runner: Runner = .{ .engine = fake.engine() };
+        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try testing.expectEqual(Diagnostic.Call.empty_answer, runner.refusal.?.call);
+        try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
+    }
+}
+
+test "a refusal reads as a sentence, and no two of them read the same" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    // The one a real x86_64 runner produced, measured 2026-08-26: Vulcan's
+    // JIT would not build the module. See this file's `Diagnostic`.
+    try writer.print("{f}", .{Diagnostic{ .call = .instantiate, .cause = error.Unsupported }});
+    try testing.expectEqualStrings(
+        "the engine would not instantiate the module: Unsupported",
+        writer.buffered(),
+    );
+
+    // A refusal with no engine behind it prints the fact and stops. **No
+    // trailing colon**, because there is nothing after it to read.
+    writer = .fixed(&buffer);
+    try writer.print("{f}", .{Diagnostic{ .call = .tool_index }});
+    try testing.expectEqualStrings(
+        "a tool was called by an index the module never bound",
+        writer.buffered(),
+    );
+
+    // **No two calls read the same.** A reader has to be able to tell which
+    // of the seven sites answered, which is the whole reason this type exists.
+    const calls = std.enums.values(Diagnostic.Call);
+    for (calls, 0..) |one, i| {
+        try testing.expect(one.text().len > 0);
+        for (calls[i + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, one.text(), other.text()));
+        }
+    }
 }
 
 test "arguments the guest has no room for are refused, and never written anyway" {

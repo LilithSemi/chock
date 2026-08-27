@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
-            .url = "git+https://github.com/Midstall/vulcan#b62217f98e3ebb984f8ea8a0d99f9c4680a7e0b6",
-            .hash = "vulcan-0.0.0-d6EfZI6fhACrKe1LU2YYf8cQfTldOGoooYQVxvFkWq7s",
+            .url = "git+https://github.com/Midstall/vulcan#b85759fc2ff9e4047855da1ad7ca89b7aeb7b8ee",
+            .hash = "vulcan-0.0.0-d6EfZDbfhADEz427qO0reiJV1-duNymtWSONezjKLYAY",
         },
         .phantom = .{
             .url = "git+https://github.com/Midstall/phantom#cc6c500f9dc52a72d61ba271c7ee59cdaf4ec540",

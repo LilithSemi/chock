@@ -1085,6 +1085,26 @@ fn runTurn(
             // clock notice reports. See `notices.State.observeEvent`.
             telling.observeEvent(nowMs(io, deps), true);
 
+            // **After the message and before everything else.** The
+            // provider declined the request, and a classifier that fires part
+            // way through a turn leaves real text behind it, so the words the
+            // model did write are already durable above and the session ends
+            // here. Before the empty check, because a refusal and an absence
+            // arrive looking alike and the advice on them is opposite: ask an
+            // empty turn again, and a refusal asked again is refused again.
+            // See `chock_proto.event.SessionEndReason.refused_by_model`.
+            //
+            // **Nothing retries, switches model, resets the context, or
+            // rewords this.** Chock says what the provider said and stops.
+            if (reply.stop().isRefusal()) {
+                const detail = try refusalDetail(allocator, reply.stop(), whichTurn(turn_index));
+                defer allocator.free(detail);
+                _ = try appendAndApply(allocator, io, locked, session, deps, .{
+                    .session_end = .{ .reason = .refused_by_model, .detail = detail },
+                });
+                return true;
+            }
+
             // **Before the tool loop, because a turn that said nothing asked
             // for nothing.** See `saidSomething` for what counts, and
             // `chock_proto.event.SessionEndReason.empty_response` for the
@@ -1173,75 +1193,113 @@ fn saidSomething(reply: chock_provider.message.Message) bool {
     return false;
 }
 
+/// Which turn of the session this is, in the words both end sentences use.
+///
+/// **The turn number, because the first turn and a later one are different
+/// facts.** A session whose first turn ended did no work at all. A session
+/// whose fifth turn ended did four turns of work that is still in the log and
+/// still in the workspace. The number is what tells a person which of the two
+/// they are reading.
+fn whichTurn(turn_index: usize) []const u8 {
+    return if (turn_index == 0) "the first turn of the session" else "a turn of the session";
+}
+
+/// What the provider said beyond its one word stop reason, as a clause to put
+/// on the end of a sentence, or an empty string when it said nothing. Caller
+/// owns the result.
+///
+/// **One clause, written once, for every sentence that reports a stop.** The
+/// category and the explanation are the same fact wherever they are read, and
+/// two renderings of one fact drift.
+///
+/// **An empty category or explanation stays out of the clause.** Both are
+/// nullable on the wire even on a real refusal, so empty means the provider
+/// said nothing, and a clause that named a category the provider never sent
+/// would be an invented reason, which is the fault this whole path exists to
+/// stop. See `chock_provider.Client.Stop`.
+fn stopWords(
+    allocator: std.mem.Allocator,
+    stop: chock_provider.Client.Stop,
+) std.mem.Allocator.Error![]u8 {
+    if (stop.category.len != 0 and stop.explanation.len != 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            ", in the category {s}: {s}",
+            .{ stop.category, stop.explanation },
+        );
+    }
+    if (stop.category.len != 0) {
+        return std.fmt.allocPrint(allocator, ", in the category {s}", .{stop.category});
+    }
+    if (stop.explanation.len != 0) {
+        return std.fmt.allocPrint(allocator, ": {s}", .{stop.explanation});
+    }
+    return allocator.dupe(u8, "");
+}
+
+/// What the log says about something the provider refused. `what` names it,
+/// for example `whichTurn(turn_index)` for the agent's own turn or "the
+/// compaction call" for the one this loop makes on its own account. Caller owns
+/// the result.
+///
+/// **The provider's own words, and only those.** It sends a category and a
+/// sentence of prose beside the word `refusal`, and a log holding only the
+/// word tells the person reading it nothing they can act on while the sentence
+/// that says why sits one field away. Both of those fields can still be null,
+/// and a refusal that arrives with neither says so plainly rather than
+/// borrowing a reason from anywhere else.
+///
+/// **Nothing here works around the refusal**, and nothing anywhere else does
+/// either. Chock records what happened and the session ends. No retry, no
+/// second model, no reset of the context, no softer wording: a harness that
+/// quietly routed around a safety decision would be answering it.
+fn refusalDetail(
+    allocator: std.mem.Allocator,
+    stop: chock_provider.Client.Stop,
+    what: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    const words = try stopWords(allocator, stop);
+    defer allocator.free(words);
+    if (words.len == 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "the model backend refused {s}, and gave no reason for the refusal",
+            .{what},
+        );
+    }
+    return std.fmt.allocPrint(allocator, "the model backend refused {s}{s}", .{ what, words });
+}
+
 /// What the log says about a turn that carried nothing. Caller owns the result.
 ///
 /// **The provider's own word first, when it sent one.** `stop.reason` is
-/// `end_turn`, `max_tokens`, `refusal`, or whatever else the provider said, and
-/// a Chock that invented a reason of its own while holding that word would be
-/// throwing away the only explanation anybody has. See
+/// `end_turn`, `max_tokens`, or whatever else the provider said, and a Chock
+/// that invented a reason of its own while holding that word would be throwing
+/// away the only explanation anybody has. See
 /// `chock_provider.Client.Delta.stop_reason`.
 ///
-/// **And every other word it sent, for the same reason.** A refusal carries a
-/// category and a sentence of the provider's own prose beside the word, and
-/// "it stopped because of refusal" tells the person reading the log nothing
-/// they can act on while the sentence that says why sits one field away. See
-/// `chock_provider.Client.Stop`.
-///
-/// **An empty category or explanation stays out of the sentence.** Both are
-/// nullable on the wire even on a real refusal, so empty means the provider
-/// said nothing, and a sentence that named a category the provider never sent
-/// would be the invented reason this whole function exists to stop. A refusal
-/// with neither reads exactly as a refusal always did, which is the honest
-/// report of a provider that gave one word and no more.
-///
-/// **Nothing here works around the refusal**, and nothing anywhere else does
-/// either. This function says what happened and the session ends. A harness
-/// that retried, changed model, or softened the words would be answering a
-/// safety decision by routing around it.
-///
-/// **The turn number, because the first turn and a later one are different
-/// facts.** A session whose first turn carried nothing did no work at all. A
-/// session whose fifth turn carried nothing did four turns of work that is
-/// still in the log and still in the workspace. Both end the same way, because
-/// the loop has no signal but this one for "the model is done", and a model
-/// that is done says so in words. The number is what tells a person which of
-/// the two they are reading.
+/// **A refusal never reaches here**, because `runTurn` ends the session with
+/// `refused_by_model` before it asks whether the turn was empty: the two
+/// arrive looking alike, one turn with nothing to act on, and the advice on
+/// them is opposite. `stopWords` is still used, so a wire that one day sends
+/// a category or an explanation with some other stop reason keeps them.
 fn emptyReplyDetail(
     allocator: std.mem.Allocator,
     stop: chock_provider.Client.Stop,
     turn_index: usize,
 ) std.mem.Allocator.Error![]u8 {
-    const which = if (turn_index == 0)
-        "the first turn of the session"
-    else
-        "a turn of the session";
+    const which = whichTurn(turn_index);
     const opening = "the model backend answered {s} with no text and no tool call";
     if (stop.reason.len == 0) {
         return std.fmt.allocPrint(allocator, opening ++ ", and gave no stop reason", .{which});
     }
-    const because = opening ++ ", and said it stopped because of {s}";
-    if (stop.category.len != 0 and stop.explanation.len != 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            because ++ ", in the category {s}: {s}",
-            .{ which, stop.reason, stop.category, stop.explanation },
-        );
-    }
-    if (stop.category.len != 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            because ++ ", in the category {s}",
-            .{ which, stop.reason, stop.category },
-        );
-    }
-    if (stop.explanation.len != 0) {
-        return std.fmt.allocPrint(
-            allocator,
-            because ++ ": {s}",
-            .{ which, stop.reason, stop.explanation },
-        );
-    }
-    return std.fmt.allocPrint(allocator, because, .{ which, stop.reason });
+    const words = try stopWords(allocator, stop);
+    defer allocator.free(words);
+    return std.fmt.allocPrint(
+        allocator,
+        opening ++ ", and said it stopped because of {s}{s}",
+        .{ which, stop.reason, words },
+    );
 }
 
 /// Send one turn's request, and send it again after a wait when the provider
@@ -1908,22 +1966,29 @@ fn compactNow(
     const folding = try compaction.plan(arena, session, deps.compaction) orelse return false;
     const rendered = try compaction.transcript(arena, folding.folded, deps.compaction);
 
+    const asked = try askForSummary(allocator, arena, io, locked, session, deps, rendered);
     var summary: []const u8 = undefined;
     var wrote_it: []const u8 = "";
-    if (try askForSummary(allocator, arena, io, locked, session, deps, rendered)) |text| {
-        summary = text;
+    if (asked.text.len != 0) {
+        summary = asked.text;
         wrote_it = deps.model_alias;
     } else {
         summary = try compaction.harnessSummary(arena, folding.folded, deps.compaction);
     }
 
-    _ = try appendAndApply(allocator, io, locked, session, deps, .{ .compaction = .{
-        .summary = summary,
-        .from_id = folding.from_id,
-        .through_id = folding.through_id,
-        .kept_ranges = folding.kept_ranges,
-        .model_alias = wrote_it,
-    } });
+    _ = try appendAndApply(allocator, io, locked, session, deps, .{
+        .compaction = .{
+            .summary = summary,
+            .from_id = folding.from_id,
+            .through_id = folding.through_id,
+            .kept_ranges = folding.kept_ranges,
+            .model_alias = wrote_it,
+            // **The compaction happens either way, so this is the only trace the
+            // model call leaves when it gave nothing.** See
+            // `chock_proto.event.Compaction.stand_in_reason`.
+            .stand_in_reason = asked.stand_in_reason,
+        },
+    });
 
     // **Here and not at either caller**, because both of them fold for
     // different reasons and a second author would arm one and forget the
@@ -1934,7 +1999,18 @@ fn compactNow(
     return true;
 }
 
-/// Ask the model for the summary, or null when it could not give one.
+/// What one compaction call came back with. `text` is the model's summary, and
+/// both fields are borrowed from the `arena` the caller passed in.
+///
+/// **Exactly one of the two is ever set.** A call that gave a summary has
+/// nothing to explain, and a call that gave none must say why: see
+/// `chock_proto.event.Compaction.stand_in_reason` for what that answers.
+const CompactionAnswer = struct {
+    text: []const u8 = "",
+    stand_in_reason: []const u8 = "",
+};
+
+/// Ask the model for the summary. See `CompactionAnswer`.
 ///
 /// **The request carries one user message and no tools.** The folded span
 /// cannot be replayed as real messages: a `tool` role message needs the
@@ -1946,11 +2022,19 @@ fn compactNow(
 /// model call and it costs real money, so a budget checked against a total
 /// that skipped it would under count exactly the sessions that compact most.
 ///
-/// Null on every refusal and every empty reply, never an error: a compaction
-/// that could not reach the model still has to happen, and the fallback in
-/// `compactNow` is what happens instead. An allocation failure is the one
-/// thing that still escapes, because at that point there is nothing left to
-/// build a fallback with either.
+/// **No summary on every refusal and every empty reply, never an error**: a
+/// compaction that could not reach the model still has to happen, and the
+/// harness summary in `compactNow` is what happens instead. An allocation
+/// failure is the one thing that still escapes, because at that point there is
+/// nothing left to build a summary with either.
+///
+/// **A refusal here does not end the session, and it is recorded all the same.**
+/// This is the loop's own call and not the agent's turn, and a summary the
+/// harness wrote is a real answer, so the work carries on. What must not
+/// happen is a person seeing an ordinary looking compaction and never learning
+/// the model declined: the words go in `stand_in_reason`. A turn the agent
+/// itself asked for is the other case, and that one does end the session. See
+/// `chock_proto.event.SessionEndReason.refused_by_model`.
 fn askForSummary(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1959,7 +2043,7 @@ fn askForSummary(
     session: *chock_proto.state.Session,
     deps: Deps,
     rendered: []const u8,
-) Error!?[]const u8 {
+) Error!CompactionAnswer {
     const asked = try compaction.summaryPrompt(arena, rendered);
     const parts = [_]message.ContentPart{.{ .text = asked }};
     const messages = [_]message.Message{.{ .role = .user, .content = &parts }};
@@ -1975,22 +2059,42 @@ fn askForSummary(
     // is how a redactor is bypassed. See `sendOnce`.
     const reply = sendOnce(allocator, arena, deps, request, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
+        else => return .{ .stand_in_reason = try std.fmt.allocPrint(
+            arena,
+            "the compaction call did not reach the model backend: {s}",
+            .{@errorName(err)},
+        ) },
     };
     defer chock_provider.Client.freeUsage(allocator, reply.usage);
     try appendUsage(allocator, io, locked, session, deps, reply.usage);
 
     switch (reply.outcome) {
         .status_error => |status_error| {
-            allocator.free(status_error.body);
-            return null;
+            defer allocator.free(status_error.body);
+            return .{ .stand_in_reason = try std.fmt.allocPrint(
+                arena,
+                "the model backend answered the compaction call with status {d}: {s}",
+                .{ @intFromEnum(status_error.status), status_error.body },
+            ) };
         },
         .failed => |failed| {
             chock_provider.Client.freeAssembledMessage(allocator, failed.partial);
-            return null;
+            return .{ .stand_in_reason = try std.fmt.allocPrint(
+                arena,
+                "the reply to the compaction call did not complete: {s}",
+                .{@errorName(failed.err)},
+            ) };
         },
         .message => |reply_message| {
             defer chock_provider.Client.freeAssembledMessage(allocator, reply_message);
+            // **Before the text is read, because a refusal is never a
+            // summary.** A classifier fires part way through, so a refused
+            // call can carry half a summary, and folding thirty turns into
+            // words the provider declined would be using what it said no to.
+            if (reply.stop().isRefusal()) {
+                const said = try refusalDetail(arena, reply.stop(), "the compaction call");
+                return .{ .stand_in_reason = said };
+            }
             var out: std.ArrayList(u8) = .empty;
             for (reply_message.content) |part| {
                 if (part == .text) try out.appendSlice(arena, part.text);
@@ -1999,8 +2103,13 @@ fn askForSummary(
             // A reply of only whitespace, or of nothing but reasoning, is a
             // reply with no summary in it. The harness one is better than an
             // empty summary standing in for thirty turns.
-            if (std.mem.trim(u8, joined, " \t\r\n").len == 0) return null;
-            return joined;
+            if (std.mem.trim(u8, joined, " \t\r\n").len == 0) {
+                return .{ .stand_in_reason = try arena.dupe(
+                    u8,
+                    "the model backend answered the compaction call with no summary text",
+                ) };
+            }
+            return .{ .text = joined };
         },
     }
 }
@@ -4223,8 +4332,11 @@ test "an empty turn carries the provider's own stop reason into the log" {
     const store = backing.storage();
     defer store.close(io);
 
+    // `end_turn`, the word the measured session of 2026-08-26 carried. **Not
+    // `refusal`**, which no longer reaches this path at all: see
+    // `refused_by_model`, and the test below it.
     var fake_client = FakeClient{
-        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{ .reason = "refusal" } }} }},
+        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{ .reason = "end_turn" } }} }},
     };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
@@ -4236,19 +4348,15 @@ test "an empty turn carries the provider's own stop reason into the log" {
     const detail = try endDetailOf(allocator, io, store);
     defer allocator.free(detail);
     // The provider's own word, and not a sentence Chock made up in its place.
-    try testing.expect(std.mem.indexOf(u8, detail, "refusal") != null);
-    // A refusal the provider said nothing more about reads as one. Nothing
-    // here may name a category or a reason the provider never sent: see
-    // `emptyReplyDetail`.
-    try testing.expect(std.mem.indexOf(u8, detail, "category") == null);
-    try testing.expect(std.mem.endsWith(u8, detail, "because of refusal"));
+    try testing.expect(std.mem.endsWith(u8, detail, "because of end_turn"));
 }
 
-test "a refusal carries the provider's own category and explanation into the log" {
-    // The fault one level deeper than the stop reason itself. The API sends
-    // `stop_details` beside the word, with the sentence that says why, and a
-    // log that holds only "refusal" tells the person reading it nothing they
-    // can act on. See `chock_provider.Client.Stop`.
+test "a refusal that came with text ends the session and keeps the text" {
+    // **The ordinary refusal, not the edge case.** The classifier fires part
+    // way through a turn, so the model has usually written something by the
+    // time it lands. The words are real work and belong in the log, and the
+    // session still ends: see
+    // `chock_proto.event.SessionEndReason.refused_by_model`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4257,38 +4365,47 @@ test "a refusal carries the provider's own category and explanation into the log
     defer store.close(io);
 
     var fake_client = FakeClient{
-        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{
-            .reason = "refusal",
-            .category = "cyber_harm",
-            .explanation = "This request was declined because it could enable cyber harm.",
-        } }} }},
+        .turns = &.{.{ .deltas = &.{
+            .{ .text = "Here is how the exploit works" },
+            .{ .stop_reason = .{
+                .reason = "refusal",
+                .category = "cyber",
+                .explanation = "This request was declined because it could enable cyber harm.",
+            } },
+        } }},
     };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
     const reason = try endReasonOf(allocator, io, store);
-    try testing.expectEqual(event.SessionEndReason.empty_response, std.meta.activeTag(reason));
+    try testing.expectEqual(event.SessionEndReason.refused_by_model, std.meta.activeTag(reason));
 
     const detail = try endDetailOf(allocator, io, store);
     defer allocator.free(detail);
     try testing.expectEqualStrings(
-        "the model backend answered the first turn of the session with no text and no tool " ++
-            "call, and said it stopped because of refusal, in the category cyber_harm: This " ++
+        "the model backend refused the first turn of the session, in the category cyber: This " ++
             "request was declined because it could enable cyber harm.",
         detail,
     );
-    // **The session ended, and nothing tried the request again.** A harness
-    // that retried, changed model, or reworded a refusal would be routing
-    // around a safety decision.
+
+    // **The text the model did write is still there.** A session that dropped
+    // it would leave the person reading the log unable to see what was said
+    // before the refusal landed.
+    const said = try lastAssistantText(allocator, io, store);
+    defer allocator.free(said);
+    try testing.expectEqualStrings("Here is how the exploit works", said);
+
+    // **No retry, no second model, no reset.** One request, no tool, and the
+    // session ends.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 }
 
-test "a refusal with an explanation and no category names the explanation only" {
-    // Both fields of `stop_details` are nullable even on a real refusal, so
-    // this shape is one a real provider sends. The sentence must carry what
-    // arrived and must not name a category that did not.
+test "a refusal with no text ends refused_by_model and never empty_response" {
+    // The two arrive looking alike, one turn with nothing to act on, and the
+    // advice on them is opposite: ask an empty turn again, and a refusal asked
+    // again is refused again.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4306,65 +4423,134 @@ test "a refusal with an explanation and no category names the explanation only" 
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
+    const reason = try endReasonOf(allocator, io, store);
+    try testing.expectEqual(event.SessionEndReason.refused_by_model, std.meta.activeTag(reason));
+    try testing.expect(std.meta.activeTag(reason) != event.SessionEndReason.empty_response);
+
     const detail = try endDetailOf(allocator, io, store);
     defer allocator.free(detail);
     try testing.expectEqualStrings(
-        "the model backend answered the first turn of the session with no text and no tool " ++
-            "call, and said it stopped because of refusal: This request was declined.",
+        "the model backend refused the first turn of the session: This request was declined.",
         detail,
     );
 }
 
-test "every shape of a stop reason gets its own sentence" {
-    // The five shapes the wire produces, side by side, because what separates
+test "a refusal with no category and no explanation still ends, and invents nothing" {
+    // Both fields of `stop_details` are nullable even on a real refusal. The
+    // session ends the same way, and the sentence says the provider gave no
+    // reason rather than naming one it never sent.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{
+        .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{ .reason = "refusal" } }} }},
+    };
+    var fake_tools = FakeToolRunner{ .output = "unused" };
+
+    try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
+
+    const reason = try endReasonOf(allocator, io, store);
+    try testing.expectEqual(event.SessionEndReason.refused_by_model, std.meta.activeTag(reason));
+
+    const detail = try endDetailOf(allocator, io, store);
+    defer allocator.free(detail);
+    try testing.expectEqualStrings(
+        "the model backend refused the first turn of the session, and gave no reason for the " ++
+            "refusal",
+        detail,
+    );
+    // Nothing that names a class the provider never sent.
+    try testing.expect(std.mem.indexOf(u8, detail, "category") == null);
+    try testing.expectEqual(@as(usize, 1), fake_client.calls);
+}
+
+test "every shape of a refusal gets its own sentence" {
+    // The four shapes the wire produces, side by side, because what separates
     // them is what a person reading the log gets. A refusal with a sentence
     // and a refusal without one must not read the same way, and neither may
-    // name anything the provider did not send. See `emptyReplyDetail`.
+    // name anything the provider did not send. See `refusalDetail`.
     const allocator = testing.allocator;
-    const opening = "the model backend answered a turn of the session with no text and no tool call";
+    const opening = "the model backend refused a turn of the session";
 
     const cases = [_]struct { stop: chock_provider.Client.Stop, want: []const u8 }{
         .{
-            .stop = .{ .reason = "" },
-            .want = opening ++ ", and gave no stop reason",
-        },
-        .{
             .stop = .{ .reason = "refusal" },
-            .want = opening ++ ", and said it stopped because of refusal",
+            .want = opening ++ ", and gave no reason for the refusal",
         },
         .{
-            .stop = .{ .reason = "refusal", .category = "cyber_harm" },
-            .want = opening ++ ", and said it stopped because of refusal, in the category cyber_harm",
+            .stop = .{ .reason = "refusal", .category = "cyber" },
+            .want = opening ++ ", in the category cyber",
         },
         .{
             .stop = .{ .reason = "refusal", .explanation = "This request was declined." },
-            .want = opening ++ ", and said it stopped because of refusal: This request was declined.",
+            .want = opening ++ ": This request was declined.",
         },
         .{
             .stop = .{
                 .reason = "refusal",
-                .category = "cyber_harm",
+                .category = "cyber",
                 .explanation = "This request was declined.",
             },
-            .want = opening ++ ", and said it stopped because of refusal, in the category " ++
-                "cyber_harm: This request was declined.",
+            .want = opening ++ ", in the category cyber: This request was declined.",
         },
     };
 
     for (cases) |case| {
-        const detail = try emptyReplyDetail(allocator, case.stop, 3);
+        const detail = try refusalDetail(allocator, case.stop, whichTurn(3));
         defer allocator.free(detail);
         try testing.expectEqualStrings(case.want, detail);
     }
 
     // The turn number is the other half of the sentence, and the first turn
     // still reads as the first turn.
-    const first = try emptyReplyDetail(allocator, .{ .reason = "refusal" }, 0);
+    const first = try refusalDetail(allocator, .{ .reason = "refusal" }, whichTurn(0));
+    defer allocator.free(first);
+    try testing.expectEqualStrings(
+        "the model backend refused the first turn of the session, and gave no reason for the " ++
+            "refusal",
+        first,
+    );
+}
+
+test "an empty turn reports the word the provider sent, or that it sent none" {
+    // A refusal never reaches this sentence: `runTurn` ends the session before
+    // it asks whether the turn was empty. What is left is a provider that
+    // stopped for some other reason, and one that named no reason at all.
+    const allocator = testing.allocator;
+    const opening = "the model backend answered a turn of the session with no text and no tool call";
+
+    const said_nothing = try emptyReplyDetail(allocator, .{ .reason = "" }, 3);
+    defer allocator.free(said_nothing);
+    try testing.expectEqualStrings(opening ++ ", and gave no stop reason", said_nothing);
+
+    const said_a_word = try emptyReplyDetail(allocator, .{ .reason = "end_turn" }, 3);
+    defer allocator.free(said_a_word);
+    try testing.expectEqualStrings(opening ++ ", and said it stopped because of end_turn", said_a_word);
+
+    const first = try emptyReplyDetail(allocator, .{ .reason = "end_turn" }, 0);
     defer allocator.free(first);
     try testing.expectEqualStrings(
         "the model backend answered the first turn of the session with no text and no tool " ++
-            "call, and said it stopped because of refusal",
+            "call, and said it stopped because of end_turn",
         first,
+    );
+
+    // A wire that one day sends a category or an explanation with some other
+    // stop reason keeps them, because both sentences render that clause
+    // through `stopWords`.
+    const with_words = try emptyReplyDetail(
+        allocator,
+        .{ .reason = "max_tokens", .explanation = "The answer was cut short." },
+        3,
+    );
+    defer allocator.free(with_words);
+    try testing.expectEqualStrings(
+        opening ++ ", and said it stopped because of max_tokens: The answer was cut short.",
+        with_words,
     );
 }
 
@@ -6430,11 +6616,13 @@ const FoundCompaction = struct {
     through_id: u64,
     kept_ranges: []event.EventRange,
     model_alias: []u8,
+    stand_in_reason: []u8,
 
     fn deinit(self: *FoundCompaction, allocator: std.mem.Allocator) void {
         allocator.free(self.summary);
         allocator.free(self.kept_ranges);
         allocator.free(self.model_alias);
+        allocator.free(self.stand_in_reason);
     }
 };
 
@@ -6456,6 +6644,7 @@ fn firstCompaction(
             .through_id = found.through_id,
             .kept_ranges = try allocator.dupe(event.EventRange, found.kept_ranges),
             .model_alias = try allocator.dupe(u8, found.model_alias),
+            .stand_in_reason = try allocator.dupe(u8, found.stand_in_reason),
         };
     }
     return null;
@@ -7213,10 +7402,79 @@ test "a compaction whose summary call is refused still folds, and the event says
     defer found.deinit(allocator);
     try testing.expectEqualStrings("", found.model_alias);
     try testing.expect(std.mem.startsWith(u8, found.summary, compaction.harness_summary_first_line));
+    // **And why**, because an empty `model_alias` says the harness wrote the
+    // summary and nothing used to say what happened to the model's own.
+    try testing.expectEqualStrings(
+        "the model backend answered the compaction call with status 500: the summariser fell over",
+        found.stand_in_reason,
+    );
     try testing.expectEqual(
         event.SessionEndReason.finished,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
     );
+}
+
+test "a refused compaction call is written into the log, and the session carries on" {
+    // **Recorded, never acted on.** This is the loop's own call and not the
+    // agent's turn: a harness written summary is a real answer, so the session
+    // keeps going. What must not happen is a person seeing an ordinary looking
+    // compaction and never learning the model declined. A refused turn of the
+    // agent's own is the other case, and that one ends the session: see
+    // `chock_proto.event.SessionEndReason.refused_by_model`.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+
+    const task = [_]event.ContentPart{.{ .text = "TASK: one thing" }};
+    try seedEvent(allocator, io, store, .{ .message = .{ .role = .user, .content = &task } });
+    try seedMessages(allocator, io, store, "MIDDLE", 5);
+    try seedMessages(allocator, io, store, "RECENT", 6);
+
+    var fake_client = FakeClient{
+        .turns = &.{
+            .{ .refusal = .{ .body = measured_overflow_body } },
+            // The summary call is refused by the model itself, with half a
+            // summary already written: a classifier fires part way through.
+            .{ .deltas = &.{
+                .{ .text = "The session was about" },
+                .{ .stop_reason = .{
+                    .reason = "refusal",
+                    .category = "cyber",
+                    .explanation = "This request was declined because it could enable cyber harm.",
+                } },
+            } },
+            .{ .deltas = &.{.{ .text = "all done" }} },
+        },
+    };
+    var fake_tools = FakeToolRunner{ .output = "unused" };
+    try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
+
+    var found = (try firstCompaction(allocator, io, store)).?;
+    defer found.deinit(allocator);
+    try testing.expectEqualStrings(
+        "the model backend refused the compaction call, in the category cyber: This request was " ++
+            "declined because it could enable cyber harm.",
+        found.stand_in_reason,
+    );
+
+    // **The refused words are not the summary.** Half a summary the provider
+    // said no to must not stand in for thirty turns, so the harness one does.
+    try testing.expectEqualStrings("", found.model_alias);
+    try testing.expect(std.mem.startsWith(u8, found.summary, compaction.harness_summary_first_line));
+    try testing.expect(std.mem.indexOf(u8, found.summary, "The session was about") == null);
+
+    // The session carried on and finished: a refusal on this call is not the
+    // agent's turn being refused.
+    try testing.expectEqual(
+        event.SessionEndReason.finished,
+        std.meta.activeTag(try endReasonOf(allocator, io, store)),
+    );
+    const said = try lastAssistantText(allocator, io, store);
+    defer allocator.free(said);
+    try testing.expectEqualStrings("all done", said);
 }
 
 // Every test here drives a real `run` and reads the answer out of the log,

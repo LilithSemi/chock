@@ -617,7 +617,7 @@ pub const DecodeError = std.mem.Allocator.Error || std.json.ParseError(std.json.
 /// different.
 pub const StopDetails = struct {
     /// A short token naming the class of the refusal, for example
-    /// `cyber_harm`. Empty when the provider sent none.
+    /// `cyber`. Empty when the provider sent none.
     category: []const u8 = "",
     /// The provider's own sentence about the refusal, for example "This
     /// request was declined because it could enable cyber harm." Empty when
@@ -1445,11 +1445,11 @@ test "a refusal keeps the category and the explanation the wire sent with it" {
     defer decoder.deinit();
 
     _ = try feedEvent(&decoder,
-        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber_harm","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":12}}
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":"This request was declined because it could enable cyber harm."}},"usage":{"output_tokens":12}}
     );
 
     try testing.expectEqualStrings("refusal", decoder.stopReason());
-    try testing.expectEqualStrings("cyber_harm", decoder.stopDetails().category);
+    try testing.expectEqualStrings("cyber", decoder.stopDetails().category);
     try testing.expectEqualStrings(
         "This request was declined because it could enable cyber harm.",
         decoder.stopDetails().explanation,
@@ -1485,9 +1485,9 @@ test "a refusal with one detail null keeps the other one" {
     try testing.expectEqualStrings("This request was declined.", decoder.stopDetails().explanation);
 
     _ = try feedEvent(&decoder,
-        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber_harm","explanation":null}},"usage":{"output_tokens":4}}
+        \\{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","explanation":null}},"usage":{"output_tokens":4}}
     );
-    try testing.expectEqualStrings("cyber_harm", decoder.stopDetails().category);
+    try testing.expectEqualStrings("cyber", decoder.stopDetails().category);
     // **Cleared with the reason it belonged to.** The explanation above
     // described the first refusal, and reporting it beside the second one
     // would attach a reason to a word that never carried it.
