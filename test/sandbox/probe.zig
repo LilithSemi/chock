@@ -9,6 +9,10 @@
 //!   4 - a netns-connect check could not prove the network namespace was entered.
 //!   5 - the kernel refused the operation, but not with the errno the design
 //!       predicts. Something else is broken, and this must not read as a pass.
+//!  63 - this machine would not give the sandbox its namespaces, so nothing
+//!       this operation is about was measured. **Not a pass and not a
+//!       failure**: the caller skips and says why. See
+//!       `namespace.nothing_measured_exit_status`.
 //! A death by SIGSYS means the seccomp filter killed the process, which is a pass for
 //! a call in `blocked_calls`.
 
@@ -27,6 +31,39 @@ const linux = std.os.linux;
 /// something did.
 const stdin_pipe_token = "chock-helper-request";
 
+/// End this program with `nothing_measured_exit_status` when `err` is the
+/// sandbox refusing to be built at all.
+///
+/// **For the operations that read `spawn`'s own error rather than letting it
+/// out.** Several here expect a setup failure and check which one it was, so
+/// the error never reaches `main`; a machine with no namespace would give
+/// them the wrong failure and they would report a real fault. Returns for
+/// every other error, so a genuine setup fault keeps the exit code that says
+/// so. Nothing is printed, for the reason `enterOrEndUnmeasured` gives.
+fn endIfNothingMeasured(err: anyerror) void {
+    if (err != error.NamespaceFailed) return;
+    std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+}
+
+/// Enter the namespaces, or end this program with
+/// `nothing_measured_exit_status`.
+///
+/// **A machine that will not give a user namespace measures nothing here.**
+/// Every operation that reaches this line is about a boundary that lives
+/// inside the namespaces, so a run that cannot make them proves neither that
+/// the boundary holds nor that it leaks. The caller reads the status and
+/// skips. See `namespace.nothing_measured_exit_status`.
+///
+/// **Nothing is printed, on purpose.** `build.zig`'s own `failOnTestStderr`
+/// fails the build when a test binary writes to standard error, and a caller
+/// that lets this program inherit its own descriptors would carry these bytes
+/// there. The exit status is the whole answer.
+fn enterOrEndUnmeasured(options: sandbox.namespace.Options) void {
+    sandbox.namespace.enter(options, null) catch {
+        std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+    };
+}
+
 /// Build a sandbox root with one writable workspace and one read only file.
 /// `root` is scratch space the caller already made and owns the cleanup of;
 /// this probe never invents a location of its own. Every setup failure ends
@@ -43,7 +80,7 @@ fn enterTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const guarded = try std.fs.path.join(arena, &.{ work, "chock.zon" });
     try writeTestFile(arena, guarded, ".{}\n");
 
-    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
     try sandbox.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
         .{ .bind = .{ .source = guarded, .target = "/work/chock.zon", .read_only = true } },
@@ -720,6 +757,19 @@ const ThreadedSpawn = struct {
         return self.done.load(.acquire);
     }
 
+    /// End this program with `nothing_measured_exit_status` when the call
+    /// ended because the sandbox could not be built at all.
+    ///
+    /// **Read in every branch that gives up on a bounded wait.** A sandbox
+    /// that never came up starts no program, writes no file and signals
+    /// nobody, so each of those waits runs out and reports a fault of its own
+    /// long before the `spawn_err` check further down is ever reached. See
+    /// this file's own `endIfNothingMeasured`.
+    fn endIfSandboxRefused(self: *ThreadedSpawn) void {
+        if (!self.done.load(.acquire)) return;
+        if (self.spawn_err) |err| endIfNothingMeasured(err);
+    }
+
     /// End every process of the call, whatever state it is in. Called on
     /// every failure path, so a broken build never leaves a sandboxed program
     /// running after the suite has moved on. SIGKILL, because a failure path
@@ -784,7 +834,7 @@ fn enterFileOverFileTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const source = try std.fs.path.join(arena, &.{ root, "source-file" });
     try writeTestFile(arena, source, file_over_file_content);
 
-    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
     try sandbox.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = source, .target = "/marker", .read_only = false } },
     }, null);
@@ -806,7 +856,7 @@ fn enterSubmountTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     const sub = try std.fs.path.join(arena, &.{ guarded, "sub" });
     try makeTestDir(arena, guarded);
 
-    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+    enterOrEndUnmeasured(.{ .network = .none, .mount = true });
 
     try makeTestDir(arena, sub);
     try mountTmpfs(arena, sub);
@@ -901,6 +951,19 @@ fn enterLandlockTruncateTestRoot(arena: std.mem.Allocator, root: []const u8) !st
 // Zig 0.16 removed std.process.argsAlloc. A hosted main can instead take
 // std.process.Init.Minimal as its first parameter, and the runtime fills it in.
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    return runOperation(init) catch |err| {
+        // **The machine, and not the boundary.** Every operation here that
+        // calls `Sandbox.spawn` reaches this error the same way: the sandbox
+        // could not be built at all, so nothing the operation is about ever
+        // ran. Reported as its own exit status rather than as this program's
+        // ordinary error exit, which is a real failure and must stay one.
+        // Nothing is printed, for the reason `enterOrEndUnmeasured` gives.
+        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        return err;
+    };
+}
+
+fn runOperation(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1057,13 +1120,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // Nothing to set up. See the comment on `spawned` above.
     } else if (std.mem.startsWith(u8, args[1], "netns-")) {
         // A setup failure is not the same fact as the kernel refusing the probed
-        // operation. Give it its own exit code, so a broken `unshare` cannot be
-        // mistaken for a network namespace that did its job. Name the error, so the
-        // failure is never silent.
-        sandbox.namespace.enter(.{}) catch |err| {
-            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
-            return 3;
-        };
+        // operation. It has an exit code of its own, so a broken `unshare` cannot
+        // be mistaken for a network namespace that did its job, and it names the
+        // call and the errno, so the failure is never silent.
+        enterOrEndUnmeasured(.{});
     } else if (std.mem.eql(u8, args[1], "session-keyring-fresh")) {
         // Nothing to set up here either: this operation calls the join directly
         // below and reads the result straight back. No seccomp filter goes on,
@@ -2693,6 +2753,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // every check below meaningless, so it is its own answer.
             return 5;
         } else |err| {
+            endIfNothingMeasured(err);
             if (err != error.MountTreeFailed) return 5;
         }
 
@@ -2753,6 +2814,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }, &.{"/probe"}, null, null)) |_| {
             return 5;
         } else |err| {
+            endIfNothingMeasured(err);
             if (err != error.ScratchMountFailed) return 5;
         }
         _ = linux.close(write_fd);
@@ -2774,6 +2836,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }, &.{"/probe"}, null, null)) |_| {
             return 5;
         } else |err| {
+            endIfNothingMeasured(err);
             if (err != error.MountTreeFailed) return 5;
         }
         return 0;
@@ -2841,6 +2904,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }, &.{ "/probe", "spawned-forge-exit" }, null, null) catch |err| {
             // The one wrong outcome this whole operation exists to catch: spawn
             // mistook the caller's own forged exit code for a setup failure.
+            endIfNothingMeasured(err);
             std.debug.print("spawn-forge-exit: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -2927,6 +2991,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             _ = linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
         }
         if (ctx.middle.pid == 0) {
+            // **The join first, and the read after it.** A sandbox that never
+            // came up publishes no pid, so this branch is the one a machine
+            // with no namespace takes, and the `spawn_err` check further down
+            // is never reached from here. The join is what makes reading the
+            // field safe, and the thread is already finished in this case.
+            thread.join();
+            if (ctx.spawn_err) |err| endIfNothingMeasured(err);
             std.debug.print("{s}: never learned the middle process\n", .{args[1]});
             return 3;
         }
@@ -2940,6 +3011,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // caller: see `sandbox.Middle`. After the join, never before.
         sandbox.closeMiddle(&ctx.middle);
         if (ctx.spawn_err) |err| {
+            endIfNothingMeasured(err);
             std.debug.print("{s}: spawn reported a setup failure: {s}\n", .{ args[1], @errorName(err) });
             return 3;
         }
@@ -2980,6 +3052,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
         }, &.{ "/probe", "spawned-signal-group" }, null, null) catch |err| {
+            endIfNothingMeasured(err);
             std.debug.print("spawn-signal-group: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -3023,6 +3096,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         const started_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/started", .{root_arg}, 0);
         const go_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/go", .{root_arg}, 0);
         if (!waitForPath(started_path)) {
+            ctx.endIfSandboxRefused();
             std.debug.print("spawn-group-press: the sandboxed program never started\n", .{});
             ctx.killCall();
             return 3;
@@ -3046,11 +3120,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         };
 
         if (!ctx.waitForDone()) {
+            ctx.endIfSandboxRefused();
             std.debug.print("spawn-group-press: the call never finished\n", .{});
             ctx.killCall();
             return 3;
         }
         if (ctx.spawn_err) |err| {
+            endIfNothingMeasured(err);
             std.debug.print("spawn-group-press: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
         }
@@ -3114,6 +3190,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // A non zero pid is how `spawn` says the handle beside it is there to
         // read: see `sandbox.Middle`. Nothing here ever signals the number.
         if (ctx.waitForMiddlePid() == 0) {
+            ctx.endIfSandboxRefused();
             std.debug.print("spawn-signal-middle-handled: never learned the middle process\n", .{});
             return 3;
         }
@@ -3122,6 +3199,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // below cannot land before there is anything to cancel.
         const heartbeat_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/heartbeat.txt", .{root_arg}, 0);
         if (!waitForPath(heartbeat_path)) {
+            ctx.endIfSandboxRefused();
             std.debug.print("spawn-signal-middle-handled: the sandboxed program never started\n", .{});
             ctx.killCall();
             return 3;
@@ -3141,11 +3219,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // The fault itself. The middle process caught this process's own
             // handler and stayed alive, so the call was never cancelled at
             // all and spawn is still blocked on it.
+            ctx.endIfSandboxRefused();
             std.debug.print("spawn-signal-middle-handled: the call outlived its own cancellation\n", .{});
             ctx.killCall();
             return 1;
         }
         if (ctx.spawn_err) |err| {
+            endIfNothingMeasured(err);
             std.debug.print("spawn-signal-middle-handled: spawn reported a setup failure: {s}\n", .{@errorName(err)});
             return 3;
         }

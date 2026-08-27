@@ -4062,8 +4062,9 @@ fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Er
 /// * **`given` is what the driver of this build declares it applies.**
 ///   `chock_sandbox.Sandbox.guarantees` is the driver's own answer, one member
 ///   per capability layer, and a layer that is not in it is a layer this build
-///   never had. Every one is in it on Linux, and none is on Darwin, which is
-///   why that driver refuses to run anything at all.
+///   never had. Every one is in it on Linux. Darwin declares four, which are
+///   the network, the signals, the IPC and the paths, and it does not declare
+///   a system call filter or a mounted workspace: see `darwin/driver.zig`.
 /// * **`network` is what this session asked for**, out of the config it will
 ///   really spawn with. `.host` gives the network layer up, and that is allowed
 ///   only for an act a user approved.

@@ -454,7 +454,15 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/sandbox/escape.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "probe_path", .module = probe_path_options.createModule() }},
+                // `chock-sandbox` for one question only: the exit status a
+                // probe answers with when this machine will not give it a
+                // sandbox at all. See that suite's own `skipIfNothingMeasured`,
+                // and `test/sandbox/darwin_escape.zig`, which takes the same
+                // narrow import for `confinedAlready`.
+                .imports = &.{
+                    .{ .name = "probe_path", .module = probe_path_options.createModule() },
+                    .{ .name = "chock-sandbox", .module = chock_sandbox },
+                },
             }),
         });
         const run_escape_tests = b.addRunArtifact(escape_tests);
@@ -802,9 +810,13 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/container/sandbox.zig"),
                 .target = target,
                 .optimize = optimize,
+                // `chock-sandbox` for one question only: the exit status the
+                // probe answers with when this machine will not give it a
+                // sandbox at all. See that suite's own `runInside`.
                 .imports = &.{
                     .{ .name = "chock-container", .module = chock_container },
                     .{ .name = "rootfs_probe_path", .module = rootfs_probe_path_options.createModule() },
+                    .{ .name = "chock-sandbox", .module = chock_sandbox },
                 },
             }),
         });
@@ -1038,8 +1050,12 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("test/core/lsp.zig"),
                 .target = target,
                 .optimize = optimize,
+                // `chock-sandbox` for one question only: the exit status a
+                // probe answers with when this machine will not give it a
+                // sandbox at all. See that suite's `skipIfNothingMeasured`.
                 .imports = &.{
                     .{ .name = "lsp_probe_path", .module = lsp_probe_path_options.createModule() },
+                    .{ .name = "chock-sandbox", .module = chock_sandbox },
                 },
             }),
         });
@@ -1286,10 +1302,11 @@ pub fn build(b: *std.Build) void {
     // checking the verdict, which needs no model and no credential, and is
     // the only part of this that could ever be automated.
     //
-    // Linux only, by `linux_only` above. Every canary here reads `/proc`, and
-    // the sandbox a run measures is the Linux driver: `SECURITY.md` says
-    // Chock does not run tool calls on macOS at all, so a Darwin run would
-    // measure a boundary that refuses to exist.
+    // Linux only, by `linux_only` above. Every canary here reads `/proc`,
+    // which macOS has not got, and the sandbox a run measures is the Linux
+    // driver. This is NOT because macOS runs no tool calls. It runs real
+    // sessions with four layers on: see `docs/sandbox.md`. Measuring the
+    // Darwin boundary needs canaries of its own.
     if (linux_only) {
         // The harness starts `chock`, so it needs the path of the very binary
         // this build produced. Same reasoning as every probe path above: Zig

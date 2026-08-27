@@ -9,6 +9,33 @@ const linux = std.os.linux;
 // an options module built with `addOptionPath`.
 const probe_path = @import("probe_path").probe_path;
 
+// `chock-sandbox` for one question only: what a probe answers when this
+// machine will not give it a sandbox at all, which is the one state in which
+// none of these tests can be answered. The same narrow import, for the same
+// reason, that `test/sandbox/darwin_escape.zig` takes for `confinedAlready`.
+const sandbox = @import("chock-sandbox");
+
+/// Skip when the probe answered "this machine would not give me a sandbox".
+///
+/// **A boundary that was never reached is not a boundary that held.** Every
+/// test here asks whether the sandbox stops something, and every one needs a
+/// real sandbox to ask inside, so a machine that refuses one measures nothing
+/// and must not report a row of passes. A skip is what says so.
+///
+/// **Read here, and never inside the probe's own operation code.** The probe
+/// ends at the first layer it cannot build, whichever operation it was asked
+/// for, so one status covers every one of them. See
+/// `namespace.nothing_measured_exit_status`, and the CI job named "Sandbox",
+/// which runs this suite on a machine that can host one and fails rather than
+/// skips.
+fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
+    const code = switch (term) {
+        .exited => |c| c,
+        else => return,
+    };
+    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
+}
+
 /// Read the absolute path of an already open directory descriptor, through
 /// /proc/self/fd. std.testing.tmpDir hands back a directory under
 /// .zig-cache/tmp, reached only through a relative path, but the probe's
@@ -82,7 +109,9 @@ fn runProbeArgv(argv: []const []const u8) !std.process.Child.Term {
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    return child.wait(std.testing.io);
+    const term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(term);
+    return term;
 }
 
 /// The size of the file at `path`, or null if it cannot be read. Used to watch
@@ -128,6 +157,7 @@ fn runReportPid(root: []const u8) !ReportPidResult {
     }
 
     result.term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(result.term);
     return result;
 }
 
@@ -186,6 +216,7 @@ fn runProbeCapturing(argv: []const []const u8) !CaptureResult {
     result.out_len = readPipeToEnd(child.stdout.?.handle, &result.out_buffer);
     result.err_len = readPipeToEnd(child.stderr.?.handle, &result.err_buffer);
     result.term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(result.term);
     return result;
 }
 
@@ -764,7 +795,7 @@ test "a setup failure is written to the descriptor the caller named, and not to 
     //
     // Mutation check: put `std.posix.STDERR_FILENO` back in `writeStderr` and
     // the named descriptor reads empty while descriptor 2 carries the line.
-    // Hand `printFault` the error instead of the diagnostic in `dieMount` and
+    // Hand `printFault` the error instead of the diagnostic in `dieNamespace` and
     // the line loses both the call and the errno.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
@@ -1008,6 +1039,15 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
         pid_line_buf[pid_line_len] = byte[0];
         pid_line_len += 1;
     }
+    // **No pid line at all is an answer too.** The probe prints one only once
+    // `spawn` has forked, so a machine that would not give it a sandbox prints
+    // nothing and ends with `nothing_measured_exit_status`, and reading that
+    // as a malformed number would report this mechanism as broken. See
+    // `skipIfNothingMeasured`.
+    if (pid_line_len == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
+        return error.TestUnexpectedResult;
+    }
     const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
 
     var heartbeat_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1031,6 +1071,14 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
                 break;
             }
         }
+    }
+    // **A file that never grew is an answer too.** `spawn` publishes the pid
+    // of the process it forked before it builds any layer, so the pid line
+    // above arrives even on a machine that then refuses the namespaces, and
+    // the program inside never runs. The probe's own exit status is what tells
+    // that apart from a real fault. See `skipIfNothingMeasured`.
+    if (size_before_signal == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
     }
     try std.testing.expect(size_before_signal > 0);
 
@@ -1111,6 +1159,15 @@ test "a cancelled call takes the processes it started with it, not only the one 
         pid_line_buf[pid_line_len] = byte[0];
         pid_line_len += 1;
     }
+    // **No pid line at all is an answer too.** The probe prints one only once
+    // `spawn` has forked, so a machine that would not give it a sandbox prints
+    // nothing and ends with `nothing_measured_exit_status`, and reading that
+    // as a malformed number would report this mechanism as broken. See
+    // `skipIfNothingMeasured`.
+    if (pid_line_len == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
+        return error.TestUnexpectedResult;
+    }
     const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
 
     var forked_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1140,6 +1197,14 @@ test "a cancelled call takes the processes it started with it, not only the one 
         }
     }
     // The grandchild is really running and really producing the file.
+    // **A file that never grew is an answer too.** `spawn` publishes the pid
+    // of the process it forked before it builds any layer, so the pid line
+    // above arrives even on a machine that then refuses the namespaces, and
+    // the program inside never runs. The probe's own exit status is what tells
+    // that apart from a real fault. See `skipIfNothingMeasured`.
+    if (size_before_signal == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
+    }
     try std.testing.expect(size_before_signal > 0);
     // And the fork really happened, so the writer above is the grandchild and
     // not the sandboxed program under another name.

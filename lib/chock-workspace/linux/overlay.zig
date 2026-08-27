@@ -530,6 +530,11 @@ fn resolveKind(
 
 const overlay_helper_path = @import("overlay_helper_path").overlay_helper_path;
 
+// `chock-sandbox` for one question only: what the helper answers when this
+// machine will not give it a user namespace. `../overlay.zig`, the interface
+// file above this one, already imports the same module for `Mount`.
+const sandbox = @import("chock-sandbox");
+
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     var link_buffer: [64]u8 = undefined;
     const link = std.fmt.bufPrintZ(&link_buffer, "/proc/self/fd/{d}", .{dir_fd}) catch unreachable;
@@ -654,6 +659,16 @@ fn runOverlayHelper(allocator: std.mem.Allocator, ov: Overlay, ops: []const []co
     });
     const term = try child.wait(std.testing.io);
     allowScratchCleanup(allocator, ov);
+    // **A boundary that was never reached is not a boundary that held.**
+    // Every test below asks what a real overlay mount does, and the helper
+    // needs a user namespace to make one, so a machine that refuses one
+    // measures nothing here and must not report a row of passes. See
+    // `chock-sandbox`'s own `namespace.nothing_measured_exit_status`, and the
+    // CI job named "Sandbox", which runs this suite on a machine that can
+    // host one and fails rather than skips.
+    if (term == .exited and term.exited == sandbox.namespace.nothing_measured_exit_status) {
+        return error.SkipZigTest;
+    }
     return term;
 }
 

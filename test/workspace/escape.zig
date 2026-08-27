@@ -323,7 +323,26 @@ fn runProbe(
         .stdout = .ignore,
         .stderr = .ignore,
     });
-    return child.wait(std.testing.io);
+    const term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(term);
+    return term;
+}
+
+/// Skip when the probe answered "this machine would not give me a sandbox".
+///
+/// **A boundary that was never reached is not a boundary that held.** Every
+/// test here asks whether a workspace mount stops something, and every one
+/// needs a real sandbox to ask inside, so a machine that refuses one measures
+/// nothing and must not report a row of passes. A skip is what says so. See
+/// `namespace.nothing_measured_exit_status`, and the CI job named "Sandbox",
+/// which runs this suite on a machine that can host one and fails rather than
+/// skips.
+fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
+    const code = switch (term) {
+        .exited => |c| c,
+        else => return,
+    };
+    if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
 /// Find `git` on this process's own PATH, the same binary `nix develop`

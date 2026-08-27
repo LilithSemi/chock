@@ -677,8 +677,10 @@ pub const SpawnError = error{
     /// A driver that cannot give the guarantees `spawn` promises refuses
     /// before it runs anything, named for the layer it cannot apply. Chock
     /// refuses to run before it runs without a sandbox. Only the Darwin driver
-    /// returns this today, always, for the reason `NoMountNamespace`'s own
-    /// name gives: see `darwin/driver.zig`.
+    /// returns this today, and it returns it for a config that needs a mount
+    /// tree, which is the one layer that platform has not got. A config whose
+    /// every path stays where it is runs there: see `darwin/driver.zig`'s
+    /// `Inexpressible` for the whole rule.
     NoMountNamespace,
     /// `Config.network` is `.filtered` and `Config.net_broker` is null, so
     /// there is nobody for the sandboxed process to ask. **Refused rather

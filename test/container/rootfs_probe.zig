@@ -34,6 +34,11 @@
 //!   252                             this program ran out of memory or could
 //!                                   not parse a blob
 //!   253                             `Sandbox.spawn` refused
+//!    63                             this machine would not give the sandbox
+//!                                   its namespaces, so nothing here was
+//!                                   measured. **Not a pass and not a
+//!                                   failure**: the caller skips. See
+//!                                   `namespace.nothing_measured_exit_status`.
 //!   254                             the sandboxed program was signalled
 
 const std = @import("std");
@@ -103,7 +108,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // same network isolation every other tool call gets, because the
         // sandbox is unchanged by where the files came from.
         .network = .none,
-    }, argv, null, null) catch return spawn_refused;
+    }, argv, null, null) catch |err| {
+        // **The machine, and not the image.** A sandbox that cannot be built
+        // at all means nothing about the rootfs was measured, which is a
+        // different fact from a sandbox that refused this configuration. See
+        // `namespace.nothing_measured_exit_status`.
+        if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
+        return spawn_refused;
+    };
 
     return switch (term) {
         .exited => |code| code,

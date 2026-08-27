@@ -111,6 +111,10 @@
 //!   2 - a mounts or rules blob could not be parsed.
 //!   3 - dispatch itself returned a real error (a sandbox or setup fault,
 //!       not a tool level failure). The error name is on standard error.
+//!  63 - this machine would not give the sandbox its namespaces, so the call
+//!       never ran and nothing here was measured. **Not a pass and not a
+//!       failure**: the caller skips and says why. See
+//!       `namespace.nothing_measured_exit_status`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -303,9 +307,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     } else null;
     if (table) |*one| context.tasks = one;
 
-    const result = chock_core.tools.Registry.dispatchWith(arena, io, &env, config, call, context) catch |err| {
-        std.debug.print("dispatch failed: {s}\n", .{@errorName(err)});
-        return 3;
+    const result = chock_core.tools.Registry.dispatchWith(arena, io, &env, config, call, context) catch |err| switch (err) {
+        // **The machine, and not the tool.** A sandbox that cannot be built
+        // at all means the call this probe is about never ran, so nothing
+        // here was measured. Its own exit status, so the caller skips rather
+        // than read it as a tool that failed. Nothing is printed: `build.zig`'s
+        // own `failOnTestStderr` fails the build on a byte a test binary
+        // writes to standard error, and the status is the whole answer.
+        error.NamespaceFailed => return sandbox.namespace.nothing_measured_exit_status,
+        else => {
+            std.debug.print("dispatch failed: {s}\n", .{@errorName(err)});
+            return 3;
+        },
     };
 
     // Before the result is printed and before this process ends: a background

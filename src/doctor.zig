@@ -1912,6 +1912,10 @@ const Answer = enum(u8) {
     absent = 1,
     /// It has it and the child was refused.
     refused = 2,
+    /// **The namespaces step only.** The user namespace was made, and the id
+    /// map inside it could not be written, so every process in it would be
+    /// the overflow user and could own no file. See `runProbes`.
+    refused_id_map = 3,
 };
 
 /// One record on the pipe: which step, and what it answered.
@@ -2077,7 +2081,7 @@ fn measureLayers(
         return;
     }
 
-    narrowNamespaces(m, whole, filter);
+    narrowNamespaces(arena, m, whole, filter);
 }
 
 /// The probe file a Seatbelt run may read, and the one it may not.
@@ -2280,7 +2284,12 @@ fn seatbeltToolCallRefusal(arena: std.mem.Allocator, root: []const u8) ?[]const 
 /// the boundary. So a machine that refuses one refuses the sandbox, and this
 /// reports them together rather than inventing a distinction the library does
 /// not make.
-fn narrowNamespaces(m: *Measured, whole: ChildReport, filter: ?[]sandbox.bpf.Insn) void {
+fn narrowNamespaces(
+    arena: std.mem.Allocator,
+    m: *Measured,
+    whole: ChildReport,
+    filter: ?[]sandbox.bpf.Insn,
+) void {
     const failed = whole.namespaces orelse Answer.refused;
     const bare = runChild(.{
         .network = .host,
@@ -2292,7 +2301,7 @@ fn narrowNamespaces(m: *Measured, whole: ChildReport, filter: ?[]sandbox.bpf.Ins
     applySeccomp(m, bare, filter);
 
     if (bare.namespaces != Answer.ok) {
-        const why = whyFor(failed, "the kernel refused a user namespace to this process");
+        const why = whyFor(failed, namespaceRefusalText(arena, failed));
         m.user_namespace = why;
         m.pid_namespace = why;
         m.ipc_namespace = why;
@@ -2358,8 +2367,38 @@ fn whyFor(answer: Answer, refused_text: []const u8) Probe {
     return switch (answer) {
         .ok => .ok,
         .absent => .{ .absent = "the kernel answered that it does not have it" },
-        .refused => .{ .refused = refused_text },
+        // The two refusals read the same text on purpose. Which one it was is
+        // already in the words the caller built: see `namespaceRefusalText`,
+        // the one caller that can ever be handed `refused_id_map`.
+        .refused, .refused_id_map => .{ .refused = refused_text },
     };
+}
+
+/// Why the namespaces were refused, in the words a person acts on.
+///
+/// **Two facts, and the second one is the file to change.** `answer` is what
+/// the probe child measured, and it can say that the user namespace was made
+/// and the id map inside it was not, which is what Ubuntu's
+/// `kernel.apparmor_restrict_unprivileged_userns` does; a report that called
+/// that a refused user namespace would send a person to `max_user_namespaces`,
+/// which is not the file to change. The call and the errno come from
+/// `probeAvailability`, which the child could not carry back: it answers over
+/// a two byte pipe, and this runs in the parent, where there is an allocator
+/// and a terminal.
+///
+/// **One more fork, and it is worth it.** `chock doctor` is the command a
+/// person runs when the sandbox will not come up, and the errno is the whole
+/// diagnosis. A probe that answers anything but a refusal is left out rather
+/// than argued with: the measurement above is the one that really ran, and a
+/// second opinion that disagrees says nothing about which is right.
+fn namespaceRefusalText(arena: std.mem.Allocator, answer: Answer) []const u8 {
+    const measured = switch (answer) {
+        .refused_id_map => "the kernel made the user namespace and refused the id map write inside it",
+        .ok, .absent, .refused => "the kernel refused a user namespace to this process",
+    };
+    const detail = sandbox.namespace.probeAvailability();
+    if (detail != .unavailable) return measured;
+    return std.fmt.allocPrint(arena, "{s}, and {f}", .{ measured, detail.unavailable }) catch measured;
 }
 
 /// Ask the kernel for a handle on this process, and give it straight back.
@@ -2536,15 +2575,28 @@ fn readReport(read_fd: i32) ChildReport {
 /// fork may have happened while another thread held its lock. The one call
 /// that needs an allocator gets a fixed buffer of its own.
 fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) void {
-    const entered = sandbox.namespace.enter(.{ .network = plan.network, .mount = plan.mount });
+    // **No diagnostic, and that is not an oversight.** This child answers over
+    // a two byte pipe and cannot print: see this function's own comment. So it
+    // carries the state and never the errno, and the two states below are the
+    // most it can say. `Sandbox.spawn` is where the errno reaches a caller, in
+    // `SetupFailureRecord`.
+    const entered = sandbox.namespace.enter(.{ .network = plan.network, .mount = plan.mount }, null);
     if (entered) |_| {
         say(write_fd, .namespaces, .ok);
     } else |err| {
         say(write_fd, .namespaces, switch (err) {
+            // **The namespace was made and it is unusable, which is not the
+            // same fact as a refusal.** Measured on 2026-08-25: Ubuntu 24.04
+            // sets `kernel.apparmor_restrict_unprivileged_userns=1`, and a
+            // process inside a nested user namespace there is given the
+            // namespace and refused the id map. A report that called that a
+            // refused user namespace would send a person to
+            // `max_user_namespaces`, which is not the file to change.
+            error.MapFailed => .refused_id_map,
             // Every one of these is this process being refused, and none of
             // them says the kernel has no namespaces. A kernel built without
             // them cannot run the machine this is measuring.
-            error.NotPermitted, error.MultiThreaded, error.MapFailed, error.Unexpected => .refused,
+            error.NotPermitted, error.MultiThreaded, error.Unexpected => .refused,
         });
         // Nothing below can be measured without them, and a mount made with
         // no mount namespace is a mount on the machine a person is using.

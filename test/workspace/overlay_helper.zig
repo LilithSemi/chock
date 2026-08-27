@@ -45,13 +45,16 @@
 //! Exit codes:
 //!   0 - every step succeeded.
 //!   1 - too few arguments.
-//!   2 - sandbox.namespace.enter failed.
 //!   3 - the overlay mount was refused because this kernel does not support a
 //!       rootless overlay mount. See namespace.zig's own error.OverlayNotSupported.
 //!   4 - the overlay mount failed for another reason.
 //!   5 - a component of the overlay's own paths (project, upper, or work)
 //!       could not be read.
 //!   6 - an op failed, or named an operation this program does not know.
+//!  63 - this machine would not give a user namespace, so nothing here was
+//!       measured. **Not a pass and not a failure**: the caller skips and says
+//!       why. See `namespace.nothing_measured_exit_status`, which every helper
+//!       program in this suite answers with for the same reason.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -79,9 +82,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .merged = @constCast(args[4]),
     };
 
-    sandbox.namespace.enter(.{}) catch |err| {
-        std.debug.print("entering the namespace failed: {s}\n", .{@errorName(err)});
-        return 2;
+    // **Nothing is printed here.** This program's standard error is the test
+    // binary's own, and `build.zig`'s `failOnTestStderr` fails the build on
+    // any byte a test binary writes there. The exit status carries the fact,
+    // and the caller turns it into a skip.
+    sandbox.namespace.enter(.{}, null) catch {
+        return sandbox.namespace.nothing_measured_exit_status;
     };
 
     const described = ov.mounts(arena) catch |err| switch (err) {

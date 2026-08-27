@@ -103,6 +103,10 @@
 //!       tampered read of the pre-existing parent commit succeeding anyway;
 //!       for git-push, "git --version" failing, which means the push's own
 //!       failure would say nothing, since git could not run at all.
+//!  63 - this machine would not give the sandbox its namespaces, so nothing
+//!       this operation is about was measured. **Not a pass and not a
+//!       failure**: the caller skips and says why. See
+//!       `namespace.nothing_measured_exit_status`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -124,6 +128,25 @@ const git_target = "/probe-git";
 /// which would prove nothing about the scratch store this flow exists to
 /// exercise.
 const commit_test_file = "chock-object-store-test.txt";
+
+/// End this program with `nothing_measured_exit_status`, and say why, when
+/// `err` is the sandbox refusing to be built at all.
+///
+/// **A boundary that was never reached is not a boundary that held.** Every
+/// operation in this program asks whether a workspace mount stops something,
+/// and every one of them needs a sandbox to ask inside. A machine that will
+/// not give one measures nothing, and the caller must skip on it rather than
+/// count it. Returns for every other error, so a real setup fault keeps the
+/// exit code that says so.
+///
+/// **Nothing is printed, on purpose.** `build.zig`'s own `failOnTestStderr`
+/// fails the build when a test binary writes to standard error, and a caller
+/// that lets this program inherit its own descriptors would carry these bytes
+/// there. The exit status is the whole answer.
+fn endIfNothingMeasured(err: anyerror) void {
+    if (err != error.NamespaceFailed) return;
+    std.process.exit(sandbox.namespace.nothing_measured_exit_status);
+}
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -258,6 +281,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .env = env,
         .network = .none,
     }, argv, null, null) catch |err| {
+        endIfNothingMeasured(err);
         std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
         return 3;
     };
@@ -357,6 +381,7 @@ fn runGitStep(
         .env = env,
         .network = .none,
     }, argv.items, null, null) catch |err| {
+        endIfNothingMeasured(err);
         std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
         return null;
     };

@@ -919,7 +919,7 @@ fn mountScratchAreas(config: Config, write_fd: i32) ScratchAreas {
             area.target,
             config.limits.scratch_bytes,
             &diag,
-        ) catch |err| dieMount(write_fd, config.stderr_fd, .scratch_mount, err, diag);
+        ) catch |err| dieNamespace(write_fd, config.stderr_fd, .scratch_mount, err, diag);
         areas.fds[areas.count] = fd;
         areas.count += 1;
     }
@@ -1379,6 +1379,8 @@ fn die(write_fd: i32, stderr_fd: i32, step: SetupStep, err: anyerror) noreturn {
 }
 
 /// Same as `die`, for a step that can also say which call the kernel refused.
+/// Every step that carries a `namespace.Diagnostic` comes here: the namespaces
+/// themselves, the scratch mount, the mount tree and the pivot.
 ///
 /// **The errno reaches the parent, and not only this process's stderr.** A
 /// mount fault used to answer `error.Unexpected` over the pipe and put the one
@@ -1386,7 +1388,14 @@ fn die(write_fd: i32, stderr_fd: i32, step: SetupStep, err: anyerror) noreturn {
 /// that is not a terminal never saw it. `SetupFailureRecord` always had the
 /// field for this; it was written as zero because nothing carried the value
 /// this far.
-fn dieMount(
+///
+/// **The namespace step was missed when that was fixed.** It kept calling
+/// plain `die`, so a machine that refused the user namespace answered
+/// `error.NamespaceFailed` with errno 0. Measured on 2026-08-25: two CI
+/// architectures failed 132 tests each, and the whole log could say only that
+/// the sandbox would not start. Which call it was, and with what errno, is the
+/// diagnosis, and none of it left the child.
+fn dieNamespace(
     write_fd: i32,
     stderr_fd: i32,
     step: SetupStep,
@@ -1407,7 +1416,7 @@ fn dieMount(
     std.process.exit(1);
 }
 
-/// Same as `dieMount`, for the three Landlock calls.
+/// Same as `dieNamespace`, for the three Landlock calls.
 ///
 /// **The errno reaches the parent, and not only this process's stderr.**
 /// Landlock used to print its own errno from inside this child, which is
@@ -1435,9 +1444,9 @@ fn dieLandlock(
     std.process.exit(1);
 }
 
-/// Same as `dieMount`, for a resource limit the kernel refused.
+/// Same as `dieNamespace`, for a resource limit the kernel refused.
 ///
-/// **The errno reaches the parent**, for the reason `dieMount` gives: a
+/// **The errno reaches the parent**, for the reason `dieNamespace` gives: a
 /// caller that is not a terminal never reads what this child prints, and
 /// `error.ResourceLimitFailed` alone does not say which limit or why.
 fn dieLimit(write_fd: i32, stderr_fd: i32, err: anyerror, diag: ?rlimits.Diagnostic) noreturn {
@@ -1588,8 +1597,14 @@ fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, scratch_write_fd: 
 fn enterNamespaces(config: Config, write_fd: i32, scratch_write_fd: i32, broker_fd: i32) void {
     closeInheritedFds(write_fd, scratch_write_fd, config.stdout_fd, config.stderr_fd, config.stdin_fd, broker_fd);
 
-    namespace.enter(.{ .network = config.network, .mount = true }) catch |err|
-        die(write_fd, config.stderr_fd, .namespace, err);
+    // The slot is here for the reason `applyLayers` has one, and for one more:
+    // `error.NamespaceFailed` on its own cannot tell a policy that refuses an
+    // unprivileged user namespace from a machine that has no room for another
+    // one, nor either of those from a map file this process may not write. See
+    // `dieNamespace`.
+    var diag: ?namespace.Diagnostic = null;
+    namespace.enter(.{ .network = config.network, .mount = true }, &diag) catch |err|
+        dieNamespace(write_fd, config.stderr_fd, .namespace, err, diag);
 }
 
 /// Steps 2 to 6 of the order above, in B, the process that runs the caller's
@@ -1609,9 +1624,9 @@ fn applyLayers(
     // explains the rest.
     var diag: ?namespace.Diagnostic = null;
     namespace.buildRoot(allocator, config.root, config.mounts, &diag) catch |err|
-        dieMount(write_fd, config.stderr_fd, .mount_tree, err, diag);
+        dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
     namespace.pivotInto(allocator, config.root, &diag) catch |err|
-        dieMount(write_fd, config.stderr_fd, .pivot, err, diag);
+        dieNamespace(write_fd, config.stderr_fd, .pivot, err, diag);
 
     // One slot for all three calls, for the reason the mount slot above has
     // one: `note` keeps the first fault, and a rule can only be added to a
@@ -2569,6 +2584,14 @@ test "spawn reports the Landlock ABI and its features before it ever forks" {
 
     var report: LandlockReport = undefined;
 
+    // **A boundary that was never reached is not a boundary that held.** This
+    // test builds a whole sandbox, so a machine that will not give one
+    // measures nothing here. Asked in a child, which is the only way to ask
+    // without spending this process's own one namespace: see
+    // `namespace.probeAvailability`. The CI job named "Sandbox" runs this
+    // suite on a machine that can host one and fails rather than skips.
+    if (!namespace.probeAvailability().available()) return error.SkipZigTest;
+
     // The child's execve on /does-not-exist is meant to fail, and when it does it
     // prints "sandbox: execve failed: NOENT" to standard error. That line is correct,
     // not a bug, but left alone it reads as a failure to anyone watching a normal
@@ -2601,6 +2624,15 @@ test "spawn reports the Landlock ABI and its features before it ever forks" {
         .cwd = "/",
         .env = &.{},
     }, &.{"/does-not-exist"}, &report, null);
+
+    // **Standard error goes back before the first assertion, and not on the
+    // way out.** With the restore left to the deferred call above, a failing
+    // assertion here printed what it expected and what it found into
+    // /dev/null, and the whole test read as "failed without output". Measured
+    // on 2026-08-25: that is exactly what a CI run answered for this test, and
+    // the one line that would have named the real cause was the line that went
+    // nowhere.
+    _ = linux.dup2(saved_stderr, std.posix.STDERR_FILENO);
 
     if (err) |_| {
         return error.TestUnexpectedResult;
@@ -2686,6 +2718,104 @@ fn isEmptyDirectory(dir_fd: i32) bool {
             offset += entry.reclen;
         }
     }
+}
+
+test "a machine that refuses the user namespace says which call it refused, and with what errno" {
+    // **The fault this whole diagnostic exists for, driven end to end.** Before
+    // it, `enterNamespaces` called plain `die`, so a machine that would not
+    // give a user namespace answered `error.NamespaceFailed` with errno 0 over
+    // the setup pipe and one word on a descriptor a caller that is not a
+    // terminal never reads. Measured on 2026-08-25: two CI architectures
+    // answered `MapFailed` and `NamespaceFailed` and nobody could say whether
+    // it was `max_user_namespaces`, a nesting depth, or a capability, because
+    // the errno was thrown away at the one place that had it.
+    //
+    // **The refusal is made rather than waited for.** This machine gives a
+    // user namespace, so the only way to see the path a machine that refuses
+    // one takes is to make `unshare` answer `EPERM`, which a seccomp filter
+    // does exactly. The filter is permanent and inherited, so it goes on a
+    // child of this test and never on the test runner itself.
+    //
+    // Mutation check: put `die` back in `enterNamespaces` in place of
+    // `dieNamespace` and the line below arrives as "sandbox: NamespaceFailed",
+    // which fails the comparison.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = try absoluteDirPath(&path_buffer, tmp.dir.handle);
+
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{})));
+    defer _ = linux.close(fds[0]);
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        // 3: the filter would not go on, so nothing below was ever asked.
+        var insns = [_]bpf.Insn{
+            bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr),
+            bpf.jump(bpf.JMP_JEQ_K, @intFromEnum(linux.SYS.unshare), 0, 1),
+            bpf.stmt(bpf.RET_K, seccomp.RET_ERRNO_PERM),
+            bpf.stmt(bpf.RET_K, seccomp.RET_ALLOW),
+        };
+        seccomp.install(bpf.Prog.init(&insns)) catch std.process.exit(3);
+
+        // **The page allocator, and never the test's own.** This is a forked
+        // child of a test binary with more than one thread.
+        const err = spawn(std.heap.page_allocator, .{
+            .root = root_z,
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            // Where the child's own line goes, which is the half of this a
+            // caller that is not a terminal used to lose.
+            .stderr_fd = fds[1],
+        }, &.{"/does-not-exist"}, null, null);
+        if (err) |_| {
+            std.process.exit(1);
+        } else |actual| {
+            // 4: a kernel with no Landlock at all, which is a machine this
+            // test cannot ask its question on.
+            if (actual == error.LandlockUnavailable) std.process.exit(4);
+            // 2: the sandbox failed somewhere else, so the line below is not
+            // the one this test is about.
+            if (actual != error.NamespaceFailed) std.process.exit(2);
+            std.process.exit(0);
+        }
+    }
+
+    _ = linux.close(fds[1]);
+    var text: [256]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < text.len) {
+        const rc = linux.read(fds[0], text[filled..].ptr, text.len - filled);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        filled += rc;
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+
+    const code = linux.W.EXITSTATUS(status);
+    // A machine with no seccomp and a machine with no Landlock are both
+    // environments rather than faults, and neither one can be asked this
+    // question at all.
+    if (code == 3 or code == 4) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), code);
+
+    // **The whole point.** Not "the sandbox would not start", but which call
+    // the kernel refused and what it answered.
+    try std.testing.expectEqualStrings(
+        "sandbox: the unshare that makes the namespaces failed: PERM\n",
+        text[0..filled],
+    );
 }
 
 test "a landlock errno travels the setup pipe, and is not lost with the layer" {
@@ -2801,6 +2931,17 @@ test "a reaped number really does name somebody else, and the handle still reach
     // Mutation check: signal `middle.pid` with `kill` instead of `middle.fd`
     // with `signalMiddle` and the innocent process below dies, which is
     // exactly the 2026-08-22 incident in miniature.
+    //
+    // **A machine whose user namespace carries no capability measures nothing
+    // here.** The child below needs `CAP_SYS_ADMIN` over the pid namespace it
+    // just made to put the counter back, and a namespace made under Ubuntu's
+    // `kernel.apparmor_restrict_unprivileged_userns` carries no capability at
+    // all: measured on 2026-08-25, that child answered 26, a refused write to
+    // `ns_last_pid`, on both CI architectures. The probe asks the same
+    // question in the same shape, through the id map write, and skipping on
+    // it keeps that answer from reading as this mechanism failing.
+    if (!namespace.probeAvailability().available()) return error.SkipZigTest;
+
     const fork_rc = linux.fork();
     try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
     const outer: linux.pid_t = @intCast(fork_rc);
