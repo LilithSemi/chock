@@ -4,6 +4,11 @@ Every tool call runs inside a sandbox, in a throwaway copy of the project. Your
 real project is never written by a tool call. This page says what the boundary
 is made of.
 
+**The layers below are the Linux ones.** macOS builds the boundary a different
+way, out of Seatbelt, and it gives less. See
+[The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do) for what
+it holds and what it cannot.
+
 **The layers are separate on purpose.** Each one is measured, each one can be
 absent on a given machine, and `chock doctor` says which are on. A red team run
 on 2026-08-22 set up an io_uring ring inside a tool call, which is the classic
@@ -188,19 +193,67 @@ written next to it in the code.
 A project's `chock.zon` can lower any of these and can never raise one. It is
 the same ratchet the policy table keeps.
 
-## There is no sandbox on macOS
+## The sandbox on macOS, and what it does not do
 
-**`Sandbox.spawn` refuses on macOS.** It returns `error.NoMountNamespace`
-unconditionally, before it allocates anything and before it forks. The set of
-guarantees the Darwin driver offers is empty, and tests pin all of it.
+**A session runs on macOS, with four layers on.** Seatbelt holds the paths, the
+network including unix sockets, the signals and shared memory. Darwin's own
+resource limits bound what a program can consume. The driver declares exactly
+four guarantees, and a test on a real Mac tries to break each one. See
+`test/sandbox/darwin_escape.zig`:
 
-The reason is that Darwin has no bind mount, so the workspace cannot be made to
-appear at the project's own path, and that guarantee cannot be given. Chock
-refuses rather than running a tool call with no boundary at all. **The gap is
-treated as permanent**, and not as something a future Seatbelt profile closes.
+| Guarantee | On macOS |
+|---|---|
+| `network_isolated` | yes |
+| `signal_isolated` | yes |
+| `ipc_isolated` | yes |
+| `path_restricted` | yes |
+| `syscall_restricted` | **no, and it is permanent** |
+| `workspace_mounted` | **no, and it is permanent** |
 
-Chock's libraries compile for Darwin, and a Darwin driver exists for the
-workspace. A session does not run there.
+**A layer this driver reports as on, and does not enforce, is worse than a
+refusal.** A refusal cannot mislead anybody. Chock compares a policy against a
+driver and refuses a driver that claims too little, but it trusts a driver that
+claims too much. So every claim above comes from a measurement on Apple
+Silicon, macOS 15.7.9, arm64. Two layers were tried and then dropped:
+
+- **There is no system call filter.** `(deny syscall-unix (syscall-number 26))`
+  compiles, applies, and `ptrace` still returns 0. Only the blanket
+  `(deny syscall-unix)` has an effect, and that stops `execve`, so it cannot be
+  used.
+- **The other processes of the machine are not hidden.** A sandboxed program
+  reads the whole host process table through `sysctl KERN_PROC_ALL`, and taking
+  `sysctl-read` away stops ordinary software starting. Darwin has no PID
+  namespace. The program still cannot **act** on any process it sees.
+
+### What `spawn` refuses, and why a session still runs
+
+macOS has no bind mount. A path means the same thing inside the sandbox and
+outside it only when nothing was remapped, and remapping is what a mount
+namespace does. So `spawn` refuses a config that needs a mount tree, by name,
+before it allocates anything and before it forks:
+
+| Refused | Because |
+|---|---|
+| a root that is not `/` | there is no `pivot_root` |
+| a bind whose target is not its source | this is the mount gap itself |
+| an overlay mount | macOS has no overlayfs |
+| a procfs mount | macOS has no procfs, and no PID namespace |
+| a capped scratch area | an ordinary user cannot mount a filesystem, so there is nothing to cap |
+
+The capped scratch area is refused and not quietly left out. A caller that asked
+for a bounded writable area and got an unbounded one would learn nothing until
+the disk filled.
+
+**A config whose every path stays where it is does run.** That is what
+`Layout.in_place` builds in `lib/chock-workspace/layout.zig`: the checkout, the
+project's own `.git` and the scratch object store each keep their real path, so
+the workspace becomes a set of rules instead of a set of mounts. This is why
+`workspace_mounted` is absent and a tool call still works.
+
+Two things follow from having no mount tree. An absolute path that a program
+writes into a file names a directory that is deleted with the session. `TMPDIR`
+and `CHOCK_SCRATCHPAD` name one directory, and a file written through either
+survives the call. `chock doctor` reports both.
 
 ## Checking a machine
 

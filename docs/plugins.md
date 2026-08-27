@@ -30,7 +30,9 @@ all**, none of its other tools included.
 The tool list, the capabilities and the decisions are all read out of the
 module's own file with no engine, before any of it runs. A plugin whose tools
 are never called starts no process. The first call starts one, and it is a
-sandbox of its own with no network and no path but its own module.
+sandbox of its own with no network. It reads three things, and all three read
+only: the `chock` program that hosts it, its own module, and the toolchain the
+session runs under. **It reaches neither the project nor the workspace.**
 
 ## Writing one
 

@@ -1,10 +1,20 @@
 # Approvals
 
-An action a rule answers `ask` is put to a person before it happens. Eight
-actions go through the broker: `git.commit`, `git.push`, `git.branch.delete`,
-`net.fetch`, `nix.build`, `file.write`, `workspace.apply` and `model.select`.
-Which of them are asked about, and which are answered before the session
-starts, is the policy table in `chock.zon`. See [policy.md](policy.md).
+An action a rule answers `ask` is put to a person before it happens, wherever
+there is a moment at which a person can be asked. The broker knows eight
+actions: `git.commit`, `git.push`, `git.branch.delete`, `net.fetch`,
+`nix.build`, `file.write`, `workspace.apply` and `model.select`. It answers one
+more, `policy.widen`, which is a session asking to be let out of a promise it
+made to itself. What each one is allowed, denied or asked is the policy table
+in `chock.zon`. See [policy.md](policy.md).
+
+**Two of them really put a question to a person in this release, and no more.**
+`workspace.apply` is asked at the end of a session, and `policy.widen` is asked
+during one. `net.fetch`, `nix.build` and `model.select` are each read before
+the work they govern, at a moment when nobody is waiting to answer, so `ask` is
+a refusal for all three. `git.commit`, `git.push`, `git.branch.delete` and
+`file.write` are rows the table can answer and nothing in a session asks them
+yet. See [status.md](status.md).
 
 ## The one every project meets
 
@@ -28,10 +38,10 @@ chock: this needs your approval before it can happen.
 Allow this? [y/N]
 ```
 
-Only `y` or `yes` is a yes. Anything else, a bare Enter included, is a no, and
-a no leaves your repository exactly as it was. The work is still in the
-session's workspace either way, and the line printed after a refusal says
-where.
+Only `y` or `yes`, in any case, is a yes. Anything else, a bare Enter included,
+is a no, and a no leaves your repository exactly as it was. The work is still
+in the session's workspace either way, and the line printed after a refusal
+says where.
 
 Ctrl-C at the prompt ends the run with the question unanswered, which is a
 refusal, and keeps the workspace.

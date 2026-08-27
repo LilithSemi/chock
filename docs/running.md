@@ -36,7 +36,7 @@ copies your uncommitted work into the workspace as well.
 
 ## The tools
 
-The agent has fifteen tools, and every one that touches the machine goes
+The agent has seventeen tools, and every one that touches the machine goes
 through that sandbox: `read_file`, `list_directory`, `glob`, `grep`,
 `write_file`, `edit_file`, `run_command`, `read_memory` and `write_memory`.
 Only `run_command` takes a command. The rest name a path, a pattern, or the
@@ -44,7 +44,10 @@ text to write, because a person can review a change and cannot review a shell
 line.
 
 `read_guidance` reads a document compiled into Chock, so it reaches nothing on
-the machine at all. The other five are described on pages of their own:
+the machine at all. `ask_user` puts one question to the person who started the
+session, and it grants nothing: a yes there permits no act. `set_title` names
+the session, so `chock sessions` reads as more than a list of identifiers. The
+last five are described on pages of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
@@ -58,15 +61,17 @@ the machine at all. The other five are described on pages of their own:
 
 The loop knows things the model can only estimate, and it says them at the end
 of a turn's context: the time, the task restated, a call the agent has already
-made, a file it has already read and that has not changed, the budget, and the
-work it cannot see. `chock run --no-notices` turns all of it off, for measuring
-whether any of it helps.
+made, a file it has already read and that has not changed, the budget, the
+work it cannot see, and its own task list after a compaction folded it away.
+`chock run --no-notices` turns all of it off, for measuring whether any of it
+helps.
 
 ## The session log
 
 The session log is the session. It goes to
-`~/.local/state/chock/sessions/<project>/<session id>.jsonl`, and `chock run`
-prints its path before it starts.
+`~/.local/state/chock/sessions/<project>/<session id>.jsonl`. A quiet start
+names the session and not the path, and `chock run --verbose` prints the path
+before it starts.
 
 **Which sessions are running comes from the lock, never from a timestamp.** The
 process holding a session log's lock is the one that owns that session, which is

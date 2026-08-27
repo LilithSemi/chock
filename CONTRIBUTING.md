@@ -14,12 +14,14 @@ agree to uphold it.
 - `lib/` - the libraries, one module for each concern. `chock-sandbox` holds the
   boundary, `chock-proto` the event log, `chock-policy` the rules, `chock-core`
   the agent loop, `chock-broker` the arbitration, and `chock-nix` the toolchain.
-  `chock-auth`, `chock-cost`, `chock-io`, `chock-pcsc`, `chock-provider`,
-  `chock-workspace`, `chock-plugin-core` and `chock-plugin-sdk` complete the set.
+  `chock-auth`, `chock-container`, `chock-cost`, `chock-io`, `chock-pcsc`,
+  `chock-provider`, `chock-workspace`, `chock-plugin-core` and
+  `chock-plugin-sdk` complete the set.
 - `src/` - the command line. One file for each command, with `main.zig` above
   them.
-- `test/` - the tests that need more than one process, by area: `sandbox`,
-  `broker`, `cli`, `core`, `pcsc`, `plugin`, `proto` and `workspace`.
+- `test/` - the tests that need more than one process, by area: `auth`,
+  `broker`, `cli`, `container`, `core`, `pcsc`, `plugin`, `proto`, `redteam`,
+  `sandbox` and `workspace`.
 - `docs/` - the documentation. Start at [docs/README.md](docs/README.md).
 
 ## The rules that hold the model together
@@ -118,10 +120,14 @@ it and the documentation that describes it.
 
 - `zig build` succeeds.
 - `zig build test --summary all` passes, and a skip says why it skipped.
-- `zig fmt` leaves the source unchanged.
+- `zig fmt --check build.zig lib src test` names no file. Give it the source
+  directories, because a bare `.` also walks the fetched packages under
+  `zig-pkg/`, which are not ours to format.
 - The build log is silent. `zig build` prints `failed command:` for any step that
   writes to standard error, whatever its exit status, so a stray print makes
-  every other result in the run look doubtful.
+  every other result in the run look doubtful. `zig build test` therefore fails
+  outright when a test binary writes one byte there. Give the code under test a
+  writer the test owns, as `src/tty.zig`'s `Capture` does.
 - A bug fix comes with a test that fails before the fix and passes after.
 - A security relevant change says what it changes in [SECURITY.md](SECURITY.md),
   or says why that file still reads true.

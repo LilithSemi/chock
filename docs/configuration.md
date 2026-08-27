@@ -80,9 +80,10 @@ See [credentials.md](credentials.md) for where a lookup goes and what
 
 `config.zon` is yours and it is about providers. `chock.zon`, in the project
 root, is the project's own file and it is about what an agent may do there.
-The policy table, the budget, the subagent limits, the denied paths and the
-plugin list all live in it. Chock binds it into the workspace read only, so
-the agent works under rules it cannot edit.
+What an agent may do lives in it: the policy table, the budget, the subagent
+limits and the denied paths. So do the plugin list, the MCP servers, the
+language servers and the container image. Chock binds it into the workspace
+read only, so the agent works under rules it cannot edit.
 
 The whole file is one struct literal, and each block is one field of it. This
 is a complete `chock.zon` with every block a first project needs:
@@ -106,6 +107,9 @@ is a complete `chock.zon` with every block a first project needs:
 }
 ```
 
+`.subagents` also takes `.max_depth`. Both default to 6. See
+[subagents.md](subagents.md).
+
 **A rule goes under `.policy.rules`, and never directly under `.policy`.**
 `.policy` is a struct with named fields, so a rule written beside `.agents` is
 a syntax error and the session does not start. Every block is optional: leave
@@ -117,13 +121,25 @@ out the ones you do not want.
 
 ### When Chock refuses the file
 
-Chock reads `chock.zon` before it builds the workspace, so a fault in it stops
-the session at the start. The message names the file, the line and the column:
+**A fault in `chock.zon` stops the session before the agent runs.** The message
+names the file, the line and the column.
+
+Chock reads the file as a whole, and reads the `deny_read` block, before it
+builds the workspace. A fault that early is named against the workspace:
 
 ```
 chock run: the workspace for /home/you/site could not be built: chock.zon is
 not valid:
 4:9: error: expected field initializer
+```
+
+The `policy`, `budget`, `subagents` and `plugins` blocks are read after the
+workspace is there, so a fault in one of those names the block instead:
+
+```
+chock run: the budget in chock.zon could not be read: chock.zon: the budget
+block is not valid:
+1:18: error: unexpected field
 ```
 
 A message that says **`chock.zon is not valid`** is about the whole file, and
