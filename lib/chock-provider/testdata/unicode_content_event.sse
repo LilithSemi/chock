@@ -1,0 +1,2 @@
+data: {"choices":[{"finish_reason":null,"index":0,"delta":{"content":"こんにちは"}}],"created":1787239255,"id":"chatcmpl-5uhBVhJsfmxCYsdiMxDPR0hvXUBbtNLz","model":"glm4.7-flash:A3B","system_fingerprint":"b10209-","object":"chat.completion.chunk"}
+

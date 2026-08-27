@@ -1,0 +1,84 @@
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  DeterminateCI:
+    uses: DeterminateSystems/ci/.github/workflows/workflow.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      fail-fast: false
+
+  Release:
+    if: github.event_name != 'pull_request'
+    needs: DeterminateCI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Build the release artefacts
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
+            *) version="0.0.0-g$(git rev-parse --short HEAD)" ;;
+          esac
+
+          mkdir -p artifacts
+          for target in x86_64-linux aarch64-linux; do
+            name="chock-${version}-${target}"
+            nix develop --command zig build \
+              -Doptimize=ReleaseSmall \
+              -Dtarget="${target}" \
+              -Dversion="${version}" \
+              --prefix "build/${target}"
+            cp "build/${target}/bin/chock" "artifacts/${name}"
+          done
+
+          ls -l artifacts
+
+          reported="$(./artifacts/chock-${version}-x86_64-linux --version)"
+          echo "the binary reports: ${reported}"
+          case "${reported}" in
+            "chock ${version}"*) ;;
+            *) echo "::error::${reported} does not agree with ${version}" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: chock-release
+          path: artifacts/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+          gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber

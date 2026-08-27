@@ -1,0 +1,3246 @@
+//! One dangerous operation per run. A test starts this program and reads the result.
+//!
+//! Exit codes:
+//!   0 - the operation succeeded, or was blocked in the way the test expects.
+//!   1 - the kernel refused the operation, with the specific errno the design
+//!       predicts. The sandbox layer stopped it for the reason it claims to.
+//!   2 - the operation name given on the command line is unknown.
+//!   3 - the sandbox setup itself failed, before the probed operation ran.
+//!   4 - a netns-connect check could not prove the network namespace was entered.
+//!   5 - the kernel refused the operation, but not with the errno the design
+//!       predicts. Something else is broken, and this must not read as a pass.
+//! A death by SIGSYS means the seccomp filter killed the process, which is a pass for
+//! a call in `blocked_calls`.
+
+const std = @import("std");
+const sandbox = @import("chock-sandbox");
+/// The real network broker, and the real policy table it reads. **Not a stand
+/// in.** See `filteredEscape` for what does stand in, which is the transport
+/// alone, and for why the decision path has to be the one that ships.
+const chock_broker = @import("chock-broker");
+const chock_policy = @import("chock-policy");
+const linux = std.os.linux;
+
+/// What `spawn-stdin-pipe` writes into the pipe it names in `Config.stdin_fd`,
+/// and what `spawned-stdin-pipe` must read back on descriptor 0. A fixed
+/// string, so the check is that these exact bytes arrived and not merely that
+/// something did.
+const stdin_pipe_token = "chock-helper-request";
+
+/// Build a sandbox root with one writable workspace and one read only file.
+/// `root` is scratch space the caller already made and owns the cleanup of;
+/// this probe never invents a location of its own. Every setup failure ends
+/// the process, because a probe that continues after a failed layer tests
+/// nothing.
+fn enterTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
+    // The tree is built outside the namespace, while the paths are still
+    // writable. `root` itself already exists; only the workspace under it
+    // is new.
+    const work = try std.fs.path.join(arena, &.{ root, "work" });
+    try makeTestDir(arena, work);
+
+    // A file that a read only bind mount protects, as chock.zon is protected.
+    const guarded = try std.fs.path.join(arena, &.{ work, "chock.zon" });
+    try writeTestFile(arena, guarded, ".{}\n");
+
+    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+    try sandbox.namespace.buildRoot(arena, root, &.{
+        .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
+        .{ .bind = .{ .source = guarded, .target = "/work/chock.zon", .read_only = true } },
+        .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
+    }, null);
+    try sandbox.namespace.pivotInto(arena, root, null);
+}
+
+// Zig 0.16 moved directory creation and file writes behind std.Io.Dir, which needs
+// an Io instance this probe does not carry. namespace.zig has the same restriction
+// and calls the kernel directly, so this test helper does the same.
+fn makeTestDir(arena: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try arena.dupeZ(u8, path);
+    switch (linux.errno(linux.mkdir(path_z.ptr, 0o755))) {
+        .SUCCESS, .EXIST => {},
+        else => return error.SetupFailed,
+    }
+}
+
+fn writeTestFile(arena: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
+    const path_z = try arena.dupeZ(u8, path);
+    const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.SetupFailed;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    // One write must carry the whole file. Nothing here writes enough for a partial
+    // write to be a realistic outcome, so a short write is treated as a failure.
+    const written = linux.write(fd, contents.ptr, contents.len);
+    if (linux.errno(written) != .SUCCESS or written != contents.len) return error.SetupFailed;
+}
+
+/// Read the path of this running binary through /proc/self/exe. Used only by
+/// the spawn-ptrace probe, which binds its own binary into a fresh sandbox root
+/// and execs it again from inside. `std.fs.selfExePathAlloc` does not exist in
+/// this Zig version, so the link is read directly, the same way every other
+/// path in this file reaches the kernel.
+fn selfExePath(arena: std.mem.Allocator) ![]const u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = linux.readlink("/proc/self/exe", &buffer, buffer.len);
+    if (linux.errno(rc) != .SUCCESS) return error.SetupFailed;
+    return arena.dupe(u8, buffer[0..rc]);
+}
+
+/// Read `fd` until end of file, into `buffer`, and answer what arrived.
+///
+/// For the two setup fault operations, which have to say what one descriptor
+/// received and not only that something did. A read of zero, or any failure
+/// that is not `EINTR`, ends the loop: both mean nothing more is coming, and
+/// the caller compares what it got either way.
+fn readToEnd(fd: i32, buffer: []u8) []u8 {
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const rc = linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        filled += rc;
+    }
+    return buffer[0..filled];
+}
+
+/// A sandbox that cannot be built, for the two setup fault operations.
+///
+/// `root` is a path under the caller's own scratch directory that was never
+/// made, so `namespace.buildRoot` fails on it inside `spawn`'s own child and
+/// the setup failure path runs. Nothing on the host is touched: the directory
+/// is not there to touch.
+fn absentRoot(arena: std.mem.Allocator, root: []const u8) ![]const u8 {
+    return std.fs.path.join(arena, &.{ root, "absent" });
+}
+
+/// The mount tree and Landlock rules every "spawn-" operation shares: the nix
+/// store so the exec inside the sandbox can find its shared libraries, and this
+/// binary bound in as /probe so the sandboxed child can run itself again.
+fn baseEscapeConfig(arena: std.mem.Allocator) !struct {
+    mounts: []const sandbox.namespace.Mount,
+    rules: []const sandbox.Config.Rule,
+} {
+    const self_path = try selfExePath(arena);
+    const mounts = try arena.dupe(sandbox.namespace.Mount, &.{
+        .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
+        .{ .bind = .{ .source = self_path, .target = "/probe", .read_only = true } },
+    });
+    const rules = try arena.dupe(sandbox.Config.Rule, &.{
+        .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
+        // The Landlock ruleset handles the execute right for every path, not
+        // only the ones named here, so without this rule execve on /probe
+        // itself is refused with EACCES before the probed operation ever runs.
+        //
+        // /probe is a file, not a directory, so its rule cannot carry
+        // read_only's read_dir bit: landlock_add_rule returns EINVAL for a
+        // directory-only right on a non-directory path.
+        .{ .path = "/probe", .access = .{ .execute = true, .read_file = true } },
+    });
+    return .{ .mounts = mounts, .rules = rules };
+}
+
+/// The host every filtered probe asks for. Under the class the policy below
+/// permits, so a request for it is a request the table really answers `allow`
+/// to.
+const filtered_host = "api.anthropic.com";
+
+/// A host the policy below does not permit, under no class it names.
+const filtered_refused_host = "secret.evil.test";
+
+/// The policy every filtered probe runs under.
+///
+/// `main` may reach anything under `anthropic.com`, on any port, and `fetcher`
+/// may too. The port has to stay open here, because the ports these probes use
+/// are ephemeral ones the kernel chooses at run time and no rule could name
+/// them.
+///
+/// **`main` is denied under `deny_parent` below and not here.** Two sources,
+/// so the subagent probes compare a fold against a rule and not against a
+/// missing rule.
+const filtered_policy: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "net.connect.com.anthropic.*", .decision = .allow },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// The same, with the parent kind refused. A subagent whose own kind is
+/// permitted still cannot reach the host under this, because `evaluateChain`
+/// takes the intersection over the whole chain.
+const filtered_deny_parent_policy: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .agent_kind = "main", .action = "net.connect.com.anthropic.*", .decision = .deny },
+    \\            .{ .agent_kind = "fetcher", .action = "net.connect.com.anthropic.*", .decision = .allow },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// A listening socket on the loopback interface, with the port the kernel
+/// chose.
+const Listener = struct {
+    fd: i32,
+    port: u16,
+
+    /// True when something has connected and nobody has accepted it yet.
+    /// **This is how a probe proves a connection did not happen**, which is
+    /// the half of an escape test that an exit code cannot carry.
+    fn hasPending(self: Listener) bool {
+        var fds = [1]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready = linux.poll(&fds, 1, 0);
+        return linux.errno(ready) == .SUCCESS and ready > 0;
+    }
+
+    /// Accept one connection and read what was written into it. Null when
+    /// nothing connected.
+    fn readFirst(self: Listener, buffer: []u8) ?[]u8 {
+        if (!self.hasPending()) return null;
+        const rc = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        const peer: i32 = @intCast(rc);
+        defer _ = linux.close(peer);
+        const read = linux.read(peer, buffer.ptr, buffer.len);
+        if (linux.errno(read) != .SUCCESS) return null;
+        return buffer[0..read];
+    }
+};
+
+/// Listen on `127.0.0.1` on a port the kernel chooses.
+///
+/// A backlog and no accept: the kernel completes the handshake into that
+/// backlog, so a connect succeeds while this process is still inside
+/// `Sandbox.spawn` and cannot accept anything.
+fn listenLoopback() !Listener {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SetupFailed;
+    const fd: i32 = @intCast(rc);
+
+    var address = linux.sockaddr.in{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.SetupFailed;
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.SetupFailed;
+
+    var length: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getsockname(fd, @ptrCast(&address), &length)) != .SUCCESS)
+        return error.SetupFailed;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, address.port) };
+}
+
+/// Connect to `127.0.0.1` on `port`, from this process, outside every
+/// namespace.
+fn connectLoopback(port: u16) !i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SetupFailed;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+
+    const address = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    if (linux.errno(linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.SetupFailed;
+    return fd;
+}
+
+/// The one stand-in of the filtered probes: where a name resolves to, and
+/// where a connection really goes.
+///
+/// `lookup` answers with `resolves_to`, which is an address on the public
+/// internet for every probe but one, so `addressIsReachable` runs for real and
+/// really does permit it. `dial` ignores that address and connects to a
+/// listening socket on the loopback interface, because **no test may reach the
+/// network**.
+const ProbeTransport = struct {
+    /// What a name resolves to. Every host resolves to this, including the one
+    /// the policy refuses, so a refusal can never be a name that failed to
+    /// resolve.
+    resolves_to: chock_broker.network.Transport.Address,
+    /// Where a connection really goes.
+    port: u16,
+    /// How many names were resolved. **Zero for a host the policy refused**,
+    /// which is the DNS claim of `chock_broker.network`'s own top comment,
+    /// proven here through a real spawn.
+    lookups: usize = 0,
+    dials: usize = 0,
+
+    fn transport(self: *ProbeTransport) chock_broker.network.Transport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_broker.network.Transport.VTable{ .lookup = lookupFn, .dial = dialFn };
+
+    fn lookupFn(
+        ptr: *anyopaque,
+        io: std.Io,
+        host: []const u8,
+        port: u16,
+    ) chock_broker.network.Transport.LookupError!chock_broker.network.Transport.Address {
+        _ = io;
+        _ = host;
+        const self: *ProbeTransport = @ptrCast(@alignCast(ptr));
+        self.lookups += 1;
+        var address = self.resolves_to;
+        address.setPort(port);
+        return address;
+    }
+
+    fn dialFn(
+        ptr: *anyopaque,
+        io: std.Io,
+        address: chock_broker.network.Transport.Address,
+    ) chock_broker.network.Transport.DialError!std.posix.fd_t {
+        _ = io;
+        _ = address;
+        const self: *ProbeTransport = @ptrCast(@alignCast(ptr));
+        self.dials += 1;
+        return connectLoopback(self.port) catch error.NotConnected;
+    }
+};
+
+/// What one filtered spawn came back with, for the operation that started it.
+const FilteredRun = struct {
+    term: std.process.Child.Term,
+    lookups: usize,
+    dials: usize,
+    granted: usize,
+    refused: usize,
+};
+
+/// Run `/probe <op> <ports>` inside a real filtered sandbox, with the real
+/// network broker answering.
+///
+/// `chain` is the spawn chain the policy is folded over. `resolves_to` is what
+/// every name answers with. `dial_port` is where a granted connection really
+/// goes.
+fn filteredEscape(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    op: []const u8,
+    ports: []const u8,
+    source: [:0]const u8,
+    chain: []const []const u8,
+    resolves_to: chock_broker.network.Transport.Address,
+    dial_port: u16,
+) !FilteredRun {
+    const base = try baseEscapeConfig(arena);
+    const policy = try chock_policy.table.Table.parse(arena, source, null);
+
+    var transport = ProbeTransport{ .resolves_to = resolves_to, .port = dial_port };
+    var network = chock_broker.network.Network{
+        .gpa = arena,
+        // **Never read.** The transport above ignores it, and this probe must
+        // stay single threaded because `Sandbox.spawn` forks: a `std.Io`
+        // implementation with threads behind it is the one thing that must not
+        // be built here. A field that is never read is the honest way to say
+        // that, and a real one would be the dishonest way.
+        .io = undefined,
+        .table = policy,
+        .chain = chain,
+        .agent_kind = chain[chain.len - 1],
+        .model = "main",
+        .tool = "mcp",
+        .transport = transport.transport(),
+    };
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root,
+        .mounts = base.mounts,
+        .rules = base.rules,
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_broker = network.netBroker(),
+    }, &.{ "/probe", op, ports }, null, null);
+
+    return .{
+        .term = term,
+        .lookups = transport.lookups,
+        .dials = transport.dials,
+        .granted = network.granted,
+        .refused = network.refused,
+    };
+}
+
+/// An address on the public internet, so `addressIsReachable` permits it for
+/// real. Every filtered probe but `spawn-filtered-loopback` uses this.
+const filtered_public_address: chock_broker.network.Transport.Address =
+    .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } };
+
+/// The token a filtered child writes into a granted connection, so the
+/// operation that started it can prove the descriptor really carried the
+/// connection the broker opened.
+const filtered_token = "the-broker-opened-this";
+
+/// The two ports a filtered child is given, as `"<granted>,<other>"`.
+fn filteredPorts(arena: std.mem.Allocator, granted: u16, other: u16) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{d},{d}", .{ granted, other });
+}
+
+/// Read `"<a>,<b>"` back inside the sandbox.
+fn splitPorts(text: []const u8) ?struct { u16, u16 } {
+    const comma = std.mem.indexOfScalar(u8, text, ',') orelse return null;
+    const first = std.fmt.parseInt(u16, text[0..comma], 10) catch return null;
+    const second = std.fmt.parseInt(u16, text[comma + 1 ..], 10) catch return null;
+    return .{ first, second };
+}
+
+/// Try to point `fd` at `127.0.0.1:port`, the way an escape would.
+///
+/// Two calls and not one, because a connected TCP socket refuses a plain
+/// re-connect with `EISCONN` and only gives way after an `AF_UNSPEC`
+/// disconnect. Measured on 2026-08-23: with `connect` allowed, the disconnect
+/// answered 0 and the re-connect answered 0, so this really is a way to aim a
+/// granted descriptor somewhere else.
+///
+/// Gives back the errno of whichever call refused, or `.SUCCESS` when the
+/// socket was aimed somewhere else.
+fn tryToReaim(fd: i32, port: u16) linux.E {
+    var nothing = linux.sockaddr.in{ .family = linux.AF.UNSPEC, .port = 0, .addr = 0 };
+    const loose = linux.connect(fd, @ptrCast(&nothing), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(loose) != .SUCCESS) return linux.errno(loose);
+
+    const address = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    const again = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
+    return linux.errno(again);
+}
+
+/// How many descriptors this process holds, read out of `/proc/self/fd`.
+///
+/// **This is how a filtered child proves a refusal gave it nothing.** An exit
+/// code says what the child decided; the descriptor table says what the child
+/// was actually handed, and a descriptor that arrived would land on a free
+/// number whatever the reply said.
+fn openDescriptorCount() usize {
+    const rc = linux.open("/proc/self/fd", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    const dir: i32 = @intCast(rc);
+    defer _ = linux.close(dir);
+
+    var count: usize = 0;
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const nread = linux.getdents64(dir, &buffer, buffer.len);
+        if (linux.errno(nread) != .SUCCESS or nread == 0) break;
+        var offset: usize = 0;
+        while (offset < nread) {
+            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
+            count += 1;
+            offset += entry.reclen;
+        }
+    }
+    return count;
+}
+
+/// Where the disk probes below put their scratch area, inside the sandbox.
+/// Under `runtime_prefix` because that is the one directory of a sandbox root
+/// that belongs to Chock rather than to the project: see `Sandbox.runtime_prefix`.
+const scratch_target = sandbox.runtime_prefix ++ "/scratch";
+
+/// `baseEscapeConfig` plus one capped scratch area, and the Landlock rule that
+/// makes it writable. **Both, or the area is one the program cannot use**: an
+/// area no rule names is refused by Landlock before the cap ever matters, and a
+/// rule with no area behind it is refused at `landlock_add_rule` because the
+/// path does not exist.
+fn diskEscapeConfig(arena: std.mem.Allocator) !struct {
+    mounts: []const sandbox.namespace.Mount,
+    rules: []const sandbox.Config.Rule,
+    scratch: []const sandbox.namespace.Scratch,
+} {
+    const base = try baseEscapeConfig(arena);
+    const rules = try arena.alloc(sandbox.Config.Rule, base.rules.len + 1);
+    @memcpy(rules[0..base.rules.len], base.rules);
+    rules[base.rules.len] = .{ .path = scratch_target, .access = sandbox.landlock.AccessFs.read_write };
+
+    const scratch = try arena.dupe(sandbox.namespace.Scratch, &.{
+        .{ .target = scratch_target },
+    });
+    return .{ .mounts = base.mounts, .rules = rules, .scratch = scratch };
+}
+
+/// How many children `spawned-fork-bomb` will make before it stops on its
+/// own. The unbounded run reaches exactly this.
+const fork_bomb_cap: u8 = 64;
+/// The process limit the bounded fork bomb run gets. Well under the cap, so
+/// the two runs cannot be confused.
+const fork_bomb_limit: u64 = 8;
+
+/// How many 8 MiB blocks `spawned-mem-bomb` will touch before it stops on its
+/// own. 64 blocks is 512 MiB, which is a bounded amount of work for the
+/// unbounded run and far past the limit the bounded run gets.
+const mem_bomb_cap: u8 = 64;
+/// One block, in bytes. Touched, not only mapped: an untouched mapping is
+/// exactly the thing `RLIMIT_AS` would have refused and `memory.max` would
+/// not, and this probe has to exercise the real one.
+const mem_bomb_block_bytes: usize = 8 << 20;
+/// The memory limit the bounded run gets, for both the resident ceiling and
+/// the mapped ceiling, so this probe proves something on a machine with no
+/// cgroups as well as on one with them.
+const mem_bomb_limit: u64 = 128 << 20;
+
+/// How many extra descriptors `spawned-fd-bomb` will open before it stops on
+/// its own.
+const fd_bomb_cap: u8 = 200;
+/// The descriptor limit the bounded run gets.
+const fd_bomb_limit: u64 = 32;
+
+/// How many small files `spawned-disk-file-bomb` will make before it stops on
+/// its own. The unbounded run reaches exactly this.
+const disk_file_cap: u8 = 250;
+/// How many bytes each of those files carries. Small on purpose: **the attack
+/// is the number of files and not the size of any one of them**, which is
+/// exactly what `RLIMIT_FSIZE` cannot see.
+const disk_file_bytes: usize = 4096;
+
+/// The scratch cap the bounded file bomb run gets.
+///
+/// **Chosen against the page size and never against a number of files.**
+/// Measured on 2026-08-22: a file costs a whole page whatever is in it, so a
+/// cap of 512 KiB holds 8 files on this machine, whose pages are 64 KiB, and
+/// 128 files on an ordinary 4 KiB page machine. Both are far under
+/// `disk_file_cap`, so the bounded run and the unbounded run cannot be
+/// confused on either. A cap chosen so that a 4 KiB page machine fitted more
+/// than `disk_file_cap` files would make this test pass for the wrong reason
+/// there and nowhere else, which is the worst kind of test to own.
+const disk_file_limit: u64 = 512 << 10;
+
+/// How many 64 KiB blocks `spawned-disk-one-bomb` will write into one file
+/// before it stops on its own. The unbounded run reaches exactly this, which is
+/// 12.8 MiB of work.
+const disk_one_cap: u8 = 200;
+/// One block of that file, in bytes.
+const disk_one_block_bytes: usize = 64 << 10;
+/// The one file limit the bounded run of the enormous file gets. Well under
+/// what `disk_one_cap` blocks come to.
+const disk_one_file_limit: u64 = 1 << 20;
+/// The scratch cap that run gets.
+///
+/// **It must be larger than everything `spawned-disk-one-bomb` can write, and
+/// that was measured rather than assumed.** At 8 MiB it was not: the program's
+/// own ceiling is `disk_one_cap` blocks, which is 12.8 MiB, so the area filled
+/// first and **the run passed with `RLIMIT_FSIZE` deleted from the library**.
+/// The mutation check caught it, which is the whole reason to run one rather
+/// than write one down. 64 MiB is five times what the program can write, so the
+/// area can never be the thing that stops it and the file size limit is the
+/// only bound left.
+///
+/// It also has to stay under `rlimits.Limits.scratchFitsUnderMemory`, which the
+/// default memory ceiling of 2 GiB leaves ample room for.
+const disk_one_scratch_limit: u64 = 64 << 20;
+
+/// What a bounded or unbounded limit run ended as, encoded so that
+/// `escape.zig` can read it off the probe's own exit status with no pipe.
+///
+/// **`stopped_legibly` and `stopped_quietly` are different on purpose.** The
+/// project's rule is that a confusing failure costs turns and a plain refusal
+/// costs one, so a limit that stopped a program must also be able to say
+/// which limit it was. `stopped_legibly` means `Sandbox.LimitsReport` named
+/// it; `stopped_quietly` means something stopped the program and the report
+/// could not say what, which is what a machine with no cgroups gets for
+/// memory.
+const LimitOutcome = enum(u8) {
+    stopped_legibly = 10,
+    stopped_quietly = 11,
+    /// The program ran to its own internal cap. **Nothing bounded it.**
+    not_stopped = 12,
+    /// The program ended in a way this probe cannot read.
+    unreadable = 13,
+    /// The cgroup layer did not apply on this machine, so the run that was
+    /// about the cgroup specifically proved nothing and the test that asked
+    /// for it skips. **Only the `-cgroup` operations ever answer this**, and
+    /// they answer it before they read the outcome at all, so a cgroup that
+    /// applied and then bounded nothing is still a failure and not a skip.
+    no_cgroup = 14,
+};
+
+/// Read one limit run's outcome off the `Term` the inner sandbox ended with.
+///
+/// `cap` is the program's own internal ceiling, and reaching it is the one
+/// outcome that means no limit did anything. `named` is whether
+/// `Sandbox.LimitsReport` could say which limit it was.
+fn limitOutcome(term: std.process.Child.Term, cap: u8, named: bool) u8 {
+    return @intFromEnum(switch (term) {
+        .exited => |code| blk: {
+            if (code >= cap) break :blk LimitOutcome.not_stopped;
+            // A count below the program's own cap means a syscall was
+            // refused: a fork that answered EAGAIN, an allocation that
+            // answered ENOMEM, an open that answered EMFILE.
+            break :blk if (named) LimitOutcome.stopped_legibly else LimitOutcome.stopped_quietly;
+        },
+        // Killed. `memory.max` does this, and so does the cpu limit.
+        .signal => if (named) LimitOutcome.stopped_legibly else LimitOutcome.stopped_quietly,
+        else => LimitOutcome.unreadable,
+    });
+}
+
+/// Turn the Term of a process spawned through sandbox.spawn into this process's
+/// own exit status, so the test that started this probe can read the inner
+/// sandbox's outcome straight off this probe's own Term.
+fn reportChildTerm(term: std.process.Child.Term) u8 {
+    switch (term) {
+        .signal => |sig| {
+            // Re-raising should end this process by the same signal, so the
+            // failure to raise is the only outcome that can still reach the
+            // return below. Name it, so that path is never silent.
+            std.posix.raise(sig) catch |err| {
+                std.debug.print("could not re-raise {s}: {s}\n", .{ @tagName(sig), @errorName(err) });
+            };
+            return 1;
+        },
+        .exited => |code| return code,
+        else => return 2,
+    }
+}
+
+/// Set by `onCallerSignal` when a caught signal reaches this process. Read by
+/// the three signal operations below, each of which has to tell "the signal
+/// was delivered here" from "the signal went nowhere at all".
+var caller_signal_seen: std.atomic.Value(bool) = .init(false);
+
+/// A handler that does one thing and one thing only, the same rule
+/// `src/interrupt.zig` follows: a handler runs between any two instructions of
+/// the program it interrupts, so it takes no lock and reaches no allocator.
+fn onCallerSignal(_: std.posix.SIG) callconv(.c) void {
+    caller_signal_seen.store(true, .monotonic);
+}
+
+/// Catch `sig` instead of dying from it, and record that it arrived.
+///
+/// **A process that dies cannot report anything**, and the signal operations
+/// below have to survive a signal aimed at their own group so they can say
+/// afterwards whether it arrived. The default action of every signal they use
+/// ends a process, so without this the report would be the death itself,
+/// which is the same outcome for two different reasons.
+fn catchSignal(sig: std.posix.SIG) void {
+    const action = std.posix.Sigaction{
+        .handler = .{ .handler = onCallerSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(sig, &action, null);
+}
+
+/// How long a probe waits for a condition that a working build reaches in
+/// milliseconds, and how often it looks. Reaching the bound is a bug
+/// detector, never an expected wait: every caller of it treats the bound as a
+/// failure with its own exit code, so a broken build fails the test rather
+/// than hanging the suite.
+const probe_wait_bound_ns: u64 = 10 * std.time.ns_per_s;
+const probe_wait_step_ns: u64 = 1 * std.time.ns_per_ms;
+
+/// True when `path` names something the kernel can stat. Used to wait for a
+/// marker file another process writes, which is how the operations below stay
+/// in step with each other without a fixed sleep guessed to be long enough.
+fn pathExists(path: [:0]const u8) bool {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+/// Wait, bounded, for `path` to appear. False when the bound ran out first.
+fn waitForPath(path: [:0]const u8) bool {
+    var waited: u64 = 0;
+    while (waited < probe_wait_bound_ns) : (waited += probe_wait_step_ns) {
+        if (pathExists(path)) return true;
+        _ = linux.nanosleep(&.{ .sec = 0, .nsec = @intCast(probe_wait_step_ns) }, null);
+    }
+    return pathExists(path);
+}
+
+/// One `sandbox.spawn` call, running on a thread of its own so the thread
+/// that started it can still act while `spawn` is blocked on the sandboxed
+/// program. `spawn` is synchronous, so this is the only way an operation can
+/// both learn the pid of the process `spawn` forked and do something with it
+/// before the whole call finishes: the same shape `lib/chock-core/tools.zig`
+/// uses for the same reason.
+const ThreadedSpawn = struct {
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    mounts: []const sandbox.namespace.Mount,
+    rules: []const sandbox.Config.Rule,
+    argv: []const []const u8,
+    middle: sandbox.Middle = .{},
+    term: std.process.Child.Term = undefined,
+    spawn_err: ?anyerror = null,
+    /// Set with `.release` after `term` or `spawn_err` is already written, so
+    /// an `.acquire` load of it makes a plain read of either one safe.
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *ThreadedSpawn) void {
+        self.term = sandbox.spawn(self.allocator, .{
+            .root = self.root,
+            .mounts = self.mounts,
+            .rules = self.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, self.argv, null, &self.middle) catch |err| {
+            self.spawn_err = err;
+            self.done.store(true, .release);
+            return;
+        };
+        self.done.store(true, .release);
+    }
+
+    /// Wait, bounded, for `spawn` to fill in the pid of the process it forked.
+    /// 0 when the bound ran out first, which `spawn` reaches within
+    /// microseconds of its first fork, so it never happens in a working build.
+    fn waitForMiddlePid(self: *ThreadedSpawn) linux.pid_t {
+        var waited: u64 = 0;
+        while (waited < probe_wait_bound_ns) : (waited += probe_wait_step_ns) {
+            const pid = @atomicLoad(linux.pid_t, &self.middle.pid, .acquire);
+            if (pid != 0) return pid;
+            if (self.done.load(.acquire)) return 0;
+            _ = linux.nanosleep(&.{ .sec = 0, .nsec = @intCast(probe_wait_step_ns) }, null);
+        }
+        return @atomicLoad(linux.pid_t, &self.middle.pid, .acquire);
+    }
+
+    /// Wait, bounded, for the call to finish. False when the bound ran out
+    /// first, which is a real answer and not only a broken build: a `spawn`
+    /// that never returns after the process it forked was signalled is
+    /// exactly the fault `spawn-signal-middle-handled` looks for.
+    fn waitForDone(self: *ThreadedSpawn) bool {
+        var waited: u64 = 0;
+        while (waited < probe_wait_bound_ns) : (waited += probe_wait_step_ns) {
+            if (self.done.load(.acquire)) return true;
+            _ = linux.nanosleep(&.{ .sec = 0, .nsec = @intCast(probe_wait_step_ns) }, null);
+        }
+        return self.done.load(.acquire);
+    }
+
+    /// End every process of the call, whatever state it is in. Called on
+    /// every failure path, so a broken build never leaves a sandboxed program
+    /// running after the suite has moved on. SIGKILL, because a failure path
+    /// here has already stopped believing anything answers a polite signal.
+    ///
+    /// Through the handle, which reaches the middle process only and still
+    /// ends the whole call: see `sandbox.spawn`'s own doc comment. A `kill` on
+    /// the negated number would be the very fault `sandbox.Middle` exists to
+    /// remove, and a probe is not exempt from it.
+    fn killCall(self: *ThreadedSpawn) void {
+        if (@atomicLoad(linux.pid_t, &self.middle.pid, .acquire) == 0) return;
+        sandbox.signalMiddle(self.middle.fd, .KILL) catch {};
+    }
+
+    /// Give the handle up. Only after `spawn` has returned: see
+    /// `sandbox.Middle`.
+    fn closeHandle(self: *ThreadedSpawn) void {
+        sandbox.closeMiddle(&self.middle);
+    }
+};
+
+/// The mount tree and Landlock rules a spawn operation needs when the
+/// sandboxed program has to write into `root/work` and read what the caller
+/// writes there. `baseEscapeConfig` on its own gives no writable path.
+fn workEscapeConfig(arena: std.mem.Allocator, root: []const u8) !struct {
+    mounts: []const sandbox.namespace.Mount,
+    rules: []const sandbox.Config.Rule,
+} {
+    const work = try std.fs.path.join(arena, &.{ root, "work" });
+    try makeTestDir(arena, work);
+
+    const base = try baseEscapeConfig(arena);
+    const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+        base.mounts,
+        &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
+    });
+    const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+        base.rules,
+        &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+    });
+    return .{ .mounts = mounts, .rules = rules };
+}
+
+/// The content written to the source file in enterFileOverFileTestRoot, and
+/// checked back out of the bound target afterward.
+const file_over_file_content = "chock file over file probe content\n";
+
+/// The path spawned-landlock-read tries to open. spawn-landlock-escape writes a
+/// file here, inside the root it hands to sandbox.spawn, but never names it in
+/// the rules it hands along beside it, so only a missing Landlock layer could
+/// let the read through.
+const spawned_landlock_target = "/unguarded/marker";
+
+/// Build a sandbox root that binds a file onto a target path which does not
+/// exist anywhere in the root yet. This is different from enterTestRoot's
+/// chock.zon case, where source and target are the same already-existing path.
+/// A fresh target is what exercises the real bug: makePath used to always
+/// create a directory for a mount target, so a file bound onto a target that did
+/// not already exist failed with ENOTDIR. chock.zon itself is protected this
+/// way in a real project, source and target both files, so this has to work.
+fn enterFileOverFileTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
+    const source = try std.fs.path.join(arena, &.{ root, "source-file" });
+    try writeTestFile(arena, source, file_over_file_content);
+
+    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+    try sandbox.namespace.buildRoot(arena, root, &.{
+        .{ .bind = .{ .source = source, .target = "/marker", .read_only = false } },
+    }, null);
+    try sandbox.namespace.pivotInto(arena, root, null);
+}
+
+/// Build a sandbox root with one directory, "guarded", bound read only, with a
+/// tmpfs mounted inside it before the read only mark is applied.
+///
+/// This is the order a reviewer used to prove that a plain remount is not
+/// recursive: mount something under a directory, mark the directory read only,
+/// then show the thing underneath is still writable. The submount has to exist
+/// under "guarded" before buildRoot binds "guarded" onto itself, because a bind
+/// mount only carries along the submounts that already exist under its source at
+/// the moment it runs, not ones added later.
+///
+fn enterSubmountTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
+    const guarded = try std.fs.path.join(arena, &.{ root, "guarded" });
+    const sub = try std.fs.path.join(arena, &.{ guarded, "sub" });
+    try makeTestDir(arena, guarded);
+
+    try sandbox.namespace.enter(.{ .network = .none, .mount = true });
+
+    try makeTestDir(arena, sub);
+    try mountTmpfs(arena, sub);
+
+    try sandbox.namespace.buildRoot(arena, root, &.{
+        .{ .bind = .{ .source = guarded, .target = "/guarded", .read_only = true } },
+    }, null);
+    try sandbox.namespace.pivotInto(arena, root, null);
+}
+
+fn mountTmpfs(arena: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try arena.dupeZ(u8, path);
+    if (linux.errno(linux.mount(null, path_z.ptr, "tmpfs", 0, 0)) != .SUCCESS) {
+        return error.SetupFailed;
+    }
+}
+
+/// Create a private shared memory segment of one page.
+fn createShmSegment() !usize {
+    const ipc_private: usize = 0;
+    const ipc_creat: usize = 0o1000;
+    const size: usize = 4096;
+    const shmid = linux.syscall3(.shmget, ipc_private, size, ipc_creat | 0o600);
+    if (linux.errno(shmid) != .SUCCESS) return error.ShmgetFailed;
+    return shmid;
+}
+
+/// Mark a shared memory segment for removal. The kernel destroys a segment with
+/// IPC_RMID the moment it has zero attaches, so this must run after the shmat
+/// attempt, not before: calling it right after shmget, while nattch is still
+/// zero, destroys the segment on the spot and turns a later shmat into EINVAL,
+/// no matter what shmflg asked for.
+fn removeShmSegment(shmid: usize) void {
+    const ipc_rmid: usize = 0;
+    _ = linux.syscall3(.shmctl, shmid, ipc_rmid, 0);
+}
+
+/// The directory outside every Landlock rule, for the write and truncate
+/// probes below. A subdirectory of `root`, the scratch space the caller
+/// already made and owns the cleanup of.
+fn outsideDir(arena: std.mem.Allocator, root: []const u8) ![:0]const u8 {
+    return std.fmt.allocPrintSentinel(arena, "{s}/outside", .{root}, 0);
+}
+
+/// Build one directory a Landlock rule permits, and one directory it never
+/// names, both under `root`, then restrict this process to the ruleset.
+/// Returns the permitted directory, allocated from the arena so it survives
+/// after this returns. Every setup failure here must reach the caller as an
+/// error, never a bare process exit, so a broken ruleset cannot be mistaken
+/// for a working one that correctly refused the probed operation.
+fn enterLandlockWriteTestRoot(arena: std.mem.Allocator, root: []const u8) ![:0]const u8 {
+    const inside = try std.fmt.allocPrintSentinel(arena, "{s}/inside", .{root}, 0);
+    try makeTestDir(arena, inside);
+    try makeTestDir(arena, try outsideDir(arena, root));
+
+    const abi = try sandbox.landlock.probeAbi();
+    var ruleset = try sandbox.landlock.Ruleset.init(abi, null);
+    // Permit one directory only. Every other path is refused.
+    try ruleset.allowPath(inside, sandbox.landlock.AccessFs.read_write, null);
+    try ruleset.restrictSelf(null);
+    // The kernel keeps its own reference to the ruleset once restrictSelf
+    // succeeds, so the fd this process held is no longer needed.
+    ruleset.deinit();
+    return inside;
+}
+
+/// Same permitted/forbidden directory split as enterLandlockWriteTestRoot, but
+/// each directory also gets a file with content, since truncate needs a file
+/// that already exists to prove anything.
+fn enterLandlockTruncateTestRoot(arena: std.mem.Allocator, root: []const u8) !struct {
+    inside_file: [:0]const u8,
+    outside_file: [:0]const u8,
+} {
+    const inside = try std.fmt.allocPrintSentinel(arena, "{s}/inside", .{root}, 0);
+    const inside_file = try std.fmt.allocPrintSentinel(arena, "{s}/file", .{inside}, 0);
+    try makeTestDir(arena, inside);
+    try writeTestFile(arena, inside_file, "chock landlock truncate probe content\n");
+
+    const outside_file = try std.fmt.allocPrintSentinel(arena, "{s}/truncate-file", .{try outsideDir(arena, root)}, 0);
+    try makeTestDir(arena, try outsideDir(arena, root));
+    try writeTestFile(arena, outside_file, "chock landlock truncate probe content\n");
+
+    const abi = try sandbox.landlock.probeAbi();
+    var ruleset = try sandbox.landlock.Ruleset.init(abi, null);
+    // Permit one directory only. Every other path is refused.
+    try ruleset.allowPath(inside, sandbox.landlock.AccessFs.read_write, null);
+    try ruleset.restrictSelf(null);
+    ruleset.deinit();
+    return .{ .inside_file = inside_file, .outside_file = outside_file };
+}
+
+// Zig 0.16 removed std.process.argsAlloc. A hosted main can instead take
+// std.process.Init.Minimal as its first parameter, and the runtime fills it in.
+pub fn main(init: std.process.Init.Minimal) !u8 {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try init.args.toSlice(arena);
+    if (args.len < 2) {
+        std.debug.print("usage: probe <operation> [host-id]\n", .{});
+        return 2;
+    }
+    // "spawn-ptrace", "spawn-landlock-escape", and "spawn-network-escape" belong here
+    // for a different reason: each one forks and lets sandbox.spawn build the whole
+    // sandbox, including its own call to unshare, inside that child. A seccomp filter
+    // installed here on this process would be inherited across the fork, since a
+    // filter can never be removed, and would kill the child's unshare before
+    // Sandbox.spawn ever reached the point of installing its own filter after the
+    // mount tree and Landlock rules. The test would then still see a death by SIGSYS,
+    // but for the wrong reason, and would no longer prove the ordering it claims to
+    // prove.
+    const builds_own_root = std.mem.eql(u8, args[1], "read-home") or
+        std.mem.eql(u8, args[1], "write-readonly") or
+        std.mem.eql(u8, args[1], "delete-mounted-file") or
+        std.mem.eql(u8, args[1], "write-readonly-submount") or
+        std.mem.eql(u8, args[1], "file-bind-content") or
+        std.mem.eql(u8, args[1], "spawn-ptrace") or
+        std.mem.eql(u8, args[1], "spawn-landlock-escape") or
+        std.mem.eql(u8, args[1], "spawn-network-escape") or
+        std.mem.eql(u8, args[1], "spawn-signal-host") or
+        std.mem.eql(u8, args[1], "spawn-shm-attach") or
+        std.mem.eql(u8, args[1], "spawn-report-pid") or
+        std.mem.eql(u8, args[1], "spawn-stdin-devnull") or
+        std.mem.eql(u8, args[1], "spawn-stdin-pipe") or
+        std.mem.eql(u8, args[1], "spawn-proc-mask") or
+        std.mem.eql(u8, args[1], "spawn-proc-live") or
+        // The two setup fault operations. Each one lets `Sandbox.spawn` fail
+        // to build a sandbox in a child of its own, so each belongs here for
+        // the reason above: a filter installed on this process first would be
+        // inherited across that fork and would kill the child's own `unshare`
+        // before the mount step this operation is about could ever run.
+        std.mem.eql(u8, args[1], "spawn-setup-fault-named-stderr") or
+        std.mem.eql(u8, args[1], "spawn-setup-fault-default-stderr") or
+        std.mem.eql(u8, args[1], "spawn-setup-fault-closed-stderr") or
+        std.mem.eql(u8, args[1], "spawn-forge-exit") or
+        std.mem.eql(u8, args[1], "spawn-signal-middle") or
+        std.mem.eql(u8, args[1], "spawn-signal-middle-forked") or
+        std.mem.eql(u8, args[1], "spawn-signal-middle-handled") or
+        std.mem.eql(u8, args[1], "spawn-signal-group") or
+        std.mem.eql(u8, args[1], "spawn-approval-socket") or
+        std.mem.eql(u8, args[1], "spawn-group-press") or
+        // The filtered network operations. Each one makes its own listening
+        // sockets, parses its own policy, and spawns a real sandbox with a
+        // real broker answering it. See `filteredEscape`.
+        std.mem.startsWith(u8, args[1], "spawn-filtered-") or
+        // The three resource limit runs, each in a bounded and an unbounded
+        // form. They belong here for the reason every other "spawn-" operation
+        // does: each one forks and lets sandbox.spawn build the whole sandbox
+        // inside that child, and a seccomp filter installed on this process
+        // first would be inherited and would kill that child's own unshare.
+        std.mem.eql(u8, args[1], "spawn-fork-bomb") or
+        std.mem.eql(u8, args[1], "spawn-fork-bomb-unbounded") or
+        std.mem.eql(u8, args[1], "spawn-mem-bomb") or
+        std.mem.eql(u8, args[1], "spawn-mem-bomb-unbounded") or
+        std.mem.eql(u8, args[1], "spawn-mem-bomb-cgroup") or
+        std.mem.eql(u8, args[1], "spawn-fd-bomb") or
+        std.mem.eql(u8, args[1], "spawn-fd-bomb-unbounded") or
+        // The two disk runs, in the same two forms and for the same reason.
+        std.mem.startsWith(u8, args[1], "spawn-disk-");
+
+    // The Landlock write and truncate probes build two plain directories of their
+    // own, "inside" and "outside" a granted ruleset, but never a mount tree: no
+    // namespace is entered for them, so they are not part of builds_own_root above,
+    // which is about which operations must skip the seccomp filter. They still need
+    // scratch space from the caller, the same as every builds_own_root operation.
+    const needs_scratch_root = builds_own_root or
+        std.mem.eql(u8, args[1], "landlock-write-outside") or
+        std.mem.eql(u8, args[1], "landlock-write-inside") or
+        std.mem.eql(u8, args[1], "landlock-truncate-outside") or
+        std.mem.eql(u8, args[1], "landlock-truncate-inside");
+
+    // "spawn-signal-host", "spawn-shm-attach", and their "spawned-" targets carry one
+    // more argument: a host pid or a host shmid that the caller (escape.zig, or this
+    // same probe one layer up) made outside every namespace. "session-keyring-fresh"
+    // carries one too: the description of a key escape.zig planted in its own session
+    // keyring. None of these operations can pick a meaningful target on its own; each
+    // has to be handed one that is real.
+    const needs_id_arg = std.mem.eql(u8, args[1], "spawn-signal-host") or
+        std.mem.eql(u8, args[1], "spawned-signal-host") or
+        std.mem.eql(u8, args[1], "spawn-shm-attach") or
+        std.mem.eql(u8, args[1], "spawned-shm-attach") or
+        // The approval socket lives beside the session log, on a path no
+        // mount list names. Neither of these two can
+        // invent that path: escape.zig makes a real socket, proves the host can
+        // reach it, and hands the path down.
+        std.mem.eql(u8, args[1], "spawn-approval-socket") or
+        std.mem.eql(u8, args[1], "spawned-approval-socket") or
+        // The descriptor the caller left open on the host root. Only the
+        // caller knows which number it landed on, and the whole point of the
+        // check is that the number names nothing by the time it is read.
+        std.mem.eql(u8, args[1], "spawned-stdin-pipe") or
+        // The two ports a filtered child is given: the one a granted
+        // connection really goes to, and the one it must not be able to
+        // reach. Both are ephemeral, so no rule and no constant could name
+        // them and the operation that spawned this one has to pass them down.
+        std.mem.startsWith(u8, args[1], "spawned-filtered-") or
+        std.mem.eql(u8, args[1], "session-keyring-fresh");
+
+    // A needs_scratch_root operation reads its scratch root off the command line,
+    // right after the operation name: the caller already knows where that should
+    // live, through std.testing.tmpDir, so this probe never invents a location of
+    // its own, the way it once built one from its own pid. An id argument, when
+    // there is one, always comes right after that.
+    const expected_args: usize = 2 +
+        @as(usize, if (needs_scratch_root) 1 else 0) +
+        @as(usize, if (needs_id_arg) 1 else 0);
+    if (args.len != expected_args) {
+        std.debug.print("usage: probe <operation> [root] [id]\n", .{});
+        return 2;
+    }
+    var next_arg: usize = 2;
+    const root_arg: []const u8 = blk: {
+        if (!needs_scratch_root) break :blk "";
+        const value = args[next_arg];
+        next_arg += 1;
+        break :blk value;
+    };
+    const id_arg: []const u8 = blk: {
+        if (!needs_id_arg) break :blk "";
+        const value = args[next_arg];
+        next_arg += 1;
+        break :blk value;
+    };
+
+    // A "spawned-" operation does no setup at all, not even its own filter. It is
+    // only ever reached by exec, as the child of a real Sandbox.spawn call, so every
+    // layer it can run into was already put there by that call's applyLayers. This is
+    // the property Finding 1 needs: a "spawned-" operation must have no path of its
+    // own to the outcome it checks, or a mutation that deletes a whole layer from
+    // applyLayers could still pass by the operation's own doing, the same bug that
+    // made the old "spawn-ptrace" probe worthless as a test.
+    const spawned = std.mem.startsWith(u8, args[1], "spawned-");
+
+    // A "netns-" operation must enter the namespaces instead of installing the filter.
+    // `unshare` is in the seccomp filter's blocked call list, so installing the filter
+    // first would kill the probe with SIGSYS before it could ever reach unshare.
+    //
+    // "read-home", "write-readonly", "delete-mounted-file", and
+    // "write-readonly-submount" also need the namespaces and not the filter: mount
+    // and pivot_root are blocked calls too, and the mount tree they probe would not
+    // exist under seccomp. They enter the namespaces themselves inside
+    // enterTestRoot or enterSubmountTestRoot, with different options than the
+    // netns- path uses, so this block must not call enter for them, or the second
+    // unshare would run inside a namespace the first one already built.
+    //
+    if (spawned) {
+        // Nothing to set up. See the comment on `spawned` above.
+    } else if (std.mem.startsWith(u8, args[1], "netns-")) {
+        // A setup failure is not the same fact as the kernel refusing the probed
+        // operation. Give it its own exit code, so a broken `unshare` cannot be
+        // mistaken for a network namespace that did its job. Name the error, so the
+        // failure is never silent.
+        sandbox.namespace.enter(.{}) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+    } else if (std.mem.eql(u8, args[1], "session-keyring-fresh")) {
+        // Nothing to set up here either: this operation calls the join directly
+        // below and reads the result straight back. No seccomp filter goes on,
+        // because the read-back has to call request_key, one of the very calls
+        // Finding 1 also adds to blocked_calls, and installing the filter here
+        // would kill this process before it could ever prove anything.
+    } else if (!builds_own_root) {
+        // Several operations below expect a plain exit code of 1 as their
+        // "refused" pass, with no signal involved: mmap-wx, pkey-wx,
+        // personality-rwx, shmat-exec, and landlock-write-outside. A bare try
+        // here would turn a broken filter build into exactly that same exit
+        // code 1, and the test would read a setup bug as a pass. Give this its
+        // own exit code instead, the same as every other setup step in this
+        // file.
+        const insns = sandbox.seccomp.build(arena, .{}) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        sandbox.seccomp.install(sandbox.bpf.Prog.init(insns)) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+    }
+
+    if (std.mem.eql(u8, args[1], "netns-connect")) {
+        // A failed connect alone proves nothing on a machine with no route at all,
+        // that would pass with no namespace entered. Read the routing table inside
+        // the namespace first, and require it to hold no route.
+        //
+        // /proc/net/route always prints a header line starting with "Iface" when it
+        // prints anything at all, but this kernel prints zero bytes, not even the
+        // header, while `lo` is down, which is the state `namespace.enter` leaves
+        // it in. So the check below skips the header if present and counts only
+        // the data rows, rather than assuming a fixed line count.
+        var route_buf: [4096]u8 = undefined;
+        const route_fd = linux.open("/proc/net/route", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(route_fd) != .SUCCESS) {
+            std.debug.print(
+                "could not open /proc/net/route: {s}\n",
+                .{@tagName(linux.errno(route_fd))},
+            );
+            return 4;
+        }
+        const route_handle: i32 = @intCast(route_fd);
+        defer _ = linux.close(route_handle);
+
+        const read_rc = linux.read(route_handle, &route_buf, route_buf.len);
+        if (linux.errno(read_rc) != .SUCCESS) {
+            std.debug.print(
+                "could not read /proc/net/route: {s}\n",
+                .{@tagName(linux.errno(read_rc))},
+            );
+            return 4;
+        }
+        var route_rows: usize = 0;
+        var route_line_it = std.mem.splitScalar(u8, route_buf[0..read_rc], '\n');
+        while (route_line_it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "Iface")) continue; // the header line
+            route_rows += 1;
+        }
+        if (route_rows != 0) {
+            std.debug.print(
+                "routing table has a route, the network namespace was not entered\n",
+                .{},
+            );
+            return 4;
+        }
+
+        // The routing table is empty. Now prove the same thing from the connect
+        // side: the failure must be ENETUNREACH specifically, not some other fault
+        // that would also return a nonzero exit code but proves nothing about the
+        // namespace.
+        const fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        if (linux.errno(fd) != .SUCCESS) return 1;
+        var addr = std.mem.zeroes(linux.sockaddr.in);
+        addr.family = linux.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, 53);
+        // 1.1.1.1
+        addr.addr = std.mem.nativeToBig(u32, 0x01010101);
+        const rc = linux.connect(@intCast(fd), @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        const connect_errno = linux.errno(rc);
+        if (connect_errno != .NETUNREACH) {
+            std.debug.print(
+                "connect did not fail with ENETUNREACH, got: {s}\n",
+                .{@tagName(connect_errno)},
+            );
+            return 4;
+        }
+        return 1;
+    }
+    if (std.mem.eql(u8, args[1], "netns-loopback")) {
+        // A network namespace must still permit a unix socket, so that a local pipe and
+        // a client socket keep working.
+        const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+        return if (linux.errno(fd) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, args[1], "session-keyring-fresh")) {
+        // Prove Finding 1's join actually replaces the session keyring, not just
+        // that request_key returns something. id_arg is the description of a
+        // key escape.zig planted in its own session keyring, the same one this
+        // process inherited across the fork before the join runs. A search that
+        // still finds it would mean the join changed nothing and the host's
+        // session keyring is still reachable from in here.
+        sandbox.Sandbox.joinFreshSessionKeyring(std.posix.STDERR_FILENO) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        const description_z = arena.dupeZ(u8, id_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        // "user" matches the type escape.zig used when it planted the key.
+        const key_type = "user";
+        const rc = linux.syscall4(
+            .request_key,
+            @intFromPtr(key_type.ptr),
+            @intFromPtr(description_z.ptr),
+            0,
+            0,
+        );
+        const find_errno = linux.errno(rc);
+        if (find_errno == .SUCCESS) return 0; // Found the host's key. The join did nothing.
+        // A fresh keyring holds no key under this description, so the kernel must
+        // refuse with ENOKEY specifically, not some other fault that would also be
+        // nonzero but prove nothing.
+        return if (find_errno == .NOKEY) 1 else 5;
+    }
+
+    // The operations below are the "spawned-" ones. No code above this point ran
+    // for them: no filter, no namespace, no ruleset. They only exist to be the
+    // exec target of a real Sandbox.spawn call, from one of the "spawn-" operations
+    // further down, so whatever they hit is entirely the doing of that call's
+    // applyLayers. This is what Finding 1 needs: deleting any one layer from
+    // applyLayers must change the outcome one of these sees, because nothing else
+    // in this process could have produced it.
+    if (std.mem.eql(u8, args[1], "spawned-ptrace")) {
+        const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
+        // A seccomp filter that is actually installed kills this process before this
+        // line runs. Reaching it at all means the filter spawn was supposed to
+        // install never came up.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.startsWith(u8, args[1], "spawned-filtered-")) {
+        const ports = splitPorts(id_arg) orelse {
+            std.debug.print("the two ports a filtered child is given are not two numbers: {s}\n", .{id_arg});
+            return 3;
+        };
+        const granted_port = ports[0];
+        const other_port = ports[1];
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-connect")) {
+            // A filtered process opening a connection of its own. **The
+            // errno is the whole test**: an empty network namespace answers
+            // `ENETUNREACH` on its own, so a probe that only checked for a
+            // failure would pass with the filter deleted.
+            const socket_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+            if (linux.errno(socket_rc) != .SUCCESS) {
+                // Making a socket is not what is refused, and a filter that
+                // refused it would be one this design never asked for.
+                std.debug.print("socket: {t}\n", .{linux.errno(socket_rc)});
+                return 3;
+            }
+            const fd: i32 = @intCast(socket_rc);
+            defer _ = linux.close(fd);
+
+            const address = linux.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, granted_port),
+                .addr = std.mem.nativeToBig(u32, 0x7f000001),
+            };
+            const rc = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
+            const err = linux.errno(rc);
+            if (err == .SUCCESS) return 0; // Reached a host on its own.
+            if (err == .PERM) return 1; // The filter refused it, which is the design.
+            std.debug.print("connect answered {t}, not EPERM\n", .{err});
+            return 5;
+        }
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-grant")) {
+            // Ask, use, and then try to aim the answer somewhere else.
+            const answer = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            const handle = switch (answer) {
+                .granted => |fd| fd,
+                .refused => {
+                    std.debug.print("a host the policy permits was refused\n", .{});
+                    return 3;
+                },
+            };
+            defer _ = linux.close(handle);
+
+            // **The descriptor really carries the connection.** The operation
+            // that spawned this one accepts on that listener afterwards and
+            // reads these bytes back, so a grant that handed over some other
+            // descriptor cannot pass.
+            const written = linux.write(handle, filtered_token, filtered_token.len);
+            if (linux.errno(written) != .SUCCESS or written != filtered_token.len) {
+                std.debug.print("the granted descriptor would not carry bytes\n", .{});
+                return 3;
+            }
+
+            // And it cannot be aimed anywhere else. `EPERM` is the filter; a
+            // success is an escape; anything else means something other than
+            // the filter refused it and must not read as a pass.
+            const reaim = tryToReaim(handle, other_port);
+            if (reaim == .SUCCESS) return 1;
+            if (reaim != .PERM) {
+                std.debug.print("re-aiming answered {t}, not EPERM\n", .{reaim});
+                return 5;
+            }
+            return 0;
+        }
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-refused")) {
+            // **What a refusal tells this process, which must be nothing.**
+            // The descriptor table before and after is the whole check: a
+            // refusal that carried a descriptor would raise the count, and a
+            // refusal that carried a reason would have to arrive somewhere
+            // this process could read.
+            const before = openDescriptorCount();
+            const answer = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_refused_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            switch (answer) {
+                .granted => |fd| {
+                    _ = linux.close(fd);
+                    return 1; // A host the policy refuses was reached.
+                },
+                .refused => {},
+            }
+            if (openDescriptorCount() != before) {
+                std.debug.print("a refusal changed this process's descriptor table\n", .{});
+                return 5;
+            }
+
+            // And a permitted host on the same socket is still granted, so
+            // the refusal above is the policy and not a broken channel. This
+            // is what stops the test passing against a broker that refuses
+            // everything.
+            const good = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("the second ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            switch (good) {
+                .granted => |fd| {
+                    _ = linux.close(fd);
+                    return 0;
+                },
+                .refused => {
+                    std.debug.print("a host the policy permits was refused too\n", .{});
+                    return 5;
+                },
+            }
+        }
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-budget")) {
+            // Ask one more time than the far end will answer, and require the
+            // extra one to be the end of the stream.
+            //
+            // **Two facts in one run.** The far end really does stop at
+            // `max_requests`, so a sandboxed process cannot make it work
+            // without bound. And an ask past that point answers: it does not
+            // leave this process blocked until the call's own deadline, and it
+            // does not end this process with a bare signal number.
+            //
+            // Every ask is for a host the policy refuses, so nothing is
+            // resolved and nothing is dialled: this run costs the far end its
+            // budget in policy reads and nothing else.
+            // **Two asks past the end and not one.** The first one past the
+            // budget usually reaches the socket before the far end's close
+            // does, so its bytes go into a buffer and the end of the stream
+            // arrives on the read. The second is sent when the peer is
+            // certainly gone, so it is the one that exercises a send onto a
+            // closed socket rather than a read of a closed one.
+            var made: usize = 0;
+            var gone_at: ?usize = null;
+            while (made <= sandbox.net_broker.max_requests + 1) : (made += 1) {
+                const answer = sandbox.net_broker.ask(
+                    sandbox.net_broker.fd_number,
+                    filtered_refused_host,
+                    granted_port,
+                ) catch |err| {
+                    if (err != error.BrokerGone) {
+                        std.debug.print("ask {d} failed with {s}\n", .{ made, @errorName(err) });
+                        return 5;
+                    }
+                    if (gone_at == null) {
+                        if (made != sandbox.net_broker.max_requests) {
+                            std.debug.print("the far end went at ask {d}\n", .{made});
+                            return 5;
+                        }
+                        gone_at = made;
+                    }
+                    continue;
+                };
+                if (gone_at != null) {
+                    std.debug.print("the far end answered again after it had gone\n", .{});
+                    return 5;
+                }
+                switch (answer) {
+                    .granted => |fd| {
+                        _ = linux.close(fd);
+                        return 1;
+                    },
+                    .refused => {},
+                }
+            }
+            if (gone_at == null) {
+                std.debug.print("the far end answered past its own budget\n", .{});
+                return 5;
+            }
+            return 0;
+        }
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-ask")) {
+            // The plainest one: ask for the permitted host and say whether it
+            // was granted. Used by the operations that vary the policy rather
+            // than the sandbox.
+            const answer = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            switch (answer) {
+                .granted => |fd| {
+                    _ = linux.close(fd);
+                    return 0;
+                },
+                .refused => return 1,
+            }
+        }
+
+        std.debug.print("unknown filtered network operation: {s}\n", .{args[1]});
+        return 2;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-landlock-read")) {
+        // spawned_landlock_target is bound into the sandbox root by the
+        // spawn-landlock-escape operation below, through the recursive bind that
+        // carries root's own content, but no Landlock rule ever names it.
+        const fd = linux.open(spawned_landlock_target, .{ .ACCMODE = .RDONLY }, 0);
+        const open_errno = linux.errno(fd);
+        if (open_errno == .SUCCESS) {
+            _ = linux.close(@intCast(fd));
+            return 0; // Opened a path no rule named. The ruleset never applied.
+        }
+        // A path that no rule names is refused with EACCES, the same as every other
+        // Landlock refusal in this file.
+        return if (open_errno == .ACCES) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-fork-bomb")) {
+        // A fork bomb, capped from the inside so the unbounded run is bounded
+        // work on the machine running the tests. Every child blocks for ever
+        // on a pipe nobody writes to, so it stays a live process and really
+        // counts against `pids.max` and `RLIMIT_NPROC`. A child that exited
+        // would count too, as a zombie, but only until something reaped it,
+        // and "only until" is not a property a test should rest on.
+        //
+        // This process is process 1 of its own pid namespace, so when it
+        // returns the kernel kills every child it left behind. Nothing here
+        // has to clean up, and nothing can outlive the call.
+        var fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return 3;
+
+        var made: u8 = 0;
+        while (made < fork_bomb_cap) {
+            const rc = linux.fork();
+            if (linux.errno(rc) != .SUCCESS) break;
+            if (rc == 0) {
+                var byte: [1]u8 = undefined;
+                while (true) _ = linux.read(fds[0], &byte, 1);
+            }
+            made += 1;
+        }
+        return made;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-mem-bomb")) {
+        // An allocation that never stops, capped from the inside. **Every
+        // block is written to, not only asked for.** An untouched mapping is
+        // exactly what makes `RLIMIT_AS` refuse programs it should not, and a
+        // probe that only mapped memory would prove nothing about
+        // `memory.max`, which counts resident pages.
+        var touched: u8 = 0;
+        while (touched < mem_bomb_cap) {
+            const block = arena.alloc(u8, mem_bomb_block_bytes) catch break;
+            @memset(block, 1);
+            touched += 1;
+        }
+        return touched;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-fd-bomb")) {
+        // Descriptor exhaustion, capped from the inside. `/probe` is this
+        // same binary, bound into the sandbox read only by
+        // `baseEscapeConfig`, and it is the one path a Landlock rule permits
+        // this process to read. Nothing is closed: the point is to hold them.
+        var opened: u8 = 0;
+        while (opened < fd_bomb_cap) {
+            const rc = linux.open("/probe", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(rc) != .SUCCESS) break;
+            opened += 1;
+        }
+        return opened;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-disk-file-bomb")) {
+        // **The attack `RLIMIT_FSIZE` cannot see**: many small files. Every
+        // one of them is far under any file size limit, and together they fill
+        // whatever filesystem they land on. Capped from the inside so the
+        // unbounded run is bounded work on the machine running the tests.
+        var made: u8 = 0;
+        while (made < disk_file_cap) {
+            var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const name = std.fmt.bufPrintZ(&name_buffer, "{s}/f{d}", .{ scratch_target, made }) catch return 3;
+            const fd_rc = linux.open(name.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+            if (linux.errno(fd_rc) != .SUCCESS) break;
+            const fd: i32 = @intCast(fd_rc);
+            const payload = [_]u8{'d'} ** disk_file_bytes;
+            const written = linux.write(fd, &payload, payload.len);
+            _ = linux.close(fd);
+            if (linux.errno(written) != .SUCCESS) break;
+            made += 1;
+        }
+        return made;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-disk-one-bomb")) {
+        // One enormous file, in the scratch area rather than in the workspace.
+        // **A tmpfs is a filesystem this project had never put `RLIMIT_FSIZE`
+        // against**, and a limit that stopped a write on one filesystem and
+        // not on another would be a hole nobody would find by reading.
+        var name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buffer, "{s}/one", .{scratch_target}) catch return 3;
+        const fd_rc = linux.open(name.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (linux.errno(fd_rc) != .SUCCESS) return 3;
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+
+        var blocks: u8 = 0;
+        while (blocks < disk_one_cap) {
+            const payload = [_]u8{'o'} ** disk_one_block_bytes;
+            const written = linux.write(fd, &payload, payload.len);
+            if (linux.errno(written) != .SUCCESS) break;
+            if (written != payload.len) break;
+            blocks += 1;
+        }
+        return blocks;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-approval-socket")) {
+        // The approval socket. Anything that can reach it can approve an
+        // action, so a tool call must not be able to.
+        // The path is a real, listening socket on the host: escape.zig made it
+        // and proved it can connect to it itself a moment ago. This process is
+        // inside a real Sandbox.spawn whose mount list names the store and this
+        // program and nothing else.
+        const path_z = arena.dupeZ(u8, id_arg) catch return 3;
+        const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
+        // A network namespace still permits a unix socket, which the
+        // netns-loopback operation already proves, so failing here would mean
+        // something other than the mount tree stopped this and would prove
+        // nothing about the path.
+        if (linux.errno(fd) != .SUCCESS) return 5;
+        var addr = std.mem.zeroes(linux.sockaddr.un);
+        addr.family = linux.AF.UNIX;
+        if (path_z.len >= addr.path.len) return 3;
+        @memcpy(addr.path[0..path_z.len], path_z);
+        const rc = linux.connect(@intCast(fd), @ptrCast(&addr), @sizeOf(linux.sockaddr.un));
+        const connect_errno = linux.errno(rc);
+        if (connect_errno == .SUCCESS) {
+            _ = linux.close(@intCast(fd));
+            // Reached the session's approval socket from inside a tool call.
+            return 0;
+        }
+        // The path does not exist in this mount tree at all, so the refusal
+        // must be ENOENT specifically. Any other errno would also be nonzero
+        // and would say something different happened.
+        if (connect_errno != .NOENT) {
+            std.debug.print(
+                "connect to the approval socket did not fail with ENOENT, got: {s}\n",
+                .{@tagName(connect_errno)},
+            );
+            return 5;
+        }
+        return 1;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-connect")) {
+        const fd = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        if (linux.errno(fd) != .SUCCESS) return 5;
+        var addr = std.mem.zeroes(linux.sockaddr.in);
+        addr.family = linux.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, 53);
+        // 1.1.1.1
+        addr.addr = std.mem.nativeToBig(u32, 0x01010101);
+        const rc = linux.connect(@intCast(fd), @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        const connect_errno = linux.errno(rc);
+        if (connect_errno == .SUCCESS) return 0; // Reached the host. The namespace never applied.
+        return if (connect_errno == .NETUNREACH) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-signal-host")) {
+        // id_arg is the pid of a process spawn-signal-host made on the host, outside
+        // every namespace, and confirmed alive there both before and after this call.
+        // A fresh pid namespace has no member under that number: not this process,
+        // which is 1, and nothing else, since nothing else was ever forked in it.
+        const target = std.fmt.parseInt(linux.pid_t, id_arg, 10) catch {
+            std.debug.print("spawned-signal-host: bad pid argument\n", .{});
+            return 5;
+        };
+        // SIGKILL, the same signal the real attack sent to a host victim. The kernel
+        // must fail to find a task under this number before it can even ask whether
+        // the signal is permitted, so the errno reports a missing process, not a
+        // refused permission.
+        const rc = linux.kill(target, .KILL);
+        const kill_errno = linux.errno(rc);
+        if (kill_errno == .SUCCESS) return 0; // Reached the host process. The pid namespace never applied.
+        return if (kill_errno == .SRCH) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-shm-attach")) {
+        // id_arg is the id of a segment spawn-shm-attach created on the host, outside
+        // every namespace, with a marker written into it.
+        const shmid = std.fmt.parseInt(usize, id_arg, 10) catch {
+            std.debug.print("spawned-shm-attach: bad shmid argument\n", .{});
+            return 5;
+        };
+        const rc = linux.syscall3(.shmat, shmid, 0, 0);
+        const shmat_errno = linux.errno(rc);
+        if (shmat_errno == .SUCCESS) return 0; // Attached the host segment. The ipc namespace never applied.
+        // An id namespace holds no table entry for, so shmat refuses it with EINVAL,
+        // the same errno a shmid that was never valid at all would give.
+        return if (shmat_errno == .INVAL) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-report-pid")) {
+        // The direct proof CLONE_NEWPID took effect: this process is the first one the
+        // kernel ever created inside the new namespace, so it is numbered 1, never a
+        // host scale number. Written to standard output: closeInheritedFds never
+        // touches fd 0, 1, or 2, so this line reaches the test through the same pipe
+        // the test set up before spawn ever ran.
+        var buffer: [16]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{d}\n", .{linux.getpid()}) catch unreachable;
+        _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-stdin-devnull")) {
+        // Finding 2: spawn must give the sandboxed process /dev/null on descriptor
+        // 0, never a terminal. statx proves it directly: /dev/null is a character
+        // device, and neither a terminal nor a pipe nor a socket is ever one.
+        // spawned-stdin-devnull does no setup of its own, so whatever descriptor 0
+        // turns out to be is entirely spawn's own doing, before applyLayers ever ran.
+        var stx: linux.Statx = undefined;
+        const rc = linux.statx(std.posix.STDIN_FILENO, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stx);
+        if (linux.errno(rc) != .SUCCESS) return 5;
+        const is_char_device = (stx.mode & linux.S.IFMT) == linux.S.IFCHR;
+        return if (is_char_device) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-stdin-pipe")) {
+        // The other half of `Config.stdin_fd`: a helper the harness itself
+        // starts really does get the harness's pipe on descriptor 0, and it
+        // gets that pipe and nothing else.
+        //
+        // Five facts, and every one of them is a separate way the field could
+        // be wrong. spawned-stdin-pipe does no setup of its own, so each of
+        // them is entirely `spawn`'s doing.
+        var stx: linux.Statx = undefined;
+        const stat_rc = linux.statx(std.posix.STDIN_FILENO, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stx);
+        if (linux.errno(stat_rc) != .SUCCESS) return 5;
+
+        // 1. Descriptor 0 is a pipe. /dev/null and a terminal are both
+        //    character devices, so this one comparison tells the new
+        //    behaviour from the old and from the hazard at once.
+        if ((stx.mode & linux.S.IFMT) != linux.S.IFIFO) {
+            std.debug.print("spawned-stdin-pipe: descriptor 0 is not a pipe\n", .{});
+            return 1;
+        }
+
+        // 2. It is not a terminal, which is the injection route
+        //    `redirectStdinToDevNull`'s own comment names: TIOCSTI needs
+        //    descriptor 0 to be one. A pipe answers ENOTTY to every terminal
+        //    ioctl, and tcgetattr is the cheapest of them.
+        var termios: linux.termios = undefined;
+        if (linux.errno(linux.tcgetattr(std.posix.STDIN_FILENO, &termios)) == .SUCCESS) {
+            std.debug.print("spawned-stdin-pipe: descriptor 0 is a terminal\n", .{});
+            return 1;
+        }
+
+        // 3. What arrives is exactly the bytes the caller wrote, so the
+        //    descriptor really is the caller's own pipe and not some other
+        //    pipe that happens to be there.
+        var buffer: [stdin_pipe_token.len]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < buffer.len) {
+            const rc = linux.read(std.posix.STDIN_FILENO, buffer[filled..].ptr, buffer.len - filled);
+            const read_errno = linux.errno(rc);
+            if (read_errno == .INTR) continue;
+            if (read_errno != .SUCCESS) return 5;
+            if (rc == 0) break;
+            filled += rc;
+        }
+        if (!std.mem.eql(u8, buffer[0..filled], stdin_pipe_token)) {
+            std.debug.print("spawned-stdin-pipe: descriptor 0 carried other bytes\n", .{});
+            return 1;
+        }
+
+        // 4. A closed write end reads as end of file, never as a wait with no
+        //    end. This is what lets a helper learn its owner is finished with
+        //    it, and it only works because every copy of the write end is
+        //    closed: the caller's own, and the one A holds after the second
+        //    fork.
+        var extra: [1]u8 = undefined;
+        const eof_rc = linux.read(std.posix.STDIN_FILENO, &extra, 1);
+        if (linux.errno(eof_rc) != .SUCCESS or eof_rc != 0) {
+            std.debug.print("spawned-stdin-pipe: descriptor 0 never reached end of file\n", .{});
+            return 1;
+        }
+
+        // 5. **The exemption is one descriptor wide.** The caller left a
+        //    directory descriptor on the host root open across the spawn, the
+        //    exact shape `closeInheritedFds` exists to revoke, and it must be
+        //    gone here even though the caller named a descriptor to keep.
+        //    F_GETFD answers EBADF on a closed descriptor.
+        const escape_fd = std.fmt.parseInt(i32, id_arg, 10) catch return 5;
+        if (linux.errno(linux.fcntl(escape_fd, linux.F.GETFD, 0)) != .BADF) {
+            std.debug.print("spawned-stdin-pipe: an inherited descriptor survived\n", .{});
+            return 1;
+        }
+
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-proc-mask")) {
+        // Every name on the list, not one of them. A masking loop that stopped
+        // after the first entry, or that skipped one spelling, passes a test
+        // that reads a single file and fails this one. The list comes from
+        // `namespace.masked_proc_entries` itself, so a name added there is
+        // covered here on the day it is added.
+        var checked: usize = 0;
+        for (sandbox.namespace.masked_proc_entries) |name| {
+            var path_buffer: [64]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buffer, "/proc/{s}", .{name}) catch return 5;
+
+            const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
+            const open_errno = linux.errno(fd_rc);
+            // A kernel built without the option that makes this file. Nothing
+            // to read and nothing to prove.
+            if (open_errno == .NOENT) continue;
+            if (open_errno != .SUCCESS) {
+                std.debug.print("spawned-proc-mask: open {s}: {s}\n", .{ path, @tagName(open_errno) });
+                return 5;
+            }
+            const fd: i32 = @intCast(fd_rc);
+            defer _ = linux.close(fd);
+
+            var buffer: [256]u8 = undefined;
+            const read_rc = linux.read(fd, &buffer, buffer.len);
+            if (linux.errno(read_rc) != .SUCCESS) {
+                std.debug.print("spawned-proc-mask: read {s}: {s}\n", .{ path, @tagName(linux.errno(read_rc)) });
+                return 5;
+            }
+            if (read_rc != 0) {
+                std.debug.print("spawned-proc-mask: {s} gave {d} bytes\n", .{ path, read_rc });
+                return 1;
+            }
+            checked += 1;
+        }
+        // `cmdline`, `version` and `kallsyms` are in every kernel, so a run
+        // that masked nothing at all had a broken list rather than a spare
+        // kernel, and must not read as a pass.
+        if (checked < 3) {
+            std.debug.print("spawned-proc-mask: only {d} entries existed to check\n", .{checked});
+            return 5;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-proc-live")) {
+        // The other half of the pair. Masking and `/proc/self` can break each
+        // other: a mask over the wrong path takes away `/proc/self/exe`, which
+        // is the reason `/proc` is mounted at all, and a procfs that went
+        // missing or that something empty was mounted over would make every
+        // read in spawned-proc-mask return zero bytes for the wrong reason.
+        var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const link_rc = linux.readlink("/proc/self/exe", &link_buffer, link_buffer.len);
+        if (linux.errno(link_rc) != .SUCCESS) {
+            std.debug.print("spawned-proc-live: /proc/self/exe: {s}\n", .{@tagName(linux.errno(link_rc))});
+            return 1;
+        }
+        // The path this probe was execed as, and nothing else: a link that
+        // resolved to something else would mean this is not this process's
+        // own procfs.
+        if (!std.mem.eql(u8, link_buffer[0..link_rc], "/probe")) {
+            std.debug.print("spawned-proc-live: /proc/self/exe gave {s}\n", .{link_buffer[0..link_rc]});
+            return 1;
+        }
+
+        // A global file that no mask names. It has to hold bytes, or the
+        // whole procfs is empty and the mask proves nothing.
+        const fd_rc = linux.open("/proc/uptime", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-proc-live: open /proc/uptime: {s}\n", .{@tagName(linux.errno(fd_rc))});
+            return 5;
+        }
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+        var buffer: [256]u8 = undefined;
+        const read_rc = linux.read(fd, &buffer, buffer.len);
+        if (linux.errno(read_rc) != .SUCCESS) {
+            std.debug.print("spawned-proc-live: read /proc/uptime: {s}\n", .{@tagName(linux.errno(read_rc))});
+            return 5;
+        }
+        if (read_rc == 0) {
+            std.debug.print("spawned-proc-live: /proc/uptime was empty\n", .{});
+            return 5;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-forge-exit")) {
+        // Finding 1: do real work, then pick an exit code from the range the
+        // old design used to treat as proof the sandbox itself never came up
+        // (111 was namespace_failed). spawned-forge-exit does no setup of its
+        // own, so the only way this code could ever be read as a setup failure
+        // is if spawn itself still trusted an exit code for that, which it must
+        // not: the caller's own program controls every byte of its own exit
+        // status, and this is that attack, played out directly.
+        writeTestFile(arena, "/work/output.txt", "chock forge-exit probe content\n") catch |err| {
+            std.debug.print("spawned-forge-exit: could not write the marker: {s}\n", .{@errorName(err)});
+            return 5;
+        };
+        return 111;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-loop-write")) {
+        // Finding 2: keep appending to a marker file until something kills this
+        // process. If PDEATHSIG never arms, or the race window between the
+        // second fork and armPdeathsig's own prctl call swallows it, this
+        // process becomes an orphan and keeps growing this file forever after
+        // the middle process spawn forked is gone. spawned-loop-write does no
+        // setup of its own, so its only job is to keep producing a side effect
+        // a test can watch stop.
+        while (true) {
+            const fd = linux.open("/work/heartbeat.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+            if (linux.errno(fd) == .SUCCESS) {
+                const handle: i32 = @intCast(fd);
+                _ = linux.write(handle, "x", 1);
+                _ = linux.close(handle);
+            }
+            _ = linux.nanosleep(&.{ .sec = 0, .nsec = 5_000_000 }, null);
+        }
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-fork-loop-write")) {
+        // **A tool call that started something of its own.** A cancel reaches
+        // one process, the one `spawn` forked, and that process is neither
+        // this one nor the child forked below. This operation is what makes
+        // the difference visible: nothing this process writes is the heartbeat
+        // the caller watches, so a heartbeat that keeps growing after the
+        // cancel is a leaked grandchild and nothing else.
+        //
+        // The marker says the fork itself worked. Without it, a fork that
+        // failed would leave no heartbeat at all, and a test watching for the
+        // heartbeat to stop would pass for the wrong reason.
+        const child = linux.fork();
+        if (linux.errno(child) != .SUCCESS) {
+            std.debug.print("spawned-fork-loop-write: fork failed\n", .{});
+            return 5;
+        }
+
+        if (@as(linux.pid_t, @intCast(child)) == 0) {
+            while (true) {
+                const fd = linux.open("/work/heartbeat.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+                if (linux.errno(fd) == .SUCCESS) {
+                    const handle: i32 = @intCast(fd);
+                    _ = linux.write(handle, "x", 1);
+                    _ = linux.close(handle);
+                }
+                _ = linux.nanosleep(&.{ .sec = 0, .nsec = 5_000_000 }, null);
+            }
+        }
+
+        const marker = linux.open("/work/forked.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+        if (linux.errno(marker) == .SUCCESS) {
+            const handle: i32 = @intCast(marker);
+            _ = linux.write(handle, "f", 1);
+            _ = linux.close(handle);
+        }
+
+        // This process writes nothing else, ever. It is here only so the
+        // grandchild has a parent that a cancel does not name either.
+        while (true) _ = linux.nanosleep(&.{ .sec = 3600, .nsec = 0 }, null);
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-signal-group")) {
+        // The attack the pid namespace does not answer on its own. A signal to
+        // a pid number is refused in here, which spawned-signal-host already
+        // proves, but `kill(0, sig)` names no number at all: it names the
+        // caller's own process group, which the kernel holds as an object.
+        // Measured on 2026-08-21: a process in a fresh pid namespace reads
+        // getpgid(0) as 0, because its group has no number there, and this
+        // same call still reached a process outside the namespace.
+        //
+        // SIGUSR1, because spawn-signal-group above catches it and reports
+        // whether it arrived. Reporting from here is not possible: this
+        // process cannot see the group it is in, which is the whole point.
+        const rc = linux.kill(0, .USR1);
+        const kill_errno = linux.errno(rc);
+        if (kill_errno != .SUCCESS) {
+            std.debug.print("spawned-signal-group: kill(0, USR1): {s}\n", .{@tagName(kill_errno)});
+            return 5;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-group-press")) {
+        // The Ctrl-C half. A terminal sends its signal to the whole foreground
+        // process group, so this process must be in a group the caller's own
+        // press cannot name. It catches the signal rather than dying from it,
+        // because "the press arrived here" and "this process died" have to be
+        // two different answers: process 1 of a pid namespace ignores every
+        // signal whose action is the default one, so a death is not a thing
+        // this process can be relied on to have.
+        catchSignal(.USR1);
+        writeTestFile(arena, "/work/started", "started\n") catch |err| {
+            std.debug.print("spawned-group-press: could not write the marker: {s}\n", .{@errorName(err)});
+            return 5;
+        };
+
+        // The caller presses first and writes this second, so a run that
+        // reaches here has already had every chance to be signalled.
+        if (!waitForPath("/work/go")) {
+            std.debug.print("spawned-group-press: the caller never wrote /work/go\n", .{});
+            return 4;
+        }
+        return if (caller_signal_seen.load(.monotonic)) 1 else 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "read-home")) {
+        // A setup failure must exit 3, never 1 or 5. Those two are what the test
+        // asserts for a working sandbox that correctly refuses the read, so a
+        // setup bug that reused either would read as a passing test instead of a
+        // broken probe.
+        enterTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        // The home directory is not in the mount tree, so it does not exist here.
+        const fd = linux.open("/home", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        const open_errno = linux.errno(fd);
+        if (open_errno == .SUCCESS) _ = linux.close(@intCast(fd));
+        if (open_errno == .SUCCESS) return 0;
+        // Exit 1 only for the specific reason the design predicts: /home was
+        // never created, so opening it must fail with ENOENT. Any other errno
+        // means something else broke, and must not be mistaken for the sandbox
+        // doing its job.
+        return if (open_errno == .NOENT) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "write-readonly")) {
+        enterTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        const fd = linux.open(
+            "/nix/store/chock-probe",
+            .{ .ACCMODE = .WRONLY, .CREAT = true },
+            0o644,
+        );
+        const open_errno = linux.errno(fd);
+        if (open_errno == .SUCCESS) _ = linux.close(@intCast(fd));
+        if (open_errno == .SUCCESS) return 0;
+        // A read only mount refuses a new file with EROFS, not EPERM or EACCES.
+        return if (open_errno == .ROFS) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "write-readonly-submount")) {
+        enterSubmountTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        const fd = linux.open(
+            "/guarded/sub/chock-probe",
+            .{ .ACCMODE = .WRONLY, .CREAT = true },
+            0o644,
+        );
+        const open_errno = linux.errno(fd);
+        if (open_errno == .SUCCESS) _ = linux.close(@intCast(fd));
+        if (open_errno == .SUCCESS) return 0;
+        // The submount must be read only too, refused with the same EROFS a
+        // direct read only bind gives, not merely some other failure.
+        return if (open_errno == .ROFS) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "delete-mounted-file")) {
+        enterTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        // A file that is a mount point cannot be unlinked. The kernel returns EBUSY.
+        const unlink_errno = linux.errno(linux.unlink("/work/chock.zon"));
+        if (unlink_errno == .SUCCESS) return 0;
+        return if (unlink_errno == .BUSY) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "file-bind-content")) {
+        enterFileOverFileTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        // Read the target back and compare it with the content written to the
+        // source before the bind, proving the target really is the source file,
+        // not an empty directory that a file bind failed to cover.
+        var read_buffer: [64]u8 = undefined;
+        var matched = false;
+        const fd = linux.open("/marker", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd) == .SUCCESS) {
+            const handle: i32 = @intCast(fd);
+            const read_rc = linux.read(handle, &read_buffer, read_buffer.len);
+            _ = linux.close(handle);
+            if (linux.errno(read_rc) == .SUCCESS) {
+                matched = std.mem.eql(u8, read_buffer[0..read_rc], file_over_file_content);
+            }
+        }
+
+        return if (matched) 0 else 1;
+    }
+
+    // The netns-connect, netns-loopback, read-home, write-readonly,
+    // write-readonly-submount, delete-mounted-file, and file-bind-content checks
+    // above ran inside the namespaces, with no seccomp filter installed. Every
+    // operation below this line runs with the filter installed, and did not
+    // enter any namespace.
+    if (std.mem.eql(u8, args[1], "ptrace")) {
+        const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "umount-protected")) {
+        // The path does not need to be a real mount point. The filter must kill the
+        // call before the kernel ever looks at the path. Without this rule, a process
+        // in its own user namespace could unmount the read only bind mount that
+        // protects a file such as chock.zon, then open it for write and change it.
+        const rc = linux.umount2("/work/chock.zon", linux.MNT.DETACH);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "open-tree-attr-protected")) {
+        // open_tree_attr is open_tree and mount_setattr combined into one call, added
+        // in kernel 6.15. Without OPEN_TREE_CLONE it acts on the live mount, so
+        // clearing MOUNT_ATTR_RDONLY here undoes the read only bind that protects a
+        // file such as chock.zon, the same way a bare mount_setattr can. The path
+        // does not need to be a real mount point, the same as umount-protected above:
+        // the filter must kill the call before the kernel ever looks at the path.
+        const MountAttr = extern struct {
+            attr_set: u64 = 0,
+            attr_clr: u64 = 0,
+            propagation: u64 = 0,
+            userns_fd: u64 = 0,
+        };
+        const mount_attr_rdonly: u64 = 0x00000001;
+        var attr = MountAttr{ .attr_clr = mount_attr_rdonly };
+        const path: [*:0]const u8 = "/work/chock.zon";
+        const rc = linux.syscall5(
+            .open_tree_attr,
+            @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+            @intFromPtr(path),
+            0,
+            @intFromPtr(&attr),
+            @sizeOf(MountAttr),
+        );
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "userfaultfd")) {
+        const rc = linux.syscall1(.userfaultfd, 0);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "add-key")) {
+        // Finding 1: the filter must refuse add_key outright, the same way it
+        // refuses ptrace, with no dependence on which session keyring is current.
+        // This probe does not join a fresh one itself; the filter has to stop the
+        // call regardless.
+        const key_type = "user";
+        const description = "chock-probe-add-key";
+        const payload = "chock-probe-payload";
+        const key_spec_session_keyring: usize = @bitCast(@as(isize, -3));
+        const rc = linux.syscall5(
+            .add_key,
+            @intFromPtr(key_type.ptr),
+            @intFromPtr(description.ptr),
+            @intFromPtr(payload.ptr),
+            payload.len,
+            key_spec_session_keyring,
+        );
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "io-uring-setup")) {
+        // Finding 3. io_uring is the standard way around a syscall filter: the
+        // operations go in a ring and kernel workers do them, so the thread that
+        // asked never makes the call the filter reads. The filter has to refuse the
+        // ring itself, because it cannot read what goes into one.
+        //
+        // The arguments are the ones a real caller sends, so this call would set up a
+        // ring if the filter let it through. Anything less would pass this probe for
+        // the wrong reason.
+        var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
+        const rc = linux.io_uring_setup(1, &params);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "io-uring-enter")) {
+        // The call that submits the operations. This probe holds no ring, the same
+        // way umount-protected above names no real mount point: the filter must kill
+        // the call before the kernel ever looks at the descriptor. A filter that
+        // refused only io_uring_setup would leave a ring another process set up and
+        // handed over still usable.
+        const rc = linux.syscall6(.io_uring_enter, @bitCast(@as(isize, -1)), 1, 0, 0, 0, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "io-uring-register")) {
+        // The call that gives a ring its buffers, its files, and its eventfd. Refused
+        // for the same reason as io_uring_enter above, and with no ring here either.
+        const rc = linux.syscall4(.io_uring_register, @bitCast(@as(isize, -1)), 0, 0, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "getpid")) {
+        // A call that the filter must allow. This proves the filter is not a deny all.
+        _ = linux.getpid();
+        return 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "landlock-write-outside") or
+        std.mem.eql(u8, args[1], "landlock-write-inside"))
+    {
+        // A setup failure here must exit 3, never 1 or 0. Those two are what
+        // the corresponding tests assert for a working sandbox, so a setup bug
+        // must never be read as either one.
+        const inside = enterLandlockWriteTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        const parent = if (std.mem.eql(u8, args[1], "landlock-write-inside"))
+            inside
+        else
+            outsideDir(arena, root_arg) catch |err| {
+                std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+        const target = std.fmt.allocPrint(arena, "{s}/file", .{parent}) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        const target_z = arena.dupeZ(u8, target) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        const fd = linux.open(target_z, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+        if (linux.errno(fd) != .SUCCESS) return 1;
+        _ = linux.close(@intCast(fd));
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "landlock-truncate-outside") or
+        std.mem.eql(u8, args[1], "landlock-truncate-inside"))
+    {
+        // Proves the fix for the bug a reviewer found: a ruleset that does not
+        // handle truncate leaves truncate permitted everywhere, so a file
+        // outside every granted directory could still be emptied. A setup
+        // failure here must exit 3, never 1 or 0, for the same reason as the
+        // write probe above.
+        const paths = enterLandlockTruncateTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        const target = if (std.mem.eql(u8, args[1], "landlock-truncate-inside"))
+            paths.inside_file
+        else
+            paths.outside_file;
+
+        const rc = linux.syscall2(.truncate, @intFromPtr(target.ptr), 0);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-ptrace")) {
+        // Run this same program through the whole sandbox, and let it call ptrace.
+        // Only the seccomp filter spawn installs can be standing in the way, since
+        // spawned-ptrace does no setup of its own. See the comment on `spawned`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-ptrace" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.startsWith(u8, args[1], "spawn-fork-bomb") or
+        std.mem.startsWith(u8, args[1], "spawn-mem-bomb") or
+        std.mem.startsWith(u8, args[1], "spawn-fd-bomb"))
+    {
+        // The three resource limit runs. **The layer these prove is the only
+        // one in this sandbox that is about appetite rather than reach**: the
+        // namespaces, Landlock and seccomp all let a fork bomb through.
+        //
+        // Each operation has an `-unbounded` twin that runs the same program
+        // under `Limits.none`. `escape.zig` runs both and compares them, so a
+        // limit deleted from the library changes the bounded run's answer
+        // into the unbounded one's and the test fails. See `LimitOutcome`.
+        const unbounded = std.mem.endsWith(u8, args[1], "-unbounded");
+        // The one run that is about the cgroup and not about the floor. It
+        // leaves `mapped_memory_bytes` off, so `RLIMIT_DATA` refuses nothing
+        // and only `memory.max` can stop the program. That matters for the
+        // legibility half: the rlimit floor stops an allocation by refusing
+        // an `mmap`, which the program itself reports, while `memory.max`
+        // stops it with a bare `SIGKILL` that reads exactly like a cancel.
+        // **The second one is the failure that needs a report to be legible
+        // at all**, so it needs a run of its own to prove.
+        const cgroup_only = std.mem.endsWith(u8, args[1], "-cgroup");
+        const base = try baseEscapeConfig(arena);
+
+        const which: enum { fork, memory, files } = if (std.mem.startsWith(u8, args[1], "spawn-fork-bomb"))
+            .fork
+        else if (std.mem.startsWith(u8, args[1], "spawn-mem-bomb"))
+            .memory
+        else
+            .files;
+
+        // The bounded runs start from the library's own defaults and narrow
+        // exactly the one field each is about, so what runs here is the shape
+        // a real tool call gets and not a special case built for a test.
+        const limits: sandbox.Sandbox.Limits = if (unbounded)
+            sandbox.Sandbox.Limits.none
+        else switch (which) {
+            .fork => .{ .processes = fork_bomb_limit },
+            // Both memory fields, because a machine with no cgroup v2 has no
+            // resident ceiling at all and this run still has to prove
+            // something there. See lib/chock-sandbox/linux/rlimits.zig.
+            .memory => .{
+                .memory_bytes = mem_bomb_limit,
+                .mapped_memory_bytes = if (cgroup_only) null else mem_bomb_limit,
+            },
+            .files => .{ .open_files = fd_bomb_limit },
+        };
+
+        const target = switch (which) {
+            .fork => "spawned-fork-bomb",
+            .memory => "spawned-mem-bomb",
+            .files => "spawned-fd-bomb",
+        };
+        const cap = switch (which) {
+            .fork => fork_bomb_cap,
+            .memory => mem_bomb_cap,
+            .files => fd_bomb_cap,
+        };
+
+        var report: sandbox.Sandbox.LimitsReport = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .limits = limits,
+            .limits_report = &report,
+        }, &.{ "/probe", target }, null, null);
+
+        // Whether the report could name what stopped the program, which is
+        // the half of this that is about a person being able to read the
+        // failure rather than about the failure happening at all. A kill by
+        // `memory.max` is a bare SIGKILL and reads exactly like a cancel;
+        // `killed_by` is what tells them apart. A fork refused by `pids.max`
+        // is not a kill at all, and `events.fork_refusals` is what makes it
+        // visible.
+        // A machine with no cgroup v2 tree, or one that delegates nothing, is
+        // a machine this project supports. Say so before reading the outcome,
+        // so that a test asking about the cgroup skips there **and a cgroup
+        // that did apply and then bounded nothing still fails**.
+        if (cgroup_only and !report.cgroup.applied()) {
+            return @intFromEnum(LimitOutcome.no_cgroup);
+        }
+
+        const named = report.killed_by != null or report.events.fork_refusals > 0;
+        return limitOutcome(term, cap, named);
+    }
+    if (std.mem.startsWith(u8, args[1], "spawn-disk-")) {
+        // The two disk runs. **The row of the resource limit table that no
+        // rlimit and no cgroup covers**: `RLIMIT_FSIZE` bounds one file, and
+        // ten thousand files of one byte each still fill a filesystem. See
+        // `lib/chock-sandbox/linux/namespace.zig`'s own `Scratch`.
+        //
+        // Each operation has an `-unbounded` twin that runs the same program
+        // under `Limits.none`, which still mounts a scratch area and gives it
+        // no `size=` of its own, so the two runs differ in the cap and in
+        // nothing else.
+        const unbounded = std.mem.endsWith(u8, args[1], "-unbounded");
+        const many_files = std.mem.startsWith(u8, args[1], "spawn-disk-files");
+        const config = try diskEscapeConfig(arena);
+
+        const limits: sandbox.Sandbox.Limits = if (unbounded)
+            sandbox.Sandbox.Limits.none
+        else if (many_files)
+            .{ .scratch_bytes = disk_file_limit }
+        else
+            // The enormous file run. The scratch cap is deliberately far above
+            // what this program writes, so the area cannot be what stops it and
+            // `RLIMIT_FSIZE` is the only thing left that can.
+            .{ .file_size_bytes = disk_one_file_limit, .scratch_bytes = disk_one_scratch_limit };
+
+        const target = if (many_files) "spawned-disk-file-bomb" else "spawned-disk-one-bomb";
+        const cap = if (many_files) disk_file_cap else disk_one_cap;
+
+        var report: sandbox.Sandbox.LimitsReport = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = config.mounts,
+            .rules = config.rules,
+            .scratch = config.scratch,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .limits = limits,
+            .limits_report = &report,
+        }, &.{ "/probe", target }, null, null);
+
+        // **`killed_by` is what makes a full scratch area readable as a limit
+        // rather than as the user's disk being full.** Nothing in the kernel
+        // counts a full filesystem, so this is read from the area itself: see
+        // `LimitsReport.scratch_full`.
+        const named = report.killed_by != null;
+        return limitOutcome(term, cap, named);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-approval-socket")) {
+        // Run this same program through the whole sandbox and let it try to
+        // reach the session's own approval socket. The path is one escape.zig
+        // made and can reach itself, and it is outside `root_arg`, so nothing
+        // in the mount list this hands to spawn names it. See
+        // `spawned-approval-socket`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-approval-socket", id_arg }, null, null);
+
+        return reportChildTerm(term);
+    }
+
+    if (std.mem.startsWith(u8, args[1], "spawn-filtered-")) {
+        const granted = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(granted.fd);
+        const other = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(other.fd);
+
+        const ports = try filteredPorts(arena, granted.port, other.port);
+
+        if (std.mem.eql(u8, args[1], "spawn-filtered-connect")) {
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-connect",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // Nothing was ever asked of the broker, so nothing was resolved
+            // and nothing was dialled: the child never got as far as asking.
+            if (run.lookups != 0 or run.dials != 0) {
+                std.debug.print("the child that opened its own connection also used the broker\n", .{});
+                return 5;
+            }
+            // **And it reached neither listener.** This is the independent
+            // observation: the child says what it decided, and the backlogs
+            // say what really happened on the wire. A connect that succeeded
+            // fills the first backlog, and the child would report that too, so
+            // the two disagreeing means something other than the filter is at
+            // work and must never read as a pass.
+            if (granted.hasPending() or other.hasPending()) {
+                std.debug.print("a filtered process reached a listener on its own\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-filtered-grant")) {
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-grant",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            if (run.granted != 1 or run.refused != 0) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            // **The descriptor really carried the connection the broker
+            // opened.** These are the bytes the child wrote, arriving on the
+            // listener this process dialled, which no forged descriptor could
+            // produce.
+            var buffer: [64]u8 = undefined;
+            const arrived = granted.readFirst(&buffer) orelse {
+                std.debug.print("nothing arrived on the listener the broker dialled\n", .{});
+                return 5;
+            };
+            if (!std.mem.eql(u8, arrived, filtered_token)) {
+                std.debug.print("the listener read {s}, not the token\n", .{arrived});
+                return 5;
+            }
+            // **And nothing reached the other listener.** This is the half an
+            // exit code cannot carry: with the filter deleted, the child's own
+            // re-aim connects here and this backlog is not empty. The child
+            // reports that escape as exit 1 by itself, so a full backlog with
+            // a child that reported a pass is a third thing again, and it is
+            // never one.
+            if (other.hasPending()) {
+                std.debug.print("a granted descriptor was aimed at another host\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-filtered-refused")) {
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-refused",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // One refusal and one grant, which is what the child asked for.
+            if (run.refused != 1 or run.granted != 1) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            // **The refused host was never resolved**, so a name the policy
+            // does not cover is not even a message to whoever runs its zone.
+            // One lookup, for the permitted host that followed it.
+            if (run.lookups != 1 or run.dials != 1) {
+                std.debug.print("the broker looked up {d} names and dialled {d}\n", .{ run.lookups, run.dials });
+                return 5;
+            }
+            if (other.hasPending()) {
+                std.debug.print("a refused host reached a listener\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // The subagent pair. The same host, the same policy source, and two
+        // spawn chains: one that is the root, and one that is a subagent under
+        // a parent the policy refuses.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-chain-root") or
+            std.mem.eql(u8, args[1], "spawn-filtered-chain-subagent"))
+        {
+            const root_only = std.mem.eql(u8, args[1], "spawn-filtered-chain-root");
+            const chain: []const []const u8 = if (root_only) &.{"fetcher"} else &.{ "main", "fetcher" };
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_deny_parent_policy,
+                chain,
+                filtered_public_address,
+                granted.port,
+            );
+            return reportChildTerm(run.term);
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-filtered-budget")) {
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-budget",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // The far end answered exactly its own budget and then stopped,
+            // and every one of those answers was a refusal that resolved
+            // nothing and dialled nothing.
+            if (run.refused != sandbox.net_broker.max_requests or run.granted != 0) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            if (run.lookups != 0 or run.dials != 0) {
+                std.debug.print("the broker looked up {d} names and dialled {d}\n", .{ run.lookups, run.dials });
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // A permitted name whose address is this machine. The policy says yes
+        // and `addressIsReachable` says no, so this pins that the address
+        // check really runs inside a spawn and not only in a unit test.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-loopback")) {
+            const run = try filteredEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
+                granted.port,
+            );
+            // The name was resolved, because the policy permitted it, and
+            // nothing was dialled. That is what says the address check is what
+            // refused it.
+            if (run.lookups != 1 or run.dials != 0) {
+                std.debug.print("the broker looked up {d} names and dialled {d}\n", .{ run.lookups, run.dials });
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        std.debug.print("unknown filtered network operation: {s}\n", .{args[1]});
+        return 2;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-landlock-escape")) {
+        // Run this same program through the whole sandbox, and let it read a path
+        // that no Landlock rule names. The path exists because it is a plain
+        // subdirectory of root, carried into the sandbox by the same recursive
+        // bind that carries every other part of root, so nothing hides it from a
+        // process that never got restricted. Only the ruleset spawn applies can
+        // still refuse the read, since spawned-landlock-read does no setup of its
+        // own. See the comment on `spawned`.
+        const unguarded = try std.fs.path.join(arena, &.{ root_arg, "unguarded" });
+        try makeTestDir(arena, unguarded);
+        const marker = try std.fs.path.join(arena, &.{ unguarded, "marker" });
+        try writeTestFile(arena, marker, "chock landlock escape probe content\n");
+
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-landlock-read" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-network-escape")) {
+        // Run this same program through the whole sandbox, and let it try to
+        // connect out. `.network` is left off this Config on purpose, so the
+        // default Finding 2 puts on Sandbox.Config decides: `.none`, not the
+        // host's network. Only the network namespace spawn enters can refuse the
+        // connect, since spawned-connect does no setup of its own. See the
+        // comment on `spawned`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+        }, &.{ "/probe", "spawned-connect" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-signal-host")) {
+        // id_arg is the pid of a real process the caller (escape.zig) made outside
+        // every namespace, so that a refusal here proves the pid namespace hides an
+        // actual host process, not merely that some unused number was tried. Only the
+        // pid namespace spawn enters can refuse the signal, since spawned-signal-host
+        // does no setup of its own. See the comment on `spawned`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-signal-host", id_arg }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-shm-attach")) {
+        // id_arg is the id of a segment the caller made outside every namespace,
+        // with a marker written into it, the same shape as the shared memory half of
+        // the real escape this proves closed. Only the ipc namespace spawn enters can
+        // refuse the attach, since spawned-shm-attach does no setup of its own. See
+        // the comment on `spawned`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-shm-attach", id_arg }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-report-pid")) {
+        // Run this same program through the whole sandbox, and let it print its own
+        // pid. spawned-report-pid does no setup of its own, so the number it prints
+        // is entirely a fact about the pid namespace spawn's applyLayers built.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-report-pid" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-stdin-devnull")) {
+        // Run this same program through the whole sandbox, and let it statx its own
+        // descriptor 0. spawned-stdin-devnull does no setup of its own, so the
+        // answer it gets is entirely a fact about what spawn's own child put on
+        // that descriptor before applyLayers ever ran.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-stdin-devnull" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-stdin-pipe")) {
+        // Run this same program through the whole sandbox with a real pipe
+        // named in `Config.stdin_fd`, and let it look at its own descriptor 0.
+        // See `spawned-stdin-pipe` above for the five facts it checks.
+        var pipe_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe_fds, .{})) != .SUCCESS) return 5;
+        const read_fd = pipe_fds[0];
+        const write_fd = pipe_fds[1];
+
+        // The whole request, written before the sandbox is built, so nothing
+        // here has to read and write at the same time. The token is far below
+        // any pipe buffer, so this one write is the whole of it.
+        const written = linux.write(write_fd, stdin_pipe_token, stdin_pipe_token.len);
+        if (linux.errno(written) != .SUCCESS or written != stdin_pipe_token.len) return 5;
+        // Closed now, so the sandboxed program reads end of file after the
+        // token. Every other copy of this end is closed by `spawn` itself: see
+        // `spawned-stdin-pipe`'s own fourth check.
+        _ = linux.close(write_fd);
+
+        // A descriptor on the host root, open across the spawn. This is the
+        // leak `closeInheritedFds` exists to revoke, and it is here to prove
+        // that naming one descriptor to keep does not keep this one too.
+        const escape_rc = linux.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(escape_rc) != .SUCCESS) return 5;
+        const escape_fd: i32 = @intCast(escape_rc);
+        const escape_text = try std.fmt.allocPrint(arena, "{d}", .{escape_fd});
+
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .stdin_fd = read_fd,
+        }, &.{ "/probe", "spawned-stdin-pipe", escape_text }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-setup-fault-named-stderr")) {
+        // A sandbox that cannot come up, with a pipe of this process's own
+        // named in `Config.stderr_fd`. What this proves is where the reason
+        // went: the pipe is copied to descriptor 1, and descriptor 2 is left
+        // untouched, so the test can read the whole of each and see that the
+        // caller's descriptor got the line and the terminal got nothing.
+        var pipe_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe_fds, .{})) != .SUCCESS) return 5;
+        const read_fd = pipe_fds[0];
+        const write_fd = pipe_fds[1];
+
+        const absent = try absentRoot(arena, root_arg);
+        if (sandbox.spawn(arena, .{
+            .root = absent,
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            .stderr_fd = write_fd,
+        }, &.{"/probe"}, null, null)) |_| {
+            // A sandbox that came up on a root that is not there would make
+            // every check below meaningless, so it is its own answer.
+            return 5;
+        } else |err| {
+            if (err != error.MountTreeFailed) return 5;
+        }
+
+        // This process's own copy of the write end, closed so the read below
+        // reaches end of file rather than waiting on a writer that is this
+        // process. Every other copy is already gone: `spawn` has returned, so
+        // both processes it forked have ended.
+        _ = linux.close(write_fd);
+        var buffer: [512]u8 = undefined;
+        const arrived = readToEnd(read_fd, &buffer);
+        _ = linux.close(read_fd);
+
+        const wrote = linux.write(std.posix.STDOUT_FILENO, arrived.ptr, arrived.len);
+        if (linux.errno(wrote) != .SUCCESS or wrote != arrived.len) return 5;
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-setup-fault-closed-stderr")) {
+        // A setup failure whose reason cannot be written anywhere: the pipe
+        // named in `Config.stderr_fd` has its read end closed before `spawn` is
+        // ever called, so the write of the reason answers `EPIPE` and raises
+        // `SIGPIPE`, whose default action ends the process that was writing it.
+        //
+        // **`spawn` must still answer the error, and not a `Term`.** What makes
+        // that true is the order inside the `die` family: the record reaches
+        // the setup pipe before the text is attempted. Written the other way
+        // round, the process dies before the record exists, `spawn` reads end
+        // of file with no data, which is exactly how a successful `execve`
+        // reports itself, and answers for a program that never ran.
+        //
+        // **The failure has to be one the middle process meets, and this is
+        // why the config asks for five scratch areas.** A failure inside the
+        // sandboxed process, such as the mount tree the two operations above
+        // use, cannot show this at all: that process is process 1 of a fresh
+        // pid namespace, and the kernel discards a signal with a default action
+        // for the process 1 of a namespace, so `SIGPIPE` there is ignored and
+        // the record is written whatever the order is. Measured on 2026-08-24.
+        // The scratch area count is checked in the middle process, before the
+        // second fork, and that process is process 1 of nothing.
+        var pipe_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe_fds, .{})) != .SUCCESS) return 5;
+        _ = linux.close(pipe_fds[0]);
+        const write_fd = pipe_fds[1];
+
+        if (sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            .scratch = &.{
+                .{ .target = "/run/chock/one" },
+                .{ .target = "/run/chock/two" },
+                .{ .target = "/run/chock/three" },
+                .{ .target = "/run/chock/four" },
+                .{ .target = "/run/chock/five" },
+            },
+            .stderr_fd = write_fd,
+        }, &.{"/probe"}, null, null)) |_| {
+            return 5;
+        } else |err| {
+            if (err != error.ScratchMountFailed) return 5;
+        }
+        _ = linux.close(write_fd);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-setup-fault-default-stderr")) {
+        // The same sandbox that cannot come up, with nothing named in
+        // `Config.stderr_fd`. The reason must land on this process's own
+        // descriptor 2, which is what every caller of `spawn` got before that
+        // field governed a setup failure at all, and this operation writes
+        // nothing else there.
+        const absent = try absentRoot(arena, root_arg);
+        if (sandbox.spawn(arena, .{
+            .root = absent,
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+        }, &.{"/probe"}, null, null)) |_| {
+            return 5;
+        } else |err| {
+            if (err != error.MountTreeFailed) return 5;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-proc-mask") or std.mem.eql(u8, args[1], "spawn-proc-live")) {
+        // Run this same program through the whole sandbox, with a procfs of
+        // the sandbox's own, and let it read what is in there. Both halves
+        // need a real `Sandbox.spawn`: the mask is made by `buildRoot`, which
+        // only ever runs inside spawn's own child, and a procfs mounted
+        // anywhere else would be the host's.
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .proc = .{} }},
+        });
+        // A mount with no rule is present and unreachable, so without this
+        // every read below is refused by Landlock instead of answering.
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+        });
+
+        const inner: []const u8 = if (std.mem.eql(u8, args[1], "spawn-proc-mask"))
+            "spawned-proc-mask"
+        else
+            "spawned-proc-live";
+
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", inner }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-forge-exit")) {
+        // Finding 1 proof. Build a root with one writable directory bound in, run
+        // spawned-forge-exit through the whole sandbox, and let it write there
+        // before it picks a forged exit code. If spawn ever read that code as a
+        // setup failure, it would call removeContentsBestEffort on this same root and
+        // the file below would be gone by the time this checks for it.
+        const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
+        try makeTestDir(arena, work);
+
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+        });
+
+        const term = sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-forge-exit" }, null, null) catch |err| {
+            // The one wrong outcome this whole operation exists to catch: spawn
+            // mistook the caller's own forged exit code for a setup failure.
+            std.debug.print("spawn-forge-exit: spawn reported a setup failure: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-signal-middle") or
+        std.mem.eql(u8, args[1], "spawn-signal-middle-forked"))
+    {
+        // Finding 2 proof. Run sandbox.spawn on its own thread, so this thread
+        // can hand the pid of the process spawn forked back to the caller over
+        // standard output while spawn is still blocked waiting for the
+        // sandboxed program, the same shape a real caller sees: spawn is
+        // synchronous, so there is no other way to learn that pid before the
+        // whole call finishes.
+        //
+        // The two forms differ only in what runs inside the sandbox. The plain
+        // one runs a program that writes the heartbeat itself. **The `-forked`
+        // one runs a program that forks and lets its own child write it**, so
+        // the caller's one signal has to reach a process it never named and
+        // cannot see: a tool call that started a build is that shape, and a
+        // cancel that left the build running would be a leak the plain form
+        // cannot detect. See `spawned-fork-loop-write`.
+        const inner: []const u8 = if (std.mem.eql(u8, args[1], "spawn-signal-middle-forked"))
+            "spawned-fork-loop-write"
+        else
+            "spawned-loop-write";
+
+        const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
+        try makeTestDir(arena, work);
+
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{ .path = "/work", .access = sandbox.landlock.AccessFs.read_write }},
+        });
+
+        const SpawnCtx = struct {
+            allocator: std.mem.Allocator,
+            root: []const u8,
+            mounts: []const sandbox.namespace.Mount,
+            rules: []const sandbox.Config.Rule,
+            inner: []const u8,
+            middle: sandbox.Middle = .{},
+            term: std.process.Child.Term = undefined,
+            spawn_err: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                self.term = sandbox.spawn(self.allocator, .{
+                    .root = self.root,
+                    .mounts = self.mounts,
+                    .rules = self.rules,
+                    .cwd = "/",
+                    .env = &.{},
+                    .network = .none,
+                }, &.{ "/probe", self.inner }, null, &self.middle) catch |err| {
+                    self.spawn_err = err;
+                    return;
+                };
+            }
+        };
+        var ctx = SpawnCtx{
+            .allocator = arena,
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .inner = inner,
+        };
+
+        const thread = std.Thread.spawn(.{}, SpawnCtx.run, .{&ctx}) catch |err| {
+            std.debug.print("{s}: could not start the spawn thread: {s}\n", .{ args[1], @errorName(err) });
+            return 3;
+        };
+
+        // spawn fills the handle in right after its first fork, before it does
+        // anything that can block for long, so a two second bound is generous,
+        // never a wait that could hang the suite if something is badly broken.
+        var waited_ns: u64 = 0;
+        while (ctx.middle.pid == 0 and waited_ns < 2_000_000_000) : (waited_ns += 1_000_000) {
+            _ = linux.nanosleep(&.{ .sec = 0, .nsec = 1_000_000 }, null);
+        }
+        if (ctx.middle.pid == 0) {
+            std.debug.print("{s}: never learned the middle process\n", .{args[1]});
+            return 3;
+        }
+
+        var pid_line_buf: [16]u8 = undefined;
+        const pid_line = std.fmt.bufPrint(&pid_line_buf, "{d}\n", .{ctx.middle.pid}) catch unreachable;
+        _ = linux.write(std.posix.STDOUT_FILENO, pid_line.ptr, pid_line.len);
+
+        thread.join();
+        // The caller of `spawn` owns the handle, and this operation is that
+        // caller: see `sandbox.Middle`. After the join, never before.
+        sandbox.closeMiddle(&ctx.middle);
+        if (ctx.spawn_err) |err| {
+            std.debug.print("{s}: spawn reported a setup failure: {s}\n", .{ args[1], @errorName(err) });
+            return 3;
+        }
+
+        return reportChildTerm(ctx.term);
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-signal-group")) {
+        // A process group of this operation's own, before anything else runs.
+        // The fault this looks for is a sandbox that can still signal its
+        // caller's group, and a detection that took the whole test runner down
+        // with it would be worse than the fault: this bounds the blast radius
+        // to this process and the sandbox it starts.
+        if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) {
+            std.debug.print("spawn-signal-group: setpgid failed\n", .{});
+            return 3;
+        }
+        catchSignal(.USR1);
+
+        // The handler has to be live in this process before spawn forks from
+        // it, or "no signal arrived" below would be true for the wrong reason.
+        std.posix.raise(.USR1) catch |err| {
+            std.debug.print("spawn-signal-group: could not raise USR1: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        if (!caller_signal_seen.load(.monotonic)) {
+            std.debug.print("spawn-signal-group: the handler never ran on a raise here\n", .{});
+            return 3;
+        }
+        caller_signal_seen.store(false, .monotonic);
+
+        const base = try baseEscapeConfig(arena);
+        _ = sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-signal-group" }, null, null) catch |err| {
+            std.debug.print("spawn-signal-group: spawn reported a setup failure: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+
+        // The Term is not the answer here and is deliberately dropped. A
+        // contained call ends the sandbox's own group, which the process spawn
+        // forked belongs to, so the Term is a signal death either way; the
+        // only fact that separates the two outcomes is whether this process,
+        // outside that group, was reached.
+        return if (caller_signal_seen.load(.monotonic)) 1 else 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-group-press")) {
+        // A group of this operation's own, standing in for a session's
+        // foreground process group, and for the same reason
+        // spawn-signal-group takes one: the press below must never reach the
+        // test runner.
+        if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) {
+            std.debug.print("spawn-group-press: setpgid failed\n", .{});
+            return 3;
+        }
+        catchSignal(.USR1);
+
+        const config = try workEscapeConfig(arena, root_arg);
+        var ctx = ThreadedSpawn{
+            .allocator = arena,
+            .root = root_arg,
+            .mounts = config.mounts,
+            .rules = config.rules,
+            .argv = &.{ "/probe", "spawned-group-press" },
+        };
+        const thread = std.Thread.spawn(.{}, ThreadedSpawn.run, .{&ctx}) catch |err| {
+            std.debug.print("spawn-group-press: could not start the spawn thread: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        // Registered before the join, so it runs after it: the handle must
+        // outlive the call it names. See `sandbox.Middle`.
+        defer ctx.closeHandle();
+        defer thread.join();
+
+        const started_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/started", .{root_arg}, 0);
+        const go_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/go", .{root_arg}, 0);
+        if (!waitForPath(started_path)) {
+            std.debug.print("spawn-group-press: the sandboxed program never started\n", .{});
+            ctx.killCall();
+            return 3;
+        }
+
+        // The press. This is what a terminal does with Ctrl-C: it signals the
+        // whole foreground process group, by group and never by process.
+        if (linux.errno(linux.kill(0, .USR1)) != .SUCCESS) {
+            std.debug.print("spawn-group-press: the press itself failed\n", .{});
+            ctx.killCall();
+            return 3;
+        }
+
+        // Let the sandboxed program finish, now that it has had every chance
+        // to be signalled. It ran to here, which is the fact this operation is
+        // about: the call was not killed by the press.
+        writeTestFile(arena, go_path, "go\n") catch |err| {
+            std.debug.print("spawn-group-press: could not write go: {s}\n", .{@errorName(err)});
+            ctx.killCall();
+            return 3;
+        };
+
+        if (!ctx.waitForDone()) {
+            std.debug.print("spawn-group-press: the call never finished\n", .{});
+            ctx.killCall();
+            return 3;
+        }
+        if (ctx.spawn_err) |err| {
+            std.debug.print("spawn-group-press: spawn reported a setup failure: {s}\n", .{@errorName(err)});
+            return 3;
+        }
+        // The press has to have been delivered somewhere, or every check
+        // above passes for the wrong reason.
+        if (!caller_signal_seen.load(.monotonic)) {
+            std.debug.print("spawn-group-press: the press reached nothing at all\n", .{});
+            return 3;
+        }
+
+        switch (ctx.term) {
+            // spawned-group-press exits 1 when the press reached it, and 0
+            // when it did not. Both are its own answer about itself, carried
+            // out through its exit status.
+            .exited => |code| return if (code <= 1) code else 5,
+            else => {
+                std.debug.print("spawn-group-press: the call died: {any}\n", .{ctx.term});
+                return 5;
+            },
+        }
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-signal-middle-handled")) {
+        // The same cancellation Finding 2 proves works, with one thing added:
+        // this process has a SIGTERM handler of its own installed before it
+        // ever calls spawn, exactly as `chock run` does. The process spawn
+        // forks is a fork of this one, so it kept that handler, and a handler
+        // that runs there catches the cancelling signal and refuses to die.
+        catchSignal(.TERM);
+
+        // Prove the handler is live in this process first. Without this, a
+        // `catchSignal` that quietly did nothing would make the whole
+        // operation pass while pinning nothing at all.
+        std.posix.raise(.TERM) catch |err| {
+            std.debug.print("spawn-signal-middle-handled: could not raise TERM: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        if (!caller_signal_seen.load(.monotonic)) {
+            std.debug.print("spawn-signal-middle-handled: the handler never ran on a raise here\n", .{});
+            return 3;
+        }
+        caller_signal_seen.store(false, .monotonic);
+
+        const config = try workEscapeConfig(arena, root_arg);
+        var ctx = ThreadedSpawn{
+            .allocator = arena,
+            .root = root_arg,
+            .mounts = config.mounts,
+            .rules = config.rules,
+            .argv = &.{ "/probe", "spawned-loop-write" },
+        };
+        const thread = std.Thread.spawn(.{}, ThreadedSpawn.run, .{&ctx}) catch |err| {
+            std.debug.print("spawn-signal-middle-handled: could not start the spawn thread: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        // Registered before the join, so it runs after it: the handle must
+        // outlive the call it names. See `sandbox.Middle`.
+        defer ctx.closeHandle();
+        defer thread.join();
+
+        // A non zero pid is how `spawn` says the handle beside it is there to
+        // read: see `sandbox.Middle`. Nothing here ever signals the number.
+        if (ctx.waitForMiddlePid() == 0) {
+            std.debug.print("spawn-signal-middle-handled: never learned the middle process\n", .{});
+            return 3;
+        }
+
+        // Wait for the sandboxed program to really be running, so the signal
+        // below cannot land before there is anything to cancel.
+        const heartbeat_path = try std.fmt.allocPrintSentinel(arena, "{s}/work/heartbeat.txt", .{root_arg}, 0);
+        if (!waitForPath(heartbeat_path)) {
+            std.debug.print("spawn-signal-middle-handled: the sandboxed program never started\n", .{});
+            ctx.killCall();
+            return 3;
+        }
+
+        // The cancellation `lib/chock-core/tools.zig` makes when a tool call
+        // runs past its deadline: SIGTERM to the process spawn forked, never
+        // to the sandboxed program, for the reason spawn's own doc comment
+        // gives. Through the handle, and by the same call that file makes.
+        sandbox.signalMiddle(ctx.middle.fd, .TERM) catch |err| {
+            std.debug.print("spawn-signal-middle-handled: could not signal the middle process: {s}\n", .{@errorName(err)});
+            ctx.killCall();
+            return 3;
+        };
+
+        if (!ctx.waitForDone()) {
+            // The fault itself. The middle process caught this process's own
+            // handler and stayed alive, so the call was never cancelled at
+            // all and spawn is still blocked on it.
+            std.debug.print("spawn-signal-middle-handled: the call outlived its own cancellation\n", .{});
+            ctx.killCall();
+            return 1;
+        }
+        if (ctx.spawn_err) |err| {
+            std.debug.print("spawn-signal-middle-handled: spawn reported a setup failure: {s}\n", .{@errorName(err)});
+            return 3;
+        }
+
+        switch (ctx.term) {
+            .signal => |sig| {
+                if (sig != .TERM) {
+                    std.debug.print("spawn-signal-middle-handled: died from {s}\n", .{@tagName(sig)});
+                    return 5;
+                }
+                return 0;
+            },
+            else => {
+                std.debug.print("spawn-signal-middle-handled: ended as {any}\n", .{ctx.term});
+                return 5;
+            },
+        }
+    }
+
+    // personality(READ_IMPLIES_EXEC) makes the kernel add PROT_EXEC to every later
+    // mapping on its own, after seccomp has already looked at the prot argument. The
+    // filter must refuse this call so that trick cannot defeat the write exclusive
+    // execute rule below.
+    if (std.mem.eql(u8, args[1], "personality-rwx")) {
+        const read_implies_exec: usize = 0x0400000;
+        const rc = linux.syscall1(.personality, read_implies_exec);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    // 0xffffffff only reads the current personality and changes nothing. The filter
+    // must let this through, or an ordinary read of the current value would break.
+    if (std.mem.eql(u8, args[1], "personality-read")) {
+        const read_current: usize = 0xffffffff;
+        const rc = linux.syscall1(.personality, read_current);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    const prot_read: u32 = 0x1;
+    const prot_write: u32 = 0x2;
+    const prot_exec: u32 = 0x4;
+    const map_private_anon: u32 = 0x02 | 0x20;
+
+    // Zig 0.16's linux.mmap and linux.mprotect take the PROT and MAP flags as packed
+    // structs, not plain integers. The seccomp filter reads the same bits off the raw
+    // syscall argument, so a bit cast from the plain u32 keeps the two views in sync.
+    if (std.mem.eql(u8, args[1], "mmap-wx")) {
+        const prot: linux.PROT = @bitCast(prot_write | prot_exec);
+        const flags: linux.MAP = @bitCast(map_private_anon);
+        const rc = linux.mmap(null, 4096, prot, flags, -1, 0);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "mmap-then-exec")) {
+        const rw: linux.PROT = @bitCast(prot_read | prot_write);
+        const flags: linux.MAP = @bitCast(map_private_anon);
+        const rc = linux.mmap(null, 4096, rw, flags, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) return 1;
+        const addr: [*]u8 = @ptrFromInt(rc);
+        addr[0] = 0xc0; // Write to the page while it is not executable.
+        const rx: linux.PROT = @bitCast(prot_read | prot_exec);
+        const rc2 = linux.mprotect(addr, 4096, rx);
+        return if (linux.errno(rc2) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "pkey-wx")) {
+        const rw: linux.PROT = @bitCast(prot_read | prot_write);
+        const flags: linux.MAP = @bitCast(map_private_anon);
+        const rc = linux.mmap(null, 4096, rw, flags, -1, 0);
+        if (linux.errno(rc) != .SUCCESS) return 1;
+        const rc2 = linux.syscall4(.pkey_mprotect, rc, 4096, prot_write | prot_exec, 0);
+        return if (linux.errno(rc2) == .SUCCESS) 0 else 1;
+    }
+
+    // shmat has no prot argument, so the write and execute rule above never sees this
+    // request. SHM_EXEC in shmflg is what asks the kernel to attach the segment
+    // executable, and the filter must refuse only that flag combination.
+    if (std.mem.eql(u8, args[1], "shmat-exec")) {
+        const shmid = createShmSegment() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer removeShmSegment(shmid);
+        const shm_exec: usize = 0x8000;
+        const rc = linux.syscall3(.shmat, shmid, 0, shm_exec);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    // An attach with no SHM_EXEC flag must still work, so the rule above does not
+    // refuse an ordinary shared memory attach along with the executable one.
+    if (std.mem.eql(u8, args[1], "shmat-plain")) {
+        const shmid = createShmSegment() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer removeShmSegment(shmid);
+        const rc = linux.syscall3(.shmat, shmid, 0, 0);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    std.debug.print("unknown operation: {s}\n", .{args[1]});
+    return 2;
+}

@@ -1,0 +1,26 @@
+.{
+    .name = .chock,
+    .version = "0.1.0",
+    .fingerprint = 0x311929c5f780c906,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vulcan = .{
+            .url = "git+https://github.com/Midstall/vulcan#b62217f98e3ebb984f8ea8a0d99f9c4680a7e0b6",
+            .hash = "vulcan-0.0.0-d6EfZI6fhACrKe1LU2YYf8cQfTldOGoooYQVxvFkWq7s",
+        },
+        .phantom = .{
+            .url = "git+https://github.com/Midstall/phantom#cc6c500f9dc52a72d61ba271c7ee59cdaf4ec540",
+            .hash = "phantom-0.1.0-HsUDTOHbGgC12mYmso-3LQZ4B9YcZ5NTWNxGjGiMD07p",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "lib",
+        "test",
+        "plugins",
+        "LICENSE",
+        "README.md",
+    },
+}
