@@ -1,11 +1,13 @@
 # Documentation
 
 - [sandbox.md](sandbox.md) - the layers a tool call runs inside, the throwaway
-  workspace, the limits, and why there is no sandbox on macOS.
-- [running.md](running.md) - `chock run`, the fifteen tools, the session log,
-  the exit codes, cost, and the task list.
+  workspace, the limits, and what the macOS sandbox holds and cannot.
+- [running.md](running.md) - `chock run`, the seventeen tools, the session log,
+  getting the work back out of the workspace, the exit codes, cost, the task
+  list, and `chock doctor`.
 - [configuration.md](configuration.md) - `config.zon`, provider instances, how
-  much context a model holds, and the two files Chock reads.
+  much context a model holds, and how the project's own `chock.zon` differs
+  from it.
 - [credentials.md](credentials.md) - `chock login`, where a credential goes,
   and why there is no argument and no environment variable for one.
 - [approvals.md](approvals.md) - what a session asks a person, and what happens

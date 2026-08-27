@@ -16,7 +16,7 @@ shell gets the same mount set as a person who has not.
 A project that names a container image in the `container` block of `chock.zon`
 gets its toolchain from that image and never from Nix. The image is read on the
 host, before any sandbox exists, and its root filesystem is written once into
-`~/.local/share/chock/images/<image>/`. Every tool call then binds that tree,
+`~/.local/state/chock/images/<image>/`. Every tool call then binds that tree,
 read only. Nothing is fetched during a session, so an image that is not on the
 machine is refused at the start with the `pull` command to run.
 

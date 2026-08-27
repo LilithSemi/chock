@@ -20,10 +20,12 @@ returned nothing, so it measured nothing, and the harness records that as an
 empty answer rather than as a session that held.
 
 Read the result knowing what it is. Two models on one machine is a measurement,
-not a guarantee. The instrument itself had six faults found while it was built
-and run, and five of those would have reported a breach as held, or a breach
-nobody committed. It says a boundary is unchecked rather than held whenever it
-cannot rebuild the decision, which is what makes the answer worth anything.
+not a guarantee. The instrument itself had faults found while it was built and
+run, and most of those would have reported a breach as held, or a breach nobody
+committed. `test/redteam/oracle.zig` keeps one of them in the code: a narrowing
+added to stop a false positive is exactly where a real finding hid. The oracle
+says a boundary is unchecked rather than held whenever it cannot rebuild the
+decision, which is what makes the answer worth anything.
 
 ## Reporting a vulnerability
 

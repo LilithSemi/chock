@@ -84,14 +84,22 @@ keyboard is refused everything.
 | `file.write` | write a file on the host |
 | `workspace.apply` | carry the session's commit into your repository |
 | `model.select` | which provider instance and which model a session uses |
+| `policy.widen` | let a session out of a promise it made to itself |
 
-The three `git` actions reach the agent through a shim: a `git` first on the
-`PATH` inside the sandbox, which reads the argument vector, runs the real git
-for a read only subcommand, and sends an approval request for a subcommand that
-changes state. **The shim prevents a mistake and it does not prevent an
-attack.** The sandbox layers are the boundary. An agent that wants to avoid the
-shim has several ways and none of them is difficult, so nothing in Chock is
-built as though the shim were a control.
+The three `git` actions have a shim in front of them. It reads the argument
+vector of every `run_command` call whose first word is `git`, and it sorts each
+subcommand into one that only reads and one that changes state. **The shim
+prevents a mistake and it does not prevent an attack.** The sandbox layers are
+the boundary. An agent that wants to avoid the shim has several ways and none
+of them is difficult, so nothing in Chock is built as though the shim were a
+control.
+
+**Only part of the shim is wired in this release.** A subcommand that has to
+reach another host, such as `git push`, is refused with a sentence that says
+why. Every other subcommand, `git commit` included, runs the real git inside
+the sandbox, and no approval request is sent. So `git.commit`, `git.push` and
+`git.branch.delete` are rows the table can answer, and nothing in a session
+asks them yet. The same is true of `file.write`.
 
 `net.fetch` is `fetch_url`'s action, and the host is part of the name, with
 the labels reversed: `docs.ziglang.org` becomes `net.fetch.org.ziglang.docs`.
@@ -118,7 +126,13 @@ refusal on your screen names the rule to add, and the block it goes in.
 `model.select` reads two rows: `provider.<instance>` is the instance by its
 name in your `config.zon`, and `provider.<instance>.<model>` is one model at
 that instance by the id that goes on the wire. The narrower of the two is the
-answer.
+answer. A session picks its model before the first turn, when nobody is waiting
+to be asked, so **only `allow` lets a model be used** and every other answer is
+a refusal.
+
+`nix.build` is read once, also before the first turn, and it decides whether
+the `provide_tool` tool exists at all. Only `allow` gives the session that
+tool, and `ask` is a refusal there for the same reason.
 
 ## Files the agent may not read
 
@@ -146,6 +160,11 @@ chock: this file is denied by the project. Its bytes are not in this sandbox.
 mount tree a tool call reads through, so no tool, no shell command and no
 program the agent runs can reach them. There is nothing to filter and nothing
 to miss.
+
+That is the Linux mechanism. macOS has no bind mount, so the denial there is a
+Seatbelt rule that refuses a read and a write of the named path. The bytes stay
+where they are and the kernel refuses every open of them, which gives the same
+answer to a tool call by a different road.
 
 A few things are refused by name rather than half supported, and the refusal
 happens when the session starts, not later:
@@ -187,15 +206,26 @@ never saw the turn it was written on. So a restriction is an event in the
 session log, and it is folded back out of the log exactly the way the task
 list is.
 
-It cannot be lifted, and that is structural rather than a check:
+The agent cannot lift it alone, and that is structural rather than a check:
 
 1. **The effective ceiling is the minimum over every restriction that covers
    the action.** Adding one more can only lower it.
-2. **There is no event that removes a restriction.** The fold appends.
+2. **The fold appends.** There is no event an agent can write that removes a
+   restriction.
 3. **A proposal that asks for more than the agent holds is refused before
    anything is written.** Nothing reaches the log, so there is nothing for the
    minimum to read, and the agent is told, rather than carrying on believing
    it was lifted.
+
+**The one way out is `policy.widen`, which is an ordinary row of the table.**
+An agent that wants more than it promised must name the promise exactly as it
+wrote it, and the broker then weighs the request the way it weighs any other
+act. A project that writes no rule for `policy.widen` gets `ask`, so a session
+with nobody to ask is refused. An authorised widening writes one more event,
+and the fold reads that one as a replacement of the named promise rather than
+as one more term of the minimum. Every other promise is untouched. **The agent
+cannot mark the event itself**: the loop writes the mark, and only after an
+answer from the broker.
 
 **And the agent does not enforce this on itself.** A check an agent performs on
 itself is worth nothing. The broker reads the folded restrictions and narrows

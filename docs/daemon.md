@@ -121,9 +121,13 @@ user id on that socket and refuses anybody else with `403 Forbidden`.
 `--host <addr>` swaps the socket for a TCP listener. **TCP carries no peer
 identity**, so `serve` checks nobody there and authentication is the job of a
 proxy in front of it. A browser cannot speak a unix socket, but nginx, Caddy and
-Authelia all proxy to one, which is why the socket is the default. A person who
-wants a browser pointed straight at Chock types `--host 127.0.0.1`. `--port`
-with no `--host` is refused by name.
+Authelia all proxy to one, which is why the socket is the default.
+
+**A proxy that runs under its own account cannot open that socket**, because
+the check is the peer's user id. Run the proxy as the user that started `chock
+serve`, or give the proxy a `--host 127.0.0.1` address and accept what that
+address means. A person who wants a browser pointed straight at Chock types the
+same `--host 127.0.0.1`. `--port` with no `--host` is refused by name.
 
 ## Handing a session over
 
@@ -196,7 +200,9 @@ moment between says so by name, and names `chock run --continue` as the way to
 take the session back.
 
 A detached session asks its questions the same way every other session does,
-over the unix socket beside its log. `chock approve <session id>` answers one
-directly, and the daemon's `answer` verb reaches the same socket for a client
-that only speaks to the daemon. A session that hands over exits `8`, because
+over the unix socket beside its log. `chock approve <session id>` attaches to
+that socket directly, and the daemon's `answer` verb reaches the same socket for
+a client that only speaks to the daemon. **`chock approve` has to run on the
+machine that holds the session**, because that socket is a unix socket and no
+remote transport for it is built. A client somewhere else uses the daemon. A session that hands over exits `8`, because
 the work is not over and it is not that process's any more.
