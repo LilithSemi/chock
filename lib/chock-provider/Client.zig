@@ -344,6 +344,10 @@ pub const SendError =
         /// can tell that shape apart from a real, finished reply. Tracking
         /// it and returning this instead is the entire reason `send`
         /// exists on top of `sse.Parser`.
+        ///
+        /// **Only before the marker.** A connection that fails once the
+        /// marker is in hand truncated nothing, and calling that this cost
+        /// one owner 73 turns of finished work: see `streamBody`.
         StreamTruncated,
     };
 
@@ -671,6 +675,16 @@ const openai_path = "/chat/completions";
 
 /// ai& sends its cost and timing metadata only when the request asks for it.
 const aiand_metrics_header = "X-Aiand-Metrics";
+
+/// The `event:` name ai& puts on the one trailer that header buys, appended
+/// after the stream's `[DONE]` line. See `deliverAiandMetrics`, and
+/// https://docs.aiand.com/reference/streaming-events/ for the shape.
+const aiand_metrics_event = "metrics";
+
+/// Room for a currency code while its case is folded. Three letters under
+/// ISO 4217, and eight leaves room for a provider that says something longer
+/// without this having to allocate. See `iso4217`.
+const max_currency = 8;
 
 /// What `send` puts in `Accept-Encoding`. **The bytes as they are, with no
 /// compression at all.**
@@ -1009,9 +1023,11 @@ fn readErrorBody(allocator: std.mem.Allocator, body_reader: *std.Io.Reader) std.
 
 /// Read `body_reader` to the end, feeding every byte to an `sse.Parser` and
 /// every parsed event's JSON to `deliverDelta`. Returns
-/// `error.StreamTruncated` the moment either the transport itself fails, for
-/// example a chunked body cut off mid chunk, or the stream ends without
-/// ever producing a `.done` event: see `SendError.StreamTruncated`.
+/// `error.StreamTruncated` when the stream ends, cleanly or through a
+/// transport fault such as a chunked body cut off mid chunk, before the wire's
+/// own end marker arrived: see `SendError.StreamTruncated`. **After that
+/// marker the reply is whole**, and a connection that fails from then on is
+/// not a truncation: see the check at the bottom of this function.
 ///
 /// **This is where streaming actually happens, and it earlier did not.**
 /// `std.Io.Reader.readSliceShort(&chunk_buf)`, the call this function used
@@ -1098,7 +1114,24 @@ fn streamBody(
             // end it then sees as a failure rather than as an end of stream.
             // Calling that a broken connection would name the wrong fault, in
             // the wrong file, for a provider that simply went quiet.
-            error.ReadFailed => return if (stalled) error.StreamStalled else error.StreamTruncated,
+            //
+            // **A connection that fails after the reply is already whole
+            // truncated nothing**, and this is the arm that used to say it
+            // did. It returned before the completeness check at the bottom of
+            // this function ever ran, so a turn that arrived in full, said
+            // `[DONE]`, and then lost its connection was reported as cut
+            // short. This end asks ai& for a `metrics` trailer that arrives
+            // after `[DONE]`, so Chock holds a connection it no longer needs
+            // anything from, and a provider that drops it in that window cost
+            // one owner 73 turns of real work.
+            //
+            // `saw_end` is the whole of the test, and it is the same fact the
+            // bottom of this function reads: see the check there for why the
+            // end marker alone answers this.
+            error.ReadFailed => {
+                if (saw_end) break;
+                return if (stalled) error.StreamStalled else error.StreamTruncated;
+            },
         };
 
         // fillMore's own doc comment allows it to add zero bytes without
@@ -1117,9 +1150,17 @@ fn streamBody(
             switch (event) {
                 .done => saw_end = true,
                 .data => |data| switch (adapter) {
-                    .openai_compatible => try deliverDelta(allocator, data, on_delta, ctx),
+                    .openai_compatible => if (std.mem.eql(u8, data.name, aiand_metrics_event))
+                        // **By the name the server gave it, never by its
+                        // shape.** ai&'s own documentation says not to read a
+                        // `metrics` event as a chat completion chunk, and a
+                        // reader that sniffed the JSON instead would have to
+                        // guess for every provider that ever adds a field.
+                        try deliverAiandMetrics(allocator, data.body, on_delta, ctx)
+                    else
+                        try deliverDelta(allocator, data.body, on_delta, ctx),
                     .anthropic => {
-                        if (try deliverAnthropic(allocator, &decoder, data, status, on_delta, ctx)) |refusal| {
+                        if (try deliverAnthropic(allocator, &decoder, data.body, status, on_delta, ctx)) |refusal| {
                             return .{ .status_error = refusal };
                         }
                         // The decoder keeps this across events, so the check
@@ -1148,7 +1189,21 @@ fn streamBody(
         }
     }
 
-    if (!saw_end or parser.finish() != .complete) {
+    // **The end marker is the whole test, and a half read event after it
+    // proves nothing about the reply.** This check used to demand
+    // `parser.finish() == .complete` as well. Both wires put their end marker
+    // last and this parser hands events out in the order they arrive, so a
+    // stream that reached `[DONE]`, or `message_stop`, delivered every event
+    // of the reply before it. Whatever the parser still holds half read
+    // therefore arrived after the reply ended and belongs to no part of it.
+    // On ai& that leftover has a name: the `metrics` trailer, which is what
+    // Chock is still reading for when the connection dies. Failing a finished
+    // turn over a half arrived cost line would lose the work all over again,
+    // for a number the turn does not need.
+    //
+    // A reply that was really cut short reaches neither marker, so `saw_end`
+    // is false and both faults below are reported exactly as before.
+    if (!saw_end) {
         // **Which fault it was depends on why the reading stopped**, and the
         // two are different things to tell a user. A truncated stream ended:
         // the connection closed or the transport failed, and there was
@@ -1293,14 +1348,14 @@ fn deliverDelta(
     }
 }
 
-/// The value of `object[name]` under any of `names`, or null. The exact
-/// spelling ai& uses for its metric fields inside the trailing stream event
-/// is not something this project has read off a live endpoint. ai& names the
-/// HTTP headers `X-Cost` and `X-Cost-Currency`, and the streaming path carries
-/// them in the final event instead. Accepting
-/// the header spelling, the snake case spelling, and the bare name costs
-/// nothing and guessing one of the three wrong loses the number in silence,
-/// which is the failure this whole milestone exists to stop.
+/// The value of `object[name]` under any of `names`, or null. ai& names its
+/// HTTP headers `X-Cost` and `X-Cost-Currency`, and a provider that folds
+/// numbers of that kind into a chat completion chunk may spell them the
+/// header way, the snake case way, or the bare way. Accepting all three costs
+/// nothing and guessing one of them wrong loses the number in silence.
+///
+/// **ai&'s own cost does not arrive here.** It comes in a named `metrics`
+/// trailer with its own field names, read by `aiandMetrics`.
 fn firstOf(object: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
     for (names) |name| {
         if (object.get(name)) |value| return value;
@@ -1317,6 +1372,126 @@ fn countOf(object: std.json.ObjectMap, names: []const []const u8) ?u64 {
 fn textOf(object: std.json.ObjectMap, names: []const []const u8) ?[]const u8 {
     const value = firstOf(object, names) orelse return null;
     return if (value == .string) value.string else null;
+}
+
+/// A money amount is a fraction of a cent and arrives as a JSON number, which
+/// a parser hands back as a float, as an integer when it happens to be whole,
+/// or as `number_string` when it has more digits than a float holds.
+fn numberOf(object: std.json.ObjectMap, names: []const []const u8) ?f64 {
+    const value = firstOf(object, names) orelse return null;
+    return switch (value) {
+        .float => |amount| amount,
+        .integer => |amount| @floatFromInt(amount),
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        else => null,
+    };
+}
+
+/// The ISO 4217 spelling of `text`, which is the uppercase one.
+///
+/// **Case is not cosmetic here.** ai& spells its currency `usd`, and every
+/// other place Chock compares a currency spells it `USD`: a budget's own
+/// `currency` defaults to that, and `chock_proto.state.Spend` calls two
+/// spellings of one currency a mixed total and stops counting the spend
+/// against the cap at all. Fold it once, here, rather than teach every
+/// comparer about it.
+///
+/// The answer borrows `buf` whenever a fold happened, so it lives exactly as
+/// long as the caller's frame: the same lifetime `Delta` already states for
+/// every string it carries. A code longer than `buf` passes through unchanged,
+/// because an ISO 4217 code is three letters and a provider that sends
+/// something else is not one to quietly reshape.
+fn iso4217(text: []const u8, buf: []u8) []const u8 {
+    if (text.len == 0 or text.len > buf.len) return text;
+    return std.ascii.upperString(buf[0..text.len], text);
+}
+
+/// Read ai&'s `metrics` trailer and hand the counts and the cost it carries
+/// to `on_delta`. See `aiandMetrics` for the shape and `aiand_metrics_event`
+/// for how this event is told apart from a chat completion chunk.
+///
+/// **A trailer this cannot read never fails the reply.** The trailer arrives
+/// after `[DONE]`, so by the time it is read the model's answer is already
+/// whole and already delivered. Losing the cost line of one turn is a smaller
+/// harm than losing the turn, which is why a malformed trailer is dropped
+/// here while a malformed chunk still fails the stream in `deliverDelta`: a
+/// chunk carries the reply, and a trailer carries only what it cost.
+fn deliverAiandMetrics(
+    allocator: std.mem.Allocator,
+    json_text: []const u8,
+    on_delta: OnDelta,
+    ctx: ?*anyopaque,
+) SendError!void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch |err| switch (err) {
+        // Not a fault of the trailer, and the caller has its own answer for
+        // it: out of memory ends the request wherever it happens.
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var currency_buf: [max_currency]u8 = undefined;
+    const usage = aiandMetrics(parsed.value.object, &currency_buf) orelse return;
+    try on_delta(ctx, .{ .usage = usage });
+}
+
+/// Read one ai& `metrics` trailer, whose documented shape is
+/// `{"tokens":{"input":7,"output":2,"total":9,"cached":0},"cost":0.000018,`
+/// `"currency":"usd","ttft_ms":120,"inference_ms":850}`. Null when the object
+/// held none of it, so a caller can tell "the provider said nothing" apart
+/// from "the provider said zero": see `message.Cost`.
+///
+/// **This is the only place a real token count comes from on this provider.**
+/// ai& relays the model's own SSE events unchanged, so a model that reports no
+/// `usage` object leaves `openAiUsage` with nothing to read: three sessions
+/// against qwen and glm wrote 94 usage events of nothing but zeros for exactly
+/// that reason. See https://docs.aiand.com/reference/streaming-events/.
+///
+/// `cost` is the provider's own final figure for the turn, so the answer is
+/// `known` with an empty `price_table_version`: a number Chock was told beats
+/// a number Chock estimated, and the empty version is what says which of the
+/// two this was.
+///
+/// `total` is not read: it is `input` plus `output`, which the caller already
+/// has, and a second copy of a number is a second number to disagree with.
+/// `ttft_ms` is not read either, because `message.Usage` has no field for time
+/// to first token and inventing one to hold a number nothing reads would be
+/// worse than leaving it on the wire.
+///
+/// Every string in the answer is a slice into `object` or into `currency_buf`,
+/// which is the same lifetime rule `Delta` already states.
+fn aiandMetrics(object: std.json.ObjectMap, currency_buf: []u8) ?message.Usage {
+    var usage = message.Usage{};
+    var said_anything = false;
+
+    if (object.get("tokens")) |tokens_value| {
+        if (tokens_value == .object) {
+            const tokens = tokens_value.object;
+            said_anything = true;
+            if (countOf(tokens, &.{"input"})) |count| usage.input_tokens = count;
+            if (countOf(tokens, &.{"output"})) |count| usage.output_tokens = count;
+            // Kept apart from the fresh input, exactly as `openAiUsage` keeps
+            // `prompt_tokens_details.cached_tokens` apart: a cached prompt
+            // token is billed at a fraction of a fresh one, and folding the
+            // two together hides the discount from anybody reading the log.
+            if (countOf(tokens, &.{"cached"})) |count| usage.cache_read_input_tokens = count;
+        }
+    }
+
+    if (numberOf(object, &.{"cost"})) |amount| {
+        said_anything = true;
+        usage.cost = .{ .known = .{
+            .value = amount,
+            .currency = iso4217(textOf(object, &.{"currency"}) orelse "", currency_buf),
+        } };
+    }
+    if (countOf(object, &.{"inference_ms"})) |count| {
+        said_anything = true;
+        usage.inference_ms = count;
+    }
+
+    return if (said_anything) usage else null;
 }
 
 /// Read the OpenAI compatible `usage` object, and ai&'s own cost and timing
@@ -1352,20 +1527,12 @@ fn openAiUsage(object: std.json.ObjectMap) ?message.Usage {
         }
     }
 
-    if (firstOf(object, &.{ "X-Cost", "x_cost", "cost" })) |cost_value| {
-        const amount: ?f64 = switch (cost_value) {
-            .float => |value| value,
-            .integer => |value| @floatFromInt(value),
-            .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-            else => null,
-        };
-        if (amount) |value| {
-            said_anything = true;
-            usage.cost = .{ .known = .{
-                .value = value,
-                .currency = textOf(object, &.{ "X-Cost-Currency", "x_cost_currency", "cost_currency" }) orelse "",
-            } };
-        }
+    if (numberOf(object, &.{ "X-Cost", "x_cost", "cost" })) |amount| {
+        said_anything = true;
+        usage.cost = .{ .known = .{
+            .value = amount,
+            .currency = textOf(object, &.{ "X-Cost-Currency", "x_cost_currency", "cost_currency" }) orelse "",
+        } };
     }
     if (textOf(object, &.{ "X-Request-ID", "x_request_id", "request_id", "id" })) |text| {
         usage.request_id = text;

@@ -1125,6 +1125,304 @@ test "an OpenAI compatible stream's final usage chunk reaches the caller instead
     try std.testing.expect(std.mem.indexOf(u8, fp.captured.body, "\"include_usage\":true") != null);
 }
 
+/// The trailer ai& appends after `[DONE]` when the request asks for it, in
+/// the shape its own documentation gives. **A named event, not a chunk**: the
+/// name is what tells it apart from a chat completion, and reading it as one
+/// is what ai& tells readers not to do.
+const aiand_metrics_trailer = "event: metrics\n" ++
+    "data: {\"tokens\":{\"input\":7,\"output\":2,\"total\":9,\"cached\":3}," ++
+    "\"cost\":0.000018,\"currency\":\"usd\",\"ttft_ms\":120,\"inference_ms\":850}\n\n";
+
+test "ai&'s metrics trailer is the token count and the cost of a turn, and it lands after DONE" {
+    // Measured, not guessed: across three real sessions against ai& every one
+    // of 94 usage events held nothing but zeros, because ai& relays a model's
+    // SSE events unchanged and qwen and glm send no `usage` object at all.
+    // This trailer is the only place the numbers exist on that provider.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk("data: [DONE]\n\n") },
+            .{ .bytes = fake_provider.httpChunk(aiand_metrics_trailer) },
+            .{ .bytes = fake_provider.last_chunk },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+    defer switch (reply.outcome) {
+        .message => |msg| freeAssembledMessage(allocator, msg),
+        .status_error => |status_error| allocator.free(status_error.body),
+        .failed => |failed| freeAssembledMessage(allocator, failed.partial),
+    };
+
+    // The trailer is read for what it is and never folded into the reply: a
+    // reader that took it for a chunk would either fail the whole stream or
+    // append its JSON to what the model said.
+    try std.testing.expect(reply.outcome == .message);
+    try std.testing.expectEqual(@as(usize, 1), reply.outcome.message.content.len);
+    try std.testing.expectEqualStrings("ok", reply.outcome.message.content[0].text);
+
+    try std.testing.expectEqual(@as(u64, 7), reply.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), reply.usage.output_tokens);
+    // Apart from the fresh input, never folded into it: a cached prompt token
+    // is billed at a fraction of a fresh one.
+    try std.testing.expectEqual(@as(u64, 3), reply.usage.cache_read_input_tokens);
+    try std.testing.expectEqual(@as(u64, 850), reply.usage.inference_ms);
+
+    // The provider's own final figure, so `known` and not an estimate, and
+    // `price_table_version` stays empty because no table produced it.
+    try std.testing.expectEqual(message.Cost.known, std.meta.activeTag(reply.usage.cost));
+    try std.testing.expectEqual(@as(f64, 0.000018), reply.usage.cost.known.value);
+    try std.testing.expectEqual(@as(usize, 0), reply.usage.price_table_version.len);
+    // Uppercase, though ai& wrote `usd`: a budget's currency is `USD`, and a
+    // spend in another spelling counts against no cap at all.
+    try std.testing.expectEqualStrings("USD", reply.usage.cost.known.currency);
+}
+
+test "a connection that fails after the reply is whole delivers the reply, and never calls it truncated" {
+    // What killed 73 turns of real work. Chock asks ai& for the metrics
+    // trailer, so it keeps reading after `[DONE]`, and the provider dropped
+    // the connection in that window. The reply had arrived in full, the end
+    // marker was in hand, and the whole turn was thrown away as truncated.
+    //
+    // The script writes no terminating zero length chunk: the connection dies
+    // mid chunk frame, which is a transport fault and not a clean end of body.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the whole answer\"}," ++
+                    "\"finish_reason\":\"stop\"}]}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk("data: [DONE]\n\n") },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+    defer switch (reply.outcome) {
+        .message => |msg| freeAssembledMessage(allocator, msg),
+        .status_error => |status_error| allocator.free(status_error.body),
+        .failed => |failed| freeAssembledMessage(allocator, failed.partial),
+    };
+
+    try std.testing.expect(reply.outcome == .message);
+    try std.testing.expectEqual(@as(usize, 1), reply.outcome.message.content.len);
+    try std.testing.expectEqualStrings("the whole answer", reply.outcome.message.content[0].text);
+    try std.testing.expectEqualStrings("stop", reply.stopReason());
+}
+
+test "a connection that fails before the end marker is still a truncated stream" {
+    // The half of the pair that must not move. The script above and this one
+    // differ in one thing, whether `[DONE]` arrived before the connection
+    // died, and that one thing is the whole of what tells a finished turn
+    // apart from a lost one. A reply cut off mid sentence is still an error,
+    // and the text that did arrive still comes back in `failed.partial`.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
+            ) },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+
+    switch (reply.outcome) {
+        .message, .status_error => return error.TestUnexpectedResult,
+        .failed => |failed| {
+            defer freeAssembledMessage(allocator, failed.partial);
+            try std.testing.expect(failed.err == error.StreamTruncated);
+            try std.testing.expectEqual(@as(usize, 1), failed.partial.content.len);
+            try std.testing.expectEqualStrings("half an ans", failed.partial.content[0].text);
+        },
+    }
+}
+
+test "a malformed metrics trailer costs the cost line and never the reply" {
+    // A trailer arrives after the model's answer is already whole, so nothing
+    // it says can make the answer worse. Failing the stream over unreadable
+    // metadata would throw away a finished turn for the sake of a number
+    // nobody can spend.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk("data: [DONE]\n\n") },
+            .{ .bytes = fake_provider.httpChunk(
+                "event: metrics\ndata: {\"tokens\":{\"input\":7,\n\n",
+            ) },
+            .{ .bytes = fake_provider.last_chunk },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+    defer switch (reply.outcome) {
+        .message => |msg| freeAssembledMessage(allocator, msg),
+        .status_error => |status_error| allocator.free(status_error.body),
+        .failed => |failed| freeAssembledMessage(allocator, failed.partial),
+    };
+
+    try std.testing.expect(reply.outcome == .message);
+    try std.testing.expectEqualStrings("ok", reply.outcome.message.content[0].text);
+    // Unknown, and never a zero: nothing readable said what this turn cost.
+    // See `message.Cost`, where those are different states.
+    try std.testing.expectEqual(message.Cost.unknown, std.meta.activeTag(reply.usage.cost));
+}
+
+test "a trailer that is still arriving when the connection dies costs nothing but the trailer" {
+    // The sharpest shape of the same trap, and the reason the end marker is
+    // the whole of the test. `[DONE]` has arrived, the reply is whole, and
+    // the connection then dies partway through the metrics trailer, leaving a
+    // half read event in the parser. Demanding a clean parser as well as the
+    // end marker would call this turn truncated and lose it, over a cost line
+    // that arrived late and incomplete.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the whole answer\"}," ++
+                    "\"finish_reason\":\"stop\"}]}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk("data: [DONE]\n\n") },
+            // No terminating blank line, and no zero length chunk after it:
+            // the trailer is cut off mid event and the connection drops.
+            .{ .bytes = fake_provider.httpChunk("event: metrics\ndata: {\"tokens\":{\"input\":7") },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+    defer switch (reply.outcome) {
+        .message => |msg| freeAssembledMessage(allocator, msg),
+        .status_error => |status_error| allocator.free(status_error.body),
+        .failed => |failed| freeAssembledMessage(allocator, failed.partial),
+    };
+
+    try std.testing.expect(reply.outcome == .message);
+    try std.testing.expectEqualStrings("the whole answer", reply.outcome.message.content[0].text);
+    // The half trailer said nothing this reader can spend, so the cost stays
+    // unknown. The turn is kept; only its price is missing.
+    try std.testing.expectEqual(message.Cost.unknown, std.meta.activeTag(reply.usage.cost));
+}
+
+test "a stream with no trailer at all is read exactly as it was, which is what OpenAI proper sends" {
+    // The trailer is one provider's extension, bought with one request
+    // header. OpenAI proper names no event and appends nothing after
+    // `[DONE]`, so its usage chunk must still be the whole answer, and a
+    // reader that started demanding a trailer would report nothing at all
+    // for every other provider on this wire.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var fp = try fake_provider.FakeProvider.start(allocator, io, .{
+        .head = anthropic_head,
+        .body = &.{
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":4}}\n\n",
+            ) },
+            .{ .bytes = fake_provider.httpChunk("data: [DONE]\n\n") },
+            .{ .bytes = fake_provider.last_chunk },
+        },
+    });
+
+    var base_buf: [64]u8 = undefined;
+    var http_client = HttpClient.init(allocator, io, fp.baseUrl(&base_buf), "test-key");
+    defer http_client.deinit();
+
+    const user_content = [_]message.ContentPart{.{ .text = "hi" }};
+    const messages = [_]message.Message{.{ .role = .user, .content = &user_content }};
+
+    const reply = try sendAndAssemble(http_client.client(), allocator, testRequest(&messages));
+    fp.join();
+    defer fp.deinit();
+    defer freeUsage(allocator, reply.usage);
+    defer switch (reply.outcome) {
+        .message => |msg| freeAssembledMessage(allocator, msg),
+        .status_error => |status_error| allocator.free(status_error.body),
+        .failed => |failed| freeAssembledMessage(allocator, failed.partial),
+    };
+
+    try std.testing.expect(reply.outcome == .message);
+    try std.testing.expectEqualStrings("ok", reply.outcome.message.content[0].text);
+    try std.testing.expectEqual(@as(u64, 11), reply.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 4), reply.usage.output_tokens);
+    // The chunk said counts and no cost, so the cost stays unknown rather
+    // than becoming a zero somebody could spend against a cap.
+    try std.testing.expectEqual(message.Cost.unknown, std.meta.activeTag(reply.usage.cost));
+}
+
 test "an OpenAI compatible reply with no content at all assembles to an empty message that names its stop reason" {
     // The cheap deterministic shape of the fault the red team run of
     // 2026-08-26 hit: the provider is reached, it counts input tokens, and it
