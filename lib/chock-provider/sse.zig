@@ -43,6 +43,16 @@
 //! `reasoning_content` streams the same way, fragment by fragment, ahead of
 //! `content` or `tool_calls` when the model reasons before it answers: see
 //! `testdata/reasoning_content_stream.sse`, a real capture.
+//!
+//! **`[DONE]` is not always the last thing on the wire.** ai& appends one
+//! named trailer after it, carrying what the turn actually cost:
+//!
+//!     event: metrics
+//!     data: {"tokens":{"input":7,"output":2,"total":9,"cached":0},
+//!     "cost":0.000018,"currency":"usd","ttft_ms":120,"inference_ms":850}
+//!
+//! That is why `Event.data` carries the `event:` name and not only the body:
+//! see `Data`. Chock reads that trailer in `Client.zig`.
 
 const std = @import("std");
 const message = @import("message.zig");
@@ -50,10 +60,8 @@ const message = @import("message.zig");
 /// One complete server sent event, or the literal `[DONE]` marker that ends
 /// a stream. `data` owns its memory: the caller frees it with `deinit`.
 pub const Event = union(enum) {
-    /// One event's `data:` field, with the trailing newline and the SSE
-    /// spec's one optional leading space stripped. In practice, the JSON
-    /// text of one streaming chat completion chunk.
-    data: []const u8,
+    /// One event's `data:` field, and the `event:` name it arrived under.
+    data: Data,
     /// The stream's final event: a literal `data: [DONE]` line. Nothing
     /// stops a caller from calling `Parser.next` again after seeing this.
     /// It simply returns null until more bytes arrive.
@@ -61,9 +69,36 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: Event, allocator: std.mem.Allocator) void {
         switch (self) {
-            .data => |bytes| allocator.free(bytes),
+            .data => |data| data.deinit(allocator),
             .done => {},
         }
+    }
+};
+
+/// One event's payload and the name the server gave it. Both slices are owned
+/// by the `Event` that holds them, and `Event.deinit` frees them.
+///
+/// **The name is the only safe way to tell two payload shapes apart on one
+/// stream.** ai& appends a `metrics` event, carrying the turn's real token
+/// counts and its final cost, after the `[DONE]` line of an otherwise
+/// ordinary chat completion stream, and its documentation says in as many
+/// words not to read that event as a chat completion chunk. A reader that
+/// looks only at the JSON must guess from the shape, and a guess that is
+/// wrong in either direction either loses the cost or corrupts the reply.
+pub const Data = struct {
+    /// The `event:` field, or empty when the event carried none. Per the SSE
+    /// spec this resets between events, so an unnamed event after a named one
+    /// reads back as unnamed. The OpenAI compatible wire names nothing at all
+    /// and so leaves this empty on every chat completion chunk.
+    name: []const u8,
+    /// The `data:` field, with the SSE spec's one optional leading space
+    /// stripped, and with several `data:` lines of one event joined by `\n`.
+    /// In practice, the JSON text of one streaming chunk.
+    body: []const u8,
+
+    pub fn deinit(self: Data, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.body);
     }
 };
 
@@ -85,6 +120,11 @@ pub const Parser = struct {
     /// by `\n` per the SSE spec when an event carries more than one. Never
     /// holds more than `max_pending_bytes`: see `processLine`.
     pending: std.ArrayList(u8) = .empty,
+    /// The `event:` line of the event currently being assembled, empty when
+    /// it carried none. Per the SSE spec a second `event:` line replaces the
+    /// first rather than joining onto it, so this holds one line at most and
+    /// `max_line_bytes` bounds it.
+    pending_name: std.ArrayList(u8) = .empty,
     /// Whether `pending` holds at least one `data:` line for the event in
     /// progress. This is what tells a blank line that really ends an event
     /// apart from a stray blank line, for example a second one in a row,
@@ -177,6 +217,7 @@ pub const Parser = struct {
         for (self.events.items[self.events_read..]) |event| event.deinit(self.allocator);
         self.events.deinit(self.allocator);
         self.pending.deinit(self.allocator);
+        self.pending_name.deinit(self.allocator);
         self.line_buf.deinit(self.allocator);
     }
 
@@ -249,8 +290,7 @@ pub const Parser = struct {
         // longer complete.
         if (findLineBreak(bytes, 0) == null and self.line_buf.items.len + bytes.len > max_line_bytes) {
             self.line_buf.clearAndFree(self.allocator);
-            self.pending.clearAndFree(self.allocator);
-            self.have_pending = false;
+            self.dropPendingEvent();
             return error.LineTooLong;
         }
         try self.line_buf.appendSlice(self.allocator, bytes);
@@ -299,17 +339,13 @@ pub const Parser = struct {
             // fed afterward does not glue onto its leftovers. EventTooLarge
             // already clears both itself, in processLine, before returning
             // here, so this is a no-op in that case.
-            if (err == error.LineTooLong) {
-                self.pending.clearAndFree(self.allocator);
-                self.have_pending = false;
-            }
+            if (err == error.LineTooLong) self.dropPendingEvent();
             return err;
         }
 
         if (self.line_buf.items.len > max_line_bytes) {
             self.line_buf.clearAndFree(self.allocator);
-            self.pending.clearAndFree(self.allocator);
-            self.have_pending = false;
+            self.dropPendingEvent();
             return error.LineTooLong;
         }
     }
@@ -325,23 +361,42 @@ pub const Parser = struct {
             return;
         }
         if (line.len == 0) {
-            if (!self.have_pending) return; // a stray blank line ends nothing
+            if (!self.have_pending) {
+                // A stray blank line ends no event, and it still ends the
+                // name: per the SSE spec the event type buffer is reset on
+                // every dispatch, whether anything was dispatched or not, so
+                // a bare `event: ping` cannot name the event after it.
+                self.pending_name.clearRetainingCapacity();
+                return;
+            }
             try self.finishEvent();
             return;
         }
 
         const colon = std.mem.indexOfScalar(u8, line, ':');
         const field = if (colon) |c| line[0..c] else line;
-        // event:, id:, retry: are not read here. An SSE comment line, for
+        // id: and retry: are not read here. An SSE comment line, for
         // example ": keep-alive", starts with ':' and so has an empty
         // field name here too: it falls through this same check, no
         // separate guard needed.
-        if (!std.mem.eql(u8, field, "data")) return;
+        const is_data = std.mem.eql(u8, field, "data");
+        const is_name = std.mem.eql(u8, field, "event");
+        if (!is_data and !is_name) return;
 
         var value: []const u8 = "";
         if (colon) |c| {
             value = line[c + 1 ..];
             if (value.len != 0 and value[0] == ' ') value = value[1..];
+        }
+
+        if (is_name) {
+            // Replaced and never joined, unlike `data:` below: the SSE spec
+            // sets the event type buffer to the field value rather than
+            // appending to it, which is also what keeps this bounded by one
+            // line.
+            self.pending_name.clearRetainingCapacity();
+            try self.pending_name.appendSlice(self.allocator, value);
+            return;
         }
 
         // A second `data:` line in the same event joins onto the first with
@@ -353,24 +408,35 @@ pub const Parser = struct {
         self.have_pending = true;
 
         if (self.pending.items.len > max_pending_bytes) {
-            self.pending.clearAndFree(self.allocator);
-            self.have_pending = false;
+            self.dropPendingEvent();
             self.skip_to_blank = true;
             return error.EventTooLarge;
         }
     }
 
+    /// Throw away the event being assembled, name and all. Called wherever a
+    /// line belonging to it was refused: what is left cannot be completed,
+    /// and leaving it would let the next clean event glue onto its leftovers.
+    fn dropPendingEvent(self: *Parser) void {
+        self.pending.clearAndFree(self.allocator);
+        self.pending_name.clearAndFree(self.allocator);
+        self.have_pending = false;
+    }
+
     fn finishEvent(self: *Parser) Error!void {
         defer {
             self.pending.clearRetainingCapacity();
+            self.pending_name.clearRetainingCapacity();
             self.have_pending = false;
         }
         if (std.mem.eql(u8, self.pending.items, "[DONE]")) {
             try self.events.append(self.allocator, .done);
         } else {
-            const owned = try self.allocator.dupe(u8, self.pending.items);
-            errdefer self.allocator.free(owned);
-            try self.events.append(self.allocator, .{ .data = owned });
+            const body = try self.allocator.dupe(u8, self.pending.items);
+            errdefer self.allocator.free(body);
+            const name = try self.allocator.dupe(u8, self.pending_name.items);
+            errdefer self.allocator.free(name);
+            try self.events.append(self.allocator, .{ .data = .{ .name = name, .body = body } });
         }
         // Nothing bounds how many parsed events pile up if the caller never
         // drains with `next`: a reviewer measured 500,000 undrained events
@@ -732,7 +798,7 @@ test "a data line split across two reads produces one event" {
     defer event.deinit(allocator);
     try std.testing.expect(event == .data);
     // raw is "data: " (6 bytes) + the JSON text + "\n\n" (2 bytes).
-    try std.testing.expectEqualStrings(raw[6 .. raw.len - 2], event.data);
+    try std.testing.expectEqualStrings(raw[6 .. raw.len - 2], event.data.body);
     try std.testing.expect(parser.next() == null);
 }
 
@@ -747,12 +813,69 @@ test "the done marker ends the stream" {
     const first = parser.next() orelse return error.TestExpectedEvent;
     defer first.deinit(allocator);
     try std.testing.expect(first == .data);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", first.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", first.data.body);
 
     const second = parser.next() orelse return error.TestExpectedEvent;
     try std.testing.expect(second == .done);
 
     try std.testing.expect(parser.next() == null);
+}
+
+test "an event's name reaches the caller, because two payload shapes share one stream" {
+    // ai& appends `event: metrics` after `[DONE]`, carrying the turn's token
+    // counts and its final cost, and says in as many words not to read that
+    // event as a chat completion chunk. Its name is the only thing that tells
+    // it apart, so the name has to survive the parser.
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+    try parser.feed("data: [DONE]\n\n");
+    try parser.feed("event: metrics\ndata: {\"cost\":0.000018}\n\n");
+    try parser.feed("data: {\"choices\":[]}\n\n");
+
+    const chunk = parser.next() orelse return error.TestExpectedEvent;
+    defer chunk.deinit(allocator);
+    // The OpenAI compatible wire names nothing, and an unnamed event reads
+    // back as unnamed rather than as some default name a reader must know.
+    try std.testing.expectEqualStrings("", chunk.data.name);
+
+    const done = parser.next() orelse return error.TestExpectedEvent;
+    try std.testing.expect(done == .done);
+
+    const metrics = parser.next() orelse return error.TestExpectedEvent;
+    defer metrics.deinit(allocator);
+    try std.testing.expectEqualStrings("metrics", metrics.data.name);
+    try std.testing.expectEqualStrings("{\"cost\":0.000018}", metrics.data.body);
+
+    // The name is reset between events, per the SSE spec: without that, every
+    // event after a named one would inherit a name nobody sent, and an
+    // ordinary chunk would read as metrics.
+    const after = parser.next() orelse return error.TestExpectedEvent;
+    defer after.deinit(allocator);
+    try std.testing.expectEqualStrings("", after.data.name);
+
+    try std.testing.expect(parser.next() == null);
+}
+
+test "a named event with no data of its own dispatches nothing and names nothing after it" {
+    // Per the SSE spec an event with an empty data buffer is not dispatched
+    // at all, and the event type buffer still resets. A keep-alive shaped
+    // like this must not manufacture an event, and must not leave its name
+    // behind to be worn by the next real one.
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    defer parser.deinit();
+
+    try parser.feed("event: ping\n\n");
+    try std.testing.expect(parser.next() == null);
+
+    try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+    const event = parser.next() orelse return error.TestExpectedEvent;
+    defer event.deinit(allocator);
+    try std.testing.expectEqualStrings("", event.data.name);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data.body);
 }
 
 test "a tool call whose arguments arrive in five fragments assembles into one call" {
@@ -820,7 +943,7 @@ test "a comment line is ignored and does not end the event in progress" {
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
     try std.testing.expect(event == .data);
-    try std.testing.expectEqualStrings("first half\nsecond half", event.data);
+    try std.testing.expectEqualStrings("first half\nsecond half", event.data.body);
     try std.testing.expect(parser.next() == null);
 }
 
@@ -836,7 +959,7 @@ test "a stray blank line before any data manufactures no event" {
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
     try std.testing.expect(event == .data);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data.body);
     try std.testing.expect(parser.next() == null);
 }
 
@@ -854,7 +977,7 @@ test "a trailing carriage return on a data line is stripped" {
     try std.testing.expect(event == .data);
     // No trailing \r left on the data: proves the strip ran, not just that
     // parsing did not crash on \r\n input.
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data.body);
 }
 
 test "a bare carriage return with no following newline still ends a line" {
@@ -874,7 +997,7 @@ test "a bare carriage return with no following newline still ends a line" {
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
     try std.testing.expect(event == .data);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}", event.data.body);
     try std.testing.expect(parser.next() == null);
     try std.testing.expectEqual(Parser.FinishStatus.complete, parser.finish());
 }
@@ -892,7 +1015,7 @@ test "two data lines in one event join with a newline between them" {
 
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
-    try std.testing.expectEqualStrings("first half\nsecond half", event.data);
+    try std.testing.expectEqualStrings("first half\nsecond half", event.data.body);
 }
 
 test "a later id or name fragment overwrites the one an index already held" {
@@ -946,7 +1069,7 @@ test "text and a tool call in the same stream both come out whole" {
         while (parser.next()) |event| {
             defer event.deinit(allocator);
             switch (event) {
-                .data => |data| try applyDeltaJson(allocator, &assembler, &text, &reasoning, data),
+                .data => |data| try applyDeltaJson(allocator, &assembler, &text, &reasoning, data.body),
                 .done => saw_done = true,
             }
         }
@@ -989,7 +1112,7 @@ test "a real captured reasoning stream keeps reasoning_content apart from conten
     while (parser.next()) |event| {
         defer event.deinit(allocator);
         switch (event) {
-            .data => |data| try applyDeltaJson(allocator, &assembler, &text, &reasoning, data),
+            .data => |data| try applyDeltaJson(allocator, &assembler, &text, &reasoning, data.body),
             .done => saw_done = true,
         }
     }
@@ -1245,7 +1368,7 @@ test "a line longer than the cap is rejected, and the parser recovers after" {
     try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data.body);
 }
 
 test "a line that crosses the cap over several feed calls, none containing a newline, still recovers" {
@@ -1278,7 +1401,7 @@ test "a line that crosses the cap over several feed calls, none containing a new
     try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data.body);
 }
 
 test "an event whose data lines never get a blank line is rejected once pending is capped" {
@@ -1330,7 +1453,7 @@ test "an event whose data lines never get a blank line is rejected once pending 
     try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data.body);
 }
 
 fn expectApplyDeltaError(err: ApplyDeltaError, json_text: []const u8) !void {
@@ -1447,7 +1570,7 @@ test "a single complete line longer than the cap is rejected even though its ter
     try parser.feed("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}", event.data.body);
 }
 
 test "the event queue is bounded, and TooManyQueuedEvents does not lose events already queued" {
@@ -1639,7 +1762,7 @@ fn expectOnlyCleanEventFollows(allocator: std.mem.Allocator, parser: *Parser) !v
     const event = parser.next() orelse return error.TestExpectedEvent;
     defer event.deinit(allocator);
     try std.testing.expect(event == .data);
-    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}", event.data);
+    try std.testing.expectEqualStrings("{\"choices\":[{\"delta\":{\"content\":\"clean\"}}]}", event.data.body);
     try std.testing.expect(parser.next() == null);
 }
 
