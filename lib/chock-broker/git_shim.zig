@@ -43,11 +43,11 @@
 //! into the user's own repository, cannot be done by saying yes here at all.
 //! The design is that the agent calls `request_action` with an
 //! `actions.Action`, and the broker does it outside the sandbox, out of a
-//! payload that names the effect. **That tool is not built.** See
-//! `lib/chock-policy/ratchet.zig`, which says the same: the approval wall is
-//! gone and this is waiting on the tool itself. So `Ask.kind` names which act
-//! it would be, and `Ask.advice` tells the agent the effect cannot be had in
-//! this build, and does not name a tool it cannot call.
+//! payload that names the effect. **That tool takes one act, `workspace.apply`,
+//! and no act this file meets is that one.** A push, a commit into the user's
+//! repository and a branch delete are all refused by name there. So `Ask.kind`
+//! names which act it would be, and `Ask.advice` tells the agent the effect
+//! cannot be had in this build, and does not name a tool call that would work.
 //!
 //! **The shim cannot build that payload for the agent, and must not try.** The
 //! user approves the effect and never a shell line. An `actions.Action` holds a
@@ -931,9 +931,10 @@ test "the shim tells the user what saying yes does, and never offers to do the a
 
     try testing.expect(std.mem.indexOf(u8, run.detail, "the subcommand runs inside the sandbox") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "the sandbox has no network") != null);
-    // **Never the name of a tool that does not exist.** `request_action` is
-    // designed and not built, so a message telling the agent to call it costs
-    // the agent a turn and teaches it a tool that is not in its list.
+    // **Never the name of a tool that would refuse this.** `request_action`
+    // exists and takes one act, `workspace.apply`; a push is not that act and
+    // is refused by name there. A message telling the agent to call it costs
+    // the agent a turn and ends in the same place.
     try testing.expect(std.mem.indexOf(u8, run.detail, "request_action") == null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "no tool that asks for one") != null);
     try testing.expect(std.mem.indexOf(u8, run.detail, "git.push") != null);

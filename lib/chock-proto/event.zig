@@ -169,6 +169,8 @@ pub const Kind = enum {
     plan_update,
     policy_self,
     workspace_open,
+    workspace_integrate,
+    sandbox_open,
     unknown,
 
     /// Give the dotted wire name for a kind. Never call this with `.unknown`.
@@ -216,6 +218,8 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .plan_update = "plan.update",
     .policy_self = "policy.self",
     .workspace_open = "workspace.open",
+    .workspace_integrate = "workspace.integrate",
+    .sandbox_open = "sandbox.open",
     .unknown = "unknown",
 });
 
@@ -1256,6 +1260,106 @@ pub const WorkspaceOpen = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// Whether the write and execute rule was on for one attempt at a session.
+///
+/// **A member and not a boolean**, the rule this file's own top comment gives:
+/// a security relevant enum is never a boolean. A reader acts on the value, and
+/// `unknown` is what an older reader gives a spelling a later Chock writes.
+pub const WriteExecuteRule = union(enum) {
+    /// A page may not be writable and executable at the same time. The default,
+    /// and what every session gets that did not ask for anything else.
+    strict,
+    /// The rule was off, because this project's policy answered `allow` for
+    /// `sandbox.jit`. See `lib/chock-policy/hardening.zig`.
+    relaxed,
+    unknown: []const u8,
+
+    pub const wireName = WireString(WriteExecuteRule).wireName;
+    pub const jsonStringify = WireString(WriteExecuteRule).jsonStringify;
+    pub const jsonParse = WireString(WriteExecuteRule).jsonParse;
+};
+
+/// **What one `workspace.apply` did to the branch the user has checked out.**
+///
+/// This exists so that a session is distinguishable afterwards by what happened
+/// to the branch. Before `chock_policy.apply` existed the answer was always
+/// "nothing", and the work waited at `refs/chock/<session>` until a person ran
+/// the merge. A project can now ask for `merge`, `rebase` or `squash`, and a
+/// control that moved somebody's branch quietly would be the wrong shape
+/// whatever it was written in. `SandboxOpen` is the same fact about the
+/// sandbox, written for the same reason.
+///
+/// **The reason and not only the outcome.** `mode` and `decision` together say
+/// why this apply was allowed to move a branch at all, so a reader can tell a
+/// project that asked for a merge from an installation whose organisation
+/// permitted one, and can tell a project that asked for nothing from one whose
+/// merge was refused. `parked` says why a branch that was going to move did
+/// not.
+///
+/// **Written once per apply**, whichever way it went, including the applies
+/// where no branch was ever going to move. A fact recorded only when it is
+/// interesting is missing whenever somebody disagrees about what is
+/// interesting.
+pub const WorkspaceIntegrate = struct {
+    /// The ref the work is parked at. Set in every mode, because every mode
+    /// parks the work there first.
+    ref: []const u8,
+    /// The mode this project configured, after the policy row bounded it, by
+    /// the name `chock_policy.apply.Mode` gives it. `ref` for a project that
+    /// configured nothing.
+    mode: []const u8,
+    /// The policy answer for `workspace.integrate`, by the name
+    /// `chock_policy.table.Decision` gives it. Only `allow` keeps `mode`.
+    decision: []const u8,
+    /// The branch that moved. **Empty when no branch moved**, which is the
+    /// one field a reader looking for "did somebody's branch move" reads.
+    branch: []const u8,
+    /// Where that branch was. Empty when none moved.
+    branch_from: []const u8,
+    /// Where that branch is now. Empty when none moved.
+    branch_to: []const u8,
+    /// Why no branch moved, by the name `chock_broker.integrate.Reason` gives
+    /// it. Empty when one did.
+    parked: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// The sandbox one attempt at a session ran under.
+///
+/// **This exists so that a session which gave up hardening is distinguishable
+/// afterwards from one that did not.** `lib/chock-policy/hardening.zig` holds
+/// the one row a project can write to give a piece of it up, and a control that
+/// weakened a layer quietly would be the wrong shape whatever it was written
+/// in. So the fact is in the log, beside `workspace.open`, which is the other
+/// thing one attempt records about the machinery it built.
+///
+/// **Per attempt and not per session**, for the reason `WorkspaceOpen.attempt`
+/// gives. A session can be continued by a later process, that process reads
+/// `chock.zon` again, and the answer it gets is the answer that binds the tool
+/// calls it makes. One `session.start` at the beginning of time cannot state
+/// that.
+pub const SandboxOpen = struct {
+    /// The identifier of this attempt, the same one `WorkspaceOpen.attempt`
+    /// carries, so the two lines of one run read together.
+    attempt: []const u8,
+    /// Whether a page could be writable and executable at the same time.
+    write_execute: WriteExecuteRule,
+    /// The policy answer that decided it, by the name `table.Decision` gives
+    /// it. **The reason and not only the outcome**: a reader of the log can
+    /// otherwise not tell a project that asked for this from an installation
+    /// whose organisation permitted it.
+    decision: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A sum of money. `value` is a float rather than an integer of minor units
 /// because a single turn on a cheap model costs a fraction of a cent, and a
 /// currency's minor unit cannot hold that.
@@ -1435,6 +1539,8 @@ pub const Event = union(Kind) {
     plan_update: PlanUpdate,
     policy_self: PolicySelf,
     workspace_open: WorkspaceOpen,
+    workspace_integrate: WorkspaceIntegrate,
+    sandbox_open: SandboxOpen,
     /// A kind this reader does not recognize. See `UnknownEvent`.
     unknown: UnknownEvent,
 
@@ -1847,6 +1953,20 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
             .attempt = nl,
             .path = nl,
             .base_commit = nl,
+        } },
+        .{ .workspace_integrate = .{
+            .ref = nl,
+            .mode = nl,
+            .decision = nl,
+            .branch = nl,
+            .branch_from = nl,
+            .branch_to = nl,
+            .parked = nl,
+        } },
+        .{ .sandbox_open = .{
+            .attempt = nl,
+            .write_execute = .relaxed,
+            .decision = nl,
         } },
         .{ .unknown = .{ .kind = "future.kind", .payload = .{ .string = nl } } },
     };
@@ -2357,4 +2477,62 @@ test "a task that timed out reads as its own status and not as one that died" {
     try std.testing.expectEqual(TaskStatus.unknown, std.meta.activeTag(later.value.event.task_complete.status));
     try std.testing.expect(later.value.event.task_complete.status != .exited);
     try std.testing.expectEqualStrings("paused", later.value.event.task_complete.status.unknown);
+}
+
+test "a reader can tell a session that moved a branch from one that did not" {
+    // **The one field that answers "did somebody's branch move".** `branch` is
+    // empty for every apply that parked the work, and never empty for one that
+    // moved a branch, so a reader looking for the fact reads one field and not
+    // a combination of three.
+    const allocator = std.testing.allocator;
+
+    const moved = try toJson(allocator, .{
+        .id = 1,
+        .session = "01S",
+        .time_ms = 1,
+        .event = .{ .workspace_integrate = .{
+            .ref = "refs/chock/01S",
+            .mode = "merge",
+            .decision = "allow",
+            .branch = "refs/heads/main",
+            .branch_from = "aaaa1111",
+            .branch_to = "bbbb2222",
+            .parked = "",
+        } },
+    });
+    defer allocator.free(moved);
+    const read_moved = try fromJson(allocator, moved);
+    defer read_moved.deinit();
+    try std.testing.expectEqualStrings(
+        "refs/heads/main",
+        read_moved.value.event.workspace_integrate.branch,
+    );
+    try std.testing.expectEqualStrings("", read_moved.value.event.workspace_integrate.parked);
+
+    const parked = try toJson(allocator, .{
+        .id = 2,
+        .session = "01S",
+        .time_ms = 2,
+        .event = .{ .workspace_integrate = .{
+            .ref = "refs/chock/01S",
+            .mode = "merge",
+            .decision = "allow",
+            .branch = "",
+            .branch_from = "",
+            .branch_to = "",
+            .parked = "dirty_tree",
+        } },
+    });
+    defer allocator.free(parked);
+    const read_parked = try fromJson(allocator, parked);
+    defer read_parked.deinit();
+    try std.testing.expectEqualStrings("", read_parked.value.event.workspace_integrate.branch);
+    // **The reason and not only the outcome.** "Nothing moved" and "nothing
+    // moved because the working tree was dirty" are different facts about a
+    // session, and only the second one tells a person what to change.
+    try std.testing.expectEqualStrings(
+        "dirty_tree",
+        read_parked.value.event.workspace_integrate.parked,
+    );
+    try std.testing.expectEqualStrings("merge", read_parked.value.event.workspace_integrate.mode);
 }

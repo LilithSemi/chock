@@ -100,6 +100,7 @@ const chock_version = @import("chock-version");
 const chock_workspace = @import("chock-workspace");
 const Broker = @import("Broker.zig");
 const diagnostic = @import("diagnostic.zig");
+const integrate = @import("integrate.zig");
 const network = @import("network.zig");
 /// Why the broker refused an act, or could not carry one out. One type for
 /// the whole module: see `chock-broker/diagnostic.zig`.
@@ -141,13 +142,15 @@ pub const Kind = enum {
 /// The tool name a policy key carries when no tool call asked for the act.
 ///
 /// `chock_policy.table.Key` has a `tool` field, and `Broker.request` asserts
-/// that it is not empty, so every decision needs a name there. The design is
-/// that an agent asks for an act with the `request_action` tool and that name
-/// goes in the field. **That tool is not built yet**, so nothing fills this
-/// from an agent's own call today.
+/// that it is not empty, so every decision needs a name there. An agent asks
+/// for an act with the `request_action` tool and that name goes in the field.
+/// **The tool is built and takes one act**, `workspace.apply`, so an agent's
+/// own call fills this today.
 /// `chock run` also asks for `workspace.apply` after the agent loop has
 /// ended, on the session's behalf, and there is no tool call behind that one.
-/// It uses this name, which is the tool the agent would have called.
+/// It uses the same name, which is the tool the agent would have called, and a
+/// reader tells the two apart by the tool call id: an agent's request carries
+/// one and the harness's carries none.
 ///
 /// **A reader of the log needs the same value.** An `approval.response`
 /// records the action and a tool call id, and never the tool, so a scan that
@@ -320,8 +323,27 @@ pub const max_previous_bytes: usize = 1 << 20;
 
 /// Land the session's work in the user's own repository. The agent's git
 /// objects live in a scratch store the project never sees, and this is the one
-/// act that carries them across. The effect is which objects move and which ref
-/// moves.
+/// act that carries them across. The effect is which objects move, which ref
+/// moves, and **what happens to the branch the user has checked out**.
+///
+/// ## The branch is part of the effect, so it is part of the description
+///
+/// Before `chock_policy.apply` existed, an approved apply could never move a
+/// branch: the work went to `refs/chock/<session>` and a person ran the merge
+/// themselves. A project can now ask for `merge`, `rebase` or `squash`, which
+/// makes the same "y" at the same prompt do something larger.
+///
+/// **So `integration` is a field of the action and not a setting beside it.**
+/// `summary` and `detail` read it, so the question a person answers names the
+/// mode and says whether their branch moves. A prompt that looked the same in
+/// every mode while doing different things is the one thing this must not be.
+///
+/// **The agent fills in none of it.** The mode comes from `chock.zon`, bounded
+/// by the `workspace.integrate` row of the policy table, and both are read on
+/// the host by `src/run.zig`. `chock_core.handback.Ask` is the whole of what an
+/// agent can say about an apply, and it carries a reason and a call id: the
+/// comptime block at the end of this file fails the build if it ever gains a
+/// field that could name a mode.
 pub const WorkspaceApply = struct {
     /// Absolute host path of the user's own project.
     repository: []const u8,
@@ -343,6 +365,10 @@ pub const WorkspaceApply = struct {
     objects: []const []const u8,
     /// The diff from `old_id` to `new_id`. This is what the user reads.
     diff: []const u8,
+    /// What this apply does to the branch the user has checked out, worked out
+    /// before anybody is asked. **`.park` for every project that says nothing**,
+    /// which is the behaviour every session had before modes existed.
+    integration: integrate.Plan = .{ .park = .{ .wanted = .ref, .why = .not_asked_for } },
 
     /// Build one of these by reading the two stores and the repository, so
     /// the object list, the old id, and the diff are what is really there.
@@ -356,6 +382,10 @@ pub const WorkspaceApply = struct {
             scratch_object_store: []const u8,
             ref: []const u8,
             new_id: []const u8,
+            /// What the project's mode asked for, after the policy row
+            /// bounded it. **The default is today's behaviour**, so a caller
+            /// that says nothing parks the work and moves no branch.
+            landing: chock_policy.apply.Landing = .ref,
         },
         diag: ?*?Diagnostic,
     ) DescribeError!WorkspaceApply {
@@ -370,6 +400,21 @@ pub const WorkspaceApply = struct {
         // failure: it is an empty old id, which git reads as "this ref must
         // not exist" when the broker moves it.
         const old_id = readRef(arena, io, ctx.env, params.repository, params.ref) catch |err| return err;
+
+        // **Before the object list is read, on purpose.** A merge, a rebase or
+        // a squash builds new commits, and it builds them in the session's own
+        // scratch store, so the list a person reads below already holds them
+        // and `perform` carries them across with the rest of the work. Nothing
+        // in this call writes to the user's repository: see
+        // `lib/chock-broker/integrate.zig`.
+        const integration = try integrate.planning(arena, io, ctx.env, .{
+            .repository = params.repository,
+            .scratch_object_store = params.scratch_object_store,
+            .project_object_store = project_object_store,
+            .landing = params.landing,
+            .ref = params.ref,
+            .new_id = params.new_id,
+        }, diag);
 
         const objects = try looseObjects(arena, io, params.scratch_object_store, diag);
 
@@ -400,6 +445,7 @@ pub const WorkspaceApply = struct {
             .new_id = params.new_id,
             .objects = objects,
             .diff = diff,
+            .integration = integration,
         };
     }
 };
@@ -628,17 +674,49 @@ pub const Action = union(Kind) {
                 "put {d} bytes at {s}, outside the workspace",
                 .{ a.contents.len, a.path },
             ),
-            .workspace_apply => |a| std.fmt.allocPrint(
-                gpa,
-                "land {d} {s} of the session in {s}, and set {s} to {s}",
-                .{
-                    a.objects.len,
-                    plural(a.objects.len, "object", "objects"),
-                    a.repository,
-                    a.ref,
-                    shortId(a.new_id),
-                },
-            ),
+            // **The one line says what happens to the branch.** Three
+            // arms and not one with a mode appended: a person who reads only
+            // the summary must be able to tell a merge from a park, because
+            // the answer to both is the same "y".
+            .workspace_apply => |a| switch (a.integration) {
+                .move => |m| std.fmt.allocPrint(
+                    gpa,
+                    "land {d} {s} of the session in {s}, set {s} to {s}, and {s} it into {s}",
+                    .{
+                        a.objects.len,
+                        plural(a.objects.len, "object", "objects"),
+                        a.repository,
+                        a.ref,
+                        shortId(a.new_id),
+                        m.landing.wireName(),
+                        m.branch,
+                    },
+                ),
+                .park => |p| if (p.why == .not_asked_for) std.fmt.allocPrint(
+                    gpa,
+                    "land {d} {s} of the session in {s}, and set {s} to {s}",
+                    .{
+                        a.objects.len,
+                        plural(a.objects.len, "object", "objects"),
+                        a.repository,
+                        a.ref,
+                        shortId(a.new_id),
+                    },
+                ) else std.fmt.allocPrint(
+                    gpa,
+                    "land {d} {s} of the session in {s}, and set {s} to {s}. " ++
+                        "The {s} this project asks for does not happen, because {s}",
+                    .{
+                        a.objects.len,
+                        plural(a.objects.len, "object", "objects"),
+                        a.repository,
+                        a.ref,
+                        shortId(a.new_id),
+                        p.wanted.wireName(),
+                        p.why.sentence(),
+                    },
+                ),
+            },
             .model_select => |a| std.fmt.allocPrint(
                 gpa,
                 "use the model {s} from now on, in place of {s}",
@@ -725,6 +803,8 @@ pub const Action = union(Kind) {
             .workspace_apply => |a| apply: {
                 const objects = try indentedList(gpa, a.objects);
                 defer gpa.free(objects);
+                const branch = try branchText(gpa, a);
+                defer gpa.free(branch);
                 break :apply std.fmt.allocPrint(gpa,
                     \\repository: {s}
                     \\the objects come from: {s}
@@ -732,7 +812,7 @@ pub const Action = union(Kind) {
                     \\ref: {s}
                     \\that ref is at: {s}
                     \\that ref moves to: {s}
-                    \\objects that land, {d} of them:
+                    \\{s}objects that land, {d} of them:
                     \\{s}what the ref move changes:
                     \\{s}
                 , .{
@@ -742,6 +822,7 @@ pub const Action = union(Kind) {
                     a.ref,
                     if (a.old_id.len > 0) a.old_id else "nothing, the ref is not there yet",
                     a.new_id,
+                    branch,
                     a.objects.len,
                     objects,
                     a.diff,
@@ -755,6 +836,47 @@ pub const Action = union(Kind) {
         };
     }
 };
+
+/// What an apply does to the branch the user has checked out, as the block a
+/// person reads before they answer.
+///
+/// **Its own paragraph in every mode, including `ref`.** A person who sees
+/// nothing about their branch has to work out from the absence that nothing
+/// happens to it, and the absence reads the same as a line somebody forgot to
+/// write. The caller frees the result.
+fn branchText(gpa: std.mem.Allocator, a: WorkspaceApply) std.mem.Allocator.Error![]u8 {
+    return switch (a.integration) {
+        .move => |m| std.fmt.allocPrint(gpa,
+            \\
+            \\your branch: {s}, and this apply moves it
+            \\  how: {s}
+            \\  that branch is at: {s}
+            \\  that branch moves to: {s}
+            \\  {s}
+            \\  this was built and tested before you were asked, and it applies with no conflict
+            \\
+        , .{
+            m.branch,
+            m.landing.wireName(),
+            m.at,
+            m.to,
+            m.landing.promise(),
+        }),
+        .park => |p| if (p.why == .not_asked_for) std.fmt.allocPrint(gpa,
+            \\
+            \\your branch: no branch of yours moves
+            \\  {s}
+            \\  read the work with `git log {s}`, and take it with `git merge {s}`
+            \\
+        , .{ p.why.sentence(), a.ref, a.ref }) else std.fmt.allocPrint(gpa,
+            \\
+            \\your branch: no branch of yours moves
+            \\  this project asks for {s}, and it does not happen, because {s}
+            \\  the work still lands at {s}, and you take it with `git merge {s}`
+            \\
+        , .{ p.wanted.wireName(), p.why.sentence(), a.ref, a.ref }),
+    };
+}
 
 /// One indented line per item, each ending in a newline. Empty for an empty
 /// list. The caller frees the result.
@@ -799,7 +921,16 @@ pub const Result = union(Kind) {
     net_fetch: struct { status: u16, body: []u8, location: []u8 },
     nix_build: struct { out_paths: []u8 },
     file_write: struct { path: []u8, bytes_written: usize },
-    workspace_apply: struct { objects_moved: usize, ref: []u8, new_id: []u8 },
+    workspace_apply: struct {
+        objects_moved: usize,
+        ref: []u8,
+        new_id: []u8,
+        /// What really happened to the branch the user has checked out.
+        /// **The outcome and not the plan**: a plan that said `merge` can
+        /// still end at `park`, because the repository is read again before
+        /// the branch is touched.
+        integration: integrate.Outcome,
+    },
     model_select: struct { alias: []u8 },
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
@@ -816,9 +947,10 @@ pub const Result = union(Kind) {
             },
             .nix_build => |r| gpa.free(r.out_paths),
             .file_write => |r| gpa.free(r.path),
-            .workspace_apply => |r| {
+            .workspace_apply => |*r| {
                 gpa.free(r.ref);
                 gpa.free(r.new_id);
+                r.integration.deinit(gpa);
             },
             .model_select => |r| gpa.free(r.alias),
         }
@@ -1692,10 +1824,21 @@ fn performWorkspaceApply(
     // `old_id` says here.
     gpa.free(try runGit(gpa, io, ctx, a.repository, &.{ "update-ref", a.ref, a.new_id, a.old_id }, diag));
 
+    // **The ref is set before the branch is touched, always.** Everything up
+    // to this line is what every apply has always done, and it is what the
+    // work falls back to when the branch cannot take it. A failure below
+    // therefore leaves the project in exactly the state the mode `ref` leaves
+    // it in, which is a state the user already has a `git merge` for.
+    const integration = switch (a.integration) {
+        .park => |p| integrate.Outcome{ .park = p },
+        .move => |m| try integrate.moving(gpa, io, ctx.env, a.repository, m, diag),
+    };
+
     return .{ .workspace_apply = .{
         .objects_moved = moved,
         .ref = try gpa.dupe(u8, a.ref),
         .new_id = try gpa.dupe(u8, a.new_id),
+        .integration = integration,
     } };
 }
 
@@ -2949,6 +3092,25 @@ comptime {
     for (@typeInfo(Ask).@"struct".fields) |field| {
         if (std.mem.eql(u8, field.name, "summary") or std.mem.eql(u8, field.name, "detail")) {
             @compileError("Ask must not carry a summary or a detail: both come from the action itself");
+        }
+    }
+
+    // **The agent asks for an apply and never names how it lands.** The mode
+    // comes from `chock.zon` and from the `workspace.integrate` row above it,
+    // and both are read on the host in a process the agent cannot reach. The
+    // one thing an agent fills in for an apply is a reason, and
+    // `chock_core.handback.Ask` has its own guard saying every member of it is
+    // plain text. This is the other end of the same rule: there is no member of
+    // an `Ask` for a mode to arrive in, so no caller of this file can hand the
+    // agent's own choice to the broker even by mistake.
+    const decides = [_][]const u8{ "mode", "landing", "integration", "branch", "merge", "rebase", "squash" };
+    for (@typeInfo(Ask).@"struct".fields) |field| {
+        for (decides) |bad| {
+            if (std.ascii.eqlIgnoreCase(field.name, bad)) {
+                @compileError("an Ask carries an argument and never an answer, and \"" ++
+                    field.name ++ "\" would decide how the work lands. The mode comes from " ++
+                    "chock.zon, bounded by the workspace.integrate row");
+            }
         }
     }
 }

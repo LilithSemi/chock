@@ -27,12 +27,26 @@
 //! `lib/chock-policy/access.zig` holds the two action names that say which
 //! providers and which models a session may use. They are rows on the table
 //! above, not a system of their own.
+//!
+//! `lib/chock-policy/hardening.zig` holds the one row that lets a project give
+//! up a piece of sandbox hardening. **It is the first setting that widens**, so
+//! it is a row rather than a key in `chock.zon`: the table already folds an org
+//! bundle over a project and a parent over a child, which is exactly the
+//! question "who may widen this, and who authorises it".
+//!
+//! `lib/chock-policy/apply.zig` holds both halves of that question at once. The
+//! shape a project wants its work to land in is a `chock.zon` knob, and whether
+//! an approval may move a branch of the user's at all is a row on the table
+//! above it. See its own top comment for why the two are not written in one
+//! place.
 
 pub const table = @import("chock-policy/table.zig");
 pub const subagents = @import("chock-policy/subagents.zig");
 pub const ratchet = @import("chock-policy/ratchet.zig");
 pub const org = @import("chock-policy/org.zig");
 pub const access = @import("chock-policy/access.zig");
+pub const hardening = @import("chock-policy/hardening.zig");
+pub const apply = @import("chock-policy/apply.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

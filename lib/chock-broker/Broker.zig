@@ -8,17 +8,17 @@
 //! 6. If the user approves, the broker does the action outside the sandbox.
 //! 7. Chock sends the result into the agent context.
 //!
-//! This file is steps 2 to 5. Step 6, the privileged work itself, is a later
-//! task, and step 1 is the tool that calls this one.
+//! This file is steps 2 to 5. Step 6, the privileged work itself, is
+//! `lib/chock-broker/actions.zig`, and step 1 is the tool that calls this one.
 //!
-//! **Step 1 is not built.** There is no `request_action` in
-//! `chock_core.tools.Tool`, so no tool call inside the sandbox reaches this
-//! file. `lib/chock-policy/ratchet.zig` says why: the approval wall that used
-//! to block it is gone, and this is waiting on the tool itself. Two callers
-//! reach `request` today, and neither is an agent: `chock run` asks for
+//! **Step 1 is built for one act and for no other.**
+//! `chock_core.tools.Tool.request_action` takes `workspace.apply` and refuses
+//! every other name before anybody is asked, so an agent can ask for its own
+//! commit to be carried back and for nothing else. Read the list above as the
+//! design; today it describes one action. Three callers reach `request`, and
+//! two of them are the harness rather than an agent: `chock run` asks for
 //! `workspace.apply` after the loop has ended, and the session arbiter asks
-//! for `policy.widen` while it runs. Read the list above as the design and
-//! not as what happens now.
+//! for `policy.widen` while it runs.
 //!
 //! ## The table is the broker's own state
 //!

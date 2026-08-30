@@ -85,6 +85,8 @@ keyboard is refused everything.
 | `workspace.apply` | carry the session's commit into your repository |
 | `model.select` | which provider instance and which model a session uses |
 | `policy.widen` | let a session out of a promise it made to itself |
+| `sandbox.jit` | run with the sandbox's write and execute rule off |
+| `workspace.integrate` | let an approved apply move the branch you have checked out |
 
 The three `git` actions have a shim in front of them. It reads the argument
 vector of every `run_command` call whose first word is `git`, and it sorts each
@@ -133,6 +135,49 @@ a refusal.
 `nix.build` is read once, also before the first turn, and it decides whether
 the `provide_tool` tool exists at all. Only `allow` gives the session that
 tool, and `ask` is a refusal there for the same reason.
+
+`sandbox.jit` is read once too, and it is **the one row that widens rather than
+narrows**. It turns off the sandbox rule that refuses a page which is writable
+and executable at the same time, which a run time with a just in time compiler
+needs: V8 asks for such a page over a 268 MB range, so Node, Deno and Bun cannot
+work without it. Only `allow` turns the rule off, for the same reason as the two
+rows above: the filter is built before the first turn and there is nobody to
+ask.
+
+**It is a row here and not a key in `chock.zon` precisely because it widens.**
+Every other setting a project writes for the sandbox narrows, and a widening
+setting needs an answer to "who may do this, and who authorises it". The table
+already has that answer: an organisation writes
+`.{ .action = "sandbox.jit", .decision = .deny }` in its bundle and no project
+can raise it, because the answer is a minimum over both layers. The same fold
+means a subagent cannot give up hardening its parent kept.
+
+What is given up is documented hardening and it is not a boundary. See
+`docs/sandbox.md` for the three measured ways past the rule, and for the three
+places a session that gave it up says so.
+
+`workspace.integrate` is the second row of that shape, and it is read the other
+way round from `sandbox.jit`. A project says in its `chock.zon` how an approved
+apply should land, with `.apply = .{ .mode = .merge }` and the four modes
+[approvals.md](approvals.md) lists. This row says whether that mode may be
+anything but `ref`, which is the mode that moves no branch of yours.
+
+```zon
+.{ .action = "workspace.integrate", .decision = .deny }
+```
+
+**A row nobody wrote answers `allow` here**, unlike every action above, because
+this is a question about a capability and not about an act: a project that wrote
+`merge` and an installation whose organisation has never heard of the row gets
+`merge`. That is the same reading `provider.<instance>` gets, and it is what
+keeps a permission model from breaking every configuration the day it ships. One
+`deny` in an organisation's bundle closes the road for every project under it,
+and the same fold means a subagent moves no branch its parent could not.
+
+Only `allow` keeps the mode. The answer is read once, when the session starts,
+before an apply is described, because the description is what a person reads and
+it has to say what the apply does. So `ask` here holds the work at the ref
+exactly as `deny` does.
 
 ## Files the agent may not read
 
@@ -255,6 +300,12 @@ policy system:
   dotted patterns, and the same rule that wins.
 - The bundle is folded in as one more term of the same minimum.
 - **A rule of `chock.zon` can lower an answer and can never raise one.**
+
+That last line is why `sandbox.jit` is a row here rather than a key in
+`chock.zon`. One rule in the bundle,
+`.{ .action = "sandbox.jit", .decision = .deny }`, forbids the sandbox
+hardening being given up in every project of the installation, and no project
+can take that back.
 
 **A bundle is read as a ceiling and never as a decision.** An action no bundle
 rule names answers `allow`, which is no ceiling at all, and not `ask`, which is

@@ -419,6 +419,240 @@ test "the broker runs the action, and the agent never holds the capability" {
     try testing.expectEqualStrings(agent_commit, head_at_the_end);
 }
 
+/// A project that lets the agent carry its own work back without asking
+/// anybody, keyed on the tool that asks for it.
+///
+/// **The key is the whole point of these two tables.** `request_action` is the
+/// tool an agent calls, and it is also the name `chock run` carries when it
+/// asks at the end of a run: see `actions.self_asked_tool`. A project that
+/// writes this rule is saying that this act, asked for this way, needs nobody.
+const table_allows_the_apply: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .decision = .ask },
+    \\            .{ .tool = "request_action", .action = "workspace.apply", .decision = .allow },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// The same project with the answer the other way round.
+const table_denies_the_apply: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .decision = .ask },
+    \\            .{ .tool = "request_action", .action = "workspace.apply", .decision = .deny },
+    \\        },
+    \\    },
+    \\}
+;
+
+// The tool name in the policy key and the tool name the model calls have to
+// be one string, or a project writes a rule for a key nothing ever builds.
+test "the tool an agent calls for an apply is the tool name the policy key carries" {
+    try testing.expectEqualStrings("request_action", actions.self_asked_tool);
+    try testing.expectEqualStrings(actions.self_asked_tool, testAsk(.{ .net_fetch = .{
+        .host = "example.invalid",
+        .url = "https://example.invalid/",
+    } }).tool);
+}
+
+/// Ask for `ask` against `table`, with a waiter that answers nothing and
+/// records whether it was ever given control. **A waiter with zero waits is
+/// proof that nobody was asked**, which is the half of a table answer that a
+/// test of the outcome alone cannot see.
+fn askTheTable(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    table: [:0]const u8,
+    ctx: actions.Context,
+    ask: actions.Ask,
+    waits: *usize,
+) !actions.Attempt {
+    var backing = try chock_proto.storage.Memory.init(gpa, "01BROKER");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    // It answers nothing at all, so a table that did not decide would leave the
+    // request open and the broker would refuse it for want of an answer. That
+    // is a different outcome from either of the two below, so neither test can
+    // pass by accident.
+    var waiter = TestWaiter{
+        .gpa = gpa,
+        .store = store,
+        .locked = &locked,
+        .decision = .refused_by_user,
+        .now_ms = 1_700_000_000_000,
+    };
+    // Answering is what `waits == 1` triggers, so this stops it answering at
+    // all while still counting the turns it was given.
+    waiter.waits = 1;
+
+    const policy = try chock_policy.table.Table.parse(gpa, table, null);
+    defer chock_policy.table.Table.destroy(gpa, policy);
+
+    const broker = Broker{ .policy = policy, .waiter = waiter.waiter() };
+    const attempt = actions.run(&broker, gpa, io, store, &locked, ctx, ask, null);
+    waits.* = waiter.waits - 1;
+    if (waiter.failed) |err| return err;
+    return attempt;
+}
+
+test "an agent that asks for an apply the table allows carries its commit into the project" {
+    // The route the `request_action` tool takes, end to end and against real
+    // git: the agent commits in its own worktree, asks for `workspace.apply`
+    // with the tool name that goes in the policy key, and the project's own
+    // table answers. **The agent never answers**: the waiter here answers
+    // nothing at all and is asked nothing, and the same call with the table
+    // turned round carries nothing.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const git_path = (try findGitOnPath(gpa, io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(gpa, tmp);
+    defer project.deinit();
+
+    var workspace = try Workspace.open(
+        gpa,
+        io,
+        &project.env,
+        project.root_path,
+        project.scratch_path,
+        "sess1",
+        null,
+    );
+    defer workspace.close(gpa, io, &project.env, null) catch unreachable;
+    const wt = workspace.kind.worktree;
+
+    // The session's own environment, which puts every object git writes into
+    // the scratch store and leaves the project's own untouched. The sandbox
+    // sets the same two variables inside itself; this test is about the policy
+    // route and not about the sandbox, so the commit is made on the host.
+    var session_env = try project.env.clone(gpa);
+    defer session_env.deinit();
+    try session_env.put("GIT_OBJECT_DIRECTORY", wt.object_store_source);
+    const real_objects = try std.fs.path.join(gpa, &.{ wt.git_dir, "objects" });
+    defer gpa.free(real_objects);
+    try session_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", real_objects);
+
+    const written = try std.fs.path.join(gpa, &.{ wt.path, agent_file });
+    defer gpa.free(written);
+    try writeFileAbsolute(io, written, "the agent asked for this to be carried back\n");
+
+    const added = try gitOk(gpa, &session_env, wt.path, &.{ "add", agent_file });
+    gpa.free(added);
+    const committed = try gitOk(gpa, &session_env, wt.path, &.{
+        "-c",     "user.email=agent@example.invalid",
+        "-c",     "user.name=agent",
+        "commit", "--quiet",
+        "-m",     "the agent's own commit",
+    });
+    gpa.free(committed);
+    const agent_commit = try gitOk(gpa, &session_env, wt.path, &.{ "rev-parse", "HEAD" });
+    defer gpa.free(agent_commit);
+
+    // Nothing of it is in the user's repository yet.
+    var not_yet = try git.run(gpa, io, &project.env, project.root_path, &.{
+        "cat-file", "-e", agent_commit,
+    }, null);
+    defer not_yet.deinit(gpa);
+    try testing.expect(not_yet.term != .exited or not_yet.term.exited != 0);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ctx = actions.Context{ .env = &project.env };
+    // The ref an agent's apply lands on: a ref of the session's own, never a
+    // branch of the user's. `src/run.zig`'s `applyRef` builds the same name for
+    // both callers, so an agent that asks reaches the same place the harness
+    // would have reached at the end of the run.
+    const ref = "refs/chock/sess1";
+
+    // Turned down first, so the "it landed" half below cannot be a repository
+    // that already held the work.
+    {
+        const apply = try actions.WorkspaceApply.describing(arena, io, ctx, .{
+            .repository = project.root_path,
+            .scratch_object_store = wt.object_store_source,
+            .ref = ref,
+            .new_id = agent_commit,
+        }, null);
+        var waits: usize = 0;
+        const refused = try askTheTable(
+            gpa,
+            io,
+            table_denies_the_apply,
+            ctx,
+            testAsk(.{ .workspace_apply = apply }),
+            &waits,
+        );
+        try testing.expect(refused == .refused);
+        // **Nobody was asked.** The table decided, and a table that decides
+        // spends nobody's attention.
+        try testing.expectEqual(@as(usize, 0), waits);
+
+        var no_ref = try git.run(gpa, io, &project.env, project.root_path, &.{
+            "rev-parse", "--verify", ref,
+        }, null);
+        defer no_ref.deinit(gpa);
+        try testing.expect(no_ref.term != .exited or no_ref.term.exited != 0);
+    }
+
+    {
+        const apply = try actions.WorkspaceApply.describing(arena, io, ctx, .{
+            .repository = project.root_path,
+            .scratch_object_store = wt.object_store_source,
+            .ref = ref,
+            .new_id = agent_commit,
+        }, null);
+        // The description is what a person reads, and it has to say what would
+        // be applied or the approval is theatre. The commit is named and the
+        // file it adds is in the diff.
+        try testing.expect(apply.objects.len >= 3);
+        try testing.expect(std.mem.indexOf(u8, apply.diff, agent_file) != null);
+
+        var waits: usize = 0;
+        var landed = try askTheTable(
+            gpa,
+            io,
+            table_allows_the_apply,
+            ctx,
+            testAsk(.{ .workspace_apply = apply }),
+            &waits,
+        );
+        try testing.expect(landed == .done);
+        defer landed.done.result.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), waits);
+    }
+
+    // The work is in the user's own repository, read with no scratch store and
+    // no alternate in the environment at all.
+    const at_ref = try gitOk(gpa, &project.env, project.root_path, &.{ "rev-parse", ref });
+    defer gpa.free(at_ref);
+    try testing.expectEqualStrings(agent_commit, at_ref);
+
+    // **And no branch of the user's moved.** An agent that asks gains nothing
+    // an agent that waits would not have had, and parking the work on a ref of
+    // the session's own is the whole of that.
+    var head_after = try git.run(gpa, io, &project.env, project.root_path, &.{
+        "rev-parse", "--verify", "refs/heads/main",
+    }, null);
+    defer head_after.deinit(gpa);
+    if (head_after.term == .exited and head_after.term.exited == 0) {
+        try testing.expect(!std.mem.eql(u8, agent_commit, std.mem.trimEnd(u8, head_after.stdout, "\n")));
+    }
+}
+
 test "an approved net.fetch whose host answers this machine reads nothing" {
     // **The guard covers `actions.perform` itself**, and not only the fetch
     // tool a layer above it. This is the privileged act: it is what opens a
@@ -470,4 +704,562 @@ test "an approved net.fetch whose host answers this machine reads nothing" {
     // **Zero requests.** A refusal that opened the connection and then threw
     // the answer away would pass every check above.
     try testing.expectEqual(@as(usize, 0), server.captured.head.len);
+}
+
+// ---------------------------------------------------------------------------
+// How an approved apply lands: `ref`, `merge`, `rebase` and `squash`.
+//
+// **Every one of these runs against real git.** The thing under test is what
+// happens to a real repository with a real working tree in it, and a fake git
+// would pass whatever these tests said it should. See
+// `lib/chock-broker/integrate.zig` for the design they pin: the result is built
+// in the session's own object store, and the only write to the project is one
+// fast forward.
+// ---------------------------------------------------------------------------
+
+/// A project, a worktree session on it, and one commit that session made,
+/// which is the state every test below starts from.
+const Landing = chock_policy.apply.Landing;
+
+const Carried = struct {
+    project: TestProject,
+    workspace: Workspace,
+    session_env: std.process.Environ.Map,
+    /// The commit the session made. It is in the scratch store and the project
+    /// has never seen it.
+    commit: []u8,
+
+    /// A session that wrote `contents` into `path` inside its worktree and
+    /// committed it.
+    fn init(
+        gpa: std.mem.Allocator,
+        tmp: testing.TmpDir,
+        path: []const u8,
+        contents: []const u8,
+    ) !Carried {
+        const io = testing.io;
+        var project = try TestProject.init(gpa, tmp);
+        errdefer project.deinit();
+
+        var workspace = try Workspace.open(
+            gpa,
+            io,
+            &project.env,
+            project.root_path,
+            project.scratch_path,
+            "sess1",
+            null,
+        );
+        errdefer workspace.close(gpa, io, &project.env, null) catch unreachable;
+        const wt = workspace.kind.worktree;
+
+        // Every object git writes goes into the scratch store, and the
+        // project's own store is only read. The sandbox sets the same two
+        // variables inside itself.
+        var session_env = try project.env.clone(gpa);
+        errdefer session_env.deinit();
+        try session_env.put("GIT_OBJECT_DIRECTORY", wt.object_store_source);
+        const real_objects = try std.fs.path.join(gpa, &.{ wt.git_dir, "objects" });
+        defer gpa.free(real_objects);
+        try session_env.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", real_objects);
+
+        const written = try std.fs.path.join(gpa, &.{ wt.path, path });
+        defer gpa.free(written);
+        try writeFileAbsolute(io, written, contents);
+
+        gpa.free(try gitOk(gpa, &session_env, wt.path, &.{ "add", path }));
+        gpa.free(try gitOk(gpa, &session_env, wt.path, &.{
+            "-c",     "user.email=agent@example.invalid",
+            "-c",     "user.name=agent",
+            "commit", "--quiet",
+            "-m",     "the agent's own commit",
+        }));
+
+        return .{
+            .project = project,
+            .workspace = workspace,
+            .session_env = session_env,
+            .commit = try gitOk(gpa, &session_env, wt.path, &.{ "rev-parse", "HEAD" }),
+        };
+    }
+
+    fn deinit(self: *Carried, gpa: std.mem.Allocator) void {
+        gpa.free(self.commit);
+        self.session_env.deinit();
+        self.workspace.close(gpa, testing.io, &self.project.env, null) catch unreachable;
+        self.project.deinit();
+    }
+
+    fn tree(self: *const Carried) chock_workspace.worktree.Worktree {
+        return self.workspace.kind.worktree;
+    }
+
+    /// One more commit on the project's own branch, so the two histories have
+    /// really diverged and a merge is a merge rather than a fast forward.
+    fn commitOnMain(self: *Carried, gpa: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
+        const written = try std.fs.path.join(gpa, &.{ self.project.root_path, path });
+        defer gpa.free(written);
+        try writeFileAbsolute(testing.io, written, contents);
+        gpa.free(try gitOk(gpa, &self.project.env, self.project.root_path, &.{ "add", path }));
+        gpa.free(try gitOk(gpa, &self.project.env, self.project.root_path, &.{
+            "commit", "--quiet", "-m", "the user's own commit",
+        }));
+    }
+
+    /// Describe an apply of this session's commit, in `landing`.
+    fn describing(
+        self: *const Carried,
+        arena: std.mem.Allocator,
+        landing: Landing,
+    ) !actions.WorkspaceApply {
+        return actions.WorkspaceApply.describing(arena, testing.io, .{ .env = &self.project.env }, .{
+            .repository = self.project.root_path,
+            .scratch_object_store = self.tree().object_store_source,
+            .ref = apply_ref,
+            .new_id = self.commit,
+            .landing = landing,
+        }, null);
+    }
+
+    /// What `git` says about the project right now: the branch, where it is,
+    /// what `HEAD` is, and everything the working tree holds that the branch
+    /// does not. **Everything a "the repository is exactly as it was" claim has
+    /// to compare.** The caller frees it.
+    fn snapshot(self: *const Carried, gpa: std.mem.Allocator) ![]u8 {
+        const branch = try gitOk(gpa, &self.project.env, self.project.root_path, &.{
+            "symbolic-ref", "--quiet", "HEAD",
+        });
+        defer gpa.free(branch);
+        const head = try gitOk(gpa, &self.project.env, self.project.root_path, &.{
+            "rev-parse", "HEAD",
+        });
+        defer gpa.free(head);
+        const status = try gitOk(gpa, &self.project.env, self.project.root_path, &.{
+            "status", "--porcelain",
+        });
+        defer gpa.free(status);
+        // The reflog of the branch, so a move and a move back would still be
+        // seen as a change. A merge that happened and was undone is not "the
+        // repository is exactly as it was".
+        const reflog = try gitOk(gpa, &self.project.env, self.project.root_path, &.{
+            "reflog", "show", "--format=%H", "HEAD",
+        });
+        defer gpa.free(reflog);
+        return std.fmt.allocPrint(gpa, "{s}\n{s}\n{s}\n{s}", .{ branch, head, status, reflog });
+    }
+
+    /// What the file at `path` holds in the project's own working tree.
+    fn worktreeFile(self: *const Carried, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+        const full = try std.fs.path.join(gpa, &.{ self.project.root_path, path });
+        defer gpa.free(full);
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, full, gpa, .limited(1 << 16));
+    }
+};
+
+/// The ref an apply parks the work at. `src/run.zig`'s `applyRef` builds the
+/// same shape out of the session id.
+const apply_ref = "refs/chock/sess1";
+
+/// The file the session writes in every test below.
+const carried_file = "carried.txt";
+
+/// Run one described apply through a table that allows it, so the test is
+/// about what the act does and not about who answered.
+fn applying(gpa: std.mem.Allocator, carried: *const Carried, apply: actions.WorkspaceApply) !actions.Attempt {
+    var waits: usize = 0;
+    return askTheTable(
+        gpa,
+        testing.io,
+        table_allows_the_apply,
+        .{ .env = &carried.project.env },
+        testAsk(.{ .workspace_apply = apply }),
+        &waits,
+    );
+}
+
+test "a project that says nothing parks the work and moves no branch" {
+    // **The default, proved against real git.** This is what every session did
+    // before modes existed, and the whole feature is only safe if a project
+    // that has never heard of it behaves exactly as it did.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+    defer carried.deinit(gpa);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // `describing` with no `landing` at all: the field has a default, and the
+    // default is what a caller that has not heard of modes gets.
+    const apply = try actions.WorkspaceApply.describing(
+        arena_state.allocator(),
+        testing.io,
+        .{ .env = &carried.project.env },
+        .{
+            .repository = carried.project.root_path,
+            .scratch_object_store = carried.tree().object_store_source,
+            .ref = apply_ref,
+            .new_id = carried.commit,
+        },
+        null,
+    );
+    try testing.expect(apply.integration == .park);
+    try testing.expectEqual(
+        chock_broker.integrate.Reason.not_asked_for,
+        apply.integration.park.why,
+    );
+
+    const before = try carried.snapshot(gpa);
+    defer gpa.free(before);
+
+    var attempt = try applying(gpa, &carried, apply);
+    try testing.expect(attempt == .done);
+    defer attempt.done.result.deinit(gpa);
+    try testing.expect(attempt.done.result.workspace_apply.integration == .park);
+
+    // The work is at the ref, and the repository is otherwise untouched.
+    const at_ref = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+        "rev-parse", apply_ref,
+    });
+    defer gpa.free(at_ref);
+    try testing.expectEqualStrings(carried.commit, at_ref);
+
+    const after = try carried.snapshot(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "merge, rebase and squash each land the work on the branch the way they say" {
+    // One project per mode, each with a branch that has really moved on, so a
+    // merge is a merge and a rebase is a replay rather than a fast forward.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    for ([_]Landing{ .merge, .rebase, .squash }) |landing| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+        defer carried.deinit(gpa);
+
+        // The user has committed since the session started, to a different
+        // file, so the two histories diverge and neither mode can be a plain
+        // fast forward.
+        try carried.commitOnMain(gpa, "user.txt", "the user wrote this\n");
+        const before_main = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-parse", "refs/heads/main",
+        });
+        defer gpa.free(before_main);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const apply = try carried.describing(arena_state.allocator(), landing);
+
+        // The plan says which branch moves and where to, before anybody is
+        // asked, and the commit it moves to is one of the objects the person
+        // reads in the list.
+        try testing.expect(apply.integration == .move);
+        const planned = apply.integration.move;
+        try testing.expectEqualStrings("refs/heads/main", planned.branch);
+        try testing.expectEqualStrings(before_main, planned.at);
+        var listed = false;
+        for (apply.objects) |id| {
+            if (std.mem.eql(u8, id, planned.to)) listed = true;
+        }
+        try testing.expect(listed);
+
+        var attempt = try applying(gpa, &carried, apply);
+        try testing.expect(attempt == .done);
+        defer attempt.done.result.deinit(gpa);
+
+        const outcome = attempt.done.result.workspace_apply.integration;
+        try testing.expect(outcome == .moved);
+        try testing.expectEqual(landing, outcome.moved.landing);
+        try testing.expectEqualStrings("refs/heads/main", outcome.moved.branch);
+        try testing.expectEqualStrings(before_main, outcome.moved.from);
+
+        // The branch really moved, and it moved to the commit the person was
+        // told about.
+        const after_main = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-parse", "refs/heads/main",
+        });
+        defer gpa.free(after_main);
+        try testing.expectEqualStrings(planned.to, after_main);
+
+        // **And the working tree is at it.** A branch that moved under a
+        // working tree that did not is exactly the large reverse diff this
+        // whole design exists to avoid.
+        const status = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "status", "--porcelain",
+        });
+        defer gpa.free(status);
+        try testing.expectEqualStrings("", status);
+
+        const in_tree = try carried.worktreeFile(gpa, carried_file);
+        defer gpa.free(in_tree);
+        try testing.expectEqualStrings("the session wrote this\n", in_tree);
+        const user_file = try carried.worktreeFile(gpa, "user.txt");
+        defer gpa.free(user_file);
+        try testing.expectEqualStrings("the user wrote this\n", user_file);
+
+        // The shape each mode promises, read off the history itself.
+        const parents = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-list", "--parents", "-n", "1", "HEAD",
+        });
+        defer gpa.free(parents);
+        var fields = std.mem.tokenizeScalar(u8, parents, ' ');
+        _ = fields.next();
+        var parent_count: usize = 0;
+        while (fields.next()) |_| parent_count += 1;
+        switch (landing) {
+            // A merge names both sides, so git can still see where the work
+            // came from.
+            .merge => try testing.expectEqual(@as(usize, 2), parent_count),
+            // A rebase and a squash both leave a straight line.
+            .rebase, .squash => try testing.expectEqual(@as(usize, 1), parent_count),
+            .ref => unreachable,
+        }
+
+        // The work is at the ref as well, in every mode. That is the thing a
+        // person can always fall back on.
+        const at_ref = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-parse", apply_ref,
+        });
+        defer gpa.free(at_ref);
+        try testing.expectEqualStrings(carried.commit, at_ref);
+    }
+}
+
+test "a dirty working tree parks the work, and the repository is untouched" {
+    // **The decision this pins: fall back to the ref, do not refuse the whole
+    // apply.** Refusing would throw the session's work away, which is the one
+    // thing an apply exists to stop. Parking is what the mode `ref` does, so
+    // the fallback is a behaviour the project already has a `git merge` for.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+    defer carried.deinit(gpa);
+
+    // A tracked file the user has edited and not committed.
+    const dirty = try std.fs.path.join(gpa, &.{ carried.project.root_path, "tracked.txt" });
+    defer gpa.free(dirty);
+    try writeFileAbsolute(testing.io, dirty, "the user is in the middle of something\n");
+
+    const before = try carried.snapshot(gpa);
+    defer gpa.free(before);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const apply = try carried.describing(arena_state.allocator(), .merge);
+
+    // **Known before anybody is asked**, and the prompt says so. A person is
+    // never asked to approve a merge that was already known not to happen.
+    try testing.expect(apply.integration == .park);
+    try testing.expectEqual(chock_broker.integrate.Reason.dirty_tree, apply.integration.park.why);
+    try testing.expectEqual(Landing.merge, apply.integration.park.wanted);
+
+    var attempt = try applying(gpa, &carried, apply);
+    try testing.expect(attempt == .done);
+    defer attempt.done.result.deinit(gpa);
+    try testing.expect(attempt.done.result.workspace_apply.integration == .park);
+
+    // The work landed at the ref, which is the whole of what happened.
+    const at_ref = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+        "rev-parse", apply_ref,
+    });
+    defer gpa.free(at_ref);
+    try testing.expectEqualStrings(carried.commit, at_ref);
+
+    // And nothing else moved: not the branch, not `HEAD`, not the working
+    // tree, and the user's uncommitted edit is still there.
+    const after = try carried.snapshot(gpa);
+    defer gpa.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    const still = try carried.worktreeFile(gpa, "tracked.txt");
+    defer gpa.free(still);
+    try testing.expectEqualStrings("the user is in the middle of something\n", still);
+}
+
+test "an integration that would conflict leaves the repository exactly as it was" {
+    // **The property the whole design exists for.** A merge that stopped on a
+    // conflict would leave `MERGE_HEAD`, a half written index and a working
+    // tree full of markers. Nothing here runs a merge in the project at all, so
+    // there is nothing to abort and nothing to clean up.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    for ([_]Landing{ .merge, .rebase, .squash }) |landing| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        // Both sides change the same file, in different ways.
+        var carried = try Carried.init(gpa, tmp, "tracked.txt", "the session's line\n");
+        defer carried.deinit(gpa);
+        try carried.commitOnMain(gpa, "tracked.txt", "the user's line\n");
+
+        const before = try carried.snapshot(gpa);
+        defer gpa.free(before);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const apply = try carried.describing(arena_state.allocator(), landing);
+        try testing.expect(apply.integration == .park);
+        try testing.expectEqual(
+            chock_broker.integrate.Reason.would_conflict,
+            apply.integration.park.why,
+        );
+
+        var attempt = try applying(gpa, &carried, apply);
+        try testing.expect(attempt == .done);
+        defer attempt.done.result.deinit(gpa);
+
+        // The repository is exactly where it was: the same branch, the same
+        // commit, the same working tree, and the same reflog.
+        const after = try carried.snapshot(gpa);
+        defer gpa.free(after);
+        try testing.expectEqualStrings(before, after);
+
+        // And no operation was left unfinished. Asked of git rather than of
+        // `.git/`, because that is where a worktree keeps them.
+        for ([_][]const u8{ "MERGE_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply" }) |marker| {
+            const path = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+                "rev-parse", "--path-format=absolute", "--git-path", marker,
+            });
+            defer gpa.free(path);
+            try testing.expectError(
+                error.FileNotFound,
+                std.Io.Dir.accessAbsolute(testing.io, path, .{}),
+            );
+        }
+
+        // The work is still safe at the ref, which is what a person falls back
+        // to.
+        const at_ref = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-parse", apply_ref,
+        });
+        defer gpa.free(at_ref);
+        try testing.expectEqualStrings(carried.commit, at_ref);
+    }
+}
+
+test "a detached head and an unfinished merge each park the work" {
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+        defer carried.deinit(gpa);
+
+        gpa.free(try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "checkout", "--quiet", "--detach", "HEAD",
+        }));
+
+        const apply = try carried.describing(arena_state.allocator(), .merge);
+        try testing.expectEqual(
+            chock_broker.integrate.Reason.detached_head,
+            apply.integration.park.why,
+        );
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+        defer carried.deinit(gpa);
+
+        // A `MERGE_HEAD` where git puts it for this repository, which is what
+        // a real unfinished merge leaves behind.
+        const path = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+            "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD",
+        });
+        defer gpa.free(path);
+        try writeFileAbsolute(testing.io, path, "0000000000000000000000000000000000000000\n");
+
+        const apply = try carried.describing(arena_state.allocator(), .rebase);
+        try testing.expectEqual(
+            chock_broker.integrate.Reason.unfinished_operation,
+            apply.integration.park.why,
+        );
+    }
+}
+
+test "the question a person is asked is different in every mode and names the mode" {
+    // **The property the modes are only safe with.** The same "y" at the same
+    // prompt now does four different things, so the prompt has to say which.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+    defer carried.deinit(gpa);
+    try carried.commitOnMain(gpa, "user.txt", "the user wrote this\n");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var seen: [4][]u8 = undefined;
+    var seen_detail: [4][]u8 = undefined;
+    for (std.enums.values(Landing), 0..) |landing, index| {
+        const apply = try carried.describing(arena_state.allocator(), landing);
+        const action = actions.Action{ .workspace_apply = apply };
+        seen[index] = try action.summary(gpa);
+        seen_detail[index] = try action.detail(gpa);
+
+        // Every prompt says what happens to the branch, in words, in both the
+        // one line and the whole of it.
+        try testing.expect(std.mem.indexOf(u8, seen_detail[index], "your branch") != null);
+        if (landing == .ref) {
+            try testing.expect(std.mem.indexOf(u8, seen_detail[index], "no branch of yours moves") != null);
+        } else {
+            // The mode is named, and so is the branch it moves.
+            try testing.expect(std.mem.indexOf(u8, seen[index], landing.wireName()) != null);
+            try testing.expect(std.mem.indexOf(u8, seen[index], "refs/heads/main") != null);
+            try testing.expect(std.mem.indexOf(u8, seen_detail[index], "moves it") != null);
+        }
+    }
+    defer for (seen) |one| gpa.free(one);
+    defer for (seen_detail) |one| gpa.free(one);
+
+    // **No two of the four read the same.** A prompt that looked identical in
+    // two modes that do different things is the exact failure these modes have
+    // to not be.
+    for (seen, 0..) |one, i| {
+        for (seen[i + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, one, other));
+    }
+    for (seen_detail, 0..) |one, i| {
+        for (seen_detail[i + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, one, other));
+    }
+}
+
+test "the agent cannot name the mode, and the ask it sends carries no way to" {
+    // **Two ends of one rule.** The mode comes from `chock.zon` and from the
+    // `workspace.integrate` row above it, both read on the host. An `Ask` is the
+    // whole of what an agent sends, and there is no member of one that a mode
+    // could arrive in.
+    inline for (@typeInfo(actions.Ask).@"struct".fields) |field| {
+        inline for (.{ "mode", "landing", "integration", "branch" }) |name| {
+            try testing.expect(!std.ascii.eqlIgnoreCase(field.name, name));
+        }
+    }
+    // The one thing an agent does say about an apply is a reason, which is an
+    // argument and not an answer.
+    const ask = testAsk(.{ .net_fetch = .{ .host = "h.invalid", .url = "https://h.invalid/" } });
+    try testing.expectEqualStrings("the task asked for it", ask.reason);
 }

@@ -78,20 +78,24 @@ tenth.
 
 ## What is not built yet
 
-- **No tool call reaches the broker, because the tool that would ask is not
-  built.** This is the largest gap in the approval model, so read it before
-  the rest. `Loop.run` never asks anyone whether a tool call may run: every
-  call `deps.tools` accepts, it runs. The design is that an agent asks with a
-  `request_action` tool, and that tool is not in `chock_core.tools.Tool`. The
-  approval wall that used to block it is gone, so this waits on the tool
-  itself. Two callers reach the broker today and neither is an agent: `chock
-  run` asks for `workspace.apply` after the loop has ended, and the session
-  arbiter asks for `policy.widen` while it runs. The policy table can answer
-  `git.commit`, `git.push`, `git.branch.delete` and `file.write`, and nothing
-  in a session asks those rows yet. The git shim is the one thing that stops a
-  subcommand, and only for a subcommand that would reach another host: `git
-  commit` runs the real git inside the sandbox with no question asked.
-  **The sandbox is what holds a tool call today, not an approval.**
+- **An ordinary tool call still reaches nobody. One act is agent-requestable
+  and the rest are not.** This is the largest gap in the approval model, so
+  read it before the rest. `Loop.run` never asks anyone whether a tool call may
+  run: every call `deps.tools` accepts, it runs. What changed is one act.
+  `request_action` is now in `chock_core.tools.Tool`, and it takes
+  **`workspace.apply` and nothing else**: an agent that believes it is finished
+  can ask for its commit to be carried into the user's repository, and the
+  policy table, or a person, answers. Every other action name is refused by
+  name, before anybody is asked. An agent still cannot ask about `git.commit`,
+  `git.push`, `git.branch.delete`, `net.fetch` as an act, `nix.build` or
+  `file.write`: the table can answer those rows and nothing in a session asks
+  them. Three callers reach the broker today. Two are the harness itself:
+  `chock run` asks for `workspace.apply` after the loop has ended, and the
+  session arbiter asks for `policy.widen` while it runs. The third is the agent,
+  through `request_action`, for that one act. The git shim is still the one
+  thing that stops a subcommand, and only one that would reach another host:
+  `git commit` runs the real git inside the sandbox with no question asked.
+  **The sandbox is what holds an ordinary tool call today, not an approval.**
 
 - **A handover cannot carry a background command or a background subagent, so a
   session running one refuses.** Both live in the process that started them, and

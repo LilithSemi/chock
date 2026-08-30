@@ -4993,6 +4993,31 @@ pub const Ui = struct {
                     one.ceiling.wireName(),
                 });
             },
+            // **Only when it is not the ordinary sandbox.** A row on every
+            // replay of every session saying that the write and execute rule
+            // was on would be noise in the one region a person is reading, and
+            // the whole record is in the log either way. A session that gave
+            // the rule up is the one a reader has to see, and `chock doctor`
+            // says the same fact before a session starts.
+            // **Only when a branch of theirs moved.** A row on every replay of
+            // every session saying that nothing happened to the branch would be
+            // noise in the one region a person is reading, and the whole record
+            // is in the log either way. A session that moved somebody's branch
+            // is the one a reader has to see.
+            .workspace_integrate => |landed| if (landed.branch.len != 0) self.sayFmt(
+                .chock,
+                "your branch {s} moved to {s}, because this project asks for {s}",
+                .{ landed.branch, landed.branch_to, landed.mode },
+            ),
+            .sandbox_open => |opened| switch (opened.write_execute) {
+                .strict => {},
+                .relaxed, .unknown => self.sayFmt(
+                    .chock,
+                    "the write and execute rule is off for this session, because the policy " ++
+                        "answers {s} for sandbox.jit",
+                    .{opened.decision},
+                ),
+            },
             .session_end => |ended| self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()}),
             // **Folded and not shown.** A count after every turn would be noise
             // in the one region a person is reading; `/usage` is where it is

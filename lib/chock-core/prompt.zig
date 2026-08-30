@@ -92,13 +92,23 @@ pub const Project = struct {
 /// produces anything at all: put the change in the files, and commit it. The
 /// worktree is what `workspace.apply` carries back, prose is not in the
 /// worktree, and an uncommitted worktree is not a commit.
+///
+/// **It used to say there was no way to ask for an exception, and that is no
+/// longer true.** There is exactly one: `request_action` with
+/// `workspace.apply`. A prompt that still said none would leave a tool in the
+/// list that the rules deny, and a model reads the rules. It is named with its
+/// bound beside it, because a model told it can ask will otherwise try the act
+/// it wants rather than the one act there is. The two names here are pinned
+/// against the enum and the seam by a test at the end of this file.
 const rules =
     \\You are Chock, an agent that edits code inside a sandbox.
     \\You work in a throwaway copy of the project, checked out at one commit.
     \\A tool call cannot reach any path outside that copy and cannot reach
     \\the network, and nothing you do changes the user's own project
-    \\directly. There is no way to ask for an exception: an action outside
-    \\the sandbox simply does not run yet.
+    \\directly. One act can be asked for and no other: request_action with
+    \\"workspace.apply", which asks for your commit to be carried into the
+    \\user's own repository. You do not decide it and neither does the answer
+    \\you write in it.
     \\Make each change in the files themselves rather than describing it, and
     \\commit your work with git before you finish. The copy is thrown away at
     \\the end of the session, so your commit is the only thing carried back
@@ -663,4 +673,34 @@ test "a session with no instructions, no guidance and no notes gets none of thos
     try std.testing.expect(std.mem.indexOf(u8, after, "##") == null);
 
     try std.testing.expect(text.len < fixed_floor + 512);
+}
+
+test "the one act the rules say can be asked for is the one the tool really takes" {
+    // The rules paragraph names a tool and an action in prose, because a
+    // multiline string cannot be built from a constant. So the two names are
+    // pinned here against the enum and the seam, and a rename that reached
+    // only one of the three fails this rather than telling every model about a
+    // tool call that comes straight back.
+    const tools = @import("tools.zig");
+    const handback = @import("handback.zig");
+
+    const allocator = std.testing.allocator;
+    const one = [_]chock_provider.message.ToolDefinition{
+        .{ .name = "read_file", .description = "read", .parameters = .null },
+    };
+    const text = try build(allocator, .{}, &one, .{});
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, @tagName(tools.Tool.request_action)) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, handback.apply_action) != null);
+    // **And it says the agent does not decide it.** A model told it can ask is
+    // a model that will try to answer, and this sentence is the one thing in
+    // the prompt that says otherwise.
+    try std.testing.expect(std.mem.indexOf(u8, text, "You do not decide it") != null);
+
+    // A session with no tools is told none of this: it has no such tool, and
+    // naming one would spend its turns on a call it cannot make.
+    const bare = try build(allocator, .{}, &.{}, .{});
+    defer allocator.free(bare);
+    try std.testing.expect(std.mem.indexOf(u8, bare, @tagName(tools.Tool.request_action)) == null);
 }

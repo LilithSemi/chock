@@ -9,12 +9,13 @@ made to itself. What each one is allowed, denied or asked is the policy table
 in `chock.zon`. See [policy.md](policy.md).
 
 **Two of them really put a question to a person in this release, and no more.**
-`workspace.apply` is asked at the end of a session, and `policy.widen` is asked
-during one. `net.fetch`, `nix.build` and `model.select` are each read before
-the work they govern, at a moment when nobody is waiting to answer, so `ask` is
-a refusal for all three. `git.commit`, `git.push`, `git.branch.delete` and
-`file.write` are rows the table can answer and nothing in a session asks them
-yet. See [status.md](status.md).
+`workspace.apply` is asked at the end of a session, and again during one when
+the agent asks for it with `request_action`. `policy.widen` is asked during one.
+`net.fetch`, `nix.build` and `model.select` are each read before the work they
+govern, at a moment when nobody is waiting to answer, so `ask` is a refusal for
+all three. `git.commit`, `git.push`, `git.branch.delete` and `file.write` are
+rows the table can answer and nothing in a session asks them yet. See
+[status.md](status.md).
 
 ## The one every project meets
 
@@ -45,6 +46,103 @@ says where.
 
 Ctrl-C at the prompt ends the run with the question unanswered, which is a
 refusal, and keeps the workspace.
+
+### Where the work lands, and how to change it
+
+By default the work stops at `refs/chock/<session>`. **No branch of yours
+moves**, and you take the work with `git merge refs/chock/...` when you want it.
+
+A project that would rather not run that merge by hand says so in `chock.zon`:
+
+```zon
+.{
+    .apply = .{ .mode = .merge },
+}
+```
+
+Four modes and one question:
+
+| mode | what an approved apply does |
+| --- | --- |
+| `ref` | the default. Parks the work at the ref. No branch of yours moves. |
+| `merge` | parks the work, then merges it into the branch you have checked out. |
+| `rebase` | parks the work, then replays it on top of the branch you have checked out. |
+| `squash` | parks the work, then puts all of it on that branch as one commit. |
+| `ask` | Chock asks you which of the four, at the moment of the apply. |
+
+**The prompt says which one you are approving.** The `summary` line names the
+mode and the branch, and the detail has a paragraph of its own about your
+branch: which branch, where it is, where it moves to, and what happens to your
+working tree. A `ref` apply says in the same place that no branch of yours
+moves. The four questions do not read alike, because the same `y` no longer
+means the same thing.
+
+Every mode parks the work at the ref first, so the ref is there whatever else
+happened.
+
+**Chock never leaves your repository in the middle of a merge.** The merge, the
+rebase and the squash are all built inside the session's own object store, with
+no index and no working tree involved, and the only thing that ever runs in your
+repository is a fast forward onto a clean tree. There is nothing to abort,
+because nothing was started.
+
+That means Chock decides **before it asks you** whether the integration is
+possible at all. When it is not, the prompt says so and the work waits at the
+ref instead. It refuses for these reasons, and each one is named in the prompt
+and in the log:
+
+- your working tree holds changes that are not committed, or files that are not
+  tracked;
+- the work and your branch change the same lines, so it would stop on a
+  conflict;
+- no branch is checked out;
+- a merge, a rebase, a cherry pick or a revert is unfinished there;
+- your branch moved between the question and your answer.
+
+**A refusal never loses the work and never refuses the apply.** The objects and
+the ref land exactly as they do in `ref` mode, which is the behaviour you
+already have a `git merge` for. Chock checks the same facts again immediately
+before it moves your branch, so a working tree you dirtied while reading the
+question parks the work rather than integrating into it.
+
+`ask` needs somebody at the keyboard. A subagent, a session the daemon started,
+a `chock run` behind a pipe and a session with the full screen interface up all
+have nobody to ask, and all of them keep the work at the ref.
+
+`chock run` prints what happened either way, and says how to put your branch
+back:
+
+```
+chock run: 21 objects and the ref refs/chock/01M17... were applied to /home/you/site.
+chock run: your branch refs/heads/main moved from a1b2c3d to 9f8e7d6 (merge), and
+your working tree is there now.
+chock run: put it back with `git reset --hard a1b2c3d...`.
+```
+
+The session log carries the same fact as a `workspace.integrate` record: the
+mode, the policy answer that permitted it, the branch, where it moved from and
+to, and, when no branch moved, why. **A session is distinguishable afterwards by
+what happened to your branch.**
+
+An organisation can close this road for every project at once with one policy
+rule. See [policy.md](policy.md).
+
+### The agent can ask for the same thing
+
+`request_action` is the one act an agent may ask for by name, and it takes
+`workspace.apply` and nothing else. An agent that believes it has finished calls
+it, and you get the question above, with the agent's own reason in it, without
+waiting for the session to end. Everything else is identical: the same table
+decides, the same diff is shown, and the work lands on the same
+`refs/chock/<session>` ref. **An agent gains nothing by asking**, and in
+particular **it cannot choose how the work lands**. The mode comes from
+`chock.zon` and from the policy row above it, both read outside the sandbox, and
+the one thing an agent fills in for an apply is its reason. There is no field of
+the request a mode could arrive in, and the build fails if one is ever added.
+
+Two answers never reach you at all. An agent that asks for any other action is
+refused by name, and an agent that asks having made no commit is told how many
+files it has left uncommitted, because there is nothing to put in front of you.
 
 ## How a question reaches a person
 

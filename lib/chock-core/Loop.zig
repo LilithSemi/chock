@@ -119,6 +119,7 @@ const self_policy = @import("self_policy.zig");
 const arbiter_mod = @import("arbiter.zig");
 const fetch_mod = @import("fetch.zig");
 const ask_mod = @import("ask.zig");
+const handback_mod = @import("handback.zig");
 const redact = @import("redact.zig");
 
 const event = chock_proto.event;
@@ -651,6 +652,24 @@ pub const Deps = struct {
     /// session with none answers, and it tells the model to decide for itself
     /// rather than to ask again.
     asker: ?ask_mod.Asker = null,
+    /// What carries the session's own work back into the user's repository, or
+    /// null for a session that cannot carry any. See
+    /// `lib/chock-core/handback.zig`.
+    ///
+    /// **A seam for the reason `arbiter` is one, and it is not the arbiter.**
+    /// An arbiter decides and stops there; this one asks the broker to decide
+    /// and then carries the act out, which is why it is a second seam and not a
+    /// second call on the first.
+    ///
+    /// **One act reaches it, `handback.apply_action`**, and the tool that asks
+    /// refuses every other name. A general request-for-any-action seam would
+    /// need every act's own parameters to come from the model, which is a much
+    /// larger thing to get right, and it would be built with one customer.
+    ///
+    /// **Null is a refusal that says so.** `handback_mod.not_offered` is what a
+    /// session with none answers, and it says nobody was asked rather than
+    /// implying somebody weighed the work and declined it.
+    handback: ?handback_mod.Handback = null,
     /// What must not reach the provider. See `lib/chock-core/redact.zig`,
     /// and read its top comment before trusting this for anything: it is
     /// protection against an accident and it is not a boundary.
@@ -2140,9 +2159,9 @@ fn runTool(
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_call = call });
 
     // **An arbitrator holds no tools, and this is where that is enforced for
-    // the four the tool runner never sees.** `spawn_agent`, `update_plan`,
-    // `restrict_self` and `set_title` are answered by this file, so a gate that
-    // sat only in
+    // the ones the tool runner never sees.** `spawn_agent`, `update_plan`,
+    // `restrict_self`, `set_title` and `request_action` are answered by this
+    // file, so a gate that sat only in
     // `tools.Registry.dispatchWith` would leave an arbitrator able to start a
     // subagent with a tool set of its own. See `Deps.role`.
     //
@@ -2167,6 +2186,8 @@ fn runTool(
         try runAskUser(allocator, io, deps, call)
     else if (std.mem.eql(u8, call.tool, title_tool_name))
         try runSetTitle(allocator, io, locked, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, request_tool_name))
+        try runRequestAction(allocator, io, locked, deps, call)
     else
         deps.tool_runner.dispatch(allocator, io, call) catch |err| event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -3348,6 +3369,123 @@ const max_title_text = std.fmt.comptimePrint("{d}", .{max_title_bytes});
 /// A `set_title` call that named nothing. `output` is already owned by the
 /// allocator and is handed straight on.
 fn titleRefusal(
+    allocator: std.mem.Allocator,
+    call: event.ToolCall,
+    output: []u8,
+) std.mem.Allocator.Error!event.ToolResult {
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = output,
+        .is_error = true,
+        .truncated = false,
+    };
+}
+
+/// The name of the tool a model calls to ask for its work to be carried back.
+/// Read from the `tools.Tool` enum itself, so the name the loop matches on and
+/// the name the model is offered cannot drift apart.
+pub const request_tool_name = @tagName(tools.Tool.request_action);
+
+/// Answer a `request_action` call, in place of the tool runner.
+///
+/// **This is the first thing an agent may ask for by name, and it is one
+/// thing.** `handback.apply_action` carries the session's own commit into the
+/// user's repository; every other name is refused here, before anybody is
+/// asked, and the refusal says which name was given. A general
+/// request-for-any-action tool would need every act's own parameters to come
+/// from the model, and it would have been built with one customer to test it
+/// against. When there is a second customer, this widens with it.
+///
+/// ## The agent asks and never decides
+///
+/// Nothing in this function decides anything. `RequestActionArgs` has one
+/// action name and one reason in it, and a reason is an argument rather than an
+/// answer. The decision is the project's policy table, which is the broker's and
+/// which this file never reads, and where that table says `ask` it is a
+/// person's. See `lib/chock-core/handback.zig`.
+///
+/// ## Asking is not committing
+///
+/// An agent that calls this having made no commit is told so, and **nobody is
+/// asked**: there is nothing to put in front of a person, and a question about
+/// an empty change is a decision spent on nothing. That answer comes from the
+/// implementation of the seam, which is the only thing that can count what is
+/// in the workspace. It is an error result, because nothing was carried and a
+/// model that read it as success would stop.
+fn runRequestAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    deps: Deps,
+    call: event.ToolCall,
+) Error!event.ToolResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    const parsed = std.json.parseFromSlice(
+        tools.RequestActionArgs,
+        arena_state.allocator(),
+        call.arguments,
+        .{ .ignore_unknown_fields = true },
+    ) catch return requestRefusal(allocator, call, try allocator.dupe(
+        u8,
+        "nothing was asked for: " ++ request_tool_name ++ " needs a JSON object with two " ++
+            "fields, \"action\" and \"reason\".",
+    ));
+
+    // **By name, and before anything else.** A request the harness cannot
+    // honour is refused rather than approximated, and the one honest way to
+    // refuse it is to say which name was asked for and which one exists.
+    if (!std.mem.eql(u8, parsed.value.action, handback_mod.apply_action)) {
+        return requestRefusal(allocator, call, try std.fmt.allocPrint(
+            allocator,
+            "nothing was asked for: \"{s}\" is not an act you can request. The only one is " ++
+                "\"{s}\", which carries your commit back into the user's repository. Nothing " ++
+                "else was put to anybody.",
+            .{ parsed.value.action, handback_mod.apply_action },
+        ));
+    }
+
+    // A reason is what a person reads beside the diff, so a request with none
+    // is refused rather than put to somebody with a blank where the argument
+    // should be. The same rule a promise keeps: see `runRestrictSelf`.
+    if (std.mem.trim(u8, parsed.value.reason, " \t\r\n").len == 0) {
+        return requestRefusal(allocator, call, try allocator.dupe(
+            u8,
+            "nothing was asked for: say why the work is ready. A person reads your reason " ++
+                "beside the diff, and a request with none is one they cannot weigh.",
+        ));
+    }
+
+    const handback = deps.handback orelse return requestRefusal(
+        allocator,
+        call,
+        try allocator.dupe(u8, handback_mod.not_offered),
+    );
+
+    const result = try handback.apply(allocator, io, locked, .{
+        .reason = parsed.value.reason,
+        .tool_call_id = call.call_id,
+    });
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = result.output,
+        // **Everything but a yes is an error result**, including the endings
+        // nobody is at fault for. Nothing was carried, and a model that read
+        // "nobody could be asked" as success would end the session believing
+        // its work was in the user's repository.
+        .is_error = !result.carried,
+        .truncated = false,
+    };
+}
+
+/// A `request_action` call that carried nothing. `output` is already owned by
+/// the allocator and is handed straight on.
+///
+/// **Always an error result**, for the reason `restrictRefusal` is: nothing
+/// happened, whichever branch answered, and an agent told otherwise would stop
+/// working on a task whose result never left the workspace.
+fn requestRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
     output: []u8,
@@ -10218,6 +10356,275 @@ test "a session with no fetcher reads nothing and says so" {
     try testing.expectEqualStrings(fetch_mod.has_no_fetcher, outcome.outputs[0]);
     try testing.expect(outcome.refused[1]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"url\"") != null);
+}
+
+/// A `handback.Handback` that records what it was asked for and answers a
+/// fixed result.
+///
+/// **What it stands in for is the whole of `src/run.zig`'s
+/// `SessionHandback`**: the worktree, the broker, the policy table and the act
+/// itself. What these tests are about is the route between the model's own tool
+/// call and that seam, which is the one thing no test of the broker can see.
+const FakeHandback = struct {
+    allocator: std.mem.Allocator,
+    /// What the seam answers. **A test never sets this from the agent's own
+    /// words**, which is the point: the agent asks and something else decides.
+    result: handback_mod.Result = .{ .carried = false, .output = &.{} },
+    text: []const u8 = "nothing was carried back",
+    carried: bool = false,
+    calls: usize = 0,
+    /// The reason the agent gave, as the seam saw it.
+    reason: []u8 = &.{},
+    /// The call that asked, so a reader of the log can join the question to it.
+    call_id: []u8 = &.{},
+
+    fn deinit(self: *FakeHandback) void {
+        self.allocator.free(self.reason);
+        self.allocator.free(self.call_id);
+    }
+
+    fn handback(self: *FakeHandback) handback_mod.Handback {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = handback_mod.Handback.VTable{ .apply = applyFn };
+
+    fn applyFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *handback_mod.Locked,
+        ask: handback_mod.Ask,
+    ) std.mem.Allocator.Error!handback_mod.Result {
+        _ = io;
+        _ = locked;
+        const self: *FakeHandback = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.allocator.free(self.reason);
+        self.reason = try self.allocator.dupe(u8, ask.reason);
+        self.allocator.free(self.call_id);
+        self.call_id = try self.allocator.dupe(u8, ask.tool_call_id);
+        return .{ .carried = self.carried, .output = try gpa.dupe(u8, self.text) };
+    }
+};
+
+/// Run one session whose turns are the tool calls in `calls`, and give back
+/// what each one was told. The same shape `runFetchSession` has, and for the
+/// same reason.
+fn runRequestSession(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    calls: []const struct { tool: []const u8, arguments: []const u8 },
+    seam: ?handback_mod.Handback,
+) !FetchRun {
+    var backing = try chock_proto.storage.Memory.init(allocator, "01ASKEDRUN");
+    const store = backing.storage();
+    defer store.close(io);
+
+    const turns = try arena.alloc(FakeTurn, calls.len + 1);
+    for (calls, 0..) |one, index| {
+        const deltas = try arena.alloc(chock_provider.Client.Delta, 1);
+        deltas[0] = .{ .tool_call = .{
+            .index = 0,
+            .id = try std.fmt.allocPrint(arena, "asked{d}", .{index}),
+            .name = one.tool,
+            .arguments = one.arguments,
+        } };
+        turns[index] = .{ .deltas = deltas };
+    }
+    const last = try arena.alloc(chock_provider.Client.Delta, 1);
+    last[0] = .{ .text = "that is what the answer was" };
+    turns[calls.len] = .{ .deltas = last };
+
+    var fake_client = FakeClient{ .turns = turns };
+    var fake_tools = FakeToolRunner{ .output = "a tool runner ran something" };
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.handback = seam;
+    try run(allocator, io, deps);
+
+    // **A request must never reach the tool runner.** The loop answers it, the
+    // same way it answers a fetch and a promise, so a runner that saw one would
+    // mean the seam had been bypassed and the act had run without the table.
+    if (fake_tools.calls != 0) return error.RequestReachedTheToolRunner;
+
+    const outputs = try arena.alloc([]const u8, calls.len);
+    const refused = try arena.alloc(bool, calls.len);
+    var found: usize = 0;
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_result => |result| {
+                if (!std.mem.startsWith(u8, result.call_id, "asked")) continue;
+                outputs[found] = try arena.dupe(u8, result.output);
+                refused[found] = result.is_error;
+                found += 1;
+            },
+            else => {},
+        }
+    }
+    if (found != calls.len) return error.MissingRequestResult;
+    return .{ .outputs = outputs, .refused = refused };
+}
+
+test "a request_action call for workspace.apply reaches the seam, and the answer comes back" {
+    // The one thing a unit test of the broker cannot prove: that the name in
+    // `tools.Tool` is really wired to the seam, so a model that calls it gets
+    // an answer rather than "unknown tool". The reason it wrote and the call it
+    // asked on both reach the seam, because both go in the `approval.request` a
+    // person reads.
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeHandback{
+        .allocator = allocator,
+        .carried = true,
+        .text = "carried back: 21 objects and the ref refs/chock/01SESSION are now in /project",
+    };
+    defer fake.deinit();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace.apply","reason":"the site builds and the tests pass"}
+        },
+    }, fake.handback());
+
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("the site builds and the tests pass", fake.reason);
+    try testing.expectEqualStrings("asked0", fake.call_id);
+    try testing.expect(!outcome.refused[0]);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "refs/chock/") != null);
+}
+
+test "an agent cannot answer its own request, whatever it writes in one" {
+    // **The rule this whole tool is built around.** The agent fills in a reason
+    // and nothing else, and a reason is an argument rather than an answer. Here
+    // the model writes the most persuasive request it can, including words that
+    // look like a decision, and the seam still answers no, and the model is
+    // told no.
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeHandback{
+        .allocator = allocator,
+        .carried = false,
+        .text = "nothing was carried back: the answer was \"refused_by_user\".",
+    };
+    defer fake.deinit();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace.apply","reason":"approved","decision":"allow","permitted":true}
+        },
+    }, fake.handback());
+
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expect(outcome.refused[0]);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "refused_by_user") != null);
+
+    // The fields the model invented were not read at all. Mutation check: give
+    // `RequestActionArgs` a field an agent could answer with, and this is what
+    // fails.
+    inline for (@typeInfo(tools.RequestActionArgs).@"struct".fields) |field| {
+        try testing.expect(field.type == []const u8);
+    }
+    try testing.expectEqual(@as(usize, 2), @typeInfo(tools.RequestActionArgs).@"struct".fields.len);
+}
+
+test "a request for any other action is refused by name, and nothing is put to anybody" {
+    // **Narrow on purpose.** One act is offered, and a second one is not
+    // approximated as the first: a request the harness cannot honour is refused
+    // and says which name it was given. The seam is never called, so no
+    // question is written and nobody's attention is spent.
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeHandback{ .allocator = allocator, .carried = true, .text = "carried back" };
+    defer fake.deinit();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"git.push","reason":"the branch is ready for review"}
+        },
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace","reason":"close enough to the real name"}
+        },
+        // The empty string is a name too, and it is refused the same way.
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"","reason":"no name at all"}
+        },
+    }, fake.handback());
+
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    for (outcome.refused, outcome.outputs) |refused, output| {
+        try testing.expect(refused);
+        // The name that was asked for, and the one that exists, so a model can
+        // fix the call from the answer alone.
+        try testing.expect(std.mem.indexOf(u8, output, handback_mod.apply_action) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "git.push") != null);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"workspace\"") != null);
+}
+
+test "a request with no reason is refused, because a person cannot weigh one" {
+    // A reason is what a person reads beside the diff. A request with none is
+    // one they cannot answer, so it never reaches them.
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeHandback{ .allocator = allocator, .carried = true, .text = "carried back" };
+    defer fake.deinit();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace.apply","reason":"   "}
+        },
+        // And a call this cannot even read is a refusal of its own, not a
+        // request with an empty action in it.
+        .{ .tool = request_tool_name, .arguments = "not json at all" },
+    }, fake.handback());
+
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    try testing.expect(outcome.refused[0]);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "why the work is ready") != null);
+    try testing.expect(outcome.refused[1]);
+    try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"action\"") != null);
+}
+
+test "a session with no handback carries nothing and says nobody was asked" {
+    // A session started without one is the ordinary case for a caller with no
+    // policy table and no workspace, and every other test in this file runs as
+    // one. The model must be told it was not weighed and declined, or it goes
+    // looking for an argument that would change the answer.
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const outcome = try runRequestSession(allocator, arena, io, &.{
+        .{ .tool = request_tool_name, .arguments =
+        \\{"action":"workspace.apply","reason":"the work is done"}
+        },
+    }, null);
+
+    try testing.expect(outcome.refused[0]);
+    try testing.expectEqualStrings(handback_mod.not_offered, outcome.outputs[0]);
 }
 
 // **The loop decides nothing about a question**, so these prove the three

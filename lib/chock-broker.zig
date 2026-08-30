@@ -26,6 +26,13 @@ pub const Broker = @import("chock-broker/Broker.zig");
 /// why an action names its effect and never a command.
 pub const actions = @import("chock-broker/actions.zig");
 
+/// Carrying the session's work onto the branch the user has checked out, for
+/// the `merge`, `rebase` and `squash` modes of `chock_policy.apply`. **No merge
+/// and no rebase is ever run in the user's repository**: the result is built in
+/// the session's own object store and the only write to the project is one fast
+/// forward. See its own top comment for why that is the whole design.
+pub const integrate = @import("chock-broker/integrate.zig");
+
 /// The `git` shim. **It prevents a mistake and it does not
 /// prevent an attack**, and its own top comment says so at length, with the
 /// ways around it named one by one. The capability layers are the boundary.

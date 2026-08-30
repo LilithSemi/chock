@@ -36,7 +36,7 @@ copies your uncommitted work into the workspace as well.
 
 ## The tools
 
-The agent has seventeen tools, and every one that touches the machine goes
+The agent has eighteen tools, and every one that touches the machine goes
 through that sandbox: `read_file`, `list_directory`, `glob`, `grep`,
 `write_file`, `edit_file`, `run_command`, `read_memory` and `write_memory`.
 Only `run_command` takes a command. The rest name a path, a pattern, or the
@@ -47,7 +47,7 @@ line.
 the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names
 the session, so `chock sessions` reads as more than a list of identifiers. The
-last five are described on pages of their own:
+last six are described on pages of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
@@ -55,7 +55,16 @@ last five are described on pages of their own:
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
 | `restrict_self` | a promise the agent cannot take back | [policy.md](policy.md) |
 | `fetch_url` | one page over http or https | [policy.md](policy.md) |
+| `request_action` | your work carried back into your repository | [approvals.md](approvals.md) |
 | `update_plan` | a task list you can watch | below |
+
+`request_action` is the one act an agent can ask for by name, and it takes
+`workspace.apply` and nothing else. An agent that believes it is finished calls
+it, and your policy, or you, answer. It never moves a branch of yours: the work
+lands on a ref of the session's own, which you read with `git log` and take with
+`git merge`. **An agent that has made no commit is told so and nobody is asked**,
+because only a commit is carried back. Every other tool call still runs without
+asking anybody: see [status.md](status.md).
 
 ## What the harness tells the agent
 
@@ -90,6 +99,13 @@ chock sessions remove <session id>
 chock sessions prune --older-than 30
 ```
 
+Every run writes a `sandbox.open` event before its first turn, naming the run
+and whether the sandbox's write and execute rule was on for it. **It is written
+on every run and not only on the run that gave the rule up**, so an absent line
+means an older Chock and never a session nobody recorded. See
+[sandbox.md](sandbox.md) for the row a project writes to give it up, and
+`chock doctor` for the same fact before a session starts.
+
 The listing needs no index, because a session identifier starts with the
 millisecond it was made and sorts in that order, so the directory is already the
 list. The same identifier is where the start time comes from, rather than a
@@ -123,8 +139,14 @@ removable**, and neither is one whose lock could not be tested.
 
 Work reaches your project only when the agent commits it in the workspace
 **and** the policy in your `chock.zon` permits the apply. It lands on
-`refs/chock/<session id>`, never on a branch of yours, so `git log` reads it
-and `git merge` takes it. See [approvals.md](approvals.md).
+`refs/chock/<session id>`, so `git log` reads it and `git merge` takes it.
+
+**No branch of yours moves unless you asked for that**, in the `apply` block of
+`chock.zon`. A project can say `merge`, `rebase` or `squash` there and have the
+work carried onto the branch it has checked out, or `ask` to be asked each time.
+The approval prompt names the mode it is about to use, and Chock refuses the
+integration rather than leave your repository in the middle of one. See
+[approvals.md](approvals.md).
 
 **A session that does not end cleanly keeps its workspace**, and prints where
 it is. Errored, refused, budget reached, no progress, interrupted: whatever

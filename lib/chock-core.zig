@@ -120,6 +120,11 @@ pub const arbiter = @import("chock-core/arbiter.zig");
 /// belongs to the broker. See its own top comment, and note that a fetched page
 /// is a stranger's writing and is marked as such.
 pub const fetch = @import("chock-core/fetch.zig");
+/// How the agent gives its own work back to the project. **A seam, for the
+/// reason `arbiter` is one**, and it is the one act an agent may ask for by
+/// name. It decides nothing itself: read its own top comment, and note that an
+/// agent that asks gains nothing an agent that waits would not have had.
+pub const handback = @import("chock-core/handback.zig");
 /// How the loop asks the person a question mid session. **A seam, for the reason
 /// `arbiter` is one**: what asks a person is a terminal or a display, and every
 /// device belongs to `src/`. **It is not an approval and grants nothing**: read

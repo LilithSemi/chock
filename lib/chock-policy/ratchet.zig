@@ -124,9 +124,10 @@
 //! ## Where a promise is enforced today, and where it is not
 //!
 //! **`Broker.request` is the only place a promise changes an outcome**, and
-//! `chock run` reaches it once, at the end of a session, for
-//! `workspace.apply`. That is a real act with a real consequence, and it is
-//! also the only one an agent can be stopped from by a promise today.
+//! `workspace.apply` is the act it reaches it for. `chock run` asks at the end
+//! of a session, and an agent asks mid session with `request_action`. That is a
+//! real act with a real consequence, and it is also the only one an agent can
+//! be stopped from by a promise today.
 //!
 //! Two places read the policy and do not read a promise, and both are honest
 //! gaps rather than oversights:
@@ -135,10 +136,11 @@
 //!   first turn, to decide whether the `provide_tool` tool exists at all. A
 //!   promise made during that session comes too late to change a tool list
 //!   that was fixed before it started.
-//! * A tool call inside the sandbox reaches no broker at all. A
-//!   `request_action` tool is what changes that. **It is no longer waiting on the
-//!   approval wall**, which `lib/chock-broker/socket.zig` removed; it is waiting
-//!   on the tool itself.
+//! * An ordinary tool call inside the sandbox reaches no broker at all.
+//!   `request_action` is the tool that would change that and it takes one act,
+//!   `workspace.apply`, and refuses every other name. Widening it needs each
+//!   act's own parameters to come from the model, which is a much larger thing
+//!   to get right and is not built.
 //!
 //! ## May a self imposed restriction cite a clause of the constitution? No
 //!

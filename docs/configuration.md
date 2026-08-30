@@ -104,16 +104,37 @@ is a complete `chock.zon` with every block a first project needs:
         ".env",
     },
     .subagents = .{ .max_width = 2 },
+    .apply = .{ .mode = .merge },
 }
 ```
 
 `.subagents` also takes `.max_depth`. Both default to 6. See
 [subagents.md](subagents.md).
 
+`.apply.mode` says how an approved apply lands. It defaults to `ref`, which
+parks the work at `refs/chock/<session>` and moves no branch of yours. See
+[approvals.md](approvals.md).
+
 **A rule goes under `.policy.rules`, and never directly under `.policy`.**
 `.policy` is a struct with named fields, so a rule written beside `.agents` is
 a syntax error and the session does not start. Every block is optional: leave
 out the ones you do not want.
+
+**Every block of this file narrows what an agent may do, and two rows of the
+policy table widen.** `.{ .action = "sandbox.jit", .decision = .allow }` turns
+off the sandbox rule that refuses a page which is writable and executable, which
+a run time with a just in time compiler needs. It is a policy row and not a
+block of its own precisely because it widens: the table is where an organisation
+can forbid it and a project cannot take that back. See
+[sandbox.md](sandbox.md).
+
+`workspace.integrate` is the other. `.apply.mode` above is the project's own
+taste, and this row is what says whether that taste may be anything but `ref`.
+An organisation that wants "never touch my branch automatically" writes
+`.{ .action = "workspace.integrate", .decision = .deny }` once, in its bundle,
+and no project under it can move a branch whatever `.apply.mode` says. A row
+nobody wrote permits the mode, so a project that configures `merge` on an
+installation with no bundle gets `merge`. See [approvals.md](approvals.md).
 
 - [policy.md](policy.md) for the policy table and the denied paths.
 - [subagents.md](subagents.md) for the subagent limits.

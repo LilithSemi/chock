@@ -893,6 +893,11 @@ const Started = struct {
     /// default 6 by 6 tree, and the file is kept beyond the agent's reach, so
     /// **the model cannot raise its own limit**.
     subagents: chock_policy.subagents.Limits,
+    /// How an approved apply lands in the project, from the `apply` block of
+    /// `chock.zon` and the `workspace.integrate` row above it. **Both halves**,
+    /// because the log records the reason as well as the outcome. See
+    /// `applyModeFor` and `chock_policy.apply`.
+    apply_mode: ApplyMode,
     /// This project's language server, from the `language_servers` block of
     /// `chock.zon`, or null when it named none.
     ///
@@ -1784,6 +1789,37 @@ fn start(
     // installation's organisation put above it.
     const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
 
+    // Whether the write and execute rule is on for this session, and the log
+    // line that says which it was. **The one setting on the table that widens**,
+    // so it is here and not in a `chock.zon` block of its own: see
+    // `chock_policy.hardening`. Read after the policy, because the policy is
+    // what decides it, and before `Started` holds the config, which is the last
+    // moment anything can change it.
+    const write_execute = try hardeningDecision(
+        arena,
+        policy,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+    );
+    sandbox_config.seccomp_options.strict_wx = write_execute.rule == .strict;
+    try recordSandbox(gpa, io, storage, &attempt, write_execute);
+
+    // How an approved apply lands. **The one control that decides whether a "y"
+    // at an approval prompt can move a branch of the user's**, so it is read
+    // here, from the project's own file, under the row the organisation may
+    // have closed. Read after the policy for the same reason the hardening row
+    // is: the policy is what bounds it.
+    const apply_mode = try applyModeFor(
+        arena,
+        io,
+        project_root,
+        policy,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+    );
+
     // Whether this session may talk to this provider instance at all, and
     // whether it may use this model there. Before the first turn, because a
     // session that may not use its model has nothing to do.
@@ -2045,6 +2081,7 @@ fn start(
         .budget = budget,
         .billing = billing,
         .subagents = subagent_limits,
+        .apply_mode = apply_mode,
         .language_server = language_server,
         .mcp_servers = mcp_servers,
         .plugins = plugins,
@@ -2503,6 +2540,62 @@ fn recordWorkspace(
             },
         },
     }, std.Io.Timestamp.now(io, .real).toMilliseconds());
+}
+
+/// Write down which sandbox this run built.
+///
+/// **A session that gave up a piece of hardening must be distinguishable
+/// afterwards from one that did not.** This project has no silent degradation,
+/// and a control that turned a layer off quietly would be exactly that. So the
+/// answer is an event, on every run and not only on the run that relaxed
+/// something, for the reason every other event is written when it becomes true:
+/// a fold can rely on a fact that is always recorded, and a fact recorded only
+/// when it is interesting is missing whenever somebody disagrees about what is
+/// interesting.
+///
+/// **Written per attempt**, beside `recordWorkspace` and with the same
+/// identifier, because a later process that continues this session reads
+/// `chock.zon` again and its answer is the one that binds the tool calls it
+/// makes.
+fn recordSandbox(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    attempt: []const u8,
+    hardening: Hardening,
+) StartError!void {
+    // The lock is taken and given back here, for the reason `recordWorkspace`
+    // gives: `Loop.run` has not started yet and takes it for itself.
+    var locked = storage.lock(io) catch |err| return reportSandboxRecord(err);
+    defer locked.unlock(io) catch {};
+    _ = locked.append(gpa, io, .{
+        .sandbox_open = .{
+            .attempt = attempt,
+            .write_execute = switch (hardening.rule) {
+                .strict => .strict,
+                .relaxed => .relaxed,
+            },
+            .decision = @tagName(hardening.decision),
+        },
+    }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| return reportSandboxRecord(err);
+}
+
+/// The one message a failed `recordSandbox` writes. **The session does not
+/// start**, because a run that cannot say which sandbox it built is a run
+/// nobody can audit afterwards, and that is the whole reason the event exists.
+fn reportSandboxRecord(err: anyerror) StartError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (err == error.Busy) {
+        tty.print(.err, "chock run: {s}\n", .{busy_detail});
+        return error.Reported;
+    }
+    tty.print(
+        .err,
+        "chock run: the sandbox this run built could not be written to the log: {s}. A session " ++
+            "that cannot say which layers it ran with is one nobody can audit afterwards.\n",
+        .{@errorName(err)},
+    );
+    return error.Reported;
 }
 
 /// Open this session's handover socket, or answer null and say why.
@@ -3396,6 +3489,23 @@ fn loadImage(
     }
 }
 
+test "the one act an agent may ask for is spelled the same in all three places" {
+    // `chock-core` imports no `chock-broker`, so the action name and the tool
+    // name are each written down twice: once where the agent's tool is defined
+    // and once where the broker's act and its policy key are. This file imports
+    // both, so this is where they are held together. A rename that reached only
+    // one of them would leave a project writing a rule for a key nothing ever
+    // builds, and every request refused for want of a name.
+    try std.testing.expectEqualStrings(
+        chock_broker.actions.Kind.workspace_apply.wireName(),
+        chock_core.handback.apply_action,
+    );
+    try std.testing.expectEqualStrings(
+        chock_broker.actions.self_asked_tool,
+        chock_core.Loop.request_tool_name,
+    );
+}
+
 test "a machine with a nix store gets only that, and one without gets its own system directories" {
     // The fallback that replaced the default which broke every tool call on a
     // machine with no Nix. Both halves are asserted against this machine's own
@@ -3805,6 +3915,152 @@ fn provisionDecision(
     return decision;
 }
 
+/// What this session's policy answered about sandbox hardening, and what that
+/// answer means for the filter. Both halves, because the log records the reason
+/// as well as the outcome.
+const Hardening = struct {
+    decision: chock_policy.table.Decision,
+    rule: chock_policy.hardening.WriteExecute,
+};
+
+/// Whether this session may run with the write and execute rule off.
+///
+/// **The same shape as `provisionDecision` above, and for the same reason.**
+/// This is a capability of the whole session, answered once, before the first
+/// turn and before a broker exists. The filter is built one time and every tool
+/// call runs under it, so there is no later moment at which an answer of `ask`
+/// could be put to anybody. `chock_policy.hardening.writeExecuteFor` is what
+/// reads only `allow` as permission.
+///
+/// **Folded over the whole spawn chain**, so a subagent cannot give up
+/// hardening its parent kept, and the org bundle folds in beside it, so an
+/// organisation can forbid this for every project at once. Neither of those is
+/// code here: both are properties of `evaluateChain` taking a minimum.
+fn hardeningDecision(
+    arena: std.mem.Allocator,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+) std.mem.Allocator.Error!Hardening {
+    // The chain `evaluateChain` wants is the parents and this session, in that
+    // order. The same shape `provisionDecision` builds.
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    defer arena.free(chain);
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    var fault: ?chock_policy.table.ChainFault = null;
+    const decision = policy.evaluateChain(chain, .{
+        .agent_kind = agent_kind,
+        .model = model,
+        // No tool call asked for this and none ever can: the filter is built
+        // before the first turn. The name is the one every act with no tool
+        // call behind it carries. See `chock_broker.actions.self_asked_tool`.
+        .tool = chock_broker.actions.self_asked_tool,
+        .action = chock_policy.hardening.jit_action,
+    }, &fault);
+    if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+
+    const rule = chock_policy.hardening.writeExecuteFor(decision);
+    // **Said out loud, and not only written to the log.** A person at the
+    // keyboard of a session that gave up a layer has to be able to see that
+    // they are, the same reading `org.zig` takes for an expired bundle.
+    if (rule == .relaxed) tty.print(
+        .warn,
+        "chock: the write and execute rule is off for this session, because this project's " ++
+            "policy answers allow for {s}. A page can be writable and executable at the same " ++
+            "time, which a run time with a just in time compiler needs. Every other layer is " ++
+            "unchanged.\n",
+        .{chock_policy.hardening.jit_action},
+    );
+    return .{ .decision = decision, .rule = rule };
+}
+
+/// How an approved apply lands in the project, and the policy answer that
+/// decided it. Both halves, because the log records the reason as well as the
+/// outcome, exactly as `Hardening` does.
+const ApplyMode = struct {
+    /// What the project asked for, after the row above it bounded it.
+    mode: chock_policy.apply.Mode = .ref,
+    /// The answer the `workspace.integrate` row gave.
+    decision: chock_policy.table.Decision = .allow,
+};
+
+/// Whether this session's approved applies may move a branch of the user's,
+/// and which shape they take when they do.
+///
+/// **Two files and one answer.** `chock.zon` names the mode, because the shape
+/// a project wants its work in is the project's own taste; the
+/// `workspace.integrate` row says whether the mode may be anything but `ref`,
+/// because "may an approval move my branch at all" is a question an
+/// organisation gets to answer for every project at once. See
+/// `chock_policy.apply`'s own top comment for why the two are not written in
+/// one place.
+///
+/// **Read as a ceiling, so a project that said nothing is unchanged.**
+/// `Table.ceilingChain` is the verb and not `evaluateChain`: a row nobody wrote
+/// answers `allow`, which is no ceiling, so an installation whose organisation
+/// has never heard of this row does not have every project's setting taken
+/// away. The same reading `refuseProviderAndModel` takes for a provider.
+///
+/// **Folded over the whole spawn chain**, so a subagent cannot move a branch
+/// its parent could not, and the org bundle folds in beside it. Neither is code
+/// here: both are properties of `ceilingChain` taking a minimum.
+///
+/// A mistake in the block ends the run. The file is the project's, and a
+/// project that meant `merge` and typed `mdoe` has to hear about it now rather
+/// than find out at the end of the session that nothing was integrated.
+fn applyModeFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+) StartError!ApplyMode {
+    var apply_diag: ?chock_policy.apply.Diagnostic = null;
+    defer if (apply_diag) |*d| d.deinit(arena);
+    const settings = chock_policy.apply.load(arena, io, project_root, &apply_diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (apply_diag) |*d| {
+            tty.print(.err, "chock run: the apply block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the apply block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    defer arena.free(chain);
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    var fault: ?chock_policy.table.ChainFault = null;
+    const decision = policy.ceilingChain(chain, .{
+        .agent_kind = agent_kind,
+        .model = model,
+        // The tool an agent calls to ask for an apply, and the name a request
+        // the harness makes carries too. See `actions.self_asked_tool`.
+        .tool = chock_broker.actions.self_asked_tool,
+        .action = chock_policy.apply.integrate_action,
+    }, &fault);
+    if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+
+    const bounded = chock_policy.apply.boundBy(settings.mode, decision);
+    // **Said out loud, and not only written to the log.** A person whose
+    // project asked for a merge and will not get one has to be able to see
+    // that before the session runs, not at the end of it.
+    if (bounded != settings.mode) tty.print(
+        .warn,
+        "chock: this project asks for the mode {s} in chock.zon, and the policy answers {t} for " ++
+            "{s}, so the session's work waits at its ref and no branch of yours moves.\n",
+        .{ settings.mode.wireName(), decision, chock_policy.apply.integrate_action },
+    );
+    return .{ .mode = bounded, .decision = decision };
+}
+
 fn provisioningFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4040,6 +4296,13 @@ fn reportInstructions(loaded: chock_core.instructions.Loaded) void {
     }
 }
 
+/// The first seven characters of an object id, the length git itself
+/// abbreviates to. The whole id is always in the log; this is for a line a
+/// person reads.
+fn shortId(id: []const u8) []const u8 {
+    return if (id.len > 7) id[0..7] else id;
+}
+
 /// The ref a session's work lands on, under `refs/chock/`, named after the
 /// session.
 ///
@@ -4051,6 +4314,64 @@ fn reportInstructions(loaded: chock_core.instructions.Loaded) void {
 /// project, reachable, and inert until the user merges or cherry-picks it.
 fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "refs/chock/{s}", .{session_id});
+}
+
+/// The question `apply.mode = .ask` puts, and the answers it takes.
+const landing_question =
+    \\
+    \\chock: this project asks you how the session's work should land.
+    \\
+    \\  ref     leave it at the ref. No branch of yours moves, and you merge it yourself.
+    \\  merge   merge it into the branch you have checked out.
+    \\  rebase  replay it on top of the branch you have checked out.
+    \\  squash  put all of it on the branch you have checked out, as one commit.
+    \\
+    \\Anything else keeps the work at the ref. You are asked to approve the apply after this.
+    \\Which? [ref/merge/rebase/squash] 
+;
+
+/// Which shape this apply takes, for a project whose mode is `ask`.
+///
+/// **The question comes before the approval, not instead of it.** A person
+/// answers this, and then reads an approval request that names the answer and
+/// says what it does to their branch. So the prompt they say "y" to is still the
+/// prompt that describes the act, which is the property the whole approval flow
+/// rests on.
+///
+/// **Nobody to ask means `ref`.** A subagent, a session the daemon started and
+/// a `chock run` whose standard input is a pipe all have nobody at the keyboard,
+/// and so does a session with the full screen display up, which owns the
+/// terminal and cannot have a second reader on it. Each of those keeps the work
+/// at the ref, which is the narrow answer and the one every session had before
+/// modes existed. `chock_core.ask` refuses the same three the same way and for
+/// the same reason.
+fn chosenLanding(
+    io: std.Io,
+    mode: chock_policy.apply.Mode,
+    screen: ?*ui.Ui,
+) chock_policy.apply.Landing {
+    if (mode.settled()) |landing| return landing;
+    // The display owns this terminal. A bare prompt written into it would be a
+    // second writer of cells the display believes it owns.
+    if (screen != null) return .ref;
+    if (!approval.hasTerminal(io)) return .ref;
+
+    const stdin = approval.Stdin{};
+    const console = stdin.console();
+    console.write(io, landing_question);
+
+    var buffer: [approval.max_answer_bytes]u8 = undefined;
+    const said = switch (console.read(io, &buffer, @intCast(chock_broker.Broker.default_timeout_ms))) {
+        .bytes => |count| buffer[0..count],
+        // Nobody typed, the input ended, or something asked the session to
+        // stop. All three are "nobody answered", and the answer to that is the
+        // one that moves nothing.
+        .idle, .ended, .canceled => {
+            console.write(io, "\n");
+            return .ref;
+        },
+    };
+    return chock_policy.apply.Mode.fromAnswer(said) orelse .ref;
 }
 
 /// Every sandbox layer of this session, in the order the header names them.
@@ -4674,6 +4995,281 @@ const SessionArbiter = struct {
     }
 };
 
+/// The broker, as `chock_core.Loop` carries an agent's work back mid session.
+///
+/// **This is the first act an agent may ask for by name**, and it is
+/// deliberately the narrowest one there is: `workspace.apply`, which
+/// `chock_core.tools.Tool.request_action` is the only caller of. The gap it
+/// closes is small and was real. An agent that believed it was finished had no
+/// way to say so and get an answer: the work was carried back at the end of the
+/// run, and until then a session could sit at a prompt for hours with a commit
+/// nobody had been offered.
+///
+/// ## It does exactly what `applyWork` does
+///
+/// Both go through `carryCommit`, so the person sees the same request with the
+/// same diff in it, the decision comes from the same policy table, and the work
+/// lands in the same place: a ref under `refs/chock/`, which is inert until
+/// somebody merges it. **An agent that asks gains nothing an agent that waits
+/// would not have had.** In particular it cannot move a branch of the user's,
+/// because there is no code path here that moves one.
+///
+/// ## Three answers before anybody is asked
+///
+/// * **No worktree at all.** An overlay workspace has no commit to carry and no
+///   ref to move, so the request cannot be honoured and is refused rather than
+///   approximated. See `chock_sandbox.Guarantee`'s own doc comment, which is
+///   where that rule is written down.
+/// * **Nothing changed.** The worktree is at the commit it started from and
+///   holds no changed file, so there is nothing to put to anybody.
+/// * **Changed files and no commit.** This is the measured case, and it is the
+///   one that cost a session: an agent reported that it had committed, had not,
+///   and nobody was told. **Asking is not committing**, so the answer is the
+///   count of what is uncommitted and a plain statement that none of it is
+///   carried, and no approval is requested for an empty change.
+///
+/// ## It runs inside the loop's own lock
+///
+/// `apply` is handed the loop's own `locked` handle and passes it down, exactly
+/// as `SessionArbiter.decide` does. There is no second open of the log and no
+/// second lock: see `lib/chock-broker/socket.zig`'s own top comment.
+const SessionHandback = struct {
+    environ: std.process.Environ,
+    env: *std.process.Environ.Map,
+    started: *Started,
+    options: Options,
+    /// The display, when bare `chock` brought one up. **This is what puts the
+    /// diff and the question in front of the person during a turn**, which is
+    /// the only time this seam is ever called. Null for `chock run`, which asks
+    /// at the prompt. See `Approvers.waiter`.
+    screen: ?*ui.Ui = null,
+
+    fn handback(self: *SessionHandback) chock_core.handback.Handback {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.handback.Handback.VTable{ .apply = applyFn };
+
+    fn applyFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        /// The session's own `Io`, which **cannot spawn a process**. Not used
+        /// here, and named so that a reader sees the swap rather than wondering
+        /// where it went. See the local one below.
+        io: std.Io,
+        locked: *chock_core.handback.Locked,
+        ask: chock_core.handback.Ask,
+    ) std.mem.Allocator.Error!chock_core.handback.Result {
+        _ = io;
+        const self: *SessionHandback = @ptrCast(@alignCast(ptr));
+
+        // **An `Io` of its own, for the reason a subagent and a `nix` build
+        // each get one.** Phase 2 runs on an `Io` built over
+        // `Allocator.failing`, so `Threaded.spawnPosix` fails there, and every
+        // step below runs `git`: reading whether a commit was made, describing
+        // what it would change, and moving the objects. Measured, not reasoned
+        // about: the first real run of this tool answered "whether you have
+        // made a commit could not be read (OutOfMemory)".
+        //
+        // **Backed by the page allocator and never by the session's own**, and
+        // this is the part that matters: a background task's thread may be
+        // inside `Sandbox.spawn` at this moment, and a lock another thread
+        // holds at a `fork` is a lock the child inherits as held forever. See
+        // `SubagentSpawner`, which states it in full.
+        //
+        // It is used for the log as well as for `git`, which costs nothing: an
+        // append through `locked` is a write to a file this process already
+        // holds open, and the handle is the caller's either way.
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
+        defer threaded.deinit();
+        const spawning_io = threaded.io();
+
+        const tree = switch (self.started.workspace.kind) {
+            .worktree => |wt| wt,
+            // A project with no git of its own has no commit to carry across
+            // and no ref to move. Refused by saying so, and never by putting a
+            // question nobody can act on to a person.
+            .overlay => return .{ .carried = false, .output = try gpa.dupe(
+                u8,
+                "nothing was carried back and nobody was asked: this session works on a copy of " ++
+                    "the project rather than on a git worktree of it, so there is no commit to " ++
+                    "carry and no ref to move. Say in your answer what you changed and where.",
+            ) },
+        };
+
+        const moved = tree.headMoved(gpa, spawning_io, self.env, null) catch |err| {
+            return .{ .carried = false, .output = try std.fmt.allocPrint(
+                gpa,
+                "nothing was carried back and nobody was asked: whether you have made a commit " ++
+                    "could not be read ({s}). Say in your answer that the work is not carried " ++
+                    "back.",
+                .{@errorName(err)},
+            ) };
+        };
+        // **Asking is not committing**, and this is the branch that says so.
+        // See `nothingCommitted`.
+        const new_id = moved orelse return .{
+            .carried = false,
+            .output = try self.nothingCommitted(gpa, spawning_io, tree),
+        };
+        defer gpa.free(new_id);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const ref = try applyRef(arena, self.started.session_id);
+        var carried = carryCommit(gpa, arena, spawning_io, .{
+            .environ = self.environ,
+            .env = self.env,
+            .started = self.started,
+            .options = self.options,
+            .locked = locked,
+            .screen = self.screen,
+            .tree = tree,
+            .new_id = new_id,
+            .ref = ref,
+            .reason = ask.reason,
+            // The call that asked, so a reader of the log joins the question to
+            // it. `applyWork` leaves this empty, which is what tells the same
+            // reader that the harness asked and no agent did.
+            .tool_call_id = ask.tool_call_id,
+        });
+        defer carried.deinit(gpa);
+
+        return switch (carried) {
+            // **Carried, because the user has the work.** It was this session
+            // that put it there, so an agent that asks twice is told the
+            // second answer is the same as the first rather than being told a
+            // refusal it would try to argue with.
+            .already_there => .{ .carried = true, .output = try std.fmt.allocPrint(
+                gpa,
+                "already carried back: the ref {s} in {s} is at this very commit, so nothing " ++
+                    "moved and nobody was asked again. The user reads it with `git log {s}`.",
+                .{ ref, tree.project_root, ref },
+            ) },
+            .not_described => .{ .carried = false, .output = try gpa.dupe(
+                u8,
+                "nothing was carried back and nobody was asked: what your commit would change " ++
+                    "could not be read, so there was nothing to put in front of anybody. Say in " ++
+                    "your answer that the work is not carried back.",
+            ) },
+            .failed => .{ .carried = false, .output = try gpa.dupe(
+                u8,
+                "the request was allowed and carrying the work out failed. Your commit may not " ++
+                    "be in the user's repository. Say so in your answer, and do not commit the " ++
+                    "same work again.",
+            ) },
+            // **The outcome's own name and nothing a reviewer wrote.** A
+            // reviewer's reasoning goes to the log and to the person, never
+            // back to the agent it is about: see
+            // `lib/chock-broker/review.zig`.
+            .refused => |outcome| .{ .carried = false, .output = try std.fmt.allocPrint(
+                gpa,
+                "nothing was carried back: the answer was \"{s}\". The user's repository is " ++
+                    "unchanged and your commit is still in this workspace. That is not a " ++
+                    "judgement of the work. Say in your answer what you did and that it was not " ++
+                    "carried back.{s}",
+                .{ @tagName(outcome), reviewNote(outcome) },
+            ) },
+            // **What the agent is told about the branch is the outcome and
+            // never the plan.** A model told "your work is on their branch"
+            // when it is not would say so to the user, and a model told the
+            // opposite would ask to carry the same work twice.
+            .landed => |done| switch (done.integration) {
+                .moved => |m| .{ .carried = true, .output = try std.fmt.allocPrint(
+                    gpa,
+                    "carried back: {d} objects and the ref {s} are now in {s}, and this project " ++
+                        "asks for {s}, so **their branch {s} moved to {s}** and their working " ++
+                        "tree is at it. Say in your answer that the work is on their branch.",
+                    .{ done.objects, ref, tree.project_root, m.landing.wireName(), m.branch, m.to },
+                ) },
+                .park => |p| parked: {
+                    // **The clause is built first**, because a project that
+                    // asks for nothing gets no clause at all: telling a model
+                    // on every apply of every project that nothing moved
+                    // "because this project asks for the work to wait at the
+                    // ref" is noise in the one place it is deciding what to say
+                    // to a person.
+                    const note = if (p.why == .not_asked_for)
+                        try gpa.dupe(u8, "")
+                    else
+                        try std.fmt.allocPrint(
+                            gpa,
+                            " The {s} this project asks for did not happen, because {s}.",
+                            .{ p.wanted.wireName(), p.why.sentence() },
+                        );
+                    defer gpa.free(note);
+                    break :parked .{ .carried = true, .output = try std.fmt.allocPrint(
+                        gpa,
+                        "carried back: {d} objects and the ref {s} are now in {s}. The user " ++
+                            "reads it with `git log {s}` and takes it with `git merge {s}`. " ++
+                            "**No branch of theirs moved.**{s} Say in your answer that the work " ++
+                            "is on that ref and waiting for them.",
+                        .{ done.objects, ref, tree.project_root, ref, ref, note },
+                    ) };
+                },
+            },
+        };
+    }
+
+    /// What an agent is told when it asked and had made no commit.
+    ///
+    /// **Asking is not committing**, and this is where that is said. The
+    /// numbers are the point: an agent that has written twelve files and
+    /// committed none has to be told twelve, or it reads "nothing to carry" as
+    /// "there was nothing there" and stops. That is the shape of the session
+    /// this whole tool exists because of.
+    fn nothingCommitted(
+        self: *SessionHandback,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        tree: chock_workspace.worktree.Worktree,
+    ) std.mem.Allocator.Error![]u8 {
+        const counts = chock_workspace.worktree.countUncommitted(
+            gpa,
+            io,
+            self.env,
+            tree.path,
+            null,
+        ) catch |err| return std.fmt.allocPrint(
+            gpa,
+            "nothing was carried back and nobody was asked: you have made no commit, and what " ++
+                "is left in the workspace could not be counted ({s}). Only a commit is carried " ++
+                "back. Commit your work and ask again.",
+            .{@errorName(err)},
+        );
+
+        if (!counts.any()) return gpa.dupe(
+            u8,
+            "nothing was carried back and nobody was asked: you have made no commit and no file " ++
+                "in the workspace is changed, so there is nothing to carry. If you meant to " ++
+                "change something, you have not yet.",
+        );
+
+        return std.fmt.allocPrint(
+            gpa,
+            "nothing was carried back and nobody was asked: you have changed {d} files ({d} " ++
+                "modified, {d} new) and made no commit. Only a commit is carried back, and the " ++
+                "workspace you are in is thrown away when the session ends. Commit the work and " ++
+                "call this again.",
+            .{ counts.total(), counts.modified, counts.untracked },
+        );
+    }
+};
+
+/// The one sentence about a review that goes back to the agent that asked, or
+/// nothing at all.
+///
+/// **It says a reviewer took part and where the reasoning is, and it carries
+/// none of it.** `chock_broker.review.requesterText` is the one function that
+/// turns a review outcome into words for a requester, and a comptime guard in
+/// that file keeps it taking an outcome and nothing else.
+fn reviewNote(outcome: chock_broker.Broker.Outcome) []const u8 {
+    const review = outcome.reviewOutcome() orelse return "";
+    return chock_broker.review.requesterText(review);
+}
+
 /// Carry the session's own commit back into the user's repository, through
 /// the broker, after an approval.
 ///
@@ -4728,140 +5324,51 @@ fn applyWork(
     const arena = arena_state.allocator();
 
     const ref = try applyRef(arena, started.session_id);
-    const ctx = chock_broker.actions.Context{ .env = env };
-    // What git said, and the one notice a description that succeeded can
-    // still leave: a file in the scratch object store that is not an object
-    // and therefore does not move. The broker used to print both itself.
-    var describe_diag: ?chock_broker.Diagnostic = null;
-    defer if (describe_diag) |*d| d.deinit(arena);
-    const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
-        .repository = tree.project_root,
-        .scratch_object_store = tree.object_store_source,
-        .ref = ref,
-        .new_id = new_id,
-    }, &describe_diag) catch |err| {
-        if (describe_diag) |*fault| {
-            tty.print(
-                .err,
-                "chock run: what the session's work would change could not be read: {f}\n",
-                .{fault},
-            );
-        } else {
-            tty.print(
-                .err,
-                "chock run: what the session's work would change could not be read: {s}\n",
-                .{@errorName(err)},
-            );
-        }
-        return .failed;
-    };
-    // Said out loud on a description that answered: a file the apply leaves
-    // behind is work the user does not get, and silence about it looks the
-    // same as an apply that carried everything.
-    if (describe_diag) |*notice| tty.print(.warn, "chock run: {f}\n", .{notice});
-
-    // **The session's own log, folded once, read by two things below.**
-    // `Loop.run` has ended, so the `state.Session` it kept is gone and the log
-    // is what is left. That is not a fallback: it is what makes both readers
-    // right about a session that was resumed, or handed to the daemon, or
-    // compacted a dozen times.
-    var session = chock_proto.state.Session.init(gpa);
-    defer session.deinit();
-    foldSession(gpa, io, started.storage, &session);
-
-    // The ratchet. Every promise this decision is bound by: the ones this
-    // session made about itself, and the ones every session above it made. An
-    // agent that said "I will not apply this work" while it was planning cannot
-    // apply it now, whatever the policy table says, and it cannot have taken
-    // the promise back: see `chock_policy.ratchet`, and
-    // `chock_core.Loop.runRestrictSelf`, which is what refused every attempt
-    // to.
-    //
-    // **The promise is read here and applied in the broker.** The session that
-    // made it is over and this process is what asks on its behalf, so the
-    // promise reaches the decision the same way the spawn chain does: as a
-    // fact about the request, out of a record nothing can rewrite.
-    const promised = try promisesFor(
-        gpa,
-        arena,
-        io,
-        started.paths.dir,
-        options.parent_session,
-        &session,
-    );
-
-    // A project whose `chock.zon` answers `agent_review` for `workspace.apply`
-    // gets a reviewer here, and one that says anything else pays for nothing:
-    // the broker asks for a review only where the folded decision asked for
-    // one.
-    //
-    // **This is the one place in `chock run` where a review can happen at
-    // all**, and it is the right one: `applyWork` runs after `Loop.run` has
-    // ended, so the caller is single threaded again and a child process is
-    // something this process can start. This is acceptance of changes, and this
-    // is where a change is accepted.
-    var review_child = reviewChild(gpa, environ, env, started, options);
-    var review_spawner = reviewerFor(review_child.spawner(), started, &session);
 
     // Before the waiter, because the waiter holds this handle and answers
     // through it. One lock, taken once: see `src/approval.zig`.
     var locked = try started.storage.lock(io);
     defer locked.unlock(io) catch {};
 
-    // The same handle, so a reviewer this approval starts is appended to the
-    // log as a child and counted against the width bound. **This is why the
-    // lock had to be taken before the reviewer could be recorded**: see
-    // `ReviewSpawner.locked`.
-    review_spawner.locked = &locked;
-
-    var approvers: Approvers = undefined;
-    // **Null, and that is not an oversight.** This runs in phase 3, and
-    // `runSession`'s own `defer` took the display down at the end of phase 2:
-    // the alternate screen is gone, raw mode is off, and the transcript is back
-    // on the real screen. So there is no region to draw a question in and the
-    // bare prompt is the right one. See `takeUp`, which relies on the same
-    // ordering.
-    approvers.init(gpa, io, started, &locked, null);
-
-    const broker = chock_broker.Broker{
-        .policy = started.policy,
-        .waiter = approvers.waiter(),
-        .reviewer = review_spawner.reviewer(),
-        // The detail of this one is the commit itself, which is workspace bytes
-        // and the likeliest place a credential sits. See `brokerRedaction`.
-        .redaction = started.redact_values,
-    };
-
-    // Why the broker refused, or why the act itself failed. The broker used
-    // to print that and hand this command an error name.
-    var apply_diag: ?chock_broker.Diagnostic = null;
-    defer if (apply_diag) |*d| d.deinit(gpa);
-    var attempt = try chock_broker.actions.run(&broker, gpa, io, started.storage, &locked, ctx, .{
-        .action = .{ .workspace_apply = apply },
+    var carried = carryCommit(gpa, arena, io, .{
+        .environ = environ,
+        .env = env,
+        .started = started,
+        .options = options,
+        .locked = &locked,
+        // **Null, and that is not an oversight.** This runs in phase 3, and
+        // `runSession`'s own `defer` took the display down at the end of phase
+        // 2: the alternate screen is gone, raw mode is off, and the transcript
+        // is back on the real screen. So there is no region to draw a question
+        // in and the bare prompt is the right one. See `takeUp`, which relies
+        // on the same ordering.
+        .screen = null,
+        .tree = tree,
+        .new_id = new_id,
+        .ref = ref,
         .reason = "the session made a commit, and the workspace it is in is about to be removed",
-        .agent_kind = options.agent_kind,
-        // The decision is the intersection over the whole chain, so a subagent
-        // can hold no permission its parent lacks. The chain comes from the
-        // command line the parent wrote, and this session cannot add to it.
-        .spawn_chain = started.spawn_chain,
-        .model_alias = started.model_alias,
-        // The tool the agent would have called for this. `chock run` asks on
-        // the session's behalf at the end, and the policy key still has to
-        // name a tool: see `chock_broker.actions.self_asked_tool`, which a
-        // reader of the log rebuilds the same key from.
-        .tool = chock_broker.actions.self_asked_tool,
+        // No tool call asked for this one: `chock run` asks on the session's
+        // behalf after the loop has ended. See `carryCommit`.
         .tool_call_id = "",
-        // What this session promised about itself. Empty for a session that
-        // promised nothing, which narrows nothing at all.
-        .self_policy = promised,
-        // See this function's own doc comment. A terminal waits for the person
-        // at it, and so does a session somebody has attached a client to; a
-        // session with neither refuses at once rather than holding the lock for
-        // five minutes over a question that cannot be answered.
-        .timeout_ms = approvers.timeoutMs(),
-    }, &apply_diag);
+    });
+    defer carried.deinit(gpa);
 
-    switch (attempt) {
+    switch (carried) {
+        .not_described, .failed => return .failed,
+        // The work is in the project, so this is `landed` and not a third
+        // answer: `cleanupFor` and `exitWithApply` both ask the same question,
+        // which is whether the user has the work, and they do.
+        .already_there => {
+            tty.print(
+                .plain,
+                "chock run: the ref {s} is already at the session's commit {s} in {s}, " ++
+                    "so nothing was carried and nobody was asked again.\n" ++
+                    "chock run: read it with `git log {s}`, and take it with " ++
+                    "`git merge {s}`.\n",
+                .{ ref, new_id, tree.project_root, ref, ref },
+            );
+            return .landed;
+        },
         .refused => |outcome| {
             tty.print(
                 .warn,
@@ -4883,24 +5390,378 @@ fn applyWork(
             }
             return .refused;
         },
-        .done => |*done| {
-            defer done.result.deinit(gpa);
+        .landed => |done| {
             tty.print(
                 .plain,
-                "chock run: {d} objects and the ref {s} were applied to {s}.\n" ++
-                    "chock run: read it with `git log {s}`, and take it with " ++
-                    "`git merge {s}`.\n",
-                .{
-                    done.result.workspace_apply.objects_moved,
-                    ref,
-                    tree.project_root,
-                    ref,
-                    ref,
-                },
+                "chock run: {d} objects and the ref {s} were applied to {s}.\n",
+                .{ done.objects, ref, tree.project_root },
             );
+            switch (done.integration) {
+                // **The line that says a branch of theirs moved.** A person
+                // whose branch is somewhere new has to read that, and has to be
+                // told where it was, so they can put it back with one command.
+                .moved => |m| tty.print(
+                    .plain,
+                    "chock run: your branch {s} moved from {s} to {s} ({s}), and your working " ++
+                        "tree is there now.\n" ++
+                        "chock run: put it back with `git reset --hard {s}`.\n",
+                    .{ m.branch, shortId(m.from), shortId(m.to), m.landing.wireName(), m.from },
+                ),
+                .park => |p| {
+                    if (p.why != .not_asked_for) tty.print(
+                        .warn,
+                        "chock run: the {s} this project asks for did not happen, because {s}. " ++
+                            "No branch of yours moved.\n",
+                        .{ p.wanted.wireName(), p.why.sentence() },
+                    );
+                    tty.print(
+                        .plain,
+                        "chock run: read it with `git log {s}`, and take it with " ++
+                            "`git merge {s}`.\n",
+                        .{ ref, ref },
+                    );
+                },
+            }
             return .landed;
         },
     }
+}
+
+/// What one brokered `workspace.apply` came to.
+///
+/// **Nothing here is a sentence.** The two callers say different things about
+/// the same ending, because one is talking to a person at the end of a run and
+/// the other is answering a tool call the model made. See `carryCommit`.
+const CarryOut = union(enum) {
+    /// What the act would change could not be read, so nobody was asked and
+    /// nothing happened.
+    not_described,
+    /// The ref is already at this very commit, so the act would move nothing.
+    /// Nobody was asked.
+    ///
+    /// **This is reachable only because an agent can ask.** Before
+    /// `request_action` existed, one run made one request and the ref could
+    /// never already be there. Now an agent carries its work back mid session
+    /// and the run then reaches `applyWork` with the same commit, and putting
+    /// that question to a person a second time spends a decision on a change
+    /// that is already made.
+    already_there,
+    /// The decision did not permit it. The project is unchanged.
+    refused: chock_broker.Broker.Outcome,
+    /// The objects and the ref moved. How many objects, and what happened to
+    /// the branch the user has checked out.
+    ///
+    /// **This one owns memory**, which is why `CarryOut` has a `deinit` and the
+    /// other members do not need one: the branch names and the two object ids
+    /// come out of the broker's own `Result` and are handed on rather than
+    /// copied, so nothing here can fail for want of memory at the moment the
+    /// work has already landed.
+    landed: struct {
+        objects: usize,
+        integration: chock_broker.integrate.Outcome,
+    },
+
+    /// It was permitted and the act itself failed. The project may hold the
+    /// objects and does not hold the ref: `perform` moves the objects first.
+    failed,
+
+    /// Release what a `CarryOut` owns. Safe on every member.
+    fn deinit(self: *CarryOut, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .landed => |*done| done.integration.deinit(gpa),
+            .not_described, .already_there, .refused, .failed => {},
+        }
+        self.* = undefined;
+    }
+};
+
+/// Ask for one `workspace.apply` and carry it out when the answer permits it.
+///
+/// **The one implementation, with two callers who ask for different reasons.**
+/// `applyWork` asks at the end of the run, on the session's behalf, because the
+/// workspace is about to be removed and this is the work's last chance.
+/// `SessionHandback` asks in the middle of a session, because the agent called
+/// `request_action` and said it was finished. Both end in exactly the same
+/// place: the objects and a ref under `refs/chock/`, which is inert until a
+/// person merges it. **An agent that asks gains nothing an agent that waits
+/// would not have had**, and in particular it cannot move a branch.
+///
+/// **The decision is never this function's and never the agent's.**
+/// `chock_broker.actions.run` puts the request to the policy table of
+/// `chock.zon`, which is kept beyond the agent's reach, and where that table
+/// answers `ask` it puts the request to a person through `Approvers`. What a
+/// person reads is the description built above: the commit and the diff it
+/// makes, so the question is one they can really answer.
+///
+/// **It takes the lock and never opens the log**, so it works in both places.
+/// `Loop.run` holds the exclusive lock for the whole of a session, so the mid
+/// session caller hands its own handle down; `applyWork` runs after the loop
+/// has ended and takes the lock itself. See `lib/chock-broker/socket.zig`'s own
+/// top comment for why the broker does not have to own the log for any of this.
+///
+/// Every string this reads lives in `arena`, which the caller owns, and every
+/// diagnostic it meets is printed rather than returned: a display turns each
+/// one into a row of its transcript, so this is right in the middle of a
+/// session as well as at the end of one. See `src/tty.zig`.
+fn carryCommit(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    params: struct {
+        environ: std.process.Environ,
+        env: *std.process.Environ.Map,
+        started: *Started,
+        options: Options,
+        /// The session log, already locked by the caller.
+        locked: *ApprovalLock,
+        /// The display, when one is up. **This is what makes a mid session
+        /// question answerable in the interface**: see `Approvers.waiter`.
+        screen: ?*ui.Ui,
+        tree: chock_workspace.worktree.Worktree,
+        /// The commit that moves.
+        new_id: []const u8,
+        /// The ref it lands on, from `applyRef`.
+        ref: []const u8,
+        /// Why the act is wanted, in the words of whoever wants it. A person
+        /// reads this in the request.
+        reason: []const u8,
+        /// The `tool.call` that asked, or empty when the harness asked on the
+        /// session's behalf. The policy key still names a tool either way: see
+        /// `chock_broker.actions.self_asked_tool`, which a reader of the log
+        /// rebuilds the same key from.
+        tool_call_id: []const u8,
+    },
+) CarryOut {
+    const started = params.started;
+    const ctx = chock_broker.actions.Context{ .env = params.env };
+    // What git said, and the one notice a description that succeeded can
+    // still leave: a file in the scratch object store that is not an object
+    // and therefore does not move. The broker used to print both itself.
+    var describe_diag: ?chock_broker.Diagnostic = null;
+    defer if (describe_diag) |*d| d.deinit(arena);
+    // **Answered before the act is described**, so the description a person
+    // reads names the shape they picked. See `chosenLanding`.
+    const landing = chosenLanding(io, started.apply_mode.mode, params.screen);
+    const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
+        .repository = params.tree.project_root,
+        .scratch_object_store = params.tree.object_store_source,
+        .ref = params.ref,
+        .new_id = params.new_id,
+        .landing = landing,
+    }, &describe_diag) catch |err| {
+        if (describe_diag) |*fault| {
+            tty.print(
+                .err,
+                "chock run: what the session's work would change could not be read: {f}\n",
+                .{fault},
+            );
+        } else {
+            tty.print(
+                .err,
+                "chock run: what the session's work would change could not be read: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        return .not_described;
+    };
+    // Said out loud on a description that answered: a file the apply leaves
+    // behind is work the user does not get, and silence about it looks the
+    // same as an apply that carried everything.
+    if (describe_diag) |*notice| tty.print(.warn, "chock run: {f}\n", .{notice});
+
+    // **Before anybody is asked.** `old_id` is where the ref is now, read from
+    // the user's own repository, and a compare and swap from an id to itself
+    // moves nothing. See `CarryOut.already_there` for the one route that
+    // reaches this.
+    //
+    // **And the branch has to have nothing to gain either.** A mode that
+    // integrates can leave the ref at the session's commit and the branch
+    // untouched, when the working tree was dirty at the moment of the first
+    // request. Asking again is then worth doing, because the tree may be clean
+    // now; asking again when the plan moves nothing either would spend a
+    // person's attention on a change that is already made.
+    if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
+        recordIntegration(gpa, io, params.locked, started, params.ref, .{
+            .park = .{ .wanted = landing, .why = .already_there },
+        });
+        return .already_there;
+    }
+
+    // **The session's own log, folded once, read by two things below.** At the
+    // end of a run `Loop.run` has ended, so the `state.Session` it kept is gone
+    // and the log is what is left; in the middle of one this seam is handed no
+    // fold of its own. That is not a fallback either way: the fold is the truth
+    // of a session, and it is what makes both readers right about a session
+    // that was resumed, or handed to the daemon, or compacted a dozen times.
+    var session = chock_proto.state.Session.init(gpa);
+    defer session.deinit();
+    foldSession(gpa, io, started.storage, &session);
+
+    // The ratchet. Every promise this decision is bound by: the ones this
+    // session made about itself, and the ones every session above it made. An
+    // agent that said "I will not apply this work" while it was planning cannot
+    // apply it now, whatever the policy table says, and it cannot have taken
+    // the promise back: see `chock_policy.ratchet`, and
+    // `chock_core.Loop.runRestrictSelf`, which is what refused every attempt
+    // to.
+    //
+    // **The promise is read here and applied in the broker.** The promise
+    // reaches the decision the same way the spawn chain does: as a fact about
+    // the request, out of a record nothing can rewrite.
+    const promised = promisesFor(
+        gpa,
+        arena,
+        io,
+        started.paths.dir,
+        params.options.parent_session,
+        &session,
+    ) catch return .failed;
+
+    // A project whose `chock.zon` answers `agent_review` for `workspace.apply`
+    // gets a reviewer here, and one that says anything else pays for nothing:
+    // the broker asks for a review only where the folded decision asked for
+    // one. This is acceptance of changes, and this is where a change is
+    // accepted.
+    var review_child = reviewChild(gpa, params.environ, params.env, started, params.options);
+    var review_spawner = reviewerFor(review_child.spawner(), started, &session);
+
+    // The caller's own handle, so a reviewer this approval starts is appended
+    // to the log as a child and counted against the width bound. See
+    // `ReviewSpawner.locked`.
+    review_spawner.locked = params.locked;
+
+    var approvers: Approvers = undefined;
+    approvers.init(gpa, io, started, params.locked, params.screen);
+
+    const broker = chock_broker.Broker{
+        .policy = started.policy,
+        .waiter = approvers.waiter(),
+        .reviewer = review_spawner.reviewer(),
+        // The detail of this one is the commit itself, which is workspace bytes
+        // and the likeliest place a credential sits. See `brokerRedaction`.
+        .redaction = started.redact_values,
+    };
+
+    // Why the broker refused, or why the act itself failed. The broker used
+    // to print that and hand this command an error name.
+    var apply_diag: ?chock_broker.Diagnostic = null;
+    defer if (apply_diag) |*d| d.deinit(gpa);
+    var attempt = chock_broker.actions.run(&broker, gpa, io, started.storage, params.locked, ctx, .{
+        .action = .{ .workspace_apply = apply },
+        .reason = params.reason,
+        .agent_kind = params.options.agent_kind,
+        // The decision is the intersection over the whole chain, so a subagent
+        // can hold no permission its parent lacks. The chain comes from the
+        // command line the parent wrote, and this session cannot add to it.
+        .spawn_chain = started.spawn_chain,
+        .model_alias = started.model_alias,
+        // The tool an agent calls for this, and the name a request the harness
+        // made carries too. See `chock_broker.actions.self_asked_tool`.
+        .tool = chock_broker.actions.self_asked_tool,
+        .tool_call_id = params.tool_call_id,
+        // What this session promised about itself. Empty for a session that
+        // promised nothing, which narrows nothing at all.
+        .self_policy = promised,
+        // A terminal waits for the person at it, a display does too, and so
+        // does a session somebody has attached a client to; a session with none
+        // of the three refuses at once rather than holding the lock for five
+        // minutes over a question that cannot be answered.
+        .timeout_ms = approvers.timeoutMs(),
+    }, &apply_diag) catch |err| {
+        if (apply_diag) |*fault| {
+            tty.print(.err, "chock run: the session's work could not be applied: {f}\n", .{fault});
+        } else {
+            tty.print(
+                .err,
+                "chock run: the session's work could not be applied: {s}\n",
+                .{@errorName(err)},
+            );
+        }
+        return .failed;
+    };
+
+    if (approvers.failed()) |err| {
+        tty.print(
+            .warn,
+            "chock run: the approval of the session's work could not be shown or recorded: {t}\n",
+            .{err},
+        );
+    }
+
+    switch (attempt) {
+        .refused => |outcome| {
+            // **Refused is recorded too.** "No branch moved" is a fact about
+            // this session whichever way the apply went, and a record written
+            // only when something happened is missing exactly where a reader
+            // needs it.
+            recordIntegration(gpa, io, params.locked, started, params.ref, .{
+                .park = .{ .wanted = landing, .why = .not_asked_for },
+            });
+            return .{ .refused = outcome };
+        },
+        .done => |*done| {
+            const carried = done.result.workspace_apply;
+            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);
+            // **The two strings this does not need are freed, and the one it
+            // does is handed on.** `Result.deinit` would free all three, and a
+            // copy of the third could fail for want of memory at the one moment
+            // the work has already landed and the answer must be the truth.
+            gpa.free(carried.ref);
+            gpa.free(carried.new_id);
+            return .{ .landed = .{
+                .objects = carried.objects_moved,
+                .integration = carried.integration,
+            } };
+        },
+    }
+}
+
+/// Write down what this apply did to the branch.
+///
+/// **Once per apply, whichever way it went.** A session has to be
+/// distinguishable afterwards by what happened to somebody's branch, and a
+/// control that moved one quietly would be the wrong shape whatever it was
+/// written in. See `chock_proto.event.WorkspaceIntegrate`, which carries the
+/// reason as well as the outcome, and `recordSandbox`, which is the same
+/// arrangement for the sandbox a session ran under.
+///
+/// **It writes through the caller's own locked handle**, so it works in the
+/// middle of a session and at the end of one, which is the same rule
+/// `carryCommit` itself keeps.
+///
+/// A record that cannot be written is said out loud and does not end the
+/// session: the work is already where it is, and refusing to report that would
+/// lose the run as well as the record.
+fn recordIntegration(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    locked: *ApprovalLock,
+    started: *Started,
+    ref: []const u8,
+    outcome: chock_broker.integrate.Outcome,
+) void {
+    const moved = switch (outcome) {
+        .moved => |m| m,
+        .park => null,
+    };
+    _ = locked.append(gpa, io, .{ .workspace_integrate = .{
+        .ref = ref,
+        .mode = started.apply_mode.mode.wireName(),
+        .decision = @tagName(started.apply_mode.decision),
+        .branch = if (moved) |m| m.branch else "",
+        .branch_from = if (moved) |m| m.from else "",
+        .branch_to = if (moved) |m| m.to else "",
+        .parked = switch (outcome) {
+            .moved => "",
+            .park => |p| p.why.wireName(),
+        },
+    } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
+        tty.print(
+            .warn,
+            "chock run: what this apply did to your branch could not be written to the log: {s}\n",
+            .{@errorName(err)},
+        );
+    };
 }
 
 /// What to answer when the worktree is still at the commit the session
@@ -8012,6 +8873,18 @@ fn runSession(
         .screen = screen,
     };
 
+    // What carries the agent's own work back when it says it is finished.
+    // **The same act `applyWork` performs at the end of the run**, through the
+    // same `carryCommit`, so an agent that asks reaches exactly what an agent
+    // that waits would have reached and nothing more. See `SessionHandback`.
+    var session_handback = SessionHandback{
+        .environ = environ,
+        .env = env,
+        .started = started,
+        .options = options,
+        .screen = screen,
+    };
+
     // What answers a `fetch_url` call. **Its own arena**, because the spawn
     // chain and the promises of the sessions above this one are read once here
     // and read again on every call for the rest of the session.
@@ -8189,6 +9062,12 @@ fn runSession(
         // who could answer mid session, so every such proposal was refused
         // unasked: see `SessionArbiter`.
         .arbiter = session_arbiter.arbiter(),
+        // What answers a `request_action` call. **This line is the difference
+        // between a tool the model is offered and a tool that does
+        // something**: `chock_core.Loop.Deps.handback` defaults to null, and a
+        // session with none tells the agent nothing was carried and nobody was
+        // asked. See `SessionHandback`.
+        .handback = session_handback.handback(),
         // What answers a `fetch_url` call. **This line is the difference
         // between a tool the model is offered and a tool that does something**:
         // `chock_core.Loop.Deps.fetcher` defaults to null, and a session with
@@ -10986,6 +11865,53 @@ fn callAt(pattern: []const u8) error{CallIsGone}!usize {
     return std.mem.indexOf(u8, own_source, pattern) orelse error.CallIsGone;
 }
 
+test "an agent that has made no commit is answered before anything is put to anybody" {
+    // **Asking is not committing**, and this is the order that makes it true:
+    // `nothingCommitted` returns, and `carryCommit` is the only thing in this
+    // file that reaches the broker, so a session with no commit writes no
+    // `approval.request` and spends nobody's attention. It was measured by
+    // hand, on a real session that wrote a file and never committed it, and
+    // the answer named the count.
+    //
+    // A structural check, for the reason `own_source` gives: the end to end
+    // route needs a workspace, a policy table and a model, which this suite
+    // has none of. Mutation check: move the `carryCommit` call above the
+    // `nothingCommitted` one and this fails; delete either and it fails with
+    // `CallIsGone`.
+    const counted = try callAt("\n            .output = try self.nothingCommitted(gpa, spawning_io, tree),");
+    const asked = try callAt("\n        var carried = carryCommit(gpa, arena, spawning_io, .{");
+
+    try testing.expect(counted < asked);
+
+    // And the same rule one step earlier: a workspace that is not a git
+    // worktree is refused before either, because there is no commit to carry
+    // and no ref to move.
+    const no_worktree = try callAt("\n            .overlay => return .{ .carried = false, .output = try gpa.dupe(");
+    try testing.expect(no_worktree < counted);
+}
+
+test "every ending of an apply writes down what it did to the branch" {
+    // **A session has to be distinguishable afterwards by what happened to
+    // somebody's branch.** A record written only when a branch moved is missing
+    // exactly where a reader needs it: they cannot tell a project that never
+    // asked from one whose merge was refused, or from a Chock too old to have
+    // modes at all.
+    //
+    // A structural check, for the reason `own_source` gives: the end to end
+    // route needs a workspace, a policy table and a model, which this suite has
+    // none of. Mutation check: delete any one of the three calls and this fails
+    // with `CallIsGone`.
+    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started, params.ref, .{\n            .park = .{ .wanted = landing, .why = .already_there },");
+    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, .{\n                .park = .{ .wanted = landing, .why = .not_asked_for },");
+    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);");
+
+    // And the record is written before the answer goes back, so a crash between
+    // the two leaves the fact on disk rather than only in a return value.
+    const recorded = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);");
+    const answered = try callAt("\n            return .{ .landed = .{\n                .objects = carried.objects_moved,");
+    try testing.expect(recorded < answered);
+}
+
 test "the display is told what the session is, then filled from the log, then asked for a message" {
     // **Getting the order wrong shows an empty header behind a full
     // transcript**, and leaving the middle one out shows a session that was
@@ -11704,6 +12630,229 @@ test "the policy key is the broker's own nix.build, and a project that said noth
         chock_policy.table.Decision.deny,
         try provisionDecision(arena, child_only, &chain, "reviewer", "a-model"),
     );
+}
+
+test "the write and execute rule is on unless this project's policy says allow" {
+    // **The default is the whole point of the row.** Every other `chock.zon`
+    // knob narrows and this one widens, so a project that has never heard of it
+    // must be exactly as hardened as it was before the row existed.
+    //
+    // Mutation check: read `ask` as permission and the first case below turns
+    // the rule off for every project on earth.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The name is the one `chock_policy.hardening` owns. A key spelled again
+    // here would silently stop matching the rule a user wrote.
+    try std.testing.expectEqualStrings("sandbox.jit", chock_policy.hardening.jit_action);
+
+    // A warning reaches standard error when the rule goes off, and a test may
+    // not let a line reach the terminal: see `tty.Capture`.
+    var said: tty.Capture = undefined;
+    said.start(std.testing.io, gpa);
+    defer said.stop(std.testing.io);
+
+    const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, empty);
+    const kept = try hardeningDecision(arena, empty, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.table.Decision.ask, kept.decision);
+    try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, kept.rule);
+    try std.testing.expectEqualStrings("", said.err());
+
+    // A project that said yes, in the file that is kept beyond the agent's
+    // reach.
+    const allowed = try chock_policy.table.Table.parse(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "sandbox.jit", .decision = .allow },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(arena, allowed);
+    const given_up = try hardeningDecision(arena, allowed, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.hardening.WriteExecute.relaxed, given_up.rule);
+    // **And it is said out loud.** A person at the keyboard of a session that
+    // gave up a layer has to be able to see that they are.
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "sandbox.jit") != null);
+    try std.testing.expectEqualStrings("", said.out());
+
+    // An organisation forbids it with one rule in the bundle above the
+    // project, and the project cannot raise it back. That is not a check: the
+    // fold is a minimum over both layers.
+    said.clear();
+    const org_rules = [_]chock_policy.table.Rule{
+        .{ .action = chock_policy.hardening.jit_action, .decision = .deny },
+    };
+    const under_org = try chock_policy.table.Table.parseUnder(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "sandbox.jit", .decision = .allow },
+        \\} } }
+    , &org_rules, null);
+    defer chock_policy.table.Table.destroy(arena, under_org);
+    const refused = try hardeningDecision(arena, under_org, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, refused.decision);
+    try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, refused.rule);
+    try std.testing.expectEqualStrings("", said.err());
+
+    // And a subagent holds no more than its parent, whatever the file says
+    // about the child alone.
+    const child_only = try chock_policy.table.Table.parse(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .agent_kind = "reviewer", .action = "sandbox.jit", .decision = .allow },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(arena, child_only);
+    const chain = [_]chock_proto.event.SpawnLink{.{ .agent_kind = "main", .reason = "review it" }};
+    const child = try hardeningDecision(arena, child_only, &chain, "reviewer", "a-model");
+    try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, child.rule);
+}
+
+test "the mode comes from chock.zon and the table above it, and a project that says nothing parks" {
+    // **Two files and one answer.** The project names the shape, the
+    // `workspace.integrate` row says whether the shape may be anything but
+    // `ref`, and a project that has never heard of either is exactly as it was
+    // before an apply could move a branch at all.
+    //
+    // Mutation check: read `boundBy` as permitting `ask` and the third case
+    // below lets an installation whose organisation said no move a branch.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The row name is the one `chock_policy.apply` owns. A key spelled again
+    // here would silently stop matching the rule an organisation wrote.
+    try std.testing.expectEqualStrings("workspace.integrate", chock_policy.apply.integrate_action);
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buffer[0..try tmp.dir.realPath(io, &buffer)];
+
+    const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, empty);
+
+    // No `chock.zon` at all: the work waits at the ref, and nothing is said,
+    // because nothing was taken away.
+    const silent = try applyModeFor(arena, io, root, empty, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.apply.Mode.ref, silent.mode);
+    try std.testing.expectEqualStrings("", said.err());
+
+    // A project that asked for a merge, in the file that is kept beyond the
+    // agent's reach, and an installation whose organisation has never heard of
+    // the row.
+    const zon_path = try std.fs.path.join(arena, &.{ root, "chock.zon" });
+    var file = try std.Io.Dir.createFileAbsolute(io, zon_path, .{});
+    try file.writeStreamingAll(io, ".{ .apply = .{ .mode = .merge } }\n");
+    file.close(io);
+
+    const asked = try applyModeFor(arena, io, root, empty, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.apply.Mode.merge, asked.mode);
+    try std.testing.expectEqual(chock_policy.table.Decision.allow, asked.decision);
+    try std.testing.expectEqualStrings("", said.err());
+
+    // The same project under an organisation that closed the road. One rule,
+    // and the project cannot raise it, because the fold is a minimum.
+    said.clear();
+    const org_rules = [_]chock_policy.table.Rule{
+        .{ .action = chock_policy.apply.integrate_action, .decision = .deny },
+    };
+    const under_org = try chock_policy.table.Table.parseUnder(arena, ".{}", &org_rules, null);
+    defer chock_policy.table.Table.destroy(arena, under_org);
+
+    const refused = try applyModeFor(arena, io, root, under_org, &.{}, "main", "a-model");
+    try std.testing.expectEqual(chock_policy.apply.Mode.ref, refused.mode);
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, refused.decision);
+    // **And the person hears about it before the session runs**, rather than at
+    // the end of it when nothing was integrated.
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "workspace.integrate") != null);
+
+    // And a subagent moves no branch its parent could not.
+    said.clear();
+    const child_only = try chock_policy.table.Table.parse(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .agent_kind = "reviewer", .action = "workspace.integrate", .decision = .deny },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(arena, child_only);
+    const chain = [_]chock_proto.event.SpawnLink{.{ .agent_kind = "main", .reason = "review it" }};
+    const child = try applyModeFor(arena, io, root, child_only, &chain, "reviewer", "a-model");
+    try std.testing.expectEqual(chock_policy.apply.Mode.ref, child.mode);
+}
+
+test "a session with nobody at the keyboard never lands the work on a branch by itself" {
+    // `ask` puts the choice to a person, and a subagent, a daemon session and a
+    // `chock run` behind a pipe all have nobody to put it to. The narrow answer
+    // is the one every session had before modes existed.
+    //
+    // Mutation check: answer `merge` when there is no terminal and a session
+    // nobody is watching starts moving branches on its own.
+    const io = std.testing.io;
+    // The test binary's own standard input is the build runner's, and it is not
+    // a terminal, so this is the real reader answering for the real case.
+    try std.testing.expectEqual(
+        chock_policy.apply.Landing.ref,
+        chosenLanding(io, .ask, null),
+    );
+
+    // A settled mode needs nobody and is answered without a question.
+    for ([_]chock_policy.apply.Mode{ .ref, .merge, .rebase, .squash }) |mode| {
+        try std.testing.expectEqualStrings(
+            mode.wireName(),
+            chosenLanding(io, mode, null).wireName(),
+        );
+    }
+}
+
+test "the log says which sandbox one attempt ran under, and it says it either way" {
+    // **A session that gave up hardening must be distinguishable afterwards
+    // from one that did not.** This project has no silent degradation, so the
+    // event is written on every run and not only on the interesting one: a fold
+    // can rely on a fact that is always recorded.
+    //
+    // Mutation check: write the event only for `.relaxed` and the first half
+    // below fails, which is what stops a reader having to guess whether an
+    // absent line means strict or means an older Chock.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const dir = buffer[0..len];
+
+    const id = "01JQ" ++ "C" ** 22;
+    const attempt = "01JQ" ++ "D" ** 22;
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
+
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+
+    try recordSandbox(gpa, io, store, attempt, .{ .decision = .ask, .rule = .strict });
+    try recordSandbox(gpa, io, store, attempt, .{ .decision = .allow, .rule = .relaxed });
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(1 << 20));
+    // The wire name is on the line, so a reader that has never heard of this
+    // kind still keeps it: see `event.Event.jsonParse`.
+    try std.testing.expect(std.mem.indexOf(u8, text, "sandbox.open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"write_execute\":\"strict\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"write_execute\":\"relaxed\"") != null);
+    // **The reason and not only the outcome.** A reader can otherwise not tell
+    // a project that asked for this from one whose organisation permitted it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, attempt) != null);
 }
 
 test "a promise the session made reaches the end of session approval, out of the log" {

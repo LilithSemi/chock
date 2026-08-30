@@ -142,6 +142,7 @@ const guidance = @import("guidance.zig");
 const cache = @import("cache.zig");
 const scratchpad = @import("scratchpad.zig");
 const tasks = @import("tasks.zig");
+const handback = @import("handback.zig");
 
 /// A JSON schema for one tool's parameters, and the name and description the
 /// model reads to decide whether to call it. The same type `chock-provider`
@@ -531,6 +532,7 @@ pub const Tool = enum {
     fetch_url,
     ask_user,
     set_title,
+    request_action,
 
     /// What this tool needs from the wire format and from the provider
     /// instance before anybody may offer it. See `Support`.
@@ -553,6 +555,7 @@ pub const Tool = enum {
             .fetch_url,
             .ask_user,
             .set_title,
+            .request_action,
             => .tool_calls,
         };
     }
@@ -640,6 +643,15 @@ pub const Tool = enum {
             // "which of these was the parser run" is the question this answers
             // for a child as much as for a parent.
             .set_title,
+            // Always offered, and this is a decision of the same shape
+            // `ask_user` above carries. What can be carried back is not fixed
+            // for the life of a session: a session that has made no commit yet
+            // makes one an hour later, and whether a person is there to answer
+            // changes when a client attaches. A static tool list cannot carry
+            // an answer that changes, so the tool is offered and a call that
+            // cannot be honoured is told exactly why: see
+            // `lib/chock-core/handback.zig`.
+            .request_action,
             => true,
         };
     }
@@ -680,6 +692,10 @@ pub const Tool = enum {
             .fetch_url,
             .ask_user,
             .set_title,
+            // It writes into the user's own repository and not into the
+            // workspace, so there is no file in the tree a language server
+            // reads that this changed.
+            .request_action,
             => false,
         };
     }
@@ -730,6 +746,11 @@ pub const Tool = enum {
             // and is not on the workspace's filesystem. See
             // `chock_core.Loop.runSetTitle`.
             .set_title,
+            // The objects go into the user's own repository, which is not the
+            // workspace's filesystem. It also carries work **out** of a full
+            // disk, so refusing it there would take away the one call that
+            // makes room worth making.
+            .request_action,
             => false,
         };
     }
@@ -889,6 +910,24 @@ pub const Tool = enum {
                 "later name is the one a person sees, so if the work turns out to be something " ++
                 "else, say so. Everything you write here is kept in the session log and a person " ++
                 "reads it, so write it for them.",
+            .request_action => "Ask for the work you have done to be carried back into the " ++
+                "user's own repository, and wait for the answer. **Call it when you believe you " ++
+                "are finished**, so the user is told rather than left to find out. The only " ++
+                "action this takes is \"" ++ handback.apply_action ++ "\", and every other name " ++
+                "is refused.\n" ++
+                "**Commit first.** Only a commit is carried back: the workspace you work in is " ++
+                "thrown away at the end of the session, and a changed file that is not in a " ++
+                "commit goes with it. A call made with no commit carries nothing, tells you how " ++
+                "many files are uncommitted, and asks nobody, because there is nothing to ask " ++
+                "about.\n" ++
+                "**You are not deciding this.** The request goes to the project's own policy, " ++
+                "which you cannot read or write, and where that policy says so it goes to a " ++
+                "person, who reads the commit and the whole diff before they answer. Many " ++
+                "sessions have nobody at a keyboard, and such a call comes straight back " ++
+                "refused. That is not a judgement of your work.\n" ++
+                "**It never moves a branch of the user's.** Work that is carried back lands on " ++
+                "a ref of this session's own, which the user reads and merges when they choose. " ++
+                "Say in your answer that you asked, and what the answer was.",
         };
     }
 
@@ -916,6 +955,7 @@ pub const Tool = enum {
             .fetch_url => FetchUrlArgs,
             .ask_user => AskUserArgs,
             .set_title => SetTitleArgs,
+            .request_action => RequestActionArgs,
         };
     }
 };
@@ -1111,6 +1151,11 @@ pub const Registry = struct {
             .fetch_url => toolErrorResult(allocator, call, try allocator.dupe(u8, fetch_needs_a_session)),
             .ask_user => toolErrorResult(allocator, call, try allocator.dupe(u8, ask_needs_a_session)),
             .set_title => toolErrorResult(allocator, call, try allocator.dupe(u8, title_needs_a_session)),
+            .request_action => toolErrorResult(
+                allocator,
+                call,
+                try allocator.dupe(u8, request_needs_a_session),
+            ),
         };
     }
 };
@@ -1217,6 +1262,24 @@ pub const ask_needs_a_session = "nobody was asked: a question goes to the person
 pub const title_needs_a_session = "this session was not named: a title is kept in the session " ++
     "log, and this tool call was run without a session. Say what the work is in your answer " ++
     "instead.";
+
+/// What a `request_action` call gets from `Registry.dispatchWith`.
+///
+/// **A `Registry` holds no policy table, no session log and no workspace, and
+/// carrying work back needs all three.** The act is decided by the project's
+/// own table, the question and the answer are events in the log, and what
+/// moves is the commit in the session's own worktree. `lib/chock-core/Loop.zig`
+/// reaches all three through `Deps.handback`, so it answers this call itself
+/// and never sends one here. The same shape `fetch_needs_a_session` takes, and
+/// for the same reason.
+///
+/// It refuses rather than carrying the work anyway, because an apply that
+/// skipped the table would be the one road around the policy, and an agent
+/// told its work was safe would stop.
+pub const request_needs_a_session = "nothing was carried back: work is carried back out of the " ++
+    "session's own workspace and against this project's policy, and this tool call was run " ++
+    "without the session that holds either. Say in your answer that the work is not carried " ++
+    "back.";
 
 /// One directory, or one file, of the session's toolchain, and where the
 /// sandbox puts it.
@@ -1759,6 +1822,28 @@ pub const SetTitleArgs = struct {
         .title = "What this session is about, in a few words on one line, written for a person " ++
             "reading a list of sessions and not for you. A line break is refused, and so is a " ++
             "title longer than the bound the answer names.",
+    };
+};
+
+/// Public for the same reason `SetTitleArgs` is: the request and its answer are
+/// events in the session log, so `Loop.runTool` answers this call itself and
+/// parses these arguments. See `request_needs_a_session`.
+///
+/// **There is no field that carries a decision**, and there is not going to be
+/// one: the agent asks, and the project's policy and a person answer. See
+/// `lib/chock-core/handback.zig`, which keeps the same rule on its own `Ask`
+/// with a comptime guard.
+pub const RequestActionArgs = struct {
+    action: []const u8,
+    reason: []const u8,
+
+    pub const docs = .{
+        .action = "The act you are asking for. The only one offered is \"" ++
+            handback.apply_action ++ "\", which carries your commit back into the user's own " ++
+            "repository. Any other name is refused and nothing happens.",
+        .reason = "Why the work is ready, in one or two sentences, written for the person who " ++
+            "will read the diff and answer. Say what you did and what you did not do. This is " ++
+            "the only account of your side of it that they see.",
     };
 };
 
@@ -5977,7 +6062,7 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
 
-    // The seventeen a session with everything gets, by name, so a tool that
+    // The eighteen a session with everything gets, by name, so a tool that
     // quietly loses its entry is a test failure and not a smaller list
     // nobody notices.
     const expected = [_][]const u8{
@@ -5985,7 +6070,7 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         "write_file",   "edit_file",      "run_command", "read_guidance",
         "read_memory",  "write_memory",   "spawn_agent", "update_plan",
         "provide_tool", "restrict_self",  "fetch_url",   "ask_user",
-        "set_title",
+        "set_title",    "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
