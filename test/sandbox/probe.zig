@@ -948,6 +948,27 @@ fn enterLandlockTruncateTestRoot(arena: std.mem.Allocator, root: []const u8) !st
     return .{ .inside_file = inside_file, .outside_file = outside_file };
 }
 
+/// What one of the three io_uring operations reports for the raw syscall
+/// result `rc`. 1 is the pass, and it means the filter answered `EPERM`.
+///
+/// **The errno has to be read, and a plain "the call failed" would prove
+/// nothing here.** Two of the three probes hand the kernel the descriptor -1,
+/// so a filter that let the call through would still fail, with `EBADF`, and a
+/// test that only asked whether the call failed would pass with no filter at
+/// all. A machine whose kernel has no io_uring answers `ENOSYS` for the same
+/// reason. Only `EPERM` is the filter.
+fn ringRefusal(rc: usize) u8 {
+    return switch (linux.errno(rc)) {
+        // The ring was made, or the operation ran. The filter is not there.
+        .SUCCESS => 0,
+        // The filter refused it, and the process is still alive to say so.
+        .PERM => 1,
+        // Refused by something that is not this filter. Its own status, so it
+        // can never be read as the pass above.
+        else => 4,
+    };
+}
+
 // Zig 0.16 removed std.process.argsAlloc. A hosted main can instead take
 // std.process.Init.Minimal as its first parameter, and the runtime fills it in.
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -1138,7 +1159,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // code 1, and the test would read a setup bug as a pass. Give this its
         // own exit code instead, the same as every other setup step in this
         // file.
-        const insns = sandbox.seccomp.build(arena, .{}) catch |err| {
+        //
+        // **One operation asks for the other filter**, the one a project that
+        // needs a just in time compiler gets. See
+        // `chock_policy.hardening`: the write and execute rule is the only
+        // part of the filter a project can give up, and the operation below
+        // measures what that really does to a running process.
+        const relaxed_wx = std.mem.endsWith(u8, args[1], "-relaxed");
+        const insns = sandbox.seccomp.build(arena, .{ .strict_wx = !relaxed_wx }) catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
@@ -2138,25 +2166,39 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // the wrong reason.
         var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
         const rc = linux.io_uring_setup(1, &params);
-        // The filter kills the process, so this line never runs.
-        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+        return ringRefusal(rc);
     }
     if (std.mem.eql(u8, args[1], "io-uring-enter")) {
         // The call that submits the operations. This probe holds no ring, the same
-        // way umount-protected above names no real mount point: the filter must kill
-        // the call before the kernel ever looks at the descriptor. A filter that
-        // refused only io_uring_setup would leave a ring another process set up and
-        // handed over still usable.
+        // way umount-protected above names no real mount point: the filter must
+        // refuse the call before the kernel ever looks at the descriptor. A filter
+        // that refused only io_uring_setup would leave a ring another process set up
+        // and handed over still usable.
         const rc = linux.syscall6(.io_uring_enter, @bitCast(@as(isize, -1)), 1, 0, 0, 0, 0);
-        // The filter kills the process, so this line never runs.
-        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+        return ringRefusal(rc);
     }
     if (std.mem.eql(u8, args[1], "io-uring-register")) {
         // The call that gives a ring its buffers, its files, and its eventfd. Refused
         // for the same reason as io_uring_enter above, and with no ring here either.
         const rc = linux.syscall4(.io_uring_register, @bitCast(@as(isize, -1)), 0, 0, 0);
-        // The filter kills the process, so this line never runs.
-        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+        return ringRefusal(rc);
+    }
+    if (std.mem.eql(u8, args[1], "io-uring-then-work")) {
+        // **What the fix is actually for.** A run time probes for a ring, reads the
+        // refusal, and carries on with the thread pool it used before io_uring
+        // existed. That is what libuv does on a kernel older than 5.1, and it is what
+        // Node does at startup. This probe is the same shape: ask for a ring, expect
+        // to be refused, and then do ordinary work and exit cleanly.
+        //
+        // A kill leaves no line after the call to run, so this operation cannot pass
+        // under a filter that kills, whatever the errno rule says.
+        var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
+        const rc = linux.io_uring_setup(1, &params);
+        if (linux.errno(rc) != .PERM) return 4;
+        // Ordinary work after the refusal, so the exit status says the process was
+        // still alive and still able to make a syscall.
+        if (linux.getpid() <= 0) return 4;
+        return 0;
     }
     if (std.mem.eql(u8, args[1], "getpid")) {
         // A call that the filter must allow. This proves the filter is not a deny all.
@@ -3271,6 +3313,36 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     // structs, not plain integers. The seccomp filter reads the same bits off the raw
     // syscall argument, so a bit cast from the plain u32 keeps the two views in sync.
     if (std.mem.eql(u8, args[1], "mmap-wx")) {
+        const prot: linux.PROT = @bitCast(prot_write | prot_exec);
+        const flags: linux.MAP = @bitCast(map_private_anon);
+        const rc = linux.mmap(null, 4096, prot, flags, -1, 0);
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "ptrace-relaxed")) {
+        // A blocked call under the relaxed filter. **The setting turns off one
+        // rule and nothing else**, so this must still die exactly as `ptrace`
+        // above does. Without this, a mistake that dropped the whole filter
+        // when a project asked for a just in time compiler would pass every
+        // other test in this file.
+        const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+    if (std.mem.eql(u8, args[1], "io-uring-setup-relaxed")) {
+        // io_uring under the relaxed filter. It is refused with EPERM there
+        // too: the setting names one rule, and this is not that rule.
+        var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
+        const rc = linux.io_uring_setup(1, &params);
+        return ringRefusal(rc);
+    }
+    if (std.mem.eql(u8, args[1], "mmap-wx-relaxed")) {
+        // The same call `mmap-wx` above makes, under the filter a project that
+        // asked for a just in time compiler gets. It must succeed, and the
+        // process must still be alive to say so.
+        //
+        // **This is the whole of what the setting does.** Every other rule of
+        // the filter is unchanged, which the test beside this one states by
+        // running a blocked call under the same relaxed filter.
         const prot: linux.PROT = @bitCast(prot_write | prot_exec);
         const flags: linux.MAP = @bitCast(map_private_anon);
         const rc = linux.mmap(null, 4096, prot, flags, -1, 0);

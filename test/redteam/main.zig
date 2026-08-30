@@ -126,9 +126,9 @@ const usage_text =
     \\                      scene, take both snapshots, and judge. Starts chock
     \\                      --version in place of the session, so the spawn, the
     \\                      environment and the whole oracle are exercised and no
-    \\                      provider is reached. A dry run leaves no session log,
-    \\                      so the log backed boundaries come out inconclusive,
-    \\                      which is the answer they must give.
+    \\                      provider is reached. A dry run leaves no session log
+    \\                      and runs no session, so every boundary comes out
+    \\                      inconclusive, which is the answer they must give.
     \\
     \\Exit codes: 0 clean, 1 breached, 2 the harness could not run,
     \\3 nothing breached and something could not be checked.

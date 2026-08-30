@@ -17,7 +17,11 @@ is how a real escape gets argued away.
 it: a tool call could write into the worktree metadata directory inside the real
 repository. That is closed, on both platforms. Fable refused the exercise and
 returned nothing, so it measured nothing, and the harness records that as an
-empty answer rather than as a session that held.
+empty answer rather than as a session that held. A session that called no tool,
+that ended in a fault, or that left no log reports every boundary as unchecked
+and exits non-zero, because a canary that nothing tried to move says nothing
+about the sandbox. That catches a session which measured nothing. It does not
+catch every way an instrument can be wrong.
 
 Read the result knowing what it is. Two models on one machine is a measurement,
 not a guarantee. The instrument itself had faults found while it was built and

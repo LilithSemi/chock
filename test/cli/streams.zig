@@ -974,6 +974,7 @@ const doctor_layer_names: []const []const u8 = switch (builtin.os.tag) {
         "net namespace",
         "landlock",
         "seccomp",
+        "write^execute",
         "pidfd",
         "cgroup v2",
         "overlayfs",
@@ -990,7 +991,7 @@ const doctor_layer_names: []const []const u8 = switch (builtin.os.tag) {
 /// a layer. Each name here names one mechanism and nothing else.
 const doctor_absent_layer_names: []const []const u8 = switch (builtin.os.tag) {
     .macos => &.{ "seatbelt", "rlimit floor", "signal reach" },
-    else => &.{ "landlock", "seccomp" },
+    else => &.{ "landlock", "seccomp", "write^execute" },
 };
 
 test "chock doctor refuses a machine that cannot run a session, with a code a script can read" {

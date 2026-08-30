@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
+const chock_broker = @import("chock-broker");
 const chock_container = @import("chock-container");
 const chock_core = @import("chock-core");
 const chock_io = @import("chock-io");
@@ -277,6 +278,12 @@ pub const Measured = struct {
     /// ABI silently gives a smaller ruleset than the design asks for.
     landlock_abi: ?i32 = null,
     seccomp: Probe = .{ .absent = driver_gives_nothing },
+    /// Whether a page could be writable and executable at the same time in a
+    /// session of this project. **Read from the project's own policy and not
+    /// from the machine**: every machine can hold this rule, and the only
+    /// question is whether the project asked to give it up. See
+    /// `chock_policy.hardening`, and `measureHardening` below.
+    write_execute: chock_policy.hardening.WriteExecute = .strict,
     /// What `cgroup.Cgroup.create` answered, or null when no driver asked.
     cgroup: ?CgroupSupport = null,
     /// Which machine that answer is about, or null when no driver asked.
@@ -590,9 +597,49 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                 ""
             else
                 try std.fmt.allocPrint(arena, "no system call filter: {s}", .{m.seccomp.why()}),
-            .why = "the system calls a tool call may make are filtered, and a page cannot be both writable and executable",
+            .why = "the system calls a tool call may make are filtered",
             .fix = if (m.seccomp == .ok) "" else "The filter needs CONFIG_SECCOMP_FILTER and no_new_privs. Sandbox.spawn refuses without it.",
             .blocks = true,
+        });
+
+        // **A row of its own, because a session that gave this up must not read
+        // the same as one that kept it.** It sits under `seccomp` because it is
+        // one rule of that filter, and it is the only sandbox row here that is a
+        // question about the project rather than about the machine: see
+        // `measureHardening`.
+        //
+        // `off` and never `unsupported` or `unavailable`. Those two say the
+        // machine cannot give the layer, or would not let this process have it,
+        // and neither is true. This session can have it and the project asked
+        // for it to be given up, which is exactly what `ui.Layer.State.off`
+        // means.
+        //
+        // **It does not block a first run.** W^X is documented hardening and it
+        // is not a boundary: `test/redteam/scope.zig` retires it by name, and
+        // `lib/chock-sandbox/linux/seccomp.zig` gives three measured ways past
+        // it. A project that asked for this gets a session, and gets told.
+        try rows.append(arena, .{
+            .name = "write^execute",
+            .state = switch (m.write_execute) {
+                .strict => .on,
+                .relaxed => .off,
+            },
+            .means = switch (m.write_execute) {
+                .strict => "",
+                .relaxed => try std.fmt.allocPrint(
+                    arena,
+                    "this project's policy answers allow for {s}, so a page can be writable and " ++
+                        "executable at the same time",
+                    .{chock_policy.hardening.jit_action},
+                ),
+            },
+            .why = "a page cannot be writable and executable at the same time, which raises the cost of running injected code",
+            .fix = switch (m.write_execute) {
+                .strict => "",
+                .relaxed => "A run time with a just in time compiler needs this. Every other layer is " ++
+                    "unchanged, and an organisation can refuse it with one rule in its policy bundle.",
+            },
+            .blocks = false,
         });
 
         try rows.append(arena, .{
@@ -1510,6 +1557,88 @@ fn measureHost(
     measureCardSeal(arena, io, m);
 
     m.required_sinks = measureRequiredSinks(arena, io, env);
+
+    m.write_execute = measureHardening(arena, io, env, project_root, defaultModel(arena, io, env));
+}
+
+/// Whether a session of this project would run with the write and execute rule
+/// off. **The one sandbox row that is a question about the project and not
+/// about the machine**: every machine this driver runs on can hold the rule,
+/// and `chock_policy.hardening` is the row a project writes to give it up.
+///
+/// **The org bundle is read first, and leaving it out would be a lie in the
+/// dangerous direction.** A rule in the bundle can only lower the answer, so a
+/// report that read only `chock.zon` would say a session gives up hardening
+/// that the organisation has already forbidden. The same rules, in the same
+/// order, that `src/run.zig` folds.
+///
+/// **This asks the question the way a root session asks it**: the agent kind
+/// `chock run` starts with, and the model the configuration names by default,
+/// which together are what a `chock run` with no flags carries. A project whose
+/// rule names another agent kind, or a model the command line would have to
+/// pick, reads `strict` here and is answered by the session itself. That is the
+/// safe direction: this row never says the hardening is off when it is on.
+///
+/// A `chock.zon` this cannot read answers `strict`, which is what a session
+/// gets too: `chock run` refuses to start on a policy it cannot parse.
+fn measureHardening(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+    model: []const u8,
+) chock_policy.hardening.WriteExecute {
+    const org_rules: []const chock_policy.table.Rule = rules: {
+        const data_dir = chock_auth.paths.dataDir(arena, env) catch break :rules &.{};
+        const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch
+            break :rules &.{};
+        const bundle = chock_policy.org.load(arena, io, path, null) catch break :rules &.{};
+        break :rules bundle.rules;
+    };
+
+    const policy = chock_policy.table.Table.loadUnder(
+        arena,
+        io,
+        project_root,
+        org_rules,
+        null,
+    ) catch return .strict;
+
+    return chock_policy.hardening.writeExecuteFor(policy.evaluateChain(&.{doctor_agent_kind}, .{
+        .agent_kind = doctor_agent_kind,
+        .model = model,
+        // No tool call asked for this and none ever can: the filter is built
+        // before the first turn. See `chock_broker.actions.self_asked_tool`.
+        .tool = chock_broker.actions.self_asked_tool,
+        .action = chock_policy.hardening.jit_action,
+    }, null));
+}
+
+/// The agent kind this command asks the policy about. `chock run`'s own
+/// default, so the answer here is the answer a session started with no
+/// `--agent-kind` gets.
+const doctor_agent_kind = "main";
+
+/// The model this command asks the policy about when the configuration names
+/// no default. **A name no provider issues**, because `table.Key` refuses an
+/// empty model and any real spelling here could match a rule an author wrote
+/// for a real model. It matches only a rule that names no model at all, which
+/// is the reading that keeps the hardening.
+const no_default_model = "(no default model)";
+
+/// The model a `chock run` with no `--model` would use, or `no_default_model`
+/// when this machine has no configuration to read one from. **The same reader
+/// `measureCredential` uses**, so the two rows cannot disagree about what the
+/// configuration says.
+fn defaultModel(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+) []const u8 {
+    const config_dir = chock_auth.paths.configDir(arena, env) catch return no_default_model;
+    const config = chock_auth.config.load(arena, io, config_dir, null) catch return no_default_model;
+    const named = config.default_model orelse return no_default_model;
+    return if (named.len == 0) no_default_model else named;
 }
 
 /// Reach for a PC/SC daemon with the transport `chock sessions seal` uses.
@@ -2881,6 +3010,87 @@ test "a layer the machine has and this process may not use is BLOCKED, not NONE"
     try testing.expect(std.mem.indexOf(u8, row.fix, "unprivileged_userns_clone") != null);
 }
 
+test "a project that gave up the write and execute rule does not read like one that kept it" {
+    // **The whole reason this row exists.** A session that gave up a piece of
+    // hardening has to be visible before it starts, not only in the log
+    // afterwards. Two reports off the same machine, differing in nothing but
+    // the project's own policy, must not print the same line.
+    //
+    // Mutation check: answer `.on` for `.relaxed` and the two rows below are
+    // identical, which is the failure this test is written against.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const strict_rows = try rowsFor(arena, healthy());
+    const strict = rowNamed(strict_rows, "write^execute").?;
+    try testing.expectEqual(ui.Layer.State.on, strict.state);
+    try testing.expectEqualStrings("OK", wordFor(strict));
+
+    var m = healthy();
+    m.write_execute = .relaxed;
+    const relaxed_rows = try rowsFor(arena, m);
+    const relaxed = rowNamed(relaxed_rows, "write^execute").?;
+    try testing.expectEqual(ui.Layer.State.off, relaxed.state);
+    try testing.expectEqualStrings("OFF", wordFor(relaxed));
+
+    // **`off` and never `unsupported` or `unavailable`.** Those two say the
+    // machine cannot give the layer, or would not let this process have it, and
+    // this machine can and would. A report that spelled it either way would
+    // send a person looking for a kernel fault that is not there.
+    try testing.expect(relaxed.state != .unsupported);
+    try testing.expect(relaxed.state != .unavailable);
+
+    // And the line names the rule a person has to find to change it.
+    try testing.expect(std.mem.indexOf(u8, relaxed.means, chock_policy.hardening.jit_action) != null);
+
+    // It does not stop a first run, in either form. W^X is hardening and not a
+    // boundary: see the row's own comment in `rowsFor`.
+    try testing.expect(!strict.blocks);
+    try testing.expect(!relaxed.blocks);
+}
+
+test "the report reads the same rules a session reads, and an org bundle can take the row back" {
+    // **`chock doctor` and `chock run` must not answer differently.** The
+    // report reads `chock.zon` under the installation's own bundle, the same
+    // fold `src/run.zig` makes, so a report that said a session would give up
+    // hardening an organisation has already forbidden would be a lie in the
+    // dangerous direction.
+    //
+    // This states the fold itself rather than spawning a session, because
+    // `measureHardening` reads a real data directory and a real project root.
+    // The two halves it joins are each proven in `lib/chock-policy/hardening.zig`.
+    const allocator = testing.allocator;
+    const source =
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "sandbox.jit", .decision = .allow },
+        \\} } }
+    ;
+    const key: chock_policy.table.Key = .{
+        .agent_kind = doctor_agent_kind,
+        .model = no_default_model,
+        .tool = chock_broker.actions.self_asked_tool,
+        .action = chock_policy.hardening.jit_action,
+    };
+
+    const alone = try chock_policy.table.Table.parse(allocator, source, null);
+    defer chock_policy.table.Table.destroy(allocator, alone);
+    try testing.expectEqual(
+        chock_policy.hardening.WriteExecute.relaxed,
+        chock_policy.hardening.writeExecuteFor(alone.evaluateChain(&.{doctor_agent_kind}, key, null)),
+    );
+
+    const org_rules = [_]chock_policy.table.Rule{
+        .{ .action = chock_policy.hardening.jit_action, .decision = .deny },
+    };
+    const under_org = try chock_policy.table.Table.parseUnder(allocator, source, &org_rules, null);
+    defer chock_policy.table.Table.destroy(allocator, under_org);
+    try testing.expectEqual(
+        chock_policy.hardening.WriteExecute.strict,
+        chock_policy.hardening.writeExecuteFor(under_org.evaluateChain(&.{doctor_agent_kind}, key, null)),
+    );
+}
+
 test "a cgroup refusal measured inside a namespace says so, and never blames a working init system" {
     // The false negative this row was reported for. A process in a cgroup
     // namespace reads `0::/` for a cgroup deep in the machine's tree, so
@@ -3463,6 +3673,10 @@ fn broken() Measured {
     m.free_bytes = 1024;
     m.card_seal = .{ .absent = "there is no pcscd socket at /run/pcscd/pcscd.comm" };
     m.card_readers = null;
+    // The project asked to give up the write and execute rule. The failing
+    // form of this row is not a machine that cannot hold it: every machine can,
+    // and only a project's own policy takes it away. See `measureHardening`.
+    m.write_execute = .relaxed;
     return m;
 }
 
@@ -3517,6 +3731,11 @@ test "every row that stops a first run is one Sandbox.spawn or chock run really 
         // `seal.Level` has a software key for exactly this, and it records
         // which level it used inside the bytes the signature covers.
         "card seal",
+        // W^X is documented hardening and it is not a boundary, so a project
+        // that gave it up gets a session and gets told. `test/redteam/scope.zig`
+        // retires it by name, and `lib/chock-sandbox/linux/seccomp.zig` names
+        // three measured ways past it.
+        "write^execute",
     };
     for (blocking) |name| try testing.expect(rowNamed(rows, name).?.blocks);
     for (not_blocking) |name| try testing.expect(!rowNamed(rows, name).?.blocks);

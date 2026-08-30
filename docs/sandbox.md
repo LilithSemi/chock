@@ -87,7 +87,7 @@ The filter is a denylist. It reads the audit architecture first and kills a
 foreign one before it reads a system call number, and on x86_64 it kills an x32
 call as well.
 
-**33 calls are blocked, and a blocked call kills the process.** Not an errno: a
+**30 calls are blocked, and a blocked call kills the process.** Not an errno: a
 program that meant to escape does not get to handle the failure. The groups
 are:
 
@@ -101,17 +101,64 @@ are:
 - process introspection and injection: `ptrace`, `process_vm_readv`,
   `process_vm_writev`, `bpf`, `userfaultfd`
 - the machine: `reboot`, `syslog`, `sethostname`
-- **io_uring**: `io_uring_setup`, `io_uring_enter`, `io_uring_register`
 
-io_uring is blocked outright because a ring lets a kernel worker perform the
-operation, so the filter never sees the system call at all.
+**Three more calls are refused with `EPERM`, and io_uring is all three:**
+`io_uring_setup`, `io_uring_enter`, `io_uring_register`. A ring lets a kernel
+worker perform the operation, so the filter never sees the system call at all.
+The refusal makes no ring, submits no operation, and gives no ring a buffer, so
+io_uring is exactly as unavailable as it was on the kill list. **The only thing
+that changed is that the process learns it was refused.**
+
+The reason is measured on Node v24.19.0. libuv calls `io_uring_setup` six times
+while Node starts, before it runs one line, and `UV_USE_IO_URING=0` does not
+stop it. The probe is meant to fail on a kernel older than 5.1, and libuv then
+falls back to its thread pool. So Node does not need a ring: it needs the probe
+to fail survivably. A kill ended every Node, Deno and Bun program at startup and
+bought nothing, because a hostile program can simply not call io_uring.
 
 Four rules inspect an argument and answer `EPERM` instead of killing, so a
 program can recover: `personality` asking for `READ_IMPLIES_EXEC`, `shmat` with
 `SHM_EXEC`, and `mmap`, `mprotect` or `pkey_mprotect` asking for a page that is
 both writable and executable. **That last one raises a cost and is not a
 boundary**, and the code says so with three measured ways past it. io_uring
-being blocked is the stronger statement.
+being refused is the stronger statement.
+
+### A project that needs a just in time compiler
+
+V8 asks for a page that is writable and executable over a 268 MB code range, so
+Node, Deno and Bun cannot work under the write and execute rule unless they are
+started with `--jitless`. A project turns that one rule off with one row on the
+policy table:
+
+```zon
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "sandbox.jit", .decision = .allow },
+        },
+    },
+}
+```
+
+**It is a policy row and not a `chock.zon` key of its own, because it is the
+first setting that widens.** Every other knob on this page narrows. The table
+already folds an organisation's bundle over a project and a parent over a child,
+and that is exactly the question "who may widen this, and who authorises it". So
+three things come free:
+
+- An organisation forbids it for every project at once with
+  `.{ .action = "sandbox.jit", .decision = .deny }` in its policy bundle. A
+  project cannot raise what the bundle lowered, because the answer is a minimum.
+- A subagent holds no more than its parent.
+- `allow` and nothing else turns the rule off. An action nobody named answers
+  `ask`, so a project that has never heard of this row keeps the hardening.
+
+**A session that gave the rule up says so, three times.** `chock run` prints a
+warning at start, the session log carries a `sandbox.open` event naming
+`relaxed` and the policy answer behind it, and `chock doctor` reads the same
+rules and prints `write^execute OFF` before a session starts. Nothing else in
+the filter moves: every blocked call still kills, io_uring is still refused, and
+Landlock and the network namespace are untouched.
 
 ## The workspace
 
@@ -192,6 +239,11 @@ written next to it in the code.
 
 A project's `chock.zon` can lower any of these and can never raise one. It is
 the same ratchet the policy table keeps.
+
+**One setting widens, and it is not one of these.** The write and execute rule
+is given up with a row on the policy table and never with a key in this file:
+see "A project that needs a just in time compiler" above. That is where the
+ratchet already has an answer for who may widen a thing and who authorises it.
 
 ## The sandbox on macOS, and what it does not do
 
@@ -274,6 +326,7 @@ from a kernel version.
 | net namespace | yes |
 | landlock, with its ABI number | yes |
 | seccomp | yes |
+| write^execute | no, it is hardening and not a boundary |
 | pidfd | yes |
 | disk cap tmpfs | yes |
 | overlayfs | no, only a project with no git needs it |

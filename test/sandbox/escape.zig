@@ -347,37 +347,76 @@ test "a filtered process that calls add_key dies with SIGSYS" {
     try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, term);
 }
 
-test "a filtered process that calls io_uring_setup dies with SIGSYS" {
+test "a filtered process that calls io_uring_setup is refused with EPERM and lives" {
     // Finding 3. A ring is the way around a syscall filter, because the thread that
     // submits an operation never makes the call the filter reads. The measured run
     // set up a ring and was stopped by Landlock and by the network namespace, not by
     // this filter, and neither of those covers every operation a ring can carry. See
-    // `blocked_calls` in lib/chock-sandbox/linux/seccomp.zig.
+    // `refused_calls` in lib/chock-sandbox/linux/seccomp.zig.
+    //
+    // **EPERM and no ring is the same refusal the kill was.** What changed is that
+    // the caller is told. Node's libuv probes for a ring six times before it runs one
+    // line, whatever `UV_USE_IO_URING` says, so a kill ended every Node program at
+    // startup while buying nothing: a hostile program can simply not call io_uring.
+    //
+    // Exit status 1 is the probe's own word for "refused with EPERM", and it is not
+    // "the call failed": the probe reads the errno, because two of the three calls
+    // here would fail with EBADF under no filter at all. See `ringRefusal`.
     const term = try runProbe("io-uring-setup");
     // One comparison and not a switch: `expectEqual` prints both sides, so a
     // process that ended some other way says how in the failure itself, and
     // this test writes nothing to standard error.
-    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a filtered process that calls io_uring_enter dies with SIGSYS" {
+test "a filtered process that calls io_uring_enter is refused with EPERM and lives" {
     // The call that submits the operations. Refusing only the setup would leave a
     // ring another process made and handed over still usable.
     const term = try runProbe("io-uring-enter");
     // One comparison and not a switch: `expectEqual` prints both sides, so a
     // process that ended some other way says how in the failure itself, and
     // this test writes nothing to standard error.
-    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a filtered process that calls io_uring_register dies with SIGSYS" {
+test "a filtered process that calls io_uring_register is refused with EPERM and lives" {
     // The call that gives a ring its buffers, its files, and its eventfd. Refused
-    // for the same reason as io_uring_enter above.
+    // for the same reason as io_uring_enter above, and with no ring here either.
     const term = try runProbe("io-uring-register");
     // One comparison and not a switch: `expectEqual` prints both sides, so a
     // process that ended some other way says how in the failure itself, and
     // this test writes nothing to standard error.
-    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a program that meets the io_uring refusal carries on and exits cleanly" {
+    // **This is the whole reason the answer changed, and neither test above can
+    // state it.** Each of those ends at the refusal, so each would still pass under
+    // a filter that killed on the very next instruction. This one does ordinary work
+    // after the refused probe and exits 0, which a killed process cannot do.
+    const term = try runProbe("io-uring-then-work");
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "the calls that are meant to kill still kill, so the io_uring change did not leak" {
+    // **The other thirty were left alone on purpose**, and this is what says so.
+    // Each of them is on `blocked_calls` for a reason of its own, and none of them is
+    // probed and answered the way io_uring is, so moving one would need its own
+    // measurement. A change that moved the whole list to EPERM would still pass every
+    // io_uring test above, and it fails here.
+    //
+    // One operation per family the list covers, run through a real spawn: the mount
+    // family, the keyring family, and process introspection are each represented by a
+    // probe that already exists.
+    for ([_][]const u8{
+        "ptrace",
+        "umount-protected",
+        "open-tree-attr-protected",
+        "add-key",
+    }) |op| {
+        const term = try runProbe(op);
+        try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, term);
+    }
 }
 
 test "the filter is not a deny all, an ordinary call still works" {
@@ -392,6 +431,29 @@ test "mmap refuses a request for write and execute together" {
     // seccomp.zig for three ways an attacker got such a page anyway.
     const term = try runProbe("mmap-wx");
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a project that asked for a just in time compiler gets the page, and keeps every other rule" {
+    // **The one setting on the policy table that widens**, measured through a
+    // real spawn rather than through the shape of the filter. See
+    // `lib/chock-policy/hardening.zig` for why it is a row on the table and not
+    // a key in `chock.zon`, and `src/doctor.zig` and
+    // `chock_proto.event.SandboxOpen` for the two places that say a session ran
+    // this way.
+    //
+    // The default is the test above this one: `mmap-wx` gets EPERM. Here the
+    // same call succeeds.
+    const relaxed = try runProbe("mmap-wx-relaxed");
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, relaxed);
+
+    // **And nothing else moved.** A mistake that dropped the whole filter when
+    // a project asked for this would pass the line above and fail here. `ptrace`
+    // still kills, and io_uring is still refused with EPERM, under the very same
+    // relaxed filter.
+    const killed = try runProbe("ptrace-relaxed");
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.SYS }, killed);
+    const ring = try runProbe("io-uring-setup-relaxed");
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, ring);
 }
 
 test "a two step change from read write to read execute succeeds" {

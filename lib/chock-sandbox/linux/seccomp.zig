@@ -43,21 +43,9 @@ pub const RET_ERRNO_PERM: u32 = 0x00050000 | @as(u32, @intFromEnum(linux.E.PERM)
 /// itself uses `keyctl`; blocking these calls afterwards costs nothing, because by
 /// then the join has already finished.
 ///
-/// `io_uring_setup`, `io_uring_enter` and `io_uring_register` are here because
-/// io_uring is the standard way around a syscall filter. A process puts an operation
-/// in a ring, and a kernel worker does the operation, so the thread that asked never
-/// makes the syscall this filter reads. A rule written here is not applied to the
-/// operation at all.
-///
-/// **Nothing got through when this was measured.** The red team run of 2026-08-22 set
-/// up a ring, opened a mounted store path through it, and tried two writes outside the
-/// workspace and a `connect`. Landlock refused both writes with EACCES, and the network
-/// namespace gave ENETUNREACH, because a namespace is not a filter and so has no
-/// syscall for io_uring to avoid making. That result is a property of which layers
-/// happen to cover the file surface and the network today. It is not a statement about
-/// every operation io_uring supports, and seccomp is the only layer that covers some of
-/// them. Container runtimes commonly refuse these three calls for this reason, and no
-/// program a coding agent runs needs a ring.
+/// The three io_uring calls are **not** here. They are on `refused_calls` below, which
+/// answers `EPERM`. io_uring stays exactly as unavailable as it was; read that list for
+/// why the answer changed and why the security did not.
 pub const blocked_calls = [_]linux.SYS{
     .ptrace,
     .bpf,
@@ -89,6 +77,56 @@ pub const blocked_calls = [_]linux.SYS{
     .syslog,
     .reboot,
     .sethostname,
+};
+
+/// The calls the filter refuses with `EPERM` instead of killing the caller.
+///
+/// **io_uring is as unavailable as it was on the kill list, and that is the whole
+/// point.** A refused `io_uring_setup` creates no ring. `io_uring_enter` submits no
+/// operation, and `io_uring_register` gives no ring a buffer, a file, or an eventfd.
+/// There is no ring to hold a submission queue, so there is no kernel worker to do an
+/// operation the thread never made a syscall for. The bypass this list exists to close
+/// is closed by the refusal, not by the death of the caller. **The only thing that
+/// changed is that the process learns it was refused.**
+///
+/// io_uring is the standard way around a syscall filter. A process puts an operation in
+/// a ring, and a kernel worker does the operation, so the thread that asked never makes
+/// the syscall this filter reads. A rule written for that operation is not applied to it
+/// at all. That is why these three calls must never succeed.
+///
+/// **Nothing got through when this was measured.** The red team run of 2026-08-22 set
+/// up a ring, opened a mounted store path through it, and tried two writes outside the
+/// workspace and a `connect`. Landlock refused both writes with EACCES, and the network
+/// namespace gave ENETUNREACH, because a namespace is not a filter and so has no
+/// syscall for io_uring to avoid making. That result is a property of which layers
+/// happen to cover the file surface and the network today. It is not a statement about
+/// every operation io_uring supports, and seccomp is the only layer that covers some of
+/// them. **That run is unaffected by the change from a kill to a refusal**, because it
+/// needed a ring and a refusal gives none.
+///
+/// ## Why the kill was dropped, measured on Node v24.19.0 with `strace`
+///
+/// The old text here ended "no program a coding agent runs needs a ring". That sentence
+/// is false in the way that matters. libuv calls `io_uring_setup` six times while Node
+/// starts, before it runs one line of the program, and it does this whatever the code
+/// asks for. `UV_USE_IO_URING=0` does not stop it: six calls, measured. The probe is
+/// meant to fail on a kernel older than 5.1, and libuv then falls back to its thread
+/// pool. So Node does not need a ring. **It needs the probe to fail survivably.** A kill
+/// ends the process before `main` and `node -e` cannot run at all, which is what stopped
+/// an agent building a website with Node, Deno or Bun. With
+/// `strace -e inject=io_uring_setup:error=EPERM` the same `node -e` runs and exits 0.
+///
+/// **Killing buys nothing here.** A hostile program is free to not call io_uring, so the
+/// kill never stopped an attacker who read this file. It only stopped the honest
+/// run time that probes and falls back. A refusal costs an attacker exactly what the
+/// kill did, which is the ring, and costs the honest program nothing.
+///
+/// **This list is for a call that is probed and answered, and not for a call that is
+/// simply forbidden.** Every member of `blocked_calls` above is on that list for a
+/// reason of its own, and none of them is reached by a program that asks, reads the
+/// answer, and takes another road. Moving one of them here needs the same measurement
+/// this one got.
+pub const refused_calls = [_]linux.SYS{
     .io_uring_setup,
     .io_uring_enter,
     .io_uring_register,
@@ -226,6 +264,15 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
         // If the number matches, fall to the kill. If not, skip over the kill.
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
+    }
+
+    // See `refused_calls`. Two instructions per call, and neither one touches the
+    // accumulator, so the call number every check below reads is still in it.
+    for (refused_calls) |call| {
+        const number: u32 = @intCast(@intFromEnum(call));
+        // If the number matches, fall to the refusal. If not, skip over it.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
+        try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
     }
 
     // See `Options.block_connect`. Two instructions, and neither one touches the
@@ -487,6 +534,77 @@ test "every blocked call comparison jumps so the kill is reachable and the skip 
         checked += 1;
     }
     try std.testing.expectEqual(blocked_calls.len, checked);
+}
+
+test "every refused call answers EPERM, and none of them kills" {
+    const allocator = std.testing.allocator;
+    const prog = try build(allocator, .{});
+    defer allocator.free(prog);
+
+    // **Two facts per call, and the second is the one this change is about.**
+    // The refusal must be there, and it must not be a kill: a run time that
+    // probes for a ring reads the answer and takes another road, and a killed
+    // process reads nothing. Counted per call, the way the `blocked_calls`
+    // tests count, so a rule missing for two of the three cannot pass on the
+    // strength of the one left standing.
+    var checked: usize = 0;
+    for (refused_calls) |call| {
+        const number: u32 = @intCast(@intFromEnum(call));
+        for (prog, 0..) |insn, i| {
+            if (insn.code != bpf.JMP_JEQ_K or insn.k != number) continue;
+            // jt = 0 falls into the refusal on a match. jf = 1 skips exactly
+            // that one instruction on no match, landing on the next check.
+            try std.testing.expectEqual(@as(u8, 0), insn.jt);
+            try std.testing.expectEqual(@as(u8, 1), insn.jf);
+            try std.testing.expectEqual(bpf.RET_K, prog[i + 1].code);
+            try std.testing.expectEqual(RET_ERRNO_PERM, prog[i + 1].k);
+            try std.testing.expect(prog[i + 1].k != RET_KILL_PROCESS);
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(refused_calls.len, checked);
+}
+
+test "the two lists share no call, so nothing is both killed and refused" {
+    // **A call on both lists would be killed**, because the kill loop runs
+    // first, and the refusal after it would never be reached. The filter would
+    // still build and still install, and the only sign of it would be a run
+    // time dying at startup. This is what says the move was a move.
+    for (refused_calls) |refused| {
+        for (blocked_calls) |blocked| {
+            try std.testing.expect(refused != blocked);
+        }
+    }
+
+    // And the three that moved really are the three io_uring calls. A list
+    // that grew a fourth member needs the measurement `refused_calls` names,
+    // so it fails here and a person reads why.
+    try std.testing.expectEqualSlices(linux.SYS, &.{
+        .io_uring_setup,
+        .io_uring_enter,
+        .io_uring_register,
+    }, &refused_calls);
+}
+
+test "the refusal block adds only itself, and leaves the call number for the checks after it" {
+    // Every check after this point reads the call number out of the
+    // accumulator. An instruction here that loaded anything else would leave
+    // all of them comparing the wrong value, while the filter still installed
+    // and still looked correct. The same property `block_connect` is held to.
+    const allocator = std.testing.allocator;
+    const prog = try build(allocator, .{});
+    defer allocator.free(prog);
+
+    for (refused_calls) |call| {
+        const number: u32 = @intCast(@intFromEnum(call));
+        for (prog, 0..) |insn, i| {
+            if (insn.code != bpf.JMP_JEQ_K or insn.k != number) continue;
+            try std.testing.expectEqual(bpf.RET_K, prog[i + 1].code);
+            // Two instructions and no load between them, so the next check
+            // reads the call number and not a protection flag.
+            try std.testing.expect(prog[i + 2].code != bpf.LD_W_ABS);
+        }
+    }
 }
 
 test "strict_wx off makes a shorter filter that does not read the protection flags" {
