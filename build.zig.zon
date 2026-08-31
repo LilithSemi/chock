@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
-            .url = "git+https://github.com/Midstall/vulcan#b85759fc2ff9e4047855da1ad7ca89b7aeb7b8ee",
-            .hash = "vulcan-0.0.0-d6EfZDbfhADEz427qO0reiJV1-duNymtWSONezjKLYAY",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#8dbb53dca5e923ec497b00a802b25e762ed86369",
+            .hash = "vulcan-0.0.0-d6EfZEDfhAD7LsCcFmT2iQvBeXNm6hPtxPo96ZpF_bFR",
         },
         .phantom = .{
-            .url = "git+https://github.com/Midstall/phantom#cc6c500f9dc52a72d61ba271c7ee59cdaf4ec540",
-            .hash = "phantom-0.1.0-HsUDTOHbGgC12mYmso-3LQZ4B9YcZ5NTWNxGjGiMD07p",
+            .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#7694e28f3c8d24e8a44b8ec755792375d26e3891",
+            .hash = "phantom-0.1.0-HsUDTP_bGgCTDs95R8grcWK53sN7H27QbByzHTPN138k",
         },
     },
     .paths = .{
