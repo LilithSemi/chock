@@ -275,6 +275,19 @@ pub fn spawn(
     // read as a real probe.
     _ = landlock_report;
 
+    // **A cgroup the caller made is refused by name, and it is refused
+    // first.** macOS has no cgroup and no substitute for one, so there is
+    // nothing here that could contain a child at creation. A driver that
+    // accepted this config and ran the program anyway would give a caller a
+    // sandbox with none of the containment it asked for, and would say
+    // nothing. See `../Sandbox.zig`'s own `Containment` and
+    // `expresses.cgroup_placement`, which is the same fact at compile time for
+    // a caller that would rather not build such a config at all.
+    switch (config.containment) {
+        .best_effort => {},
+        .supplied => return error.CgroupPlacementUnsupported,
+    }
+
     if (expressibleOn(config) != null) return error.NoMountNamespace;
 
     // **A filtered config is refused rather than downgraded.** Darwin closes
@@ -966,6 +979,50 @@ test "a capped scratch area is refused rather than quietly left out" {
     };
     try std.testing.expectEqual(Inexpressible.scratch_area, expressibleOn(config).?);
     try std.testing.expectError(error.NoMountNamespace, spawn(std.testing.allocator, config, &.{"/bin/true"}, null, null));
+}
+
+test "a cgroup the caller made is refused by name, and refused before every other check" {
+    // **macOS has no cgroup and no substitute for one**, so a caller that
+    // handed one over and got a running program would have a sandbox with
+    // none of the containment it asked for. The refusal names the thing that
+    // is missing, and it comes first, so a config that is otherwise perfectly
+    // expressible here still refuses.
+    //
+    // Mutation check: drop the `config.containment` switch in `spawn` and the
+    // first call below answers `error.NoMountNamespace`, which reads as a
+    // mount problem for a config that has no mounts at all. Move the switch
+    // after `expressibleOn` and the second call answers the same.
+    const placeable = Config{
+        .root = "/",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+        .containment = .{ .supplied = .{ .fd = 7 } },
+    };
+    // Nothing about this config needs a mount tree, so `NoMountNamespace`
+    // would be the wrong word for it on every platform.
+    try std.testing.expectEqual(@as(?Inexpressible, null), expressibleOn(placeable));
+    try std.testing.expectError(
+        error.CgroupPlacementUnsupported,
+        spawn(std.testing.allocator, placeable, &.{"/bin/true"}, null, null),
+    );
+
+    // And a config that this platform could not express either way still
+    // names the cgroup, because that is the field the caller has to change
+    // first: no rearrangement of the mounts makes a cgroup appear on macOS.
+    var also_unmountable = placeable;
+    also_unmountable.root = "/somewhere-else";
+    try std.testing.expectError(
+        error.CgroupPlacementUnsupported,
+        spawn(std.testing.allocator, also_unmountable, &.{"/bin/true"}, null, null),
+    );
+
+    // **And this build says so at compile time**, for a caller that would
+    // rather not build such a config at all. `expresses.cgroup_placement` and
+    // the refusal above must agree, or a caller is told one thing and given
+    // another.
+    try std.testing.expectEqual(builtin.os.tag == .linux, iface.expresses.cgroup_placement);
 }
 
 test "a read only bind takes write away, and a later read write bind gives it back" {

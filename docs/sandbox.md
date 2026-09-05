@@ -245,6 +245,42 @@ is given up with a row on the policy table and never with a key in this file:
 see "A project that needs a just in time compiler" above. That is where the
 ratchet already has an answer for who may widen a thing and who authorises it.
 
+### A cgroup the caller made
+
+Everything above is for the cgroup Chock makes. A program that embeds
+`chock-sandbox` as a library can hand it a cgroup instead, with
+`Config.containment`, and that is a different promise:
+
+| | who makes the cgroup | who writes the limits | when the process goes in | when it cannot be done |
+|---|---|---|---|---|
+| the default | Chock | Chock | after the fork, first act of the child | the program runs with the rlimit floor |
+| a supplied cgroup | the caller | the caller | at creation | `spawn` refuses |
+
+**Chock writes no limit file into a cgroup it was given.** Not `memory.max`,
+not `memory.swap.max`, not `pids.max`. The caller owns that tree and the
+numbers in it, and a second writer is how two numbers stop agreeing. Chock
+reads nothing out of it either, so a program the caller's own `memory.max`
+killed arrives as a bare SIGKILL that Chock does not name. The caller holds
+that cgroup and can read its own `memory.events`.
+
+**The process is created inside it, and is never outside it.** Linux does that
+with `clone3` and `CLONE_INTO_CGROUP`, which charges the new task to the
+destination cgroup as it makes it. The alternative, a write to `cgroup.procs`
+after the fork, leaves a window in which the child is in the caller's own
+cgroup, and a process that runs even briefly outside its cgroup can fork faster
+than the write that would contain it.
+
+**It refuses rather than degrades.** `CLONE_INTO_CGROUP` needs Linux 5.7. On an
+older kernel, on a descriptor that is not a cgroup v2 directory, or where a
+seccomp filter answers `ENOSYS` for `clone3`, `spawn` answers
+`error.CgroupPlacementUnsupported` or `error.CgroupPlacementRefused` and starts
+nothing. There is no second attempt without the cgroup. macOS has no cgroup at
+all and refuses such a config before it allocates anything.
+
+The limits report then reads `supplied` for the cgroup row, which says exactly
+what happened: the program is contained, and Chock wrote none of what contains
+it. Nothing in Chock itself uses this today. A tool call takes the default.
+
 ## The sandbox on macOS, and what it does not do
 
 **A session runs on macOS, with four layers on.** Seatbelt holds the paths, the

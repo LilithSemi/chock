@@ -921,8 +921,14 @@ fn cgroupRow(
     const view = vantageNote(vantage);
     return .{
         .name = "cgroup v2",
+        // **`supplied` cannot come from the measurement this row reads.**
+        // `cgroupRow` is given what `cgroup.Cgroup.create` answered, and that
+        // call makes chock's own cgroup and never takes one from a caller. The
+        // arm is here so the switch stays exhaustive, and it reads `on`
+        // because a supplied cgroup really does hold the program. The sentence
+        // beside it says who wrote the numbers in it.
         .state = switch (found) {
-            .ok => .on,
+            .ok, .supplied => .on,
             .off => .off,
             .unsupported => .unsupported,
             .unavailable => .unavailable,
@@ -933,7 +939,7 @@ fn cgroupRow(
         },
         .why = "the memory and pids controllers are delegated, so a tool call has a resident memory bound and a process count bound",
         .fix = switch (found) {
-            .ok, .off => "",
+            .ok, .off, .supplied => "",
             .unsupported, .unavailable => view.fix orelse fixFor(found),
         },
         .blocks = false,
@@ -1006,7 +1012,10 @@ fn fixFor(found: CgroupSupport) []const u8 {
         "your own user manager owns.";
 
     return switch (found) {
-        .ok, .off => "",
+        // A supplied cgroup names nothing to fix on this machine: the caller
+        // made it and the caller holds it. See `cgroupRow` for why this row
+        // never reads that answer at all.
+        .ok, .off, .supplied => "",
         .unsupported, .unavailable => |reason| switch (reason) {
             .no_cgroup2_tree,
             .no_cgroup2_mount,

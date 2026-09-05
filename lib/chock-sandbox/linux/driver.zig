@@ -13,6 +13,7 @@
 //! implements, and `../darwin/driver.zig` for the driver beside it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const landlock = @import("landlock.zig");
 const namespace = @import("namespace.zig");
@@ -21,7 +22,6 @@ const bpf = @import("bpf.zig");
 const rlimits = @import("rlimits.zig");
 const cgroup = @import("cgroup.zig");
 const netbroker = @import("netbroker.zig");
-
 const iface = @import("../Sandbox.zig");
 const Config = iface.Config;
 const SetupError = iface.SetupError;
@@ -181,6 +181,63 @@ test "the filter the default config gets is the filter a caller with no options 
     try std.testing.expectEqualSlices(bpf.Insn, plain, defaulted);
 }
 
+/// Whether `kernel` can put a child into the cgroup `containment` names as it
+/// creates it.
+///
+/// **A function of its own, so a test can ask the question without an old
+/// kernel**, the same reason `seccompOptionsFor` above is one. The refusal
+/// this decides cannot be measured any other way in this project: nobody here
+/// can run a 5.6 kernel, and a test that only ran on the machine it was
+/// written on would prove the decision on exactly one release.
+///
+/// `best_effort` is always possible, because it promises nothing a kernel can
+/// take away: a machine with no cgroup v2 tree at all still runs the program
+/// with the rlimit floor. `supplied` needs `CLONE_INTO_CGROUP`. See
+/// `cgroup.clone_into_cgroup_since` for the release and for why the floor this
+/// library already keeps does not make the check dead code.
+fn placementIsPossible(kernel: rlimits.Release, containment: iface.Containment) bool {
+    return switch (containment) {
+        .best_effort => true,
+        .supplied => kernel.atLeast(cgroup.clone_into_cgroup_since),
+    };
+}
+
+test "a caller supplied cgroup is refused below 5.7, and chock's own cgroup is refused on no kernel" {
+    // **The kernel floor, asked at every boundary that matters.** 5.7 is the
+    // release that added `CLONE_INTO_CGROUP`. `clone3` itself is older, at
+    // 5.3, so the flag is the only number to compare against.
+    //
+    // Mutation check: read `clone_into_cgroup_since` as 5.3, the `clone3`
+    // release, and the 5.6 line below passes when it must fail. Answer `true`
+    // for `.supplied` and three lines fail at once.
+    const supplied = iface.Containment{ .supplied = .{ .fd = 7 } };
+
+    try std.testing.expect(!placementIsPossible(.{ .major = 4, .minor = 19 }, supplied));
+    try std.testing.expect(!placementIsPossible(.{ .major = 5, .minor = 3 }, supplied));
+    try std.testing.expect(!placementIsPossible(.{ .major = 5, .minor = 6 }, supplied));
+    try std.testing.expect(placementIsPossible(.{ .major = 5, .minor = 7 }, supplied));
+    try std.testing.expect(placementIsPossible(.{ .major = 6, .minor = 18 }, supplied));
+
+    // **A kernel this file could not read at all reads as 0.0**, which is
+    // older than every real release, so an unreadable `uname` refuses the
+    // placement rather than attempting it. See `rlimits.runningKernel`.
+    try std.testing.expect(!placementIsPossible(.{ .major = 0, .minor = 0 }, supplied));
+
+    // And the other promise is refused by no kernel at all. Chock's own
+    // cgroup is best effort, and a machine that cannot give one still runs
+    // the program with the rlimit floor: that is the behaviour every caller
+    // had before a caller could supply a cgroup, and this line is what stops
+    // a later change taking it away.
+    for ([_]rlimits.Release{
+        .{ .major = 0, .minor = 0 },
+        .{ .major = 4, .minor = 19 },
+        .{ .major = 5, .minor = 6 },
+        .{ .major = 6, .minor = 18 },
+    }) |kernel| {
+        try std.testing.expect(placementIsPossible(kernel, .best_effort));
+    }
+}
+
 /// Start a program in the sandbox and wait for it.
 ///
 /// Call this from a single threaded process, the same requirement
@@ -240,6 +297,13 @@ test "the filter the default config gets is the filter a caller with no options 
 /// pdeathsig ran on past 28 KB of output with nothing that named it. See
 /// `armPdeathsig` and `cgroup.Cgroup.destroy`.
 ///
+/// **A caller supplied cgroup gets the pdeathsig chain alone, for the same
+/// reason and by the same rule.** `cgroup.kill` is a write, and this function
+/// makes no write of any kind into a cgroup it was given: the caller owns that
+/// tree, and one write there is the first step towards two owners. A caller
+/// that wants the cgroup kill as well holds the cgroup and can write it
+/// itself, after `spawn` has returned. See `iface.Containment`.
+///
 /// **The middle process is also the process group of the whole sandbox.** That
 /// process calls `setpgid(0, 0)` before it makes anything else, so the group's
 /// own identifier is that same number: see `newProcessGroup`, which still
@@ -268,6 +332,20 @@ pub fn spawn(
         .filtered => if (config.net_broker == null) return error.NetBrokerMissing,
         .none, .host => if (config.net_broker != null) return error.NetBrokerNotFiltered,
     }
+
+    // Read once, here, and used twice below: for the placement decision and
+    // for the `RLIMIT_NPROC` decision the limits report carries. One read of
+    // one kernel, so the two answers cannot disagree.
+    const kernel = rlimits.runningKernel();
+
+    // **The caller supplied cgroup is refused on an old kernel, before
+    // anything is built and before anything is forked.** The only other way
+    // into a cgroup is a write to `cgroup.procs` after the fork, which leaves
+    // the child outside the caller's cgroup for as long as it takes to reach
+    // that write. A caller that asked for containment at creation and got that
+    // window instead would believe in a bound it does not have, so this
+    // refuses and does not fall back.
+    if (!placementIsPossible(kernel, config.containment)) return error.CgroupPlacementUnsupported;
 
     const abi = landlock.probeAbi() catch return error.LandlockUnavailable;
     if (landlock_report) |report| report.* = .{ .abi = abi, .features = landlock.featuresFor(abi) };
@@ -321,19 +399,33 @@ pub fn spawn(
     // see `rlimits.zig`'s own top comment on why both layers exist. What must
     // not happen is a caller believing in a bound that is not there, and
     // `group.support` is what stops that.
-    var group: cgroup.Cgroup = if (config.limits.wantsCgroup())
-        cgroup.Cgroup.create(
-            config.limits.memory_bytes,
-            config.limits.processes,
-            cgroup_seed.fetchAdd(1, .monotonic),
-        )
-    else
-        .{ .support = .off };
+    //
+    // **Nothing here runs for a caller supplied cgroup, and that is the whole
+    // second half of that promise.** The caller owns that tree and the numbers
+    // in it. Chock writes no `memory.max`, no `pids.max` and no
+    // `memory.swap.max` into it, because a second writer is how two numbers
+    // disagree, and it makes no cgroup of its own either: a process is in one
+    // cgroup, so a second directory would be an empty one nothing is ever
+    // charged to. `group` stays a value that owns nothing, so the `defer`
+    // below removes nothing, `readEvents` reads nothing, and the caller's own
+    // cgroup is untouched by every line of this function.
+    var group: cgroup.Cgroup = switch (config.containment) {
+        .best_effort => if (config.limits.wantsCgroup())
+            cgroup.Cgroup.create(
+                config.limits.memory_bytes,
+                config.limits.processes,
+                cgroup_seed.fetchAdd(1, .monotonic),
+            )
+        else
+            .{ .support = .off },
+        .supplied => .{ .support = .supplied },
+    };
     // Removed on every path out of this function, including the setup failure
-    // path below and every error return before the fork.
+    // path below and every error return before the fork. A `supplied` group
+    // has nothing to remove: see `cgroup.Support.applied`, which `destroy`
+    // reads first.
     defer group.destroy();
 
-    const kernel = rlimits.runningKernel();
     if (config.limits_report) |report| report.* = .{
         .limits = config.limits,
         .cgroup = group.support,
@@ -387,14 +479,35 @@ pub fn spawn(
         };
     }
 
-    const fork_rc = linux.fork();
+    // **The one place the two promises differ in what the kernel is asked
+    // for.** A supplied cgroup is not joined after the fork: the child is
+    // created inside it, in this one system call, so there is no instant at
+    // which it exists anywhere else. Everything the child goes on to make,
+    // which is B and every process B starts, inherits that membership. See
+    // `cgroup.forkInto`, and `joinCgroup` for the best effort half.
+    //
+    // **The plain `fork` stays on the best effort path on purpose.** That path
+    // has to work on a machine where `clone3` is refused, which a container
+    // runtime's own seccomp filter still does, and it already carries no
+    // promise a failure to place would break.
+    const fork_rc = switch (config.containment) {
+        .best_effort => linux.fork(),
+        .supplied => |supplied| cgroup.forkInto(supplied.fd),
+    };
     if (linux.errno(fork_rc) != .SUCCESS) {
         _ = linux.close(read_fd);
         _ = linux.close(write_fd);
         _ = linux.close(scratch_read_fd);
         _ = linux.close(scratch_write_fd);
         closeBrokerPair(&broker_fds);
-        return error.Unexpected;
+        // **A placement that was refused is named, and never retried without
+        // the cgroup.** No process was created, so nothing ran outside the
+        // caller's cgroup and nothing has to be cleaned up. The best effort
+        // path keeps the answer it always gave.
+        return switch (config.containment) {
+            .best_effort => error.Unexpected,
+            .supplied => error.CgroupPlacementRefused,
+        };
     }
     const pid: linux.pid_t = @intCast(fork_rc);
 
@@ -430,7 +543,16 @@ pub fn spawn(
         // make, which is B and everything B starts, so one write here bounds
         // the whole call. See `Cgroup.join` for why it is a descriptor and
         // not a path, and why the pid written is `0`.
-        joinCgroup(&group, write_fd, config.stderr_fd);
+        //
+        // **A supplied cgroup is never joined here, and the switch says so
+        // rather than leaving it to a descriptor that happens to be -1.** This
+        // process was created inside that cgroup, so a write would move it
+        // nowhere; and a later reader who added a join to this path would give
+        // a caller the very window the placement exists to close.
+        switch (config.containment) {
+            .best_effort => joinCgroup(&group, write_fd, config.stderr_fd),
+            .supplied => {},
+        }
 
         // Point descriptor 0 at /dev/null before any layer goes on. See the
         // comment on `redirectStdinToDevNull` for why.
@@ -3057,4 +3179,379 @@ test "a reaped number really does name somebody else, and the handle still reach
     // faults. Every other code is a real failure and names its own step.
     if (code == 20 or code == 28) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u8, 0), code);
+}
+
+test "a supplied cgroup the kernel refuses is reported by name, and nothing is forked" {
+    // **Refuse, never degrade, driven through the real `spawn`.** A caller
+    // that hands over a cgroup asked for the child to be created inside it.
+    // When the kernel says no, the only remaining way in is the write after
+    // the fork, which is exactly the window the placement exists to close. So
+    // `spawn` reports it and starts nothing.
+    //
+    // **A descriptor that is not a cgroup v2 directory is a world where the
+    // placement cannot work, and it needs no cgroup tree to build.** So this
+    // runs on a machine with no `/sys/fs/cgroup` at all, which is what a Nix
+    // build sandbox is.
+    //
+    // Mutation check: fall back to `linux.fork()` for a `.supplied` config
+    // that the kernel refused, and this comes back as `error.ExecFailed` from
+    // a child that really ran, with a `Middle` that names it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = try absoluteDirPath(&path_buffer, tmp.dir.handle);
+
+    const not_a_cgroup_rc = linux.open("/proc/self", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(not_a_cgroup_rc));
+    const not_a_cgroup: i32 = @intCast(not_a_cgroup_rc);
+    defer _ = linux.close(not_a_cgroup);
+
+    // A descriptor that names the wrong kind of thing, and a descriptor that
+    // names nothing at all. Both are refusals a real caller can produce, and
+    // neither may end with a program running outside the cgroup it asked for.
+    for ([_]std.posix.fd_t{ not_a_cgroup, -1 }) |fd| {
+        var middle: iface.Middle = .{};
+        defer iface.closeMiddle(&middle);
+
+        const err = spawn(std.testing.allocator, .{
+            .root = root_z,
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            .containment = .{ .supplied = .{ .fd = fd } },
+        }, &.{"/does-not-exist"}, null, &middle);
+
+        if (err) |_| {
+            return error.TestUnexpectedResult;
+        } else |actual| {
+            // A kernel with no Landlock is a valid environment, and `spawn`
+            // probes that before it reaches the fork. The same skip every
+            // other Landlock test in this library takes.
+            if (actual == error.LandlockUnavailable) return error.SkipZigTest;
+            try std.testing.expectEqual(error.CgroupPlacementRefused, actual);
+        }
+
+        // **Nothing was created**, which is the half a returned error alone
+        // does not prove. `Middle.pid` is written straight after the fork
+        // succeeds, so a zero here says the fork never happened, and there is
+        // no handle either.
+        try std.testing.expectEqual(@as(std.posix.pid_t, 0), middle.pid);
+        try std.testing.expectEqual(@as(std.posix.fd_t, -1), middle.fd);
+    }
+}
+
+/// The cgroup a `spawn` test supplies, and the sibling the caller of that
+/// `spawn` sits in. Both are made directly under the ancestor that delegates
+/// the controllers, so each one has its own `pids.max` and neither needs
+/// `cgroup.subtree_control` written anywhere.
+const TestCgroupPair = struct {
+    parent_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    parent_len: usize = 0,
+    target_buffer: [std.fs.max_path_bytes]u8 = undefined,
+    target_len: usize = 0,
+
+    fn parent(self: *const TestCgroupPair) []const u8 {
+        return self.parent_buffer[0..self.parent_len];
+    }
+
+    fn target(self: *const TestCgroupPair) []const u8 {
+        return self.target_buffer[0..self.target_len];
+    }
+};
+
+/// The `memory.max` a test writes into the cgroup it supplies. **Not one of
+/// `rlimits.Limits`' own defaults**, and not a round number a caller would
+/// pick: the check afterwards is that this exact value is still there, so a
+/// number chock might also have written would prove nothing.
+const supplied_memory_max = "100663296";
+
+/// The `pids.max` a test writes into the cgroup it supplies. Large enough for
+/// the two processes `spawn` makes and everything they start, and different
+/// from `rlimits.default_processes`, for the same reason as above.
+const supplied_pids_max = "97";
+
+test "spawn puts the sandboxed program in the caller's own cgroup at creation, and writes nothing into it" {
+    // **The end to end half of the placement, with the same discriminator the
+    // mechanism test in `cgroup.zig` uses.** A test that only reads the
+    // child's membership afterwards cannot tell `CLONE_INTO_CGROUP` from a
+    // write to `cgroup.procs` after the fork: both end with the child in the
+    // right place. The kernel's own `pids` accounting can. It charges a new
+    // task to the **destination** cgroup when the clone names one, and to the
+    // **current** cgroup when it does not, so a process whose own cgroup has
+    // no room left cannot fork at all and can still clone into one that has.
+    //
+    // So the child below tightens its own cgroup to exactly its current count
+    // and then calls `spawn` twice:
+    //
+    // * `.best_effort`, which forks, and must fail because that child would
+    //   have been charged to the cgroup the caller is in. This is the window
+    //   the design forbids, measured rather than argued.
+    // * `.supplied`, which clones into the cgroup the test made, and must
+    //   build the whole sandbox and reach `execve`.
+    //
+    // Mutation check: read the `.supplied` arm of `spawn`'s own fork as
+    // `linux.fork()` and the second call comes back `error.Unexpected`, which
+    // is exit code 3 below. Make chock write its own limits into a supplied
+    // cgroup and the two file comparisons at the end fail.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // **Asked before anything is tightened, because asking forks.** A machine
+    // that will not give a user namespace cannot build a sandbox at all, so
+    // the `.supplied` call would fail for a reason that has nothing to do with
+    // a cgroup.
+    if (!namespace.probeAvailability().available()) return error.SkipZigTest;
+
+    var pair = TestCgroupPair{};
+    if (!makeTestCgroupPair(&pair)) return error.SkipZigTest;
+    defer removeTestCgroup(pair.parent());
+    defer removeTestCgroup(pair.target());
+
+    // **The caller writes the limits, and chock must leave them alone.** These
+    // exact strings are read back at the end of this test.
+    if (!writeTestCgroupFile(pair.target(), "memory.max", supplied_memory_max)) return error.SkipZigTest;
+    if (!writeTestCgroupFile(pair.target(), "pids.max", supplied_pids_max)) return error.SkipZigTest;
+
+    var target_z: [std.fs.max_path_bytes]u8 = undefined;
+    const target_path = nullTerminate(&target_z, pair.target()) orelse return error.SkipZigTest;
+    const target_fd_rc = linux.open(
+        target_path.ptr,
+        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+        0,
+    );
+    if (linux.errno(target_fd_rc) != .SUCCESS) return error.SkipZigTest;
+    const target_fd: i32 = @intCast(target_fd_rc);
+    defer _ = linux.close(target_fd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = try absoluteDirPath(&path_buffer, tmp.dir.handle);
+
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{})));
+    defer _ = linux.close(fds[0]);
+
+    // **Everything below runs in a forked child.** It moves *itself* into a
+    // cgroup this test made and tightens *that* cgroup, so this process keeps
+    // its own cgroup and its own ability to fork whatever happens.
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        std.process.exit(measureSuppliedPlacement(&pair, target_fd, root_z));
+    }
+
+    _ = linux.close(fds[1]);
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+
+    const code = linux.W.EXITSTATUS(status);
+    // 10: this machine would not let the child into a cgroup of its own or
+    // would not let it write `pids.max`. 11: no Landlock, so no sandbox was
+    // ever built. Both are environments and neither is a measurement.
+    if (code == 10 or code == 11) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), code);
+
+    // **And the caller's numbers are the caller's own, still.** Chock's
+    // defaults are a different memory ceiling and a different process count,
+    // so a chock that wrote into this cgroup would leave one of these two
+    // lines reading its number instead of the test's.
+    var buffer: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        supplied_memory_max,
+        readTestCgroupFile(pair.target(), "memory.max", &buffer) orelse return error.SkipZigTest,
+    );
+    try std.testing.expectEqualStrings(
+        supplied_pids_max,
+        readTestCgroupFile(pair.target(), "pids.max", &buffer) orelse return error.SkipZigTest,
+    );
+    // `memory.swap.max` is the third file chock writes for a cgroup of its
+    // own, and it writes `0` there. A fresh cgroup reads `max`, so this line
+    // catches a write the two above would miss.
+    try std.testing.expectEqualStrings(
+        "max",
+        readTestCgroupFile(pair.target(), "memory.swap.max", &buffer) orelse return error.SkipZigTest,
+    );
+}
+
+/// The whole measurement, in the forked child that owns it. Answers the exit
+/// code the test above reads. Never returns a value the caller has to
+/// interpret twice: 0 is the measurement, 10 and 11 are environments, and
+/// every other code names the assertion that did not hold.
+fn measureSuppliedPlacement(
+    pair: *const TestCgroupPair,
+    target_fd: i32,
+    root_z: [:0]const u8,
+) u8 {
+    // This process into the sibling cgroup, and that cgroup with no room for
+    // one more process.
+    if (!writeTestCgroupFile(pair.parent(), "cgroup.procs", "0")) return 10;
+    var buffer: [4096]u8 = undefined;
+    const current = readTestCgroupFile(pair.parent(), "pids.current", &buffer) orelse return 10;
+    if (!writeTestCgroupFile(pair.parent(), "pids.max", current)) return 10;
+
+    // **The sandbox's own diagnostics go to /dev/null.** `execve` on a path
+    // that is not there is the expected end of the second call, and the child
+    // says so on this descriptor. `build.zig` fails a test binary that writes
+    // one byte to standard error.
+    const devnull_rc = linux.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
+    if (linux.errno(devnull_rc) != .SUCCESS) return 10;
+    const devnull: i32 = @intCast(devnull_rc);
+
+    // **The page allocator, and never the test's own.** This is a forked child
+    // of a test binary, and the testing allocator's own bookkeeping belongs to
+    // the process this one was copied from.
+    const base = Config{
+        .root = root_z,
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+        .stderr_fd = devnull,
+    };
+
+    // The window, measured. A fork from here is charged to this process's own
+    // cgroup, which is full, so the call cannot even make its first process.
+    const best_effort = base;
+    if (spawn(std.heap.page_allocator, best_effort, &.{"/does-not-exist"}, null, null)) |_| {
+        return 2;
+    } else |err| {
+        if (err == error.LandlockUnavailable) return 11;
+        if (err != error.Unexpected) return 2;
+    }
+
+    // The placement, in exactly the same conditions. The only thing that
+    // changed is which cgroup the kernel charges the new process to.
+    var report: LimitsReport = undefined;
+    var supplied = base;
+    supplied.containment = .{ .supplied = .{ .fd = target_fd } };
+    supplied.limits_report = &report;
+    if (spawn(std.heap.page_allocator, supplied, &.{"/does-not-exist"}, null, null)) |_| {
+        return 3;
+    } else |err| {
+        if (err == error.LandlockUnavailable) return 11;
+        // `ExecFailed` is the last step of the setup, so every layer before
+        // it came up. Anything else means the sandbox stopped earlier and
+        // this proves nothing about the placement.
+        if (err != error.ExecFailed) return 3;
+    }
+
+    // **And the report says who wrote the limits.** `ok` would claim chock
+    // applied a memory bound it never wrote, and `off` would claim nothing
+    // bounds the program at all.
+    if (report.cgroup != .supplied) return 4;
+    // Nothing was counted, because nothing of chock's own was there to count.
+    if (report.events.oom_kills != 0 or report.events.fork_refusals != 0) return 5;
+
+    return 0;
+}
+
+/// Make the two cgroups the placement test needs, under the ancestor that
+/// delegates the controllers. False when this machine has no such ancestor,
+/// which is a machine the test skips on.
+fn makeTestCgroupPair(pair: *TestCgroupPair) bool {
+    // The library's own walk, rather than a second one written here: a test
+    // that made its cgroup somewhere else would not be testing the place a
+    // real call uses. `create` makes one, and its path names the ancestor.
+    var probe = cgroup.Cgroup.create(1 << 30, 64, 0xC10E0);
+    defer probe.destroy();
+    if (!probe.support.applied()) return false;
+
+    const ancestor = std.fs.path.dirname(probe.path()) orelse return false;
+
+    // The name carries this process's own live pid, the shape
+    // `cgroup.sweepStaleSiblings` reads, so a sweep in another chock process
+    // reads the maker as alive and leaves these alone, and a run that dies
+    // before its cleanup leaves directories a later sweep removes by itself.
+    pair.parent_len = makeTestCgroup(&pair.parent_buffer, ancestor, 0xC10E3) orelse return false;
+    pair.target_len = makeTestCgroup(&pair.target_buffer, ancestor, 0xC10E4) orelse return false;
+    return true;
+}
+
+fn makeTestCgroup(buffer: []u8, ancestor: []const u8, seq: u64) ?usize {
+    const written = std.fmt.bufPrint(
+        buffer,
+        "{s}/chock.{d}.{d}",
+        .{ ancestor, linux.getpid(), seq },
+    ) catch return null;
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    const zeroed = nullTerminate(&path_z, written) orelse return null;
+    if (linux.errno(linux.mkdirat(linux.AT.FDCWD, zeroed, 0o755)) != .SUCCESS) return null;
+    return written.len;
+}
+
+/// Remove a cgroup this test made, once the kernel has finished accounting the
+/// exits of what was in it. **A retry and not one call**: `rmdir` on a cgroup
+/// answers `EBUSY` until the last exit is counted, which is a gap
+/// `cgroup.zig`'s own `remove_pause_ns` has the measurement for.
+fn removeTestCgroup(path: []const u8) void {
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    const zeroed = nullTerminate(&path_z, path) orelse return;
+    var attempt: usize = 0;
+    while (attempt < 400) : (attempt += 1) {
+        switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, zeroed, linux.AT.REMOVEDIR))) {
+            .SUCCESS, .NOENT => return,
+            else => {},
+        }
+        const request = linux.timespec{ .sec = 0, .nsec = 500 * std.time.ns_per_us };
+        _ = linux.nanosleep(&request, null);
+    }
+}
+
+fn writeTestCgroupFile(dir: []const u8, name: []const u8, contents: []const u8) bool {
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const written = std.fmt.bufPrint(&full, "{s}/{s}", .{ dir, name }) catch return false;
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    const zeroed = nullTerminate(&path_z, written) orelse return false;
+
+    const fd_rc = linux.open(zeroed, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    // A cgroup control file takes the whole value in one write, so a short
+    // write is a refusal and never something to continue from.
+    const rc = linux.write(fd, contents.ptr, contents.len);
+    return linux.errno(rc) == .SUCCESS and rc == contents.len;
+}
+
+/// One cgroup control file, with the trailing newline the kernel writes taken
+/// off, so a caller compares the value and not the formatting.
+fn readTestCgroupFile(dir: []const u8, name: []const u8, buffer: []u8) ?[]const u8 {
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const written = std.fmt.bufPrint(&full, "{s}/{s}", .{ dir, name }) catch return null;
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    const zeroed = nullTerminate(&path_z, written) orelse return null;
+
+    const fd_rc = linux.open(zeroed, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const rc = linux.read(fd, buffer[filled..].ptr, buffer.len - filled);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS) return null;
+        if (rc == 0) break;
+        filled += rc;
+    }
+    return std.mem.trim(u8, buffer[0..filled], " \n\r");
+}
+
+fn nullTerminate(buffer: []u8, text: []const u8) ?[:0]const u8 {
+    if (text.len + 1 > buffer.len) return null;
+    @memcpy(buffer[0..text.len], text);
+    buffer[text.len] = 0;
+    return buffer[0..text.len :0];
 }

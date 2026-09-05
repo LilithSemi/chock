@@ -97,6 +97,13 @@ pub const expresses = struct {
     /// has no procfs at all, on the host or anywhere else, so a program there
     /// never looks for one and a build with none takes nothing away.
     pub const procfs = builtin.os.tag == .linux;
+
+    /// A cgroup the caller made, with the child put inside it as the kernel
+    /// creates it. See `Config.containment`. Linux does this with `clone3` and
+    /// `CLONE_INTO_CGROUP`. macOS has no cgroup and no substitute for one, so
+    /// a build that answers false refuses such a config rather than running it
+    /// with no containment at all: see `darwin/driver.zig`'s own `spawn`.
+    pub const cgroup_placement = builtin.os.tag == .linux;
 };
 
 /// The path a mount source or a Landlock rule must name for `path` on this
@@ -241,6 +248,31 @@ pub const Config = struct {
     /// every other field on this struct: it refuses before it reaches a
     /// layer at all. See `darwin/driver.zig`.
     limits: Limits = .{},
+    /// Which cgroup holds this program, and which of the two promises that is.
+    /// See `Containment`, which carries the whole rule.
+    ///
+    /// **The default is the behaviour every caller had before this field
+    /// existed**: chock makes a cgroup out of `limits`, best effort, and a
+    /// machine that cannot give one still runs the program.
+    ///
+    /// A caller that names `.supplied` gets a different contract. Chock writes
+    /// **no** limit file into that cgroup, because the caller owns the tree
+    /// and a second writer is how two numbers disagree, and the child is put
+    /// inside it as the kernel creates it. `limits` is still read on that
+    /// path, for the rlimit floor alone, which is per process state and not a
+    /// write into anybody's cgroup. `LimitsReport.cgroup` then answers
+    /// `supplied`, which says exactly that: the program is contained, and
+    /// chock wrote none of what contains it.
+    ///
+    /// **Refused rather than degraded when it cannot be done.** See
+    /// `SpawnError.CgroupPlacementUnsupported` and
+    /// `SpawnError.CgroupPlacementRefused`.
+    ///
+    /// **`Config.copy` carries this across as it is**, the same as the three
+    /// descriptor fields, because a descriptor is a number in this process and
+    /// not memory to duplicate. A config that outlives the caller that opened
+    /// the descriptor must therefore keep that descriptor open too.
+    containment: Containment = .best_effort,
     /// The writable areas the sandbox owns, each one a tmpfs of its own with a
     /// hard cap on how much it can hold. Empty by default, so a caller that
     /// names none gets none.
@@ -458,6 +490,68 @@ pub const NetBroker = struct {
     }
 };
 
+/// Which cgroup holds the sandboxed program, and **which of the two promises
+/// that is**. The two are different promises and not two ways of doing one
+/// thing, so they are two members of one union rather than one nullable
+/// field: a caller names exactly one, and a driver's switch on this cannot
+/// silently treat the second as the first.
+///
+/// | | who makes the cgroup | who writes the limits | when the process goes in | what happens when it cannot |
+/// |---|---|---|---|---|
+/// | `best_effort` | chock | chock | after the fork, first act of the child | the program runs with the rlimit floor |
+/// | `supplied` | the caller | the caller | at creation, and never after | `spawn` refuses |
+///
+/// **The right hand column is the whole reason this type exists.** Chock's
+/// own cgroup is best effort on purpose: a machine with no cgroup v2 tree
+/// still gets every rlimit, and `LimitsReport.cgroup` says plainly what it did
+/// not get, so nobody believes in a bound that is not there. A caller that
+/// hands over a cgroup is asking a different question. It made that cgroup, it
+/// holds limits in it that chock never wrote, and it asked for the child to be
+/// inside it from the first instruction. Chock cannot answer that question
+/// half way. Either the kernel puts the child in at creation, or `spawn`
+/// refuses and the caller learns that at once.
+///
+/// **A fall back to the post fork write is exactly what must not happen.** A
+/// process that runs even briefly outside its cgroup can fork faster than the
+/// write that would contain it, and a fork that got out is not called back.
+pub const Containment = union(enum) {
+    /// Chock makes a cgroup for this call, writes `Config.limits` into it,
+    /// reads the counters back afterwards, and removes it. **Best effort.** A
+    /// machine with no cgroup v2 tree, or one that delegates no controller,
+    /// runs the program anyway with the rlimit floor and says so through
+    /// `LimitsReport.cgroup`.
+    ///
+    /// The default, so every caller that has never heard of this field keeps
+    /// the behaviour it always had.
+    best_effort,
+    /// The caller's own cgroup, and the child is created inside it.
+    supplied: Supplied,
+
+    /// A cgroup the caller made and still owns.
+    pub const Supplied = struct {
+        /// An open descriptor on the cgroup v2 **directory**, not on any file
+        /// in it.
+        ///
+        /// **A descriptor and not a path, for three reasons.** The kernel
+        /// takes a descriptor for `CLONE_INTO_CGROUP` and resolves no name at
+        /// clone time, so there is nothing to race: a directory that is
+        /// renamed, removed or replaced between the caller's own check and the
+        /// clone cannot make the child land somewhere else. A descriptor also
+        /// carries the caller's own permission to that cgroup, which is the
+        /// authority this placement runs on, rather than asking chock to
+        /// resolve a path it has no business interpreting. And it is the shape
+        /// this library already uses for the same class of problem: see
+        /// `linux/cgroup.zig`'s own `Cgroup.procs_fd`.
+        ///
+        /// **The caller opens it and the caller closes it.** `spawn` never
+        /// closes this, never writes through it, and never keeps it. It is
+        /// also not exempted from the pass that closes every inherited
+        /// descriptor before a program runs, so the sandboxed program is never
+        /// handed a descriptor on the caller's own cgroup tree.
+        fd: std.posix.fd_t,
+    };
+};
+
 /// How much of the machine one sandboxed program may consume. See
 /// `linux/rlimits.zig`, which owns the type and every default in it.
 pub const Limits = rlimits.Limits;
@@ -479,8 +573,17 @@ pub const Limits = rlimits.Limits;
 /// believe in a bound that is not there.
 pub const LimitsReport = struct {
     /// The numbers that were asked for.
+    ///
+    /// **Asked for, and not necessarily applied.** Which of them a cgroup
+    /// really carried is what `cgroup` below says, and it is the field to read
+    /// before believing a number here bounded anything.
     limits: Limits = .{},
     /// Whether the cgroup half went on, and why not when it did not.
+    ///
+    /// **`supplied` is the answer for a caller supplied cgroup, and it says
+    /// chock wrote nothing.** The program is contained on that path, and every
+    /// number in `limits` above that only a cgroup can carry was written by
+    /// the caller and not by chock. See `Containment` and `cgroup.Support`.
     cgroup: cgroup.Support = .off,
     /// Whether `RLIMIT_NPROC` went on. False on a kernel older than 5.14,
     /// where it counts the user's own processes on the host rather than the
@@ -490,6 +593,12 @@ pub const LimitsReport = struct {
     /// What the kernel counted inside the cgroup while the program ran. All
     /// zero when there was no cgroup, which reads the same as "no cgroup
     /// limit was reached" and is the truth in that case.
+    ///
+    /// **Also all zero for a caller supplied cgroup, and there it is an
+    /// absence and not a measurement.** Chock reads nothing out of a cgroup it
+    /// does not own, so a program the caller's own `memory.max` killed arrives
+    /// as a bare `SIGKILL` that nothing here names. The caller holds that
+    /// cgroup and can read its own `memory.events`.
     events: cgroup.Events = .{},
     /// True when a scratch area had no space left in it when the program
     /// ended. Read from the filesystem itself, because nothing in the kernel
@@ -693,6 +802,28 @@ pub const SpawnError = error{
     NetBrokerNotFiltered,
     /// The socket pair that carries the requests could not be made.
     NetBrokerSocketFailed,
+    /// `Config.containment` is `.supplied` and this build cannot put a child
+    /// into a cgroup as the kernel creates it. On Linux that means a kernel
+    /// older than `linux/cgroup.zig`'s own `clone_into_cgroup_since`. On
+    /// Darwin it means the platform, which has no cgroup at all.
+    ///
+    /// **Refused and never degraded.** The remaining way to get a process into
+    /// a cgroup is to write `cgroup.procs` after the fork, and that leaves a
+    /// window in which the child is outside the cgroup the caller asked for.
+    /// A caller that got that window and was not told would believe in a
+    /// containment it does not have.
+    CgroupPlacementUnsupported,
+    /// `Config.containment` is `.supplied` and the kernel refused to create
+    /// the child inside that cgroup. The descriptor may name something that is
+    /// not a cgroup v2 directory, the cgroup may not be able to hold
+    /// processes, it may already be at its own `pids.max`, or a seccomp filter
+    /// may answer `ENOSYS` for `clone3`.
+    ///
+    /// **Nothing ran.** The refusal comes from the system call that would have
+    /// created the process, so no process was created and no program was
+    /// started. See `CgroupPlacementUnsupported` for why there is no second
+    /// attempt.
+    CgroupPlacementRefused,
 } || SetupError || std.mem.Allocator.Error;
 
 /// What `spawn` learned about the Landlock layer while it built the sandbox.
@@ -869,6 +1000,31 @@ test "a copied config shares no memory with the original, scratch areas included
     // on purpose: a number is not memory to duplicate, and the report points at
     // storage this function has no business copying.
     try std.testing.expectEqual(original.limits, copied.limits);
+    // `containment` is the same case again, and it is a descriptor rather
+    // than a pointer: a number in this process, which duplicating would only
+    // make into a second handle nobody closes. So the copy names the caller's
+    // own cgroup, and a caller whose config outlives the descriptor it named
+    // must keep that descriptor open.
+    try std.testing.expectEqual(original.containment, copied.containment);
+    const supplied = try (Config{
+        .root = "/tmp/root",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+        .containment = .{ .supplied = .{ .fd = 11 } },
+    }).copy(arena);
+    // Read through a switch and not through the payload directly, so a copy
+    // that lost the tag fails with the two numbers printed rather than
+    // panicking on a union that holds the other member.
+    //
+    // Mutation check: write `out.containment = .best_effort;` in `copy` and
+    // this reads -1.
+    try std.testing.expectEqual(@as(std.posix.fd_t, 11), switch (supplied.containment) {
+        .supplied => |one| one.fd,
+        .best_effort => @as(std.posix.fd_t, -1),
+    });
+
     // `net_broker` is the same case: two pointers at the caller's own storage,
     // and duplicating either one would give the copy a broker nobody answers.
     // Carried across, so a config that outlives its arena keeps its channel

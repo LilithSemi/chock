@@ -74,6 +74,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+/// For `Release` and nothing else. `rlimits.zig` owns the one kernel version
+/// comparison this library makes, and `clone_into_cgroup_since` below is the
+/// second thing to need it. A second spelling of that comparison is how two
+/// answers about one kernel quietly stop agreeing. That file imports nothing
+/// from this one, so this import makes no cycle.
+const rlimits = @import("rlimits.zig");
 
 /// Where a cgroup v2 tree is mounted, in the order this file looks. The first
 /// is the ordinary unified mount. The second is where a hybrid systemd puts
@@ -109,6 +115,22 @@ pub const Support = union(enum) {
     /// spelled the two the same way would have a person looking for a kernel
     /// fault that is not there.
     off,
+    /// The caller gave a cgroup of its own, and the child was created inside
+    /// it. **Chock made no cgroup and wrote no limit file at all**, not
+    /// `memory.max`, not `pids.max`, and not `memory.swap.max`. The caller
+    /// owns that tree and the numbers in it.
+    ///
+    /// **A different answer from `ok`, and the difference is who wrote the
+    /// numbers.** `ok` says this file wrote the limits the caller asked for
+    /// and can read the counters back. This says the program is contained and
+    /// this file knows nothing about what bounds it. A report that spelled
+    /// the two the same way would claim chock applied a memory bound it never
+    /// wrote, which is the one thing this whole type exists to stop.
+    ///
+    /// **A different answer from `off` as well.** `off` says nothing bounds
+    /// the program through a cgroup. This says something does, and it is not
+    /// chock's.
+    supplied,
     /// This machine has no cgroup v2 tree this code can use.
     unsupported: Reason,
     /// The machine has one and this process may not use it.
@@ -162,6 +184,13 @@ pub const Support = union(enum) {
     /// floor whatever this answers; this only decides what the caller says
     /// about the layer, and whether there is a cgroup to read counters from
     /// and to remove afterwards.
+    ///
+    /// **`supplied` answers false, and that is not a mistake.** The program
+    /// really is in a cgroup on that path. What is false is that *this file*
+    /// applied a limit, and both of the other things this answer decides
+    /// follow from that: there are no counters of this file's own to read,
+    /// and there is no directory of this file's own to remove. A caller that
+    /// wants "is the program contained at all" reads the tag and not this.
     pub fn applied(self: Support) bool {
         return self == .ok;
     }
@@ -170,6 +199,7 @@ pub const Support = union(enum) {
         switch (self) {
             .ok => try writer.writeAll("the cgroup limits are on"),
             .off => try writer.writeAll("no cgroup limits were asked for"),
+            .supplied => try writer.writeAll("the caller's own cgroup holds the program, and chock wrote no limit into it"),
             .unsupported => |reason| try writer.print("no cgroup limits: {s}", .{reason.text()}),
             .unavailable => |reason| try writer.print("no cgroup limits: {s}", .{reason.text()}),
         }
@@ -305,6 +335,111 @@ pub const Events = struct {
     /// was refused because `pids.max` was already reached.
     fork_refusals: u64 = 0,
 };
+
+/// The kernel release that first has `CLONE_INTO_CGROUP`.
+///
+/// `clone3` itself arrived in Linux 5.3 and the flag in 5.7, so the newer of
+/// the two is the only number a caller compares against. Read with
+/// `rlimits.runningKernel().atLeast`, which is the one kernel comparison this
+/// library makes: see `rlimits.nproc_per_user_namespace_since`, which is the
+/// same shape for the same reason.
+///
+/// **A kernel below this refuses a caller supplied cgroup. It never falls
+/// back to a write after the fork.** A caller that hands over a cgroup asked
+/// for the child to be contained from its first instruction, and a process
+/// that runs even briefly outside its cgroup can fork faster than the write
+/// that would contain it. A silent fallback would leave that caller believing
+/// in a bound it did not get, which is worse than the plain refusal.
+///
+/// **The floor this library already keeps is higher than this number, and the
+/// check is still here.** `spawn` probes the Landlock ABI first and refuses a
+/// kernel with none, and Landlock is a 5.13 mechanism, so a machine that
+/// reaches a fork at all is newer than 5.7. What that argument does not cover
+/// is a seccomp filter that answers `ENOSYS` for `clone3`, which some
+/// container runtimes still ship. `forkInto` reads that as a refusal too, for
+/// the same reason: see its own comment.
+pub const clone_into_cgroup_since: rlimits.Release = .{ .major = 5, .minor = 7 };
+
+/// The `clone3` argument block. Named here rather than taken from the
+/// standard library, which has the flag and the system call number and not
+/// this structure.
+///
+/// **Every field is 8 byte aligned whatever the target is.** The kernel
+/// declares them `__aligned_u64`, and a 32 bit target that laid them out on 4
+/// bytes would hand the kernel a block whose fields are all in the wrong
+/// place while `size` still looked right.
+const CloneArgs = extern struct {
+    flags: u64 align(8) = 0,
+    pidfd: u64 align(8) = 0,
+    child_tid: u64 align(8) = 0,
+    parent_tid: u64 align(8) = 0,
+    exit_signal: u64 align(8) = 0,
+    stack: u64 align(8) = 0,
+    stack_size: u64 align(8) = 0,
+    tls: u64 align(8) = 0,
+    set_tid: u64 align(8) = 0,
+    set_tid_size: u64 align(8) = 0,
+    /// A descriptor on a cgroup v2 directory. The kernel reads it only when
+    /// `CLONE_INTO_CGROUP` is in `flags`.
+    cgroup: u64 align(8) = 0,
+};
+
+/// Make a child process **inside** the cgroup `dir_fd` names, in the one
+/// system call that creates it.
+///
+/// **This is the whole point of the caller supplied path, and it is a
+/// different promise from `Cgroup.join`.** `join` moves a process that
+/// already exists, so there is a window between the fork and the write in
+/// which the child is in the parent's cgroup and can fork faster than the
+/// write that would contain it. `CLONE_INTO_CGROUP` has no such window: the
+/// kernel charges the new task to the destination cgroup as it creates it,
+/// and the task never appears anywhere else. Everything the child goes on to
+/// make inherits that membership.
+///
+/// `dir_fd` must be a descriptor on the cgroup **directory**, not on any file
+/// in it. The caller opens it, the caller owns it, and this function neither
+/// closes it nor writes anything through it.
+///
+/// Answers exactly what `linux.fork` answers, so a caller reads it the same
+/// way: `linux.errno` on the result, and 0 in the child. **A refusal is a
+/// refusal and never a reason to fork anyway.** `ENOSYS` from a seccomp
+/// filter that does not know `clone3`, `EBADF` for a descriptor that is not a
+/// cgroup v2 directory, `EOPNOTSUPP` for a cgroup that cannot hold processes,
+/// and `EAGAIN` for one whose `pids.max` is already reached all arrive here,
+/// and every one of them means the child would not have been contained.
+pub fn forkInto(dir_fd: i32) usize {
+    // **SPARC returns from a system call through a register window, so a
+    // child that returns from an ordinary function call clobbers the parent's
+    // stack.** `linux.fork` has a whole separate assembly path for that
+    // reason. This function has none, so it refuses rather than answer with a
+    // child that corrupts its parent. This project builds for x86_64 and
+    // aarch64, where the ordinary path is correct.
+    if (comptime builtin.cpu.arch.isSPARC()) return refusal(.OPNOTSUPP);
+
+    // **A negative descriptor names nothing, and it is refused here rather
+    // than by the kernel.** The kernel reads this field as an unsigned number
+    // and answers `EINVAL` for one that does not fit an `int`, so -1 would
+    // arrive at a caller as a bad argument rather than as the bad descriptor
+    // it really is. `@intCast` below also has no meaning for a negative value.
+    if (dir_fd < 0) return refusal(.BADF);
+
+    var args = CloneArgs{
+        .flags = linux.CLONE.INTO_CGROUP,
+        // The same signal `linux.fork` sends, so the caller's own `waitpid`
+        // reaps this child exactly as it reaps a forked one.
+        .exit_signal = @intFromEnum(linux.SIG.CHLD),
+        .cgroup = @intCast(dir_fd),
+    };
+    return linux.syscall2(.clone3, @intFromPtr(&args), @sizeOf(CloneArgs));
+}
+
+/// `errno` as a system call return value, for a refusal this file makes
+/// itself rather than reads from the kernel. So a caller of `forkInto` reads
+/// every answer the one way, with `linux.errno`, and never has to know which
+/// of them the kernel wrote.
+fn refusal(errno_value: linux.E) usize {
+    return @bitCast(-@as(isize, @intFromEnum(errno_value)));
+}
 
 /// One cgroup, made for one `spawn` call and removed when that call is over.
 pub const Cgroup = struct {
@@ -1067,12 +1202,26 @@ test "a Support value says which of the three things happened, in words" {
         try std.fmt.bufPrint(&buffer, "{f}", .{Support{ .unavailable = .no_cgroup2_mount }}),
     );
 
+    // A caller's own cgroup reads as neither of the two above. "No limits
+    // were asked for" would be false, because the caller asked for its own
+    // and wrote them itself, and "the cgroup limits are on" would claim chock
+    // wrote a bound it never wrote.
+    try std.testing.expectEqualStrings(
+        "the caller's own cgroup holds the program, and chock wrote no limit into it",
+        try std.fmt.bufPrint(&buffer, "{f}", .{@as(Support, .supplied)}),
+    );
+
     // Only `ok` counts as applied. A caller that read `unavailable` as a
     // limit would report a bound that is not there, which is the one thing
     // this whole type exists to stop.
     try std.testing.expect(@as(Support, .ok).applied());
     try std.testing.expect(!(Support{ .unsupported = .no_cgroup2_tree }).applied());
     try std.testing.expect(!(Support{ .unavailable = .create_refused }).applied());
+    // **And `supplied` is not applied either.** This is what keeps `destroy`
+    // from removing a directory chock does not own and `readEvents` from
+    // reading counters out of it. A `supplied` that answered true here would
+    // have `spawn` delete the caller's own cgroup on the way out.
+    try std.testing.expect(!(@as(Support, .supplied)).applied());
 
     // Every reason reads differently, so a person can tell which one they
     // got. Two reasons with one sentence would be a report that names
@@ -1185,7 +1334,11 @@ test "a cgroup is made, holds the limits asked for, and is removed again" {
     defer group.destroy();
 
     switch (group.support) {
-        .off, .unsupported, .unavailable => {
+        // `supplied` is here for the switch and cannot come from `create`,
+        // which makes a cgroup of chock's own and never takes one from a
+        // caller. It belongs with the answers that made nothing, because
+        // `create` making one would be the fault.
+        .off, .supplied, .unsupported, .unavailable => {
             // Nothing was made, so nothing may be left behind, and there must
             // be no descriptor for a caller to write a pid into.
             try std.testing.expectEqual(@as(usize, 0), group.path_len);
@@ -1475,4 +1628,228 @@ test "the fallback signals every pid the cgroup lists, and nothing else" {
     const not_a_cgroup = testOpenDir("/proc/self") orelse return error.SkipZigTest;
     defer _ = linux.close(not_a_cgroup);
     try std.testing.expectEqual(@as(?usize, null), signalMembers(not_a_cgroup));
+}
+
+/// Remove a directory this test made, once the kernel has finished accounting
+/// whatever was in it. `testRemoveDir` above is the one call form, for a
+/// directory that was already empty; this is for one that held a process until
+/// a moment ago, where `rmdir` answers `EBUSY` until the last exit is counted.
+/// See `remove_pause_ns` for the measurement behind the wait.
+fn testRemoveDirWhenEmpty(path: []const u8) void {
+    var path_z: [std.fs.max_path_bytes]u8 = undefined;
+    const zeroed = nullTerminate(&path_z, path) orelse return;
+    removeWhenEmpty(linux.AT.FDCWD, zeroed);
+}
+
+/// Make one cgroup directly under the ancestor that delegates the controllers,
+/// named the way `makeUnder` names one. Null when it could not be made.
+///
+/// **The name carries this process's own live pid**, so a sweep in another
+/// chock process reads its maker as alive and leaves it alone, and a run that
+/// dies before its cleanup leaves a directory a later sweep removes by itself.
+/// See `sweepStaleSiblings` for the four things that decide that.
+fn testMakeSibling(buffer: []u8, ancestor: []const u8, seq: u64) ?usize {
+    var name_buffer: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(
+        &name_buffer,
+        "{s}{d}.{d}",
+        .{ name_prefix, linux.getpid(), seq },
+    ) catch return null;
+    const len = joinPath(buffer, ancestor, name) orelse return null;
+    if (!testMakeDir(buffer[0..len])) return null;
+    return len;
+}
+
+test "a child is created inside the supplied cgroup, and is never charged to the one its parent is in" {
+    // Linux only, for the reason every test in this file states: each call
+    // here is a raw Linux syscall.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // **This is the test that tells `CLONE_INTO_CGROUP` from a write to
+    // `cgroup.procs` after the fork.** A test that only reads the child's
+    // membership afterwards cannot: both ways end with the child in the right
+    // cgroup, and the whole difference is a window nothing observes.
+    //
+    // The kernel's own accounting is what tells them apart. `pids_can_fork`
+    // charges the **destination** cgroup when the clone names one, and the
+    // **current** cgroup when it does not. So a process whose own cgroup is
+    // already at its `pids.max` cannot fork at all, and can still clone a
+    // child into a cgroup that has room. The measurement below is exactly
+    // that pair, in one process, one line apart:
+    //
+    // * a plain `fork` is refused with `EAGAIN`, and
+    // * `forkInto` succeeds, and the child it made reports that it is in the
+    //   destination cgroup.
+    //
+    // A post fork write could not pass this. The child would have to exist
+    // first, and the fork that made it is the call the kernel refused.
+    //
+    // Mutation check: read `forkInto` as a plain `linux.fork()` and the second
+    // half fails with `EAGAIN`, because that child is charged to the cgroup
+    // this one is in.
+    //
+    // **Nothing here touches the cgroup this test process is in.** The whole
+    // measurement runs in a forked child, which moves *itself* into a cgroup
+    // this test made and tightens *that* cgroup's `pids.max`. So a test binary
+    // that is stopped part way through leaves an empty directory and never a
+    // developer's own shell with no forks left.
+    var ancestor: [std.fs.max_path_bytes]u8 = undefined;
+    const ancestor_len = testDelegatingAncestor(&ancestor) orelse return error.SkipZigTest;
+
+    var parent_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_len = testMakeSibling(&parent_buffer, ancestor[0..ancestor_len], 0xC10E1) orelse
+        return error.SkipZigTest;
+    const parent = parent_buffer[0..parent_len];
+    defer testRemoveDirWhenEmpty(parent);
+
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const target_len = testMakeSibling(&target_buffer, ancestor[0..ancestor_len], 0xC10E2) orelse
+        return error.SkipZigTest;
+    const target = target_buffer[0..target_len];
+    defer testRemoveDirWhenEmpty(target);
+
+    const target_fd = testOpenDir(target) orelse return error.SkipZigTest;
+    defer _ = linux.close(target_fd);
+
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return error.SkipZigTest;
+    }
+
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        // Byte 0 says the setup really happened. Every other byte is only read
+        // when it is 1, so a machine that would not let this child into a
+        // cgroup of its own reads as a skip and never as a pass.
+        var record: [4]u8 = .{ 0, 0, 0, 0 };
+
+        move: {
+            if (!writeFileAt(parent, "cgroup.procs", "0")) break :move;
+            if (holdsSelf(parent) != true) break :move;
+
+            // The limit is this cgroup's own current count, so the next fork
+            // from here is one over it. Read rather than assumed to be 1: a
+            // count that is already higher would make the limit a widening.
+            var count_buffer: [max_control_file_bytes]u8 = undefined;
+            const current_text = readFileAt(parent, "pids.current", &count_buffer) orelse break :move;
+            const current = std.mem.trim(u8, current_text, " \n\r");
+            if (!writeFileAt(parent, "pids.max", current)) break :move;
+
+            record[0] = 1;
+        }
+
+        if (record[0] == 1) {
+            const plain_rc = linux.fork();
+            // Never a return: a child of a test binary holds nothing this
+            // process may unwind. This branch is the failure the test names,
+            // and the child is ended here so it cannot run the rest.
+            if (plain_rc == 0) std.process.exit(0);
+            if (linux.errno(plain_rc) == .AGAIN) {
+                record[1] = 1;
+            } else if (linux.errno(plain_rc) == .SUCCESS) {
+                var status: u32 = undefined;
+                var rc = linux.waitpid(@intCast(plain_rc), &status, 0);
+                while (linux.errno(rc) == .INTR) rc = linux.waitpid(@intCast(plain_rc), &status, 0);
+            }
+
+            const into_rc = forkInto(target_fd);
+            if (into_rc == 0) {
+                // The grandchild answers for itself, from inside. Nothing
+                // moved it and nothing wrote a pid anywhere: the only call
+                // that made it is the one above.
+                std.process.exit(if (holdsSelf(target) orelse false) 0 else 1);
+            }
+            if (linux.errno(into_rc) == .SUCCESS) {
+                record[2] = 1;
+                var status: u32 = undefined;
+                var rc = linux.waitpid(@intCast(into_rc), &status, 0);
+                while (linux.errno(rc) == .INTR) rc = linux.waitpid(@intCast(into_rc), &status, 0);
+                if (linux.errno(rc) == .SUCCESS and linux.W.IFEXITED(status) and
+                    linux.W.EXITSTATUS(status) == 0) record[3] = 1;
+            }
+        }
+
+        _ = linux.write(fds[1], &record, record.len);
+        std.process.exit(0);
+    }
+
+    _ = linux.close(fds[1]);
+    var record: [4]u8 = .{ 0, 0, 0, 0 };
+    var held: usize = 0;
+    while (held < record.len) {
+        const rc = linux.read(fds[0], record[held..].ptr, record.len - held);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        held += rc;
+    }
+    _ = linux.close(fds[0]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+
+    // A machine that would not let this child into a cgroup of its own, or
+    // would not let it write `pids.max`, measured nothing at all. That is an
+    // environment and not a fault, and a check that was not made is never a
+    // pass.
+    if (held != record.len or record[0] != 1) return error.SkipZigTest;
+
+    // **The window, measured.** The plain fork is the design section 4.2
+    // forbids, and the kernel refuses it here because that child would have
+    // been charged to the cgroup its parent is in, which is what makes the
+    // window real in the first place.
+    try std.testing.expectEqual(@as(u8, 1), record[1]);
+    // **And the placement, in the same conditions.** The only thing that
+    // changed between these two lines is which call made the child.
+    try std.testing.expectEqual(@as(u8, 1), record[2]);
+    try std.testing.expectEqual(@as(u8, 1), record[3]);
+}
+
+test "a descriptor that is not a cgroup v2 directory is refused, and no process is made" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // **The refusal path, on a machine that needs no cgroup tree at all.** The
+    // kernel checks the descriptor before it creates anything, so this holds
+    // in a build sandbox with no `/sys/fs/cgroup` in it. A caller that handed
+    // over a descriptor on the wrong thing has to learn so, because the one
+    // other way to get a process into a cgroup is the write this whole path
+    // exists to avoid.
+    //
+    // Mutation check: answer `linux.fork()` from `forkInto` and this returns
+    // `SUCCESS`, which fails the comparison and leaves a child to reap.
+    const not_a_cgroup = testOpenDir("/proc/self") orelse return error.SkipZigTest;
+    defer _ = linux.close(not_a_cgroup);
+
+    const rc = forkInto(not_a_cgroup);
+    if (rc == 0) {
+        // Only reachable when the refusal did not happen. Ending here keeps a
+        // second copy of the test runner from finishing the suite.
+        std.process.exit(1);
+    }
+
+    const refused = linux.errno(rc);
+    // A kernel or a seccomp filter with no `clone3` at all answers this, and
+    // that is a machine this question cannot be asked on. **It is still a
+    // refusal**, which is the property that matters: `spawn` reports it and
+    // runs nothing.
+    if (refused == .NOSYS) return error.SkipZigTest;
+    try std.testing.expectEqual(linux.E.BADF, refused);
+
+    // **A descriptor that names nothing at all reads the same way.** The
+    // kernel would answer `EINVAL` for this one, because it reads the field as
+    // an unsigned number and -1 does not fit an `int`, so a caller would be
+    // told it passed a bad argument rather than a bad descriptor. This file
+    // answers first: see `forkInto`.
+    //
+    // Mutation check: drop the `dir_fd < 0` line in `forkInto` and this
+    // reads `INVAL`, or the `@intCast` beside it panics.
+    const nothing = forkInto(-1);
+    if (nothing == 0) std.process.exit(1);
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(nothing));
 }

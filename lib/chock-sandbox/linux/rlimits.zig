@@ -498,6 +498,12 @@ pub const Limits = struct {
 
     /// True when a cgroup could carry something. Only two of the five have a
     /// cgroup half.
+    ///
+    /// **A question about these numbers, and never about who holds the
+    /// cgroup.** The driver asks this only when it is about to make a cgroup
+    /// of its own. A caller that supplied one wrote its own limits into it,
+    /// and chock writes nothing there whatever this answers: see
+    /// `../Sandbox.zig`'s own `Containment`.
     pub fn wantsCgroup(self: Limits) bool {
         return self.memory_bytes != null or self.processes != null;
     }
