@@ -246,6 +246,80 @@ pub const Options = struct {
     /// profile, which was measured separately because the filter's name might
     /// have meant the profile rather than the instance.
     allow_signal_same_sandbox: bool = true,
+    /// Mach services this process may look up by name, on top of the base
+    /// `(deny mach-lookup)` every profile carries. See `default_mach_services`.
+    ///
+    /// **Empty by default, and a caller names its own list rather than getting
+    /// one for free.** `Options` is written in Darwin's own terms throughout
+    /// this file, and a silent default would hide from a reader of `Config`
+    /// which Mach services a process actually gets.
+    mach_services: []const []const u8 = &.{},
+    /// Mach services granted only when `allow_network` is also true. See
+    /// `network_mach_services`. Ignored entirely when `allow_network` is
+    /// false: a caller does not have to clear this field to keep it closed.
+    mach_services_network: []const []const u8 = &.{},
+};
+
+/// Mach services ordinary developer tooling asks for: identity lookups, the
+/// per user temp directory, preferences, logging, and the like.
+///
+/// **This list is a hypothesis, not a measurement, until task A2 checks it
+/// against a real Mac.** It is carried over from Zed's own allowlist
+/// (`macos_seatbelt.rs:257-283`), which names the same shape of problem this
+/// file exists to solve and was curated from Codex's and Chromium's Seatbelt
+/// policies before that. Zed's source lists 16 lines because
+/// `com.apple.cfprefsd.agent` appears twice there, once as a `global-name` and
+/// once as a `local-name`; `writeMachService` only ever emits `global-name`,
+/// so the two collapse to one entry here. Whether the `local-name` form is
+/// needed on a real Mac is exactly what task A2 measures.
+///
+/// **LaunchServices and launchd are not on this list, and that absence is the
+/// point of the file, not an oversight.** A process that reaches launchd
+/// through `mach-lookup` can have another process started outside this
+/// profile entirely, by `open -a Terminal` or by opening a crafted `.app`,
+/// and that new process would not carry this confinement at all. So
+/// `com.apple.lsd`, the LaunchServices daemon, and `com.apple.launchd`, the
+/// launchd bootstrap name itself, are never written here or in
+/// `network_mach_services`, and the test below pins that a later addition
+/// cannot put either one back without failing the build.
+///
+/// The pasteboard and audio services are left out for the same reason Zed
+/// leaves them out: a pasteboard service is silent clipboard theft, and an
+/// audio service is a microphone.
+pub const default_mach_services: []const []const u8 = &.{
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.system.DirectoryService.libinfo_v1",
+    "com.apple.bsd.dirhelper",
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfprefsd.agent",
+    "com.apple.logd",
+    "com.apple.logd.events",
+    "com.apple.system.logger",
+    "com.apple.diagnosticd",
+    "com.apple.system.notification_center",
+    "com.apple.analyticsd",
+    "com.apple.analyticsd.messagetracer",
+    "com.apple.PowerManagement.control",
+    "com.apple.dt.automationmode.reader",
+};
+
+/// Mach services a process needs only once it can reach the network at all:
+/// DNS resolution, TLS trust evaluation, and the system's own view of the
+/// network configuration. Kept apart from `default_mach_services` so a
+/// process with no network route does not get them either.
+///
+/// **A hypothesis in the same sense as `default_mach_services`**, carried
+/// over from the same Zed source (`macos_seatbelt.rs:392-406`), and measured
+/// by the same task A2. LaunchServices and launchd stay off this list for the
+/// reason given above: network access is not a reason to widen that hole.
+pub const network_mach_services: []const []const u8 = &.{
+    "com.apple.SecurityServer",
+    "com.apple.trustd",
+    "com.apple.SystemConfiguration.configd",
+    "com.apple.SystemConfiguration.DNSConfiguration",
+    "com.apple.networkd",
+    "com.apple.ocspd",
 };
 
 /// The root path, which dyld needs to read before it can start any program.
@@ -312,13 +386,39 @@ pub fn checkPath(path: []const u8) ?PathFault {
     if (path.len == 0) return .empty;
     if (path.len > max_path_bytes) return .too_long;
     if (path[0] != '/') return .not_absolute;
-    for (path) |byte| {
-        if (byte == 0 or byte < 0x20 or byte == 0x7f) return .bad_byte;
-    }
+    if (hasBadByte(path)) return .bad_byte;
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return .not_normalised;
     }
+    return null;
+}
+
+/// Whether `bytes` holds a byte that cannot go into a profile at all: a NUL,
+/// which would end the profile's C string early, or a control byte, which
+/// nothing legitimate needs and which would make the profile text unreadable
+/// to a person. Shared by `checkPath` and `checkMachServiceName`, because
+/// both feed the same C string and the same byte ends it early either way.
+fn hasBadByte(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte == 0 or byte < 0x20 or byte == 0x7f) return true;
+    }
+    return false;
+}
+
+/// Whether `name` can go into a profile as a Mach service name, or what is
+/// wrong with it.
+///
+/// **Only the byte guard applies here, and that is the point of a separate
+/// function rather than a call to `checkPath`.** A Mach service name carries
+/// no leading slash and no `.` or `..` component, so `not_absolute` and
+/// `not_normalised` would refuse every real name. But it is quoted into the
+/// same profile text `checkPath` guards, and terminated the same way, so a
+/// NUL or a control byte does the same damage here that it does in a path:
+/// see `Builder.finish`'s own comment on losing the last denial.
+pub fn checkMachServiceName(name: []const u8) ?PathFault {
+    if (name.len == 0) return .empty;
+    if (hasBadByte(name)) return .bad_byte;
     return null;
 }
 
@@ -331,9 +431,10 @@ pub fn checkPath(path: []const u8) ?PathFault {
 pub const Builder = struct {
     buffer: []u8,
     len: usize = 0,
-    /// The first path fault seen, kept rather than the last: the first one is
-    /// the one a person fixes.
-    fault: ?struct { path: []const u8, fault: PathFault } = null,
+    /// The first fault seen, whether the offending text was a path or a Mach
+    /// service name, kept rather than the last: the first one is the one a
+    /// person fixes.
+    fault: ?struct { text: []const u8, fault: PathFault } = null,
     overflowed: bool = false,
 
     pub fn init(buffer: []u8) Builder {
@@ -378,7 +479,7 @@ pub const Builder = struct {
 
     fn writeRule(self: *Builder, verb: Verb, rule: Rule) void {
         if (checkPath(rule.path)) |fault| {
-            if (self.fault == null) self.fault = .{ .path = rule.path, .fault = fault };
+            if (self.fault == null) self.fault = .{ .text = rule.path, .fault = fault };
             return;
         }
         // A rule that grants nothing is not written. It would be harmless and it
@@ -393,6 +494,31 @@ pub const Builder = struct {
         self.write(@tagName(rule.reach));
         self.write(" ");
         self.writeQuoted(rule.path);
+        self.write("))\n");
+    }
+
+    /// One Mach service allowance. Mirrors `writeRule`'s own shape, for a
+    /// reader comparing the two.
+    ///
+    /// **This must go through `writeQuoted`, and never a writer of its own.**
+    /// `writeQuoted` is what stops a path becoming a rule; a second, unquoted
+    /// writer here would reopen exactly that hole for a Mach service name.
+    ///
+    /// **The name is checked before it is written, the same as a path is
+    /// checked in `writeRule`.** The finished profile is a NUL terminated C
+    /// string, and a name carrying its own NUL would end that string early
+    /// and silently drop everything written after it, `options.deny`
+    /// included: see `Builder.finish`'s own comment on losing the last
+    /// denial. Unreachable today, because only this file's own constant
+    /// lists feed `mach_services` and `mach_services_network`, and checked
+    /// anyway because both fields are public.
+    fn writeMachService(self: *Builder, name: []const u8) void {
+        if (checkMachServiceName(name)) |fault| {
+            if (self.fault == null) self.fault = .{ .text = name, .fault = fault };
+            return;
+        }
+        self.write("(allow mach-lookup (global-name ");
+        self.writeQuoted(name);
         self.write("))\n");
     }
 
@@ -445,6 +571,21 @@ pub const Builder = struct {
         }
         self.write("(deny signal)\n");
         if (options.allow_signal_same_sandbox) self.write("(allow signal (target same-sandbox))\n");
+
+        // **`(deny default)` above already refuses every Mach service, and this
+        // denial is written anyway**, for the reason the network and signal
+        // denials are: a person reading a running session's profile should see
+        // what it says about Mach services without working out what the base
+        // rule implies. The allowances below are the lines that do something.
+        //
+        // **LaunchServices and launchd are not on either list, on purpose.** A
+        // process that reaches launchd starts a process outside this profile,
+        // which is the whole reason the rule exists.
+        self.write("(deny mach-lookup)\n");
+        for (options.mach_services) |name| self.writeMachService(name);
+        if (options.allow_network) {
+            for (options.mach_services_network) |name| self.writeMachService(name);
+        }
 
         for (options.deny) |rule| self.writeRule(.deny, rule);
 
@@ -707,6 +848,124 @@ test "the network and the signal rules are what the measurements say" {
     try std.testing.expect(std.mem.indexOf(u8, opened, "(allow network*)") != null);
     // The signal rules do not depend on the network answer.
     try std.testing.expect(std.mem.indexOf(u8, opened, "(deny signal)") != null);
+}
+
+test "every profile denies mach-lookup by default" {
+    // The measured escape this closes: an unrestricted `mach-lookup` lets a
+    // sandboxed process reach launchd and have another process started
+    // outside this profile entirely. `(deny default)` already refuses this,
+    // and the explicit line is written anyway so a reader of a running
+    // session's profile sees it without working out what the base rule
+    // implies. See the comment on the emission in `Builder.finish`.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const profile = try builder.finish(.{});
+    try std.testing.expect(std.mem.indexOf(u8, profile, "(deny mach-lookup)") != null);
+}
+
+test "the mach-lookup denial comes before every mach-lookup allowance" {
+    // SBPL gives the last line that names a thing: see `Rule.verb`'s own
+    // comment. A `(deny mach-lookup)` written after an allowance for a
+    // service would win and take that service back; written before, it is
+    // narrowed by the allowances that follow it, which is the only order
+    // that lets a service be granted at all.
+    //
+    // Mutation check: write the allowances before the denial in
+    // `Builder.finish` and this test fails on the index comparison.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const profile = try builder.finish(.{
+        .mach_services = default_mach_services,
+        .allow_network = true,
+        .mach_services_network = network_mach_services,
+    });
+    const deny_at = std.mem.indexOf(u8, profile, "(deny mach-lookup)").?;
+    const needle = "(allow mach-lookup (global-name ";
+    // Every allowance, not merely the first, so a rearrangement that moves
+    // only the network block ahead of the denial cannot slip past this test.
+    var checked: usize = 0;
+    var search_at: usize = 0;
+    while (std.mem.indexOfPos(u8, profile, search_at, needle)) |allow_at| {
+        try std.testing.expect(allow_at > deny_at);
+        checked += 1;
+        search_at = allow_at + needle.len;
+    }
+    try std.testing.expect(checked > 0);
+}
+
+test "the network mach services are absent without allow_network and present with it" {
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const closed = try builder.finish(.{
+        .mach_services = default_mach_services,
+        .mach_services_network = network_mach_services,
+    });
+    for (network_mach_services) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, closed, name) == null);
+    }
+    // The plain services are there regardless of the network answer.
+    for (default_mach_services) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, closed, name) != null);
+    }
+
+    var open_builder = Builder.init(&buffer);
+    const opened = try open_builder.finish(.{
+        .mach_services = default_mach_services,
+        .allow_network = true,
+        .mach_services_network = network_mach_services,
+    });
+    for (network_mach_services) |name| {
+        try std.testing.expect(std.mem.indexOf(u8, opened, name) != null);
+    }
+}
+
+test "no configuration ever names launchd or its lookup service" {
+    // **The mutation this stops.** `com.apple.lsd`, LaunchServices, and
+    // `com.apple.launchd`, the launchd bootstrap name, are the whole reason
+    // `default_mach_services` and `network_mach_services` exist as curated
+    // lists rather than a blanket `(allow mach-lookup)`. A later author who
+    // widens either list by one entry and picks either of these names fails
+    // this test.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const profile = try builder.finish(.{
+        .mach_services = default_mach_services,
+        .allow_network = true,
+        .mach_services_network = network_mach_services,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, profile, "com.apple.lsd") == null);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "com.apple.launchd") == null);
+}
+
+test "a mach service name holding a control byte is refused" {
+    // The measured gap this closes: writeMachService went straight to
+    // writeQuoted, and writeQuoted only escapes a quote and a backslash. A
+    // name carrying a NUL would end the profile's C string early and
+    // silently drop everything written after it, options.deny included,
+    // the same failure class checkPath already guards a path against.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    try std.testing.expectError(error.BadPath, builder.finish(.{
+        .mach_services = &.{"com.apple.bad\x00name"},
+    }));
+}
+
+test "a quote in a mach service name is escaped, not refused" {
+    // Mirrors "a quote in a path is escaped, so a path cannot become a
+    // rule": the same writeQuoted call guards a Mach service name, and a
+    // quote is not a byte checkMachServiceName refuses.
+    var buffer: [4096]u8 = undefined;
+    var builder = Builder.init(&buffer);
+    const profile = try builder.finish(.{
+        .mach_services = &.{"com.apple.\"injected\""},
+    });
+    var rules: usize = 0;
+    var lines = std.mem.splitScalar(u8, profile, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "(allow mach-lookup")) rules += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rules);
+    try std.testing.expect(std.mem.indexOf(u8, profile, "\\\"") != null);
 }
 
 test "every profile carries the root rule dyld needs" {
