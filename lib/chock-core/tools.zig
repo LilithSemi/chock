@@ -656,6 +656,360 @@ pub const Tool = enum {
         };
     }
 
+    /// What every `run_command` action name starts with.
+    const exec_prefix = "exec";
+
+    /// The class segment for a program `run_command` would resolve inside the
+    /// Nix store.
+    const store_class = "nix.store";
+
+    /// The class segment for a program named by a path relative to the
+    /// workspace. A path here carries at least one `/`: a bare name with
+    /// none is `path_class` instead, never this one.
+    const workspace_class = "workspace";
+
+    /// The class segment for a bare name, one with no `/` anywhere in it.
+    /// `run_command`'s own description says a name like this is looked up on
+    /// the host `PATH`, not read as a path inside the project. **Kept apart
+    /// from both other classes on purpose.** It cannot share `store_class`,
+    /// because nothing here resolves `PATH`, so this file never learns which
+    /// store entry, if any, the name would reach. It cannot share
+    /// `workspace_class` either: `jq` almost always resolves off the project
+    /// entirely, and a rule an author wrote to gate workspace programs must
+    /// not silently also match it. `runInSandbox` is what resolves `PATH`,
+    /// this only reads what the model wrote.
+    const path_class = "path";
+
+    /// The literal `/nix/store/` `run_command`'s argument is measured
+    /// against. The trailing slash is deliberate: it is what tells a bare
+    /// `/nix/store` apart from a real entry under it, and `runCommandActionInto`
+    /// checks the bare form first, on its own.
+    const store_prefix = "/nix/store/";
+
+    /// What every other tool's action name starts with. **Never `exec`**,
+    /// which is `run_command`'s alone: that prefix says a program was run,
+    /// and no other tool runs one.
+    const call_prefix = "call";
+
+    /// Answered for `run_command` when `arguments` names no program this file
+    /// can read: no `argv` key, an empty array, or a first element this
+    /// file's small reader could not take whole. **Never `null` for this**:
+    /// `null` means a name that does not fit, and a call this file cannot
+    /// read still needs a row in the table as much as any other, so it gets a
+    /// name of its own instead of the answer kept for a buffer too small to
+    /// use. See the rot test at the end of this file, which calls every tool
+    /// with `"{}"` and requires a name back from all of them.
+    const unparsed_action = exec_prefix ++ ".unparsed";
+
+    /// The longest raw path this file will still turn into a name. Borrowed
+    /// from the bound every path buffer in this file already uses.
+    const max_raw_path_bytes = std.Io.Dir.max_path_bytes;
+
+    /// The longest action name `actionInto` can build.
+    ///
+    /// `run_command`'s is the long one: the prefix, a separator, the class,
+    /// a separator, and the path. `nix.store` and `workspace` are both nine
+    /// bytes long, `path` is shorter, and the bound below is sized for
+    /// either of the two nine byte classes.
+    ///
+    /// **The path term is three times its own length and not one times
+    /// it**, because of the escape below: a byte that is a dot or a percent
+    /// sign is written as a three byte escape, and every other byte of the
+    /// path is written as itself. Each segment the path breaks into also
+    /// costs one more byte, for the separator written before it.
+    ///
+    /// **Two segments, not one, are the true worst case for a path of a
+    /// given length.** A path split into two segments by one slash spends
+    /// the same three bytes per dot as the same bytes held in one segment,
+    /// but it pays for two separators instead of one, and the slash spent
+    /// to split them is never itself escaped, so it is only two bytes
+    /// cheaper than the dot it replaced, not three. The net cost of that
+    /// split is one byte more than keeping everything in one segment.
+    /// Splitting further adds this same one byte cost again for every slash
+    /// spent past the first.
+    ///
+    /// The bound below still holds. It already carries one separator on top
+    /// of `3 * max_raw_path_bytes`, one more byte than a single all-dot
+    /// segment ever needs on its own, and the true worst case, two
+    /// segments, still lands a few bytes under it.
+    pub const max_action_bytes = exec_prefix.len + 1 + store_class.len + 1 +
+        3 * max_raw_path_bytes;
+
+    /// Writes `text` into `buffer` whole, or answers null when it does not
+    /// fit. `text` is always one of this file's own constants. The null
+    /// branch is never taken with `buffer.len` at least `max_action_bytes`.
+    /// It exists so a caller that shrank the buffer gets a refusal and not a
+    /// crash.
+    fn writeWhole(buffer: []u8, text: []const u8) ?[]const u8 {
+        if (buffer.len < text.len) return null;
+        @memcpy(buffer[0..text.len], text);
+        return buffer[0..text.len];
+    }
+
+    /// Writes one path segment into `buffer` starting at `cursor`, with a dot
+    /// or a percent sign escaped, and answers the new cursor.
+    ///
+    /// **Every dot and every percent sign in `segment` is escaped, with no
+    /// exception.** A plain dot in the built name is never written by this
+    /// function, so a plain dot always marks a real boundary `actionInto`
+    /// itself wrote, and it can never be a byte a segment held. That is what
+    /// makes the whole scheme a bijection: two different paths can never
+    /// share a built name, because the one character that marks a boundary
+    /// is a character no segment's own bytes can ever produce.
+    ///
+    /// **No bound check on `buffer` here, on purpose.** `runCommandActionInto`
+    /// already checked `buffer.len` against `max_action_bytes` and `argv0`
+    /// against `max_raw_path_bytes` before calling this, and `max_action_bytes`
+    /// is sized for the worst path either bound allows. A check here could
+    /// never fire for a real caller, and the "too long" test at the end of
+    /// this file proves the refusal happens earlier, at the buffer check,
+    /// rather than never at all.
+    fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
+        var at = cursor;
+        for (segment) |byte| {
+            switch (byte) {
+                '.' => {
+                    @memcpy(buffer[at..][0..3], "%2E");
+                    at += 3;
+                },
+                '%' => {
+                    @memcpy(buffer[at..][0..3], "%25");
+                    at += 3;
+                },
+                else => {
+                    buffer[at] = byte;
+                    at += 1;
+                },
+            }
+        }
+        return at;
+    }
+
+    /// The action name for a `run_command` call whose first `argv` element,
+    /// already read out by the real parser, is `argv0`. `project_root` is
+    /// `sandbox.Config.cwd`, the same value `leavesProject` reads. Written
+    /// into `buffer`. See `actionInto`.
+    ///
+    /// ```
+    /// /nix/store/abc-jq/bin/jq              ->  exec.nix.store.abc-jq.bin.jq
+    /// ./build.sh                            ->  exec.workspace.build%2Esh
+    /// <project_root>/build.sh               ->  exec.workspace.build%2Esh
+    /// build.sh                              ->  exec.path.build%2Esh
+    /// ./build/sh                            ->  exec.workspace.build.sh
+    /// jq                                    ->  exec.path.jq
+    /// a/../b                                ->  exec.unparsed
+    /// ```
+    ///
+    /// **A path keeps its own order, and is never reversed.** Unlike
+    /// `chock_broker.network.actionInto`'s host name, a path is already
+    /// hierarchical left to right: `/nix/store/abc-jq/bin/jq`'s `bin`
+    /// directory belongs to `abc-jq`, not the other way round, and reversing
+    /// it would write a name that means something else.
+    ///
+    /// **An absolute path inside the project is read from where it points,
+    /// and not from how it is spelled.** `leavesProject`, the executor's own
+    /// boundary check, strips `project_root` off the front of an in-project
+    /// absolute `argv0` before it decides anything else, because it is the
+    /// authority on what the call actually runs and a path inside the
+    /// project is a path inside the project whichever way it is spelled.
+    /// This function strips the same prefix, the same way, before it reads
+    /// `path` for anything else: without it, `./build.sh` and
+    /// `<project_root>/build.sh` name the one file on disk and yet build two
+    /// different names, and a deny rule aimed at the relative spelling is
+    /// dodged by the absolute one. `cwd` is never secret from the model: it
+    /// is visible through ordinary use, so this is a real bypass and not a
+    /// theoretical one. An absolute path that is not inside the project, or
+    /// a `project_root` that is not itself absolute, is left exactly as
+    /// written: see `leavesProject`'s own doc for why a path outside the
+    /// project reads the same whichever spelling names it, since the
+    /// boundary that actually stops it is the sandbox's mount tree and not
+    /// this name.
+    ///
+    /// **The path is normalised lexically before it is encoded.** A `.`
+    /// component names the same directory as the one before it and carries
+    /// no information, so it is dropped. Repeated slashes collapse to one
+    /// and a trailing slash is dropped, both for free because
+    /// `tokenizeScalar` never yields an empty segment. Without this, two
+    /// spellings of the one program, such as `build.sh` and `./build.sh`,
+    /// would build two different names, and a deny rule written against one
+    /// spelling would be dodged by the other.
+    ///
+    /// **A `..` component is never resolved, lexically or otherwise.**
+    /// Resolving it correctly needs the filesystem, to follow any symlink a
+    /// segment before it might be, and this file reads only the string the
+    /// call gave. A wrong resolution here would answer a wrong policy
+    /// question for the whole call, so a path holding a `..` component
+    /// answers `unparsed_action` instead of a guess. `Table.evaluateChain`
+    /// answers `ask` for an unnamed action, which refuses, so this lands on
+    /// the safe side.
+    ///
+    /// **The class is read from whether the raw `argv0` carries a slash
+    /// anywhere, fixed before the project root strip above runs, and never
+    /// from the normalised segment count.** `run_command`'s own description
+    /// draws this line itself: a bare name with no slash is looked up on the
+    /// host `PATH`, and a name with a slash is a path inside the project.
+    /// `./build.sh` carries a slash, so it is `workspace_class`, even though
+    /// it normalises to the one segment `build.sh`. The bare `build.sh`
+    /// carries no slash at all, so it is `path_class`, even though the two
+    /// name the same file on disk today. They must stay apart regardless: a
+    /// store path is content addressed and names one program forever, a
+    /// `PATH` lookup resolves to whichever toolchain the session was given,
+    /// and a project path can be rewritten by the agent on the turn before
+    /// it runs. A rule written to allow the toolchain must not thereby allow
+    /// a script the agent just wrote, so a name with a slash and a name
+    /// without one can never collide, no matter how few segments the
+    /// slashed path normalises to. Fixing this before the strip matters for
+    /// the same reason: `<project_root>/build.sh` carries plenty of slashes
+    /// before it is stripped down to the one segment `build.sh`, and it must
+    /// still read as `workspace_class`, not `path_class`, once the prefix
+    /// that carried them is gone.
+    ///
+    /// **A dot or a percent sign a real segment carries is escaped before it
+    /// is written, and that is the whole fix for the hazard this file's own
+    /// segments would otherwise forge.** `build.sh` is one segment and it
+    /// holds a dot, so a builder that copied every byte straight through
+    /// would write the exact same name for the file `build.sh` and for a
+    /// directory `build` holding a file named `sh`, and a rule an author
+    /// wrote for one would then also match the other. `writeSegmentEscaped`
+    /// closes that hazard for good: a plain dot in the built name is only
+    /// ever a boundary this function wrote between two segments, never a
+    /// byte a segment held, so no two distinct paths can ever share a built
+    /// name.
+    fn runCommandActionInto(buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+        if (buffer.len < max_action_bytes) return null;
+
+        var path = argv0 orelse return writeWhole(buffer, unparsed_action);
+        if (path.len == 0 or path.len > max_raw_path_bytes)
+            return writeWhole(buffer, unparsed_action);
+
+        // Fixed here, before the project root strip below can change what
+        // `path` holds. See this function's own doc on the class.
+        const has_slash = std.mem.indexOfScalar(u8, path, '/') != null;
+
+        // The same prefix strip `leavesProject` performs on this same
+        // `argv0`, kept in step with it on purpose: see this function's own
+        // doc above. `is_sibling` is `leavesProject`'s own guard against
+        // `/project` matching a `startsWith` check meant for `/projects`.
+        if (std.fs.path.isAbsolute(path) and std.fs.path.isAbsolute(project_root) and
+            std.mem.startsWith(u8, path, project_root))
+        {
+            const after_root = path[project_root.len..];
+            const root_ends_in_slash = project_root.len != 0 and
+                project_root[project_root.len - 1] == '/';
+            const is_sibling = after_root.len != 0 and after_root[0] != '/' and
+                !root_ends_in_slash;
+            if (!is_sibling) {
+                path = if (after_root.len != 0 and after_root[0] == '/')
+                    after_root[1..]
+                else
+                    after_root;
+            }
+        }
+        // The strip above can empty `path` outright, when `argv0` named the
+        // project root itself. That call has no program to run, the same as
+        // the relative spelling `.` does, so it answers the same way.
+        if (path.len == 0) return writeWhole(buffer, unparsed_action);
+
+        var is_store = false;
+        var rest: []const u8 = path;
+        if (std.mem.eql(u8, path, "/nix/store")) {
+            is_store = true;
+            rest = "";
+        } else if (std.mem.startsWith(u8, path, store_prefix)) {
+            is_store = true;
+            rest = path[store_prefix.len..];
+        }
+
+        // One pass over the components, before anything is written, to
+        // refuse outright on a `..`. This pass never counts the real
+        // segments: the class is decided below from the raw argv0, not from
+        // how many segments it normalises to.
+        var scan = std.mem.tokenizeScalar(u8, rest, '/');
+        while (scan.next()) |segment| {
+            if (std.mem.eql(u8, segment, "..")) return writeWhole(buffer, unparsed_action);
+        }
+
+        const class: []const u8 = if (is_store)
+            store_class
+        else if (has_slash)
+            workspace_class
+        else
+            path_class;
+
+        var cursor: usize = 0;
+        @memcpy(buffer[cursor..][0..exec_prefix.len], exec_prefix);
+        cursor += exec_prefix.len;
+        buffer[cursor] = '.';
+        cursor += 1;
+        @memcpy(buffer[cursor..][0..class.len], class);
+        cursor += class.len;
+
+        var wrote_a_segment = false;
+        var segments = std.mem.tokenizeScalar(u8, rest, '/');
+        while (segments.next()) |segment| {
+            if (std.mem.eql(u8, segment, ".")) continue;
+            buffer[cursor] = '.';
+            cursor += 1;
+            cursor = writeSegmentEscaped(buffer, cursor, segment);
+            wrote_a_segment = true;
+        }
+        if (!wrote_a_segment) return writeWhole(buffer, unparsed_action);
+        return buffer[0..cursor];
+    }
+
+    /// The policy action for a call of this tool whose already parsed first
+    /// `argv` element is `argv0`, written into `buffer`. `null` for `argv0`
+    /// means the real parse found no such element, and gets `exec.unparsed`
+    /// the same as an element this file's own bound rejects. `project_root`
+    /// is `sandbox.Config.cwd` and is read only for `run_command`: see
+    /// `runCommandActionInto`'s own doc for why an absolute `argv0` inside
+    /// the project needs it.
+    ///
+    /// Null when the name would not fit. See `runCommandActionInto`'s own
+    /// doc for why nothing else answers null. `buffer` must hold
+    /// `max_action_bytes`.
+    ///
+    /// **Every ordinary tool call reaches this before it runs.** The table
+    /// answers on a dotted action name the same way it answers about a host
+    /// or a plugin's own tool, and this is what turns a call into one:
+    ///
+    /// ```zon
+    /// .{ .action = "call.write_file", .decision = .ask }     // every write asks
+    /// .{ .action = "exec.workspace.*", .decision = .allow }  // a program the project built
+    /// .{ .action = "exec.nix.store.*", .decision = .ask }    // a program the store provides
+    /// ```
+    ///
+    /// Only `run_command` reads `argv0` at all: every other tool is named
+    /// after itself and nothing it was called with, because the wire format
+    /// says what changed for those calls in a field of its own, not in a
+    /// string a policy author would have to parse a second time.
+    ///
+    /// No `else`: a tool added to the enum and forgotten here fails the build
+    /// rather than being named by accident.
+    pub fn actionInto(self: Tool, buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+        return switch (self) {
+            .run_command => runCommandActionInto(buffer, argv0, project_root),
+            .read_file,
+            .list_directory,
+            .glob,
+            .grep,
+            .write_file,
+            .edit_file,
+            .read_guidance,
+            .read_memory,
+            .write_memory,
+            .spawn_agent,
+            .update_plan,
+            .provide_tool,
+            .restrict_self,
+            .fetch_url,
+            .ask_user,
+            .set_title,
+            .request_action,
+            => std.fmt.bufPrint(buffer, call_prefix ++ ".{s}", .{@tagName(self)}) catch null,
+        };
+    }
+
     /// Whether a successful call of this tool leaves a changed file in the
     /// project the agent is working on.
     ///
@@ -6376,6 +6730,297 @@ test "every offered tool is one dispatch knows, and every tool dispatch knows is
 
     const defs = try Registry.definitions(arena, plain_support);
     for (defs) |def| try std.testing.expect(std.meta.stringToEnum(Tool, def.name) != null);
+}
+
+test "a tool with no argument to read is named after itself, once each" {
+    // Pinned per tool, not just "not null": a regression that swapped two
+    // tools' names, or dropped the tool's own name from the string, would
+    // still pass a test that only checked `.len > 0`.
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    inline for (@typeInfo(Tool).@"enum".fields) |f| {
+        const tool: Tool = @enumFromInt(f.value);
+        if (tool == .run_command) continue;
+        try std.testing.expectEqualStrings(
+            "call." ++ f.name,
+            tool.actionInto(&buffer, null, "").?,
+        );
+    }
+}
+
+test "run_command on a program under the Nix store names the program, left to right" {
+    // The parent, not the whole store, is what a policy author writes a rule
+    // about, and the parent has to read as one path and not as a hostname:
+    // `/nix/store/abc-jq/bin/jq` keeps its segments in the order the
+    // filesystem gives them.
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.nix.store.abc-jq.bin.jq",
+        Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "").?,
+    );
+}
+
+test "a dot a path already carried is never read as a boundary between segments" {
+    // **The hazard this file's own comment names.** `build.sh` is one
+    // segment, and it holds a dot. A builder that copied it straight through
+    // would write the same bytes for the file `build.sh` and for a
+    // directory `build` holding a file named `sh`, and a rule written for
+    // one would then also match the other.
+    //
+    // The fix kept here: a dot the path itself carried is escaped before it
+    // is written, so a plain dot in the built name always marks a real
+    // boundary between segments and never a byte a segment held. `./build.sh`
+    // normalises to the one real segment `build.sh`, which carries a dot, so
+    // that dot comes out escaped, and the leading `./` is a no-op component
+    // dropped before encoding. `./build/sh` normalises to two real segments,
+    // neither of which carries a dot, so no escape appears, and the two no
+    // longer collide.
+    var one_segment: [Tool.max_action_bytes]u8 = undefined;
+    var two_segments: [Tool.max_action_bytes]u8 = undefined;
+
+    const from_one_segment = Tool.run_command.actionInto(&one_segment, "./build.sh", "").?;
+    const from_two_segments = Tool.run_command.actionInto(&two_segments, "./build/sh", "").?;
+
+    try std.testing.expectEqualStrings("exec.workspace.build%2Esh", from_one_segment);
+    try std.testing.expectEqualStrings("exec.workspace.build.sh", from_two_segments);
+    try std.testing.expect(!std.mem.eql(u8, from_one_segment, from_two_segments));
+}
+
+test "a dot at a segment boundary never reads as the same name from either side" {
+    // **The bug the doubling scheme carried.** `a./b` is a segment `a.`
+    // followed by a segment `b`. `a/.b` is a segment `a` followed by a
+    // segment `.b`. A scheme that doubles a dot inside a segment and writes
+    // a plain dot between segments cannot tell these two apart: both put one
+    // literal dot from content next to one literal dot from a boundary, and
+    // the doubled pair reads the same regardless of which side the content
+    // dot fell on. Escaping every dot in content, so a plain dot is only
+    // ever a boundary, is what tells them apart.
+    var a_dot_slash_b: [Tool.max_action_bytes]u8 = undefined;
+    var a_slash_dot_b: [Tool.max_action_bytes]u8 = undefined;
+
+    const from_a_dot_slash_b = Tool.run_command.actionInto(&a_dot_slash_b, "a./b", "").?;
+    const from_a_slash_dot_b = Tool.run_command.actionInto(&a_slash_dot_b, "a/.b", "").?;
+
+    try std.testing.expectEqualStrings("exec.workspace.a%2E.b", from_a_dot_slash_b);
+    try std.testing.expectEqualStrings("exec.workspace.a.%2Eb", from_a_slash_dot_b);
+    try std.testing.expect(!std.mem.eql(u8, from_a_dot_slash_b, from_a_slash_dot_b));
+}
+
+test "two spellings of the same program build the same name" {
+    // **The other half of a bijection.** An encoding that only tells
+    // distinct paths apart is not enough on its own: it must also agree
+    // that the same program, spelled two ways, is the same action, or a
+    // deny rule is dodged by respelling the path. Each group below names one
+    // program several ways; every spelling in a group must build the one
+    // name. `build.sh` is deliberately not in `group_a`: it carries no
+    // slash, so it is a host `PATH` lookup and not a project path, and it
+    // must not share `group_a`'s name.
+    const group_a = [_][]const u8{ "./build.sh", "././build.sh" };
+    const group_b = [_][]const u8{ "a/b", "a//b", "a/./b", "./a/b" };
+    const group_c = [_][]const u8{
+        "/nix/store/x/bin/jq",
+        "/nix/store//x/bin/jq",
+        "/nix/store/./x/bin/jq",
+    };
+
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    const a0 = Tool.run_command.actionInto(&buffer, group_a[0], "").?;
+    try std.testing.expectEqualStrings("exec.workspace.build%2Esh", a0);
+    for (group_a[1..]) |path| {
+        var other: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(a0, Tool.run_command.actionInto(&other, path, "").?);
+    }
+
+    // The bare `build.sh` normalises to the same one segment as
+    // `./build.sh`, and still must not share its name or its class: a `PATH`
+    // lookup resolves to the session's own toolchain, a project path can be
+    // a script the agent just wrote, and a rule for one must never also
+    // cover the other.
+    var bare_build: [Tool.max_action_bytes]u8 = undefined;
+    const bare_build_action = Tool.run_command.actionInto(&bare_build, "build.sh", "").?;
+    try std.testing.expectEqualStrings("exec.path.build%2Esh", bare_build_action);
+    try std.testing.expect(!std.mem.eql(u8, a0, bare_build_action));
+
+    const b0 = Tool.run_command.actionInto(&buffer, group_b[0], "").?;
+    try std.testing.expectEqualStrings("exec.workspace.a.b", b0);
+    for (group_b[1..]) |path| {
+        var other: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(b0, Tool.run_command.actionInto(&other, path, "").?);
+    }
+
+    const c0 = Tool.run_command.actionInto(&buffer, group_c[0], "").?;
+    try std.testing.expectEqualStrings("exec.nix.store.x.bin.jq", c0);
+    for (group_c[1..]) |path| {
+        var other: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(c0, Tool.run_command.actionInto(&other, path, "").?);
+    }
+}
+
+test "an absolute path inside the project and its relative spelling build the same name" {
+    // The fifth defect of this class. `leavesProject`, the executor's own
+    // boundary check, is the authority on what a call actually runs, and it
+    // holds that an absolute path inside the project is the same program as
+    // its relative spelling. Before this fix, `actionInto` disagreed with
+    // it and built two different names for the one file, so a deny rule
+    // aimed at the relative spelling was dodged by spelling the same script
+    // absolutely. `cwd` is not secret from the model, so this was a real
+    // bypass and not a theoretical one.
+    const project_root = "/home/ross/myproject";
+    const pairs = [_][2][]const u8{
+        // the project root itself
+        .{ ".", "/home/ross/myproject" },
+        // a file directly in the root
+        .{ "./build.sh", "/home/ross/myproject/build.sh" },
+        // a file nested two directories down
+        .{ "./bin/tools/build.sh", "/home/ross/myproject/bin/tools/build.sh" },
+        // a redundant "." in the absolute form
+        .{ "./build.sh", "/home/ross/myproject/./build.sh" },
+        // a redundant "//" in the absolute form
+        .{ "./bin/build.sh", "/home/ross/myproject//bin//build.sh" },
+    };
+
+    for (pairs) |pair| {
+        const rel = pair[0];
+        const abs = pair[1];
+
+        // Ground truth first: both spellings must stay inside the project,
+        // or the pair below proves nothing about what actually runs.
+        try std.testing.expect(!leavesProject(rel, project_root));
+        try std.testing.expect(!leavesProject(abs, project_root));
+
+        var rel_buffer: [Tool.max_action_bytes]u8 = undefined;
+        var abs_buffer: [Tool.max_action_bytes]u8 = undefined;
+        const rel_name = Tool.run_command.actionInto(&rel_buffer, rel, project_root).?;
+        const abs_name = Tool.run_command.actionInto(&abs_buffer, abs, project_root).?;
+        try std.testing.expectEqualStrings(rel_name, abs_name);
+    }
+}
+
+test "an absolute path outside the project keeps the name it already had" {
+    // `/etc/passwd` and the in-project relative `etc/passwd` still share a
+    // name after the fix above, and that is not a regression. `leavesProject`
+    // refuses the absolute one outright, and the sandbox's own mount tree,
+    // not this name, is what actually keeps it from being reached: see this
+    // file's own top comment. Nothing here strips a prefix that was never
+    // the project's own, so an outside path reads exactly as written, the
+    // same before this fix as after.
+    const project_root = "/home/ross/myproject";
+    try std.testing.expect(leavesProject("/etc/passwd", project_root));
+
+    var outside_buffer: [Tool.max_action_bytes]u8 = undefined;
+    var inside_buffer: [Tool.max_action_bytes]u8 = undefined;
+    const outside_name = Tool.run_command.actionInto(&outside_buffer, "/etc/passwd", project_root).?;
+    const inside_name = Tool.run_command.actionInto(&inside_buffer, "etc/passwd", project_root).?;
+    try std.testing.expectEqualStrings(outside_name, inside_name);
+}
+
+test "no two paths in a table built to confuse the encoding share a name" {
+    // A single pair proves nothing about the scheme in general. This table
+    // holds every path this file's own review turned up as a suspect: a dot
+    // at either side of a boundary, a run of two dots in one segment, a
+    // plain path with no dot at all, and two bare names that read on the
+    // host `PATH`. Every name built from this table must be distinct from
+    // every other, or the encoding is not injective. `a./b` and `a/.b` are
+    // genuinely different paths, one a segment `a.` followed by `b`, the
+    // other a segment `a` followed by `.b`, and both must stay apart.
+    // `build.sh` and `./build.sh` are a different kind of suspect: the
+    // second carries a slash and the first does not, so a scheme that
+    // classed them by segment count rather than by that slash would have
+    // named them alike.
+    const paths = [_][]const u8{
+        "./build.sh",
+        "./build/sh",
+        "a./b",
+        "a/.b",
+        "a..b",
+        "a/b",
+        "a.b/c",
+        "a/b.c",
+        "jq",
+        "build.sh",
+    };
+
+    var buffers: [paths.len][Tool.max_action_bytes]u8 = undefined;
+    var actions: [paths.len][]const u8 = undefined;
+    for (paths, 0..) |path, i| {
+        actions[i] = Tool.run_command.actionInto(&buffers[i], path, "").?;
+    }
+
+    for (actions, 0..) |a, i| {
+        for (actions[i + 1 ..]) |b| {
+            try std.testing.expect(!std.mem.eql(u8, a, b));
+        }
+    }
+}
+
+test "a path with a .. component is never resolved, and answers unparsed instead" {
+    // Resolving `..` correctly needs the filesystem, to follow any symlink
+    // the component before it might be, and this file reads only the string
+    // the call gave. A wrong lexical guess here would answer a wrong policy
+    // question, so all three shapes below, a `..` in the middle, at the
+    // front, and at the end, answer `exec.unparsed` instead of a resolved
+    // path. `Table.evaluateChain` answers `ask` for an unnamed action, which
+    // refuses, so this lands on the safe side.
+    const paths = [_][]const u8{ "a/../b", "../x", "a/.." };
+    for (paths) |path| {
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "exec.unparsed",
+            Tool.run_command.actionInto(&buffer, path, "").?,
+        );
+    }
+}
+
+test "a bare name run_command would resolve on PATH is its own class, neither store nor workspace" {
+    // Nothing here resolves `PATH`: the classification reads the string the
+    // call gave. `run_command`'s own description says a bare name with no
+    // slash is looked up on the host `PATH`, and `jq` almost always resolves
+    // off the project entirely, so it cannot read as `workspace_class`.
+    // Nothing here learns which store entry it would reach, so it cannot
+    // read as `store_class` either. See this file's own top comment on the
+    // seam this leaves for the caller that does resolve it.
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.path.jq",
+        Tool.run_command.actionInto(&buffer, "jq", "").?,
+    );
+}
+
+test "run_command with no argv element to read still gets a name, and never null for that reason" {
+    // `null` is kept for one reason only: a name that would not fit. A call
+    // whose `argv` the real parser could not read is a different problem,
+    // and the caller passes `null` for it, the same answer whether the real
+    // parse found no `argv` key, an empty array, or failed outright: all
+    // three collapse to the one case this file reads as "no argv0 was
+    // available". It gets a name of its own rather than the answer reserved
+    // for a buffer that is too small. The rot test below is what makes this
+    // the rule for every tool and not just this one.
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "").?);
+}
+
+test "a name too long for the buffer is a refusal, and never a truncated key" {
+    // A truncated key names a different, broader action, and a rule an author
+    // wrote for the real one would then also cover it. So the buffer is
+    // checked before anything is written, and a buffer this file will not
+    // fill in full gets `null` and nothing else.
+    var small: [8]u8 = undefined;
+    try std.testing.expect(
+        Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "") == null,
+    );
+}
+
+test "every tool has an action name, and every name reaches the table" {
+    // **The seam nothing exercises by default.** Every tool's row is an
+    // `allow` in the shipped defaults, so no ordinary session ever asks,
+    // and a broken name builder would look exactly like a working one.
+    // This test is what makes that impossible.
+    inline for (@typeInfo(Tool).@"enum".fields) |f| {
+        const tool: Tool = @enumFromInt(f.value);
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        const action = tool.actionInto(&buffer, null, "") orelse
+            return error.ToolHasNoActionName;
+        try std.testing.expect(action.len > 0);
+    }
 }
 
 test "a task list dispatched with no session around it is refused, and never reads as kept" {
