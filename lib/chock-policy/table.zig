@@ -108,8 +108,30 @@
 //! ## The table cannot change while a session runs
 //!
 //! Chock parses `chock.zon` one time and holds the result in memory.
+//!
+//! ## An action nobody named, and the rules Chock ships for it
+//!
+//! "`ask` is the answer when no rule matches" is the rule for what
+//! `chock.zon` did not name. `lib/chock-policy/defaults.zig` narrows that for
+//! one case only: the ordinary tool calls `lib/chock-core/tools.zig` builds a
+//! name for, so a project with no `chock.zon` at all still runs them without
+//! a prompt. See that file's own top comment for the rules themselves and for
+//! why every one of them names an action, never a tool alone.
+//!
+//! **A shipped default answers beside a project's own rules, not underneath
+//! them.** `evaluateRules` reads the two rule lists together, in the one
+//! search for a winner this file's own "Which rule wins" section already
+//! describes, so a project rule beats a shipped default the same way any two
+//! rules of `chock.zon` would settle a disagreement: the more specific
+//! pattern wins, and a tie goes to the decision that permits less. **This
+//! could not be built as one more term of the ceiling intersection
+//! `Table.org` uses.** A ceiling can only ever narrow an answer that already
+//! exists, and an unnamed action's existing answer is `ask`: intersecting
+//! `ask` with anything can never produce `allow`, which is the one thing a
+//! shipped default has to do for the tool calls it names.
 
 const std = @import("std");
+const defaults = @import("defaults.zig");
 
 /// The name of the configuration file, in the project root.
 /// `lib/chock-workspace/Workspace.zig` looks in the same place.
@@ -933,9 +955,30 @@ fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) voi
 
 /// The answer `Table.evaluateKindAlone` gives, over a rule list on its own.
 /// `validate` needs this before there is a `Table` to ask.
+///
+/// **`lib/chock-policy/defaults.zig`'s rules answer beside `rules`, not
+/// underneath them.** `winnerFor` already finds the one rule of a list that
+/// answers for `key`, and this asks it twice, once for each list, then keeps
+/// whichever of the two answers `ruleBeats` prefers. That is the same search
+/// `winnerFor` runs over one list that holds every rule of both, because
+/// `ruleBeats` is a total order and the strongest rule of the whole is always
+/// the stronger of the two lists' own strongest. See this file's own top
+/// comment for why that must not be built as one more term of an
+/// intersection instead.
 fn evaluateRules(rules: []const Rule, key: Key) Decision {
-    const answer = winnerFor(rules, key) orelse return .ask;
-    return answer.decision;
+    const winner = strongerOfTwoWinners(
+        winnerFor(rules, key),
+        winnerFor(defaults.rules, key),
+    ) orelse return .ask;
+    return winner.decision;
+}
+
+/// The rule `ruleBeats` would keep, between the winner of one list and the
+/// winner of another. Null only when neither list held a match at all.
+fn strongerOfTwoWinners(a: ?Rule, b: ?Rule) ?Rule {
+    const left = a orelse return b;
+    const right = b orelse return a;
+    return if (ruleBeats(right, left)) right else left;
 }
 
 /// `evaluateRules`, for a layer that is read as a ceiling: **a key no rule
