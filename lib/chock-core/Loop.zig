@@ -9,8 +9,8 @@
 //!
 //! **An event is written before the action it describes happens.** A model's
 //! reply is appended as a `message` event, and each tool call inside it is
-//! appended as its own `tool.call` event, before `deps.tools.dispatch` ever
-//! runs. A crash between the model answering and the tool running is then
+//! appended as its own `tool.call` event, before `deps.tool_runner.dispatch`
+//! ever runs. A crash between the model answering and the tool running is then
 //! replayable: the call is already on disk, even if the result never
 //! arrives. Writing the call after running the tool, because it reads
 //! simpler, is the mistake this ordering exists to rule out.
@@ -41,22 +41,44 @@
 //!
 //! ## The approval seam
 //!
-//! **The broker is built, and no tool call goes through it.** `Loop.run` never
-//! asks anyone whether a tool call may run: every call `deps.tools` accepts, it
-//! runs. The place a broker's decision would slot in is between appending the
-//! `tool.call` event, step 4a below, and calling `deps.tools.dispatch`, step
-//! 4b: a broker that refuses would append an `approval.request`, wait for an
-//! `approval.response`, and either call `deps.tools.dispatch` or build a
-//! refusal `tool.result` directly, without ever calling it. Nothing here
-//! reserves a field or a branch for that yet, because a stub that always
-//! approves is worse than no stub. The seam is this comment and the gap between
-//! those two steps, not a type.
+//! **A call bound for `deps.tool_runner` is asked about, between appending
+//! the `tool.call` event, step 4a below, and calling `deps.tool_runner.dispatch`,
+//! step 4b.** `runTool` turns the call into a policy action name with
+//! `tools.Tool.actionInto` and asks `deps.arbiter`, exactly the seam
+//! `runRestrictSelf` already used for a widening: see `gateToolCall`. A
+//! refusal there builds a `tool.result` directly and `deps.tool_runner.dispatch`
+//! is never called. This file still never holds the policy table: the broker
+//! answers, through the same seam, and this file only asks.
 //!
-//! The broker does run today, and it runs outside this file: `src/run.zig`
-//! asks it for `workspace.apply` after `run` returns, so the session's own
-//! commit can reach the user's repository. That is the same rule read from the
-//! other side: the agent never holds the capability, and nothing about the
-//! sandbox it ran in changes because an approval happened.
+//! **The seven names this file answers itself are not asked about here a
+//! second time.** `spawn_agent`, `update_plan`, `restrict_self`, `fetch_url`,
+//! `ask_user`, `set_title` and `request_action` either carry their own gate
+//! already, scoped to the actual privileged act rather than to the call that
+//! names it, or are bounded by some other means entirely: see
+//! `gateToolCall`'s own top comment for the full accounting, one name at a
+//! time.
+//!
+//! **A decision reaches the log for every one of the calls that are asked
+//! about, `allow` included**, because `chock_broker.Broker.request` writes an
+//! `approval.response` for every outcome and this file's own gate is one more
+//! caller of it. Measured against a real session, that is one more line, a
+//! few hundred bytes, for every ordinary sandboxed tool call: see the commit
+//! that added this paragraph for the number. **Kept, not routed around.** A
+//! per call record is `Broker.request`'s own deliberate design, written so a
+//! decision can later be signed, and a cache in this file that skipped asking
+//! would skip that record too, on top of going stale the moment a session
+//! narrowed itself with `restrict_self` after the first call of some action
+//! had already been let through. Growing the log is the honest cost of an
+//! audit trail that covers every call and not only the ones that needed a
+//! person. A project that finds the growth too much narrows `chock.zon` or
+//! waits for a session scoped grant, built properly, with its own replay
+//! rules, rather than an ad hoc guess here.
+//!
+//! The broker also runs for one act outside this file: `src/run.zig` asks it
+//! for `workspace.apply` after `run` returns, so the session's own commit can
+//! reach the user's repository. That is the same rule read from the other
+//! side: the agent never holds the capability, and nothing about the sandbox
+//! it ran in changes because an approval happened.
 //!
 //! ## The spawn seam
 //!
@@ -615,16 +637,34 @@ pub const Deps = struct {
     /// Who decides an act this loop is not allowed to decide for itself, or
     /// null for a session that can ask nobody. See `lib/chock-core/arbiter.zig`.
     ///
-    /// **One act reaches it today**, and it is the one this loop would
-    /// otherwise be deciding about itself: a request to widen a promise the
-    /// session already made. See `runRestrictSelf`. The policy table stays the
-    /// broker's, and nothing in this file ever reads one.
+    /// **Two acts reach it.** A request to widen a promise the session
+    /// already made, see `runRestrictSelf`, and, since this file learned to
+    /// gate a tool call, a call bound for `deps.tool_runner` as well: see
+    /// `runTool` and `gateToolCall`. The policy table stays the broker's, and
+    /// nothing in this file ever reads one. It asks through this seam both
+    /// times.
     ///
     /// **Null is a refusal that says so.** `arbiter.not_asked` is what a
     /// session with none answers, and the words a model gets back then say
     /// nobody could be asked rather than implying the request was weighed,
-    /// and those two are kept apart.
+    /// and those two are kept apart. A session with no arbiter at all can
+    /// therefore run no sandboxed tool, though it can still narrow itself,
+    /// spawn a child, keep a plan and the rest of the seven `gateToolCall`
+    /// leaves to their own gate: see that function's own top comment for why
+    /// this is the safe direction and not an accident.
     arbiter: ?arbiter_mod.Arbiter = null,
+    /// The workspace's own absolute root, or empty for a caller that does not
+    /// know one. Read only by `gateToolCall`, which hands it straight to
+    /// `tools.Tool.actionInto` as `project_root`: see that function's own doc
+    /// for why an in-project absolute path needs it to name the same action
+    /// as its relative spelling.
+    ///
+    /// **Empty is safe and not a bypass.** `actionInto` only strips this
+    /// prefix off an absolute `argv0` when both it and `project_root` are
+    /// absolute paths. An empty `project_root` fails that check and the path
+    /// is read exactly as written, which still names a real, if less
+    /// specific, action. Nothing here ever falls back to `allow`.
+    project_root: []const u8 = "",
     /// What reads a URL for the agent, or null for a session that can read
     /// none. See `lib/chock-core/fetch.zig`.
     ///
@@ -2133,6 +2173,159 @@ fn askForSummary(
     }
 }
 
+/// The policy gate a call bound for `deps.tool_runner` passes through before
+/// `runTool` ever calls it. Null means the call may run. A `ToolResult` means
+/// it may not, and `runTool` uses it in place of calling
+/// `deps.tool_runner.dispatch`.
+///
+/// **Only the calls the tool runner would otherwise just run.** The seven
+/// names `runTool` answers itself, `spawn_agent`, `update_plan`,
+/// `restrict_self`, `fetch_url`, `ask_user`, `set_title` and
+/// `request_action`, are skipped here on purpose: see the switch below for
+/// why each already has its own gate, scoped narrower than the coarse call
+/// name this function would otherwise ask about. Everything else, `read_file`
+/// through `provide_tool`, had no gate at all before this function existed,
+/// which is the gap this whole task closes.
+///
+/// **A session with no arbiter can run none of those.** `deps.arbiter`'s own
+/// doc says null answers `arbiter_mod.not_asked`, so an ordinary sandboxed
+/// call is refused rather than let through by default. This is a real
+/// behaviour change for a caller that built a `Loop.Deps` with no arbiter and
+/// expected such a call to run. `src/run.zig` sets one for every session it
+/// starts, and a test that wants the old behaviour now says so by giving one
+/// that always permits.
+///
+/// **A tool name this build does not recognise is not gated here, and that is
+/// not always because the name is unknown.** `std.meta.stringToEnum` answers
+/// null for two different callers. One is a genuinely unknown tool, which
+/// `deps.tool_runner.dispatch` is about to refuse with its own "unknown tool"
+/// message. The other is an admitted MCP or plugin tool: `chock_core.mcp`'s
+/// `Session.admit` refuses to admit a server tool whose name collides with a
+/// built-in, so by construction every legitimate MCP or plugin tool name is
+/// one this enum cannot name. `src/run.zig`'s `McpToolRunner.dispatchFn` does
+/// `self.state.session.dispatch(...) orelse return self.inner.dispatch(...)`,
+/// and `chock_core.mcp.Session.dispatch` answers a real outcome for any
+/// admitted name without ever falling through, so the call runs. This
+/// function does not tell the two cases apart. It does not need to, because
+/// an MCP or plugin tool was already gated once, before the loop ever ran,
+/// when its own server list was admitted against `mcp.<server>.<tool>`.
+///
+/// **That session start gate has two limits worth recording here, because a
+/// future reader needs them.** It never consults `deps.arbiter`, so a row of
+/// `.ask` for an MCP or plugin tool becomes a permanent refusal at session
+/// start, and no person or reviewer is ever asked. And it is evaluated once,
+/// before the loop runs, so a mid-session `restrict_self` narrowing cannot
+/// bind an MCP or plugin tool call.
+fn gateToolCall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    deps: Deps,
+    call: event.ToolCall,
+) Error!?event.ToolResult {
+    const tool = std.meta.stringToEnum(tools.Tool, call.tool) orelse return null;
+
+    // **The seven names `runTool` answers itself are not asked about here.**
+    // Each already carries its own gate, scoped to the actual privileged act
+    // rather than to the call that names it: `restrict_self` asks about
+    // `ratchet.widen_action` only when it would widen, `fetch_url` asks about
+    // `net.fetch.*` once a host is known, and `request_action` asks about the
+    // act it names, never about itself. `spawn_agent`, `update_plan`,
+    // `set_title` and `ask_user` are bounded by other means entirely: a
+    // subagent by `deps.subagents`, a plan step by `max_plan_steps`, and
+    // asking a question grants nothing. Gating the coarse call name on top of
+    // any of these would ask twice about what a person experiences as one
+    // act, and for `restrict_self` it would ask the wrong question first:
+    // `Deps.arbiter` being null must refuse a widening specifically, not
+    // every ordinary promise this session is free to narrow with no arbiter
+    // at all. See `runWiden`.
+    switch (tool) {
+        .spawn_agent,
+        .update_plan,
+        .restrict_self,
+        .fetch_url,
+        .ask_user,
+        .set_title,
+        .request_action,
+        => return null,
+        else => {},
+    }
+
+    // Only `run_command` reads its own arguments for this: see
+    // `Tool.actionInto`'s own doc on why every other tool is named after
+    // itself alone.
+    var argv0_owned: ?[]u8 = null;
+    defer if (argv0_owned) |owned| allocator.free(owned);
+    if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
+
+    var action_buffer: [tools.Tool.max_action_bytes]u8 = undefined;
+    const action = tool.actionInto(&action_buffer, argv0_owned, deps.project_root) orelse
+        return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
+
+    // `Ask.detail` is the whole effect and never a command string: `action`
+    // is exactly that, already built by `actionInto` to describe the call
+    // without repeating raw arguments back.
+    const answer = if (deps.arbiter) |arbiter| blk: {
+        const summary = try std.fmt.allocPrint(allocator, "run the tool \"{s}\"", .{call.tool});
+        defer allocator.free(summary);
+        break :blk arbiter.decide(allocator, io, locked, .{
+            .action = action,
+            .summary = summary,
+            .detail = action,
+            .reason = "",
+            .tool = call.tool,
+            .tool_call_id = call.call_id,
+        });
+    } else arbiter_mod.not_asked;
+
+    if (answer.permitted) return null;
+
+    // **The rule and the alternative, never the reason.** `answer.outcome`
+    // and `answer.review_text` are the only two fields `Answer` carries
+    // beside `permitted`, and neither ever holds a reviewer's own reasoning:
+    // see `lib/chock-core/arbiter.zig`'s own top comment. A model told why a
+    // wall exists is a model handed the same map a red team session already
+    // used once: see the changelog entry this rule comes from.
+    return try gateRefusal(allocator, call, try std.fmt.allocPrint(
+        allocator,
+        "nothing ran: \"{s}\" needs approval to run and the answer was \"{s}\". {s}{s}Do the part " ++
+            "of the task that does not need it, or stop and say what is left and why.",
+        .{
+            call.tool,
+            answer.outcome,
+            answer.review_text,
+            if (answer.review_text.len == 0) "" else " ",
+        },
+    ));
+}
+
+/// What `gateToolCall` answers when `Tool.actionInto` itself could not name
+/// the call. Sized buffers make this unreachable for a real caller, the same
+/// as `runCommandActionInto`'s own doc says of its null branch, and this
+/// exists so a future caller that shrank the buffer fails safely rather than
+/// with a crash.
+const gate_unnamed_detail = "nothing ran: this call could not be named for a policy check, " ++
+    "so it was not run. Try something else.";
+
+/// A tool call the policy gate refused. `detail` is already owned by the
+/// allocator and is handed straight on.
+///
+/// **Always an error result**, for the reason `spawnRefusal` and
+/// `restrictRefusal` are: nothing ran, whichever branch answered, and a model
+/// that read this as success would carry on as though it had.
+fn gateRefusal(
+    allocator: std.mem.Allocator,
+    call: event.ToolCall,
+    detail: []u8,
+) std.mem.Allocator.Error!event.ToolResult {
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = detail,
+        .is_error = true,
+        .truncated = false,
+    };
+}
+
 /// Append the `tool.call` event, run the call, then append the `tool.result`
 /// event and the `message` event that feeds the result back into the
 /// context for the next turn. See this file's own top comment for the
@@ -2167,6 +2360,14 @@ fn runTool(
     //
     // The call and its result are still appended, like every other, so the log
     // of a reviewer that tried shows what it tried.
+    //
+    // **The policy gate comes second, only once an arbitrator is already
+    // ruled out.** An arbitrator is refused on `Deps.role` alone, the same
+    // whichever name it asked for, and asking the policy about a call that
+    // never runs either way would spend an `approval.response` on nothing.
+    // `gateToolCall` itself answers null at once for the seven names below
+    // it, which are answered by this file and carry their own, narrower
+    // gate: see its own top comment.
     const dispatched = if (!deps.role.holdsTools())
         event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -2174,6 +2375,8 @@ fn runTool(
             .is_error = true,
             .truncated = false,
         }
+    else if (try gateToolCall(allocator, io, locked, deps, call)) |refusal|
+        refusal
     else if (std.mem.eql(u8, call.tool, spawn_tool_name))
         try runSpawn(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, plan_tool_name))
@@ -4063,6 +4266,42 @@ fn foldFromStart(allocator: std.mem.Allocator, io: std.Io, storage: chock_proto.
     return session;
 }
 
+/// An `Arbiter` that permits every act, and keeps no state of its own: see
+/// `chock_broker.Broker.SystemWaiter` for the same shape and the same reason,
+/// an anchor address with nothing behind it.
+///
+/// **What every test in this file that does not measure the policy gate
+/// itself gets from `testDeps`.** `gateToolCall` asks an arbiter about every
+/// ordinary tool call now, and a suite written before that gate existed is
+/// entitled to keep behaving as it did: a tool call runs, because somebody,
+/// even if only this stand in, was there to be asked. A test that means to
+/// measure the gate overrides `deps.arbiter` itself afterwards, the same way
+/// the promise tests already override it to measure a widening.
+const AlwaysPermitArbiter = struct {
+    var anchor: u8 = 0;
+
+    fn arbiter() arbiter_mod.Arbiter {
+        return .{ .ptr = &anchor, .vtable = &vtable };
+    }
+
+    const vtable = arbiter_mod.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *arbiter_mod.Locked,
+        ask: arbiter_mod.Ask,
+    ) arbiter_mod.Answer {
+        _ = ptr;
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        _ = ask;
+        return .{ .permitted = true, .outcome = "allowed_by_policy" };
+    }
+};
+
 fn testDeps(client: chock_provider.Client.Client, storage: chock_proto.storage.Storage, tool_runner: ToolRunner) Deps {
     return .{
         .client = client,
@@ -4073,6 +4312,7 @@ fn testDeps(client: chock_provider.Client.Client, storage: chock_proto.storage.S
         .model_alias = "main",
         .agent_kind = "coder",
         .system_prompt = "you are a test agent",
+        .arbiter = AlwaysPermitArbiter.arbiter(),
     };
 }
 
@@ -4164,6 +4404,166 @@ test "a turn with a tool call appends the call, runs it, and appends the result"
     try testing.expect(call_id != null);
     try testing.expect(result_id != null);
     try testing.expect(call_id.? < result_id.?);
+}
+
+test "a tool call whose row the policy allows runs, with no reviewer weighed in" {
+    // The policy table itself lives in the broker and this file never reads
+    // one, so "the row says allow" is simulated the same way `Broker.request`
+    // would answer it: the arbiter permits at once, with the outcome an
+    // `allow` decision carries. What this test pins is the loop's own half:
+    // it asks, and a permit really does let the call through to
+    // `deps.tool_runner`.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01GATEALLOW");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{ .permitted = true, .outcome = "allowed_by_policy" } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqual(@as(usize, 1), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_result = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(!parsed.value.event.tool_result.is_error);
+            try testing.expectEqualStrings("ok", parsed.value.event.tool_result.output);
+            saw_result = true;
+        }
+    }
+    try testing.expect(saw_result);
+}
+
+test "a tool call whose row asks, with an arbiter that permits, runs" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01GATEASKYES");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{ .permitted = true, .outcome = "approved_by_user" } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqual(@as(usize, 1), fake_tools.calls);
+}
+
+test "a tool call whose row asks, with an arbiter that refuses, does not run, and the model is told" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01GATEASKNO");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } }} },
+        .{ .deltas = &.{.{ .text = "that is what I will not do" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{
+        .permitted = false,
+        .outcome = "refused_by_user",
+        .review_text = "a reviewer weighed this and said no",
+    } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Refused, so the tool runner is never reached.
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_error_result = false;
+    var saw_tool_message = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .tool_result => |r| {
+                try testing.expect(r.is_error);
+                try testing.expect(std.mem.indexOf(u8, r.output, "refused_by_user") != null);
+                try testing.expect(
+                    std.mem.indexOf(u8, r.output, "a reviewer weighed this and said no") != null,
+                );
+                saw_error_result = true;
+            },
+            // The result reaches the model as a tool message, the same as any
+            // other tool result: this is what "the model gets a tool result
+            // saying so" means at the wire level.
+            .message => |m| if (m.role == .tool) {
+                try testing.expect(m.content[0].tool_result.is_error);
+                saw_tool_message = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_error_result);
+    try testing.expect(saw_tool_message);
+}
+
+test "a session with no arbiter refuses every ordinary tool call and does not run it" {
+    // `Deps.arbiter`'s own doc says null is a refusal that says so, and this
+    // pins that an ordinary tool call is not an exception: a session that can
+    // ask nobody runs no tool, the same as it lifts no promise.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01GATENOARBITER");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } }} },
+        .{ .deltas = &.{.{ .text = "that is what I will not do" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = null;
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_error_result = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(parsed.value.event.tool_result.is_error);
+            try testing.expect(
+                std.mem.indexOf(u8, parsed.value.event.tool_result.output, arbiter_mod.not_asked.outcome) != null,
+            );
+            saw_error_result = true;
+        }
+    }
+    try testing.expect(saw_error_result);
 }
 
 test "the context the model sees is a fold over the log, and a resume gives the same one" {

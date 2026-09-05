@@ -78,24 +78,43 @@ tenth.
 
 ## What is not built yet
 
-- **An ordinary tool call still reaches nobody. One act is agent-requestable
-  and the rest are not.** This is the largest gap in the approval model, so
-  read it before the rest. `Loop.run` never asks anyone whether a tool call may
-  run: every call `deps.tools` accepts, it runs. What changed is one act.
+- **One act is agent-requestable and the rest are not.** This is the largest
+  remaining gap in the approval model, so read it before the rest. An
+  ordinary tool call is asked about now: `gateToolCall` in `Loop.run` builds
+  the action name `Tool.actionInto` names for the call and asks
+  `deps.arbiter`, the same seam `runRestrictSelf` already used for a
+  widening. The shipped defaults answer `allow` for every one of those
+  action names, so a project with no `chock.zon` of its own gains no new
+  prompt over what ran before this gate existed. Seven tool names are
+  skipped by this gate and decided elsewhere, at the key that actually
+  works. `spawn_agent` is bounded by `chock.zon`'s own `subagents` block,
+  `max_width` and `max_depth`. `restrict_self` needs nobody's permission to
+  narrow, and asks about `ratchet.widen_action` only to widen. `fetch_url`
+  is decided per host, once the URL is known, at `net.fetch.*` and
+  `net.connect.*`. `request_action` is decided at the requested act's own
+  name. `update_plan`, `ask_user` and `set_title` grant no capability and
+  need no key at all. An MCP or plugin tool is not asked about by this gate
+  either: it is gated once, at session start, against
+  `mcp.<server>.<tool>`, and that gate never consults `deps.arbiter` and
+  never runs again, so an `.ask` row for one becomes a permanent refusal
+  with no person asked, and a mid-session `restrict_self` narrowing does not
+  bind it.
+
+  What is still missing is a way for the agent to ask about a wider act.
   `request_action` is now in `chock_core.tools.Tool`, and it takes
-  **`workspace.apply` and nothing else**: an agent that believes it is finished
-  can ask for its commit to be carried into the user's repository, and the
-  policy table, or a person, answers. Every other action name is refused by
-  name, before anybody is asked. An agent still cannot ask about `git.commit`,
-  `git.push`, `git.branch.delete`, `net.fetch` as an act, `nix.build` or
-  `file.write`: the table can answer those rows and nothing in a session asks
-  them. Three callers reach the broker today. Two are the harness itself:
-  `chock run` asks for `workspace.apply` after the loop has ended, and the
-  session arbiter asks for `policy.widen` while it runs. The third is the agent,
-  through `request_action`, for that one act. The git shim is still the one
-  thing that stops a subcommand, and only one that would reach another host:
-  `git commit` runs the real git inside the sandbox with no question asked.
-  **The sandbox is what holds an ordinary tool call today, not an approval.**
+  **`workspace.apply` and nothing else**: an agent that believes it is
+  finished can ask for its commit to be carried into the user's repository,
+  and the policy table, or a person, answers. Every other action name is
+  refused by name, before anybody is asked. An agent still cannot ask about
+  `git.commit`, `git.push`, `git.branch.delete`, `net.fetch` as an act,
+  `nix.build` or `file.write`: the table can answer those rows and nothing
+  in a session asks them. Three callers reach the broker today. Two are the
+  harness itself: `chock run` asks for `workspace.apply` after the loop has
+  ended, and the session arbiter asks for `policy.widen` while it runs. The
+  third is the agent, through `request_action`, for that one act. The git
+  shim is still the one thing that stops a subcommand, and only one that
+  would reach another host: `git commit` runs the real git inside the
+  sandbox with no question asked.
 
 - **A handover cannot carry a background command or a background subagent, so a
   session running one refuses.** Both live in the process that started them, and

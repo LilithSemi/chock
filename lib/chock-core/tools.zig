@@ -2931,6 +2931,22 @@ pub fn writtenPathIn(
     return readPathIn(allocator, arguments);
 }
 
+/// The first `argv` element a `run_command` call carries, or null when the
+/// arguments do not parse or `argv` is empty. Caller owns the result.
+///
+/// **Its own function, for the reason `readPathIn` is one.** `Tool.actionInto`
+/// needs exactly this one string to name a `run_command` call, and a second
+/// parse of `RunCommandArgs` outside this file would be a second reading of
+/// the same call that could drift from the one `runCommand` itself does.
+pub fn firstArgvIn(allocator: std.mem.Allocator, arguments: []const u8) std.mem.Allocator.Error!?[]u8 {
+    const parsed = std.json.parseFromSlice(RunCommandArgs, allocator, arguments, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.argv.len == 0) return null;
+    return try allocator.dupe(u8, parsed.value.argv[0]);
+}
+
 fn listDirectory(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -7915,6 +7931,15 @@ test "a read with no hash gives no hash, and neither does anything that is not a
     try std.testing.expect(try readPathIn(allocator, "{\"command\":\"ls\"}") == null);
     try std.testing.expect(try readPathIn(allocator, "not json at all") == null);
     try std.testing.expect(try readPathIn(allocator, "{\"path\":\"\"}") == null);
+
+    // The program name a run_command call carries, and the calls that carry
+    // none.
+    const argv0 = (try firstArgvIn(allocator, "{\"argv\":[\"jq\",\"-r\",\".\"]}")).?;
+    defer allocator.free(argv0);
+    try std.testing.expectEqualStrings("jq", argv0);
+    try std.testing.expect(try firstArgvIn(allocator, "{\"argv\":[]}") == null);
+    try std.testing.expect(try firstArgvIn(allocator, "not json at all") == null);
+    try std.testing.expect(try firstArgvIn(allocator, "{\"path\":\"a\"}") == null);
 }
 
 test "a provide_tool call with no session behind it is refused, and never says the program is there" {

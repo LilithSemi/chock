@@ -9058,10 +9058,16 @@ fn runSession(
         // `chock_core.Loop.Deps.tasks`.
         .tasks = if (table) |*one| one else null,
         // The ratchet. What the loop asks when an agent proposes to widen a
-        // promise it already made. Before the approval socket there was nobody
-        // who could answer mid session, so every such proposal was refused
-        // unasked: see `SessionArbiter`.
+        // promise it already made, and, since `gateToolCall` learned to ask,
+        // every call bound for the tool runner too. Before the approval
+        // socket there was nobody who could answer mid session, so every such
+        // proposal was refused unasked: see `SessionArbiter`.
         .arbiter = session_arbiter.arbiter(),
+        // The same root `sandbox_config.cwd` already names, so
+        // `tools.Tool.actionInto` reads an in-project absolute `argv0` from
+        // where it points and not from how it is spelled: see that
+        // function's own doc.
+        .project_root = started.sandbox_config.cwd,
         // What answers a `request_action` call. **This line is the difference
         // between a tool the model is offered and a tool that does
         // something**: `chock_core.Loop.Deps.handback` defaults to null, and a

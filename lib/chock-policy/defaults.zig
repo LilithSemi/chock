@@ -52,6 +52,28 @@
 //! exact action `actionInto` builds, and nothing wider, is what keeps a
 //! shipped default from ever answering a question it was not written for.
 //!
+//! ## Seven names with no `call.*` rule at all
+//!
+//! `lib/chock-core/Loop.zig`'s `gateToolCall` answers seven tool names itself,
+//! before it ever calls `Tool.actionInto` for them, so no `call.spawn_agent`,
+//! `call.update_plan`, `call.restrict_self`, `call.fetch_url`, `call.ask_user`,
+//! `call.set_title` or `call.request_action` key is ever built or evaluated by
+//! anything in Chock. A rule here under one of those names would read as a
+//! control and do nothing: this file ships none of them, on purpose, and an
+//! author who wants to bound one of these seven writes the key that is
+//! actually read instead.
+//!
+//! * `spawn_agent` is bounded by `chock.zon`'s own `subagents` block,
+//!   `max_width` and `max_depth`. There is no table key.
+//! * `restrict_self` narrowing needs nobody's permission, by design. Widening
+//!   asks about `ratchet.widen_action`.
+//! * `fetch_url` is decided per host, once the URL is known, at
+//!   `net.fetch.*` and `net.connect.*`.
+//! * `request_action` is decided at the requested act's own name, such as
+//!   `git.push`, with `.tool = "request_action"`.
+//! * `update_plan`, `ask_user` and `set_title` grant no capability and need no
+//!   key at all.
+//!
 //! ## What is deliberately absent
 //!
 //! `net.connect.*` and `net.fetch.*` hold no rule here, on purpose. Chock
@@ -73,9 +95,9 @@
 
 const table = @import("table.zig");
 
-/// One rule for every action `Tool.actionInto` can build for an ordinary
-/// tool call, so an empty or absent `chock.zon` still runs them without a
-/// prompt.
+/// One rule for every action `gateToolCall` actually asks the table about
+/// for an ordinary tool call, so an empty or absent `chock.zon` still runs
+/// them without a prompt.
 ///
 /// `run_command` needs four rules, one for each class `actionInto` can
 /// build, because `.tool = "run_command"` alone would be exactly the unsafe
@@ -83,6 +105,13 @@ const table = @import("table.zig");
 /// needs exactly one, because `actionInto` builds it exactly one name,
 /// `"call." ++ @tagName(tool)`, and nothing else in Chock ever asks the
 /// table about that name.
+///
+/// **The seven names `gateToolCall` answers itself hold no rule here.**
+/// `spawn_agent`, `update_plan`, `restrict_self`, `fetch_url`, `ask_user`,
+/// `set_title` and `request_action` never reach `Tool.actionInto` from
+/// `gateToolCall`, so a `call.*` rule for any of them would never be built
+/// or evaluated by anything. See this file's own top comment, "Seven names
+/// with no `call.*` rule at all".
 ///
 /// **A tool added to `lib/chock-core/tools.zig` and forgotten here does not
 /// fail a build.** `chock-policy` imports no other chock library, so this
@@ -104,14 +133,7 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_guidance", .decision = .allow },
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
-    .{ .action = "call.spawn_agent", .decision = .allow },
-    .{ .action = "call.update_plan", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
-    .{ .action = "call.restrict_self", .decision = .allow },
-    .{ .action = "call.fetch_url", .decision = .allow },
-    .{ .action = "call.ask_user", .decision = .allow },
-    .{ .action = "call.set_title", .decision = .allow },
-    .{ .action = "call.request_action", .decision = .allow },
 };
 
 const std = @import("std");
@@ -152,14 +174,7 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
         "call.read_guidance",
         "call.read_memory",
         "call.write_memory",
-        "call.spawn_agent",
-        "call.update_plan",
         "call.provide_tool",
-        "call.restrict_self",
-        "call.fetch_url",
-        "call.ask_user",
-        "call.set_title",
-        "call.request_action",
     };
     for (call_actions) |action| {
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key(action)));
