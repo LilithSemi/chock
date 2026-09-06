@@ -449,6 +449,31 @@ pub const Network = struct {
     /// top comment on what changed and what did not.
     asker: ?Asker = null,
 
+    /// What this session promised about itself, folded from its own
+    /// `policy.self` events. Empty for a session that promised nothing, which
+    /// is every session that had no use for a promise, and every test of this
+    /// file before this field existed.
+    ///
+    /// **Applied to the plain table answer in `answer`, and carried into the
+    /// broker's own request in `askPermits`.** A `restrict_self` promise tells
+    /// the model it binds for the rest of the session, and `net.connect` is
+    /// not a special case: `lib/chock-broker/fetch.zig`'s `Session.decide` is
+    /// the same fold over `net.fetch`, and this is that fold over
+    /// `net.connect`. The caller renames this before every tool call, the
+    /// same way `tool` is renamed: see `src/run.zig`'s `ToolNetwork`.
+    self_policy: []const chock_policy.ratchet.Restriction = &.{},
+
+    /// The `call_id` of the `tool.call` this connection was opened for. Empty
+    /// for a `Network` built where there is no one call to name: the MCP
+    /// startup path, and every test of this file before this field existed.
+    ///
+    /// **This is not decoration.** `test/redteam/logscan.zig`'s `Fold.toolFor`
+    /// returns null for an empty id, which the red team oracle reads as a gap
+    /// in the log rather than as an answered question, and a gap downgrades a
+    /// boundary to inconclusive rather than passing or failing it. An empty
+    /// id here is a hole in the evidence, not a saving of a byte.
+    tool_call_id: []const u8 = "",
+
     /// How many connections were granted and how many were refused, so a
     /// caller can say what a call did without reading a log.
     granted: usize = 0,
@@ -494,12 +519,25 @@ pub const Network = struct {
         // gone the moment this returns. The decision the refusal records says
         // `ask` either way, which is the same thing a table with no rule says.
         var fault: ?table.ChainFault = null;
-        const decision = self.table.evaluateChain(self.chain, .{
-            .agent_kind = self.agent_kind,
-            .model = self.model,
-            .tool = self.tool,
-            .action = action,
-        }, &fault);
+        // **The session's own promises are folded in here, and not only in
+        // `askPermits`.** Without this, a rule that already said `allow`
+        // reached `finishConnect` on the line below with nobody ever
+        // consulting `self.self_policy`, because `allow` never reaches the
+        // broker: see this file's own top comment. `ratchet.narrow` covers
+        // the exact action, and `ceilingFor` on `action_prefix` covers a bare
+        // `net.connect` promise the same way `fetch.zig`'s `Session.decide`
+        // covers a bare `net.fetch` one: neither is a pattern `narrow` alone
+        // would match against a per-host action.
+        const decision = chock_policy.ratchet.narrow(
+            self.table.evaluateChain(self.chain, .{
+                .agent_kind = self.agent_kind,
+                .model = self.model,
+                .tool = self.tool,
+                .action = action,
+            }, &fault),
+            self.self_policy,
+            action,
+        ).intersect(chock_policy.ratchet.ceilingFor(self.self_policy, action_prefix));
         if (decision != .allow) {
             // **Only `ask` is ever sent on.** `deny`, `agent_review` and
             // `agent_then_human` are refused right here, exactly as they
@@ -610,8 +648,21 @@ pub const Network = struct {
             .agent_kind = self.agent_kind,
             .model_alias = self.model,
             .tool = self.tool,
-            .tool_call_id = "",
+            // **Never empty when a real dispatch built this `Network`.** See
+            // `tool_call_id`'s own doc comment: an empty id here is what made
+            // `logscan.Fold.toolFor` blind to this request, which is what
+            // turned two boundaries `inconclusive` for a session that ever
+            // asked about a connection.
+            .tool_call_id = self.tool_call_id,
             .spawn_chain = links[0..parents.len],
+            // **The same promise `answer`'s own fast path already applied.**
+            // Passing it again here is not a second evaluation: `Broker.request`
+            // folds it into the one evaluation it performs over `action`, the
+            // same key this file built above. Leaving it out is exactly the
+            // fault this field exists to close: a table answer of `ask`
+            // reached a person even though a `restrict_self` promise had
+            // already narrowed it to `deny`.
+            .self_policy = self.self_policy,
         }, null) catch {
             _ = self.refuse(.{ .net_host_not_permitted = .{
                 .host = self.copy(host),
@@ -1637,4 +1688,138 @@ test "a network built with no asker refuses ask exactly as it always has, becaus
     try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
     try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
     try testing.expectEqual(@as(usize, 1), network.refused);
+}
+
+// ## A `restrict_self` promise binds `net.connect` too
+//
+// `lib/chock-broker/fetch.zig`'s own `Session.decide` already folds this
+// session's own promises over `net.fetch`. The tests below are the same
+// claim over `net.connect`: a promise the model made about the network binds
+// the tool call path, not only the fetch tool.
+
+test "a session's own promise narrows an allow the table gives on its own, so an allow row is ratcheted too" {
+    // **The fast path this pins.** A table that already says `allow` never
+    // reaches the broker: see this file's own top comment on the volume that
+    // would create. That is still true after this test passes, and it is
+    // exactly why the promise has to be applied here, in `answer`, rather
+    // than left for `askPermits` to fold: `askPermits` is never reached for
+    // a decision the table already answered `allow` about.
+    //
+    // Mutation check: drop the `ratchet.narrow` call this test exists to add
+    // to `answer` and this test is the one that catches it; every test above
+    // it still passes, because none of them ever sets `self_policy`.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    const promised = [_]chock_policy.ratchet.Restriction{
+        .{ .action = "net.*", .ceiling = .deny },
+    };
+    network.self_policy = &promised;
+
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 1), network.refused);
+}
+
+test "a session's own promise narrows an ask the table gives, with nobody asked at all" {
+    // No `asker` here on purpose: if the promise narrows the plain `ask`
+    // answer to `deny` inside `answer` itself, this refuses before it ever
+    // looks for one to ask. The broker side of the same claim is the test
+    // below, which is the one that pins `askPermits`.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    const promised = [_]chock_policy.ratchet.Restriction{
+        .{ .action = "net.*", .ceiling = .deny },
+    };
+    network.self_policy = &promised;
+
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+}
+
+test "askPermits carries this session's own promise into the broker's own decision, so a person is never asked" {
+    // **Measured on 2026-09-05**: with this promise and this table, passing
+    // `self_policy` through decides `deny`; leaving it out, which is what
+    // `askPermits` did before this test, decides `ask`, and a person could
+    // then say yes to a connection the model had already promised away.
+    //
+    // Mutation check: drop `.self_policy = self.self_policy` from the
+    // `Broker.Request` `askPermits` builds and `waiter.waits` below reads 1
+    // instead of 0, because the broker would have gone on to ask.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    const promised = [_]chock_policy.ratchet.Restriction{
+        .{ .action = "net.*", .ceiling = .deny },
+    };
+    network.self_policy = &promised;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK6");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .approved_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    try testing.expectEqual(@as(usize, 0), waiter.waits);
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+}
+
+test "askPermits writes the real tool call id, not an empty one, into the request it asks about" {
+    // **This is what `logscan.Fold.toolFor` reads.** An empty id there
+    // returns null, which the red team oracle folds into `inconclusive`
+    // rather than a pass: see `test/redteam/oracle.zig`'s `noteLogGaps`.
+    //
+    // Mutation check: put `""` back for `.tool_call_id` in `askPermits` and
+    // this test is the one that fails; every test above it still passes,
+    // because none of them ever reads the written request back.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+    network.tool_call_id = "call_123";
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK7");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .approved_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    try testing.expect(network.answer("api.anthropic.com", 443) == .granted);
+
+    var replay = try store.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found_request = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .approval_request) continue;
+        found_request = true;
+        try testing.expectEqualStrings("call_123", parsed.value.event.approval_request.tool_call_id);
+    }
+    try testing.expect(found_request);
 }

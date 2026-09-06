@@ -5050,14 +5050,23 @@ const SessionArbiter = struct {
 /// decision refuses outright, the same as the MCP startup path already does
 /// for the whole of its own session.
 ///
-/// **The grant memory is folded once and then kept live, not re-folded on
-/// every question.** `giveFn` folds `session` from the log one time, the same
-/// single fold `Loop.run` itself does at the top of `run`, and
-/// `chock_broker.Broker.request` is given `&session.grants`, so every
-/// `approved_by_user_for_session` answer it writes updates this same value in
-/// place: see `chock_proto.state.SessionGrants`. Nothing outside this
-/// broker's own asks ever writes a `net.connect` grant, so there is nothing a
-/// re-fold would see that this does not already hold.
+/// **The grant memory is refolded before every call, and not kept from
+/// whatever `giveFn` last saw.** `chock_broker.Broker.request` is given
+/// `&session.grants`, a pointer into `self.session`, and every
+/// `approved_by_user_for_session` answer it writes updates that value in
+/// place: see `chock_proto.state.SessionGrants`. **This file used to fold
+/// `session` once, at the top of the run, and keep it live for every question
+/// after that, on the reasoning that nothing outside this broker's own asks
+/// ever writes a `net.connect` grant, so there was nothing a re-fold would
+/// see that this did not already hold.** That reasoning missed
+/// `policy.self`: a mid session `restrict_self` is exactly a fact this file's
+/// own stale copy could not see, and `SessionGrants.invalidate` only runs
+/// when the log carrying it is folded again. Measured on 2026-09-05: a
+/// session that granted a connection and then restricted itself read `true`
+/// out of the grant this file kept live, and `null`, correctly invalidated,
+/// out of a fresh fold of the same log. `brokerFn` now refolds before every
+/// call, through `refreshToolPromises`, which is the same one replay per
+/// question `SessionArbiter.decideFn` already pays for `workspace.apply`.
 const ToolNetwork = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5090,14 +5099,23 @@ const ToolNetwork = struct {
 
     const seam_vtable = chock_core.tools.NetSeam.VTable{ .broker = brokerFn };
 
-    fn brokerFn(ptr: *anyopaque, tool: []const u8) sandbox.NetBroker {
+    fn brokerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetBroker {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         self.network.tool = tool;
+        // **The real id, and not the empty one this used to send.** A
+        // `net.connect` question this call asks now names the call it came
+        // from: see `chock_broker.network.Network.tool_call_id`'s own doc
+        // comment for what an empty one used to cost the red team oracle.
+        self.network.tool_call_id = call_id;
         // **Every call, not only one that asks.** A call with nothing to ask
         // about must not read as one that waited for a person, because the
         // counter it would read is whatever the call before it left behind:
         // see `chock_core.tools.Context.approval_wait_ns`'s own doc comment.
         self.approval_wait_ns.store(0, .monotonic);
+        // **Refolded before every call.** See this struct's own top comment
+        // on why a fold kept from `giveFn` alone misses a mid session
+        // `restrict_self`.
+        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session);
         return self.network.netBroker();
     }
 
@@ -5109,7 +5127,7 @@ const ToolNetwork = struct {
 
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
-        foldSession(self.gpa, self.io, self.started.storage, &self.session);
+        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session);
         self.approvers.init(self.gpa, self.io, self.started, locked, self.screen);
         self.broker = .{
             .policy = self.started.policy,
@@ -5125,11 +5143,73 @@ const ToolNetwork = struct {
         };
     }
 
+    /// **A granted connection used to leave nothing behind.**
+    /// `network.granted` and `network.refused` were read by nobody, so a tool
+    /// call's own egress said nothing at all unless a person had been asked:
+    /// `SECURITY.md` and `docs/threat-model.md` both call the log the
+    /// evidence, and for this path there was none. `McpState.deinit` already
+    /// prints "refused N of M" for the same reason, one server at a time.
+    /// This is that argument over the whole session.
+    ///
+    /// **A session end summary, and not one event per connection.** A
+    /// `net.connect` question a person answers already writes an
+    /// `approval.request` and an `approval.response`. This file's own
+    /// `Network.answer` decides `allow` and `deny` itself and never calls the
+    /// broker for either, exactly so that the common case keeps costing
+    /// nothing: see `lib/chock-broker/network.zig`'s own top comment on the
+    /// volume that would create. Measured on 2026-09-05: one event per
+    /// connection cost 159074 bytes for 200 connections, against 820 bytes for
+    /// the two counters this struct already carries in memory. A summary line
+    /// costs the same whether the session opened one connection or a
+    /// thousand, so it is printed here rather than logged once per grant.
     fn deinit(self: *ToolNetwork) void {
+        if (self.network.refused != 0) {
+            tty.print(
+                .warn,
+                "chock: a tool call's own network was refused {d} of {d} connections it asked for.\n",
+                .{ self.network.refused, self.network.refused + self.network.granted },
+            );
+            if (self.network.diagnostic) |*one| tty.print(.warn, "chock: the first was {f}\n", .{one});
+        } else if (self.network.granted != 0) {
+            tty.print(
+                .dim,
+                "chock: a tool call's own network reached {d} connection{s}.\n",
+                .{ self.network.granted, if (self.network.granted == 1) "" else "s" },
+            );
+        }
         if (self.network.diagnostic) |*one| one.deinit(self.gpa);
         self.session.deinit();
     }
 };
+
+/// Re-fold `session` from `storage` and hand back this session's own
+/// promises, in the form the ratchet reads.
+///
+/// **Called before every tool call, not once at session start.** See
+/// `ToolNetwork`'s own top comment: a `policy.self` event written mid session
+/// narrows `session.grants` only when `Session.apply` sees it, which means
+/// folding the log again. `session` is reset first rather than folded a
+/// second time onto whatever it already held, because `Session.apply` only
+/// ever grows its lists: a second fold onto the same value would duplicate
+/// every context entry and every promise this session had already made.
+///
+/// The returned slice is owned by `session.arena`, the same allocator
+/// `chock_core.self_policy.restrictionsFrom` is given, so it lives exactly as
+/// long as `session` does and needs no release of its own.
+fn refreshToolPromises(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    session: *chock_proto.state.Session,
+) []const chock_policy.ratchet.Restriction {
+    session.deinit();
+    session.* = chock_proto.state.Session.init(gpa);
+    foldSession(gpa, io, storage, session);
+    return chock_core.self_policy.restrictionsFrom(
+        session.arena.allocator(),
+        session.self_policy.restrictions.items,
+    ) catch &.{};
+}
 
 /// The broker, as `chock_core.Loop` carries an agent's work back mid session.
 ///

@@ -1503,7 +1503,7 @@ pub const Registry = struct {
         // for a call it starts in the background, below.
         if (context.net) |net| {
             config.network = .filtered;
-            config.net_broker = net.broker(call.tool);
+            config.net_broker = net.broker(call.tool, call.call_id);
         }
 
         // No `else`: a member added to `Tool` and forgotten here fails the
@@ -1697,11 +1697,19 @@ pub const NetSeam = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        broker: *const fn (ptr: *anyopaque, tool: []const u8) sandbox.NetBroker,
+        broker: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetBroker,
     };
 
-    pub fn broker(self: NetSeam, tool: []const u8) sandbox.NetBroker {
-        return self.vtable.broker(self.ptr, tool);
+    /// `call_id` is the `call_id` of the `tool.call` this broker is being
+    /// built for. **It has to reach the broker this way, before the call
+    /// runs, and not be read back out of a question afterward.** A `Network`
+    /// answers a `net.connect` question with this id or with none at all: see
+    /// `lib/chock-broker/network.zig`'s `tool_call_id`. An empty id there is
+    /// read by `test/redteam/logscan.zig`'s `Fold.toolFor` as no call at all,
+    /// which downgrades a red team boundary to inconclusive rather than
+    /// passing or failing it, so this is not a label the model reads.
+    pub fn broker(self: NetSeam, tool: []const u8, call_id: []const u8) sandbox.NetBroker {
+        return self.vtable.broker(self.ptr, tool, call_id);
     }
 };
 
@@ -7307,6 +7315,8 @@ const TestNetSeam = struct {
     calls: usize = 0,
     last_tool: [64]u8 = undefined,
     last_tool_len: usize = 0,
+    last_call_id: [64]u8 = undefined,
+    last_call_id_len: usize = 0,
 
     fn seam(self: *TestNetSeam) NetSeam {
         return .{ .ptr = self, .vtable = &vtable };
@@ -7314,11 +7324,13 @@ const TestNetSeam = struct {
 
     const vtable = NetSeam.VTable{ .broker = brokerFn };
 
-    fn brokerFn(ptr: *anyopaque, name: []const u8) sandbox.NetBroker {
+    fn brokerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) sandbox.NetBroker {
         const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         self.last_tool_len = @min(name.len, self.last_tool.len);
         @memcpy(self.last_tool[0..self.last_tool_len], name[0..self.last_tool_len]);
+        self.last_call_id_len = @min(call_id.len, self.last_call_id.len);
+        @memcpy(self.last_call_id[0..self.last_call_id_len], call_id[0..self.last_call_id_len]);
         return .{ .ptr = self, .vtable = &net_vtable };
     }
 
@@ -7333,6 +7345,10 @@ const TestNetSeam = struct {
 
     fn tool(self: *const TestNetSeam) []const u8 {
         return self.last_tool[0..self.last_tool_len];
+    }
+
+    fn callId(self: *const TestNetSeam) []const u8 {
+        return self.last_call_id[0..self.last_call_id_len];
     }
 };
 
@@ -7377,6 +7393,12 @@ test "a tool call is given a network broker, named after the tool that is runnin
 
     try std.testing.expectEqual(@as(usize, 1), seam.calls);
     try std.testing.expectEqualStrings(@tagName(Tool.read_guidance), seam.tool());
+    // **The call id reaches the broker too, and not only the tool name.**
+    // `lib/chock-broker/network.zig`'s `Network.tool_call_id` is what a
+    // `net.connect` question is written with, and an empty id there is read
+    // by `test/redteam/logscan.zig`'s `Fold.toolFor` as no call at all: see
+    // this file's own `NetSeam.broker` doc comment.
+    try std.testing.expectEqualStrings("read1", seam.callId());
 }
 
 test "spawnCapturing reports a pipe creation failure without ever reaching the sandbox" {
