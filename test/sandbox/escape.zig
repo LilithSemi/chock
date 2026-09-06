@@ -566,6 +566,40 @@ test "a deny_read entry that is a symlink cannot bind the notice onto its target
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "a bind mount whose source is a symlink does not follow it onto the host" {
+    // `chock.zon` is read out of the agent's own checkout, a tree the agent
+    // can write to between tool calls: nothing stops `ln -s <host path>
+    // chock.zon` there. `outside` is a directory this test made with its own
+    // scratchRoot, no relation to the sandbox root at all and never named in
+    // any mount this probe builds, so a file there staying unreachable
+    // through the sandbox's own bind target is the proof this test needs.
+    var outside = try scratchRoot();
+    defer outside.cleanup();
+
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+
+    const term = try runProbeArgv(&.{ probe_path, "bind-source-symlink", scratch.path(), outside.path() });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a deny_read entry with a symlinked intermediate component cannot write outside the sandbox root" {
+    // `link` sits between `/work` and the leaf `deny.zig` accepts a path like
+    // `link/creds/token` on purpose, and never sees that `link` is not a
+    // directory. `outside` is a directory this test made with its own
+    // scratchRoot, wholly separate from the sandbox root and empty: nothing
+    // this sandbox root names ever creates anything under it, so
+    // `creds/token` appearing there is the proof this test needs.
+    var outside = try scratchRoot();
+    defer outside.cleanup();
+
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+
+    const term = try runProbeArgv(&.{ probe_path, "deny-intermediate-symlink", scratch.path(), outside.path() });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a tool call inside the sandbox cannot reach the session's approval socket" {
     // See `lib/chock-broker/socket.zig`: **anything that can reach that
     // socket can approve an action**, so a tool call must not be able to. The

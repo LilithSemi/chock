@@ -773,6 +773,31 @@ pub const MountError = error{
     /// **The sandbox does not start**, for the same reason
     /// `DenyTargetIsDirectory` does not let one through either.
     DenyTargetIsSymlink,
+    /// A bind mount's own source is a symbolic link, or changed into one
+    /// between `pinBindSource`'s own check and its use. `mount` follows a
+    /// symbolic link, and a bind source such as `chock.zon` is read out of
+    /// the agent's own checkout, a tree the agent can write to between tool
+    /// calls: a project with no `chock.zon` gets none, an agent can
+    /// `ln -s <host path> chock.zon` there, and the next tool call would
+    /// have bound that host path into the sandbox in its place. Refused
+    /// rather than followed, the same answer `DenyTargetIsSymlink` gives for
+    /// the same shape of fault on a denied path.
+    ///
+    /// **The sandbox does not start**, for the same reason the two faults
+    /// above do not let one through either.
+    BindSourceIsSymlink,
+    /// A bind mount's own target, inside the sandbox, is a symbolic link.
+    /// Most targets are made fresh under a root this file controls, but a
+    /// target such as `chock.zon` or `.git` is one path component under a
+    /// directory an earlier bind in the same list already covered with the
+    /// agent's own checkout, so the name `makeFile` opens can be a link the
+    /// agent placed there. `open` without `O_NOFOLLOW` would follow it and
+    /// bind the mount onto whatever host path the link names instead of the
+    /// file the project meant to cover. Refused rather than followed.
+    ///
+    /// **The sandbox does not start**, for the same reason every other
+    /// symlink fault above does not let one through either.
+    BindTargetIsSymlink,
     /// The kernel returned an errno with no specific recovery. Reported as a bug.
     Unexpected,
 };
@@ -812,6 +837,7 @@ pub const Diagnostic = struct {
         overlay_mount,
         scratch_mount,
         scratch_open,
+        mount_source_open,
         mount_source_stat,
         mount_setattr,
         mount_target_mkdir,
@@ -840,6 +866,7 @@ pub const Diagnostic = struct {
                 .overlay_mount => "the overlay mount",
                 .scratch_mount => "the scratch area mount",
                 .scratch_open => "open on a scratch area",
+                .mount_source_open => "open on a mount source",
                 .mount_source_stat => "statx on a mount source",
                 .mount_setattr => "mount_setattr",
                 .mount_target_mkdir => "mkdirat on a mount target",
@@ -937,12 +964,19 @@ pub fn buildRoot(
 /// did, leaves a window between the two calls for the name to become a link
 /// aimed outside the project, and `mount` would then land the notice on
 /// whatever the link resolves to, out there and not in the sandbox.
-/// `pinDenyTarget` closes that window: it opens the target once, with
-/// `O_NOFOLLOW`, and hands back a descriptor this function mounts through as
-/// `/proc/self/fd/N`, so the bind lands on the inode that descriptor names
-/// and not on whatever a fresh lookup of the path would find. A symbolic
-/// link at the leaf is refused outright, with `error.DenyTargetIsSymlink`,
-/// never opened through.
+/// `pinDenyTarget` closes that window: it opens `root`, then walks every
+/// component of the denied path in turn, with `O_NOFOLLOW` on each one, and
+/// hands back a descriptor this function mounts through as `/proc/self/fd/N`,
+/// so the bind lands on the inode that descriptor names and not on whatever a
+/// fresh lookup of the path would find. `deny.zig` accepts a path such as
+/// `secrets/config.txt` on purpose, and by the time this pass runs `root`
+/// already holds the project's own checkout, bound in by an earlier pass, so
+/// `secrets` here can be a symbolic link the agent placed in that checkout
+/// aimed outside the sandbox root entirely: measured against a real
+/// `buildRoot`, an intermediate link of that shape once let `mkdirat` and
+/// `openat` create the covering file out there instead. A symbolic link at
+/// any component, the leaf included, is refused outright, with
+/// `error.DenyTargetIsSymlink`, never opened through.
 fn applyDenyMounts(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -975,10 +1009,7 @@ fn applyDenyMounts(
             .bind, .overlay, .proc => continue,
         };
 
-        const target = try std.fs.path.join(allocator, &.{ root, deny.target });
-        defer allocator.free(target);
-
-        const fd = try pinDenyTarget(allocator, target, diag);
+        const fd = try pinDenyTarget(allocator, root, deny.target, diag);
         defer _ = linux.close(fd);
 
         var magic_buf: [64]u8 = undefined;
@@ -991,6 +1022,8 @@ fn applyDenyMounts(
         // name resolves to by now.
         try mountCall(source_z, magic_z, null, linux.MS.BIND, 0, diag);
 
+        const target = try std.fs.path.join(allocator, &.{ root, deny.target });
+        defer allocator.free(target);
         const target_z = try allocator.dupeZ(u8, target);
         defer allocator.free(target_z);
         // The original name, read only now that the mount stands on it: a
@@ -1000,39 +1033,134 @@ fn applyDenyMounts(
     }
 }
 
-/// Open `target`, an absolute path already joined onto a sandbox root, and
-/// hand back a descriptor `applyDenyMounts` mounts through instead of
-/// `target`'s own name. See `applyDenyMounts` for why a name is not trusted
-/// twice.
+/// Open `relative_target`, a `deny_read` entry's path inside the sandbox,
+/// under `root`, and hand back a descriptor `applyDenyMounts` mounts through
+/// instead of the joined name. See `applyDenyMounts` for why a name is not
+/// trusted twice.
 ///
-/// `O_NOFOLLOW` on every open this function and `createDenyTarget` make is
-/// the whole mechanism: a target that is there and is not a link is opened
-/// directly and its descriptor is returned; a target that is not there yet
-/// is created fresh, through a descriptor on its parent directory rather
-/// than by a name that could have changed since `deny.zig` last looked at
-/// it; a symbolic link at the leaf is caught by the `statx` below, since
-/// `O_PATH` changes what a symlink leaf does to `open` itself. See that
-/// `statx` call for why.
+/// **Walked one component at a time, with `O_NOFOLLOW` on every step, not
+/// only the leaf.** `deny.zig` accepts a path such as `secrets/config.txt` on
+/// purpose, and it is a string check: it cannot see that `secrets` is a
+/// symbolic link. By the time this pass runs, `root` already holds the
+/// project's own checkout, bound in by an earlier pass, so a component before
+/// the leaf can be a link the agent placed in that checkout, aimed outside
+/// the sandbox root entirely. Resolving the whole path by name in one call,
+/// as `std.fs.path.join` plus a single `mkdirat` or `open` once did here,
+/// follows every one of those links. This instead opens `root` itself once,
+/// then opens each further component through the descriptor the step before
+/// it returned, so a symbolic link at any position is refused with
+/// `error.DenyTargetIsSymlink` before this function ever asks the kernel to
+/// create or open the name behind it.
 fn pinDenyTarget(
     allocator: std.mem.Allocator,
-    target: []const u8,
+    root: []const u8,
+    relative_target: []const u8,
     diag: ?*?Diagnostic,
 ) MountError!i32 {
-    const target_z = try allocator.dupeZ(u8, target);
-    defer allocator.free(target_z);
+    std.debug.assert(relative_target.len > 1 and relative_target[0] == '/');
 
-    const fd_rc = linux.open(target_z.ptr, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    const root_z = try allocator.dupeZ(u8, root);
+    defer allocator.free(root_z);
+    const root_fd_rc = linux.open(root_z.ptr, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    switch (linux.errno(root_fd_rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .deny_target_open, err);
+            return error.Unexpected;
+        },
+    }
+    // Reassigned as the walk goes deeper. The `defer` below always closes
+    // whichever descriptor `dir_fd` holds when this function returns,
+    // because every earlier one is already closed by hand as soon as the
+    // next component's descriptor replaces it.
+    var dir_fd: i32 = @intCast(root_fd_rc);
+    defer _ = linux.close(dir_fd);
+
+    var it = std.mem.splitScalar(u8, relative_target[1..], '/');
+    var component = it.next() orelse return error.Unexpected;
+    while (true) {
+        const next = it.next();
+        const component_z = try allocator.dupeZ(u8, component);
+        defer allocator.free(component_z);
+
+        if (next == null) return openDenyLeaf(dir_fd, component_z.ptr, diag);
+
+        const opened = try openDenyDirComponent(dir_fd, component_z.ptr, diag);
+        _ = linux.close(dir_fd);
+        dir_fd = opened;
+        component = next.?;
+    }
+}
+
+/// Open one directory component of a `deny_read` path, through `dir_fd`,
+/// making it first if `deny.zig`'s own `check` allowed a path whose
+/// directories the project has not made yet, such as `secrets/config.txt`.
+///
+/// **`O_NOFOLLOW` on a single path component is the whole guarantee.**
+/// Unlike a name resolved in one call, `openat` here only ever looks up
+/// `component` itself inside the directory `dir_fd` already names, so a
+/// symbolic link at this position answers `ELOOP` and nothing this function
+/// does can be tricked into stepping through it into some other directory.
+fn openDenyDirComponent(dir_fd: i32, component: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
+    while (true) {
+        const fd_rc = linux.openat(dir_fd, component, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (linux.errno(fd_rc)) {
+            .SUCCESS => return @intCast(fd_rc),
+            // A symlink at this component. Measured: with `O_DIRECTORY` in
+            // the same call, the kernel answers `ENOTDIR`, not `ELOOP`,
+            // because `O_NOFOLLOW` stops the walk before the directory check
+            // ever runs. Either errno means the same fault here, and a
+            // component that turns out to be an ordinary file instead of a
+            // symlink is refused the same way: `openDenyDirComponent` cannot
+            // tell the two apart without opening through whichever it is,
+            // and opening through either is what this walk exists to refuse.
+            .LOOP, .NOTDIR => return error.DenyTargetIsSymlink,
+            .NOENT => {
+                switch (linux.errno(linux.mkdirat(dir_fd, component, 0o755))) {
+                    // `EEXIST` means another step of this same walk, or a
+                    // previous run, already made it: retry the open, the same
+                    // tolerance `makeDir` gives every other mount target.
+                    .SUCCESS, .EXIST => continue,
+                    .PERM, .ACCES => return error.NotPermitted,
+                    else => |err| {
+                        note(diag, .mount_target_mkdir, err);
+                        return error.Unexpected;
+                    },
+                }
+            },
+            .PERM, .ACCES => return error.NotPermitted,
+            else => |err| {
+                note(diag, .deny_target_open, err);
+                return error.Unexpected;
+            },
+        }
+    }
+}
+
+/// Open the leaf of a `deny_read` path, through `dir_fd`, and hand back a
+/// descriptor `pinDenyTarget` mounts through. Creates the leaf fresh, through
+/// `createDenyLeaf`, when nothing is there yet: `deny.zig`'s own `check`
+/// accepts an entry naming a file the project has not made, such as `.env`
+/// before it exists.
+///
+/// **`O_PATH` changes what `O_NOFOLLOW` means at the last component.** With
+/// `O_PATH` alone, `open` on a symlink leaf does not fail with `ELOOP`: it
+/// succeeds, and hands back a descriptor on the link itself, never on
+/// whatever it points to. So the open below cannot be the refusal; the
+/// `statx` after it is. `AT_EMPTY_PATH` reads the descriptor's own target,
+/// not a fresh lookup of `component`, which is the same "no second name"
+/// property the open itself is for.
+fn openDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
+    const fd_rc = linux.openat(dir_fd, leaf, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     switch (linux.errno(fd_rc)) {
         .SUCCESS => {},
-        // A symlink loop somewhere above the leaf, not the leaf itself:
-        // `O_PATH` changes what a symlink leaf answers here, see below. This
-        // is still a link the sandbox does not get to resolve on the
+        // A symlink loop, which at a single component can only mean the leaf
+        // itself: `O_PATH` changes what a symlink leaf answers here, see
+        // above. Still a link the sandbox does not get to resolve on the
         // project's behalf, so it is refused the same way.
         .LOOP => return error.DenyTargetIsSymlink,
-        // Nothing at this name yet. `deny.zig`'s own `check` accepts this: a
-        // project may deny a file it has not made yet, such as `.env` before
-        // it exists.
-        .NOENT, .NOTDIR => return createDenyTarget(allocator, target, diag),
+        .NOENT, .NOTDIR => return createDenyLeaf(dir_fd, leaf, diag),
         .PERM, .ACCES => return error.NotPermitted,
         else => |err| {
             note(diag, .deny_target_open, err);
@@ -1042,13 +1170,6 @@ fn pinDenyTarget(
     const fd: i32 = @intCast(fd_rc);
     errdefer _ = linux.close(fd);
 
-    // **`O_PATH` changes what `O_NOFOLLOW` means at the last component.**
-    // With `O_PATH` alone, `open` on a symlink leaf does not fail with
-    // `ELOOP`: it succeeds, and hands back a descriptor on the link itself,
-    // never on whatever it points to. So the open above cannot be the
-    // refusal; this `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
-    // target, not a fresh lookup of `target_z`, which is the same "no second
-    // name" property the open itself was for.
     var stat_buf: linux.Statx = undefined;
     const empty: [*:0]const u8 = "";
     const rc = linux.statx(fd, empty, linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat_buf);
@@ -1065,49 +1186,19 @@ fn pinDenyTarget(
     return fd;
 }
 
-/// Make `target` a fresh, empty file and hand back a descriptor on it, for a
-/// `deny_read` entry the project does not hold yet. Called only from
-/// `pinDenyTarget`, once an `open` with `O_NOFOLLOW` has already found
-/// nothing at that name.
+/// Make `leaf` a fresh, empty file through `dir_fd` and hand back a
+/// descriptor on it, for a `deny_read` entry the project does not hold yet.
+/// Called only from `openDenyLeaf`, once an `open` with `O_NOFOLLOW` has
+/// already found nothing at that name.
 ///
-/// **The parent is opened once, and the leaf is created through it with
-/// `O_CREAT | O_EXCL | O_NOFOLLOW`.** `O_EXCL` is what makes this atomic:
-/// between `pinDenyTarget`'s own check and this call, nothing stopped some
-/// other actor from placing a file, or a link, at the name that used to be
-/// empty. `O_EXCL` refuses to open through either rather than silently
+/// **Created through the same directory descriptor the walk already pinned,
+/// with `O_CREAT | O_EXCL | O_NOFOLLOW`.** `O_EXCL` is what makes this
+/// atomic: between `openDenyLeaf`'s own check and this call, nothing stopped
+/// some other actor from placing a file, or a link, at the name that used to
+/// be empty. `O_EXCL` refuses to open through either rather than silently
 /// succeeding on whichever one got there first.
-fn createDenyTarget(
-    allocator: std.mem.Allocator,
-    target: []const u8,
-    diag: ?*?Diagnostic,
-) MountError!i32 {
-    const dir = std.fs.path.dirname(target) orelse return error.Unexpected;
-    const base = std.fs.path.basename(target);
-
-    // The chain of directories above the leaf, made the same way every other
-    // mount target in this file is: `deny.zig`'s own `check` allows an entry
-    // such as `secrets/config.txt` naming a directory the project has not
-    // made yet.
-    try makePath(allocator, dir, .directory, diag);
-
-    const dir_z = try allocator.dupeZ(u8, dir);
-    defer allocator.free(dir_z);
-    const dir_fd_rc = linux.open(dir_z.ptr, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
-    switch (linux.errno(dir_fd_rc)) {
-        .SUCCESS => {},
-        .PERM, .ACCES => return error.NotPermitted,
-        else => |err| {
-            note(diag, .deny_target_open, err);
-            return error.Unexpected;
-        },
-    }
-    const dir_fd: i32 = @intCast(dir_fd_rc);
-    defer _ = linux.close(dir_fd);
-
-    const base_z = try allocator.dupeZ(u8, base);
-    defer allocator.free(base_z);
-
-    const fd_rc = linux.openat(dir_fd, base_z.ptr, .{
+fn createDenyLeaf(dir_fd: i32, leaf: [*:0]const u8, diag: ?*?Diagnostic) MountError!i32 {
+    const fd_rc = linux.openat(dir_fd, leaf, .{
         .ACCMODE = .RDONLY,
         .CREAT = true,
         .EXCL = true,
@@ -1117,7 +1208,7 @@ fn createDenyTarget(
     switch (linux.errno(fd_rc)) {
         .SUCCESS => return @intCast(fd_rc),
         .PERM, .ACCES => return error.NotPermitted,
-        // Something now occupies the name `pinDenyTarget` just found empty: a
+        // Something now occupies the name `openDenyLeaf` just found empty: a
         // link, or a file some other actor placed there in between. Refused
         // the same way a link found straight away is refused, because this
         // cannot tell the two apart without opening through whichever it is,
@@ -1174,8 +1265,9 @@ fn makeNoticeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
 }
 
 /// Apply one bind mount, `b`, under `root`. Exactly the mount `buildRoot`
-/// always made, unchanged: this is only `buildRoot`'s own loop body, pulled
-/// out so the loop can switch on `Mount`'s three kinds.
+/// always made, this is only `buildRoot`'s own loop body, pulled out so the
+/// loop can switch on `Mount`'s three kinds. The source is pinned before the
+/// mount, and never named twice: see `pinBindSource`.
 fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind, diag: ?*?Diagnostic) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, b.target });
     defer allocator.free(target);
@@ -1183,18 +1275,98 @@ fn buildBindMount(allocator: std.mem.Allocator, root: []const u8, b: Mount.Bind,
     const source_z = try allocator.dupeZ(u8, b.source);
     defer allocator.free(source_z);
 
+    const pinned = try pinBindSource(source_z.ptr, diag);
+    defer _ = linux.close(pinned.fd);
+
     // chock.zon is protected by binding a file over a file, not a directory
     // over a directory, so the target must match whichever kind the source
-    // actually is.
-    const kind: PathKind = if (try sourceIsDirectory(source_z, diag)) .directory else .file;
-    try makePath(allocator, target, kind, diag);
+    // actually is. `pinned.kind` reads that off the same descriptor the mount
+    // below reads the source from, never off a second lookup of `b.source`.
+    try makePath(allocator, target, pinned.kind, diag);
 
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
-    try mountCall(source_z, target_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
+    var magic_buf: [64]u8 = undefined;
+    const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{pinned.fd}) catch
+        return error.Unexpected;
+
+    // The mount is named by the descriptor `pinBindSource` handed back, so it
+    // lands on the inode that was checked and no other, whatever `b.source`
+    // resolves to by now. `MS.REC` still applies: the magic symlink resolves
+    // to the same dentry the descriptor names, so a directory source with its
+    // own mounts nested under it is carried across exactly as it was when the
+    // mount was named by `b.source` directly.
+    try mountCall(magic_z, target_z, null, linux.MS.BIND | linux.MS.REC, 0, diag);
 
     if (b.read_only) try markReadOnly(target_z, diag);
+}
+
+/// What `pinBindSource` pins: a descriptor on the source, and which kind of
+/// target `buildBindMount` must create for it.
+const PinnedSource = struct {
+    fd: i32,
+    kind: PathKind,
+};
+
+/// Open `source`, a bind mount's source path outside the sandbox, and hand
+/// back a descriptor `buildBindMount` mounts through instead of `source`'s
+/// own name, together with which kind of mount target it needs.
+///
+/// **The source is pinned once, and never named twice.** `buildBindMount`
+/// once read `source`'s type with `statx` by name, then handed that same
+/// name to `mount`, which follows a symbolic link. A source can be attacker
+/// influenced: `chock.zon` is read out of the agent's own checkout, a tree
+/// the agent can write to between tool calls, and nothing stops an agent
+/// from replacing a project's `chock.zon` with a symbolic link aimed at an
+/// arbitrary host path before the next tool call binds it in. Checking the
+/// name and then mounting the same name, as this function's caller once did,
+/// leaves a window between the two calls for exactly that substitution, even
+/// when the first check found an ordinary file. This closes the window the
+/// same way `pinDenyTarget` closes it for a denied path: `source` is opened
+/// once, with `O_NOFOLLOW`, and the descriptor this hands back is what
+/// `buildBindMount` mounts, as `/proc/self/fd/N`, so the bind lands on the
+/// inode this function checked and no other.
+fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSource {
+    const fd_rc = linux.open(source, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    switch (linux.errno(fd_rc)) {
+        .SUCCESS => {},
+        // A symlink loop somewhere above the leaf, not the leaf itself:
+        // `O_PATH` changes what a symlink leaf answers here, see the statx
+        // below. Still a link this sandbox does not get to resolve on the
+        // project's behalf, so it is refused the same way.
+        .LOOP => return error.BindSourceIsSymlink,
+        .NOENT, .NOTDIR => return error.SourceMissing,
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .mount_source_open, err);
+            return error.Unexpected;
+        },
+    }
+    const fd: i32 = @intCast(fd_rc);
+    errdefer _ = linux.close(fd);
+
+    // **`O_PATH` changes what `O_NOFOLLOW` means at the last component.**
+    // With `O_PATH` alone, `open` on a symlink leaf does not fail with
+    // `ELOOP`: it succeeds, and hands back a descriptor on the link itself,
+    // never on whatever it points to. So the open above cannot be the
+    // refusal; this `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
+    // target, not a fresh lookup of `source`, which is the same "no second
+    // name" property the open itself is for.
+    var stat_buf: linux.Statx = undefined;
+    const empty: [*:0]const u8 = "";
+    const rc = linux.statx(fd, empty, linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat_buf);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .mount_source_stat, err);
+            return error.Unexpected;
+        },
+    }
+    if ((stat_buf.mode & linux.S.IFMT) == linux.S.IFLNK) return error.BindSourceIsSymlink;
+    const kind: PathKind = if ((stat_buf.mode & linux.S.IFMT) == linux.S.IFDIR) .directory else .file;
+    return .{ .fd = fd, .kind = kind };
 }
 
 /// Mount a fresh procfs at `p.target` under `root`. See `Mount.Proc`.
@@ -1364,7 +1536,7 @@ fn makeEmptyFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
 }
 
 /// What is at `path`, when the answer "nothing" is a fact the caller acts on
-/// rather than a fault. Unlike `sourceIsDirectory`, an absent path is an
+/// rather than a fault. Unlike `pinBindSource`, an absent path is an
 /// answer here: `maskProcEntries` skips an entry a kernel was built without,
 /// and `applyDenyMounts` makes a file for a path the project does not hold
 /// yet. `call` is what a failure is reported as, so a reader learns which of
@@ -1601,23 +1773,6 @@ fn makeDirPath(path: []const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
-/// Whether `source` names a directory. Used to decide whether a mount target
-/// should be created as a file or a directory before the bind mount runs.
-fn sourceIsDirectory(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!bool {
-    var stat_buf: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, source, 0, .{ .TYPE = true }, &stat_buf);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .NOENT => return error.SourceMissing,
-        .PERM, .ACCES => return error.NotPermitted,
-        else => |err| {
-            note(diag, .mount_source_stat, err);
-            return error.Unexpected;
-        },
-    }
-    return (stat_buf.mode & linux.S.IFMT) == linux.S.IFDIR;
-}
-
 /// The kernel's `struct mount_attr`, the argument `mount_setattr` reads. Zig's
 /// standard library does not define this type, and its `mount_setattr` wrapper
 /// does not match the real five argument syscall, so this file defines the ABI
@@ -1731,12 +1886,27 @@ fn makeDir(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
     }
 }
 
+/// **No `O_EXCL`, kept, not added.** The same `root` is reused across every
+/// tool call of a session, so a target such as `chock.zon` legitimately
+/// exists already, from the run before this one, and `O_EXCL` would refuse
+/// that ordinary reuse with `EEXIST` on the second tool call onward. An
+/// existing file at this path is left alone and simply opened: its content
+/// does not matter, the bind mount is about to cover it.
+///
+/// **`O_NOFOLLOW`, added.** A target such as `chock.zon` or the worktree's
+/// own `.git` file is one path component under a directory an earlier bind
+/// in the same list already covered with the agent's own checkout, so the
+/// name this function opens can be a symbolic link the agent placed there
+/// between tool calls. `O_NOFOLLOW` refuses that leaf rather than following
+/// it and binding onto whatever host path the link names. It costs nothing
+/// against the reuse case above: a plain file left over from a previous run
+/// is not a symlink, and `O_NOFOLLOW` only refuses a name that actually is
+/// one.
 fn makeFile(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!void {
-    // No O_EXCL, so an existing file at this path is left alone and simply
-    // opened. Its content does not matter, the bind mount is about to cover it.
-    const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o644);
+    const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .NOFOLLOW = true }, 0o644);
     switch (linux.errno(fd_rc)) {
         .SUCCESS => {},
+        .LOOP => return error.BindTargetIsSymlink,
         .PERM, .ACCES => return error.NotPermitted,
         else => |err| {
             note(diag, .mount_target_open, err);

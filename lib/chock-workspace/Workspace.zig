@@ -51,6 +51,14 @@ pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || e
     /// what is missing, and the whole of what is missing is an
     /// `overlay.adopt` beside `overlay.create`, one per driver.
     OverlayCannotBeAdopted,
+    /// `chock.zon` names a symbolic link instead of an ordinary file, in the
+    /// checkout `findChockZon` was asked to read. Chock's own policy file
+    /// must be real: an agent that can write its own checkout can otherwise
+    /// replace `chock.zon` with a link to an arbitrary host path, and the
+    /// bind mount that is meant to protect it would then bind that path in
+    /// instead. Refused rather than followed. See `findChockZon`'s own doc
+    /// comment.
+    ChockZonIsSymlink,
 };
 
 /// Which backing a session got. `Workspace.open` decides. A caller never
@@ -561,6 +569,18 @@ const FoundChockZon = struct {
 /// report both where it lives there and where it belongs inside the sandbox,
 /// under `target_root`. Neither field is set when the project has no
 /// `chock.zon`: see `Workspace.chock_zon_source`'s own doc comment.
+///
+/// **A `chock.zon` that is a symbolic link is refused, not followed.** A
+/// worktree checkout is the agent's own to write between tool calls, and
+/// nothing stops it running `ln -s <host path> chock.zon` there when the
+/// project has no policy file of its own to protect: the next `adopt` would
+/// then read this link as if it were the project's own `chock.zon`, and
+/// `chock-sandbox`'s own bind mount would land on whatever host path the
+/// link names instead. `chockZonExists` answers with
+/// `error.ChockZonIsSymlink` for exactly that shape, rather than the `bool`
+/// `existsAsFile` gives every other caller in this file, because this is the
+/// one caller for which a symbolic link is not an ordinary fact about the
+/// disk but a fault this file must stop rather than hand onward.
 fn findChockZon(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -571,9 +591,12 @@ fn findChockZon(
     const source_path = try std.fs.path.join(allocator, &.{ source_root, "chock.zon" });
     errdefer allocator.free(source_path);
 
-    const found = existsAsFile(io, source_path) catch |err| {
-        diagnostic.noteErr(diag, .chock_zon_check, err);
-        return error.Unexpected;
+    const found = chockZonExists(io, source_path) catch |err| switch (err) {
+        error.ChockZonIsSymlink => return error.ChockZonIsSymlink,
+        else => {
+            diagnostic.noteErr(diag, .chock_zon_check, err);
+            return error.Unexpected;
+        },
     };
     if (!found) {
         allocator.free(source_path);
@@ -582,6 +605,25 @@ fn findChockZon(
 
     const target_path = try std.fs.path.join(allocator, &.{ target_root, "chock.zon" });
     return .{ .source = source_path, .target = target_path };
+}
+
+/// True if `absolute_path` names `chock.zon` as an ordinary file, false if
+/// nothing is there, `error.ChockZonIsSymlink` if a symbolic link is. See
+/// `findChockZon`'s own doc comment for why this file's policy file gets its
+/// own check instead of `existsAsFile`'s.
+///
+/// **`follow_symlinks = false`, unlike `existsAsFile`.** `existsAsFile`
+/// answers what a path resolves to, which is the right question for a file
+/// this module only ever reads back through the sandbox's own mounts. This
+/// answers what is at the name itself, which is the right question for a
+/// name this module is about to trust as the project's own policy.
+fn chockZonExists(io: std.Io, absolute_path: []const u8) (std.Io.Dir.StatFileError || error{ChockZonIsSymlink})!bool {
+    const st = std.Io.Dir.cwd().statFile(io, absolute_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => |e| return e,
+    };
+    if (st.kind == .sym_link) return error.ChockZonIsSymlink;
+    return true;
 }
 
 /// The `chock.zon` an adopted session gets bound over it: the checkout's own
@@ -1370,6 +1412,55 @@ test "adopt keeps the checkout's own chock.zon when the checkout still has one" 
     const in_checkout = try std.fs.path.join(allocator, &.{ second.workPath(), "chock.zon" });
     defer allocator.free(in_checkout);
     try std.testing.expectEqualStrings(in_checkout, second.chock_zon_source.?);
+}
+
+test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
+    // **The live path needs no committed chock.zon at all.** A project with
+    // none gets no bind, and nothing stops an agent creating one of its own
+    // kind in its own checkout between tool calls: `ln -s <host path>
+    // chock.zon` there is exactly this shape. `findChockZonForAdopt` must not
+    // read that link as though it were the project's own policy file.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try project.makeGitRepository();
+    // No commitChockZon: the project itself has no policy file, so the
+    // checkout starts with none either.
+
+    const base_commit = try headOf(allocator, &project);
+    defer allocator.free(base_commit);
+
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    {
+        var first = try Workspace.openWithLayout(allocator, io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+        defer first.keep(allocator);
+
+        try std.testing.expect(first.chock_zon_source == null);
+
+        const link_path = try std.fmt.bufPrintZ(&link_buffer, "{s}/chock.zon", .{first.workPath()});
+        // The target does not need to exist, or even resolve, for what this
+        // test is about: `chockZonExists` must refuse the link itself,
+        // never follow it to find out where it leads.
+        const target_path = try std.fmt.bufPrintZ(&target_buffer, "{s}/outside-the-project", .{project.scratch_path});
+        try std.Io.Dir.symLinkAbsolute(io, target_path, link_path, .{});
+    }
+
+    try std.testing.expectError(error.ChockZonIsSymlink, Workspace.adoptWithLayout(
+        allocator,
+        io,
+        &project.env,
+        project.root_path,
+        project.scratch_path,
+        "sess1",
+        base_commit,
+        .remapped,
+        null,
+    ));
 }
 
 test "adopt refuses the overlay kind by name, because there is no overlay.adopt to call" {

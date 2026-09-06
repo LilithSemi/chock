@@ -1277,8 +1277,20 @@ fn setupErrorFor(step: SetupStep) SetupError {
 /// `MS_PRIVATE` before it mounted anything, so no mount ever propagated back
 /// to the host, and the kernel tore the namespace down when the child exited.
 /// `spawn` reaps that child before it calls this. What is left on the host is
-/// therefore plain directories and files that `makePath` created before any
-/// mount ever covered them, and this walk can only ever meet those.
+/// therefore plain directories and files that `makePath`, or `buildRoot`'s
+/// own deny path walk, created under `root` before any mount ever covered
+/// them.
+///
+/// **This walk can only ever meet those, because `buildRoot` no longer lets a
+/// path resolved by name put anything outside `root` in the first place.**
+/// That was not always true: an intermediate symbolic link in a `deny_read`
+/// path, planted in the project's own checkout and resolved by `mkdirat` and
+/// `openat` calls that took a name instead of a pinned descriptor, once let
+/// `buildRoot` create the covering file wherever that link pointed, measured
+/// against a real `buildRoot` and never under `root` at all. This walk would
+/// never have met a file placed that way, and could not have removed it. See
+/// `pinDenyTarget` in `namespace.zig`, which now refuses a symbolic link at
+/// any component of that path before a name is ever handed to the kernel.
 ///
 /// A failure here is not reported: the caller already has the real failure,
 /// from whichever layer actually failed, and leaked scratch is a nuisance,
@@ -1487,6 +1499,35 @@ fn printDenyTargetSymlinkFault(stderr_fd: i32) void {
     );
 }
 
+/// The one sentence a project author reads for
+/// `namespace.MountError.BindSourceIsSymlink`, in place of `printFault`'s
+/// bare error name. Same reasoning as `printDenyTargetSymlinkFault`: this
+/// fault fires because of a name in the project's own tree, not because the
+/// kernel refused this process a privilege, so a bare error name sends a
+/// person to search for a Zig identifier instead of their own file.
+/// `chock.zon` is the case a person actually hits: it is read out of the
+/// agent's own checkout, and nothing stops that checkout holding a symlink
+/// in its place. The reasoning for why a symlink is refused rather than
+/// followed lives in `namespace.zig`'s own doc comment on
+/// `BindSourceIsSymlink`, and in the threat model; this sentence carries
+/// only what to change.
+fn printBindSourceSymlinkFault(stderr_fd: i32) void {
+    writeStderr(
+        stderr_fd,
+        "sandbox: a bind mount's source names a symbolic link, and it will not be followed. chock.zon is the usual case: make it a real file, not a link to one.\n",
+    );
+}
+
+/// Same as `printBindSourceSymlinkFault`, for
+/// `namespace.MountError.BindTargetIsSymlink`: the same fault, on the other
+/// side of the same mount.
+fn printBindTargetSymlinkFault(stderr_fd: i32) void {
+    writeStderr(
+        stderr_fd,
+        "sandbox: a bind mount's target names a symbolic link, and it will not be followed. chock.zon is the usual case: make it a real file, not a link to one.\n",
+    );
+}
+
 /// Same as `printFault`, for a step that reads its own errno instead of
 /// returning a Zig error, the same way `namespace.zig` names an errno it
 /// cannot map to a specific recovery.
@@ -1567,6 +1608,16 @@ fn dieNamespace(
         // sentence instead of `printFault`'s bare name.
         reportSetupFailure(write_fd, step, 0);
         printDenyTargetSymlinkFault(stderr_fd);
+    } else if (err == error.BindSourceIsSymlink) {
+        // No `diag`: `pinBindSource` refuses this on purpose, never a kernel
+        // errno. See `printBindSourceSymlinkFault`.
+        reportSetupFailure(write_fd, step, 0);
+        printBindSourceSymlinkFault(stderr_fd);
+    } else if (err == error.BindTargetIsSymlink) {
+        // No `diag`: `makeFile` refuses this on purpose, never a kernel
+        // errno. See `printBindTargetSymlinkFault`.
+        reportSetupFailure(write_fd, step, 0);
+        printBindTargetSymlinkFault(stderr_fd);
     } else {
         reportSetupFailure(write_fd, step, 0);
         printFault(stderr_fd, err);

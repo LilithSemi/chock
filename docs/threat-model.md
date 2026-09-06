@@ -80,8 +80,16 @@ yet), `applyDenyMounts` mounts through `/proc/self/fd/N` rather than through
 the original path string. `/proc/self/fd/N` names the exact inode the
 descriptor holds, so whatever the path `.env` resolves to by the time `mount`
 actually runs, the bind lands on the file that was checked and nothing else.
-There is no second name for an attacker to redirect between the check and the
-mount, because there is no second name at all.
+
+**The source has no second name. The target still does.** `applyDenyMounts`
+passes the target path as a name, both to the `mount` call that makes the
+bind and again to `markReadOnly`, which remounts it read only afterward. A
+target renamed between those two calls does not reopen the hole this section
+describes, because a target name only decides where the fixed, already
+checked source lands. `markReadOnly`'s own lookup either finds the mount
+`applyDenyMounts` just made or finds nothing there at all, and the second
+case answers `EINVAL`, which this code reads as a fault and aborts on rather
+than pressing ahead. Fails safe, not free of a second name.
 
 The lesson generalises past this one function: a security check on a path
 name and an operation on that same path name are two different lookups unless

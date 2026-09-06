@@ -2802,6 +2802,16 @@ fn mountAnswer(err: sandbox.namespace.MountError) Answer {
         // still has to be read and classified by whoever adds one.
         error.DenyTargetIsDirectory,
         error.DenyTargetIsSymlink,
+        // This probe calls `mountScratch` and `mountOverlay` only, never
+        // `buildBindMount`, so a symlinked bind source or bind target can
+        // never be what it hits either. Named here for the same reason the
+        // two above are: a person adding a real bind mount to this probe
+        // later has to read this list and decide, not fall through an
+        // `else`. The message a project author actually needs for either
+        // fault is in `dieNamespace`, in `chock-sandbox/linux/driver.zig`,
+        // which is what prints when a real `Sandbox.spawn` hits one.
+        error.BindSourceIsSymlink,
+        error.BindTargetIsSymlink,
         error.Unexpected,
         => .refused,
     };
