@@ -5776,6 +5776,25 @@ fn carryCommit(
         // The detail of this one is the commit itself, which is workspace bytes
         // and the likeliest place a credential sits. See `brokerRedaction`.
         .redaction = started.redact_values,
+        // **The memory that stops this from asking about `workspace.apply`
+        // twice.** `session` was just folded from the whole log, above, so it
+        // already holds every `approved_by_user_for_session` answer a person
+        // gave to an earlier request in this session, `workspace.apply`
+        // included. Without this, `docs/approvals.md`'s "rest of the session"
+        // is offered here and never kept: see `SessionArbiter.decideFn`,
+        // which wires the same field for the same reason.
+        .grants = &session.grants,
+        // **`session.arena.allocator()`, and not `gpa`, for the reason
+        // `decideFn` spends a whole paragraph on.** `chock_broker.actions.run`
+        // below calls `perform`, which hands back a `Result` this function's
+        // own caller frees with `gpa` after `session` is gone: see the
+        // `gpa.free(carried.ref)` two callers up. That `gpa` has to stay a
+        // plain allocator for that reason alone, so it cannot be the value
+        // `broker.request` uses to grow `session.grants.granted` too: this
+        // field is `Broker`'s seam for keeping the two apart. See
+        // `Broker.grants_allocator`'s own doc comment for the free-through-the-
+        // wrong-allocator fault this exists to avoid.
+        .grants_allocator = session.arena.allocator(),
     };
 
     // Why the broker refused, or why the act itself failed. The broker used

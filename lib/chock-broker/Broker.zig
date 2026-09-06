@@ -200,6 +200,28 @@ redaction: []const []const u8 = &.{},
 /// really was `ask`.
 grants: ?*chock_proto.state.SessionGrants = null,
 
+/// The allocator `findAnswer` gives a fresh `approved_by_user_for_session`
+/// answer to, when it writes it into `grants`. Null defaults to `request`'s
+/// own `gpa`, which is only safe when `grants` was itself built through that
+/// same allocator, or is about to be discarded alongside it either way: see
+/// `src/run.zig`'s `SessionArbiter.decideFn`, which passes
+/// `session.arena.allocator()` as `request`'s own `gpa` and needs no second
+/// field here because the two are already the same value.
+///
+/// **A caller whose `gpa` must stay a plain allocator sets this instead of
+/// that.** `chock_proto.state.SessionGrants.granted` is a
+/// `std.StringHashMapUnmanaged`: it carries no allocator of its own, and its
+/// `grow` allocates a new backing array with whatever allocator the *current*
+/// call passes and frees the *old* array with that same value, whichever one
+/// actually built it. `session.grants` is filled through `session`'s own
+/// arena by `foldSession`, so a live grant recorded here has to go through
+/// that arena too, or a later `grow` frees arena memory through the wrong
+/// allocator. `src/run.zig`'s `carryCommit` is the caller this exists for: its
+/// own `gpa` must outlive `session`, which `session.deinit()` tears down
+/// before `carryCommit` returns, because a real `perform`ed action's `Result`
+/// is freed by the caller with that same `gpa` after this call has ended.
+grants_allocator: ?std.mem.Allocator = null,
+
 /// How long a request waits for an answer, when the caller names no other
 /// time. A request has a timeout, and a request which expires counts as a
 /// refusal. Five minutes is long enough for a user to read a diff and short
@@ -751,7 +773,16 @@ fn askTheHuman(
 
     var last_look_ms = asked_at_ms;
     while (true) {
-        if (try findAnswer(gpa, io, storage, request_id, ask, self.grants, diag)) |outcome| return outcome;
+        if (try findAnswer(
+            gpa,
+            io,
+            storage,
+            request_id,
+            ask,
+            self.grants,
+            self.grants_allocator orelse gpa,
+            diag,
+        )) |outcome| return outcome;
 
         const now_ms = self.waiter.nowMs(io);
         // A `Waiter` whose clock runs backwards would make the deadline
@@ -957,6 +988,34 @@ pub fn openRequest(
     return newest;
 }
 
+/// The `action` an `approval.request` named, read back out of the log by its
+/// own id. Null when `request_id` names no such envelope.
+///
+/// **Here, and not written three times over, for the same reason
+/// `openRequest` is here.** `Waiter.wait` is handed only `io` and a budget,
+/// never the `Request` that `askTheHuman` built the question from, so
+/// `src/approval.zig`'s `Terminal` and `Display` and this file's own `Waiter`
+/// are all missing the one fact `appendAnswer` already had in hand. Each of
+/// the three reads it back the same way, out of the request it is answering,
+/// so `SessionGrants.apply` and `findAnswer`'s own `disagrees` see the exact
+/// action `askTheHuman` wrote and never a guess a client or a person typed.
+/// Caller owns the returned slice.
+pub fn requestAction(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    request_id: u64,
+) Error!?[]u8 {
+    var replay = try storage.replay(gpa, io, request_id);
+    defer replay.deinit();
+
+    const parsed = try replay.next(io) orelse return null;
+    defer parsed.deinit();
+    if (parsed.value.event != .approval_request) return null;
+
+    return try gpa.dupe(u8, parsed.value.event.approval_request.action);
+}
+
 /// Look through the log for the answer to one request, and give back what it
 /// decided. Null when no answer is there yet.
 ///
@@ -987,6 +1046,7 @@ fn findAnswer(
     request_id: u64,
     ask: Request,
     grants: ?*chock_proto.state.SessionGrants,
+    grants_allocator: std.mem.Allocator,
     diag: ?*?Diagnostic,
 ) Error!?Outcome {
     var replay = try storage.replay(gpa, io, request_id);
@@ -1034,7 +1094,7 @@ fn findAnswer(
             // here, the moment the line is read, rather than a second reader
             // having to replay the log again to learn the same fact.
             .approved_by_user_for_session => blk: {
-                if (grants) |g| try g.apply(gpa, answer);
+                if (grants) |g| try g.apply(grants_allocator, answer);
                 break :blk .approved_by_user;
             },
             .refused_by_user => .refused_by_user,

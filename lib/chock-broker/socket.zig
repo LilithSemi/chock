@@ -695,6 +695,12 @@ pub const Waiter = struct {
 
     /// Append the answer through the caller's own handle. See this file's own
     /// top comment: this one line is the whole trick.
+    ///
+    /// **`action` is read back out of the request.** A `Waiter.wait` is
+    /// handed only `io` and a budget, never the `Request` that
+    /// `Broker.askTheHuman` already answered every other decision out of. See
+    /// `Broker.requestAction` and `src/approval.zig`'s `Terminal.record`,
+    /// which reads it back the same way for the same reason.
     fn record(
         self: *Waiter,
         io: std.Io,
@@ -712,10 +718,20 @@ pub const Waiter = struct {
         };
         defer self.gpa.free(responder);
 
+        const action = (Broker.requestAction(self.gpa, io, self.storage, request_id) catch |err| {
+            self.report(err, "the answer could not be recorded");
+            return .canceled;
+        }) orelse {
+            self.report(error.RequestNotInTheLog, "the answer could not be recorded");
+            return .canceled;
+        };
+        defer self.gpa.free(action);
+
         _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
             .request_id = request_id,
             .decision = decision,
             .responder = responder,
+            .action = action,
         } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
             self.report(err, "the answer could not be written to the session log");
             return .canceled;

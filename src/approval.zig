@@ -403,16 +403,32 @@ pub const Terminal = struct {
 
     /// Append the answer through the caller's own handle. See this file's own
     /// top comment: this one line is the whole trick.
+    ///
+    /// **`action` is read back out of the request, not carried from `ask`.**
+    /// `readAnswer` may take several looks to fill one line, and `ask` runs
+    /// only on the first of them, so `record` reads the request fresh rather
+    /// than keep a copy nothing frees at the end of a session. See
+    /// `Broker.requestAction`.
     fn record(
         self: *Terminal,
         io: std.Io,
         request_id: u64,
         decision: event.ApprovalDecision,
     ) Broker.Waiter.Wake {
+        const action = (Broker.requestAction(self.gpa, io, self.storage, request_id) catch |err| {
+            self.report(err, "the answer could not be recorded");
+            return .canceled;
+        }) orelse {
+            self.report(error.RequestNotInTheLog, "the answer could not be recorded");
+            return .canceled;
+        };
+        defer self.gpa.free(action);
+
         _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
             .request_id = request_id,
             .decision = decision,
             .responder = responder,
+            .action = action,
         } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
             self.report(err, "the answer could not be written to the session log");
             return .canceled;
@@ -608,16 +624,29 @@ pub const Display = struct {
 
     /// Append the answer through the caller's own handle. The same one line
     /// `Terminal.record` is, and for the same reason.
+    ///
+    /// **`action` is read back out of the request.** See `Terminal.record`'s
+    /// own doc comment and `Broker.requestAction`.
     fn record(
         self: *Display,
         io: std.Io,
         request_id: u64,
         decision: event.ApprovalDecision,
     ) Broker.Waiter.Wake {
+        const action = (Broker.requestAction(self.gpa, io, self.storage, request_id) catch |err| {
+            self.report(err, "the answer could not be recorded");
+            return .canceled;
+        }) orelse {
+            self.report(error.RequestNotInTheLog, "the answer could not be recorded");
+            return .canceled;
+        };
+        defer self.gpa.free(action);
+
         _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
             .request_id = request_id,
             .decision = decision,
             .responder = display_responder,
+            .action = action,
         } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
             self.report(err, "the answer could not be written to the session log");
             return .canceled;
@@ -1102,6 +1131,148 @@ test "an answer of session is its own decision, distinct from a plain yes" {
     try testing.expectEqual(@as(usize, 1), result.answers.len);
     try testing.expectEqual(Decision.approved_by_user_for_session, result.answers[0]);
     try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/s]") != null);
+}
+
+test "a person who says session is not asked again, through a real Terminal and no fake" {
+    // **The point of this task.** Every other test in this file drives one
+    // question and stops. This drives two, over the same log, with a fresh
+    // `state.Session` folded before each one, exactly the way
+    // `src/run.zig`'s own `SessionArbiter.decideFn` and `carryCommit` do it
+    // for a live session: a new `Session` and a new `Broker` on every turn,
+    // because neither keeps one alive across a tool call.
+    //
+    // **Nothing here fills in `.action` by hand.** `Terminal.record`, real
+    // production code, is the only thing that ever writes either
+    // `approval.response`. A test that scripted the second line itself, the
+    // way the two fakes elsewhere in this codebase do, would prove that
+    // `SessionGrants` works and nothing about whether `Terminal` ever gives
+    // it what it needs, which is exactly the gap that shipped four times
+    // over with every test green.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SESSIONGRANT");
+    const store = backing.storage();
+    defer store.close(io);
+
+    const policy = try chock_policy.table.Table.parse(gpa, ask_everything, null);
+    defer chock_policy.table.Table.destroy(gpa, policy);
+
+    const ask = Broker.Request{
+        .action = "workspace.apply",
+        .summary = "move 3 objects and set refs/chock/01SESSIONGRANT",
+        .detail = "a1b2c3 fix the parser\n",
+        .reason = "the session made a commit",
+        .agent_kind = "coder",
+        .model_alias = "main",
+        .tool = "request_action",
+        .tool_call_id = "call1",
+        .timeout_ms = Broker.default_timeout_ms,
+    };
+
+    // The first question: a person types "s".
+    {
+        var session = chock_proto.state.Session.init(gpa);
+        defer session.deinit();
+        {
+            var replay = try store.replay(gpa, io, 0);
+            defer replay.deinit();
+            while (try replay.next(io)) |parsed| {
+                defer parsed.deinit();
+                try session.apply(parsed.value);
+            }
+        }
+
+        var locked = try store.lock(io);
+        defer locked.unlock(io) catch {};
+
+        const lines = [_][]const u8{"s\n"};
+        var console = FakeConsole{
+            .gpa = gpa,
+            .replies = &.{.{ .bytes = 0 }},
+            .lines = &lines,
+        };
+        defer console.deinit();
+
+        var terminal = Terminal{
+            .gpa = gpa,
+            .storage = store,
+            .locked = &locked,
+            .console = console.console(),
+        };
+
+        const broker = Broker{ .policy = policy, .waiter = terminal.waiter(), .grants = &session.grants };
+        // `session.arena.allocator()`, and not `gpa`: `session.grants` is
+        // filled through that arena, and `Broker.grants_allocator`'s own doc
+        // comment says why a live grant recorded through a different
+        // allocator risks a later `grow` freeing arena memory through the
+        // wrong one. `src/run.zig`'s `SessionArbiter.decideFn` is the
+        // production caller this mirrors: nothing this call returns needs to
+        // outlive `session`, so the whole call can use its arena.
+        const outcome = try broker.request(session.arena.allocator(), io, store, &locked, ask, null);
+        try testing.expectEqual(Broker.Outcome.approved_by_user, outcome);
+        if (terminal.failed) |err| return err;
+    }
+
+    // The identical request again, from nothing: a fresh `Session` folded
+    // from the log the first block left behind, and a fresh `Terminal` whose
+    // console is never read from. If it is, the test that follows fails,
+    // because the console this time has nothing to say.
+    {
+        var session = chock_proto.state.Session.init(gpa);
+        defer session.deinit();
+        {
+            var replay = try store.replay(gpa, io, 0);
+            defer replay.deinit();
+            while (try replay.next(io)) |parsed| {
+                defer parsed.deinit();
+                try session.apply(parsed.value);
+            }
+        }
+
+        var locked = try store.lock(io);
+        defer locked.unlock(io) catch {};
+
+        var console = FakeConsole{ .gpa = gpa, .replies = &.{.ended} };
+        defer console.deinit();
+
+        var terminal = Terminal{
+            .gpa = gpa,
+            .storage = store,
+            .locked = &locked,
+            .console = console.console(),
+        };
+
+        const broker = Broker{ .policy = policy, .waiter = terminal.waiter(), .grants = &session.grants };
+        const outcome = try broker.request(session.arena.allocator(), io, store, &locked, ask, null);
+        try testing.expectEqual(Broker.Outcome.approved_by_user, outcome);
+        try testing.expectEqual(@as(usize, 0), console.reads);
+        if (terminal.failed) |err| return err;
+    }
+
+    // Exactly one question was ever written, however many times the same act
+    // was asked about: the memory answered the second one before a request
+    // for it ever reached the log.
+    var questions: usize = 0;
+    var responses: usize = 0;
+    var replay = try store.replay(gpa, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .approval_request => |request| {
+                questions += 1;
+                try testing.expectEqualStrings("workspace.apply", request.action);
+            },
+            .approval_response => |response| {
+                responses += 1;
+                try testing.expectEqualStrings("workspace.apply", response.action);
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), questions);
+    try testing.expectEqual(@as(usize, 1), responses);
 }
 
 test "a Ctrl-C at the prompt ends the wait and leaves the question open" {
