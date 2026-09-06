@@ -219,7 +219,12 @@ fn answerOne(
     defer parsed.deinit();
     if (parsed.value.event != .approval_request) return false;
 
-    const text = try approval.promptText(gpa, parsed.value.event.approval_request);
+    // **`.socket`, never `.terminal`.** This client is a peer of the approval
+    // socket, and `lib/chock-broker/socket.zig`'s own clamp turns a session
+    // grant claimed from any peer into a refusal. Printing the terminal's
+    // `[y/N/s]` here would show a person a letter this connection can never
+    // keep: see `approval.Client`'s own doc comment.
+    const text = try approval.promptText(gpa, parsed.value.event.approval_request, .socket);
     defer gpa.free(text);
     // The same filter `chock run` writes its own prompt through. See this
     // file's own top comment.
@@ -353,6 +358,63 @@ fn parseOptions(args: []const []const u8) !Options {
 }
 
 const testing = std.testing;
+
+/// A `Console` a test scripts, never a terminal. What `readWord` reads is the
+/// only thing pinned here, so this needs none of `src/approval.zig`'s own
+/// `FakeConsole` fields for a display or a budget.
+const FakeConsole = struct {
+    /// The lines `read` delivers, in order. Once they run out, the console
+    /// reads as ended, the same as a person who walked away.
+    lines: []const []const u8,
+    taken: usize = 0,
+
+    fn console(self: *FakeConsole) approval.Console {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = approval.Console.VTable{ .write = writeFn, .read = readFn };
+
+    fn writeFn(ptr: *anyopaque, io: std.Io, bytes: []const u8) void {
+        _ = ptr;
+        _ = io;
+        _ = bytes;
+    }
+
+    fn readFn(ptr: *anyopaque, io: std.Io, buffer: []u8, budget_ms: u64) approval.Console.Read {
+        _ = io;
+        _ = budget_ms;
+        const self: *FakeConsole = @ptrCast(@alignCast(ptr));
+        if (self.taken >= self.lines.len) return .ended;
+        const line = self.lines[self.taken];
+        self.taken += 1;
+        std.debug.assert(line.len <= buffer.len);
+        @memcpy(buffer[0..line.len], line);
+        return .{ .bytes = line.len };
+    }
+};
+
+test "the session letter, typed here out of habit, is a plain refusal and never a grant" {
+    // `promptText` no longer prints `s` as a choice for this client (see
+    // `approval.zig`'s own test for that), but a person who typed it anyway,
+    // remembering the terminal's prompt, must still land on the safe answer.
+    // `readWord` knows one word, a plain yes, and everything else, `s`
+    // included, is a no: there is no path here that could turn it into
+    // `approved_by_user_for_session`, because this function returns a `bool`
+    // and `answerOne` maps only `true` to `approved_by_user`.
+    const io = testing.io;
+    var console = FakeConsole{ .lines = &.{"s\n"} };
+    try testing.expect(!(try readWord(io, console.console())));
+
+    // The same is true of the word this build actually accepts nowhere but
+    // the terminal.
+    var session_word = FakeConsole{ .lines = &.{"session\n"} };
+    try testing.expect(!(try readWord(io, session_word.console())));
+
+    // A plain yes is still a yes, so this is not `readWord` refusing
+    // everything.
+    var yes = FakeConsole{ .lines = &.{"y\n"} };
+    try testing.expect(try readWord(io, yes.console()));
+}
 
 test "the command line names one session at most" {
     // A second positional is a person who meant something else, and guessing

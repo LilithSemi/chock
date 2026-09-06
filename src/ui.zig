@@ -11821,6 +11821,14 @@ test "Enter and Esc answer nothing, and neither does a letter that is not one of
     // approve a push by accident, and an approval is not dismissable, because
     // refusing is an answer and ignoring is not.
     //
+    // **`s` is in this list on purpose.** The terminal prompt this region's
+    // question is drawn from offers `y`, `N` and `s`, the last one a grant for
+    // the rest of the session: see `src/approval.zig`'s `promptText` and
+    // `Client`. This region has no third member of `Answered` to hold that
+    // answer in, so a person who typed `s` out of terminal habit must see
+    // nothing happen, not a refusal dressed up as the letter they know from
+    // there, and never the grant itself.
+    //
     // Mutation check: make Enter the default answer and the first block fails,
     // which is the highlighted button the design says must not exist.
     const gpa = testing.allocator;
@@ -11829,7 +11837,7 @@ test "Enter and Esc answer nothing, and neither does a letter that is not one of
     try askIn(h, a_question);
     try settleOut(h);
 
-    for ([_][]const u8{ "\r", "\n", "\x1b", "q", "Y", "N", " " }) |key| {
+    for ([_][]const u8{ "\r", "\n", "\x1b", "q", "Y", "N", " ", "s", "S" }) |key| {
         h.screen.surface.terminal.feed(key);
         try testing.expect(h.screen.paint());
         try testing.expectEqual(@as(?Answered, null), h.screen.approval_answer);

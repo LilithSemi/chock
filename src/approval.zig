@@ -359,7 +359,7 @@ pub const Terminal = struct {
         defer parsed.deinit();
         if (parsed.value.event != .approval_request) return error.RequestNotInTheLog;
 
-        const text = try promptText(self.gpa, parsed.value.event.approval_request);
+        const text = try promptText(self.gpa, parsed.value.event.approval_request, .terminal);
         defer self.gpa.free(text);
         writeFiltered(self.console, io, text);
     }
@@ -723,16 +723,38 @@ pub fn saysYes(said: []const u8) bool {
 ///
 /// **A word of its own, and never a modifier on `saysYes`.** The two must
 /// stay easy to tell apart at a glance from a person answering at three in
-/// the morning, so `promptText` offers exactly two letters, `y` and `s`, and
-/// nothing that could be mistaken for the other. There is no third word that
-/// reaches `chock.zon`: see `event.ApprovalDecision.approved_by_user_for_session`
-/// for what this actually records, and why it never reaches farther than this
-/// process.
+/// the morning, so `promptText` offers exactly two letters, `y` and `s`, to
+/// the one asker that can keep the promise `s` makes, and never to
+/// `Client.socket`: see that type's own doc comment. There is no third word
+/// that reaches `chock.zon`: see
+/// `event.ApprovalDecision.approved_by_user_for_session` for what this
+/// actually records, and why it never reaches farther than this process.
 pub fn saysSession(said: []const u8) bool {
     const trimmed = std.mem.trim(u8, said, " \t\r");
     if (trimmed.len == 0) return false;
     return std.ascii.eqlIgnoreCase(trimmed, "s") or std.ascii.eqlIgnoreCase(trimmed, "session");
 }
+
+/// Who is being asked, so `promptText` never offers a letter that asker
+/// cannot act on.
+///
+/// **The session-wide memory needs the log's exclusive lock, and only one
+/// asker ever holds it.** `Terminal` and `Display` both run inside the process
+/// that holds that lock, so a `session` answer from either is a fact that
+/// process can act on for the rest of its own run. A peer of the approval
+/// socket is a different process, over a connection `lib/chock-broker/socket.zig`
+/// does not trust with that memory: its own `decisionFrom` turns
+/// `approved_by_user_for_session` from any peer into a refusal, whatever this
+/// function prints. Offering the letter there would show a choice the answer
+/// can never keep, so it is not offered.
+pub const Client = enum {
+    /// The process that holds the log's exclusive lock: `Terminal`, at
+    /// `chock run`'s own terminal.
+    terminal,
+    /// `chock approve`, on the far side of the approval socket. See this
+    /// type's own doc comment for why the session letter stops here.
+    socket,
+};
 
 /// The question, as a person reads it. The caller owns the result.
 ///
@@ -741,6 +763,7 @@ pub fn saysSession(said: []const u8) bool {
 pub fn promptText(
     gpa: std.mem.Allocator,
     request: event.ApprovalRequest,
+    client: Client,
 ) std.mem.Allocator.Error![]u8 {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
@@ -785,12 +808,22 @@ pub fn promptText(
         );
     }
 
-    // Two answers, and no third. `y` runs this one act and asks again next
-    // time. `s` runs it and remembers this exact action for the rest of the
-    // session, so a project that just wrote its first `ask` rule does not
-    // turn every later call into the same question. Neither ever reaches
-    // `chock.zon`: see `event.ApprovalDecision.approved_by_user_for_session`.
-    try text.appendSlice(gpa, "\nAllow this once, or for the rest of the session? [y/N/s] ");
+    // Two answers, and no third, where a `session` answer means something.
+    // `y` runs this one act and asks again next time. `s` runs it and
+    // remembers this exact action for the rest of the session, so a project
+    // that just wrote its first `ask` rule does not turn every later call into
+    // the same question. Neither ever reaches `chock.zon`: see
+    // `event.ApprovalDecision.approved_by_user_for_session`.
+    //
+    // **The socket never gets the second answer.** See `Client`'s own doc
+    // comment: a choice this asker cannot keep is not offered to it.
+    switch (client) {
+        .terminal => try text.appendSlice(
+            gpa,
+            "\nAllow this once, or for the rest of the session? [y/N/s] ",
+        ),
+        .socket => try text.appendSlice(gpa, "\nAllow this? [y/N] "),
+    }
     return text.toOwnedSlice(gpa);
 }
 
@@ -1430,7 +1463,7 @@ test "the question names the act, the chain, the reason and the review" {
         .tool_call_id = "call1",
         .review = .approved,
         .review_note = "the diff is the fix the task asked for",
-    });
+    }, .terminal);
     defer gpa.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "workspace.apply") != null);
@@ -1455,7 +1488,7 @@ test "the question names the act, the chain, the reason and the review" {
         .spawn_chain = &.{},
         .timeout_at_ms = 0,
         .tool_call_id = "call1",
-    });
+    }, .terminal);
     defer gpa.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "review") == null);
     // With no parents, the chain is the asking agent alone and there is no
@@ -1483,7 +1516,7 @@ test "a diff too large for a screen is cut, and says how much was left out" {
         .spawn_chain = &.{},
         .timeout_at_ms = 0,
         .tool_call_id = "call1",
-    });
+    }, .terminal);
     defer gpa.free(text);
 
     try testing.expectEqual(max_detail_bytes, std.mem.count(u8, text, "x"));
@@ -1494,6 +1527,46 @@ test "a diff too large for a screen is cut, and says how much was left out" {
         text,
         "Allow this once, or for the rest of the session? [y/N/s] ",
     ));
+}
+
+test "a socket peer is never shown the letter it cannot keep" {
+    // `chock approve` speaks for a peer of the approval socket, and
+    // `lib/chock-broker/socket.zig`'s own clamp turns
+    // `approved_by_user_for_session` from any peer into a refusal: see
+    // `decisionFrom` there and `Client`'s own doc comment here. A prompt that
+    // still printed `s` as a choice would be showing a person a letter that
+    // grants a session no matter what they type, so it must be gone from the
+    // words this asker reads, not merely from what the clamp does with it.
+    const gpa = testing.allocator;
+
+    const request: event.ApprovalRequest = .{
+        .action = "workspace.apply",
+        .summary = "move 3 objects",
+        .detail = "a1b2c3 fix the parser\n",
+        .reason = "the session made a commit",
+        .agent_kind = "coder",
+        .spawn_chain = &.{},
+        .timeout_at_ms = 0,
+        .tool_call_id = "call1",
+    };
+
+    const socket_text = try promptText(gpa, request, .socket);
+    defer gpa.free(socket_text);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "[y/N/s]") == null);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "s]") == null);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "the rest of the session") == null);
+    try testing.expect(std.mem.endsWith(u8, socket_text, "\nAllow this? [y/N] "));
+
+    // The rest of the question is unchanged: only the last line names what a
+    // socket peer may say.
+    try testing.expect(std.mem.indexOf(u8, socket_text, "workspace.apply") != null);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "move 3 objects") != null);
+
+    // The terminal, over the same request, still reads the letter: this is a
+    // difference between askers and not a change to what the terminal offers.
+    const terminal_text = try promptText(gpa, request, .terminal);
+    defer gpa.free(terminal_text);
+    try testing.expect(std.mem.indexOf(u8, terminal_text, "[y/N/s]") != null);
 }
 
 test "only a plain yes is a yes" {
