@@ -723,16 +723,22 @@ pub fn saysYes(said: []const u8) bool {
 ///
 /// **A word of its own, and never a modifier on `saysYes`.** The two must
 /// stay easy to tell apart at a glance from a person answering at three in
-/// the morning, so `promptText` offers exactly two letters, `y` and `s`, to
-/// the one asker that can keep the promise `s` makes, and never to
+/// the morning, so `promptText` offers exactly two letters, `y` and `a`, to
+/// the one asker that can keep the promise `a` makes, and never to
 /// `Client.socket`: see that type's own doc comment. There is no third word
 /// that reaches `chock.zon`: see
 /// `event.ApprovalDecision.approved_by_user_for_session` for what this
 /// actually records, and why it never reaches farther than this process.
+///
+/// **`a`, for "always", not `s`.** `s` collides with "skip" and "stop" in
+/// other tools' conventions, and it is retired here: a stray `s` from old
+/// habit is a plain refusal now, the same as any other word this function
+/// does not know, and never a grant. `a` is the letter `git add -p` already
+/// gives this same meaning to, "yes, and all the rest".
 pub fn saysSession(said: []const u8) bool {
     const trimmed = std.mem.trim(u8, said, " \t\r");
     if (trimmed.len == 0) return false;
-    return std.ascii.eqlIgnoreCase(trimmed, "s") or std.ascii.eqlIgnoreCase(trimmed, "session");
+    return std.ascii.eqlIgnoreCase(trimmed, "a") or std.ascii.eqlIgnoreCase(trimmed, "always");
 }
 
 /// Who is being asked, so `promptText` never offers a letter that asker
@@ -811,18 +817,18 @@ pub fn promptText(
     // Two answers say yes, and everything else is a no. The terminal prompt
     // shows a third letter, `N`, only to mark the default when nothing is
     // typed, never as a third way to say yes.
-    // `y` runs this one act and asks again next time. `s` runs it and
-    // remembers this exact action for the rest of the session, so a project
-    // that just wrote its first `ask` rule does not turn every later call into
-    // the same question. Neither ever reaches `chock.zon`: see
-    // `event.ApprovalDecision.approved_by_user_for_session`.
+    // `y` runs this one act and asks again next time. `a`, for "always",
+    // runs it and remembers this exact action for the rest of the session,
+    // so a project that just wrote its first `ask` rule does not turn every
+    // later call into the same question. Neither ever reaches `chock.zon`:
+    // see `event.ApprovalDecision.approved_by_user_for_session`.
     //
     // **The socket never gets the second answer.** See `Client`'s own doc
     // comment: a choice this asker cannot keep is not offered to it.
     switch (client) {
         .terminal => try text.appendSlice(
             gpa,
-            "\nAllow this once, or for the rest of the session? [y/N/s] ",
+            "\nAllow this once, or for the rest of the session? [y/N/a] ",
         ),
         .socket => try text.appendSlice(gpa, "\nAllow this? [y/N] "),
     }
@@ -1136,11 +1142,11 @@ test "a yes and a no both leave a record that replays, written through the one h
         );
         // And the question reached the screen.
         try testing.expect(std.mem.indexOf(u8, result.shown, "workspace.apply") != null);
-        try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/s]") != null);
+        try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/a]") != null);
     }
 }
 
-test "an answer of session is its own decision, distinct from a plain yes" {
+test "an answer of always is its own decision, distinct from a plain yes" {
     // The third word the prompt accepts. It permits the act exactly as a
     // plain yes does, from the broker's own point of view: `Broker.Outcome`
     // has no member for it, only `event.ApprovalDecision` does, because the
@@ -1150,7 +1156,7 @@ test "an answer of session is its own decision, distinct from a plain yes" {
     const gpa = testing.allocator;
     const io = testing.io;
 
-    const lines = [_][]const u8{"s\n"};
+    const lines = [_][]const u8{"a\n"};
     var console = FakeConsole{
         .gpa = gpa,
         .replies = &.{.{ .bytes = 0 }},
@@ -1165,10 +1171,36 @@ test "an answer of session is its own decision, distinct from a plain yes" {
     try testing.expect(result.outcome.?.permits());
     try testing.expectEqual(@as(usize, 1), result.answers.len);
     try testing.expectEqual(Decision.approved_by_user_for_session, result.answers[0]);
-    try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/s]") != null);
+    try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/a]") != null);
 }
 
-test "a person who says session is not asked again, through a real Terminal and no fake" {
+test "a stray s from muscle memory refuses rather than grant a session" {
+    // `s` used to be the session letter and now grants nothing: a person who
+    // types it out of old habit must land on a plain refusal, not on
+    // `approved_by_user_for_session` and not on some other silent behaviour
+    // of its own. Anything this build does not know is a no, and `s` is now
+    // one more word it does not know.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const lines = [_][]const u8{"s\n"};
+    var console = FakeConsole{
+        .gpa = gpa,
+        .replies = &.{.{ .bytes = 0 }},
+        .lines = &lines,
+    };
+    defer console.deinit();
+
+    var result = try drive(gpa, io, &console, neverStopped, Broker.default_timeout_ms);
+    defer result.deinit();
+
+    try testing.expectEqual(Broker.Outcome.refused_by_user, result.outcome.?);
+    try testing.expect(!result.outcome.?.permits());
+    try testing.expectEqual(@as(usize, 1), result.answers.len);
+    try testing.expectEqual(Decision.refused_by_user, result.answers[0]);
+}
+
+test "a person who says always is not asked again, through a real Terminal and no fake" {
     // **The point of this task.** Every other test in this file drives one
     // question and stops. This drives two, over the same log, with a fresh
     // `state.Session` folded before each one, exactly the way
@@ -1205,7 +1237,7 @@ test "a person who says session is not asked again, through a real Terminal and 
         .timeout_ms = Broker.default_timeout_ms,
     };
 
-    // The first question: a person types "s".
+    // The first question: a person types "a".
     {
         var session = chock_proto.state.Session.init(gpa);
         defer session.deinit();
@@ -1221,7 +1253,7 @@ test "a person who says session is not asked again, through a real Terminal and 
         var locked = try store.lock(io);
         defer locked.unlock(io) catch {};
 
-        const lines = [_][]const u8{"s\n"};
+        const lines = [_][]const u8{"a\n"};
         var console = FakeConsole{
             .gpa = gpa,
             .replies = &.{.{ .bytes = 0 }},
@@ -1498,7 +1530,7 @@ test "the question names the act, the chain, the reason and the review" {
     try testing.expect(std.mem.indexOf(u8, text, "approved") != null);
     try testing.expect(std.mem.indexOf(u8, text, "the fix the task asked for") != null);
     // The two answers, with the refusing one as the default.
-    try testing.expect(std.mem.indexOf(u8, text, "[y/N/s]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[y/N/a]") != null);
 
     // A request no reviewer saw says nothing about a review, rather than
     // showing an empty one a reader would wonder about.
@@ -1548,7 +1580,7 @@ test "a diff too large for a screen is cut, and says how much was left out" {
     try testing.expect(std.mem.endsWith(
         u8,
         text,
-        "Allow this once, or for the rest of the session? [y/N/s] ",
+        "Allow this once, or for the rest of the session? [y/N/a] ",
     ));
 }
 
@@ -1557,7 +1589,7 @@ test "a socket peer is never shown the letter it cannot keep" {
     // `lib/chock-broker/socket.zig`'s own clamp turns
     // `approved_by_user_for_session` from any peer into a refusal: see
     // `decisionFrom` there and `Client`'s own doc comment here. A prompt that
-    // still printed `s` as a choice would be showing a person a letter that
+    // still printed `a` as a choice would be showing a person a letter that
     // grants a session no matter what they type, so it must be gone from the
     // words this asker reads, not merely from what the clamp does with it.
     const gpa = testing.allocator;
@@ -1575,8 +1607,8 @@ test "a socket peer is never shown the letter it cannot keep" {
 
     const socket_text = try promptText(gpa, request, .socket);
     defer gpa.free(socket_text);
-    try testing.expect(std.mem.indexOf(u8, socket_text, "[y/N/s]") == null);
-    try testing.expect(std.mem.indexOf(u8, socket_text, "s]") == null);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "[y/N/a]") == null);
+    try testing.expect(std.mem.indexOf(u8, socket_text, "a]") == null);
     try testing.expect(std.mem.indexOf(u8, socket_text, "the rest of the session") == null);
     try testing.expect(std.mem.endsWith(u8, socket_text, "\nAllow this? [y/N] "));
 
@@ -1589,7 +1621,7 @@ test "a socket peer is never shown the letter it cannot keep" {
     // difference between askers and not a change to what the terminal offers.
     const terminal_text = try promptText(gpa, request, .terminal);
     defer gpa.free(terminal_text);
-    try testing.expect(std.mem.indexOf(u8, terminal_text, "[y/N/s]") != null);
+    try testing.expect(std.mem.indexOf(u8, terminal_text, "[y/N/a]") != null);
 }
 
 test "only a plain yes is a yes" {
@@ -1615,28 +1647,32 @@ test "only a plain yes is a yes" {
     try testing.expect(!saysYes("eyes"));
 }
 
-test "only a plain session is a session, and the two words never both fire" {
+test "only a plain always is an always, and the two words never both fire" {
     // The two words `promptText` offers must never overlap: a person reading
-    // `[y/N/s]` at three in the morning has to be able to tell them apart, and
+    // `[y/N/a]` at three in the morning has to be able to tell them apart, and
     // a waiter that answered both at once would leave `readAnswer`'s `if` to
     // pick one arbitrarily.
-    try testing.expect(saysSession("s"));
-    try testing.expect(saysSession("S"));
-    try testing.expect(saysSession("session"));
-    try testing.expect(saysSession("SESSION"));
-    try testing.expect(saysSession(" s \r"));
+    try testing.expect(saysSession("a"));
+    try testing.expect(saysSession("A"));
+    try testing.expect(saysSession("always"));
+    try testing.expect(saysSession("ALWAYS"));
+    try testing.expect(saysSession(" a \r"));
 
     try testing.expect(!saysSession(""));
     try testing.expect(!saysSession("y"));
     try testing.expect(!saysSession("yes"));
     try testing.expect(!saysSession("n"));
     try testing.expect(!saysSession("no"));
-    try testing.expect(!saysSession("sessions"));
-    try testing.expect(!saysSession("ss"));
+    try testing.expect(!saysSession("always1"));
+    try testing.expect(!saysSession("aa"));
+    // The old letter and word: retired, and neither grants anything now.
+    try testing.expect(!saysSession("s"));
+    try testing.expect(!saysSession("session"));
 
     const words = [_][]const u8{
-        "",        "y",   "yes",    "n",     "no", "s",
-        "session", "yep", "sesion", "maybe",
+        "",       "y",     "yes",    "n",   "no",
+        "a",      "always", "yep",   "s",   "session",
+        "alwyas", "maybe",
     };
     for (words) |word| {
         // Never both. `readAnswer` trusts exactly that to give one decision.

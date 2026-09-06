@@ -222,7 +222,7 @@ fn answerOne(
     // **`.socket`, never `.terminal`.** This client is a peer of the approval
     // socket, and `lib/chock-broker/socket.zig`'s own clamp turns a session
     // grant claimed from any peer into a refusal. Printing the terminal's
-    // `[y/N/s]` here would show a person a letter this connection can never
+    // `[y/N/a]` here would show a person a letter this connection can never
     // keep: see `approval.Client`'s own doc comment.
     const text = try approval.promptText(gpa, parsed.value.event.approval_request, .socket);
     defer gpa.free(text);
@@ -393,22 +393,27 @@ const FakeConsole = struct {
     }
 };
 
-test "the session letter, typed here out of habit, is a plain refusal and never a grant" {
-    // `promptText` no longer prints `s` as a choice for this client (see
+test "the always letter, typed here out of habit, is a plain refusal and never a grant" {
+    // `promptText` no longer prints `a` as a choice for this client (see
     // `approval.zig`'s own test for that), but a person who typed it anyway,
     // remembering the terminal's prompt, must still land on the safe answer.
-    // `readWord` knows one word, a plain yes, and everything else, `s`
+    // `readWord` knows one word, a plain yes, and everything else, `a`
     // included, is a no: there is no path here that could turn it into
     // `approved_by_user_for_session`, because this function returns a `bool`
     // and `answerOne` maps only `true` to `approved_by_user`.
     const io = testing.io;
-    var console = FakeConsole{ .lines = &.{"s\n"} };
+    var console = FakeConsole{ .lines = &.{"a\n"} };
     try testing.expect(!(try readWord(io, console.console())));
 
     // The same is true of the word this build actually accepts nowhere but
     // the terminal.
-    var session_word = FakeConsole{ .lines = &.{"session\n"} };
-    try testing.expect(!(try readWord(io, session_word.console())));
+    var always_word = FakeConsole{ .lines = &.{"always\n"} };
+    try testing.expect(!(try readWord(io, always_word.console())));
+
+    // And the old letter, from muscle memory: also just a no here, as it
+    // always was for this client.
+    var old_letter = FakeConsole{ .lines = &.{"s\n"} };
+    try testing.expect(!(try readWord(io, old_letter.console())));
 
     // A plain yes is still a yes, so this is not `readWord` refusing
     // everything.

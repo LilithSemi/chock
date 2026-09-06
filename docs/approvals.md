@@ -47,10 +47,10 @@ chock: this needs your approval before it can happen.
 
   a1b2c3 add a test for the parser
 
-Allow this once, or for the rest of the session? [y/N/s]
+Allow this once, or for the rest of the session? [y/N/a]
 ```
 
-`y` or `yes`, in any case, answers yes for this apply alone. `s` or `session`
+`y` or `yes`, in any case, answers yes for this apply alone. `a` or `always`
 answers yes and remembers this exact action for the rest of the session, so a
 later `workspace.apply` in the same session does not ask again. Anything
 else, a bare Enter included, is a no, and a no leaves your repository exactly
