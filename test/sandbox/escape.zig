@@ -550,6 +550,22 @@ test "a file bound onto a target that did not exist yet carries the source's con
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "a deny_read entry that is a symlink cannot bind the notice onto its target" {
+    // `.env` inside the project points at a file here instead: a directory
+    // this test made with its own scratchRoot, no relation to the sandbox
+    // root at all and never named in any mount this probe builds. See
+    // `deny.zig`'s own top comment: `deny_read` is the one project supplied
+    // path in the whole mount tree, and a repository can hold a symlink.
+    var outside = try scratchRoot();
+    defer outside.cleanup();
+
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+
+    const term = try runProbeArgv(&.{ probe_path, "deny-symlink-outside", scratch.path(), outside.path() });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a tool call inside the sandbox cannot reach the session's approval socket" {
     // See `lib/chock-broker/socket.zig`: **anything that can reach that
     // socket can approve an action**, so a tool call must not be able to. The

@@ -763,6 +763,16 @@ pub const MountError = error{
     /// dropped would read the very bytes the project asked to keep out, so the
     /// only safe answer is to refuse the call.
     DenyTargetIsDirectory,
+    /// A `Mount.Deny` names a path that is a symbolic link, or that changed
+    /// into one between `pinDenyTarget`'s own check and its use, inside the
+    /// sandbox. `mount` follows a symbolic link, and `deny_read` is the one
+    /// project supplied path in the whole mount tree, so a link aimed
+    /// outside the project would move the denial's own bind mount there
+    /// instead of covering anything inside it. Refused rather than followed.
+    ///
+    /// **The sandbox does not start**, for the same reason
+    /// `DenyTargetIsDirectory` does not let one through either.
+    DenyTargetIsSymlink,
     /// The kernel returned an errno with no specific recovery. Reported as a bug.
     Unexpected,
 };
@@ -798,6 +808,7 @@ pub const Diagnostic = struct {
         deny_notice_file,
         deny_notice_write,
         deny_target_stat,
+        deny_target_open,
         overlay_mount,
         scratch_mount,
         scratch_open,
@@ -825,6 +836,7 @@ pub const Diagnostic = struct {
                 .deny_notice_file => "open on the deny notice file",
                 .deny_notice_write => "the write of the deny notice",
                 .deny_target_stat => "statx on a denied path",
+                .deny_target_open => "open on a denied path",
                 .overlay_mount => "the overlay mount",
                 .scratch_mount => "the scratch area mount",
                 .scratch_open => "open on a scratch area",
@@ -918,11 +930,19 @@ pub fn buildRoot(
 /// the user's repository, which only a commit does. That is the price of a
 /// protection that does not lapse the moment the agent makes the file itself.
 ///
-/// **A target that already exists is never opened here.** The kind is read
-/// with `statx` and the bind follows. An `open` with `O_CREAT` on an existing
-/// file would trigger an overlayfs copy up, which would copy the very bytes
-/// this function exists to keep out of reach into the session's own scratch
-/// directory.
+/// **The target is pinned before it is used, and never named twice.**
+/// `deny_read` is the one project supplied path in this whole mount tree, and
+/// `mount` follows a symbolic link at its target. Checking what a name holds
+/// with `statx` and then binding over that same name, as this function once
+/// did, leaves a window between the two calls for the name to become a link
+/// aimed outside the project, and `mount` would then land the notice on
+/// whatever the link resolves to, out there and not in the sandbox.
+/// `pinDenyTarget` closes that window: it opens the target once, with
+/// `O_NOFOLLOW`, and hands back a descriptor this function mounts through as
+/// `/proc/self/fd/N`, so the bind lands on the inode that descriptor names
+/// and not on whatever a fresh lookup of the path would find. A symbolic
+/// link at the leaf is refused outright, with `error.DenyTargetIsSymlink`,
+/// never opened through.
 fn applyDenyMounts(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -958,22 +978,156 @@ fn applyDenyMounts(
         const target = try std.fs.path.join(allocator, &.{ root, deny.target });
         defer allocator.free(target);
 
+        const fd = try pinDenyTarget(allocator, target, diag);
+        defer _ = linux.close(fd);
+
+        var magic_buf: [64]u8 = undefined;
+        const magic_z = std.fmt.bufPrintZ(&magic_buf, "/proc/self/fd/{d}", .{fd}) catch
+            return error.Unexpected;
+
+        // No `MS.REC`: one file, which has nothing under it. The mount is
+        // named by the descriptor `pinDenyTarget` handed back, so it lands on
+        // the inode that was checked and no other, whatever the target's own
+        // name resolves to by now.
+        try mountCall(source_z, magic_z, null, linux.MS.BIND, 0, diag);
+
         const target_z = try allocator.dupeZ(u8, target);
         defer allocator.free(target_z);
-
-        switch (try existingPathKind(target_z.ptr, .deny_target_stat, diag)) {
-            // Nothing there yet. Make an empty file to bind over, so the
-            // denial holds for the file the agent has not made yet.
-            .missing => try makePath(allocator, target, .file, diag),
-            .directory => return error.DenyTargetIsDirectory,
-            .file => {},
-        }
-
-        // No `MS.REC`: one file, which has nothing under it.
-        try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
-        // So a write to a denied path is refused rather than editing the one
+        // The original name, read only now that the mount stands on it: a
+        // write to a denied path is refused rather than editing the one
         // notice file every other denial in this sandbox also reads.
         try markReadOnly(target_z, diag);
+    }
+}
+
+/// Open `target`, an absolute path already joined onto a sandbox root, and
+/// hand back a descriptor `applyDenyMounts` mounts through instead of
+/// `target`'s own name. See `applyDenyMounts` for why a name is not trusted
+/// twice.
+///
+/// `O_NOFOLLOW` on every open this function and `createDenyTarget` make is
+/// the whole mechanism: a target that is there and is not a link is opened
+/// directly and its descriptor is returned; a target that is not there yet
+/// is created fresh, through a descriptor on its parent directory rather
+/// than by a name that could have changed since `deny.zig` last looked at
+/// it; a symbolic link at the leaf is caught by the `statx` below, since
+/// `O_PATH` changes what a symlink leaf does to `open` itself. See that
+/// `statx` call for why.
+fn pinDenyTarget(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    diag: ?*?Diagnostic,
+) MountError!i32 {
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+
+    const fd_rc = linux.open(target_z.ptr, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    switch (linux.errno(fd_rc)) {
+        .SUCCESS => {},
+        // A symlink loop somewhere above the leaf, not the leaf itself:
+        // `O_PATH` changes what a symlink leaf answers here, see below. This
+        // is still a link the sandbox does not get to resolve on the
+        // project's behalf, so it is refused the same way.
+        .LOOP => return error.DenyTargetIsSymlink,
+        // Nothing at this name yet. `deny.zig`'s own `check` accepts this: a
+        // project may deny a file it has not made yet, such as `.env` before
+        // it exists.
+        .NOENT, .NOTDIR => return createDenyTarget(allocator, target, diag),
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .deny_target_open, err);
+            return error.Unexpected;
+        },
+    }
+    const fd: i32 = @intCast(fd_rc);
+    errdefer _ = linux.close(fd);
+
+    // **`O_PATH` changes what `O_NOFOLLOW` means at the last component.**
+    // With `O_PATH` alone, `open` on a symlink leaf does not fail with
+    // `ELOOP`: it succeeds, and hands back a descriptor on the link itself,
+    // never on whatever it points to. So the open above cannot be the
+    // refusal; this `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
+    // target, not a fresh lookup of `target_z`, which is the same "no second
+    // name" property the open itself was for.
+    var stat_buf: linux.Statx = undefined;
+    const empty: [*:0]const u8 = "";
+    const rc = linux.statx(fd, empty, linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stat_buf);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .deny_target_stat, err);
+            return error.Unexpected;
+        },
+    }
+    if ((stat_buf.mode & linux.S.IFMT) == linux.S.IFLNK) return error.DenyTargetIsSymlink;
+    if ((stat_buf.mode & linux.S.IFMT) == linux.S.IFDIR) return error.DenyTargetIsDirectory;
+    return fd;
+}
+
+/// Make `target` a fresh, empty file and hand back a descriptor on it, for a
+/// `deny_read` entry the project does not hold yet. Called only from
+/// `pinDenyTarget`, once an `open` with `O_NOFOLLOW` has already found
+/// nothing at that name.
+///
+/// **The parent is opened once, and the leaf is created through it with
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`.** `O_EXCL` is what makes this atomic:
+/// between `pinDenyTarget`'s own check and this call, nothing stopped some
+/// other actor from placing a file, or a link, at the name that used to be
+/// empty. `O_EXCL` refuses to open through either rather than silently
+/// succeeding on whichever one got there first.
+fn createDenyTarget(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    diag: ?*?Diagnostic,
+) MountError!i32 {
+    const dir = std.fs.path.dirname(target) orelse return error.Unexpected;
+    const base = std.fs.path.basename(target);
+
+    // The chain of directories above the leaf, made the same way every other
+    // mount target in this file is: `deny.zig`'s own `check` allows an entry
+    // such as `secrets/config.txt` naming a directory the project has not
+    // made yet.
+    try makePath(allocator, dir, .directory, diag);
+
+    const dir_z = try allocator.dupeZ(u8, dir);
+    defer allocator.free(dir_z);
+    const dir_fd_rc = linux.open(dir_z.ptr, .{ .PATH = true, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    switch (linux.errno(dir_fd_rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .deny_target_open, err);
+            return error.Unexpected;
+        },
+    }
+    const dir_fd: i32 = @intCast(dir_fd_rc);
+    defer _ = linux.close(dir_fd);
+
+    const base_z = try allocator.dupeZ(u8, base);
+    defer allocator.free(base_z);
+
+    const fd_rc = linux.openat(dir_fd, base_z.ptr, .{
+        .ACCMODE = .RDONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0o644);
+    switch (linux.errno(fd_rc)) {
+        .SUCCESS => return @intCast(fd_rc),
+        .PERM, .ACCES => return error.NotPermitted,
+        // Something now occupies the name `pinDenyTarget` just found empty: a
+        // link, or a file some other actor placed there in between. Refused
+        // the same way a link found straight away is refused, because this
+        // cannot tell the two apart without opening through whichever it is,
+        // and opening through either is the fault this function exists to
+        // close.
+        .EXIST => return error.DenyTargetIsSymlink,
+        else => |err| {
+            note(diag, .deny_target_open, err);
+            return error.Unexpected;
+        },
     }
 }
 

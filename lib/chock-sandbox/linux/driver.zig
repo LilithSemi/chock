@@ -1458,6 +1458,35 @@ fn printFault(stderr_fd: i32, err: anyerror) void {
     writeStderr(stderr_fd, line);
 }
 
+/// The one sentence a project author reads for
+/// `namespace.MountError.DenyTargetIsSymlink`, in place of `printFault`'s
+/// bare error name.
+///
+/// **Why this gets a sentence and `printFault`'s other callers do not.**
+/// Every other fault `dieNamespace` and its neighbours report is a kernel
+/// refusing this process something; the bare name plus an errno is already
+/// the diagnosis, because the fix is "give this process the privilege" or
+/// "use a newer kernel", not something in a person's own project. This one
+/// is different: it fires only because of a line the project itself wrote in
+/// its own `chock.zon`, so a bare error name sends a person to search for a
+/// Zig identifier instead of their own file. The reasoning for why a symlink
+/// is refused rather than followed lives in `namespace.zig`'s own doc comment
+/// on `DenyTargetIsSymlink`, and in the threat model; this sentence carries
+/// only what to change.
+///
+/// **It does not, and cannot yet, name the entry.** `namespace.Diagnostic`
+/// carries two enumerations and nothing else, on purpose: the hardest callers
+/// build one in a forked child with no allocator, and this fault is
+/// deliberate rather than a kernel errno, so it never fills one in. Naming
+/// the offending path would mean carrying a path through that type for every
+/// caller, not only this one, and that is a bigger change than this message.
+fn printDenyTargetSymlinkFault(stderr_fd: i32) void {
+    writeStderr(
+        stderr_fd,
+        "sandbox: a deny_read entry in chock.zon names a symbolic link, and it will not be followed. Point deny_read at the real file, not at a link to it.\n",
+    );
+}
+
 /// Same as `printFault`, for a step that reads its own errno instead of
 /// returning a Zig error, the same way `namespace.zig` names an errno it
 /// cannot map to a specific recovery.
@@ -1531,6 +1560,13 @@ fn dieNamespace(
         const line = std.fmt.bufPrint(&buffer, "sandbox: {f}\n", .{d}) catch
             "sandbox: a mount failed, and the reason was too long to print\n";
         writeStderr(stderr_fd, line);
+    } else if (err == error.DenyTargetIsSymlink) {
+        // No `diag`: this is `applyDenyMounts` refusing on purpose, never a
+        // kernel errno, so there is nothing in `d.errno` to report. See
+        // `printDenyTargetSymlinkFault` for why this fault alone gets a
+        // sentence instead of `printFault`'s bare name.
+        reportSetupFailure(write_fd, step, 0);
+        printDenyTargetSymlinkFault(stderr_fd);
     } else {
         reportSetupFailure(write_fd, step, 0);
         printFault(stderr_fd, err);

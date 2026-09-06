@@ -1008,6 +1008,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "delete-mounted-file") or
         std.mem.eql(u8, args[1], "write-readonly-submount") or
         std.mem.eql(u8, args[1], "file-bind-content") or
+        std.mem.eql(u8, args[1], "deny-symlink-outside") or
         std.mem.eql(u8, args[1], "spawn-ptrace") or
         std.mem.eql(u8, args[1], "spawn-landlock-escape") or
         std.mem.eql(u8, args[1], "spawn-network-escape") or
@@ -1079,6 +1080,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // reach it, and hands the path down.
         std.mem.eql(u8, args[1], "spawn-approval-socket") or
         std.mem.eql(u8, args[1], "spawned-approval-socket") or
+        // A directory outside the sandbox root entirely, made by escape.zig
+        // with its own scratchRoot, so the file this probe puts a symlink's
+        // target at is provably not part of the sandbox's own mount tree.
+        std.mem.eql(u8, args[1], "deny-symlink-outside") or
         // The descriptor the caller left open on the host root. Only the
         // caller knows which number it landed on, and the whole point of the
         // check is that the number names nothing by the time it is read.
@@ -2084,12 +2089,68 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         return if (matched) 0 else 1;
     }
+    if (std.mem.eql(u8, args[1], "deny-symlink-outside")) {
+        // `id_arg` is a directory escape.zig made with its own scratchRoot,
+        // wholly separate from `root_arg`: not a subdirectory of it, not
+        // bind mounted into it, nothing this sandbox's own mount tree names.
+        // A file put there and read back afterward is the proof this probe
+        // needs: `applyDenyMounts` never touches anything outside the
+        // sandbox root it was handed, so a change here can only mean the
+        // bind mount followed a symlink out of the project.
+        const secret_content = "chock outside secret content\n";
+        const secret_path = try std.fs.path.join(arena, &.{ id_arg, "secret" });
+        try writeTestFile(arena, secret_path, secret_content);
+        const secret_z = try arena.dupeZ(u8, secret_path);
+
+        // `.env`, inside the project, aimed outside it. `deny.zig`'s own
+        // `check` accepts this shape today: it never stats a symlink's
+        // target, so a project may name a link exactly like this one under
+        // `deny_read` and have it accepted.
+        const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
+        try makeTestDir(arena, work);
+        const env_path = try std.fs.path.join(arena, &.{ work, ".env" });
+        const env_z = try arena.dupeZ(u8, env_path);
+        if (linux.errno(linux.symlink(secret_z.ptr, env_z.ptr)) != .SUCCESS) return 3;
+
+        enterOrEndUnmeasured(.{ .network = .none, .mount = true });
+        const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
+            .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
+            .{ .deny = .{ .target = "/work/.env" } },
+        }, null);
+
+        // The secret's own real path, read back exactly as this probe wrote
+        // it. Still reachable by that same absolute name here: `buildRoot`
+        // never calls `pivot_root`, so nothing has detached the host tree
+        // yet. If the bind landed on it, this now holds the deny notice
+        // instead of what was written above. The buffer has to hold the
+        // whole notice, not only the secret: a buffer sized to the shorter
+        // string would truncate the read and could never compare equal to
+        // the longer one, which reads as "not escaped" whether or not it was.
+        var read_buffer: [sandbox.namespace.deny_notice.len]u8 = undefined;
+        var read_content: []const u8 = &.{};
+        const read_fd = linux.open(secret_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(read_fd) == .SUCCESS) {
+            const handle: i32 = @intCast(read_fd);
+            const read_rc = linux.read(handle, &read_buffer, read_buffer.len);
+            _ = linux.close(handle);
+            if (linux.errno(read_rc) == .SUCCESS) read_content = read_buffer[0..read_rc];
+        }
+        const escaped = std.mem.eql(u8, read_content, sandbox.namespace.deny_notice);
+
+        // Exit 1 is the fault this probe exists to catch: the bind landed
+        // outside, whatever buildRoot itself went on to answer. Exit 0 is a
+        // clean refusal, `error.DenyTargetIsSymlink`, with the secret left
+        // exactly as this probe wrote it. Anything else is exit 5: neither
+        // the fault nor the fix this probe was written to tell apart.
+        if (escaped) return 1;
+        if (build_result) |_| return 5 else |err| return if (err == error.DenyTargetIsSymlink) 0 else 5;
+    }
 
     // The netns-connect, netns-loopback, read-home, write-readonly,
-    // write-readonly-submount, delete-mounted-file, and file-bind-content checks
-    // above ran inside the namespaces, with no seccomp filter installed. Every
-    // operation below this line runs with the filter installed, and did not
-    // enter any namespace.
+    // write-readonly-submount, delete-mounted-file, file-bind-content, and
+    // deny-symlink-outside checks above ran inside the namespaces, with no
+    // seccomp filter installed. Every operation below this line runs with the
+    // filter installed, and did not enter any namespace.
     if (std.mem.eql(u8, args[1], "ptrace")) {
         const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
         // The filter kills the process, so this line never runs.

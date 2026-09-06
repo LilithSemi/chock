@@ -2796,10 +2796,12 @@ fn mountAnswer(err: sandbox.namespace.MountError) Answer {
         error.SourceMissing,
         error.OutOfMemory,
         // This probe passes no `Mount.deny` at all, so a denied path that is
-        // a directory can never be what it hits. Named here rather than left
-        // to an `else`, so a later mount fault still has to be read and
-        // classified by whoever adds one.
+        // a directory, or a symbolic link, can never be what it hits: both
+        // are refused by `applyDenyMounts`, which this probe never calls.
+        // Named here rather than left to an `else`, so a later mount fault
+        // still has to be read and classified by whoever adds one.
         error.DenyTargetIsDirectory,
+        error.DenyTargetIsSymlink,
         error.Unexpected,
         => .refused,
     };
