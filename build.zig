@@ -438,6 +438,11 @@ pub fn build(b: *std.Build) void {
                     .{ .name = "chock-sandbox", .module = chock_sandbox },
                     .{ .name = "chock-broker", .module = chock_broker },
                     .{ .name = "chock-policy", .module = chock_policy },
+                    // For a real chock_proto.storage.Memory and a real
+                    // Broker.request, driven from inside this probe's own
+                    // Sandbox.spawn: see test/sandbox/probe.zig's own
+                    // AskArbiter and askingEscape.
+                    .{ .name = "chock-proto", .module = chock_proto },
                 },
             }),
         });

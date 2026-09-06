@@ -811,6 +811,87 @@ test "a permitted name that resolves onto this machine reaches nothing" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
+// **The reentrancy proof.** `lib/chock-broker/network.zig` now calls
+// `Broker.request` when the policy answers `ask`, from inside `serveOne`,
+// from inside `Sandbox.spawn`'s own `serveBroker` loop, from inside a tool
+// call `Loop.run` has not finished. Nothing above these five tests had
+// proved that call safe: see `test/sandbox/probe.zig`'s own `askingEscape`
+// and `AskArbiter`, which build a real session log and a real, in process
+// arbiter and drive the whole thing through a real `Sandbox.spawn`. Every
+// assertion of substance runs inside the probe itself, because the log this
+// reentrant call writes to lives only in that process; this file only reads
+// the one number a process boundary can still carry, its exit code.
+//
+// **What this proves, and what it does not.** These five tests prove the
+// log, lock and turn mechanics with an in process stand in arbiter
+// (`AskArbiter`), not the production socket waiter
+// (`lib/chock-broker/socket.zig`), because nothing shipped reaches that
+// configuration yet: `Network.asker` is `null` for every real caller today,
+// and the one caller that does build a filtered `Network`, the MCP server
+// path in `src/run.zig`, never goes through `lib/chock-core/tools.zig`'s own
+// deadline machinery at all. A reader who sees five passing reentrancy tests
+// here should not conclude the production socket path through this same
+// nesting is proved. It is not, yet.
+
+test "a question asked from inside a running tool call reaches the log, in order, and the turn survives" {
+    // The plainest case: the table says `ask`, an arbiter played entirely in
+    // process approves it, and the probe itself checks that the
+    // `approval.request` and its `approval.response` are both in the log
+    // with a real id, that the `tool.call` and `tool.result` bracketing the
+    // spawn are still in order around them, and that the log's own hash
+    // chain never broke. See `spawn-filtered-ask-grant`.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-filtered-ask-grant", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "the same reentrant question, answered no, refuses the connection and still leaves the log correct" {
+    // A refusal must reach the sandboxed child exactly as faithfully as a
+    // grant does, and the log must hold the request and the `refused_by_user`
+    // response, in order. See `spawn-filtered-ask-refuse`.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-filtered-ask-refuse", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a reentrant question nobody answers expires rather than hanging the call" {
+    // The arbiter never answers. `askTheHuman`'s own deadline is what ends
+    // the wait, and it writes the `expired` answer itself, so the question
+    // does not sit open forever and the sandboxed call still ends rather
+    // than hanging inside `Sandbox.spawn`. See `spawn-filtered-ask-timeout`.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-filtered-ask-timeout", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a cancelled wait leaves the question open, refuses the connection, and still ends the call" {
+    // The wait itself reports a cancellation, the way a signal reaching this
+    // process while it waits would. `Broker.request` returns `error.Canceled`,
+    // `Network.askPermits` catches it and refuses, and the question is left
+    // in the log with no answer at all, the same state a crash leaves: see
+    // `Waiter.Wake.canceled`'s own doc comment. Nothing here hangs.
+    // `spawn-filtered-ask-cancel`.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-filtered-ask-cancel", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a second, different question in the same tool call is answered on its own, not the first one's answer" {
+    // The first re-entry into `Broker.request` might work and the second
+    // might not, which is exactly what this pins: two different hosts, asked
+    // one after the other on the same broker pair inside one `Sandbox.spawn`,
+    // each answered the way the arbiter meant to answer it. See
+    // `spawn-filtered-ask-two`.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-filtered-ask-two", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "spawn gives the sandboxed process /dev/null on standard input, never a terminal" {
     // The sandboxed program must have no terminal, so a password prompt fails
     // fast instead of hanging on a read nobody can answer. It is also an injection channel closed: a descriptor left open on

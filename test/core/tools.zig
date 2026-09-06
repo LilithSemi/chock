@@ -264,9 +264,14 @@ const ProbeOutcome = struct {
     is_error: bool,
     truncated: bool,
     output: []u8,
+    /// `chock_core.tools.ToolResult.note`: what a person reading the log
+    /// afterward gets and the model never does. Empty for every test that
+    /// never touches a path that sets one.
+    note: []u8,
 
     fn deinit(self: *ProbeOutcome, allocator: std.mem.Allocator) void {
         allocator.free(self.output);
+        allocator.free(self.note);
         self.* = undefined;
     }
 };
@@ -342,6 +347,11 @@ const ProbeOptions = struct {
     /// certain to be over or certain to be under, never one that depends on
     /// how full the disk happens to be.
     workspace_floor_bytes: ?u64 = null,
+    /// A fixed number of milliseconds `chock_core.tools.Context.approval_wait_ns`
+    /// is set to before the probe's own `dispatchTimed` ever runs. Null is a
+    /// call that carries no extension at all, which is every test but the one
+    /// that proves this deadline can be widened.
+    approval_wait_ms: ?u64 = null,
 };
 
 /// Same as `runToolCall`, with the probe's own trailing two arguments named.
@@ -401,13 +411,19 @@ fn runToolCallWith(
     else
         "";
 
+    var approval_wait_buf: [20]u8 = undefined;
+    const approval_wait_word: []const u8 = if (options.approval_wait_ms) |ms|
+        try std.fmt.bufPrint(&approval_wait_buf, "{d}", .{ms})
+    else
+        "";
+
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
         tools_probe_path,              tool,                         "probe-call",                    root_path,                   config.cwd,
         mounts_blob,                   rules_blob,                   env_blob,                        host_path,                   arguments_json,
         timeout_word,                  options.memory_dir orelse "", store_blob,                      options.cache_dir orelse "", cancel_word,
-        options.scratch_dir orelse "", scratch_bytes_word,           options.workspace_dir orelse "", floor_word,
+        options.scratch_dir orelse "", scratch_bytes_word,           options.workspace_dir orelse "", floor_word,                  approval_wait_word,
     });
 
     // **The probe's standard error goes nowhere, and that is deliberate.**
@@ -473,7 +489,13 @@ fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term,
             .exited => |c| c,
             else => 255,
         };
-        return .{ .fault = code, .is_error = false, .truncated = false, .output = try allocator.dupe(u8, &.{}) };
+        return .{
+            .fault = code,
+            .is_error = false,
+            .truncated = false,
+            .output = try allocator.dupe(u8, &.{}),
+            .note = try allocator.dupe(u8, &.{}),
+        };
     }
 
     const newline_idx = std.mem.indexOfScalar(u8, stdout, '\n') orelse return error.BadProbeOutput;
@@ -482,17 +504,26 @@ fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term,
     const is_error_field = fields.next() orelse return error.BadProbeOutput;
     const truncated_field = fields.next() orelse return error.BadProbeOutput;
     const len_field = fields.next() orelse return error.BadProbeOutput;
+    const note_len_field = fields.next() orelse return error.BadProbeOutput;
 
     const is_error = std.mem.eql(u8, is_error_field, "is_error=1");
     const truncated = std.mem.eql(u8, truncated_field, "truncated=1");
 
     if (!std.mem.startsWith(u8, len_field, "len=")) return error.BadProbeOutput;
     const len = try std.fmt.parseInt(usize, len_field["len=".len..], 10);
+    if (!std.mem.startsWith(u8, note_len_field, "note_len=")) return error.BadProbeOutput;
+    const note_len = try std.fmt.parseInt(usize, note_len_field["note_len=".len..], 10);
 
     const body = stdout[newline_idx + 1 ..];
-    if (body.len != len) return error.BadProbeOutput;
+    if (body.len != len + note_len) return error.BadProbeOutput;
 
-    return .{ .fault = null, .is_error = is_error, .truncated = truncated, .output = try allocator.dupe(u8, body) };
+    return .{
+        .fault = null,
+        .is_error = is_error,
+        .truncated = truncated,
+        .output = try allocator.dupe(u8, body[0..len]),
+        .note = try allocator.dupe(u8, body[len..]),
+    };
 }
 
 test "run_command runs in the workspace and returns what the program wrote" {
@@ -1595,6 +1626,57 @@ test "a command that outlives its timeout is stopped and says so" {
     // less than four seconds said the same thing less exactly and measured the
     // machine as well.
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "[chock: command exceeded its 300ms limit and was stopped]") != null);
+}
+
+test "a deadline extended for an approval wait does not kill the call, and the log says both numbers" {
+    // Section C2 of the plan: `tools.zig`'s own 120 second wall clock deadline
+    // must not be the thing that answers a question a person is still
+    // reading, or a prompt nobody reaches inside two minutes kills the very
+    // call the prompt was about. `sleep 2` through `run_command`, with
+    // `dispatchTimed`'s own deadline set to 200 ms, would ordinarily be
+    // stopped the same way the test above stops `sleep 5`: this one also
+    // names `approval_wait_ms`, standing in for `Context.approval_wait_ns`
+    // credited by whatever inside the sandboxed call had to stop and ask
+    // someone, and 3000 ms is comfortably longer than the sleep it must now
+    // let finish.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    var outcome = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        "{\"argv\":[\"sleep\",\"2\"]}",
+        .{ .timeout_ms = 200, .approval_wait_ms = 3000 },
+    );
+    defer outcome.deinit(allocator);
+
+    // The sleep ran to its own end: no timeout message, and no error, which
+    // is what a plain 200 ms deadline against a two second sleep could never
+    // have produced without the extension.
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(!outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "[chock: command exceeded") == null);
+    // **Both numbers, in the one field a person reads and the model never
+    // does.** The original deadline and the time waited, exactly as section
+    // C2 asked for: see `buildToolResult` and `event.ToolResult.note`'s own
+    // doc comment on why this is never in `output`.
+    try std.testing.expectEqualStrings(
+        "[chock: this call's own 200ms limit was extended by 3000ms while a person was asked " ++
+            "to approve something it did]",
+        outcome.note,
+    );
 }
 
 /// Sum the "count:" and "in-pack:" lines of `git count-objects -v` at

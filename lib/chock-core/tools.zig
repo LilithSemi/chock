@@ -1675,6 +1675,23 @@ pub const Context = struct {
     /// the same sandbox for the same deadline whether or not anybody is
     /// watching: see `drainCapture`, which is the one place this is read.
     idle: ?idle_mod.Idle = null,
+    /// Nanoseconds `timeout_ns` should be extended by, read live while the
+    /// call runs, and bumped by whatever inside the sandboxed call had to
+    /// stop and ask a person something. Null, the default, is nothing at all,
+    /// which is every caller before this field existed and every call that
+    /// never opens a filtered connection today. See `SandboxCall.approval_wait_ns`.
+    ///
+    /// **Only the receiving end exists.** `drainCapture` reads this counter
+    /// live and extends its own deadline by it, and that half is built and
+    /// tested. Nothing today holds one of these and bumps it from inside a
+    /// running `Broker.request` wait: no caller passes a live counter in, so
+    /// this field is always null in every real session that exists right
+    /// now. The sending end is the wiring that would let a filtered
+    /// connection's own `ask`, answered from inside a tool call rather than
+    /// only from inside an MCP server's own long lived process, credit this
+    /// counter as it waits. That wiring belongs to whoever builds that
+    /// caller, not to this field.
+    approval_wait_ns: ?*const std.atomic.Value(u64) = null,
     /// The host directory this project's knowledgebase lives in, or null for
     /// a session that has none. `Support.memory` decides whether the model is
     /// told the two memory tools exist; this is where they actually work.
@@ -2418,6 +2435,7 @@ fn runCommand(
         // `grep`, a `read_file` and a `write_file` are each one short program
         // Chock itself chose, under the same deadline. See `Context.idle`.
         .idle = if (in_background) null else context.idle,
+        .approval_wait_ns = if (in_background) null else context.approval_wait_ns,
     }) catch |err| switch (err) {
         error.TooManyTasks => return toolErrorResult(
             allocator,
@@ -2509,6 +2527,28 @@ fn runCommand(
     if (config.network == .none and result.is_error and namesTheNetwork(result.output)) {
         result.note = try allocator.dupe(u8, no_network_note);
     }
+    // **For the person, and never for the model.** See
+    // `SandboxCall.approval_wait_ns` and `Captured.waited_for_approval_ns`: a
+    // call that ran long because a person was asked something reads, from
+    // `output` alone, exactly like a call that just ran long. The two numbers
+    // are what let a reader of the log tell them apart afterward, and the
+    // model never sees this: see `event.ToolResult.note`'s own doc comment.
+    //
+    // `else if`, and not a second `if`: the two conditions above and below
+    // cannot both be true today, `.none` networking never sets
+    // `approval_wait_ns`, but a caller that could only ever overwrite the
+    // other note, never append past it, must not become one that leaks it.
+    else if (ran == .captured and ran.captured.waited_for_approval_ns > 0) {
+        result.note = try std.fmt.allocPrint(
+            allocator,
+            "[chock: this call's own {d}ms limit was extended by {d}ms while a person was asked " ++
+                "to approve something it did]",
+            .{
+                ran.captured.timeout_ns / std.time.ns_per_ms,
+                ran.captured.waited_for_approval_ns / std.time.ns_per_ms,
+            },
+        );
+    }
     return result;
 }
 
@@ -2550,6 +2590,10 @@ fn backgroundRun(
         // **Nobody is watching a background task.** This runner is what the
         // task process drives, and that process has no display of its own: see
         // `Context.idle`.
+        null,
+        // **Nobody is watching, so nothing extends this deadline either.** A
+        // task nobody reads until it finishes has nobody to wait for an
+        // answer either. See `SandboxCall.approval_wait_ns`.
         null,
     ) catch |err| return .{
         .status = .did_not_run,
@@ -4774,6 +4818,19 @@ const SandboxCall = struct {
     /// What the caller does while the program runs. Carried from
     /// `Context.idle`, and null for every caller that has nobody watching.
     idle: ?idle_mod.Idle = null,
+    /// Nanoseconds this call's own deadline has been extended by, read live
+    /// while the program runs. Null for every call that carries none, which
+    /// today is every call: nothing yet asks a person from inside a running
+    /// sandboxed call. See `spawnCapturingIo`'s own doc comment on why the
+    /// deadline needs this at all, and `Captured.waited_for_approval_ns` for
+    /// where the value this call ends with is read back out.
+    ///
+    /// **Owned by the caller, and written by whatever runs inside the
+    /// sandboxed call.** The day a filtered connection's own `ask` can be
+    /// answered from inside a tool call, and not only from inside an MCP
+    /// server's own long lived process, this is the seam that answer's own
+    /// wait bumps: see `lib/chock-broker/network.zig`'s `Network.asker`.
+    approval_wait_ns: ?*const std.atomic.Value(u64) = null,
 };
 
 /// What one call to `runInSandboxWith` produced: the program's own output, or
@@ -4961,6 +5018,7 @@ fn runInSandboxWith(
         call.timeout_ns,
         call.keep_bytes,
         call.idle,
+        call.approval_wait_ns,
     );
     return .{ .captured = captured };
 }
@@ -5374,6 +5432,15 @@ const Captured = struct {
     /// is copied by value out of the storage `spawnCapturingIo` lent the spawn
     /// thread.
     limits: sandbox.Sandbox.LimitsReport = .{},
+    /// How many nanoseconds `timeout_ns` was extended by, read once from
+    /// `SandboxCall.approval_wait_ns` after the call has already ended. Zero
+    /// for every call that named no counter, which is every call before this
+    /// field existed. **Carried here so a person reading the log afterward
+    /// can tell a call that ran long because a person was asked something
+    /// from a call that just ran long**, and never shown to the model: see
+    /// `buildToolResult`, which puts it in `ToolResult.note` and not in
+    /// `ToolResult.output`.
+    waited_for_approval_ns: u64 = 0,
 };
 
 /// What the dedicated thread inside `spawnCapturing` reports back once its
@@ -5565,6 +5632,21 @@ pub fn cancelRunningTool() void {
 /// runs past `timeout_ns`. See this file's own top comment for why the
 /// dedicated thread `SpawnThread.run` runs on is safe here, and for why the
 /// timeout exists.
+///
+/// **`approval_wait_ns` is the deadline's own release valve.** `timeout_ns`
+/// bounds an ordinary compile or test run; it says nothing about a person.
+/// The moment something inside the sandboxed call has to stop and ask one,
+/// this clock must not be the thing that answers first: a prompt nobody
+/// reaches inside two minutes must not kill the very call the prompt was
+/// about, and a person who has walked away from the keyboard to read a diff
+/// must not come back to a session that gave up on them. `drainCapture`
+/// reads this value on every pass and adds it to the fixed deadline it
+/// computed at the start, so a caller that keeps bumping it keeps the call
+/// alive for exactly as long as the bumping continues, and never longer:
+/// nothing here removes the two minute bound, it only tells `drainCapture`
+/// the true reason the clock has not fired yet. Null for a caller with
+/// nothing that can ever bump it, which is every caller before this
+/// parameter existed and every call that never opens a filtered connection.
 fn spawnCapturing(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5573,8 +5655,9 @@ fn spawnCapturing(
     timeout_ns: u64,
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
+    approval_wait_ns: ?*const std.atomic.Value(u64),
 ) sandbox.Sandbox.SpawnError!Captured {
-    return spawnCapturingIo(allocator, io, config, argv, timeout_ns, keep_bytes, filler, chock_io.default());
+    return spawnCapturingIo(allocator, io, config, argv, timeout_ns, keep_bytes, filler, approval_wait_ns, chock_io.default());
 }
 
 /// Same as `spawnCapturing`, with the `chock-io` driver named explicitly
@@ -5592,6 +5675,7 @@ fn spawnCapturingIo(
     timeout_ns: u64,
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
+    approval_wait_ns: ?*const std.atomic.Value(u64),
     chock_io_driver: chock_io.Io,
 ) sandbox.Sandbox.SpawnError!Captured {
     const raw_pipe = try chock_io_driver.pipeCloseOnExec();
@@ -5721,7 +5805,16 @@ fn spawnCapturingIo(
     // failed outright. So a caller that paints a screen inside `filler` cannot
     // be holding an allocator lock or a stream lock at the moment a child
     // inherits this address space. See `Context.idle`.
-    const drained = drainCapture(allocator, io, read_file, &spawn_thread, timeout_ns, keep_bytes, filler) catch |err| {
+    const drained = drainCapture(
+        allocator,
+        io,
+        read_file,
+        &spawn_thread,
+        timeout_ns,
+        keep_bytes,
+        filler,
+        approval_wait_ns,
+    ) catch |err| {
         std.Io.File.close(read_file, io);
         thread.join();
         return err;
@@ -5740,6 +5833,12 @@ fn spawnCapturingIo(
         .truncated = drained.truncated,
         .timed_out = drained.timed_out,
         .timeout_ns = timeout_ns,
+        // Read once, now that the call has ended, rather than inside
+        // `drainCapture`'s own loop: this is the total a person reading the
+        // log afterward wants, not a value that kept changing underneath it.
+        // Zero when `approval_wait_ns` is null, which is every call before
+        // this field existed.
+        .waited_for_approval_ns = if (approval_wait_ns) |counter| counter.load(.monotonic) else 0,
         // Safe to read: `thread.join` above has already returned, so the one
         // write to this storage happened before it.
         .limits = limits_report,
@@ -5767,6 +5866,20 @@ fn earlier(a: std.Io.Clock.Timestamp, b: std.Io.Clock.Timestamp) std.Io.Clock.Ti
 /// pipe closes, which that signal's own delivery brings about. The signal
 /// is sent at most once.
 ///
+/// **`approval_wait_ns` extends that deadline, live.** `base_deadline` is
+/// fixed once, at this function's own start, exactly as it always was; the
+/// deadline actually enforced on each pass is `base_deadline` plus whatever
+/// `approval_wait_ns` reads at that moment, computed fresh every time rather
+/// than once. A read of zero, or a null `approval_wait_ns`, is the ordinary
+/// case and changes nothing: this call still ends at `base_deadline`, the
+/// same as before this parameter existed. The re-check inside the
+/// `error.Timeout` branch is what makes an extension that lands *while* one
+/// read is already blocked still count: `std.Io.operateTimeout` was handed a
+/// deadline at the moment that read started, so a bump that arrives after
+/// cannot move a wait already in flight, and without the re-check this
+/// function would report a timeout for a wait that had, in the same instant,
+/// stopped being one.
+///
 /// Each read is one `std.Io.operateTimeout` call over one
 /// `Io.File.readStreaming` operation, bounded by the same fixed deadline
 /// every time, rather than a hand rolled `poll` loop with its own
@@ -5788,6 +5901,7 @@ fn drainCapture(
     timeout_ns: u64,
     keep_bytes: usize,
     filler: ?idle_mod.Idle,
+    approval_wait_ns: ?*const std.atomic.Value(u64),
 ) sandbox.Sandbox.SpawnError!Drained {
     var kept = try allocator.alloc(u8, keep_bytes);
     errdefer allocator.free(kept);
@@ -5799,13 +5913,22 @@ fn drainCapture(
     // `.awake` and not `.real`. A deadline must not move when NTP steps the
     // wall clock, or this timeout fires early or never fires at all. `.awake`
     // counts forward from an unspecified point and cannot jump.
-    const deadline: std.Io.Clock.Timestamp = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
+    const base_deadline: std.Io.Clock.Timestamp = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{
         .raw = .fromNanoseconds(@intCast(timeout_ns)),
         .clock = .awake,
     });
 
     var scratch: [4096]u8 = undefined;
     while (true) {
+        // `base_deadline` plus whatever this call has been credited so far.
+        // Read fresh on every pass: see this function's own doc comment.
+        const deadline: std.Io.Clock.Timestamp = if (approval_wait_ns) |counter| blk: {
+            const extra = counter.load(.monotonic);
+            break :blk if (extra == 0) base_deadline else base_deadline.addDuration(.{
+                .raw = .fromNanoseconds(@intCast(extra)),
+                .clock = .awake,
+            });
+        } else base_deadline;
         // Once the kill signal has gone out, there is nothing left to time:
         // the read loop just waits for the pipe to close, which the signal's
         // own delivery brings about. Before that, the same fixed deadline is
@@ -5839,6 +5962,21 @@ fn drainCapture(
                         one.step();
                         continue;
                     }
+                }
+                // **The other way a look can end early: `approval_wait_ns`
+                // moved while this read was already blocked.**
+                // `std.Io.operateTimeout` was handed a fixed deadline the
+                // moment this read started, so a bump landing after that
+                // cannot move a wait already in flight; this is what makes it
+                // count anyway. Read fresh, not the `deadline` this pass
+                // already computed, which is now stale.
+                if (approval_wait_ns) |counter| {
+                    const extra = counter.load(.monotonic);
+                    const fresh = if (extra == 0) base_deadline else base_deadline.addDuration(.{
+                        .raw = .fromNanoseconds(@intCast(extra)),
+                        .clock = .awake,
+                    });
+                    if (std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, fresh)) continue;
                 }
                 timed_out = true;
                 // Through the handle and never the pid. **The same race lives
@@ -7105,6 +7243,7 @@ test "spawnCapturing reports a pipe creation failure without ever reaching the s
         &.{"true"},
         default_timeout_ns,
         max_output_bytes,
+        null,
         null,
         chock_io.Fake.driver(),
     );

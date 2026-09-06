@@ -23,6 +23,13 @@ const sandbox = @import("chock-sandbox");
 /// alone, and for why the decision path has to be the one that ships.
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
+/// A real session log, in memory, for `askingEscape`: the reentrancy proof
+/// needs a real `Broker.request`, and `Broker.request` needs a real
+/// `chock_proto.storage.Storage` to write the question and the answer into.
+/// `Memory` touches no file and ignores the `io` it is handed, which is what
+/// keeps this probe's own `io` field safely `undefined`: see `Network.io`'s
+/// own comment on why nothing here may build a threaded one.
+const chock_proto = @import("chock-proto");
 const linux = std.os.linux;
 
 /// What `spawn-stdin-pipe` writes into the pipe it names in `Config.stdin_fd`,
@@ -404,6 +411,266 @@ fn filteredEscape(
         .dials = transport.dials,
         .granted = network.granted,
         .refused = network.refused,
+    };
+}
+
+/// No rule at all, which `Table.evaluateChain` answers with `ask` for any
+/// action. Every asking probe below uses this, so the table's own default is
+/// what routes the connection to `Broker.request` rather than a rule an
+/// author happened to spell `.ask`.
+const ask_policy: [:0]const u8 =
+    \\.{ .policy = .{ .rules = .{} } }
+;
+
+/// A second host, distinct from `filtered_host`, for the probe operation that
+/// asks about two hosts inside the same `Sandbox.spawn`. Two names, so the
+/// second reentrant `Broker.request` is a different question and not the
+/// same one answered twice.
+const second_filtered_host = "second.example.com";
+
+/// The id of the most recent `approval.request` in the log that has no
+/// `approval.response` naming it yet, or null when every question asked so
+/// far has already been answered.
+///
+/// One open request at a time is the only shape this probe ever produces: the
+/// sandboxed child asks, blocks for the answer, and only then asks again, so
+/// there is never a second question in flight to confuse this with the first.
+fn openRequest(gpa: std.mem.Allocator, store: chock_proto.storage.Storage) ?u64 {
+    var replay = store.replay(gpa, undefined, 0) catch return null;
+    defer replay.deinit();
+
+    var last_request: ?u64 = null;
+    var answered = false;
+    while (replay.next(undefined) catch null) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .approval_request => {
+                last_request = parsed.value.id;
+                answered = false;
+            },
+            .approval_response => |response| {
+                if (last_request != null and response.request_id == last_request.?) answered = true;
+            },
+            else => {},
+        }
+    }
+    if (last_request) |id| {
+        if (!answered) return id;
+    }
+    return null;
+}
+
+/// A `Broker.Waiter` that answers, refuses to answer, or reports a
+/// cancellation, entirely in process. **This is the reentrancy under test.**
+/// `Broker.request` calls `wait` from inside `Waiter.wait`'s own caller,
+/// `askTheHuman`, which itself runs from inside `serveBroker`'s poll loop,
+/// itself inside this probe's one and only call to `Sandbox.spawn`. This type
+/// stands in for the person who would otherwise answer through
+/// `lib/chock-broker/socket.zig`: a real arbiter, played by code that never
+/// touches `std.Io` and never starts a thread, for the same reason
+/// `ProbeTransport` does not. `nowMs` and `wait` both ignore the `io` they are
+/// handed, so this probe's own `network.io` field can stay `undefined`
+/// throughout, exactly as `filteredEscape`'s own comment requires.
+///
+/// **This proves the log, lock and turn mechanics, not the production socket
+/// waiter.** `lib/chock-broker/socket.zig`'s own `Waiter` does real socket
+/// I/O through `std.Io`, and nothing here stands in for that half. It does
+/// not need to, to answer this task's question: nothing shipped calls
+/// `Broker.request` from inside a running `Sandbox.spawn` today, so there is
+/// no production configuration yet for that waiter to be tested in. The day
+/// there is, it is a smaller, more confident step for this proof already
+/// existing, not a step this proof has already taken.
+const AskArbiter = struct {
+    gpa: std.mem.Allocator,
+    store: chock_proto.storage.Storage,
+    locked: *chock_broker.network.Locked,
+    now_ms: i64 = 1_700_000_000_000,
+    waits: usize = 0,
+    /// What this arbiter answers the first, second, and later open requests
+    /// it sees with, in order. The last entry repeats for every request past
+    /// the end, so a single element answers every one of them the same way.
+    /// Used to prove two different questions in the same `Sandbox.spawn` each
+    /// get the answer meant for them and not the other one's: see
+    /// `spawned-filtered-ask-two`.
+    decisions: []const chock_proto.event.ApprovalDecision = &.{.approved_by_user},
+    /// How many requests this arbiter has already answered. Indexes
+    /// `decisions`, capped at its last entry.
+    answered: usize = 0,
+    /// False for the "nobody is there" case: every open request is left
+    /// exactly as it is, so `askTheHuman`'s own deadline, and nothing this
+    /// type does, is what ends the wait.
+    answers: bool = true,
+    /// The wait count at which this arbiter instead reports a cancellation
+    /// and answers nothing. Null: never cancels.
+    cancel_at: ?usize = null,
+
+    fn waiter(self: *AskArbiter) chock_broker.Broker.Waiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_broker.Broker.Waiter.VTable{ .nowMs = nowMsFn, .wait = waitFn };
+
+    fn nowMsFn(ptr: *anyopaque, io: std.Io) i64 {
+        _ = io;
+        const self: *AskArbiter = @ptrCast(@alignCast(ptr));
+        return self.now_ms;
+    }
+
+    fn waitFn(ptr: *anyopaque, io: std.Io, budget_ms: u64) chock_broker.Broker.Waiter.Wake {
+        _ = io;
+        const self: *AskArbiter = @ptrCast(@alignCast(ptr));
+        self.waits += 1;
+        if (self.cancel_at) |at| {
+            if (self.waits >= at) return .canceled;
+        }
+        if (self.answers) {
+            if (openRequest(self.gpa, self.store)) |id| {
+                const index = @min(self.answered, self.decisions.len - 1);
+                _ = self.locked.append(self.gpa, undefined, .{ .approval_response = .{
+                    .request_id = id,
+                    .decision = self.decisions[index],
+                    .responder = "arbiter",
+                } }, self.now_ms) catch {};
+                self.answered += 1;
+            }
+        }
+        self.now_ms += @intCast(budget_ms);
+        return .slept;
+    }
+};
+
+/// What one `askingEscape` run came back with, for the operation that started
+/// it to check against what it expected.
+const AskingRun = struct {
+    term: std.process.Child.Term,
+    granted: usize,
+    refused: usize,
+    /// How many `approval.request` events the log holds.
+    requests: usize,
+    /// How many `approval.response` events the log holds.
+    responses: usize,
+    /// What a full read of the log's own hash chain found.
+    verdict: chock_proto.chain.Verdict,
+    /// True when the `tool.call` this run wrote before `Sandbox.spawn`, every
+    /// `approval.request` and `approval.response` the spawn caused, and the
+    /// `tool.result` this run wrote after it, all appear in exactly that
+    /// order by id. **This is the turn that was already in flight**, and the
+    /// proof that a real reentrant `Broker.request` left it intact.
+    turn_intact: bool,
+};
+
+/// Run `/probe <op> <ports>` inside a real filtered sandbox, with the real
+/// network broker answering, and a real `Broker.request` wired in for the
+/// `ask` decision: see `chock_broker.network.Network.asker`.
+///
+/// A real session log, held in memory, brackets the call with a `tool.call`
+/// and a `tool.result` the way `Loop.runTool` brackets a real tool call, so a
+/// reader of the log afterward can tell whether the turn that was in flight
+/// survived the reentrant call the sandboxed child caused in the middle of it.
+fn askingEscape(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    op: []const u8,
+    ports: []const u8,
+    resolves_to: chock_broker.network.Transport.Address,
+    dial_port: u16,
+    decisions: []const chock_proto.event.ApprovalDecision,
+    answers: bool,
+    cancel_at: ?usize,
+) !AskingRun {
+    const base = try baseEscapeConfig(arena);
+    const policy = try chock_policy.table.Table.parse(arena, ask_policy, null);
+
+    var backing = try chock_proto.storage.Memory.init(arena, "01PROBEASK");
+    const store = backing.storage();
+
+    var locked = try store.lock(undefined);
+    const call_id = try locked.append(arena, undefined, .{ .tool_call = .{
+        .call_id = "call1",
+        .tool = "mcp",
+        .arguments = "{}",
+    } }, 1_700_000_000_000);
+
+    var arbiter = AskArbiter{
+        .gpa = arena,
+        .store = store,
+        .locked = &locked,
+        .decisions = decisions,
+        .answers = answers,
+        .cancel_at = cancel_at,
+    };
+    var broker = chock_broker.Broker{ .policy = policy, .waiter = arbiter.waiter() };
+
+    var transport = ProbeTransport{ .resolves_to = resolves_to, .port = dial_port };
+    var network = chock_broker.network.Network{
+        .gpa = arena,
+        // **Never read**, for the reason `AskArbiter`'s own comment gives:
+        // this process has already forked, or is about to, and nothing here
+        // may start a thread through `std.Io`'s own machinery to get here.
+        .io = undefined,
+        .table = policy,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "main",
+        .tool = "mcp",
+        .transport = transport.transport(),
+        .asker = .{ .broker = &broker, .storage = store, .locked = &locked },
+    };
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root,
+        .mounts = base.mounts,
+        .rules = base.rules,
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_broker = network.netBroker(),
+    }, &.{ "/probe", op, ports }, null, null);
+
+    const result_id = try locked.append(arena, undefined, .{ .tool_result = .{
+        .call_id = "call1",
+        .output = "done",
+        .is_error = false,
+        .truncated = false,
+    } }, 1_700_000_000_002);
+
+    var requests: usize = 0;
+    var responses: usize = 0;
+    var first_request_id: ?u64 = null;
+    var last_response_id: ?u64 = null;
+    {
+        var replay = try store.replay(arena, undefined, 0);
+        defer replay.deinit();
+        while (try replay.next(undefined)) |parsed| {
+            defer parsed.deinit();
+            switch (parsed.value.event) {
+                .approval_request => {
+                    requests += 1;
+                    if (first_request_id == null) first_request_id = parsed.value.id;
+                },
+                .approval_response => {
+                    responses += 1;
+                    last_response_id = parsed.value.id;
+                },
+                else => {},
+            }
+        }
+    }
+
+    const verdict = (try chock_proto.storage.verify(store, arena, undefined)).verdict;
+
+    const turn_intact = requests > 0 and
+        call_id < (first_request_id orelse std.math.maxInt(u64)) and
+        (last_response_id orelse 0) < result_id;
+
+    return .{
+        .term = term,
+        .granted = network.granted,
+        .refused = network.refused,
+        .requests = requests,
+        .responses = responses,
+        .verdict = verdict,
+        .turn_intact = turn_intact,
     };
 }
 
@@ -1508,6 +1775,54 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                 },
                 .refused => return 1,
             }
+        }
+
+        if (std.mem.eql(u8, args[1], "spawned-filtered-ask-two")) {
+            // Two different hosts, one after another, on the same broker
+            // pair. The second ask must not be answered by whatever answered
+            // the first, and must not be lost because the first one already
+            // ran a full reentrant `Broker.request`.
+            const first = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("first ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            const first_granted = switch (first) {
+                .granted => |fd| blk: {
+                    _ = linux.close(fd);
+                    break :blk true;
+                },
+                .refused => false,
+            };
+
+            const second = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                second_filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("second ask failed: {s}\n", .{@errorName(err)});
+                return 3;
+            };
+            const second_granted = switch (second) {
+                .granted => |fd| blk: {
+                    _ = linux.close(fd);
+                    break :blk true;
+                },
+                .refused => false,
+            };
+
+            // The first is answered yes and the second is answered no, so a
+            // pass here needs both answers to have landed on the right
+            // question and neither to have been skipped or duplicated.
+            if (first_granted and !second_granted) return 0;
+            std.debug.print(
+                "first granted {} second granted {}\n",
+                .{ first_granted, second_granted },
+            );
+            return 1;
         }
 
         std.debug.print("unknown filtered network operation: {s}\n", .{args[1]});
@@ -2671,6 +2986,189 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             // refused it.
             if (run.lookups != 1 or run.dials != 0) {
                 std.debug.print("the broker looked up {d} names and dialled {d}\n", .{ run.lookups, run.dials });
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // **The reentrancy proof.** `ask_policy` names no rule, so the table
+        // answers `ask` for the one host the child asks about, and that is
+        // what routes the connection through a real `Broker.request`, called
+        // from inside this very `Sandbox.spawn`'s own `serveBroker` loop. An
+        // arbiter played entirely in process approves it, and the checks
+        // below are the four things section C2 of the plan asks a real run to
+        // prove: the request and its answer are both in the log, in order,
+        // with a real id; the turn that was already in flight is still
+        // intact; the hash chain never broke; and the sandboxed call finished
+        // normally rather than hanging or crashing.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-ask-grant")) {
+            const run = try askingEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_public_address,
+                granted.port,
+                &.{.approved_by_user},
+                true,
+                null,
+            );
+            if (run.granted != 1 or run.refused != 0) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            if (run.requests != 1 or run.responses != 1) {
+                std.debug.print("the log holds {d} requests and {d} responses\n", .{ run.requests, run.responses });
+                return 5;
+            }
+            if (run.verdict != .intact) {
+                std.debug.print("the log's own chain read back as {s}\n", .{@tagName(run.verdict)});
+                return 5;
+            }
+            if (!run.turn_intact) {
+                std.debug.print("the turn that was already in flight did not come back intact\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // The same proof, with the arbiter saying no instead of yes. A
+        // refusal must reach the log and the sandboxed child exactly as
+        // faithfully as a grant does.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-ask-refuse")) {
+            const run = try askingEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_public_address,
+                granted.port,
+                &.{.refused_by_user},
+                true,
+                null,
+            );
+            if (run.granted != 0 or run.refused != 1) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            if (run.requests != 1 or run.responses != 1) {
+                std.debug.print("the log holds {d} requests and {d} responses\n", .{ run.requests, run.responses });
+                return 5;
+            }
+            if (run.verdict != .intact) {
+                std.debug.print("the log's own chain read back as {s}\n", .{@tagName(run.verdict)});
+                return 5;
+            }
+            if (!run.turn_intact) {
+                std.debug.print("the turn that was already in flight did not come back intact\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // Nobody answers. `askTheHuman`'s own deadline is what ends the wait,
+        // and it writes the `expired` answer itself: an unanswered question
+        // must not hang the sandboxed call forever, and it must not look like
+        // a person said no.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-ask-timeout")) {
+            const run = try askingEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_public_address,
+                granted.port,
+                &.{.approved_by_user},
+                false,
+                null,
+            );
+            if (run.granted != 0 or run.refused != 1) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            // The deadline itself writes one answer, `expired`, so the
+            // question does not sit open the way a cancellation leaves it.
+            if (run.requests != 1 or run.responses != 1) {
+                std.debug.print("the log holds {d} requests and {d} responses\n", .{ run.requests, run.responses });
+                return 5;
+            }
+            if (run.verdict != .intact) {
+                std.debug.print("the log's own chain read back as {s}\n", .{@tagName(run.verdict)});
+                return 5;
+            }
+            if (!run.turn_intact) {
+                std.debug.print("the turn that was already in flight did not come back intact\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // The wait itself is cancelled, the way a signal reaching this
+        // process while it waits would report through `Waiter.wait`. The
+        // question must stay open with no answer, the same state a crash
+        // leaves, and the call must still end rather than hang.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-ask-cancel")) {
+            const run = try askingEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask",
+                ports,
+                filtered_public_address,
+                granted.port,
+                &.{.approved_by_user},
+                false,
+                1,
+            );
+            if (run.granted != 0 or run.refused != 1) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            if (run.requests != 1 or run.responses != 0) {
+                std.debug.print("the log holds {d} requests and {d} responses\n", .{ run.requests, run.responses });
+                return 5;
+            }
+            if (run.verdict != .intact) {
+                std.debug.print("the log's own chain read back as {s}\n", .{@tagName(run.verdict)});
+                return 5;
+            }
+            if (!run.turn_intact) {
+                std.debug.print("the turn that was already in flight did not come back intact\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        // Two different hosts, asked one after the other inside the same
+        // `Sandbox.spawn`. The first re-entry into `Broker.request` might
+        // work and the second might not, which is exactly what this pins:
+        // both must reach the log, in order, each answered the way this
+        // arbiter meant to answer it and not the other one's decision.
+        if (std.mem.eql(u8, args[1], "spawn-filtered-ask-two")) {
+            const run = try askingEscape(
+                arena,
+                root_arg,
+                "spawned-filtered-ask-two",
+                ports,
+                filtered_public_address,
+                granted.port,
+                &.{ .approved_by_user, .refused_by_user },
+                true,
+                null,
+            );
+            if (run.granted != 1 or run.refused != 1) {
+                std.debug.print("the broker granted {d} and refused {d}\n", .{ run.granted, run.refused });
+                return 5;
+            }
+            if (run.requests != 2 or run.responses != 2) {
+                std.debug.print("the log holds {d} requests and {d} responses\n", .{ run.requests, run.responses });
+                return 5;
+            }
+            if (run.verdict != .intact) {
+                std.debug.print("the log's own chain read back as {s}\n", .{@tagName(run.verdict)});
+                return 5;
+            }
+            if (!run.turn_intact) {
+                std.debug.print("the turn that was already in flight did not come back intact\n", .{});
                 return 5;
             }
             return reportChildTerm(run.term);

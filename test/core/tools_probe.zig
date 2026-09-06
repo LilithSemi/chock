@@ -177,12 +177,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const arena = arena_state.allocator();
 
     const args = try init.args.toSlice(arena);
-    if (args.len != 19) {
+    if (args.len != 20) {
         std.debug.print(
             "usage: tools-probe <tool> <call_id> <root> <cwd> <mounts-blob> <rules-blob> " ++
                 "<sandbox-env-blob> <host-path> <arguments-json> <timeout-ms> <memory-dir> " ++
                 "<store-paths> <cache-dir> <cancel-after-ms> <scratch-dir> <scratch-bytes> " ++
-                "<workspace-dir> <workspace-floor-bytes>\n",
+                "<workspace-dir> <workspace-floor-bytes> <approval-wait-ms>\n",
             .{},
         );
         return 1;
@@ -221,6 +221,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const workspace_floor_bytes: ?u64 = if (args[18].len != 0)
         std.fmt.parseInt(u64, args[18], 10) catch {
             std.debug.print("workspace-floor-bytes did not parse as an integer\n", .{});
+            return 1;
+        }
+    else
+        null;
+    // A fixed value, set once before `dispatchWith` ever runs, and never
+    // touched again: this probe stays single threaded, the same requirement
+    // every other one of these carries, so nothing here bumps it live. See
+    // `chock_core.tools.Context.approval_wait_ns`'s own doc comment for the
+    // caller that would, once one exists.
+    const approval_wait_ms: ?u64 = if (args[19].len != 0)
+        std.fmt.parseInt(u64, args[19], 10) catch {
+            std.debug.print("approval-wait-ms did not parse as an integer\n", .{});
             return 1;
         }
     else
@@ -281,6 +293,11 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     // command line named none, so a probe run that says nothing about the
     // toolchain takes exactly the production default and not a test only
     // value of this file's own.
+    // Lives on this function's own stack for the length of the one
+    // `dispatchWith` call below, which is the only thing that ever reads it:
+    // see `approval_wait_ms`'s own comment on why nothing here bumps it live.
+    var approval_wait_counter: std.atomic.Value(u64) = .init(0);
+
     var context = chock_core.tools.Context{
         .timeout_ns = if (timeout_ms) |ms| ms * std.time.ns_per_ms else chock_core.tools.default_timeout_ns,
         .memory_dir = memory_dir,
@@ -291,6 +308,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
     if (store_paths.len != 0) context.store_paths = store_paths;
     if (workspace_floor_bytes) |bytes| context.workspace_free_floor_bytes = bytes;
+    if (approval_wait_ms) |ms| {
+        approval_wait_counter = .init(ms * std.time.ns_per_ms);
+        context.approval_wait_ns = &approval_wait_counter;
+    }
 
     // The session's own task table, when the command line named a scratchpad.
     // The page allocator, never the arena, for the reason
@@ -337,15 +358,22 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 /// and a header built with `std.fmt.bufPrint` keeps this the same "no
 /// hidden allocation on the standard output path" shape every other probe
 /// in this project uses.
+///
+/// `note_len` and `result.note`, appended after `result.output`, are what
+/// `test/core/tools.zig`'s own timeout test needed nothing but `output` for
+/// and the extended deadline test needs this for: `note` is the one field
+/// `Loop.runTool` keeps out of what the model ever reads, so it is the one
+/// field this wire format did not have to carry before now.
 fn printResult(result: chock_core.tools.ToolResult) void {
-    var header_buffer: [128]u8 = undefined;
+    var header_buffer: [160]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buffer,
-        "is_error={d} truncated={d} len={d}\n",
-        .{ @intFromBool(result.is_error), @intFromBool(result.truncated), result.output.len },
+        "is_error={d} truncated={d} len={d} note_len={d}\n",
+        .{ @intFromBool(result.is_error), @intFromBool(result.truncated), result.output.len, result.note.len },
     ) catch unreachable;
     writeAll(header);
     writeAll(result.output);
+    writeAll(result.note);
 }
 
 fn writeAll(bytes: []const u8) void {
