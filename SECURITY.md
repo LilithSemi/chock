@@ -5,6 +5,10 @@
 Chock is pre-alpha and it has not had an external security review. Do not give
 it access you would not give to a program you are still testing.
 
+See [docs/threat-model.md](docs/threat-model.md) for the adversary Chock is
+built against, one real attack walked end to end, and what the sandbox does
+not cover.
+
 Its own red team suite is written and has been run. `zig build redteam` measures
 a canary set before and after a real session, against a scope list compiled into
 the binary that reports the verdict, in two configurations: the floor, with no
