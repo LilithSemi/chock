@@ -106,9 +106,10 @@ not a broken sandbox.
 The write-and-execute rule in the seccomp filter is hardening, and
 `docs/sandbox.md` and `SECURITY.md`'s own scope list say so directly: a page
 that is both writable and executable is not, by itself, an escape. `chock
-doctor` reports it as `write^execute OFF, it is hardening and not a
-boundary` when a project turns it off for a JIT runtime such as V8, and the
-red team oracle in `test/redteam/scope.zig` is written to agree: a session
+doctor` reports a `write^execute` row in state `OFF`, with a note that this
+project's policy allowed it, when a project turns the rule off for a JIT
+runtime such as V8, and the red team oracle in `test/redteam/scope.zig` is
+written to agree: a session
 that relaxed this rule and did nothing else must never be scored the same as
 a session that broke out. Landlock, the namespaces, and the 30 seccomp calls
 that kill the process outright are boundaries. Their absence, or a kernel that
@@ -138,7 +139,8 @@ has nothing that plays its role on macOS.
 Chock would place under a mount point on Linux instead appears at its own
 real host path on macOS, because there is no `pivot_root` and no ordinary
 user can mount a filesystem to cap it. A file a tool call writes through
-`TMPDIR` or `CHOCK_SCRATCHPAD` survives the call. `chock doctor` names both.
+`TMPDIR` or `CHOCK_SCRATCHPAD` survives the call. `lib/chock-core/scratchpad.zig`
+names both.
 
 **`sysctl-read` is granted by default on macOS, and a program can read the
 host process table through it.** `KERN_PROC_ALL` names every process on the
@@ -161,20 +163,23 @@ read a fresher answer. `lib/chock-core/Loop.zig`'s own `gateToolCall` states
 both limits next to the code.
 
 **As of this milestone, a foreground tool call holds a network descriptor
-whether or not any policy rule grants a host.** `lib/chock-broker/network.zig`
+whether or not any policy rule grants a host.** `lib/chock-core/tools.zig`
 gives every foreground tool call `Network.filtered` unconditionally, so the
 sandboxed process always has the one connected descriptor a filtered process
 uses to ask for a connection, even in a session whose policy table grants no
-host at all. The descriptor being present is not the same as a connection
-being possible: nothing is reachable until a `net.connect.*` rule names a
-host, and an `ask` decision on that rule really does reach a person, through
-the same wait every other mid session approval uses. But the file descriptor
-itself is there from the first foreground call onward, on every project,
-whether or not the project has ever named a host. A background `run_command`
-call and a language server do not get this. A background call is reset to
-`Network.none` before it starts, because nothing today can carry an `ask`
-question out of a task with no turn of the loop waiting on it, and a language
-server gets `Network.none` because nothing it does needs a socket.
+host at all. The descriptor being present does not mean a connection happens
+on its own, but it does not mean a host with no rule stays out of reach
+either. A host no rule names resolves to `ask`, the same as any other
+unnamed action, and that `ask` reaches a person, through the same wait every
+other mid session approval uses. A person who answers yes makes the
+connection happen, so a foreground call on a project with an empty policy
+table can still reach any host at all, one approval at a time. The file
+descriptor itself is there from the first foreground call onward, on every
+project, whether or not the project has ever named a host. A background
+`run_command` call and a language server do not get this. A background call
+is reset to `Network.none` before it starts, because nothing today can carry
+an `ask` question out of a task with no turn of the loop waiting on it, and a
+language server gets `Network.none` because nothing it does needs a socket.
 
 If any of the five points above stop being true, this document is wrong until
 it is corrected. Each one was checked against the code, not carried forward

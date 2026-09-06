@@ -290,7 +290,7 @@ pub const Plan = struct {
             // A step with no identifier cannot be merged and cannot be found
             // again, so it is dropped rather than added as a step nothing can
             // ever change. `Loop` refuses such a call before it reaches the
-            // log; this is the answer for a log written by something else.
+            // log. This is the answer for a log written by something else.
             if (given.id.len == 0) continue;
 
             const status = try dupePlanStatus(allocator, given.status);
@@ -337,7 +337,7 @@ pub const SelfPolicy = struct {
     /// list is what `chock_policy.ratchet.ceilingFor` folds, and a session
     /// that promised nothing folds to `allow`, which is already the answer a
     /// caller wants. `Plan` has an `isEmpty` because `chock plan` asks that
-    /// question of a session it is about to print; nothing asks it here.
+    /// question of a session it is about to print. Nothing asks it here.
     restrictions: std.ArrayList(event.SelfRestriction) = .empty,
 
     /// Merge one `policy.self` in. `allocator` owns every string this keeps,
@@ -377,7 +377,7 @@ pub const SelfPolicy = struct {
         for (update.restrictions) |given| {
             // A restriction that names no action covers no act, so it binds
             // nothing and a reader could never say what was promised.
-            // `chock_core.Loop` refuses one before it reaches the log; this is
+            // `chock_core.Loop` refuses one before it reaches the log. This is
             // the answer for a log written by something else. Dropping it is
             // the same treatment `Plan.apply` gives a step with no identifier.
             if (given.action.len == 0) continue;
@@ -395,8 +395,8 @@ pub const SelfPolicy = struct {
 /// `event.ApprovalDecision.approved_by_user_for_session` for what the decision
 /// itself means.
 ///
-/// **Not `chock_broker.askpass.Grants`.** That one holds a host's password;
-/// this one holds a person's answer to an approval. The two share a name and
+/// **Not `chock_broker.askpass.Grants`.** That one holds a host's password.
+/// This one holds a person's answer to an approval. The two share a name and
 /// nothing else.
 ///
 /// **A memory of an answer, and never a permission of its own.** Nothing here

@@ -131,7 +131,7 @@ test "the filter for a mode is the caller's own, and only a filtered call has co
     // comment on `block_connect`.
     //
     // Mutation check: answer `true` for `.none` and the first line below
-    // fails; answer `false` for `.filtered` and the third fails.
+    // fails. Answer `false` for `.filtered` and the third fails.
     try std.testing.expectEqual(false, seccompOptionsFor(.{}, .none).block_connect);
     try std.testing.expectEqual(false, seccompOptionsFor(.{}, .host).block_connect);
     try std.testing.expectEqual(true, seccompOptionsFor(.{}, .filtered).block_connect);
@@ -242,7 +242,7 @@ test "a caller supplied cgroup is refused below 5.7, and chock's own cgroup is r
 ///
 /// Call this from a single threaded process, the same requirement
 /// `namespace.enter` already carries. `spawn` calls `fork`, and `fork` only
-/// carries the calling thread into the child; any lock another thread of the
+/// carries the calling thread into the child. Any lock another thread of the
 /// parent held at that moment, such as the allocator's own lock or the global
 /// lock `std.debug.print` takes, is copied into the child as still held, with
 /// no thread left in the child that could ever release it. A child stuck on a
@@ -434,7 +434,7 @@ pub fn spawn(
     };
 
     // The setup pipe. Every failure path from here to `execve` writes a
-    // SetupFailureRecord to the write end and ends its own process; a
+    // SetupFailureRecord to the write end and ends its own process. A
     // successful `execve` closes the write end on its own, through CLOEXEC,
     // without writing anything. `spawn` reads the other end below to learn
     // which of the two happened. Both ends start CLOEXEC so a later, unrelated
@@ -463,7 +463,7 @@ pub fn spawn(
     const scratch_write_fd = scratch_pipe[1];
 
     // The broker pair, for a filtered call and for no other. `[0]` stays in
-    // this process and is what the serve loop below reads; `[1]` crosses into
+    // this process and is what the serve loop below reads. `[1]` crosses into
     // the sandbox and becomes the one channel out that the network namespace
     // does not close. Both ends are close-on-exec: `execute` clears the flag
     // on the child's end in the last step before `execve`, so a sandbox that
@@ -547,7 +547,7 @@ pub fn spawn(
         // **A supplied cgroup is never joined here, and the switch says so
         // rather than leaving it to a descriptor that happens to be -1.** This
         // process was created inside that cgroup, so a write would move it
-        // nowhere; and a later reader who added a join to this path would give
+        // nowhere. A later reader who added a join to this path would give
         // a caller the very window the placement exists to close.
         switch (config.containment) {
             .best_effort => joinCgroup(&group, write_fd, config.stderr_fd),
@@ -583,7 +583,7 @@ pub fn spawn(
         // become process 1 of a pid namespace A is not a member of, so A's pid
         // number means nothing inside B's own namespace, and pidfd_open needs a
         // pid number in the caller's own namespace to resolve. A fd, once open,
-        // needs no such resolution; it is just inherited across the fork like any
+        // needs no such resolution. It is just inherited across the fork like any
         // other descriptor. See armPdeathsig for what it is used for.
         const middle_pidfd_rc = linux.pidfd_open(linux.getpid(), 0);
         if (linux.errno(middle_pidfd_rc) != .SUCCESS) {
@@ -620,7 +620,7 @@ pub fn spawn(
             unreachable;
         }
 
-        // A no longer needs the pidfd once B has it; B's own copy, inherited
+        // A no longer needs the pidfd once B has it. B's own copy, inherited
         // across the fork above, is untouched by closing this one.
         _ = linux.close(middle_pidfd);
 
@@ -767,7 +767,7 @@ pub fn spawn(
 
     if (maybe_failure) |record| {
         _ = linux.close(scratch_read_fd);
-        // A setup failure. Reap A regardless of whatever it exited with; the
+        // A setup failure. Reap A regardless of whatever it exited with. The
         // record above is the only outcome that matters here, never A's own
         // exit code, which this process must never read as meaningful again.
         var reap_status: u32 = undefined;
@@ -779,7 +779,7 @@ pub fn spawn(
         // What buildRoot made on the host under config.root is nothing but
         // scratch nobody asked to keep: the caller's program never ran, so
         // nothing in it is real output. This is the only place spawn ever
-        // removes it; a real program's own output, once execve has happened,
+        // removes it. A real program's own output, once execve has happened,
         // is never ours to delete, no matter what that program's exit code is.
         //
         // The contents only, never config.root itself. **config.root belongs
@@ -962,7 +962,7 @@ fn serveBroker(pid: linux.pid_t, broker_fd: i32, broker: iface.NetBroker) SpawnE
         // **The request is read first, and A's death second.** A program that
         // asked and then exited has its request already in the pair, and the
         // kernel reports both descriptors on the same look. Reading the
-        // request first costs one answer nobody collects; reading the death
+        // request first costs one answer nobody collects. Reading the death
         // first would lose a request that was really made.
         if (fds[0].revents & linux.POLL.IN != 0) {
             switch (netbroker.serveOne(broker_fd, broker)) {
@@ -1218,7 +1218,7 @@ fn readSetupReport(read_fd: i32) SpawnError!?SetupFailureRecord {
     }
     if (filled == 0) return null;
     // A short record is never trusted as a different, smaller failure. Only a
-    // full, exact-size record is ever read as one; anything else is unreadable
+    // full, exact-size record is ever read as one. Anything else is unreadable
     // and reported as such rather than guessed at.
     if (filled != buffer.len) return error.UntrustedSetupReport;
 
@@ -1268,8 +1268,8 @@ fn setupErrorFor(step: SetupStep) SetupError {
 /// Remove everything `buildRoot` made on the host under `root`, best effort,
 /// and leave `root` itself, empty, exactly as the caller handed it over.
 ///
-/// **The directory is the caller's and outlives one spawn; its contents are
-/// this library's own scratch.** See the call site in `spawn` for what a
+/// **The directory is the caller's and outlives one spawn.** Its contents are
+/// this library's own scratch. See the call site in `spawn` for what a
 /// removed root did to the session that owned it.
 ///
 /// The mounts inside it are already gone by the time this runs: they lived in
@@ -1317,7 +1317,7 @@ const RemoveTreeFrame = struct {
     /// other frame's directory is removed by this walk, through `parent_fd`
     /// and `name`, once its own `getdents64` reads run dry.
     parent_fd: i32 = -1,
-    // NAME_MAX on Linux is 255 bytes; +1 leaves room for the null the code
+    // NAME_MAX on Linux is 255 bytes. +1 leaves room for the null the code
     // below always writes, so `nameZ` can hand back a sentinel-terminated
     // slice with no extra copy.
     name: [256]u8 = undefined,
@@ -1335,7 +1335,7 @@ const RemoveTreeFrame = struct {
 /// calls relative to open descriptors rather than building an absolute path
 /// for every entry. A deep enough tree makes an absolute path exceed
 /// `PATH_MAX`, and a build that stops there with ENAMETOOLONG leaves every
-/// directory below that point unreachable and leaked; a descriptor relative
+/// directory below that point unreachable and leaked. A descriptor relative
 /// walk has no such limit tied to depth.
 ///
 /// The walk itself is an explicit stack on `allocator`, not native recursion:
@@ -1343,7 +1343,7 @@ const RemoveTreeFrame = struct {
 /// the call stack at every level, and the design review's own 4098 level tree
 /// is already enough to overrun a default 8 MiB stack that way, trading one
 /// crash for another. A heap allocated stack has no such bound tied to
-/// process stack size; only `OutOfMemory` or the descriptor limit can stop it,
+/// process stack size. Only `OutOfMemory` or the descriptor limit can stop it,
 /// and both already degrade gracefully below, the same as every other fault
 /// in this best effort walk. Takes ownership of `root_fd` and closes it, and
 /// every descriptor this walk opens under it, before returning.
@@ -1476,14 +1476,14 @@ fn printFault(stderr_fd: i32, err: anyerror) void {
 ///
 /// **Why this gets a sentence and `printFault`'s other callers do not.**
 /// Every other fault `dieNamespace` and its neighbours report is a kernel
-/// refusing this process something; the bare name plus an errno is already
+/// refusing this process something. The bare name plus an errno is already
 /// the diagnosis, because the fix is "give this process the privilege" or
 /// "use a newer kernel", not something in a person's own project. This one
 /// is different: it fires only because of a line the project itself wrote in
 /// its own `chock.zon`, so a bare error name sends a person to search for a
 /// Zig identifier instead of their own file. The reasoning for why a symlink
 /// is refused rather than followed lives in `namespace.zig`'s own doc comment
-/// on `DenyTargetIsSymlink`, and in the threat model; this sentence carries
+/// on `DenyTargetIsSymlink`, and in the threat model. This sentence carries
 /// only what to change.
 ///
 /// **It does not, and cannot yet, name the entry.** `namespace.Diagnostic`
@@ -1509,7 +1509,7 @@ fn printDenyTargetSymlinkFault(stderr_fd: i32) void {
 /// agent's own checkout, and nothing stops that checkout holding a symlink
 /// in its place. The reasoning for why a symlink is refused rather than
 /// followed lives in `namespace.zig`'s own doc comment on
-/// `BindSourceIsSymlink`, and in the threat model; this sentence carries
+/// `BindSourceIsSymlink`, and in the threat model. This sentence carries
 /// only what to change.
 fn printBindSourceSymlinkFault(stderr_fd: i32) void {
     writeStderr(
@@ -1578,7 +1578,7 @@ fn die(write_fd: i32, stderr_fd: i32, step: SetupStep, err: anyerror) noreturn {
 /// mount fault used to answer `error.Unexpected` over the pipe and put the one
 /// fact that identifies it on the terminal of a sandboxed child, where a caller
 /// that is not a terminal never saw it. `SetupFailureRecord` always had the
-/// field for this; it was written as zero because nothing carried the value
+/// field for this. It was written as zero because nothing carried the value
 /// this far.
 ///
 /// **The namespace step was missed when that was fixed.** It kept calling
@@ -1693,7 +1693,7 @@ fn dieErrno(
 /// spawn as a setup failure, and there must not be one: the caller's own
 /// program has already started running by the time `waitAndRelay` runs, so
 /// nothing from here on may ever look like a setup failure to spawn. This
-/// exists only so the fault is not silent; the exit code it uses is not read
+/// exists only so the fault is not silent. The exit code it uses is not read
 /// by spawn as meaning anything.
 ///
 /// **Descriptor 2, and never `config.stderr_fd`.** This runs in A, after A has
@@ -1720,7 +1720,7 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
 /// This process, the intermediate between the real parent and the sandboxed
 /// program, is an ordinary process in its own right pid namespace, not process 1
 /// anywhere. Process 1 of a pid namespace does not get the default action for an
-/// unhandled signal, so it does not die from a plain SIGTERM; that immunity does
+/// unhandled signal, so it does not die from a plain SIGTERM. That immunity does
 /// not apply here, and raising the same signal on this process ends it the
 /// normal way. That is what makes the relay possible: the real parent's own
 /// waitpid, further up the call stack, reads this process's own death as the
@@ -1929,7 +1929,7 @@ fn printMiddleFault(err: anyerror, diag: ?landlock.Diagnostic) void {
 /// filter can never be removed, so calling this after the filter goes on
 /// would only ever fail. It is public so a test can call it directly,
 /// outside a full `spawn`, and prove the fresh keyring really is empty. A
-/// real caller never calls this itself; `applyLayers` already does, in the
+/// real caller never calls this itself. `applyLayers` already does, in the
 /// one place order matters.
 ///
 /// `stderr_fd` is where the errno goes, and it is a parameter for the reason
@@ -2065,7 +2065,7 @@ fn newProcessGroup(write_fd: i32, stderr_fd: i32) void {
 /// from /dev/null and returns control to Chock instead of hanging on a read
 /// nobody can ever answer. And if descriptor 0 was the caller's controlling
 /// terminal, `ioctl(0, TIOCSTI)` can push characters straight into that
-/// terminal's own input queue; no Landlock rule covers a descriptor that was
+/// terminal's own input queue. No Landlock rule covers a descriptor that was
 /// already open before the sandbox existed, so replacing the descriptor is
 /// the only fix. Standard output and standard error are left untouched: a
 /// caller needs the program's real output.
@@ -2173,7 +2173,7 @@ fn closeInheritedFds(
         while (offset < nread) {
             const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
             // `name` is a flexible array member. `@offsetOf` gives its true
-            // position; `@sizeOf` would include tail padding the layout does
+            // position. `@sizeOf` would include tail padding the layout does
             // not actually carry between entries.
             const name_offset = offset + @offsetOf(linux.dirent64, "name");
             const name_ptr: [*:0]const u8 = @ptrCast(&buffer[name_offset]);
@@ -2225,7 +2225,7 @@ fn closeInheritedFds(
 /// `getppid` cannot reveal that A is already gone. This process is about to
 /// become process 1 of a pid namespace A is not a member of, and a pid
 /// namespace only shows processes that are members of it or one of its
-/// descendants; A predates this namespace and belongs to neither, so A has no
+/// descendants. A predates this namespace and belongs to neither, so A has no
 /// pid number in here at all, whether A is alive or dead. `getppid` reads 0
 /// unconditionally, before this call and after it, in both cases, which is
 /// exactly why this function does not call it. `middle_pidfd`, opened by A on
@@ -2251,7 +2251,7 @@ fn armPdeathsig(write_fd: i32, stderr_fd: i32, middle_pidfd: i32) void {
         // A was already gone before the prctl call above could register, so the
         // kernel never had a live target to deliver PDEATHSIG to. End this
         // process the same way PDEATHSIG would have: SIGKILL on itself. This is
-        // not a setup failure to report over the pipe; it is the same outcome a
+        // not a setup failure to report over the pipe. It is the same outcome a
         // caller that signals A is meant to see, just reached by a different
         // path.
         std.posix.raise(std.posix.SIG.KILL) catch {};
@@ -2312,9 +2312,9 @@ fn execute(
     // of these limits would refuse the setup path itself if they went on
     // earlier: `RLIMIT_DATA` bounds the mapped anonymous memory this process
     // inherited from the harness across two forks, and every allocation above
-    // is still in front of it; `RLIMIT_NOFILE` has to come after Landlock and
-    // the mount tree, which each open a descriptor per rule and per target;
-    // and `RLIMIT_CPU` should count the caller's program rather than the
+    // is still in front of it. `RLIMIT_NOFILE` has to come after Landlock and
+    // the mount tree, which each open a descriptor per rule and per target.
+    // `RLIMIT_CPU` should count the caller's program rather than the
     // sandbox coming up. See `rlimits.apply`'s own doc comment, which states
     // the same three as its contract.
     //
@@ -2746,7 +2746,7 @@ test "a filtered config with nobody to ask is refused, and refused before anythi
 
     // And the other way round: a broker on a config that is not filtered has
     // no socket to be asked anything on, so the field would read as a
-    // permission that is never used. A refusal says so; silence would not.
+    // permission that is never used. A refusal says so. Silence would not.
     const Never = struct {
         fn connect(ptr: *anyopaque, host: []const u8, port: u16) iface.NetBroker.Grant {
             _ = ptr;
@@ -3072,7 +3072,7 @@ test "a handle answers Gone once the process it names has been reaped" {
     // there is nothing left for it to name, which is the `Gone` below.
     //
     // Mutation check: map SRCH to success in `signalMiddle` and a caller
-    // believes it cancelled a call it did not; drop the `fd < 0` guard and a
+    // believes it cancelled a call it did not. Drop the `fd < 0` guard and a
     // handle nobody opened turns into a syscall on descriptor -1.
     const fork_rc = linux.fork();
     try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));

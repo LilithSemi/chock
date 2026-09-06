@@ -53,8 +53,8 @@ fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
 }
 
 /// Scratch space for one probe run, on the host side of whatever sandbox root
-/// the probe builds inside it. The test owns this directory and its cleanup;
-/// the probe only ever uses the path it is handed, on the command line, and
+/// the probe builds inside it. The test owns this directory and its cleanup.
+/// The probe only ever uses the path it is handed, on the command line, and
 /// never picks a location of its own.
 const ScratchRoot = struct {
     tmp: std.testing.TmpDir,
@@ -853,19 +853,22 @@ test "a permitted name that resolves onto this machine reaches nothing" {
 // and `AskArbiter`, which build a real session log and a real, in process
 // arbiter and drive the whole thing through a real `Sandbox.spawn`. Every
 // assertion of substance runs inside the probe itself, because the log this
-// reentrant call writes to lives only in that process; this file only reads
+// reentrant call writes to lives only in that process. This file only reads
 // the one number a process boundary can still carry, its exit code.
 //
 // **What this proves, and what it does not.** These five tests prove the
 // log, lock and turn mechanics with an in process stand in arbiter
 // (`AskArbiter`), not the production socket waiter
-// (`lib/chock-broker/socket.zig`), because nothing shipped reaches that
-// configuration yet: `Network.asker` is `null` for every real caller today,
-// and the one caller that does build a filtered `Network`, the MCP server
-// path in `src/run.zig`, never goes through `lib/chock-core/tools.zig`'s own
-// deadline machinery at all. A reader who sees five passing reentrancy tests
-// here should not conclude the production socket path through this same
-// nesting is proved. It is not, yet.
+// (`lib/chock-broker/socket.zig`). `Network.asker` is no longer null for
+// every real caller: `src/run.zig`'s own `ToolNetwork.giveFn` now wires a
+// real one, over the same `Approvers` and the same production socket
+// waiter, for every foreground tool call. The MCP server path in
+// `src/run.zig` still builds a filtered `Network` with `asker` left null,
+// and it still never goes through `lib/chock-core/tools.zig`'s own
+// deadline machinery. A reader who sees five passing reentrancy tests here
+// should still not conclude the production socket path through this same
+// nesting is proved: these tests exercise `AskArbiter`, not the real
+// waiter, and no test here calls `src/run.zig`'s own wiring at all.
 
 test "a question asked from inside a running tool call reaches the log, in order, and the turn survives" {
     // The plainest case: the table says `ask`, an arbiter played entirely in
@@ -1053,9 +1056,9 @@ test "a setup failure still reaches spawn when the descriptor the caller named c
 test "the global files of /proc that describe the host read empty" {
     // Measured on 2026-08-21, before this mask existed: /proc/cmdline gave
     // "lsm=landlock,yama,bpf", the system store path and the host name, which
-    // hands a reader the list of enforcement mechanisms to work around;
-    // /proc/version gave the kernel version; /proc/kallsyms gave every symbol
-    // name; /proc/config.gz gave the kernel configuration.
+    // hands a reader the list of enforcement mechanisms to work around.
+    // /proc/version gave the kernel version. /proc/kallsyms gave every symbol
+    // name. /proc/config.gz gave the kernel configuration.
     //
     // **This is a reduced surface and not a boundary.** See
     // `namespace.masked_proc_entries`: it is a list of names, and the next
@@ -1166,7 +1169,7 @@ test "the session keyring join gives the sandbox a keyring the host cannot see i
 test "the sandboxed process sees a fresh process id space, not the host's" {
     // The grandchild Sandbox.spawn runs the caller's program in is the first process
     // the kernel ever creates in the new namespace, so it is pid 1 there. A host pid
-    // is never that small; this very test process is already a much larger number by
+    // is never that small. This very test process is already a much larger number by
     // the time the suite reaches this line. Pid 1 outside a container is normally
     // init, a process this test must never be able to name or affect, so a small
     // number here is a fresh space, not a lucky host pid.
@@ -1252,7 +1255,7 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
 
     // Wait, bounded, for the sandboxed program's loop to actually start
     // growing the file, so the signal below cannot land before there is
-    // anything running to kill. Two seconds is generous; this must never spin
+    // anything running to kill. Two seconds is generous. This must never spin
     // forever if something is badly broken and the file never appears.
     var waited_ns: u64 = 0;
     var size_before_signal: u64 = 0;
@@ -1313,7 +1316,7 @@ test "a cancelled call takes the processes it started with it, not only the one 
     // That would be a leak if it stopped there. It does not, and two
     // mechanisms are why: the sandboxed program's own `PR_SET_PDEATHSIG` fires
     // when the signalled process dies, and the kernel then kills every other
-    // process in the pid namespace whose process 1 has just died; and
+    // process in the pid namespace whose process 1 has just died.
     // `Cgroup.destroy` writes `cgroup.kill` on the way out of `spawn`. See
     // `Sandbox.spawn`'s own doc comment, which records both and says why
     // neither is decoration.
@@ -1326,7 +1329,7 @@ test "a cancelled call takes the processes it started with it, not only the one 
     // **This test pins the outcome and not one mechanism**, which is the
     // honest reading of the mutation check made on 2026-08-22: disarm
     // `armPdeathsig` alone and this still passes, because the cgroup kill
-    // reaches the grandchild; drop the `cgroup.kill` write alone and it still
+    // reaches the grandchild. Drop the `cgroup.kill` write alone and it still
     // passes, because the pdeathsig chain does. Take both away and this test
     // and "Finding 2" above both fail on a heartbeat that went on growing,
     // which is the leak they exist to catch.
@@ -1449,7 +1452,7 @@ test "a process cannot signal its caller's process group, which a pid namespace 
     // The probe puts itself in a process group of its own first, so this test
     // can never take the test runner down with it, and catches SIGUSR1 so that
     // it survives to report. Exit 0 means the signal reached nothing outside
-    // the sandbox; exit 1 means it reached the caller.
+    // the sandbox. Exit 1 means it reached the caller.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-signal-group", scratch.path());

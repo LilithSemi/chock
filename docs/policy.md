@@ -68,9 +68,26 @@ Two rules can reach the same score and still both match. The more restrictive
 decision then wins, so the answer never depends on the order the rules have in
 the file.
 
-**An action no rule names answers `ask`.** A project with no `chock.zon` at
-all therefore answers `ask` for every key, and a session with nobody at the
-keyboard is refused everything.
+**An action no rule names, and no shipped default names either, answers
+`ask`.** A session with nobody at the keyboard is refused there.
+
+**Chock ships default rules for the ordinary tool calls, so a project with no
+`chock.zon` at all still runs them without a prompt.** Reading a file, listing
+a directory, a glob, a grep, writing a file, editing a file, the workspace and
+toolchain paths a `run_command` call may execute, and the guidance and memory
+tools, all answer `allow` out of the box. A shipped default is a lower class
+of rule than anything in `chock.zon`: it is read only when a project's own
+rules name nothing that matches the key at all. **A project rule that matches
+wins outright**, whatever it names and however wide it is next to a default,
+because the entire reason a default exists is to answer for a key the project
+did not. Writing `.{ .action = "call.write_file", .decision = .ask }` in your
+own `chock.zon` puts that call back behind a prompt, even though a shipped
+default would otherwise let it through.
+
+`net.connect.*` and `net.fetch.*` hold no shipped default, on purpose: a
+project that named nothing about a host still meets `ask` there, never
+`allow`. See [threat-model.md](threat-model.md) for what an `ask` on
+`net.connect.*` can now reach.
 
 ## The actions
 

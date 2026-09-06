@@ -8,14 +8,25 @@ more, `policy.widen`, which is a session asking to be let out of a promise it
 made to itself. What each one is allowed, denied or asked is the policy table
 in `chock.zon`. See [policy.md](policy.md).
 
-**Two of them really put a question to a person in this release, and no more.**
-`workspace.apply` is asked at the end of a session, and again during one when
-the agent asks for it with `request_action`. `policy.widen` is asked during one.
-`net.fetch`, `nix.build` and `model.select` are each read before the work they
-govern, at a moment when nobody is waiting to answer, so `ask` is a refusal for
-all three. `git.commit`, `git.push`, `git.branch.delete` and `file.write` are
-rows the table can answer and nothing in a session asks them yet. See
-[status.md](status.md).
+**Two of these nine really put a question to a person in this release, and no
+more.** `workspace.apply` is asked at the end of a session, and again during
+one when the agent asks for it with `request_action`. `policy.widen` is asked
+during one. `net.fetch`, `nix.build` and `model.select` are each read before
+the work they govern, at a moment when nobody is waiting to answer, so `ask`
+is a refusal for all three. `git.commit`, `git.push`, `git.branch.delete` and
+`file.write` are rows the table can answer and nothing in a session asks them
+yet. See [status.md](status.md).
+
+**A tool call is a different question, and it is gated too.** `gateToolCall`
+asks the same arbiter about every ordinary tool call now, so a project rule of
+`ask` on `call.write_file`, `exec.*`, or any other action `Tool.actionInto`
+names reaches a person mid session, not only `workspace.apply` and
+`policy.widen`. See [policy.md](policy.md) for the actions a tool call itself
+can name. A filtered tool call's own `net.connect.*` question reaches the same
+person too: a host no rule names answers `ask`, and that `ask` is a live
+question, not the refusal `net.fetch` still is. See
+[threat-model.md](threat-model.md) for the network descriptor every foreground
+tool call now holds, whether or not any host has been named.
 
 ## The one every project meets
 
@@ -36,13 +47,17 @@ chock: this needs your approval before it can happen.
 
   a1b2c3 add a test for the parser
 
-Allow this? [y/N]
+Allow this once, or for the rest of the session? [y/N/s]
 ```
 
-Only `y` or `yes`, in any case, is a yes. Anything else, a bare Enter included,
-is a no, and a no leaves your repository exactly as it was. The work is still
-in the session's workspace either way, and the line printed after a refusal
-says where.
+`y` or `yes`, in any case, answers yes for this apply alone. `s` or `session`
+answers yes and remembers this exact action for the rest of the session, so a
+later `workspace.apply` in the same session does not ask again. Anything
+else, a bare Enter included, is a no, and a no leaves your repository exactly
+as it was. The work is still in the session's workspace either way, and the
+line printed after a refusal says where. `chock approve`, answering over a
+socket instead of a keyboard, is never offered the session letter: only the
+terminal that holds the session's own lock can keep that promise.
 
 Ctrl-C at the prompt ends the run with the question unanswered, which is a
 refusal, and keeps the workspace.

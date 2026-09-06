@@ -20,7 +20,11 @@ pub const Network = enum {
     /// **Nothing can be reached.** Its own network namespace, with no route out
     /// and no descriptor to ask on.
     ///
-    /// This is the default. A tool call gets this.
+    /// This is `Sandbox.Config.network`'s own zero value, and it is no longer
+    /// what a foreground tool call gets. See `lib/chock-core/tools.zig`'s
+    /// `Context.net`, which moves every foreground call to `filtered` instead.
+    /// A background `run_command` call, a language server, and an MCP server a
+    /// policy has not let out still get this.
     none,
     /// **Only the hosts a policy names can be reached, one connection at a
     /// time.** Its own network namespace, and a unix socket to the parent. The
@@ -38,8 +42,8 @@ pub const Network = enum {
     /// read it as one.** Measured on 2026-08-24, in this tree: making this the
     /// default of `Sandbox.Config.network` failed 69 tests. `spawn` refuses a
     /// `filtered` config that names no broker with `error.NetBrokerMissing`,
-    /// before it forks, so every caller that omits one stops running at all;
-    /// and the filter below takes `connect` away, which is a second, separate
+    /// before it forks, so every caller that omits one stops running at all.
+    /// The filter below takes `connect` away, which is a second, separate
     /// change. See `Sandbox.Config.net_broker`.
     ///
     /// It is also **stricter than `none` on system calls**, not looser: the
@@ -208,7 +212,7 @@ pub const Availability = union(enum) {
     /// The probe itself could not run to an answer.
     unknown: Unknown,
 
-    /// Why no answer came back. Never a reason the kernel gave; every one of
+    /// Why no answer came back. Never a reason the kernel gave. Every one of
     /// these is the probe's own machinery.
     pub const Unknown = enum {
         /// The pipe the child answers on could not be made.
@@ -252,7 +256,7 @@ pub const Availability = union(enum) {
 ///
 /// **It is not a pass and not a failure.** Every helper program in this
 /// project's own suite already reports what it measured through its exit
-/// status, and each one has a scheme of its own; this number is the one value
+/// status, and each one has a scheme of its own. This number is the one value
 /// they all share, so a suite can tell "the boundary held" from "the boundary
 /// was never reached" without reading text. The caller that reads it must skip
 /// and say why, and must never count it as a boundary that held.
@@ -499,8 +503,8 @@ test "a diagnostic names the call and the errno, and allocates nothing" {
     }
 }
 
-/// One entry in the sandbox's own mount tree. Every entry describes a mount;
-/// none of them perform one. `buildRoot` is the only place that ever calls
+/// One entry in the sandbox's own mount tree. Every entry describes a mount.
+/// None of them perform one. `buildRoot` is the only place that ever calls
 /// `mount(2)`, so a caller can build a full mount list, including an overlay
 /// entry, from an ordinary, unprivileged process, and hand it to
 /// `Sandbox.spawn` without ever entering a namespace itself.
@@ -1147,7 +1151,7 @@ fn openDenyDirComponent(dir_fd: i32, component: [*:0]const u8, diag: ?*?Diagnost
 /// **`O_PATH` changes what `O_NOFOLLOW` means at the last component.** With
 /// `O_PATH` alone, `open` on a symlink leaf does not fail with `ELOOP`: it
 /// succeeds, and hands back a descriptor on the link itself, never on
-/// whatever it points to. So the open below cannot be the refusal; the
+/// whatever it points to. So the open below cannot be the refusal. The
 /// `statx` after it is. `AT_EMPTY_PATH` reads the descriptor's own target,
 /// not a fresh lookup of `component`, which is the same "no second name"
 /// property the open itself is for.
@@ -1350,7 +1354,7 @@ fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSo
     // With `O_PATH` alone, `open` on a symlink leaf does not fail with
     // `ELOOP`: it succeeds, and hands back a descriptor on the link itself,
     // never on whatever it points to. So the open above cannot be the
-    // refusal; this `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
+    // refusal. This `statx` is. `AT_EMPTY_PATH` reads the descriptor's own
     // target, not a fresh lookup of `source`, which is the same "no second
     // name" property the open itself is for.
     var stat_buf: linux.Statx = undefined;
@@ -1414,8 +1418,8 @@ fn buildProcMount(allocator: std.mem.Allocator, root: []const u8, p: Mount.Proc,
 ///
 /// **Measured, and this is what a red team session read out of `/proc` on
 /// 2026-08-21**: `cmdline` gave `lsm=landlock,yama,bpf`, the NixOS system
-/// store path and the host name; `version` gave the kernel version and the
-/// compiler that built it; `kallsyms` gave every symbol name; `config.gz`
+/// store path and the host name. `version` gave the kernel version and the
+/// compiler that built it. `kallsyms` gave every symbol name. `config.gz`
 /// gave the kernel configuration. The `lsm=` line is the one that matters,
 /// because it hands a reader the exact list of enforcement mechanisms to
 /// work around. The value of masking is that the sandbox stops describing
@@ -1588,7 +1592,7 @@ fn buildOverlayMount(allocator: std.mem.Allocator, root: []const u8, o: Mount.Ov
 /// Mount an overlayfs merging `o.lower` (read only) and `o.upper` (read
 /// write) at `o.target`, with `o.work` as overlayfs's own scratch directory.
 /// `o.target` must already exist as a directory: `buildOverlayMount` makes it
-/// first, under a sandbox root; `test/workspace/overlay_helper.zig` calls
+/// first, under a sandbox root. `test/workspace/overlay_helper.zig` calls
 /// this directly, with a target it made itself, to get a real overlay mount
 /// outside any sandbox root at all, the same way it needs one to test
 /// `lib/chock-workspace/overlay.zig`'s own upper layer diff.
@@ -1621,7 +1625,7 @@ pub fn mountOverlay(allocator: std.mem.Allocator, o: Mount.Overlay, diag: ?*?Dia
         // by hand. NOSYS is kept too, in case a future kernel ever uses it.
         .PERM, .NODEV, .NOSYS => return error.OverlayNotSupported,
         // A component of lower, upper, or work could not be read by this
-        // process. The overlay filesystem itself is available; only one of
+        // process. The overlay filesystem itself is available. Only one of
         // the paths is not.
         .ACCES => return error.NotPermitted,
         else => |err| {
@@ -1990,7 +1994,7 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
         },
     }
 
-    // Best effort only. The mount point is already gone; failing to remove the now
+    // Best effort only. The mount point is already gone. Failing to remove the now
     // empty directory does not leave any path back to the host.
     _ = linux.rmdir("/.old_root");
 }

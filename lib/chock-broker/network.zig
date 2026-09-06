@@ -307,7 +307,7 @@ pub const Transport = struct {
 
 /// True when a connection may be opened to `address` at all.
 ///
-/// **This is not a host policy.** The host policy already said yes; this is
+/// **This is not a host policy.** The host policy already said yes. This is
 /// the answer to a different question, which is whether the name it said yes
 /// to resolved to something on the network or to this machine. Whoever runs
 /// the permitted zone decides what the name answers, so a rule about a host on
@@ -604,7 +604,7 @@ pub const Network = struct {
         // always runs in the process that called `Sandbox.spawn`, on the
         // branch that runs *after* that process's own `fork()` has already
         // returned control to it. POSIX restricts only the child between
-        // `fork` and `execve`; the parent is unrestricted the moment `fork`
+        // `fork` and `execve`. The parent is unrestricted the moment `fork`
         // returns, and stays the same process it always was, so there is no
         // production hazard in reading a real clock through a real `Io` from
         // inside `serveBroker`. `src/run.zig`'s own tool call wiring gives
@@ -620,7 +620,7 @@ pub const Network = struct {
         // nothing outside `src/run.zig` builds one, so the two facts always
         // travel together. Gating on the counter is therefore not a
         // workaround keyed on a condition that happens to be false in a test
-        // and true in production; it is the same fact, stated once, that
+        // and true in production. It is the same fact, stated once, that
         // decides whether `self.io` is real.
         //
         // **Measured on 2026-09-05**: a version of this function that read
@@ -773,7 +773,7 @@ pub const System = struct {
         defer future.cancel(io) catch {};
 
         // The first address, and nothing after it. A name with several
-        // addresses is ordinary; every one of them is the same host as far as
+        // addresses is ordinary. Every one of them is the same host as far as
         // this file is concerned, and taking the first is what a connect
         // would have done anyway.
         var found: ?Transport.Address = null;
@@ -1069,7 +1069,7 @@ test "only allow permits, and every other decision is a refusal" {
     // call that is already running, and the loop that would ask is holding the
     // log's own lock and waiting for that call. So `ask` is a refusal here,
     // and so is `agent_review`, which needs a reviewer this has no way to
-    // start. Both are narrowings and both are safe; what would not be safe is
+    // start. Both are narrowings and both are safe. What would not be safe is
     // reading either one as permission.
     const gpa = testing.allocator;
 
@@ -1109,7 +1109,7 @@ test "only allow permits, and every other decision is a refusal" {
 
 test "a subagent cannot reach a host its parent could not" {
     // The intersection, on the one question this file answers. The child kind
-    // is permitted the host outright; the parent kind is not. `evaluateChain`
+    // is permitted the host outright. The parent kind is not. `evaluateChain`
     // takes the intersection over the whole chain, so the child's own rule
     // never applies on its own.
     //
@@ -1333,7 +1333,7 @@ test "a port is part of the key, so a rule about one port is not a rule about ev
 
 // ## A connection can now ask, through a real `Broker`
 //
-// Everything above this line builds no `Asker` and reaches no `Broker`; every
+// Everything above this line builds no `Asker` and reaches no `Broker`. Every
 // test above still passes unchanged, which is the proof that a `Network`
 // nobody wires an `Asker` into behaves exactly as it always has. The tests
 // below build a real `chock_broker.Broker` over a real, in-memory
@@ -1706,7 +1706,7 @@ test "a session's own promise narrows an allow the table gives on its own, so an
     // a decision the table already answered `allow` about.
     //
     // Mutation check: drop the `ratchet.narrow` call this test exists to add
-    // to `answer` and this test is the one that catches it; every test above
+    // to `answer` and this test is the one that catches it. Every test above
     // it still passes, because none of them ever sets `self_policy`.
     const gpa = testing.allocator;
     var bench = try Bench.init(gpa, allow_anthropic, &.{
@@ -1748,7 +1748,7 @@ test "a session's own promise narrows an ask the table gives, with nobody asked 
 
 test "askPermits carries this session's own promise into the broker's own decision, so a person is never asked" {
     // **Measured on 2026-09-05**: with this promise and this table, passing
-    // `self_policy` through decides `deny`; leaving it out, which is what
+    // `self_policy` through decides `deny`. Leaving it out, which is what
     // `askPermits` did before this test, decides `ask`, and a person could
     // then say yes to a connection the model had already promised away.
     //
@@ -1789,7 +1789,7 @@ test "askPermits writes the real tool call id, not an empty one, into the reques
     // rather than a pass: see `test/redteam/oracle.zig`'s `noteLogGaps`.
     //
     // Mutation check: put `""` back for `.tool_call_id` in `askPermits` and
-    // this test is the one that fails; every test above it still passes,
+    // this test is the one that fails. Every test above it still passes,
     // because none of them ever reads the written request back.
     const gpa = testing.allocator;
     const io = testing.io;

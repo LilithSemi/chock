@@ -230,7 +230,7 @@ pub const SandboxToolRunner = struct {
 /// `ToolRunner` to grow a parameter that only one of them reads.
 ///
 /// **This is not a second owner of the log.** The pointer this hands out is
-/// the very one `run` already holds; nothing here opens the log again or
+/// the very one `run` already holds. Nothing here opens the log again or
 /// locks it a second time, and the caller that stores this pointer must
 /// never call `unlock` on it. See `arbiter_mod.Locked`'s own top comment for
 /// why the type has to be reached this way.
@@ -580,7 +580,7 @@ pub const Deps = struct {
     ///
     /// **A function and not a flag, because the caller owns how it is set.**
     /// `src/interrupt.zig` sets its own flag from a signal handler and passes
-    /// `requested` here; a client with a cancel button would pass something
+    /// `requested` here. A client with a cancel button would pass something
     /// else. Neither shape reaches this file.
     ///
     /// **It must be safe to call from anywhere and must not fail.** It is read
@@ -721,7 +721,7 @@ pub const Deps = struct {
     /// writes to a device.
     ///
     /// **This is not the arbiter and must never become it.** An arbiter decides
-    /// whether an act may happen; this asks a person for a fact and grants
+    /// whether an act may happen. This asks a person for a fact and grants
     /// nothing whatever they type. Read `ask.zig`'s own top comment before
     /// joining the two.
     ///
@@ -734,7 +734,7 @@ pub const Deps = struct {
     /// `lib/chock-core/handback.zig`.
     ///
     /// **A seam for the reason `arbiter` is one, and it is not the arbiter.**
-    /// An arbiter decides and stops there; this one asks the broker to decide
+    /// An arbiter decides and stops there. This one asks the broker to decide
     /// and then carries the act out, which is why it is a second seam and not a
     /// second call on the first.
     ///
@@ -796,7 +796,7 @@ pub const Error =
 /// First folds whatever `deps.storage` already holds, the same replay a resume
 /// or a `/daemonize` handover would do. A caller that wants the very first turn
 /// to answer a prompt appends that prompt as a `message` event, with its own
-/// lock/append/unlock, before calling `run`; `run` itself starts from whatever
+/// lock/append/unlock, before calling `run`. `run` itself starts from whatever
 /// is already there, nothing more.
 ///
 /// Appends `session.start` only when the fold found none already, so
@@ -913,7 +913,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
 /// difference is not a preference. `subagent.Table.deinit` has to wait in any
 /// case, because a child writes into a session directory below this session's
 /// own scratchpad, which the caller is about to remove, so the wait happens
-/// either way; doing it here is what stops the parent's log losing the answer.
+/// either way. Doing it here is what stops the parent's log losing the answer.
 /// Then every `session.spawn` in the log has an `agent.complete` after it,
 /// which is a property a replay can rely on. A background command has no such
 /// forced wait and no log of its own, and a session that is over must not sit
@@ -2961,7 +2961,7 @@ pub const restrict_tool_name = @tagName(tools.Tool.restrict_self);
 /// Answer a `restrict_self` call, in place of the tool runner.
 ///
 /// **Narrowing is free, and widening needs authorisation.**
-/// `lib/chock-policy/ratchet.zig` holds the rule and the reasoning; this is the
+/// `lib/chock-policy/ratchet.zig` holds the rule and the reasoning. This is the
 /// caller.
 ///
 /// **A promise is an event in the session log, and a tool runner has no log.**
@@ -3476,7 +3476,7 @@ pub const title_tool_name = @tagName(tools.Tool.set_title);
 /// The longest title one session may be given.
 ///
 /// **One hundred and twenty bytes, and it is narrower than a plan step's
-/// subject on purpose.** A step is read on a line of its own; a title is read at
+/// subject on purpose.** A step is read on a line of its own. A title is read at
 /// the end of a `chock sessions` row that already carries an identifier, a
 /// timestamp, a state, a turn count and a model name. A title that ran past the
 /// width of a terminal would push the one thing on the row a reader is scanning
@@ -3521,7 +3521,7 @@ pub const max_title_bytes: usize = 120;
 ///
 /// **A reader must not rely on any of it.** A log is a file on disk that another
 /// build, or a person with an editor, can write, so `src/sessions.zig` filters
-/// what it prints as well. This stops a bad title being written; that stops a
+/// what it prints as well. This stops a bad title being written. That stops a
 /// bad title being obeyed.
 fn runSetTitle(
     allocator: std.mem.Allocator,
@@ -3635,7 +3635,7 @@ pub const request_tool_name = @tagName(tools.Tool.request_action);
 ///
 /// **This is the first thing an agent may ask for by name, and it is one
 /// thing.** `handback.apply_action` carries the session's own commit into the
-/// user's repository; every other name is refused here, before anybody is
+/// user's repository. Every other name is refused here, before anybody is
 /// asked, and the refusal says which name was given. A general
 /// request-for-any-action tool would need every act's own parameters to come
 /// from the model, and it would have been built with one customer to test it
@@ -3772,7 +3772,7 @@ fn promiseText(
 ///
 /// **The answer and a path, never the child's transcript.** Six children each
 /// returning a page of prose is a parent that spends its whole context
-/// reading; the child's own log holds every turn, and the scratchpad holds
+/// reading. The child's own log holds every turn, and the scratchpad holds
 /// whatever the child wrote down.
 fn spawnResultText(
     allocator: std.mem.Allocator,
@@ -3992,7 +3992,7 @@ fn noteRead(
 /// is not `pub`: see that type's own doc comment on why a runtime generation
 /// check, not the type system, is what actually proves a caller holds a real
 /// lock. Every real caller of this function already holds one, from
-/// `deps.storage.lock` in `run`, so the check always passes here; `anytype`
+/// `deps.storage.lock` in `run`, so the check always passes here. `anytype`
 /// only works around the type being unnameable, not around the check
 /// itself.
 ///
@@ -6785,7 +6785,7 @@ test "a result's note reaches the log and never the model" {
     // into the output on the way out.
     //
     // Mutation check: add `note` to the `feedback` part in `runTool` and the
-    // request assertion fails; drop `.note` from the event `runFetch` and
+    // request assertion fails. Drop `.note` from the event `runFetch` and
     // `runTool` build and the log assertion fails.
     const allocator = testing.allocator;
     const io = testing.io;
@@ -6863,7 +6863,7 @@ test "ordinary text output reaches the request unchanged, multi byte characters 
 test "a megabyte with no newline survives the turn as a JSON string" {
     // Long is not the same fact as binary, and a plausible thing a real
     // command prints. `tools.max_output_bytes` is what bounds a real tool
-    // call; this runner is not the sandbox one, so it carries the whole
+    // call. This runner is not the sandbox one, so it carries the whole
     // megabyte and the point is that the turn still goes out as a string.
     const allocator = testing.allocator;
     const io = testing.io;
@@ -7477,7 +7477,7 @@ const measured_rate_limit_body =
 
 test "a rate limit is waited out, and the reply after the wait is the session's real answer" {
     // **The whole point of the retry.** A session that ends on a 429 loses
-    // everything it had done; a session that waits gets the answer. So this
+    // everything it had done. A session that waits gets the answer. So this
     // pins the answer itself and not merely that a second attempt happened: a
     // retry that came back with an error would satisfy "it retried" and would
     // still have lost the session.

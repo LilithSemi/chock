@@ -110,7 +110,7 @@ fn join(arena: std.mem.Allocator, root: []const u8, rest: []const u8) []const u8
 
 /// Looks up one Mach service by name through this process's own bootstrap
 /// port. `succeeded` means the lookup answered `KERN_SUCCESS` and this
-/// process now holds a send right to the service; anything else is a refusal,
+/// process now holds a send right to the service. Anything else is a refusal,
 /// which for a name a sandbox denies arrives as `BOOTSTRAP_NOT_PRIVILEGED`
 /// (1100), not `BOOTSTRAP_UNKNOWN_SERVICE` (1102): measured on 2026-09-05, so
 /// a refusal here is never confused with a name nobody registered.

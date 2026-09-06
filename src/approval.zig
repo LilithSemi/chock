@@ -808,7 +808,9 @@ pub fn promptText(
         );
     }
 
-    // Two answers, and no third, where a `session` answer means something.
+    // Two answers say yes, and everything else is a no. The terminal prompt
+    // shows a third letter, `N`, only to mark the default when nothing is
+    // typed, never as a third way to say yes.
     // `y` runs this one act and asks again next time. `s` runs it and
     // remembers this exact action for the rest of the session, so a project
     // that just wrote its first `ask` rule does not turn every later call into

@@ -3108,9 +3108,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // from inside this very `Sandbox.spawn`'s own `serveBroker` loop. An
         // arbiter played entirely in process approves it, and the checks
         // below are the four things section C2 of the plan asks a real run to
-        // prove: the request and its answer are both in the log, in order,
-        // with a real id; the turn that was already in flight is still
-        // intact; the hash chain never broke; and the sandboxed call finished
+        // prove. The request and its answer are both in the log, in order,
+        // with a real id. The turn that was already in flight is still
+        // intact. The hash chain never broke. The sandboxed call finished
         // normally rather than hanging or crashing.
         if (std.mem.eql(u8, args[1], "spawn-filtered-ask-grant")) {
             const run = try askingEscape(

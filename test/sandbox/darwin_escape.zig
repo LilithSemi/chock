@@ -2,7 +2,7 @@
 //!
 //! **Every test here drives a real `chock_sandbox.spawn` on a real Mac.** None
 //! of them reads a profile, and none of them asks a stand-in what it would have
-//! done. A test that says a path is refused opened that path and was refused; a
+//! done. A test that says a path is refused opened that path and was refused. A
 //! test that says the network is closed tried to reach something. This project
 //! has already shipped an LSP client that had never once worked against a real
 //! server, because both in-house fakes accepted what no real one would, and a
@@ -40,7 +40,7 @@ const default_mach_services = chock_sandbox.darwin_driver_for_testing.default_ma
 const sun_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
 
 /// What one probe run answered. See `test/sandbox/darwin_probe.zig` for the
-/// whole contract; these three are the only ones a test here reads.
+/// whole contract. These three are the only ones a test here reads.
 const succeeded: u8 = 0;
 const refused: u8 = 1;
 
@@ -119,7 +119,7 @@ fn runProbe(argv: []const []const u8) !u8 {
 /// **The stated reason: Nix on macOS runs every builder under `sandbox-exec`,
 /// and macOS refuses to nest one profile inside another.** Measured on a real
 /// Mac on 2026-08-25: from a login shell `sandbox_init` answered 0 for
-/// `(allow default)` and for a deny-by-default profile; inside a Nix build the
+/// `(allow default)` and for a deny-by-default profile. Inside a Nix build the
 /// same two calls answered -1 with `EPERM`. So the environment refuses the
 /// question this file asks, and the whole suite has nothing to measure there.
 /// See `chock-sandbox/darwin/seatbelt.zig`'s own `confinedAlready`, which asks
@@ -316,7 +316,7 @@ test "the opt in list widens exactly the name it grants, and LaunchServices stay
     // wires a caller to it.
     //
     // **Both halves matter.** A profile that granted everything would pass the
-    // first case and be useless; one that granted nothing would pass the
+    // first case and be useless. One that granted nothing would pass the
     // second case and be useless. Together they show the opt in list is a real
     // boundary and not a decoration, and that LaunchServices stays outside it.
     try requireOwnProfile();
@@ -394,7 +394,7 @@ test "a sandboxed program cannot drop the sandbox it is in" {
     // The whole layer is worth nothing if the program can call `sandbox_init`
     // again with a wider profile. Measured on 2026-08-25: the second call is
     // refused with `EPERM`, whether it would widen or narrow. The probe does not
-    // trust that return value on its own; it tries the denied read again
+    // trust that return value on its own. It tries the denied read again
     // afterwards.
     try requireOwnProfile();
     var root = try scratch();

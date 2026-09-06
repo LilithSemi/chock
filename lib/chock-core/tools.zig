@@ -99,7 +99,7 @@
 //! inside `Sandbox.spawn` waiting for that same program to exit. Both sides
 //! wait for the other and neither ever runs again. `cat` on a 4 MB file
 //! reproduces this in seconds. `pipe_target_bytes` now only trims how often
-//! the read loop below has to wake up; it is a throughput tweak, not a
+//! the read loop below has to wake up. It is a throughput tweak, not a
 //! correctness requirement.
 //!
 //! Reading while the program runs means calling `Sandbox.spawn` from a
@@ -207,7 +207,7 @@ pub const content_hash_length: usize = 16;
 /// edit gives a different hash, and the edit is refused before a byte is
 /// written, rather than being applied against surroundings the model never
 /// saw. `edit_file`'s uniqueness rule already catches the case where the text
-/// being replaced itself moved or multiplied; the hash catches the case where
+/// being replaced itself moved or multiplied. The hash catches the case where
 /// something else in the file moved.
 ///
 /// **It also says the model actually read the file.** A model cannot compute
@@ -218,7 +218,7 @@ pub const content_hash_length: usize = 16;
 ///
 /// Not a cryptographic hash, and it does not need to be. Nothing here is
 /// trying to stop a party who can choose the file's contents freely and grind
-/// for a collision; it is trying to stop an edit built on a stale reading, and
+/// for a collision. It is trying to stop an edit built on a stale reading, and
 /// sixty four bits is far past what that needs. `Wyhash` with a fixed seed, so
 /// two runs of Chock, and two processes of one run, agree.
 pub fn contentHash(content: []const u8) [content_hash_length]u8 {
@@ -237,7 +237,7 @@ pub const Capability = chock_provider.message.Capability;
 /// What this provider instance can do beyond answering with words. The second
 /// of the two gates. A caller builds this from
 /// `chock_auth.config.Instance.capabilities`, which is where a user writes it
-/// down; this library does not import `chock-auth`, so the value arrives as an
+/// down. This library does not import `chock-auth`, so the value arrives as an
 /// argument instead of being read here.
 pub const ProviderCapabilities = struct {
     /// This instance can take an image in a request.
@@ -441,7 +441,7 @@ pub const default_timeout_ns: u64 = 120 * std.time.ns_per_s;
 ///
 /// * **It cannot stop one runaway call.** The reading happens before the call
 ///   starts, and a program that then writes a hundred gigabytes fills the disk
-///   with nothing in the way. A cap refuses the write itself; this only refuses
+///   with nothing in the way. A cap refuses the write itself. This only refuses
 ///   the next call.
 /// * **It is stale the moment it is taken.** Everything else on the machine is
 ///   writing to the same filesystem.
@@ -846,7 +846,7 @@ pub const Tool = enum {
     /// made this refusal cosmetic: `./.git/../build.sh` named `exec.unparsed`
     /// exactly as this comment says, and the shipped default answered
     /// `allow` for it regardless of what a project denied. Refusing to guess
-    /// was always the right call for the `..` itself; the fault was giving
+    /// was always the right call for the `..` itself. The fault was giving
     /// the name that refusal produces a default answer of `allow` rather
     /// than leaving it to fall through to `ask` like any other action
     /// nobody named. See that file's own top comment, "What is deliberately
@@ -1399,7 +1399,7 @@ pub const Registry = struct {
     ///
     /// **This takes no `Support`, and runs whatever tool it is given a name
     /// for.** The gate decides what the model is *told about*, in `definitions`
-    /// and therefore in `prompt.build`; it is not a second boundary. Nothing a
+    /// and therefore in `prompt.build`. It is not a second boundary. Nothing a
     /// tool does here depends on it, and the boundary that does matter, the
     /// mount tree, is the same for every tool. A tool that is one day gated off
     /// will therefore still dispatch if a model names it out of nowhere, and
@@ -1409,7 +1409,7 @@ pub const Registry = struct {
     /// **`Context.role` is the one exception, and it is a boundary.** An
     /// arbitrator holds no tools at all, so a name it invented runs nothing:
     /// see `Role`. A tool nobody was told about is a tool nobody meant to
-    /// hide; a tool an arbitrator must not hold is the point of the role.
+    /// hide. A tool an arbitrator must not hold is the point of the role.
     pub fn dispatch(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -1421,8 +1421,8 @@ pub const Registry = struct {
     }
 
     /// Same as `dispatch`, with the deadline named explicitly instead of
-    /// `default_timeout_ns`. `dispatch` is what every real caller wants;
-    /// this exists so a test can pin the timeout behaviour itself without
+    /// `default_timeout_ns`. `dispatch` is what every real caller wants.
+    /// This exists so a test can pin the timeout behaviour itself without
     /// making the whole suite wait out `default_timeout_ns` for real. See
     /// this file's own top comment on why a tool call has a deadline at
     /// all.
@@ -1479,7 +1479,7 @@ pub const Registry = struct {
 
         // The session's toolchain, added to the config once here rather
         // than by each of the calls below. `Context.store_paths` is what a
-        // caller names it with; a tool call is what binds it. The mounts
+        // caller names it with. A tool call is what binds it. The mounts
         // and rules live only as long as this dispatch, which is longer
         // than the last `Sandbox.spawn` under it: a `sandbox.Config`
         // borrows both slices and never keeps them.
@@ -1762,7 +1762,7 @@ pub const Context = struct {
     net: ?NetSeam = null,
     /// The host directory this project's knowledgebase lives in, or null for
     /// a session that has none. `Support.memory` decides whether the model is
-    /// told the two memory tools exist; this is where they actually work.
+    /// told the two memory tools exist. This is where they actually work.
     ///
     /// **The model never names this path and cannot influence it.** It comes
     /// from the caller, the same way the workspace does, and the name in a
@@ -2410,7 +2410,7 @@ fn runCommand(
 
     if (context.cache_dir) |host_dir| {
         // **The target is asked for and never spelled.** A build that moves a
-        // path answers `cache.sandbox_dir`; macOS answers `host_dir` itself, so
+        // path answers `cache.sandbox_dir`. macOS answers `host_dir` itself, so
         // the bind is source to source, which is the one shape
         // `darwin/driver.zig` can express. See `cache.sandboxDirFor`.
         const inside = cache.sandboxDirFor(host_dir);
@@ -2431,7 +2431,7 @@ fn runCommand(
 
     // The scratchpad, which is two bind mounts and never one, plus one capped
     // area of the sandbox's own. `scratch/` is the agent's own notes and is
-    // bound writable; `tasks/` holds records of what commands produced and is
+    // bound writable. `tasks/` holds records of what commands produced and is
     // bound **read only**, so the agent that reads a result cannot edit it into
     // a different result. See `lib/chock-core/tasks.zig` on why a file it could
     // edit would be no evidence at all.
@@ -2513,7 +2513,7 @@ fn runCommand(
         .timeout_ns = if (in_background) tasks.default_timeout_ns else context.timeout_ns,
         .background = if (in_background) context.tasks else null,
         // **`run_command` and no other tool.** This is the one call that runs a
-        // program the model chose, so it is the one that can take minutes; a
+        // program the model chose, so it is the one that can take minutes. A
         // `grep`, a `read_file` and a `write_file` are each one short program
         // Chock itself chose, under the same deadline. See `Context.idle`.
         .idle = if (in_background) null else context.idle,
@@ -2760,7 +2760,7 @@ fn withLimitNote(
 /// about where the harness put it.
 ///
 /// It also says the agent cannot fix this, which is the part that saves turns.
-/// Every other refusal in this file names something to try instead; this one has
+/// Every other refusal in this file names something to try instead. This one has
 /// nothing to offer, and a model not told that will delete files, retry, and
 /// spend a session on it.
 fn workspaceRefusal(
@@ -3322,7 +3322,7 @@ fn globFiles(
         return outsideProjectResult(allocator, call, .glob, path);
     }
     // `find` has no `--`, so it cannot be told that a word beginning with a
-    // dash is a path. Refusing here is honest; guessing would make `find`
+    // dash is a path. Refusing here is honest. Guessing would make `find`
     // read the path as an option and report something about `find` that the
     // model cannot act on.
     if (path.len != 0 and path[0] == '-') {
@@ -4438,7 +4438,7 @@ const StageError = error{StagingFailed} || std.mem.Allocator.Error;
 
 /// How many names `stageContent` tries before it gives up. Each one is
 /// sixteen hex digits of entropy, so a second attempt is already
-/// unimaginable; the bound exists so a directory that refuses every create
+/// unimaginable. The bound exists so a directory that refuses every create
 /// for some other reason fails at once instead of spinning.
 const stage_attempts: usize = 4;
 
@@ -4452,7 +4452,7 @@ const stage_attempts: usize = 4;
 /// Mode 0600, and created exclusively, so nobody else on the host reads the
 /// bytes while the call runs and nothing already at that name is
 /// overwritten. A file that `cp` creates inside the workspace takes this
-/// mode; one that already exists keeps its own. Git records only the execute
+/// mode. One that already exists keeps its own. Git records only the execute
 /// bit, so neither answer changes what a commit carries.
 fn stageContent(
     allocator: std.mem.Allocator,
@@ -4549,7 +4549,7 @@ const RunError = error{
 ///
 /// **A project's own `sh build.sh` is refused too, and it never worked.**
 /// `sh` binds only `sh`, so the first program the script runs is already
-/// missing; and `argv[0]` must be a bare name, so `./build.sh` was refused
+/// missing. And `argv[0]` must be a bare name, so `./build.sh` was refused
 /// before this list existed. A shell script in a project is not runnable by
 /// `run_command` either way. The refusal changes the message from a puzzle
 /// into a statement, and takes nothing away that ran.
@@ -4673,7 +4673,7 @@ fn hostDirHasFile(io: std.Io, host_dir: []const u8, name: []const u8) bool {
 ///
 /// The overlay kind is two directories and both are looked in. The upper
 /// layer holds every write this session made, which is where a program the
-/// session built lands; the lower layer holds the project as it came. A
+/// session built lands. The lower layer holds the project as it came. A
 /// program sees the merged view of the two, so a file in either one is a file
 /// the path form would really find.
 fn workspaceHasFile(io: std.Io, config: sandbox.Config, name: []const u8) bool {
@@ -4888,7 +4888,7 @@ const SandboxCall = struct {
     /// and unreachable.
     extra_rules: []const sandbox.Config.Rule = &.{},
     /// How much of the program's own output is kept. `max_output_bytes` is
-    /// what a model reads; a call whose output Chock itself has to be
+    /// what a model reads. A call whose output Chock itself has to be
     /// complete, such as the read `edit_file` makes before it rewrites a
     /// file, names a larger number here.
     keep_bytes: usize = max_output_bytes,
@@ -4949,7 +4949,7 @@ const Ran = union(enum) {
 ///
 /// A path that cannot be read at all still gets a rule, the directory one.
 /// The mount for it fails a moment later with `SourceMissing`, which names
-/// the real problem; deciding here that it is absent would only move the
+/// the real problem. Deciding here that it is absent would only move the
 /// failure somewhere less clear.
 /// **Public for one caller outside this file**, which is the language server
 /// helper: `src/run.zig` builds a `sandbox.Config` for it the same way
@@ -5247,7 +5247,7 @@ pub fn prepare(
     // `Context.store_paths` onto the config before this was called, so the
     // dynamic linker can resolve the shared libraries of whichever binary
     // runs next. It used to be the host's whole /nix/store, added right
-    // here; see `withStore` and `Context.store_paths` for why it moved and
+    // here. See `withStore` and `Context.store_paths` for why it moved and
     // what decides it now.
     try mounts.appendSlice(allocator, workspace_config.mounts);
     // The one program this call runs, when a mount does not already carry it.
@@ -5259,7 +5259,7 @@ pub fn prepare(
     // test/sandbox/escape_probe.zig's own top comment records for the same
     // mount. Not read only: namespace.zig's own markReadOnly also sets NODEV on
     // a read only mount, which then refuses to open the device node at all. A
-    // small synthetic /dev for the sandbox generally comes later; until that
+    // small synthetic /dev for the sandbox generally comes later. Until that
     // exists, this one node is the minimum a tool call needs to behave like an
     // ordinary program.
     try mounts.append(allocator, .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } });
@@ -5273,7 +5273,7 @@ pub fn prepare(
     // See `sandbox.namespace.Mount.Proc` and `masked_proc_entries`.
     //
     // **Only on a build whose driver has one.** macOS has no procfs anywhere,
-    // so a program there never looks for one and this takes nothing away; a
+    // so a program there never looks for one and this takes nothing away. A
     // config that asked for one anyway had the whole tool call refused with
     // `NoMountNamespace`, measured on the Darwin box on 2026-08-25 as the first
     // reason `read_file` would not run. See `sandbox.expresses.procfs`.
@@ -5314,7 +5314,7 @@ pub fn prepare(
     // function has no reason to know about, such as `seccomp_options` or
     // `network`, and a field-by-field rebuild silently drops whatever it
     // forgets to list. It was safe only by accident, because both of those
-    // fields' defaults happen to already be the safe ones; a future field
+    // fields' defaults happen to already be the safe ones. A future field
     // with an unsafe default would not get the same luck.
     //
     // **`stdin_fd` is one of the fields carried across untouched**, and for a
@@ -5559,7 +5559,7 @@ const SpawnThread = struct {
     /// see `Sandbox.spawn`'s own doc comment on `middle`, and `sandbox.Middle`
     /// for what the two fields are and which one a caller may signal.
     /// `Sandbox.spawn` takes a plain `*sandbox.Middle`, not a
-    /// `std.atomic.Value`, so `pid` stays a plain field; every read of it from
+    /// `std.atomic.Value`, so `pid` stays a plain field. Every read of it from
     /// the other thread goes through `@atomicLoad` with an explicit
     /// `.acquire`, so the compiler cannot cache a stale zero across
     /// `spawnCapturing`'s own wait and read loops, the same hazard
@@ -5611,7 +5611,7 @@ const SpawnThread = struct {
 /// **This exists for a signal handler to read**, which is why it is an array of
 /// plain atomics and not a list of anything: a handler runs between any two
 /// instructions of the program it interrupts, so it can take no lock and reach
-/// no allocator. A descriptor number fits in one atomic; a `sandbox.Middle`
+/// no allocator. A descriptor number fits in one atomic. A `sandbox.Middle`
 /// would not. See `cancelRunningTool`.
 ///
 /// -1 and not 0 for a free slot, because 0 is a real descriptor number.
@@ -5717,7 +5717,7 @@ pub fn cancelRunningTool() void {
 /// timeout exists.
 ///
 /// **`approval_wait_ns` is the deadline's own release valve.** `timeout_ns`
-/// bounds an ordinary compile or test run; it says nothing about a person.
+/// bounds an ordinary compile or test run. It says nothing about a person.
 /// The moment something inside the sandboxed call has to stop and ask one,
 /// this clock must not be the thing that answers first: a prompt nobody
 /// reaches inside two minutes must not kill the very call the prompt was
@@ -5744,8 +5744,8 @@ fn spawnCapturing(
 }
 
 /// Same as `spawnCapturing`, with the `chock-io` driver named explicitly
-/// instead of `chock_io.default()`. Every real caller wants `spawnCapturing`;
-/// this exists so a test can hand in `chock_io.Fake`, which always fails
+/// instead of `chock_io.default()`. Every real caller wants `spawnCapturing`.
+/// This exists so a test can hand in `chock_io.Fake`, which always fails
 /// `pipeCloseOnExec`, and pin the "pipe creation itself failed" path: see the
 /// test for it near the bottom of this file. A real pipe cannot be made to
 /// fail on demand without exhausting the whole process's descriptor table, so
@@ -5828,7 +5828,7 @@ fn spawnCapturingIo(
     // last write end before that fork ever ran, if `Sandbox.spawn` never
     // reaches it at all. Five seconds is generous for probeAbi and
     // building the seccomp filter, the only work Sandbox.spawn does before
-    // that fork; reaching the bound is a bug detector, never an expected
+    // that fork. Reaching the bound is a bug detector, never an expected
     // wait.
     const wait_step: std.Io.Duration = .fromMilliseconds(1);
     const wait_bound: std.Io.Duration = .fromSeconds(5);
@@ -5847,7 +5847,7 @@ fn spawnCapturingIo(
         // The bound above was not enough: something is badly wrong in
         // Sandbox.spawn's own pre-fork setup. Leave the thread running
         // rather than close this process's own copy of the pipe's write end
-        // underneath a fork that has not happened yet; this process is a
+        // underneath a fork that has not happened yet. This process is a
         // one-shot tool runner (see this file's own top comment) that is
         // about to exit through this error regardless.
         return error.Unexpected;
@@ -5950,7 +5950,7 @@ fn earlier(a: std.Io.Clock.Timestamp, b: std.Io.Clock.Timestamp) std.Io.Clock.Ti
 /// is sent at most once.
 ///
 /// **`approval_wait_ns` extends that deadline, live.** `base_deadline` is
-/// fixed once, at this function's own start, exactly as it always was; the
+/// fixed once, at this function's own start, exactly as it always was. The
 /// deadline actually enforced on each pass is `base_deadline` plus whatever
 /// `approval_wait_ns` reads at that moment, computed fresh every time rather
 /// than once. A read of zero, or a null `approval_wait_ns`, is the ordinary
@@ -6050,7 +6050,7 @@ fn drainCapture(
                 // moved while this read was already blocked.**
                 // `std.Io.operateTimeout` was handed a fixed deadline the
                 // moment this read started, so a bump landing after that
-                // cannot move a wait already in flight; this is what makes it
+                // cannot move a wait already in flight. This is what makes it
                 // count anyway. Read fresh, not the `deadline` this pass
                 // already computed, which is now stale.
                 if (approval_wait_ns) |counter| {
@@ -7047,7 +7047,7 @@ test "two spellings of the same program build the same name" {
     // distinct paths apart is not enough on its own: it must also agree
     // that the same program, spelled two ways, is the same action, or a
     // deny rule is dodged by respelling the path. Each group below names one
-    // program several ways; every spelling in a group must build the one
+    // program several ways. Every spelling in a group must build the one
     // name. `build.sh` is deliberately not in `group_a`: it carries no
     // slash, so it is a host `PATH` lookup and not a project path, and it
     // must not share `group_a`'s name.
@@ -7732,7 +7732,7 @@ test "a mount that covers the answer cancels it, so a call never runs a differen
 
 // A user approves what will happen, never a shell line.
 // `lib/chock-broker/actions.zig` already fails the build when an action
-// payload gains a field that could hold a command; this is the same rule one
+// payload gains a field that could hold a command. This is the same rule one
 // layer up, where the model's own words arrive.
 //
 // A tool that edits through `run_command sh -c "cat > file"` gives the broker
@@ -8200,7 +8200,7 @@ test "a pattern built to make the matcher backtrack forever gives up instead" {
     // runner, outside the sandbox and outside the deadline
     // `spawnCapturing` enforces. Without a bound, this one input runs for
     // longer than anybody is going to wait. Reaching the assertion at all is
-    // the proof; the answer is "no match", which is what `glob` then reports.
+    // the proof. The answer is "no match", which is what `glob` then reports.
     const pathological = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
     const path = "a" ** 120;
     try std.testing.expect(!matchGlob(pathological, path));

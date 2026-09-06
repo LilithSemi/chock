@@ -180,7 +180,7 @@ pub const Rule = struct {
     verb: Verb = .allow,
 };
 
-/// What one profile asks for. The driver builds this from its own `Config`; it
+/// What one profile asks for. The driver builds this from its own `Config`. It
 /// is deliberately in Darwin's own terms, not Linux's, so no field here has to
 /// be read as an approximation of a Linux mechanism.
 pub const Options = struct {
@@ -269,7 +269,7 @@ pub const Options = struct {
 /// file exists to solve and was curated from Codex's and Chromium's Seatbelt
 /// policies before that. Zed's source lists 16 lines because
 /// `com.apple.cfprefsd.agent` appears twice there, once as a `global-name` and
-/// once as a `local-name`; `writeMachService` only ever emits `global-name`,
+/// once as a `local-name`. `writeMachService` only ever emits `global-name`,
 /// so the two collapse to one entry here. Whether the `local-name` form is
 /// needed on a real Mac is exactly what task A2 measures.
 ///
@@ -501,7 +501,7 @@ pub const Builder = struct {
     /// reader comparing the two.
     ///
     /// **This must go through `writeQuoted`, and never a writer of its own.**
-    /// `writeQuoted` is what stops a path becoming a rule; a second, unquoted
+    /// `writeQuoted` is what stops a path becoming a rule. A second, unquoted
     /// writer here would reopen exactly that hole for a Mach service name.
     ///
     /// **The name is checked before it is written, the same as a path is
@@ -634,7 +634,7 @@ pub const Builder = struct {
 ///
 /// **This never prints and never allocates**, so it is safe in the window
 /// between `fork` and `execve`. `sandbox_init` fills in an error string on a
-/// refusal; it is freed here and its text is not carried out, because the only
+/// refusal. It is freed here and its text is not carried out, because the only
 /// refusals reachable are ones this file's own builder caused, and the caller
 /// learns which through `Support`.
 pub fn apply(profile: [:0]const u8) Support {
@@ -645,7 +645,7 @@ pub fn apply(profile: [:0]const u8) Support {
         if (rc == 0) return .ok;
         // A refusal here is either a profile this code built wrongly or a
         // process that already has one. The two are told apart by the caller,
-        // which knows whether it has called this before; this function reports
+        // which knows whether it has called this before. This function reports
         // the one it can see.
         return .{ .unavailable = .profile_refused };
     } else {
@@ -888,7 +888,7 @@ test "every profile denies mach-lookup by default" {
 test "the mach-lookup denial comes before every mach-lookup allowance" {
     // SBPL gives the last line that names a thing: see `Rule.verb`'s own
     // comment. A `(deny mach-lookup)` written after an allowance for a
-    // service would win and take that service back; written before, it is
+    // service would win and take that service back. Written before, it is
     // narrowed by the allowances that follow it, which is the only order
     // that lets a service be granted at all.
     //

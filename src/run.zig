@@ -4850,8 +4850,9 @@ const ApprovalLock = @typeInfo(
 /// The loop holds a `state.Session` of its own and this seam is handed none, so
 /// the log is folded here. That is not a workaround: the fold is the truth of a
 /// session, and it is what makes this right about a session that was resumed,
-/// handed to the daemon, or compacted. It costs one replay per question, and a
-/// widening proposal is rare.
+/// handed to the daemon, or compacted. It costs one replay per question, and
+/// `gateToolCall` now asks this for every ordinary tool call, not only a
+/// widening proposal.
 ///
 /// ## The reviewer, and the honest limit on it
 ///
