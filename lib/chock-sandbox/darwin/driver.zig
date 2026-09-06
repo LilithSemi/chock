@@ -102,6 +102,14 @@ pub const confinedAlready = seatbelt.confinedAlready;
 pub const nesting = seatbelt.nesting;
 pub const Nesting = seatbelt.Nesting;
 
+/// The curated opt in list, re-exported for the same reason `confinedAlready`
+/// is: `test/sandbox/darwin_escape.zig` reaches this driver through
+/// `chock-sandbox.zig`'s own `darwin_driver_for_testing` and never imports
+/// `seatbelt.zig` by path. Its own mach-lookup tests widen with the first name
+/// on this list rather than a name typed a second time, so the two cannot
+/// drift apart.
+pub const default_mach_services = seatbelt.default_mach_services;
+
 /// The longest profile this driver builds. A workspace, a dev shell closure and
 /// the deny list together are far below this; a config that is not is refused
 /// rather than truncated. See `seatbelt.Builder.finish`.

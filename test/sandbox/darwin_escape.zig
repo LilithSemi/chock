@@ -29,6 +29,11 @@ const chock_sandbox = @import("chock-sandbox");
 // options module built with `addOptionPath`.
 const probe_path = @import("probe_path").probe_path;
 
+/// The curated opt in list the mach-lookup tests below widen with. Read from
+/// the real constant rather than typed out a second time here, so a later
+/// edit to the list cannot make these tests stale without failing them too.
+const default_mach_services = chock_sandbox.darwin_driver_for_testing.default_mach_services;
+
 /// The size of this platform's `sun_path`, read off the platform's own
 /// structure so it cannot drift. 104 on Darwin and 108 on Linux. See the skip
 /// below for why `std.Io.net.UnixAddress.max_len` is the wrong number.
@@ -250,6 +255,75 @@ test "a sandboxed program cannot reach a unix socket outside it" {
     defer server.deinit(std.testing.io);
 
     try std.testing.expectEqual(refused, try runWith("connect-unix", root.path(), socket_path));
+}
+
+test "the control: a real Mach service resolves with no sandbox at all" {
+    // **This has to run first and it has to pass, or nothing below means
+    // anything.** `seatbelt.zig`'s own comment used to name `com.apple.launchd`
+    // as "the launchd bootstrap name itself". Measured on 2026-09-05:
+    // `bootstrap_look_up` for that exact string answers `BOOTSTRAP_UNKNOWN_SERVICE`
+    // whether or not any sandbox is applied at all, so it cannot tell a closed
+    // boundary from a name nobody ever registered, and every test below avoids
+    // it. `com.apple.lsd` on its own fails the same way: launchd's own
+    // `/System/Library/LaunchDaemons/com.apple.lsd.plist` registers its Mach
+    // services under longer names, `com.apple.lsd.open` among them, and that
+    // is the one used here and below. Both names below were confirmed by hand
+    // to resolve outside any profile before either was written into an
+    // assertion, which is the whole reason this test exists: a lookup that
+    // fails everywhere would make a broken sandbox look like a working one.
+    try requireOwnProfile();
+    var root = try scratch();
+    defer root.cleanup();
+    try std.testing.expectEqual(succeeded, try runWith("in-mach-lookup", root.path(), default_mach_services[0]));
+    try std.testing.expectEqual(succeeded, try runWith("in-mach-lookup", root.path(), "com.apple.lsd.open"));
+}
+
+test "the shipped default profile, with no opt in list at all, refuses a Mach lookup" {
+    // **The claim under test.** `sandbox.spawn`'s own `Config` carries no
+    // field for `Options.mach_services`, so this is the profile every real
+    // session runs under today: `seatbelt.Builder.finish` writes `(deny
+    // mach-lookup)` and nothing else. `seatbelt.zig` says the base `(deny
+    // default)` rule already refused this before that line was ever added.
+    // See that file's own comment for what this test found.
+    //
+    // Mutation check: change the base rule in `seatbelt.Builder.finish` from
+    // `(deny default)` to `(allow default)` and this fails.
+    try requireOwnProfile();
+    var root = try scratch();
+    defer root.cleanup();
+    try std.testing.expectEqual(refused, try runWith("mach-lookup", root.path(), default_mach_services[0]));
+}
+
+test "the shipped default profile refuses LaunchServices" {
+    // Kept apart from the test above because `com.apple.lsd.open` is the one
+    // name `seatbelt.zig` says is never written to either Mach service list,
+    // on purpose, so that a process cannot reach it by asking to be widened.
+    // This measures the half of that claim a widened profile cannot: that
+    // even the shipped default, which grants nothing, already refuses it.
+    try requireOwnProfile();
+    var root = try scratch();
+    defer root.cleanup();
+    try std.testing.expectEqual(refused, try runWith("mach-lookup", root.path(), "com.apple.lsd.open"));
+}
+
+test "the opt in list widens exactly the name it grants, and LaunchServices stays shut" {
+    // **A second question, asked only because the first one held.** Nothing
+    // that goes through `sandbox.spawn` can set `Options.mach_services` today:
+    // see `widenedMachLookup` in `darwin_probe.zig`. This drives `sandbox_init`
+    // directly with the same profile text `seatbelt.Builder.finish` would
+    // write for `Options{ .mach_services = default_mach_services }`, to answer
+    // whether the list does what the code beside it claims, once something
+    // wires a caller to it.
+    //
+    // **Both halves matter.** A profile that granted everything would pass the
+    // first case and be useless; one that granted nothing would pass the
+    // second case and be useless. Together they show the opt in list is a real
+    // boundary and not a decoration, and that LaunchServices stays outside it.
+    try requireOwnProfile();
+    var root = try scratch();
+    defer root.cleanup();
+    try std.testing.expectEqual(succeeded, try run("mach-lookup-widened-allowed", root.path()));
+    try std.testing.expectEqual(refused, try run("mach-lookup-widened-lsd", root.path()));
 }
 
 test "a sandboxed program cannot signal a process outside it, and can signal its own child" {

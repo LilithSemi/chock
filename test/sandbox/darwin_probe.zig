@@ -28,6 +28,23 @@ const sandbox = @import("chock-sandbox");
 extern "c" fn sandbox_init(profile: [*:0]const u8, flags: u64, errorbuf: *?[*:0]u8) c_int;
 extern "c" fn shmat(id: c_int, addr: ?*const anyopaque, flags: c_int) ?*anyopaque;
 
+/// The two Mach types this program needs, declared by hand rather than
+/// through `@cImport`, for the same reason `seatbelt.zig` declares
+/// `sandbox_init` by hand: IronStyle's pure Zig rule allows an `extern`
+/// declaration of a symbol libSystem already carries, and forbids a C header.
+const mach_port_t = c_uint;
+const kern_return_t = c_int;
+
+/// `bootstrap_look_up` is the call every `mach-lookup` rule in a Seatbelt
+/// profile governs, and `bootstrap_port` is this process's own send right to
+/// its bootstrap namespace, the one a profile's `mach-lookup` rules stand
+/// between a program and. Both are deprecated in `<bootstrap.h>` in the same
+/// documentation-only way `sandbox_init` is deprecated in `<sandbox.h>`: see
+/// `seatbelt.zig`'s own top comment. Measured on 2026-09-05: `bootstrap_port`
+/// is set by dyld before `main` runs, and needs no call to fill in.
+extern "c" fn bootstrap_look_up(bp: mach_port_t, service_name: [*:0]const u8, sp: *mach_port_t) kern_return_t;
+extern "c" var bootstrap_port: mach_port_t;
+
 const succeeded: u8 = 0;
 const refused: u8 = 1;
 const no_answer: u8 = 2;
@@ -89,6 +106,43 @@ fn readsBack(fd: c_int) bool {
 
 fn join(arena: std.mem.Allocator, root: []const u8, rest: []const u8) []const u8 {
     return std.fs.path.join(arena, &.{ root, rest }) catch @panic("out of memory");
+}
+
+/// Looks up one Mach service by name through this process's own bootstrap
+/// port. `succeeded` means the lookup answered `KERN_SUCCESS` and this
+/// process now holds a send right to the service; anything else is a refusal,
+/// which for a name a sandbox denies arrives as `BOOTSTRAP_NOT_PRIVILEGED`
+/// (1100), not `BOOTSTRAP_UNKNOWN_SERVICE` (1102): measured on 2026-09-05, so
+/// a refusal here is never confused with a name nobody registered.
+fn machLookup(name: []const u8) u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var port: mach_port_t = 0;
+    const kr = bootstrap_look_up(bootstrap_port, zpath(&buffer, name), &port);
+    return if (kr == 0) succeeded else refused;
+}
+
+/// Applies a profile that grants `granted` and nothing else beyond the file
+/// read every program needs to start, then looks up `target`.
+///
+/// **This calls `sandbox_init` directly rather than going through
+/// `sandbox.spawn`**, because `Sandbox.Config` carries no field for
+/// `Options.mach_services` at all: `driver.zig`'s own `optionsFor` never sets
+/// it, so nothing that goes through the public API can widen this list today.
+/// The profile text below is the same shape `seatbelt.Builder.finish` writes
+/// for `Options{ .mach_services = default_mach_services }`, typed out by hand
+/// because that builder is not reachable from here either. This is the second
+/// question task A2 asks, kept apart from the first: whether the opt in list,
+/// once wired to a caller, does what the code beside it claims.
+fn widenedMachLookup(granted: []const u8, target: []const u8) u8 {
+    var buffer: [1024]u8 = undefined;
+    const profile = std.fmt.bufPrintZ(
+        &buffer,
+        "(version 1)\n(deny default)\n(allow file-read* (literal \"/\"))\n(deny mach-lookup)\n(allow mach-lookup (global-name \"{s}\"))\n",
+        .{granted},
+    ) catch return profile_unbuildable;
+    var message: ?[*:0]u8 = null;
+    if (sandbox_init(profile, 0, &message) != 0) return profile_refused;
+    return machLookup(target);
 }
 
 /// One polling step. Zig 0.16 has no `std.Thread.sleep`, and this program links
@@ -271,6 +325,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return if (readsBack(3)) succeeded else refused;
     }
 
+    if (std.mem.eql(u8, op, "in-mach-lookup")) {
+        return machLookup(args[3]);
+    }
+
     if (std.mem.eql(u8, op, "in-widen")) {
         var message: ?[*:0]u8 = null;
         const rc = sandbox_init("(version 1)(allow default)", 0, &message);
@@ -382,6 +440,27 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, op, "shm-attach")) {
         return runInside(arena, work, self_path, &.{ self_path, "in-shm", root, args[3] }, &.{}, .none, limits);
+    }
+
+    if (std.mem.eql(u8, op, "mach-lookup")) {
+        // The shipped default: `sandbox.spawn`'s own `Config` carries no
+        // `mach_services` field, so this is the profile every real session
+        // runs under today, with nothing on the opt in list at all.
+        return runInside(arena, work, self_path, &.{ self_path, "in-mach-lookup", root, args[3] }, &.{}, .none, limits);
+    }
+
+    if (std.mem.eql(u8, op, "mach-lookup-widened-allowed")) {
+        // No `runInside`: see `widenedMachLookup`. `granted` and `target` are
+        // the same name, so this answers whether a name on the opt in list
+        // becomes reachable at all.
+        return widenedMachLookup(sandbox.darwin_driver_for_testing.default_mach_services[0], sandbox.darwin_driver_for_testing.default_mach_services[0]);
+    }
+
+    if (std.mem.eql(u8, op, "mach-lookup-widened-lsd")) {
+        // The same granted name as above, but the lookup this time is
+        // LaunchServices, which `default_mach_services` never carries. See
+        // `seatbelt.zig`'s own comment on why that absence is deliberate.
+        return widenedMachLookup(sandbox.darwin_driver_for_testing.default_mach_services[0], "com.apple.lsd.open");
     }
 
     if (std.mem.eql(u8, op, "widen")) {

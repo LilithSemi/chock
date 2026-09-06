@@ -578,9 +578,31 @@ pub const Builder = struct {
         // what it says about Mach services without working out what the base
         // rule implies. The allowances below are the lines that do something.
         //
+        // **Measured on macOS 15.7.9 on 2026-09-05, and this is not a guess
+        // carried over from the network and signal rules above.** A profile
+        // holding only `(deny default)` and the dyld root read, with no
+        // `(deny mach-lookup)` line at all, already answers
+        // `BOOTSTRAP_NOT_PRIVILEGED` for `bootstrap_look_up` on a real,
+        // registered service, the same answer a profile that spells out
+        // `(deny mach-lookup)` gives. The control matters as much as the
+        // denial: the same lookup outside any profile answers
+        // `KERN_SUCCESS`, so the refusal is the profile and not a name nobody
+        // registered. See `test/sandbox/darwin_escape.zig`'s own mach-lookup
+        // tests, task A2.
+        //
         // **LaunchServices and launchd are not on either list, on purpose.** A
         // process that reaches launchd starts a process outside this profile,
-        // which is the whole reason the rule exists.
+        // which is the whole reason the rule exists. `com.apple.lsd` on its
+        // own does not resolve at all, sandboxed or not: LaunchServices
+        // registers its Mach services under longer names, `com.apple.lsd.open`
+        // among them, and that family is what a widened profile must keep
+        // shut. `com.apple.launchd`, named above as "the launchd bootstrap
+        // name itself", does not resolve either, on this machine, whether or
+        // not any sandbox is applied: `bootstrap_look_up` answers
+        // `BOOTSTRAP_UNKNOWN_SERVICE` for it every time it was tried. Left
+        // here anyway, because a name that answers "not found" today is still
+        // a name this profile must never grant if a later macOS ever
+        // registers it.
         self.write("(deny mach-lookup)\n");
         for (options.mach_services) |name| self.writeMachService(name);
         if (options.allow_network) {

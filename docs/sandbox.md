@@ -297,6 +297,17 @@ four guarantees, and a test on a real Mac tries to break each one. See
 | `path_restricted` | yes |
 | `syscall_restricted` | **no, and it is permanent** |
 | `workspace_mounted` | **no, and it is permanent** |
+| Mach services (`mach-lookup`) | yes, no opt in list needed |
+
+**The Mach services row is not one of the four declared guarantees, and it is
+in this table anyway.** No program a session starts can look up a Mach
+service by name, launchd's own bootstrap namespace included, unless a caller
+later widens `Options.mach_services`, which nothing does today. Measured on
+Apple Silicon, macOS 15.7.9, arm64, on 2026-09-05: a profile holding
+`(deny default)` and nothing naming `mach-lookup` at all already refuses a
+real, registered service, the same answer a profile spelling out
+`(deny mach-lookup)` gives, where the identical lookup outside any profile
+succeeds. See `test/sandbox/darwin_escape.zig`'s own mach-lookup tests.
 
 **A layer this driver reports as on, and does not enforce, is worse than a
 refusal.** A refusal cannot mislead anybody. Chock compares a policy against a
