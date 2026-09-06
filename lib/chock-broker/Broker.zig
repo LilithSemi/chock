@@ -180,6 +180,26 @@ secrets: secrets_mod.Store = .{},
 /// value that reaches this field is matched like any other.
 redaction: []const []const u8 = &.{},
 
+/// A memory of every `approved_by_user_for_session` answer this broker has
+/// already read back from the log, for the one branch of `request` that asks
+/// the table's own answer was `ask`. Null for a caller that holds none, which
+/// is every test of this file before this field existed and every caller
+/// built before it.
+///
+/// **Owned by whoever builds this `Broker`, and not by this struct.** A
+/// `Session` folds the whole log once and keeps `SessionGrants` as one of its
+/// own fields. A caller that already has one passes its address here rather
+/// than have this file keep a second copy that could fall out of step with
+/// the first.
+///
+/// **Consulted here and nowhere else.** `chock_broker.network.Network` and
+/// the loop's own tool gate, reached through `chock_core.arbiter`, both end
+/// up in this one function, so a memory that lives here serves both instead
+/// of only the caller that thought to add it. See `chock_proto.state.SessionGrants.get`
+/// for the proof this function alone can give it: that the fresh evaluation
+/// really was `ask`.
+grants: ?*chock_proto.state.SessionGrants = null,
+
 /// How long a request waits for an answer, when the caller names no other
 /// time. A request has a timeout, and a request which expires counts as a
 /// refusal. Five minutes is long enough for a user to read a diff and short
@@ -518,7 +538,21 @@ pub fn request(
             _ = try appendAnswer(gpa, io, locked, ask, 0, .denied_by_policy, "", self.waiter.nowMs(io), .{});
             return .denied_by_policy;
         },
-        .ask => return self.askTheHuman(gpa, io, storage, locked, ask, .{}, diag),
+        .ask => {
+            // **The one place this memory is read.** `grants.get` demands
+            // proof that the fresh evaluation was exactly `ask`, and this
+            // branch is that proof: nothing above it, and nothing that
+            // follows below the `switch`, is a second evaluation. A grant
+            // found here answers with no `approval.request` and no
+            // `approval.response` of its own: the person's decision is
+            // already in the log once, as the `approved_by_user_for_session`
+            // line `findAnswer` folded in, and a second record of the same
+            // fact would be the flood this memory exists to prevent.
+            if (self.grants) |grants| {
+                if (grants.get(ask.action, true) != null) return .approved_by_user;
+            }
+            return self.askTheHuman(gpa, io, storage, locked, ask, .{}, diag);
+        },
         .agent_review, .agent_then_human => {},
     }
 
@@ -717,7 +751,7 @@ fn askTheHuman(
 
     var last_look_ms = asked_at_ms;
     while (true) {
-        if (try findAnswer(gpa, io, storage, request_id, ask, diag)) |outcome| return outcome;
+        if (try findAnswer(gpa, io, storage, request_id, ask, self.grants, diag)) |outcome| return outcome;
 
         const now_ms = self.waiter.nowMs(io);
         // A `Waiter` whose clock runs backwards would make the deadline
@@ -952,6 +986,7 @@ fn findAnswer(
     storage: chock_proto.storage.Storage,
     request_id: u64,
     ask: Request,
+    grants: ?*chock_proto.state.SessionGrants,
     diag: ?*?Diagnostic,
 ) Error!?Outcome {
     var replay = try storage.replay(gpa, io, request_id);
@@ -992,9 +1027,16 @@ fn findAnswer(
             // as a plain yes permits it. The extra promise, not to be asked
             // again about this exact action for the rest of the session, is
             // not a fact about this one request: it is a memory kept in
-            // `chock_proto.state.SessionGrants`, folded from the same
-            // response line by whoever reads the log next.
-            .approved_by_user_for_session => .approved_by_user,
+            // `chock_proto.state.SessionGrants`. `grants` is null for a
+            // caller that holds none, in which case this line is read and
+            // the promise is not kept anywhere, the same as before this
+            // parameter existed. A caller that does hold one gets the fold
+            // here, the moment the line is read, rather than a second reader
+            // having to replay the log again to learn the same fact.
+            .approved_by_user_for_session => blk: {
+                if (grants) |g| try g.apply(gpa, answer);
+                break :blk .approved_by_user;
+            },
             .refused_by_user => .refused_by_user,
             .expired => .expired,
             // **The three a review writes are not answers.** This broker

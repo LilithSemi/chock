@@ -44,19 +44,49 @@
 //! `evil.com.anthropic.api` becomes `net.connect.api.anthropic.com.evil.443`,
 //! which `net.connect.com.anthropic.*` does not match.
 //!
-//! ## Only `allow` permits, and everything else is a refusal
+//! ## Only `allow` grants outright, and `ask` may now ask
 //!
-//! `evaluateChain` gives one of five decisions. This grants on `allow` and
-//! refuses on the other four, including `ask`.
+//! `evaluateChain` gives one of five decisions. `allow` grants at once,
+//! `deny`, `agent_review` and `agent_then_human` still refuse outright, and
+//! `ask` reaches a person when there is a way to ask one.
 //!
-//! **That is a narrowing, and it is not a shortcut.** A connection is served
-//! from inside a tool call that is already running: `Sandbox.spawn` is in its
-//! wait loop, and the loop that would ask a person is holding the session log's
-//! exclusive lock and waiting for that same `spawn` to return. So a question
-//! asked here could not be answered by anybody, and a decision that needs an
-//! answer from outside is a decision this cannot pay for. Refusing is the safe
-//! direction and the only honest one. An author who wants a host reached
-//! writes `allow` for it.
+//! **This used to be a flat refusal on every decision but `allow`, and the
+//! reasoning for it was correct at the time.** A connection is served from
+//! inside a tool call that is already running: `Sandbox.spawn` is in its wait
+//! loop, called from the same turn of `Loop.run` that holds the session log's
+//! own exclusive lock. Asking meant writing a question into that log and
+//! waiting for an answer, and the one thing that could write an answer was
+//! the very loop that was blocked on this call. A question with no possible
+//! answer is not a question, so refusing was the safe direction and the only
+//! honest one.
+//!
+//! **The fact under that reasoning changed, and not the reasoning itself.**
+//! `Broker.request` writes the question and waits for the answer through the
+//! caller's own locked handle, in the same process, rather than through a
+//! second lock of its own: see `lib/chock-broker/Broker.zig`'s own top
+//! comment on the one seam that made this possible. `Network` is broker side
+//! already, so it can call `Broker.request` directly and let the same wait
+//! that answers every other approval answer this one. `deny`, `agent_review`
+//! and `agent_then_human` are not part of this change: a review still needs a
+//! reviewer this file has no way to start, and a `deny` needs nobody asked at
+//! all, so both still refuse outright the way they always did. An author who
+//! wants a host reached without a question writes `allow` for it.
+//!
+//! ## The volume this creates, and the memory that bounds it
+//!
+//! `Broker.request` writes an `approval.response` for every decision it
+//! reaches, `allow` included. This file still decides `allow` itself and
+//! never calls the broker for it, so the common case costs what it always
+//! did: nothing written. Only `ask` reaches the broker, and one MCP server
+//! can open the same host and port hundreds of times in one session, so
+//! asking a person every single time would flood the log with the same
+//! question answered the same way. `chock_proto.state.SessionGrants`, held by
+//! `Broker.request` itself, is what a person's `approved_by_user_for_session`
+//! answer is remembered in: the second and every later connection to that
+//! same action is answered from that memory, with no `approval.request` and
+//! no `approval.response` of its own. See `Broker.request`'s own comment on
+//! its `ask` branch for where that memory is read, and why there and nowhere
+//! else.
 //!
 //! ## A child is never stronger than its parent
 //!
@@ -127,6 +157,13 @@
 //! rule names a host.** The two rules are separate on purpose: the first says
 //! a server may have a socket, and the second says where it may point.
 //!
+//! **This caller builds every `Network` with `asker` left null.** MCP servers
+//! start before `Loop.run` takes the session log's exclusive lock, so there is
+//! no `Locked` handle yet to hand one. An `ask` decision there still refuses
+//! outright, exactly as it always has: see `Network.Asker` and this file's
+//! own top comment on the volume `ask` can now answer for a caller that does
+//! hold one.
+//!
 //! What is real besides is `test/sandbox/escape.zig`, which drives this file
 //! through a real `Sandbox.spawn` on every test run.
 
@@ -134,14 +171,29 @@ const std = @import("std");
 
 const chock_policy = @import("chock-policy");
 const chock_sandbox = @import("chock-sandbox");
+const chock_proto = @import("chock-proto");
 
 const diagnostic = @import("diagnostic.zig");
 /// Why the broker refused an act, or could not carry one out. One type for
 /// the whole module: see `chock-broker/diagnostic.zig`.
 pub const Diagnostic = diagnostic.Diagnostic;
 
+const Broker = @import("Broker.zig");
+const event = chock_proto.event;
+
 const table = chock_policy.table;
 const NetBroker = chock_sandbox.NetBroker;
+
+/// `chock_proto.storage.Locked` is not `pub`, so no file outside
+/// `chock-proto` can name it. This reaches the same type through the return
+/// type of `Storage.lock`, which is public: the same route
+/// `chock_core.arbiter.Locked` uses, and for the same reason. `Broker.request`
+/// takes a locked handle as `anytype` because it cannot name this either. A
+/// struct field has to name a real type, so this file needs its own copy of
+/// the trick.
+pub const Locked = @typeInfo(
+    @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
+).error_union.payload;
 
 /// What every action name in this file starts with. This is the action class
 /// for reaching a host.
@@ -321,6 +373,28 @@ fn ip4BytesAreReachable(bytes: [4]u8) bool {
     return true;
 }
 
+/// What a `Network` needs to turn a refusal into a question. Every part of
+/// this is borrowed: the caller that builds one still owns the broker, the
+/// storage, and the lock, for as long as the `Network` beside it lives.
+///
+/// **`broker.policy` must be the same table this file's own `Network.table`
+/// is.** Nothing here checks that. It is a caller invariant the same way a
+/// subagent's own chain is. The two are read separately, once here and once
+/// inside `Broker.request`, so an author who wires them to different tables
+/// has built a `Network` that decides on one policy and asks on another.
+pub const Asker = struct {
+    broker: *const Broker,
+    storage: chock_proto.storage.Storage,
+    locked: *Locked,
+};
+
+/// The most parents `askPermits` will build a `Broker.Request` for.
+/// Generous against `chock_policy.subagents.default_max_depth`, which is 6,
+/// so no session built under this project's own limits comes near it. A
+/// chain deeper than this refuses rather than allocates, the same safe
+/// direction every other bound in this file takes.
+const max_chain_parents = 32;
+
 /// The network broker for one sandboxed call.
 ///
 /// **One of these belongs to one `Sandbox.spawn`.** It holds the policy that
@@ -344,6 +418,12 @@ pub const Network = struct {
     tool: []const u8,
     /// Where a name is resolved and a connection is opened.
     transport: Transport,
+    /// What lets a refusal become a question, when there is one to ask. Null
+    /// for a `Network` built where there is no `Locked` handle to give it:
+    /// the MCP startup path in `src/run.zig` builds one before `Loop.run`
+    /// takes the session lock, so it has none to give. See this file's own
+    /// top comment on what changed and what did not.
+    asker: ?Asker = null,
 
     /// How many connections were granted and how many were refused, so a
     /// caller can say what a call did without reading a log.
@@ -397,6 +477,16 @@ pub const Network = struct {
             .action = action,
         }, &fault);
         if (decision != .allow) {
+            // **Only `ask` is ever sent on.** `deny`, `agent_review` and
+            // `agent_then_human` are refused right here, exactly as they
+            // always were: see this file's own top comment for why asking a
+            // person is the one case that changed, and not the other two.
+            if (decision == .ask) {
+                if (self.asker) |asker| {
+                    if (self.askPermits(asker, action, host, port)) return self.finishConnect(host, port);
+                    return .refused;
+                }
+            }
             return self.refuse(.{ .net_host_not_permitted = .{
                 .host = self.copy(host),
                 .port = port,
@@ -404,6 +494,76 @@ pub const Network = struct {
             } });
         }
 
+        return self.finishConnect(host, port);
+    }
+
+    /// Ask the broker about a connection this file's own table did not answer
+    /// `allow` about. True when it may proceed. A refusal is recorded exactly
+    /// the way every other refusal in this file is, so a caller reads
+    /// `diagnostic` and `refused` for either path and never a third one.
+    ///
+    /// **`action` is a `net.connect` action, never a general one.** Building
+    /// the same key twice, once here and once inside `Broker.request`, is not
+    /// the second evaluation this file's own top comment warns against: the
+    /// table `Broker.request` reads is the one that decides, and this
+    /// function never reads its answer to grant anything on its own. The
+    /// evaluation above this call is what routes here in the first place, and
+    /// nothing routes here that the table did not already say `ask` about.
+    fn askPermits(self: *Network, asker: Asker, action: []const u8, host: []const u8, port: u16) bool {
+        // The parents of this agent, in the shape `Broker.Request` wants: see
+        // `event.SpawnLink`. `self.chain` already ends with this agent's own
+        // kind, which `Broker.Request.agent_kind` carries separately, so only
+        // what comes before it is a parent.
+        const parents = self.chain[0 .. self.chain.len - 1];
+        if (parents.len > max_chain_parents) {
+            _ = self.refuse(.{ .net_host_not_permitted = .{
+                .host = self.copy(host),
+                .port = port,
+                .decision = .ask,
+            } });
+            return false;
+        }
+        var links: [max_chain_parents]event.SpawnLink = undefined;
+        for (parents, links[0..parents.len]) |kind, *slot| slot.* = .{ .agent_kind = kind, .reason = "" };
+
+        // A description for whoever answers. `NetBroker.connect` gives this
+        // file only a host and a port, so that is all either string can say.
+        var summary_buf: [max_host_bytes + 40]u8 = undefined;
+        const summary = std.fmt.bufPrint(&summary_buf, "reach {s} on port {d}", .{ host, port }) catch
+            "reach a host this session's MCP server asked for";
+
+        const outcome = asker.broker.request(self.gpa, self.io, asker.storage, asker.locked, .{
+            .action = action,
+            .summary = summary,
+            .detail = summary,
+            .reason = "",
+            .agent_kind = self.agent_kind,
+            .model_alias = self.model,
+            .tool = self.tool,
+            .tool_call_id = "",
+            .spawn_chain = links[0..parents.len],
+        }, null) catch {
+            _ = self.refuse(.{ .net_host_not_permitted = .{
+                .host = self.copy(host),
+                .port = port,
+                .decision = .ask,
+            } });
+            return false;
+        };
+
+        if (outcome.permits()) return true;
+        _ = self.refuse(.{ .net_host_not_permitted = .{
+            .host = self.copy(host),
+            .port = port,
+            .decision = .ask,
+        } });
+        return false;
+    }
+
+    /// The name is resolved and the connection is opened, for a request this
+    /// file has already decided may proceed, whether the table said `allow`
+    /// on its own or the broker said yes on its behalf.
+    fn finishConnect(self: *Network, host: []const u8, port: u16) NetBroker.Grant {
         const address = self.transport.lookup(self.io, host, port) catch
             return self.refuse(.{ .net_host_not_resolved = self.about(host, port) });
 
@@ -1048,4 +1208,289 @@ test "a port is part of the key, so a rule about one port is not a rule about ev
     try testing.expect(network.answer("api.anthropic.com", 443) == .granted);
     try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 80));
     try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 4433));
+}
+
+// ## A connection can now ask, through a real `Broker`
+//
+// Everything above this line builds no `Asker` and reaches no `Broker`; every
+// test above still passes unchanged, which is the proof that a `Network`
+// nobody wires an `Asker` into behaves exactly as it always has. The tests
+// below build a real `chock_broker.Broker` over a real, in-memory
+// `chock_proto.storage.Storage`, the same pieces `Broker.zig`'s own tests use,
+// so the question this file now asks is answered by the same code a live
+// session answers it with.
+
+const ask_anthropic: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "net.connect.com.anthropic.*", .decision = .ask },
+    \\        },
+    \\    },
+    \\}
+;
+
+const deny_anthropic: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "net.connect.com.anthropic.*", .decision = .deny },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// A `Broker.Waiter` that answers the one open request the first time it is
+/// asked to wait, with a fixed decision, and counts how many times it was
+/// asked to wait at all. **The count is the whole point of `test 4`**: a
+/// second connection answered from memory never calls `wait` a second time,
+/// because `Broker.request`'s own `ask` branch returns before it ever does.
+const AnswerOnWait = struct {
+    gpa: std.mem.Allocator,
+    store: chock_proto.storage.Storage,
+    locked: *Locked,
+    decision: event.ApprovalDecision,
+    now_ms: i64 = 1_700_000_000_000,
+    waits: usize = 0,
+    answered: bool = false,
+
+    fn waiter(self: *AnswerOnWait) Broker.Waiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Broker.Waiter.VTable{ .nowMs = nowMsFn, .wait = waitFn };
+
+    fn nowMsFn(ptr: *anyopaque, io: std.Io) i64 {
+        _ = io;
+        const self: *AnswerOnWait = @ptrCast(@alignCast(ptr));
+        return self.now_ms;
+    }
+
+    fn waitFn(ptr: *anyopaque, io: std.Io, budget_ms: u64) Broker.Waiter.Wake {
+        const self: *AnswerOnWait = @ptrCast(@alignCast(ptr));
+        self.waits += 1;
+        if (!self.answered) {
+            self.answered = true;
+            if (Broker.openRequest(self.gpa, io, self.store) catch null) |id| {
+                // **The action is read back and echoed, not guessed.**
+                // `SessionGrants.apply` only ever keys on the action a real
+                // response names, so a response that left it out, the way
+                // `answerAsUser` in `Broker.zig`'s own tests does for a plain
+                // yes, would never be remembered here either.
+                if (requestActionFor(self.gpa, io, self.store, id) catch null) |owned_action| {
+                    defer self.gpa.free(owned_action);
+                    _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
+                        .request_id = id,
+                        .decision = self.decision,
+                        .responder = "tester",
+                        .action = owned_action,
+                    } }, self.now_ms) catch {};
+                }
+            }
+        }
+        self.now_ms += @intCast(budget_ms);
+        return .slept;
+    }
+};
+
+/// The `action` of the `approval.request` envelope with this id, copied so
+/// the caller can use it after the replay that found it ends. Null when
+/// there is no such envelope.
+fn requestActionFor(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    id: u64,
+) !?[]u8 {
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.id != id) continue;
+        if (parsed.value.event != .approval_request) continue;
+        return try gpa.dupe(u8, parsed.value.event.approval_request.action);
+    }
+    return null;
+}
+
+/// How many events of `kind` are in the whole log, from the start. Used to
+/// pin that a memory served grant writes nothing at all: not a second
+/// `approval.request`, and not a second `approval.response` either.
+fn countKind(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    kind: event.Kind,
+) !usize {
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var count: usize = 0;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (std.meta.activeTag(parsed.value.event) == kind) count += 1;
+    }
+    return count;
+}
+
+test "an allow decision still grants with nobody asked and no question written, even when the network could ask" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK1");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .approved_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    try testing.expect(network.answer("api.anthropic.com", 443) == .granted);
+    try testing.expectEqual(@as(usize, 0), waiter.waits);
+    try testing.expectEqual(@as(usize, 0), try countKind(gpa, io, store, .approval_request));
+}
+
+test "ask with a broker that permits grants the connection" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK2");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .approved_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    const grant = network.answer("api.anthropic.com", 443);
+    switch (grant) {
+        .granted => |fd| try testing.expect(fd >= 0),
+        .refused => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), network.granted);
+    try testing.expectEqual(@as(usize, 1), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 1), waiter.waits);
+    try testing.expectEqual(@as(usize, 1), try countKind(gpa, io, store, .approval_request));
+}
+
+test "ask with a broker that refuses does not connect, and the name is never resolved" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK3");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .refused_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    // Mutation check: move the broker call below the lookup and this fails
+    // while the granted case above still passes.
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 0), bench.fake.dials);
+    try testing.expectEqual(@as(usize, 1), network.refused);
+}
+
+test "a second connection to the same host and port is answered from the session's own memory, with no second question" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK4");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{
+        .gpa = gpa,
+        .store = store,
+        .locked = &locked,
+        .decision = .approved_by_user_for_session,
+    };
+    var grants: chock_proto.state.SessionGrants = .{};
+    defer {
+        var it = grants.granted.keyIterator();
+        while (it.next()) |key| gpa.free(key.*);
+        grants.granted.deinit(gpa);
+    }
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter(), .grants = &grants };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    const first = network.answer("api.anthropic.com", 443);
+    try testing.expect(first == .granted);
+    try testing.expectEqual(@as(usize, 1), waiter.waits);
+
+    const second = network.answer("api.anthropic.com", 443);
+    try testing.expect(second == .granted);
+    // No second question: the waiter was never asked to wait again, because
+    // `Broker.request` answered out of memory before it ever called `wait`.
+    try testing.expectEqual(@as(usize, 1), waiter.waits);
+    try testing.expectEqual(@as(usize, 2), network.granted);
+    try testing.expectEqual(@as(usize, 1), try countKind(gpa, io, store, .approval_request));
+}
+
+test "a deny decision never reaches the broker's question path at all" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, deny_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK5");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var waiter = AnswerOnWait{ .gpa = gpa, .store = store, .locked = &locked, .decision = .approved_by_user };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
+
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    try testing.expectEqual(@as(usize, 0), waiter.waits);
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 0), try countKind(gpa, io, store, .approval_request));
+}
+
+test "a network built with no asker refuses ask exactly as it always has, because the MCP startup path has no locked handle to give it" {
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    // `network.asker` is null, the default `Bench.ready` leaves it at.
+    try testing.expectEqual(NetBroker.Grant.refused, network.answer("api.anthropic.com", 443));
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 1), network.refused);
 }

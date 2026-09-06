@@ -4911,6 +4911,15 @@ const SessionArbiter = struct {
             // `Loop.appendAndApply` cannot cover what another library appends,
             // so the same values reach both. See `brokerRedaction`.
             .redaction = self.started.redact_values,
+            // **The memory that stops this loop from asking the same
+            // question twice.** `session` was just folded from the whole
+            // log, so it already holds every `approved_by_user_for_session`
+            // answer a person gave to an earlier question in this session.
+            // Without this, a person who says "yes, for the rest of the
+            // session" to one tool call would be asked again on the very
+            // next one, because `decideFn` folds a brand new `Session` and
+            // builds a brand new `Broker` every time it runs.
+            .grants = &session.grants,
         };
 
         // The promises this session and every session above it made. The same
@@ -4931,9 +4940,32 @@ const SessionArbiter = struct {
 
         // Why the broker refused, or could not decide. Released after the
         // answer is written, because a copy in it lives no longer than that.
+        // Freed with `session`'s own arena and not with `gpa`, to match the
+        // allocator the request below is passed: see the paragraph there.
         var broker_diag: ?chock_broker.Diagnostic = null;
-        defer if (broker_diag) |*d| d.deinit(gpa);
-        const outcome = broker.request(gpa, io, self.started.storage, locked, .{
+        defer if (broker_diag) |*d| d.deinit(session.arena.allocator());
+        // **`session.arena.allocator()`, and not `gpa`.**
+        // `chock_proto.state.SessionGrants.granted` is a
+        // `std.StringHashMapUnmanaged`: it carries no allocator of its own,
+        // and its `grow` (`lib/zig/std/hash_map.zig`) allocates the new
+        // backing array with whatever allocator the *current* call passes
+        // and frees the *old* array with that same value, whichever
+        // allocator actually built it. `foldSession` above filled
+        // `session.grants` through `session`'s own arena, so this call has
+        // to use that same arena, or a later regrow frees arena memory
+        // through the wrong allocator.
+        //
+        // **This does not fail on the first grant, or the tenth.** A regrow
+        // only happens once the map's current capacity is exceeded, so a
+        // session with a handful of remembered grants never reaches it in a
+        // quick test. A long session that asks about many hosts would, and
+        // the failure then lands as an invalid free deep inside `grow`,
+        // nowhere near the mismatched allocator that caused it. `request`'s
+        // own storage writes are unaffected either way: `append` uses this
+        // allocator only for a scratch buffer it frees before it returns,
+        // and the backing store grows through the allocator the storage
+        // backend was opened with, never this one.
+        const outcome = broker.request(session.arena.allocator(), io, self.started.storage, locked, .{
             .action = ask.action,
             .summary = ask.summary,
             .detail = ask.detail,
@@ -12945,6 +12977,176 @@ test "a promise the session made reaches the end of session approval, out of the
         chock_broker.Broker.Outcome.allowed_by_policy,
         try broker.request(gpa, io, storage, &locked, without, null),
     );
+}
+
+/// A `chock_broker.Broker.Waiter` a test drives, over a real log: it answers
+/// the one open request the first time it is asked to wait, `for_session`,
+/// and counts how many times it was asked to wait at all. What
+/// `lib/chock-broker/network.zig`'s own `AnswerOnWait` is for that file, this
+/// is for this one.
+const GateWaiter = struct {
+    gpa: std.mem.Allocator,
+    store: chock_proto.storage.Storage,
+    locked: *chock_core.arbiter.Locked,
+    now_ms: i64 = 1_700_000_000_000,
+    waits: usize = 0,
+    answered: bool = false,
+
+    fn waiter(self: *GateWaiter) chock_broker.Broker.Waiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_broker.Broker.Waiter.VTable{ .nowMs = nowMsFn, .wait = waitFn };
+
+    fn nowMsFn(ptr: *anyopaque, io: std.Io) i64 {
+        _ = io;
+        const self: *GateWaiter = @ptrCast(@alignCast(ptr));
+        return self.now_ms;
+    }
+
+    fn waitFn(ptr: *anyopaque, io: std.Io, budget_ms: u64) chock_broker.Broker.Waiter.Wake {
+        const self: *GateWaiter = @ptrCast(@alignCast(ptr));
+        self.waits += 1;
+        if (!self.answered) {
+            self.answered = true;
+            if (chock_broker.Broker.openRequest(self.gpa, io, self.store) catch null) |id| {
+                // The action is read back and echoed, not guessed: see
+                // `network.zig`'s own `requestActionFor` for why
+                // `SessionGrants.apply` needs it to be there at all.
+                if (gateRequestAction(self.gpa, io, self.store, id) catch null) |owned| {
+                    defer self.gpa.free(owned);
+                    _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
+                        .request_id = id,
+                        .decision = .approved_by_user_for_session,
+                        .responder = "tester",
+                        .action = owned,
+                    } }, self.now_ms) catch {};
+                }
+            }
+        }
+        self.now_ms += @intCast(budget_ms);
+        return .slept;
+    }
+};
+
+fn gateRequestAction(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    id: u64,
+) !?[]u8 {
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.id != id) continue;
+        if (parsed.value.event != .approval_request) continue;
+        return try gpa.dupe(u8, parsed.value.event.approval_request.action);
+    }
+    return null;
+}
+
+fn gateCountApprovalRequests(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !usize {
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var count: usize = 0;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .approval_request) count += 1;
+    }
+    return count;
+}
+
+test "the loop's own tool gate remembers a for-session grant across separate questions" {
+    // `SessionArbiter.decideFn` folds a brand new `state.Session` from the
+    // log and builds a brand new `chock_broker.Broker` around it for every
+    // single question, because the session that asked the first question may
+    // be long gone by the time a later one arrives. Without `.grants =
+    // &session.grants` wired into that `Broker`, a person who answers "yes,
+    // for the rest of the session" to one tool call is asked again on the
+    // very next one, because nothing carries that answer from one `decideFn`
+    // call to the next except the log itself. This pins the fix at the level
+    // `decideFn` actually works at: fold, build, ask, fold again, ask again,
+    // with no `Started` or `SessionArbiter` needed to prove it, the same way
+    // the test above needs none to prove a promise reaches `applyWork`.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ask_the_push = try chock_policy.table.Table.parse(gpa,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "git.push", .decision = .ask },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(gpa, ask_the_push);
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01GATE");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    const ask = chock_broker.Broker.Request{
+        .action = "git.push",
+        .summary = "push the branch to origin",
+        .detail = "a1b2c3 fix the parser\n",
+        .reason = "the task asked for the change to be published",
+        .agent_kind = "main",
+        .model_alias = "main",
+        .tool = "git",
+        .tool_call_id = "call1",
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), try gateCountApprovalRequests(gpa, io, storage));
+
+    // The first tool call: `decideFn`'s own first question. Nobody has
+    // answered this action before, so the table's `ask` reaches a person,
+    // who says yes for the rest of the session.
+    {
+        var session = chock_proto.state.Session.init(gpa);
+        defer session.deinit();
+        foldSession(gpa, io, storage, &session);
+
+        var locked = try storage.lock(io);
+        defer locked.unlock(io) catch {};
+
+        var waiter = GateWaiter{ .gpa = gpa, .store = storage, .locked = &locked };
+        const broker = chock_broker.Broker{
+            .policy = ask_the_push,
+            .waiter = waiter.waiter(),
+            .grants = &session.grants,
+        };
+
+        const outcome = try broker.request(session.arena.allocator(), io, storage, &locked, ask, null);
+        try std.testing.expectEqual(chock_broker.Broker.Outcome.approved_by_user, outcome);
+        try std.testing.expectEqual(@as(usize, 1), waiter.waits);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
+
+    // The second, identical tool call: `decideFn` runs again from nothing,
+    // exactly as it would for a later turn of the same session. It folds a
+    // fresh `Session` from the log, which already holds the answer above, and
+    // builds a fresh `Broker` around it. No second question reaches anybody.
+    {
+        var session = chock_proto.state.Session.init(gpa);
+        defer session.deinit();
+        foldSession(gpa, io, storage, &session);
+
+        var locked = try storage.lock(io);
+        defer locked.unlock(io) catch {};
+
+        var waiter = GateWaiter{ .gpa = gpa, .store = storage, .locked = &locked };
+        const broker = chock_broker.Broker{
+            .policy = ask_the_push,
+            .waiter = waiter.waiter(),
+            .grants = &session.grants,
+        };
+
+        const outcome = try broker.request(session.arena.allocator(), io, storage, &locked, ask, null);
+        try std.testing.expectEqual(chock_broker.Broker.Outcome.approved_by_user, outcome);
+        // No second question: the waiter was never asked to wait at all,
+        // because `Broker.request`'s own `ask` branch answered from memory
+        // before it ever called `askTheHuman`.
+        try std.testing.expectEqual(@as(usize, 0), waiter.waits);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
 }
 
 test "a promise a parent made binds its subagents, out of the parent's own log" {
