@@ -734,6 +734,15 @@ pub const ApprovalDecision = union(enum) {
     denied_by_policy,
     /// The user answered yes.
     approved_by_user,
+    /// The user answered yes, and also asked not to be asked about this exact
+    /// action again for the rest of this session. `chock_proto.state.SessionGrants`
+    /// is the fold that remembers it, keyed by the exact `action` string this
+    /// response names, and it lives only as long as this process does:
+    /// nothing this decision causes is ever written to `chock.zon`. See
+    /// `SessionGrants`'s own doc for the whole contract, and in particular for
+    /// why a memory kept here can only ever narrow how often a person is
+    /// asked, never widen what the policy table permits.
+    approved_by_user_for_session,
     /// The user answered no.
     refused_by_user,
     /// Nobody answered before the timeout named in the matching request.
@@ -1851,6 +1860,74 @@ test "a policy refusal round trips as its own decision, and an older reader keep
     try std.testing.expectEqualStrings("", future.value.event.approval_response.action);
     try std.testing.expectEqualStrings("", future.value.event.approval_response.tool_call_id);
     try std.testing.expectEqualStrings("ross", future.value.event.approval_response.responder);
+}
+
+test "a session grant round trips as its own decision, and an older reader keeps only its name" {
+    // `approved_by_user_for_session` is a wire format change the same way
+    // `denied_by_policy` was, tested the same two ways just above: a reader
+    // that knows the name gives the member, and a reader that does not keeps
+    // the spelling instead of failing the line.
+    const allocator = std.testing.allocator;
+
+    const original = Envelope{
+        .id = 4096,
+        .session = "01H0",
+        .time_ms = 5,
+        .event = .{ .approval_response = .{
+            .request_id = 4096,
+            .decision = .approved_by_user_for_session,
+            .responder = "terminal",
+            .action = "git.push",
+            .tool_call_id = "call1",
+        } },
+    };
+
+    const text = try toJson(allocator, original);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"approved_by_user_for_session\"") != null);
+
+    const parsed = try fromJson(allocator, text);
+    defer parsed.deinit();
+    const response = parsed.value.event.approval_response;
+    try std.testing.expectEqual(
+        ApprovalDecision.approved_by_user_for_session,
+        std.meta.activeTag(response.decision),
+    );
+    try std.testing.expectEqualStrings("git.push", response.action);
+    try std.testing.expectEqualStrings("call1", response.tool_call_id);
+
+    // The exact member set `ApprovalDecision` had the moment before this one
+    // was added, built over the same `WireString` every decision in this file
+    // shares, so what runs below is the very code path a real older binary
+    // would run and not a hand rolled stand-in for it. Fed the wire name
+    // above, it has no case for it, so the fallback gives a name and nothing
+    // that reads as a yes: `lib/chock-broker/Broker.zig`'s own
+    // "a decision this broker does not know is not permission" is what says
+    // that a decision landing here is never permission, whichever build
+    // could not read it or why.
+    const OldDecision = union(enum) {
+        allowed_by_policy,
+        denied_by_policy,
+        approved_by_user,
+        refused_by_user,
+        expired,
+        approved_by_review,
+        refused_by_review,
+        review_unavailable,
+        unknown: []const u8,
+
+        pub const jsonParse = WireString(@This()).jsonParse;
+    };
+
+    var old = try std.json.parseFromSlice(
+        OldDecision,
+        allocator,
+        "\"approved_by_user_for_session\"",
+        .{},
+    );
+    defer old.deinit();
+    try std.testing.expectEqual(std.meta.Tag(OldDecision).unknown, std.meta.activeTag(old.value));
+    try std.testing.expectEqualStrings("approved_by_user_for_session", old.value.unknown);
 }
 
 test "no serialized envelope contains a raw newline, whatever the Kind, and every field round trips" {

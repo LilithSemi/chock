@@ -1234,6 +1234,10 @@ test "a client cannot claim the policy allowed it, and cannot claim a review did
         .allowed_by_policy,
         .approved_by_review,
         .{ .unknown = "approved_by_everyone" },
+        // A client cannot grant itself the session wide memory either: that
+        // word is for the person at this terminal alone, over the one handle
+        // `src/approval.zig` holds, and a socket peer is never that.
+        .approved_by_user_for_session,
     };
 
     for (claimed) |decision| {

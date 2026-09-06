@@ -988,6 +988,13 @@ fn findAnswer(
             .allowed_by_policy => .allowed_by_policy,
             .denied_by_policy => .denied_by_policy,
             .approved_by_user => .approved_by_user,
+            // The immediate act this line answers about is permitted exactly
+            // as a plain yes permits it. The extra promise, not to be asked
+            // again about this exact action for the rest of the session, is
+            // not a fact about this one request: it is a memory kept in
+            // `chock_proto.state.SessionGrants`, folded from the same
+            // response line by whoever reads the log next.
+            .approved_by_user_for_session => .approved_by_user,
             .refused_by_user => .refused_by_user,
             .expired => .expired,
             // **The three a review writes are not answers.** This broker

@@ -390,8 +390,12 @@ pub const Terminal = struct {
                 const end = std.mem.indexOfScalar(u8, line, '\n') orelse return .slept;
                 const said = line[0..end];
                 self.filled = 0;
-                const decision: event.ApprovalDecision =
-                    if (saysYes(said)) .approved_by_user else .refused_by_user;
+                const decision: event.ApprovalDecision = if (saysYes(said))
+                    .approved_by_user
+                else if (saysSession(said))
+                    .approved_by_user_for_session
+                else
+                    .refused_by_user;
                 return self.record(io, request_id, decision);
             },
         }
@@ -673,16 +677,32 @@ pub const responder = "terminal";
 /// which of the two a reader is looking at.
 pub const display_responder = "display";
 
-/// Whether an answer is plainly yes.
+/// Whether an answer is plainly yes, for this one act alone.
 ///
 /// **Anything that is not is a refusal**, which is the rule
 /// `lib/chock-broker/review.zig` already keeps for a reviewer's answer. A
-/// typed word this does not know is not permission, the prompt names the two
-/// answers, and a bare newline is the default the prompt shows in capitals.
+/// typed word this does not know is not permission, the prompt names the
+/// three answers it accepts, and a bare newline is the default the prompt
+/// shows in capitals.
 pub fn saysYes(said: []const u8) bool {
     const trimmed = std.mem.trim(u8, said, " \t\r");
     if (trimmed.len == 0) return false;
     return std.ascii.eqlIgnoreCase(trimmed, "y") or std.ascii.eqlIgnoreCase(trimmed, "yes");
+}
+
+/// Whether an answer asks for the rest of the session, not only this once.
+///
+/// **A word of its own, and never a modifier on `saysYes`.** The two must
+/// stay easy to tell apart at a glance from a person answering at three in
+/// the morning, so `promptText` offers exactly two letters, `y` and `s`, and
+/// nothing that could be mistaken for the other. There is no third word that
+/// reaches `chock.zon`: see `event.ApprovalDecision.approved_by_user_for_session`
+/// for what this actually records, and why it never reaches farther than this
+/// process.
+pub fn saysSession(said: []const u8) bool {
+    const trimmed = std.mem.trim(u8, said, " \t\r");
+    if (trimmed.len == 0) return false;
+    return std.ascii.eqlIgnoreCase(trimmed, "s") or std.ascii.eqlIgnoreCase(trimmed, "session");
 }
 
 /// The question, as a person reads it. The caller owns the result.
@@ -736,7 +756,12 @@ pub fn promptText(
         );
     }
 
-    try text.appendSlice(gpa, "\nAllow this? [y/N] ");
+    // Two answers, and no third. `y` runs this one act and asks again next
+    // time. `s` runs it and remembers this exact action for the rest of the
+    // session, so a project that just wrote its first `ask` rule does not
+    // turn every later call into the same question. Neither ever reaches
+    // `chock.zon`: see `event.ApprovalDecision.approved_by_user_for_session`.
+    try text.appendSlice(gpa, "\nAllow this once, or for the rest of the session? [y/N/s] ");
     return text.toOwnedSlice(gpa);
 }
 
@@ -1047,8 +1072,36 @@ test "a yes and a no both leave a record that replays, written through the one h
         );
         // And the question reached the screen.
         try testing.expect(std.mem.indexOf(u8, result.shown, "workspace.apply") != null);
-        try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N]") != null);
+        try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/s]") != null);
     }
+}
+
+test "an answer of session is its own decision, distinct from a plain yes" {
+    // The third word the prompt accepts. It permits the act exactly as a
+    // plain yes does, from the broker's own point of view: `Broker.Outcome`
+    // has no member for it, only `event.ApprovalDecision` does, because the
+    // extra promise is a fact for `state.SessionGrants` to remember and not a
+    // fact about this one request. This is what the two must not be, and
+    // this test is what would fail if `readAnswer` ever folded them together.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const lines = [_][]const u8{"s\n"};
+    var console = FakeConsole{
+        .gpa = gpa,
+        .replies = &.{.{ .bytes = 0 }},
+        .lines = &lines,
+    };
+    defer console.deinit();
+
+    var result = try drive(gpa, io, &console, neverStopped, Broker.default_timeout_ms);
+    defer result.deinit();
+
+    try testing.expectEqual(Broker.Outcome.approved_by_user, result.outcome.?);
+    try testing.expect(result.outcome.?.permits());
+    try testing.expectEqual(@as(usize, 1), result.answers.len);
+    try testing.expectEqual(Decision.approved_by_user_for_session, result.answers[0]);
+    try testing.expect(std.mem.indexOf(u8, result.shown, "[y/N/s]") != null);
 }
 
 test "a Ctrl-C at the prompt ends the wait and leaves the question open" {
@@ -1144,7 +1197,7 @@ test "the question is asked once however many looks it takes, and the wait is bo
     }
 
     try testing.expectEqual(@as(usize, 20), console.reads);
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, console.shown.items, "Allow this?"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, console.shown.items, "Allow this once"));
     try testing.expectEqual(Broker.poll_interval_ms, console.last_budget_ms);
     // Twenty idle looks and still no answer: an idle console must not become
     // one.
@@ -1218,7 +1271,7 @@ test "the question names the act, the chain, the reason and the review" {
     try testing.expect(std.mem.indexOf(u8, text, "approved") != null);
     try testing.expect(std.mem.indexOf(u8, text, "the fix the task asked for") != null);
     // The two answers, with the refusing one as the default.
-    try testing.expect(std.mem.indexOf(u8, text, "[y/N]") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "[y/N/s]") != null);
 
     // A request no reviewer saw says nothing about a review, rather than
     // showing an empty one a reader would wonder about.
@@ -1265,7 +1318,11 @@ test "a diff too large for a screen is cut, and says how much was left out" {
     try testing.expectEqual(max_detail_bytes, std.mem.count(u8, text, "x"));
     try testing.expect(std.mem.indexOf(u8, text, "4096 more bytes") != null);
     // The question is still the last thing on screen, under the cut.
-    try testing.expect(std.mem.endsWith(u8, text, "Allow this? [y/N] "));
+    try testing.expect(std.mem.endsWith(
+        u8,
+        text,
+        "Allow this once, or for the rest of the session? [y/N/s] ",
+    ));
 }
 
 test "only a plain yes is a yes" {
@@ -1291,6 +1348,35 @@ test "only a plain yes is a yes" {
     try testing.expect(!saysYes("eyes"));
 }
 
+test "only a plain session is a session, and the two words never both fire" {
+    // The two words `promptText` offers must never overlap: a person reading
+    // `[y/N/s]` at three in the morning has to be able to tell them apart, and
+    // a waiter that answered both at once would leave `readAnswer`'s `if` to
+    // pick one arbitrarily.
+    try testing.expect(saysSession("s"));
+    try testing.expect(saysSession("S"));
+    try testing.expect(saysSession("session"));
+    try testing.expect(saysSession("SESSION"));
+    try testing.expect(saysSession(" s \r"));
+
+    try testing.expect(!saysSession(""));
+    try testing.expect(!saysSession("y"));
+    try testing.expect(!saysSession("yes"));
+    try testing.expect(!saysSession("n"));
+    try testing.expect(!saysSession("no"));
+    try testing.expect(!saysSession("sessions"));
+    try testing.expect(!saysSession("ss"));
+
+    const words = [_][]const u8{
+        "",        "y",   "yes",    "n",     "no", "s",
+        "session", "yep", "sesion", "maybe",
+    };
+    for (words) |word| {
+        // Never both. `readAnswer` trusts exactly that to give one decision.
+        try testing.expect(!(saysYes(word) and saysSession(word)));
+    }
+}
+
 test "an answer typed in pieces is read as one line" {
     // A pipe delivers what it has, which is not always a whole line, and a
     // terminal in its ordinary mode delivers one. Both have to work: a waiter
@@ -1313,7 +1399,7 @@ test "an answer typed in pieces is read as one line" {
     try testing.expectEqual(Broker.Outcome.approved_by_user, result.outcome.?);
     try testing.expectEqual(@as(usize, 3), console.reads);
     // Asked once, however many pieces the answer arrived in.
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.shown, "Allow this?"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.shown, "Allow this once"));
 }
 
 test "the real console polls with a bound, reads what arrived, and calls a closed end an end" {

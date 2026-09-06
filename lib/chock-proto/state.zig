@@ -390,6 +390,154 @@ pub const SelfPolicy = struct {
     }
 };
 
+/// A memory of every answer of `approved_by_user_for_session`, folded from the
+/// log so that a resumed process holds the same memory a crashed one did. See
+/// `event.ApprovalDecision.approved_by_user_for_session` for what the decision
+/// itself means.
+///
+/// **Not `chock_broker.askpass.Grants`.** That one holds a host's password;
+/// this one holds a person's answer to an approval. The two share a name and
+/// nothing else.
+///
+/// **A memory of an answer, and never a permission of its own.** Nothing here
+/// decides whether an act runs. A caller reads `get` only after the policy
+/// table has already answered `ask` about the very same action. A `deny` or
+/// an `allow` the table gives on its own is never looked up here, because
+/// there is nothing this struct could add to either of those. It cannot turn
+/// a `deny` into anything else: the table is asked first, every time, and
+/// this is consulted only on the branch where the table's own answer was
+/// already `ask`.
+///
+/// **Session only, and exact.** The key is the exact `action` string a
+/// request named, the same string `chock_policy.table` matches a rule
+/// against. Nothing here is ever written to `chock.zon`. This struct lives
+/// inside `Session`, which lives inside one process for as long as that
+/// process runs, and a process that takes the session over rebuilds it from
+/// nothing but the log, the same way it rebuilds every other field of
+/// `Session`.
+///
+/// **The type cannot enforce that a grant never outlives a narrowing, and it
+/// cannot even detect one.** A `policy.self` event that raises the ceiling
+/// above `ask` for an action already granted here is nothing this struct can
+/// see: `apply` below folds `approval.response` events only, and a
+/// `policy.self` event never passes through it. Session.apply is the caller
+/// that folds both, and `invalidate` is the half of this file that closes
+/// that gap. It exists because the struct itself has no way to close it.
+pub const SessionGrants = struct {
+    granted: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Merge one `approval.response` in. `allocator` owns the copy of the
+    /// action string this keeps, which for a `Session` is its own arena.
+    ///
+    /// **Only `approved_by_user_for_session` ever adds an entry, and the
+    /// match is exact equality, never an `else`.** A decision this fold does
+    /// not otherwise recognise cannot fall through into a grant by accident,
+    /// which is the one bug that would turn this memory into a hole.
+    ///
+    /// **`request_id` zero is refused too, even for that one decision.** A
+    /// response the policy table answers on its own, `allowed_by_policy` and
+    /// `denied_by_policy` both, always carries `request_id` zero, because no
+    /// question was ever written for a person to answer: see
+    /// `event.ApprovalResponse.request_id`. Nothing in this build ever writes
+    /// `approved_by_user_for_session` with a zero `request_id`, because a
+    /// person can only give that answer to a question that was actually
+    /// asked, but a fold reads whatever the log holds and must not take a
+    /// line's word for what it claims when the line contradicts itself. This
+    /// is what keeps the read that follows scoped to the ask branch: nothing
+    /// reaches `granted` that did not first pass through a real question.
+    pub fn apply(
+        self: *SessionGrants,
+        allocator: std.mem.Allocator,
+        response: event.ApprovalResponse,
+    ) std.mem.Allocator.Error!void {
+        if (response.decision != .approved_by_user_for_session) return;
+        if (response.action.len == 0 or response.request_id == 0) return;
+        if (self.granted.contains(response.action)) return;
+        const owned = try allocator.dupe(u8, response.action);
+        try self.granted.put(allocator, owned, {});
+    }
+
+    /// Whether this exact action was granted for the rest of the session.
+    /// Null for every action never granted this way, which includes one never
+    /// asked about and one answered with a plain yes, a no, or anything else.
+    ///
+    /// **`fresh_decision_is_ask` must be true only when the caller has just
+    /// asked the policy table about this same action and the table's answer
+    /// was exactly `ask`, never `agent_then_human` and nothing softer than
+    /// that either.** The caller proves it by passing this flag rather than
+    /// this function checking it, because `chock_proto` cannot import
+    /// `chock_policy` and so has no name here for
+    /// `chock_policy.table.Decision` to compare against. A plain boolean is
+    /// the only proof this file can ask for. When the flag is false this
+    /// returns null unconditionally, so an action the table now answers
+    /// `agent_then_human` about can never be waved through on the strength of
+    /// a grant a person gave before that requirement existed.
+    pub fn get(self: SessionGrants, action: []const u8, fresh_decision_is_ask: bool) ?bool {
+        if (!fresh_decision_is_ask) return null;
+        if (self.granted.contains(action)) return true;
+        return null;
+    }
+
+    /// Drop every remembered grant that `restriction` narrows below `ask`.
+    /// `Session.apply` calls this for every restriction inside a `policy.self`
+    /// event, before or after folding it into `SelfPolicy`. The order between
+    /// the two does not matter, because they are separate structures.
+    ///
+    /// **Only a ceiling stricter than `ask` invalidates.** `chock_policy.table.Decision`
+    /// ranks `deny` and `agent_then_human` below `ask`, and `agent_review` and
+    /// `allow` above it. A grant given while the table said `ask` answers the
+    /// same question a fresh `ask` would, so a restriction that only widens
+    /// past `ask` leaves it alone. `get` would not even look at it, since a
+    /// caller reads `get` only on the branch where the fresh evaluation is
+    /// exactly `ask`. A restriction that narrows to `deny` or to
+    /// `agent_then_human` changes what saying yes once was worth, so the
+    /// remembered answer can no longer stand for the question that is asked
+    /// now. An `unknown` ceiling this build cannot name is read the narrowest
+    /// way there is, the same way `chock_policy.ratchet.ceilingFromLog` reads
+    /// one, so it invalidates too.
+    ///
+    /// **The match is `restriction.action` as a pattern, `git.*` included.**
+    /// `chock_proto` cannot import `chock_policy` to reuse
+    /// `chock_policy.table.patternMatches`, so `matchesPattern` below is a
+    /// second, narrower copy of the same rule: every grant this holds is
+    /// already an exact action, never a pattern, so this only ever has to ask
+    /// whether one pattern covers one exact key, and never whether one
+    /// pattern covers another.
+    pub fn invalidate(
+        self: *SessionGrants,
+        allocator: std.mem.Allocator,
+        restriction: event.SelfRestriction,
+    ) std.mem.Allocator.Error!void {
+        const narrows = switch (restriction.ceiling) {
+            .deny, .agent_then_human, .unknown => true,
+            .ask, .agent_review, .allow => false,
+        };
+        if (!narrows or restriction.action.len == 0) return;
+
+        var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer doomed.deinit(allocator);
+        var it = self.granted.keyIterator();
+        while (it.next()) |key| {
+            if (matchesPattern(restriction.action, key.*)) try doomed.append(allocator, key.*);
+        }
+        for (doomed.items) |key| _ = self.granted.remove(key);
+    }
+};
+
+/// Whether `pattern` names `key`, in the pattern language
+/// `chock_policy.table.patternMatches` reads: a bare name that must equal
+/// `key` exactly, or a name followed by `.*` that also names anything below
+/// it. `git.*` matches `git.push` and does not match `git` itself.
+fn matchesPattern(pattern: []const u8, key: []const u8) bool {
+    if (std.mem.endsWith(u8, pattern, ".*")) {
+        const prefix = pattern[0 .. pattern.len - 2];
+        return key.len > prefix.len + 1 and
+            std.mem.startsWith(u8, key, prefix) and
+            key[prefix.len] == '.';
+    }
+    return std.mem.eql(u8, pattern, key);
+}
+
 pub const Session = struct {
     /// Owns every slice this struct or its entries hold. One arena for the
     /// whole session's lifetime keeps `apply` simple: nothing here is freed
@@ -433,6 +581,11 @@ pub const Session = struct {
     /// promised nothing. See `SelfPolicy`, and `chock_policy.ratchet` for what
     /// a promise means once it is here.
     self_policy: SelfPolicy = .{},
+
+    /// Every exact action a person has already said "yes, for the rest of
+    /// this session" to. Empty for a session where nobody has answered that
+    /// way yet. See `SessionGrants`.
+    grants: SessionGrants = .{},
 
     /// What the session has spent so far, folded from every `usage` event.
     /// See `Spend`: the log is the truth, so a replay of the same log reaches
@@ -529,7 +682,17 @@ pub const Session = struct {
                     usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
             },
             .plan_update => |update| try self.plan.apply(allocator, update),
-            .policy_self => |update| try self.self_policy.apply(allocator, update),
+            .policy_self => |update| {
+                // `grants` and `self_policy` are independent structures, so
+                // the order between clearing one and folding the other does
+                // not matter. See `SessionGrants.invalidate` for why a
+                // narrowing here must clear a grant it covers.
+                for (update.restrictions) |restriction| {
+                    try self.grants.invalidate(allocator, restriction);
+                }
+                try self.self_policy.apply(allocator, update);
+            },
+            .approval_response => |response| try self.grants.apply(allocator, response),
             .compaction => |compaction| {
                 try self.applyCompaction(allocator, compaction);
                 // The context this number measured no longer exists, and the
@@ -540,9 +703,12 @@ pub const Session = struct {
                 self.last_input_tokens = 0;
             },
             // Every other kind changes state this fold does not track yet:
-            // tool calls, approvals, prompts, and diffs. Folding those belongs
-            // with the agent loop, and adding fields nothing reads yet would be
-            // untested code, not state.
+            // tool calls, approval requests, prompts, and diffs. Folding those
+            // belongs with the agent loop, and adding fields nothing reads yet
+            // would be untested code, not state. An `approval.response` is the
+            // one exception, above, and only for the one decision
+            // `SessionGrants` remembers. Every other decision it can carry
+            // changes nothing here.
             else => {},
         }
     }
@@ -1252,6 +1418,299 @@ test "a promise from a newer writer keeps its own spelling, and one that binds n
     const kept = session.self_policy.restrictions.items[0];
     try std.testing.expectEqualStrings("nix.build", kept.action);
     try std.testing.expectEqualStrings("ask_two_people", kept.ceiling.wireName());
+}
+
+test "a grant for the rest of the session survives a resume, because it is folded from the log" {
+    // The same property `SelfPolicy` rests on, kept here for the memory
+    // `SessionGrants` holds instead of a promise: a process that only has the
+    // file rebuilds exactly what the live session held, because nothing here
+    // lives anywhere the log does not.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var dir_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try log.absoluteDirPath(io, &dir_path_buffer, tmp.dir);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/grants", .{dir_path});
+
+    var chock_log = try log.Log.open(io, path, "01GRANTS");
+    defer chock_log.close(io);
+    var locked = try chock_log.lock(io);
+
+    var live = Session.init(allocator);
+    defer live.deinit();
+
+    // The action a person answers "yes, for the rest of the session" to.
+    const granted_request: event.Event = .{ .approval_request = .{
+        .action = "git.push",
+        .summary = "push to origin",
+        .detail = "a1b2c3 fix the parser",
+        .reason = "the task asked for it",
+        .agent_kind = "coder",
+        .spawn_chain = &.{},
+        .timeout_at_ms = 0,
+        .tool_call_id = "call1",
+    } };
+    const granted_request_id = try locked.append(allocator, io, granted_request, 1);
+    try live.apply(.{ .id = granted_request_id, .session = "01GRANTS", .time_ms = 1, .event = granted_request });
+
+    const granted_response: event.Event = .{ .approval_response = .{
+        .request_id = granted_request_id,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+        .tool_call_id = "call1",
+    } };
+    const granted_response_id = try locked.append(allocator, io, granted_response, 2);
+    try live.apply(.{ .id = granted_response_id, .session = "01GRANTS", .time_ms = 2, .event = granted_response });
+
+    // A second action, asked about and answered with a plain yes. It must
+    // never be remembered the way the first one is.
+    const plain_request: event.Event = .{ .approval_request = .{
+        .action = "git.commit",
+        .summary = "commit the fix",
+        .detail = "a1b2c3 fix the parser",
+        .reason = "the task asked for it",
+        .agent_kind = "coder",
+        .spawn_chain = &.{},
+        .timeout_at_ms = 0,
+        .tool_call_id = "call2",
+    } };
+    const plain_request_id = try locked.append(allocator, io, plain_request, 3);
+    try live.apply(.{ .id = plain_request_id, .session = "01GRANTS", .time_ms = 3, .event = plain_request });
+
+    const plain_response: event.Event = .{ .approval_response = .{
+        .request_id = plain_request_id,
+        .decision = .approved_by_user,
+        .responder = "terminal",
+        .action = "git.commit",
+        .tool_call_id = "call2",
+    } };
+    const plain_response_id = try locked.append(allocator, io, plain_response, 4);
+    try live.apply(.{ .id = plain_response_id, .session = "01GRANTS", .time_ms = 4, .event = plain_response });
+
+    try std.testing.expectEqual(true, live.grants.get("git.push", true).?);
+    try std.testing.expectEqual(@as(?bool, null), live.grants.get("git.commit", true));
+    try std.testing.expectEqual(@as(?bool, null), live.grants.get("git.fetch", true));
+
+    var replayed = Session.init(allocator);
+    defer replayed.deinit();
+    var replay = try chock_log.replayFrom(allocator, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |envelope| {
+        defer envelope.deinit();
+        try replayed.apply(envelope.value);
+    }
+
+    try std.testing.expectEqual(true, replayed.grants.get("git.push", true).?);
+    try std.testing.expectEqual(@as(?bool, null), replayed.grants.get("git.commit", true));
+    try std.testing.expectEqual(@as(?bool, null), replayed.grants.get("git.fetch", true));
+}
+
+test "the overlay is read only where a question was actually asked" {
+    // `event.ApprovalResponse.request_id` is zero exactly when the policy
+    // table decided on its own, `allowed_by_policy` and `denied_by_policy`
+    // both: no question was ever written, so nobody could have answered one.
+    // Nothing in this build ever writes `approved_by_user_for_session` with a
+    // zero `request_id`, because a person can only give that answer to a
+    // question that was actually shown, but this fold reads whatever a line
+    // claims and must not take its word over the one fact the rest of the log
+    // already keeps honest. This is the same fact that says the policy table
+    // answered `ask`: a request was written, and it only ever is on that
+    // branch.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 0,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+    try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", true));
+
+    // The same decision, this time naming the request that was actually
+    // asked. Only now is it remembered, which is what proves the check above
+    // refuses a real thing and not merely everything.
+    try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+}
+
+test "every decision but the one exact yes leaves the overlay untouched, a deny included" {
+    // The property that stops this being a hole. A `denied_by_policy` for the
+    // very same action a real grant would use, carrying the same nonzero
+    // `request_id` a real grant would carry, still changes nothing: the match
+    // below is an exact equality against one member, never an `else`, so a
+    // decision this fold does not otherwise recognise cannot fall through
+    // into a grant by accident.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    const others = [_]event.ApprovalDecision{
+        .allowed_by_policy,
+        .denied_by_policy,
+        .approved_by_user,
+        .refused_by_user,
+        .expired,
+        .approved_by_review,
+        .refused_by_review,
+        .review_unavailable,
+        .{ .unknown = "approved_with_edits" },
+    };
+    for (others, 1..) |decision, id| {
+        try session.apply(.{
+            .id = @intCast(id),
+            .session = "01S",
+            .time_ms = @intCast(id),
+            .event = .{ .approval_response = .{
+                .request_id = @intCast(id),
+                .decision = decision,
+                .responder = "terminal",
+                .action = "git.push",
+            } },
+        });
+    }
+    try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", true));
+}
+
+test "a policy.self narrowing the exact action clears the grant it names" {
+    // The high finding this fold closes: a grant given while the table said
+    // `ask` must not survive the agent narrowing that very action to
+    // `agent_then_human`, because from that point on a reviewer has to weigh
+    // the act before a person is asked, and the old grant knows nothing of a
+    // reviewer.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+
+    try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .policy_self = .{
+        .restrictions = &.{
+            .{ .action = "git.push", .ceiling = .agent_then_human, .reason = "restrict_self" },
+        },
+    } } });
+    try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", true));
+}
+
+test "a policy.self narrowing through a class pattern clears every grant it covers" {
+    // The same clearing, reached through `git.*` rather than through
+    // `git.push` by name. A grant is keyed by the exact action a person was
+    // asked about, but the restriction that takes it away speaks the same
+    // pattern language a policy rule does, and a class covers every name
+    // below it.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+
+    try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .policy_self = .{
+        .restrictions = &.{
+            .{ .action = "git.*", .ceiling = .deny, .reason = "restrict_self" },
+        },
+    } } });
+    try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", true));
+}
+
+test "a policy.self narrowing an unrelated action leaves another grant alone" {
+    // The negative for both tests above. A restriction is scoped to the
+    // action or class it names, and a grant for a different action is not
+    // collateral damage.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+
+    try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .policy_self = .{
+        .restrictions = &.{
+            .{ .action = "net.fetch", .ceiling = .deny, .reason = "restrict_self" },
+        },
+    } } });
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+}
+
+test "a ceiling of ask or wider never clears a grant" {
+    // The other half of `invalidate`'s own condition, pinned rather than
+    // left to the reader's trust: a restriction that names the same action
+    // but only ever repeats or widens past `ask` is not the narrowing this
+    // fold exists to catch, and it must leave the grant standing.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+
+    const wide = [_]event.PolicyCeiling{ .ask, .agent_review, .allow };
+    for (wide, 2..) |ceiling, id| {
+        try session.apply(.{
+            .id = @intCast(id),
+            .session = "01S",
+            .time_ms = @intCast(id),
+            .event = .{ .policy_self = .{
+                .restrictions = &.{
+                    .{ .action = "git.push", .ceiling = ceiling, .reason = "restrict_self" },
+                },
+            } },
+        });
+    }
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+}
+
+test "get returns the grant only where the fresh decision is exactly ask" {
+    // The boundary the high finding turns on, pinned directly rather than
+    // only described: `Broker.request` routes both `.ask` and
+    // `.agent_then_human` through `askTheHuman`, so a caller must prove which
+    // one the fresh evaluation actually was. `get` takes that proof as a
+    // plain boolean, because `chock_proto` cannot name
+    // `chock_policy.table.Decision` to check it itself. The same grant reads
+    // as present when the caller says `ask` and as absent when the caller
+    // says anything else, including `agent_then_human`.
+    const allocator = std.testing.allocator;
+    var session = Session.init(allocator);
+    defer session.deinit();
+
+    try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .approval_response = .{
+        .request_id = 1,
+        .decision = .approved_by_user_for_session,
+        .responder = "terminal",
+        .action = "git.push",
+    } } });
+
+    try std.testing.expectEqual(true, session.grants.get("git.push", true).?);
+    try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", false));
 }
 
 test "a plan step with no identifier is dropped, because nothing could ever change it" {

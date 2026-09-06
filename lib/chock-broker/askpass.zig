@@ -358,6 +358,10 @@ pub const Grant = struct {
 };
 
 /// The credentials this broker answers prompts out of.
+///
+/// **Not `chock_proto.state.SessionGrants`.** That one remembers a person's
+/// answer to an approval for the rest of a session; this one holds a host's
+/// password. The two share a name and nothing else.
 pub const Grants = struct {
     entries: []const Grant = &.{},
 

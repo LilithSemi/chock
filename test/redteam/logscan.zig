@@ -1012,7 +1012,12 @@ fn noteWalkaround(
 /// an `Outcome`.
 pub fn permits(decision: event.ApprovalDecision) bool {
     return switch (decision) {
-        .allowed_by_policy, .approved_by_user, .approved_by_review => true,
+        // The user said yes, and also asked to be spared the same question
+        // for the rest of the session. The memory is a fact for a later
+        // request. This request went ahead exactly as a plain yes lets one
+        // go ahead, which is the same reading `Broker.findAnswer` gives it
+        // when it maps this decision onto `Outcome.approved_by_user`.
+        .allowed_by_policy, .approved_by_user, .approved_by_user_for_session, .approved_by_review => true,
         .denied_by_policy, .refused_by_user, .refused_by_review, .expired, .review_unavailable => false,
         // A decision this build cannot name is not permission. The same
         // answer `Broker.Outcome.unknown_decision` gives.
@@ -1042,7 +1047,12 @@ fn agrees(decision: event.ApprovalDecision, expected: table.Decision) bool {
     return switch (decision) {
         .allowed_by_policy => expected == .allow,
         .denied_by_policy => expected == .deny,
-        .approved_by_user, .refused_by_user => expected == .ask or expected == .agent_then_human,
+        // A person is asked, session-wide memory or not, only where the
+        // table's own answer was `ask` or put a person second in
+        // `agent_then_human`. Nothing else ever shows a question to answer,
+        // so a session grant sitting beside any other expected value is a
+        // log that disagrees with itself and must not read as a pass.
+        .approved_by_user, .approved_by_user_for_session, .refused_by_user => expected == .ask or expected == .agent_then_human,
         .approved_by_review, .refused_by_review => expected == .agent_review or expected == .agent_then_human,
         // A review that could not run refuses, and it can only arise where a
         // review was called for.
@@ -1315,6 +1325,65 @@ test "a non tool answer that agrees with the table reports nothing at all" {
     try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
     try testing.expectEqual(@as(usize, 0), result.policy.len);
     try testing.expect(!result.breached());
+}
+
+test "a session scoped grant agrees with the table where the table itself said ask" {
+    // The untested oracle arm this build's `permits` and `agrees` gained for
+    // `approved_by_user_for_session`. No rule names `workspace.apply`, so the
+    // table answers `ask`, the same branch a plain `approved_by_user` reads
+    // against. A rebuild that read the new member as anything else, or that
+    // `grep` could not even find inside `permits` and `agrees`, would fail
+    // here.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log: TestLog = undefined;
+    try log.open(gpa, io);
+    defer log.deinit();
+    try log.start(io);
+    try log.askAndAnswer(io, "workspace.apply", .approved_by_user_for_session);
+
+    var result = try scanTestLog(gpa, io, &log,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "git.push", .decision = .deny } },
+        \\} }
+    );
+    defer result.deinit();
+
+    try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
+    try testing.expectEqual(@as(usize, 0), result.policy.len);
+    try testing.expect(!result.breached());
+}
+
+test "a session scoped grant against a table that says deny is an impossible pairing and a breach" {
+    // The other arm. `agrees` never lets `approved_by_user_for_session` stand
+    // for anything but `ask` or `agent_then_human`, so a table that answers
+    // `deny` for the very same action makes the pairing one a person could
+    // never actually have produced, and it must read as a breach rather than
+    // as a pass or as merely inconclusive.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log: TestLog = undefined;
+    try log.open(gpa, io);
+    defer log.deinit();
+    try log.start(io);
+    try log.askAndAnswer(io, "workspace.apply", .approved_by_user_for_session);
+
+    var result = try scanTestLog(gpa, io, &log,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "workspace.apply", .decision = .deny } },
+        \\} }
+    );
+    defer result.deinit();
+
+    try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
+    try testing.expectEqual(@as(usize, 1), result.policy.len);
+    try testing.expect(result.policy[0].permitted);
+    try testing.expect(result.breached());
+    try testing.expectEqualStrings("deny", result.policy[0].expected);
 }
 
 test "an act with no policy key at all is still reported inconclusive" {
