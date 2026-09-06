@@ -4,13 +4,18 @@
 //! this file existed needs one less now.
 //!
 //! `lib/chock-core/tools.zig`'s `Tool.actionInto` is what a tool call turns
-//! into before it reaches the table. This file's own top comment there says
-//! why: `.{ .action = "call.write_file", .decision = .ask }` is a name a
-//! `chock.zon` author writes, and `rules` below is the same language, read by
-//! the same table, so a rule here and a rule a project writes settle their
-//! disagreement the one way `table.zig` already knows: the more specific
-//! pattern wins, and a tie goes to whichever decision permits less. See
-//! `table.zig`'s own top comment, "Which rule wins".
+//! into before it reaches the table. `.{ .action = "call.write_file",
+//! .decision = .ask }` is a name a `chock.zon` author writes, and `rules`
+//! below is the same language, read by the same table, so it is tempting to
+//! think a rule here and a rule a project writes settle a disagreement the
+//! way two rules of one `chock.zon` would: the more specific pattern wins.
+//! **They do not.** A shipped default is a lower class of rule, read only
+//! when a project's own rules name nothing that matches the key at all. A
+//! project rule that matches wins outright, whatever it names and however
+//! wide it is next to a default, because the entire reason a default exists
+//! is to answer for a key the project did not. See `table.zig`'s own top
+//! comment, "An action nobody named, and the rules Chock ships for it", and
+//! `evaluateRules` there for how the two lists are actually read.
 //!
 //! ## Every rule here names an action, and never a tool alone
 //!
@@ -30,10 +35,12 @@
 //! That specificity result only helps a project that wrote a narrower rule
 //! of its own to win with. It does nothing for a key that no rule at all
 //! contests, which is the case a shipped default exists for in the first
-//! place. It is safe for `run_command` to line up four rules of its own, one
-//! for each class `actionInto` can build, because `exec.*` is `run_command`'s
-//! alone: nothing else in Chock ever asks the table about an `exec.*` key,
-//! so a `.tool = "run_command"` default would have cost nothing there.
+//! place. It is safe for `run_command` to line up rules of its own for the
+//! three classes `actionInto` can name a path into, because `exec.*` is
+//! `run_command`'s alone: nothing else in Chock ever asks the table about an
+//! `exec.*` key, so a `.tool = "run_command"` default would have cost
+//! nothing there. `exec.unparsed`, the fourth name `actionInto` can build,
+//! holds no rule at all: see "What is deliberately absent" below.
 //!
 //! It is **not** safe for a tool whose own name is also read for a second,
 //! narrower question, and this is the reason every rule below names an
@@ -84,14 +91,33 @@
 //! line for the next author to wonder whether narrowing it is enough, when
 //! today the true answer is that no rule exists at all.
 //!
+//! `exec.unparsed` joins them, and it did not always. `lib/chock-core/tools.zig`
+//! answers `exec.unparsed` for a path it refuses to resolve, most often a `..`
+//! component: resolving one correctly needs the filesystem, to follow any
+//! symlink the segment before it might be, and reading only the string the
+//! call gave is the right call there. **The fault this file shipped was
+//! answering `allow` for the name that refusal produces, not the refusal
+//! itself.** `./.git/../build.sh` and `./.git/../x/bin/bash` both name
+//! `exec.unparsed`, because a `..` at a depth greater than zero does not
+//! leave the project and `.git` always exists, and a project that denied
+//! `exec.workspace.*`, `exec.path.*` and `exec.nix.store.*` by name still
+//! answered `allow` for either, because none of the three named
+//! `exec.unparsed` and the shipped default did. An unnameable program is not
+//! a safe one merely for being unnameable: it is a program Chock could not
+//! tell apart from any other, and that is exactly the case `ask` exists for.
+//! Removing the rule, rather than spelling `.decision = .ask` here, keeps to
+//! the same reasoning `net.connect.*` and `net.fetch.*` already gave: one
+//! fewer line for a later author to wonder whether narrowing it is enough.
+//!
 //! ## Where this folds in
 //!
-//! `table.zig`'s own `evaluateRules` reads `rules` beside a project's own,
-//! in the same search for a winner. It does not read `rules` as a ceiling
-//! the way `Table.org` is read: a ceiling can only ever narrow an existing
-//! answer, and it can never turn an unnamed key's `ask` into this file's
-//! `allow`, which is the one thing a shipped default has to do for a project
-//! that wrote no `chock.zon` at all. See `evaluateRules`'s own comment.
+//! `table.zig`'s own `evaluateRules` reads a project's own rules first, and
+//! reads `rules` here only when the project named nothing that matches the
+//! key. It does not read `rules` as a ceiling the way `Table.org` is read
+//! either: a ceiling can only ever narrow an existing answer, and it can
+//! never turn an unnamed key's `ask` into this file's `allow`, which is the
+//! one thing a shipped default has to do for a project that wrote no
+//! `chock.zon` at all. See `evaluateRules`'s own comment.
 
 const table = @import("table.zig");
 
@@ -99,12 +125,14 @@ const table = @import("table.zig");
 /// for an ordinary tool call, so an empty or absent `chock.zon` still runs
 /// them without a prompt.
 ///
-/// `run_command` needs four rules, one for each class `actionInto` can
-/// build, because `.tool = "run_command"` alone would be exactly the unsafe
-/// shape this file's own top comment measures against. Every other tool
-/// needs exactly one, because `actionInto` builds it exactly one name,
-/// `"call." ++ @tagName(tool)`, and nothing else in Chock ever asks the
-/// table about that name.
+/// `run_command` needs three rules, one for each class `actionInto` can
+/// build a path into, because `.tool = "run_command"` alone would be exactly
+/// the unsafe shape this file's own top comment measures against. It builds
+/// a fourth name, `exec.unparsed`, for a path it refuses to resolve, and that
+/// one holds no rule here at all: see this file's own top comment, "What is
+/// deliberately absent". Every other tool needs exactly one rule, because
+/// `actionInto` builds it exactly one name, `"call." ++ @tagName(tool)`, and
+/// nothing else in Chock ever asks the table about that name.
 ///
 /// **The seven names `gateToolCall` answers itself hold no rule here.**
 /// `spawn_agent`, `update_plan`, `restrict_self`, `fetch_url`, `ask_user`,
@@ -129,7 +157,6 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "exec.nix.store.*", .decision = .allow },
     .{ .action = "exec.workspace.*", .decision = .allow },
     .{ .action = "exec.path.*", .decision = .allow },
-    .{ .action = "exec.unparsed", .decision = .allow },
     .{ .action = "call.read_guidance", .decision = .allow },
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
@@ -184,7 +211,6 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
         "exec.nix.store.abc-jq.bin.jq",
         "exec.workspace.build%2Esh",
         "exec.path.jq",
-        "exec.unparsed",
     };
     for (run_command_actions) |action| {
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key(action)));
@@ -333,4 +359,134 @@ test "a rule that names an action beats a rule that names only a tool" {
         };
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(other_key));
     }
+}
+
+test "a project rule that never names an action still beats a shipped default" {
+    // Measured against a real table. A shipped default always names an
+    // `.action`, and `ruleBeats` scored an absent field as `0`, so a project
+    // rule that named no `.action` at all lost to a shipped default on the
+    // very first comparison, whatever the project rule said. A project must
+    // be able to narrow, so a project's own rule has to win here regardless
+    // of how specific it is next to a default: see this file's own top
+    // comment, "A project rule wins over a shipped default outright".
+    //
+    // Each case below is one of the five shapes measured before the fix,
+    // every one of which answered `allow` although the project rule named
+    // was `deny`.
+    const gpa = std.testing.allocator;
+
+    const Case = struct {
+        source: [:0]const u8,
+        key: table.Key,
+    };
+    const cases = [_]Case{
+        .{
+            .source =
+            \\.{ .policy = .{ .rules = .{
+            \\    .{ .agent_kind = "reviewer", .decision = .deny },
+            \\} } }
+            ,
+            .key = .{
+                .agent_kind = "reviewer",
+                .model = "test-model",
+                .tool = "write_file",
+                .action = "call.write_file",
+            },
+        },
+        .{
+            .source =
+            \\.{ .policy = .{ .rules = .{
+            \\    .{ .model = "m", .decision = .deny },
+            \\} } }
+            ,
+            .key = .{
+                .agent_kind = "main",
+                .model = "m",
+                .tool = "write_file",
+                .action = "call.write_file",
+            },
+        },
+        .{
+            .source =
+            \\.{ .policy = .{ .rules = .{
+            \\    .{ .tool = "write_file", .decision = .deny },
+            \\} } }
+            ,
+            .key = .{
+                .agent_kind = "main",
+                .model = "test-model",
+                .tool = "write_file",
+                .action = "call.write_file",
+            },
+        },
+        .{
+            .source =
+            \\.{ .policy = .{ .rules = .{
+            \\    .{ .tool = "run_command", .decision = .deny },
+            \\} } }
+            ,
+            .key = .{
+                .agent_kind = "main",
+                .model = "test-model",
+                .tool = "run_command",
+                .action = "exec.path.jq",
+            },
+        },
+        .{
+            .source =
+            \\.{ .policy = .{ .rules = .{
+            \\    .{ .action = "exec.*", .decision = .deny },
+            \\} } }
+            ,
+            .key = .{
+                .agent_kind = "main",
+                .model = "test-model",
+                .tool = "run_command",
+                .action = "exec.path.jq",
+            },
+        },
+    };
+
+    for (cases) |case| {
+        const t = try table.Table.parse(gpa, case.source, null);
+        defer table.Table.destroy(gpa, t);
+        try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(case.key));
+    }
+}
+
+test "exec.unparsed holds no shipped default, and answers ask like any other unnamed action" {
+    // `exec.unparsed` was shipped as `allow`, so a path holding a `..` that
+    // `lib/chock-core/tools.zig` refused to resolve ran without ever being
+    // named by a project's own rules. See this file's own top comment,
+    // "What is deliberately absent": the same reasoning that keeps
+    // `net.connect.*` and `net.fetch.*` off this list applies here too, and
+    // it is why `exec.unparsed` now joins them.
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("exec.unparsed")));
+}
+
+test "a project rule denying every exec class still denies a path that could not be classified" {
+    // Measured: `./build.sh` denies, but `./.git/../build.sh` and
+    // `./.git/../x/bin/bash` both name `exec.unparsed` instead of
+    // `exec.workspace.*`, because a `..` is never resolved lexically. None
+    // of the three rules below names `exec.unparsed`, so with the old
+    // shipped default of `allow` this fell straight through the project's
+    // own denial of every exec class it knew to name.
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "exec.workspace.*", .decision = .deny },
+        \\    .{ .action = "exec.path.*", .decision = .deny },
+        \\    .{ .action = "exec.nix.store.*", .decision = .deny },
+        \\} } }
+    ;
+    const t = try table.Table.parse(gpa, source, null);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(key("exec.workspace.build%2Esh")));
+    try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("exec.unparsed")));
 }

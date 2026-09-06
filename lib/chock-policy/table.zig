@@ -118,17 +118,26 @@
 //! a prompt. See that file's own top comment for the rules themselves and for
 //! why every one of them names an action, never a tool alone.
 //!
-//! **A shipped default answers beside a project's own rules, not underneath
-//! them.** `evaluateRules` reads the two rule lists together, in the one
-//! search for a winner this file's own "Which rule wins" section already
-//! describes, so a project rule beats a shipped default the same way any two
-//! rules of `chock.zon` would settle a disagreement: the more specific
-//! pattern wins, and a tie goes to the decision that permits less. **This
-//! could not be built as one more term of the ceiling intersection
-//! `Table.org` uses.** A ceiling can only ever narrow an answer that already
-//! exists, and an unnamed action's existing answer is `ask`: intersecting
-//! `ask` with anything can never produce `allow`, which is the one thing a
-//! shipped default has to do for the tool calls it names.
+//! **A shipped default is its own, lower class, read only when a project
+//! names nothing that matches `key`.** `evaluateRules` asks `chock.zon`'s
+//! own rules first, over the same "which rule wins" search this file's own
+//! section above already describes, and reads `lib/chock-policy/defaults.zig`
+//! at all only when that search finds no match. A project rule that matches
+//! `key` therefore wins outright, whatever it names and however specific it
+//! is next to a default, because the whole point of a shipped default is to
+//! answer for a key the project wrote nothing about. **This is not the same
+//! search `ruleBeats` runs inside one list.** Folding the two lists into one
+//! search, and asking `ruleBeats` to pick the winner across both, is what
+//! this file did before, and it is wrong: `ruleBeats` scores an absent field
+//! as `0`, and every shipped default names an `.action`, so a project rule
+//! that named no `.action` at all always lost to a shipped default on the
+//! first field compared, whatever decision the project rule carried. See
+//! `lib/chock-policy/defaults.zig`'s own top comment for the rest of this
+//! reasoning. **This could not be built as one more term of the ceiling
+//! intersection `Table.org` uses.** A ceiling can only ever narrow an answer
+//! that already exists, and an unnamed action's existing answer is `ask`:
+//! intersecting `ask` with anything can never produce `allow`, which is the
+//! one thing a shipped default has to do for the tool calls it names.
 
 const std = @import("std");
 const defaults = @import("defaults.zig");
@@ -956,29 +965,26 @@ fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) voi
 /// The answer `Table.evaluateKindAlone` gives, over a rule list on its own.
 /// `validate` needs this before there is a `Table` to ask.
 ///
-/// **`lib/chock-policy/defaults.zig`'s rules answer beside `rules`, not
-/// underneath them.** `winnerFor` already finds the one rule of a list that
-/// answers for `key`, and this asks it twice, once for each list, then keeps
-/// whichever of the two answers `ruleBeats` prefers. That is the same search
-/// `winnerFor` runs over one list that holds every rule of both, because
-/// `ruleBeats` is a total order and the strongest rule of the whole is always
-/// the stronger of the two lists' own strongest. See this file's own top
-/// comment for why that must not be built as one more term of an
-/// intersection instead.
+/// **A project rule that matches `key` at all wins, whatever it names, and
+/// `lib/chock-policy/defaults.zig`'s rules are read only when `rules` holds
+/// no match for `key`.** The two lists are not one search for the strongest
+/// rule of either: a default names an `.action`, and before this the search
+/// scored an absent field as `0`, so a project rule that named no `.action`
+/// at all, such as `.{ .agent_kind = "reviewer", .decision = .deny }`, lost
+/// to a shipped default on the very first field compared, whatever decision
+/// the project rule carried. That is backwards. The contract of this whole
+/// table is that a project narrows what Chock permits, and a rule that
+/// matches the key at all is the project narrowing it, however it is
+/// spelled. A shipped default exists only to answer for a key a project
+/// wrote nothing about, so it must never outrank a project rule that did.
+/// See `lib/chock-policy/defaults.zig`'s own top comment for the rest of
+/// this reasoning and for why a rule there must still keep to one exact
+/// `.action` if it names one at all: this change is about which list is
+/// asked first, not about how wide one shipped default may be.
 fn evaluateRules(rules: []const Rule, key: Key) Decision {
-    const winner = strongerOfTwoWinners(
-        winnerFor(rules, key),
-        winnerFor(defaults.rules, key),
-    ) orelse return .ask;
-    return winner.decision;
-}
-
-/// The rule `ruleBeats` would keep, between the winner of one list and the
-/// winner of another. Null only when neither list held a match at all.
-fn strongerOfTwoWinners(a: ?Rule, b: ?Rule) ?Rule {
-    const left = a orelse return b;
-    const right = b orelse return a;
-    return if (ruleBeats(right, left)) right else left;
+    if (winnerFor(rules, key)) |winner| return winner.decision;
+    if (winnerFor(defaults.rules, key)) |winner| return winner.decision;
+    return .ask;
 }
 
 /// `evaluateRules`, for a layer that is read as a ceiling: **a key no rule

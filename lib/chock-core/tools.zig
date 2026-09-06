@@ -841,7 +841,16 @@ pub const Tool = enum {
     /// question for the whole call, so a path holding a `..` component
     /// answers `unparsed_action` instead of a guess. `Table.evaluateChain`
     /// answers `ask` for an unnamed action, which refuses, so this lands on
-    /// the safe side.
+    /// the safe side, **but only because `lib/chock-policy/defaults.zig`
+    /// ships no rule for `exec.unparsed`.** It once did, at `.allow`, which
+    /// made this refusal cosmetic: `./.git/../build.sh` named `exec.unparsed`
+    /// exactly as this comment says, and the shipped default answered
+    /// `allow` for it regardless of what a project denied. Refusing to guess
+    /// was always the right call for the `..` itself; the fault was giving
+    /// the name that refusal produces a default answer of `allow` rather
+    /// than leaving it to fall through to `ask` like any other action
+    /// nobody named. See that file's own top comment, "What is deliberately
+    /// absent".
     ///
     /// **The class is read from whether the raw `argv0` carries a slash
     /// anywhere, fixed before the project root strip above runs, and never
@@ -7179,7 +7188,11 @@ test "a path with a .. component is never resolved, and answers unparsed instead
     // question, so all three shapes below, a `..` in the middle, at the
     // front, and at the end, answer `exec.unparsed` instead of a resolved
     // path. `Table.evaluateChain` answers `ask` for an unnamed action, which
-    // refuses, so this lands on the safe side.
+    // refuses, so this lands on the safe side, but only now: `exec.unparsed`
+    // was shipped as a default `allow` for a time, which meant every path
+    // here ran unconditionally, whatever a project's own rules said. See
+    // `lib/chock-policy/defaults.zig`'s own top comment, "What is
+    // deliberately absent", for why it now holds no default at all.
     const paths = [_][]const u8{ "a/../b", "../x", "a/.." };
     for (paths) |path| {
         var buffer: [Tool.max_action_bytes]u8 = undefined;

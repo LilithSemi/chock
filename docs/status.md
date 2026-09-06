@@ -83,11 +83,18 @@ tenth.
   ordinary tool call is asked about now: `gateToolCall` in `Loop.run` builds
   the action name `Tool.actionInto` names for the call and asks
   `deps.arbiter`, the same seam `runRestrictSelf` already used for a
-  widening. The shipped defaults answer `allow` for every one of those
+  widening. The shipped defaults answer `allow` for almost every one of those
   action names, so a project with no `chock.zon` of its own gains no new
-  prompt over what ran before this gate existed. Seven tool names are
-  skipped by this gate and decided elsewhere, at the key that actually
-  works. `spawn_agent` is bounded by `chock.zon`'s own `subagents` block,
+  prompt over what ran before this gate existed. The one deliberate
+  exception is `exec.unparsed`: `run_command` answers that name for a path it
+  refuses to resolve lexically, most often one holding a `..`, and it held a
+  shipped default of `allow` until that was found to let such a path escape
+  every exec rule a project wrote, naming none of its three classes. It now
+  holds no default at all, the same as `net.connect.*` and `net.fetch.*`, so
+  a project with no `chock.zon` gains a new prompt the first time such a path
+  runs. See `lib/chock-policy/defaults.zig`'s own top comment, "What is
+  deliberately absent". Seven tool names are skipped by this gate and
+  decided elsewhere, at the key that actually works. `spawn_agent` is bounded by `chock.zon`'s own `subagents` block,
   `max_width` and `max_depth`. `restrict_self` needs nobody's permission to
   narrow, and asks about `ratchet.widen_action` only to widen. `fetch_url`
   is decided per host, once the URL is known, at `net.fetch.*` and
