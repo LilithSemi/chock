@@ -10,11 +10,17 @@
 //!
 //! ## Why this exists at all
 //!
-//! A tool call gets `Network.none`, and that is right for a tool call and for
-//! a language server. It is useless for an MCP server: most of them exist to
-//! reach the network, and `host` hands a third party program the exact thing
-//! the sandbox exists to withhold. `filtered` is the only honest answer, and
-//! this is the half of it that decides.
+//! A language server gets `Network.none`, and that is right for it: nothing
+//! it does needs to reach a host, and a socket it never uses is a socket
+//! worth refusing outright. A tool call and an MCP server are different. Most
+//! of what an MCP server exists for is reaching the network, and `host` hands
+//! a third party program the exact thing the sandbox exists to withhold, so
+//! `filtered` is the only honest answer for it. A tool call gets `filtered`
+//! too, unconditionally: the model that drives it may run any program this
+//! project's own policy lets it run, and this file is what turns the program
+//! trying to reach a host into a question this project's own table answers,
+//! rather than a connection the kernel would otherwise have let straight
+//! through. This file is the half of it that decides, for both callers.
 //!
 //! ## A host rule is an action name, and not a second policy system
 //!
@@ -145,24 +151,35 @@
 //! that answers from a table and counts what it was asked, which is what lets
 //! a test pin that a refused host **was never looked up**.
 //!
-//! ## One caller builds these, and it is the only one
+//! ## Two callers build these now, and a third still gets none at all
 //!
-//! **This is the mechanism, not a feature that is switched on.** The MCP host
-//! in `src/run.zig` is the only caller that sets `Sandbox.Config.network` to
-//! `.filtered`, and it does so for one server only when this project's policy
-//! answers `allow` for `mcp.<server>.network`. A tool call gets `Network.none`
-//! and a language server gets `Network.none`, and neither should change.
+//! **This is the mechanism, not a feature that is switched on.** `src/run.zig`
+//! is the only place that ever sets `Sandbox.Config.network`, and it now
+//! builds two different kinds of `Network`.
 //!
-//! **A server that is let out still reaches nothing until a `net.connect.*`
-//! rule names a host.** The two rules are separate on purpose: the first says
-//! a server may have a socket, and the second says where it may point.
+//! The MCP host sets `.filtered` for one server only, when this project's
+//! policy answers `allow` for `mcp.<server>.network`. **A server that is let
+//! out still reaches nothing until a `net.connect.*` rule names a host.** The
+//! two rules are separate on purpose: the first says a server may have a
+//! socket, and the second says where it may point. This caller builds its
+//! `Network` with `asker` left null: an MCP server starts before `Loop.run`
+//! takes the session log's exclusive lock, so there is no `Locked` handle yet
+//! to hand one, and an `ask` decision there still refuses outright, exactly
+//! as it always has.
 //!
-//! **This caller builds every `Network` with `asker` left null.** MCP servers
-//! start before `Loop.run` takes the session log's exclusive lock, so there is
-//! no `Locked` handle yet to hand one. An `ask` decision there still refuses
-//! outright, exactly as it always has: see `Network.Asker` and this file's
-//! own top comment on the volume `ask` can now answer for a caller that does
-//! hold one.
+//! **A tool call moved, and this is the half of the mechanism that changed.**
+//! It now gets `.filtered` too, unconditionally rather than behind a policy
+//! row of its own: see `lib/chock-core/tools.zig`'s `Context.net`. Unlike the
+//! MCP host, this caller's `Network` is given a real `asker`, because
+//! `chock_core.Loop.GiveLocked` hands it the session's own locked handle once
+//! `Loop.run` has taken it, before the first turn starts. So an `ask`
+//! decision reached from inside a tool call really does reach a person,
+//! through the same `Broker.request` wait every other mid session question in
+//! this project already answers through.
+//!
+//! **A language server did not move, and it is the one thing here that
+//! still gets `Network.none`.** Nothing it does needs a socket, and giving it
+//! one would be a widening with no call behind it to justify.
 //!
 //! What is real besides is `test/sandbox/escape.zig`, which drives this file
 //! through a real `Sandbox.spawn` on every test run.
@@ -386,6 +403,13 @@ pub const Asker = struct {
     broker: *const Broker,
     storage: chock_proto.storage.Storage,
     locked: *Locked,
+    /// Bumped before `askPermits`'s own wait starts and corrected once it
+    /// ends, so a tool call's own deadline can be extended live while a
+    /// person is asked about this connection. Null for a caller that has
+    /// nothing for this to write into, which is every test of this file
+    /// before this field existed: see `lib/chock-core/tools.zig`'s
+    /// `Context.approval_wait_ns`, the reading end of the same counter.
+    approval_wait_ns: ?*std.atomic.Value(u64) = null,
 };
 
 /// The most parents `askPermits` will build a `Broker.Request` for.
@@ -530,7 +554,53 @@ pub const Network = struct {
         // file only a host and a port, so that is all either string can say.
         var summary_buf: [max_host_bytes + 40]u8 = undefined;
         const summary = std.fmt.bufPrint(&summary_buf, "reach {s} on port {d}", .{ host, port }) catch
-            "reach a host this session's MCP server asked for";
+            "reach a host this session asked for";
+
+        // **Bumped before the wait starts, corrected once it ends, and only
+        // when a live counter says a real `Io` came with it.** `self.io` is
+        // read here at all only inside this same `if`, and never outside it.
+        //
+        // **Why that is the whole rule, and not a narrower stand-in for one.**
+        // `serveBroker` (`lib/chock-sandbox/linux/driver.zig`) is what calls
+        // this function's caller, `NetBroker.connect`, and `serveBroker`
+        // always runs in the process that called `Sandbox.spawn`, on the
+        // branch that runs *after* that process's own `fork()` has already
+        // returned control to it. POSIX restricts only the child between
+        // `fork` and `execve`; the parent is unrestricted the moment `fork`
+        // returns, and stays the same process it always was, so there is no
+        // production hazard in reading a real clock through a real `Io` from
+        // inside `serveBroker`. `src/run.zig`'s own tool call wiring gives
+        // this file exactly that: a real `io` and a real counter, always
+        // together.
+        //
+        // The hazard this file's own tests and `test/sandbox/probe.zig`'s
+        // reentrant escape tests carry is narrower, and it is theirs, not
+        // production's: a probe that calls `Sandbox.spawn` keeps no working
+        // `Io` at all, on purpose, so that it can stay single threaded across
+        // its own `fork`. See that file's own comment on `Network.io`. Such
+        // a caller also never has a live counter to give here, because
+        // nothing outside `src/run.zig` builds one, so the two facts always
+        // travel together. Gating on the counter is therefore not a
+        // workaround keyed on a condition that happens to be false in a test
+        // and true in production; it is the same fact, stated once, that
+        // decides whether `self.io` is real.
+        //
+        // **Measured on 2026-09-05**: a version of this function that read
+        // `self.io` unconditionally segfaulted every one of
+        // `test/sandbox/escape.zig`'s five reentrant tests, every time at
+        // this line, because the probe's `Network.io` is honestly
+        // `undefined` and this was the first thing this function ever did
+        // with it. A future line added here that reads `self.io` outside
+        // this same `if` reintroduces exactly that crash.
+        var asked_at: std.Io.Clock.Timestamp = undefined;
+        if (asker.approval_wait_ns) |counter| {
+            asked_at = std.Io.Clock.Timestamp.now(self.io, .awake);
+            counter.store(@as(u64, @intCast(Broker.default_timeout_ms)) * std.time.ns_per_ms, .monotonic);
+        }
+        defer if (asker.approval_wait_ns) |counter| {
+            const elapsed = asked_at.untilNow(self.io).raw.toNanoseconds();
+            counter.store(if (elapsed > 0) @intCast(elapsed) else 0, .monotonic);
+        };
 
         const outcome = asker.broker.request(self.gpa, self.io, asker.storage, asker.locked, .{
             .action = action,
@@ -1253,6 +1323,13 @@ const AnswerOnWait = struct {
     now_ms: i64 = 1_700_000_000_000,
     waits: usize = 0,
     answered: bool = false,
+    /// What `askPermits` gave `Network.asker`, so a test can read what this
+    /// wait saw in it. Null for a test of this fake that gives it none.
+    counter: ?*std.atomic.Value(u64) = null,
+    /// What `counter` already held the first time this was asked to wait,
+    /// which is after `askPermits`'s own bump and before `Broker.request` has
+    /// answered anything. Null until the first `wait`.
+    seen_on_first_wait: ?u64 = null,
 
     fn waiter(self: *AnswerOnWait) Broker.Waiter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1269,6 +1346,9 @@ const AnswerOnWait = struct {
     fn waitFn(ptr: *anyopaque, io: std.Io, budget_ms: u64) Broker.Waiter.Wake {
         const self: *AnswerOnWait = @ptrCast(@alignCast(ptr));
         self.waits += 1;
+        if (self.seen_on_first_wait == null) {
+            if (self.counter) |counter| self.seen_on_first_wait = counter.load(.monotonic);
+        }
         if (!self.answered) {
             self.answered = true;
             if (Broker.openRequest(self.gpa, io, self.store) catch null) |id| {
@@ -1384,6 +1464,70 @@ test "ask with a broker that permits grants the connection" {
     try testing.expectEqual(@as(usize, 1), bench.fake.lookups);
     try testing.expectEqual(@as(usize, 1), waiter.waits);
     try testing.expectEqual(@as(usize, 1), try countKind(gpa, io, store, .approval_request));
+}
+
+test "a live counter is bumped before the wait starts and corrected once it ends" {
+    // **This is the sending end of `Context.approval_wait_ns`.** A tool
+    // call's own deadline is extended by whatever this counter reads, live,
+    // while `askPermits` waits: see `lib/chock-core/tools.zig`. The counter
+    // has to already be large before the wait below ever blocks, because
+    // nothing in this file ticks it up while that one call is in flight, and
+    // it has to end holding an honest number, because that is what a person
+    // reading the tool result afterward is told the wait cost.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var bench = try Bench.init(gpa, ask_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETASK5");
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    var counter: std.atomic.Value(u64) = .init(0);
+    var waiter = AnswerOnWait{
+        .gpa = gpa,
+        .store = store,
+        .locked = &locked,
+        .decision = .approved_by_user,
+        .counter = &counter,
+    };
+    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter() };
+    network.asker = .{ .broker = &broker, .storage = store, .locked = &locked, .approval_wait_ns = &counter };
+
+    // Before any of this runs, a call that had asked nothing would still read
+    // zero: this is the ordinary case `Context.approval_wait_ns`'s own doc
+    // comment describes, and it holds all the way up to the moment the wait
+    // starts.
+    try testing.expectEqual(@as(u64, 0), counter.load(.monotonic));
+
+    try testing.expect(network.answer("api.anthropic.com", 443) == .granted);
+
+    // **Bumped before the wait, not after.** `waitFn` read the counter the
+    // first time `Broker.request` asked it to sleep, which is before this
+    // fake ever answers the question, and it was already the broker's own
+    // default ask timeout in nanoseconds: the ceiling a 120 second deadline
+    // could not have reached on its own, which is the whole point of a call
+    // that would have died at 120 seconds surviving a longer wait.
+    //
+    // Mutation check: bump the counter only after `request` returns, and
+    // this fails while every test above it still passes.
+    try testing.expectEqual(
+        @as(u64, @intCast(Broker.default_timeout_ms)) * std.time.ns_per_ms,
+        waiter.seen_on_first_wait.?,
+    );
+
+    // **Corrected once the wait ends.** The fake waiter never really sleeps,
+    // so the honest number the report is built from is small, and it is
+    // never the untouched ceiling `askPermits` bumped it to before the wait:
+    // a counter left at that value would tell a person this call waited a
+    // full five minutes for an answer that in fact came back on the first
+    // look.
+    try testing.expect(counter.load(.monotonic) < @as(u64, @intCast(Broker.default_timeout_ms)) * std.time.ns_per_ms);
 }
 
 test "ask with a broker that refuses does not connect, and the name is never resolved" {

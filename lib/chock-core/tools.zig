@@ -1474,7 +1474,7 @@ pub const Registry = struct {
         // and rules live only as long as this dispatch, which is longer
         // than the last `Sandbox.spawn` under it: a `sandbox.Config`
         // borrows both slices and never keeps them.
-        const config = try withStore(
+        var config = try withStore(
             allocator,
             io,
             workspace_config,
@@ -1483,6 +1483,19 @@ pub const Registry = struct {
         );
         defer allocator.free(config.mounts);
         defer allocator.free(config.rules);
+
+        // **Every tool call, and not only `run_command`.** `context.net` is
+        // null for a session that gives tool calls no network at all, which
+        // keeps every caller before this line at exactly the sandbox it had.
+        // Set, this is the one place `Sandbox.Config.network` moves off
+        // `.none` for a tool call: see `Context.net`'s own doc comment and
+        // `lib/chock-broker/network.zig`'s top comment for what a socket
+        // with no host granted can and cannot do. `runCommand` undoes this
+        // for a call it starts in the background, below.
+        if (context.net) |net| {
+            config.network = .filtered;
+            config.net_broker = net.broker(call.tool);
+        }
 
         // No `else`: a member added to `Tool` and forgotten here fails the
         // build, rather than becoming a tool that is offered and does
@@ -1656,6 +1669,33 @@ pub const ToolchainMount = struct {
     pub const Kind = enum { directory, file };
 };
 
+/// What gives a tool call's own sandbox a network broker. A seam, and not a
+/// direct call, for the reason `Loop.ToolRunner` is one: `chock_broker` is
+/// what decides a connection, `chock-core` imports no `chock-broker`, and
+/// this file is the join between the two, the same shape `Loop.Deps.arbiter`
+/// already is for a different question.
+///
+/// **`tool` is the tool that is about to run, not a fixed name.** A dispatch
+/// runs to completion before the next one starts unless it asked to run in
+/// the background, and a background call is excluded before it ever reaches
+/// this seam: see `runCommand`. So the implementation may keep one `Network`
+/// for the whole session and simply rename it before handing it out, and the
+/// four part policy key a `net.connect` question is answered against reads
+/// the same tool name every other action in this project already reads it
+/// by.
+pub const NetSeam = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        broker: *const fn (ptr: *anyopaque, tool: []const u8) sandbox.NetBroker,
+    };
+
+    pub fn broker(self: NetSeam, tool: []const u8) sandbox.NetBroker {
+        return self.vtable.broker(self.ptr, tool);
+    }
+};
+
 /// Everything about this session a tool may need beyond the workspace
 /// itself. A struct and not three more positional parameters, so a caller
 /// that has none of it passes `.{}` and a field added later touches no call
@@ -1678,20 +1718,31 @@ pub const Context = struct {
     /// Nanoseconds `timeout_ns` should be extended by, read live while the
     /// call runs, and bumped by whatever inside the sandboxed call had to
     /// stop and ask a person something. Null, the default, is nothing at all,
-    /// which is every caller before this field existed and every call that
-    /// never opens a filtered connection today. See `SandboxCall.approval_wait_ns`.
+    /// which is every caller that gives `run_command` no filtered connection
+    /// to ask through. See `SandboxCall.approval_wait_ns`.
     ///
-    /// **Only the receiving end exists.** `drainCapture` reads this counter
-    /// live and extends its own deadline by it, and that half is built and
-    /// tested. Nothing today holds one of these and bumps it from inside a
-    /// running `Broker.request` wait: no caller passes a live counter in, so
-    /// this field is always null in every real session that exists right
-    /// now. The sending end is the wiring that would let a filtered
-    /// connection's own `ask`, answered from inside a tool call rather than
-    /// only from inside an MCP server's own long lived process, credit this
-    /// counter as it waits. That wiring belongs to whoever builds that
-    /// caller, not to this field.
+    /// **Both ends exist now.** `drainCapture` reads this counter live and
+    /// extends its own deadline by it. `net.broker` below is the sending
+    /// end: `src/run.zig` points this at the same counter it hands that
+    /// seam, and `lib/chock-broker/network.zig`'s own `Network.asker` is
+    /// what bumps it, from inside the wait a filtered connection's own `ask`
+    /// makes. `runCommand` resets it to zero before every foreground call, so
+    /// a wait one call made never reads as time a later call, with no ask of
+    /// its own, also spent waiting.
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
+    /// What builds the network broker a tool call's own sandbox gets, or null
+    /// for a session that keeps every tool call at `Network.none`, which is
+    /// every caller before this field existed.
+    ///
+    /// **Set, a tool call moves from `Network.none` to `Network.filtered`.**
+    /// `Registry.dispatchWith` calls this once per call, with the tool's own
+    /// name, right before that call's own sandbox starts: see
+    /// `lib/chock-broker/network.zig`'s own top comment for what a socket
+    /// with no host granted can and cannot do, and for the language server,
+    /// which this does not reach. A background `run_command` call is the one
+    /// exception: see that function's own note on why it resets the network
+    /// back to `none` for the call it starts, rather than reading this.
+    net: ?NetSeam = null,
     /// The host directory this project's knowledgebase lives in, or null for
     /// a session that has none. `Support.memory` decides whether the model is
     /// told the two memory tools exist; this is where they actually work.
@@ -2306,6 +2357,20 @@ fn runCommand(
     }
 
     var config = workspace_config;
+
+    // **A background call keeps `Network.none`, whatever this session gives
+    // its foreground calls.** The program this starts runs later, on a task's
+    // own thread, well after this dispatch returns: see `backgroundRun`. A
+    // network broker's own `ask` answers through this session's loop's own
+    // locked handle, and only the call the loop is inside of at that moment
+    // may hold it: see `chock_core.Loop.GiveLocked`'s own top comment. Two
+    // sandboxed programs asking through the same handle at once is not a
+    // question this project has an answer for yet, so a background call is
+    // kept out of it rather than raced against it.
+    if (in_background) {
+        config.network = .none;
+        config.net_broker = null;
+    }
 
     // Every writable surface this call may carry, plus the read only one, each
     // as one mount and one matching Landlock rule: a mount with no rule is
@@ -4820,16 +4885,17 @@ const SandboxCall = struct {
     idle: ?idle_mod.Idle = null,
     /// Nanoseconds this call's own deadline has been extended by, read live
     /// while the program runs. Null for every call that carries none, which
-    /// today is every call: nothing yet asks a person from inside a running
-    /// sandboxed call. See `spawnCapturingIo`'s own doc comment on why the
-    /// deadline needs this at all, and `Captured.waited_for_approval_ns` for
-    /// where the value this call ends with is read back out.
+    /// is every tool but a foreground `run_command`: see `runCommand`, which
+    /// is the one caller that passes `Context.approval_wait_ns` through.
+    /// See `spawnCapturingIo`'s own doc comment on why the deadline needs
+    /// this at all, and `Captured.waited_for_approval_ns` for where the
+    /// value this call ends with is read back out.
     ///
     /// **Owned by the caller, and written by whatever runs inside the
-    /// sandboxed call.** The day a filtered connection's own `ask` can be
-    /// answered from inside a tool call, and not only from inside an MCP
-    /// server's own long lived process, this is the seam that answer's own
-    /// wait bumps: see `lib/chock-broker/network.zig`'s `Network.asker`.
+    /// sandboxed call.** A filtered connection's own `ask`, answered from
+    /// inside this very call rather than only from inside an MCP server's
+    /// own long lived process, is what bumps it: see
+    /// `lib/chock-broker/network.zig`'s `Network.asker`.
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
 };
 
@@ -7219,6 +7285,87 @@ test "a task list dispatched with no session around it is refused, and never rea
     try std.testing.expect(std.mem.indexOf(u8, result.output, "your answer") != null);
 }
 
+/// A `NetSeam` that records the tool name it was asked to build a broker
+/// for, and refuses whatever it is then asked to connect. Used to pin that
+/// `Registry.dispatchWith` reaches this seam once per call, with the tool
+/// that is really running, for a tool that never touches the network at
+/// all: the broker is offered whether or not anything ever asks it for one.
+const TestNetSeam = struct {
+    calls: usize = 0,
+    last_tool: [64]u8 = undefined,
+    last_tool_len: usize = 0,
+
+    fn seam(self: *TestNetSeam) NetSeam {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = NetSeam.VTable{ .broker = brokerFn };
+
+    fn brokerFn(ptr: *anyopaque, name: []const u8) sandbox.NetBroker {
+        const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.last_tool_len = @min(name.len, self.last_tool.len);
+        @memcpy(self.last_tool[0..self.last_tool_len], name[0..self.last_tool_len]);
+        return .{ .ptr = self, .vtable = &net_vtable };
+    }
+
+    const net_vtable = sandbox.NetBroker.VTable{ .connect = connectFn };
+
+    fn connectFn(ptr: *anyopaque, host: []const u8, port: u16) sandbox.NetBroker.Grant {
+        _ = ptr;
+        _ = host;
+        _ = port;
+        return .refused;
+    }
+
+    fn tool(self: *const TestNetSeam) []const u8 {
+        return self.last_tool[0..self.last_tool_len];
+    }
+};
+
+test "a tool call is given a network broker, named after the tool that is running" {
+    // **This is the wiring `Context.net` exists for.** A tool call moves off
+    // `Network.none` for every tool, not only `run_command`: this is what a
+    // person approves when this session's own policy lets a call reach a
+    // host at all, so the broker has to be there before any tool's own
+    // handler runs, whether or not that handler ever tries to use it. See
+    // `lib/chock-broker/network.zig`'s own top comment on what moved.
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+
+    var seam = TestNetSeam{};
+    const config = sandbox.Config{
+        .root = "/does-not-matter-for-this-test",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+    };
+
+    // The guidance name does not exist, so this ends in a refusal, and that
+    // is the point: even a call that goes nowhere near the sandbox still
+    // reaches this seam first, because the code path this pins runs before
+    // the switch on which tool it is.
+    const result = try Registry.dispatchWith(
+        allocator,
+        std.testing.io,
+        &env,
+        config,
+        .{
+            .call_id = "read1",
+            .tool = @tagName(Tool.read_guidance),
+            .arguments = "{\"name\":\"does-not-exist\"}",
+        },
+        .{ .net = seam.seam(), .store_paths = &.{} },
+    );
+    defer allocator.free(result.call_id);
+    defer allocator.free(result.output);
+
+    try std.testing.expectEqual(@as(usize, 1), seam.calls);
+    try std.testing.expectEqualStrings(@tagName(Tool.read_guidance), seam.tool());
+}
+
 test "spawnCapturing reports a pipe creation failure without ever reaching the sandbox" {
     // Before chock-io existed, this path had no test: a real pipe cannot be
     // made to fail on demand without exhausting the whole process's
@@ -7932,6 +8079,46 @@ test "a prepared call asks for nothing this build's own driver refuses" {
             sandbox.darwin_driver_for_testing.expressibleOn(prepared.config),
         );
     }
+}
+
+test "prepare carries a config's own network through untouched, whatever it was" {
+    // **This is why a language server still gets `Network.none`.** The
+    // helper `src/run.zig` starts for it is built through this function and
+    // `withStore` alone, never through `Registry.dispatchWith`, so there is
+    // no `Context.net` for it to reach: see that field's own doc comment.
+    // `prepare` takes no `Context` at all, and this pins that it has no
+    // opinion of its own about the network either: whatever
+    // `Sandbox.Config.network` already said going in is exactly what
+    // `Prepared.config.network` says coming out.
+    //
+    // Mutation check: have this function set `.filtered` on the way out and
+    // this fails while the tool call test beside it still passes, because
+    // that one goes through `Registry.dispatchWith` and this one does not.
+    const arena_state_gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(arena_state_gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env = std.process.Environ.Map.init(arena_state_gpa);
+    defer env.deinit();
+
+    const workspace_config = sandbox.Config{
+        .root = "/",
+        .mounts = &.{.{ .bind = .{
+            .source = "/work/checkout",
+            .target = "/work/checkout",
+            .read_only = false,
+        } }},
+        .rules = &.{.{ .path = "/work/checkout", .access = sandbox.landlock.AccessFs.read_write }},
+        .cwd = "/work/checkout",
+        .env = &.{},
+        .network = .none,
+    };
+    const argv = [_][]const u8{"./zig-out/bin/tool"};
+    const prepared = try prepare(arena, std.testing.io, &env, workspace_config, &argv, &.{}, &.{});
+
+    try std.testing.expectEqual(sandbox.namespace.Network.none, prepared.config.network);
+    try std.testing.expect(prepared.config.net_broker == null);
 }
 
 test "a staged file holds exactly the bytes it was given, and is gone afterwards" {

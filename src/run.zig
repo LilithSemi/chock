@@ -5027,6 +5027,110 @@ const SessionArbiter = struct {
     }
 };
 
+/// The network broker a tool call's own sandbox gets, and the session state
+/// that lets it answer a question its own table cannot decide alone.
+///
+/// **One of these for the whole session.** `chock_broker.network.Network`'s
+/// own doc comment says one belongs to one `Sandbox.spawn`, which is the MCP
+/// host's own shape: an MCP server is one long lived process. A tool call is
+/// different, and a dispatch runs to completion before the next one starts
+/// unless it asked to run in the background, and `chock_core.tools.runCommand`
+/// keeps a background call away from this seam entirely: see
+/// `chock_core.tools.Context.net`'s own doc comment. So renaming
+/// `network.tool` before handing the broker out, once per call, is safe, and
+/// it is what lets a `net.connect` question read the tool name every other
+/// action in this project already reads it by, rather than a fixed name this
+/// file would otherwise have to invent.
+///
+/// **`network.asker` starts null and is filled exactly once.** Nothing here
+/// can build a `chock_broker.Broker` before the session's own locked handle
+/// exists, and that handle belongs to `Loop.run`, not to this file: see
+/// `giveFn`, which `chock_core.Loop.GiveLocked` calls once, right after
+/// `Loop.run` takes it and before the first turn starts. Until then an `ask`
+/// decision refuses outright, the same as the MCP startup path already does
+/// for the whole of its own session.
+///
+/// **The grant memory is folded once and then kept live, not re-folded on
+/// every question.** `giveFn` folds `session` from the log one time, the same
+/// single fold `Loop.run` itself does at the top of `run`, and
+/// `chock_broker.Broker.request` is given `&session.grants`, so every
+/// `approved_by_user_for_session` answer it writes updates this same value in
+/// place: see `chock_proto.state.SessionGrants`. Nothing outside this
+/// broker's own asks ever writes a `net.connect` grant, so there is nothing a
+/// re-fold would see that this does not already hold.
+const ToolNetwork = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    started: *Started,
+    /// The display, when bare `chock` brought one up. See `SessionArbiter.screen`
+    /// for why a person mid session can only be reached through this or a
+    /// terminal, never both.
+    screen: ?*ui.Ui,
+
+    /// The channel every tool call's own sandbox is offered, renamed before
+    /// each call: see `brokerFn`.
+    network: chock_broker.network.Network,
+    transport: chock_broker.network.System = .{},
+    /// The sending end of `chock_core.tools.Context.approval_wait_ns`. Reset
+    /// to zero before every call this seam builds a broker for, and bumped by
+    /// `chock_broker.network.Network.askPermits` while a person is asked
+    /// about a connection that call opened.
+    approval_wait_ns: std.atomic.Value(u64) = .init(0),
+
+    session: chock_proto.state.Session,
+    /// Who this session shows a question to, and who is attached to its
+    /// approval socket. Built once, alongside `broker`, because both need the
+    /// locked handle `giveFn` is given.
+    approvers: Approvers = undefined,
+    broker: chock_broker.Broker = undefined,
+
+    fn seam(self: *ToolNetwork) chock_core.tools.NetSeam {
+        return .{ .ptr = self, .vtable = &seam_vtable };
+    }
+
+    const seam_vtable = chock_core.tools.NetSeam.VTable{ .broker = brokerFn };
+
+    fn brokerFn(ptr: *anyopaque, tool: []const u8) sandbox.NetBroker {
+        const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
+        self.network.tool = tool;
+        // **Every call, not only one that asks.** A call with nothing to ask
+        // about must not read as one that waited for a person, because the
+        // counter it would read is whatever the call before it left behind:
+        // see `chock_core.tools.Context.approval_wait_ns`'s own doc comment.
+        self.approval_wait_ns.store(0, .monotonic);
+        return self.network.netBroker();
+    }
+
+    fn giveLocked(self: *ToolNetwork) chock_core.Loop.GiveLocked {
+        return .{ .ptr = self, .vtable = &give_vtable };
+    }
+
+    const give_vtable = chock_core.Loop.GiveLocked.VTable{ .give = giveFn };
+
+    fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
+        const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
+        foldSession(self.gpa, self.io, self.started.storage, &self.session);
+        self.approvers.init(self.gpa, self.io, self.started, locked, self.screen);
+        self.broker = .{
+            .policy = self.started.policy,
+            .waiter = self.approvers.waiter(),
+            .redaction = self.started.redact_values,
+            .grants = &self.session.grants,
+        };
+        self.network.asker = .{
+            .broker = &self.broker,
+            .storage = self.started.storage,
+            .locked = locked,
+            .approval_wait_ns = &self.approval_wait_ns,
+        };
+    }
+
+    fn deinit(self: *ToolNetwork) void {
+        if (self.network.diagnostic) |*one| one.deinit(self.gpa);
+        self.session.deinit();
+    }
+};
+
 /// The broker, as `chock_core.Loop` carries an agent's work back mid session.
 ///
 /// **This is the first act an agent may ask for by name**, and it is
@@ -8905,6 +9009,43 @@ fn runSession(
         .screen = screen,
     };
 
+    // What gives a tool call's own sandbox a network broker: see
+    // `ToolNetwork`'s own top comment. The chain is the same one every other
+    // policy question this session asks folds, and it is freed with this
+    // function's own frame rather than an arena, because nothing else in this
+    // session needs it kept.
+    const tool_network_chain = try policyChain(gpa, started, options);
+    defer gpa.free(tool_network_chain);
+
+    var tool_network = ToolNetwork{
+        .gpa = gpa,
+        .io = io,
+        .started = started,
+        .screen = screen,
+        .session = .init(gpa),
+        .network = .{
+            .gpa = gpa,
+            .io = io,
+            .table = started.policy,
+            .chain = tool_network_chain,
+            .agent_kind = options.agent_kind,
+            .model = started.model,
+            // Renamed before every call: see `ToolNetwork.brokerFn`.
+            .tool = "",
+            .transport = undefined,
+        },
+    };
+    tool_network.network.transport = tool_network.transport.transport();
+    defer tool_network.deinit();
+
+    // **A tool call moves off `Network.none` here, for the whole session.**
+    // `tool_runner.context` was copied into `tool_runner` above, before
+    // `screen` and this were known, so the field is set on the copy directly:
+    // the same pattern `tool_runner.context.idle` below already uses. See
+    // `chock_core.tools.Context.net`.
+    tool_runner.context.net = tool_network.seam();
+    tool_runner.context.approval_wait_ns = &tool_network.approval_wait_ns;
+
     // What carries the agent's own work back when it says it is finished.
     // **The same act `applyWork` performs at the end of the run**, through the
     // same `carryCommit`, so an agent that asks reaches exactly what an agent
@@ -9033,6 +9174,10 @@ fn runSession(
         .client = http.client(),
         .storage = started.storage,
         .tool_runner = plugin_aware.runner(),
+        // Hands `tool_network` the session's own locked handle once `run`
+        // has taken it, so a tool call's own `ask` can reach a person: see
+        // `ToolNetwork` and `chock_core.Loop.GiveLocked`.
+        .give_locked = tool_network.giveLocked(),
         // The built-in list, plus whatever this project's MCP servers and
         // plugins declared and the policy allowed. Identical to
         // `started.tool_definitions` for a project that named neither: see

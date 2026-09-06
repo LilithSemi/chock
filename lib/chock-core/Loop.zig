@@ -215,6 +215,38 @@ pub const SandboxToolRunner = struct {
     }
 };
 
+/// Hands over the session's own locked handle, once, right after `run` takes
+/// it and before the first turn starts. Null, the default, is every caller
+/// that opens no filtered connection from inside a tool call: see
+/// `tools.Context.net` and `lib/chock-broker/network.zig`'s own `Network.asker`.
+///
+/// **Once, and never per call.** `run` holds this handle from here until the
+/// session ends, at the same address the whole time, so a tool call's own
+/// network broker needs it exactly once to answer every question a session
+/// asks through it: see this file's own top comment on the seam
+/// `Deps.arbiter` already threads per call, and why this one does not have
+/// to. A vtable that ran on every dispatch would hand over the same pointer
+/// every time for no reason, and it would ask every implementation of
+/// `ToolRunner` to grow a parameter that only one of them reads.
+///
+/// **This is not a second owner of the log.** The pointer this hands out is
+/// the very one `run` already holds; nothing here opens the log again or
+/// locks it a second time, and the caller that stores this pointer must
+/// never call `unlock` on it. See `arbiter_mod.Locked`'s own top comment for
+/// why the type has to be reached this way.
+pub const GiveLocked = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        give: *const fn (ptr: *anyopaque, locked: *arbiter_mod.Locked) void,
+    };
+
+    pub fn give(self: GiveLocked, locked: *arbiter_mod.Locked) void {
+        self.vtable.give(self.ptr, locked);
+    }
+};
+
 /// Told about each event as `Loop.run` appends it. Optional: `Loop.run`
 /// behaves the same with none, and every test in this file except the one
 /// that pins this behaviour uses none.
@@ -439,6 +471,11 @@ pub const Deps = struct {
     storage: chock_proto.storage.Storage,
     /// Runs one tool call. See this file's own top comment.
     tool_runner: ToolRunner,
+    /// Told the session's own locked handle once, right after `run` takes it.
+    /// Null, the default, is a session whose tool calls open no filtered
+    /// connection, which is every caller before this field existed. See
+    /// `GiveLocked`.
+    give_locked: ?GiveLocked = null,
     /// The tools the model is offered, in the shape
     /// `chock_provider.message.Request.tools` wants. A caller ordinarily
     /// builds this with `tools.Registry.definitions` and also passes it to
@@ -790,6 +827,11 @@ pub const Error =
 pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
     var locked = try deps.storage.lock(io);
     defer locked.unlock(io) catch {};
+
+    // Once, here, and nowhere else: see `GiveLocked`'s own top comment on why
+    // a tool call's own network broker needs this pointer exactly once and
+    // never per call.
+    if (deps.give_locked) |give| give.give(&locked);
 
     var session = chock_proto.state.Session.init(allocator);
     defer session.deinit();
