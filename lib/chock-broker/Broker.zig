@@ -565,13 +565,45 @@ pub fn request(
             // proof that the fresh evaluation was exactly `ask`, and this
             // branch is that proof: nothing above it, and nothing that
             // follows below the `switch`, is a second evaluation. A grant
-            // found here answers with no `approval.request` and no
-            // `approval.response` of its own: the person's decision is
-            // already in the log once, as the `approved_by_user_for_session`
-            // line `findAnswer` folded in, and a second record of the same
-            // fact would be the flood this memory exists to prevent.
+            // found here answers with no `approval.request` of its own: the
+            // question a person already answered is in the log once, and a
+            // second question of the same shape would be the flood this
+            // memory exists to prevent.
+            //
+            // **A response, still, and not silence.** This used to return
+            // `approved_by_user` with nothing written, so an act a grant
+            // served left no line at all: a reader could not tell it apart
+            // from an act nobody ever attempted. `request_id` zero says a
+            // fresh question was never asked, the same way it already does
+            // for `allowed_by_policy` and `denied_by_policy` above, so this
+            // response reads as what it is, a memory applied, and not as a
+            // second `askTheHuman`. `SessionGrants.apply` refuses to fold a
+            // zero `request_id` back into a grant, so this line can never
+            // become a second source of the same memory: see that function's
+            // own doc comment.
+            //
+            // **One response per act, not one pair.** Measured on 2026-09-06,
+            // over the real storage backend: 200 full `approval.request` and
+            // `approval.response` pairs cost 170047 bytes, against 75400 for
+            // 200 responses of this shape, with no request in front of any of
+            // them. It still carries `tool_call_id`, which is what lets the
+            // oracle attribute it to the call that asked. See
+            // `test/redteam/logscan.zig`'s `Fold.keyFor`.
             if (self.grants) |grants| {
-                if (grants.get(ask.action, true) != null) return .approved_by_user;
+                if (grants.get(ask.action, true) != null) {
+                    _ = try appendAnswer(
+                        gpa,
+                        io,
+                        locked,
+                        ask,
+                        0,
+                        .approved_by_user_for_session,
+                        "",
+                        self.waiter.nowMs(io),
+                        .{},
+                    );
+                    return .approved_by_user;
+                }
             }
             return self.askTheHuman(gpa, io, storage, locked, ask, .{}, diag);
         },
@@ -2983,6 +3015,117 @@ test "agent_then_human pays for no review when nobody can answer the second half
         );
         try testing.expectEqual(@as(usize, 1), review_arbiter.calls);
     }
+}
+
+test "a remembered grant answers with no question and still writes a compact record" {
+    // `request`'s own `ask` branch, when `grants` already holds a yes for
+    // this exact action. Before this, the branch returned `.approved_by_user`
+    // with nothing appended: the act a grant served left no line in the log
+    // at all, so `SECURITY.md`'s claim that the log is the evidence was false
+    // for every act after the first. See that branch's own comment.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01GRANTSERVED0000000000000");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    const ask_the_push: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "git.push", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+
+    // The real grant, made the ordinary way: a question is asked, and a
+    // person answers "yes, for the rest of the session".
+    const Answerer = struct {
+        gpa: std.mem.Allocator,
+        store: chock_proto.storage.Storage,
+        locked: *LockedHandle,
+
+        fn onWait(ctx: ?*anyopaque, io_inner: std.Io, waits: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (waits != 1) return;
+            const id = try findRequestId(self.gpa, io_inner, self.store, "git.push") orelse return;
+            _ = try answerAbout(self.gpa, io_inner, self.locked, id, .approved_by_user_for_session, "git.push", "call1");
+        }
+    };
+    var answerer = Answerer{ .gpa = gpa, .store = store, .locked = &locked };
+    var first_waiter = TestWaiter{ .ctx = &answerer, .on_wait = Answerer.onWait };
+    var first_broker = try testBroker(gpa, ask_the_push, &first_waiter);
+    defer table.Table.destroy(gpa, first_broker.policy);
+
+    const first_outcome = try first_broker.request(gpa, io, store, &locked, testRequest("git.push"), null);
+    if (first_waiter.failed) |err| return err;
+    try testing.expectEqual(Outcome.approved_by_user, first_outcome);
+    try testing.expectEqual(@as(usize, 1), try countKind(gpa, io, store, .approval_request));
+
+    // Fold the log so far, the way `src/run.zig`'s `decideFn` folds a fresh
+    // `Session` before every question: this is the grant the second call
+    // reads.
+    var folded = chock_proto.state.Session.init(gpa);
+    defer folded.deinit();
+    {
+        var replay = try store.replay(gpa, io, 0);
+        defer replay.deinit();
+        while (try replay.next(io)) |parsed| {
+            defer parsed.deinit();
+            try folded.apply(parsed.value);
+        }
+    }
+    try testing.expect(folded.grants.granted.contains("git.push"));
+
+    // The second call: the same action, the same table, nobody at the
+    // waiter's end this time, because the grant answers before the broker
+    // would ever have to give control away.
+    var second_waiter = TestWaiter{};
+    var second_broker = try testBroker(gpa, ask_the_push, &second_waiter);
+    defer table.Table.destroy(gpa, second_broker.policy);
+    second_broker.grants = &folded.grants;
+
+    const second_outcome = try second_broker.request(gpa, io, store, &locked, testRequest("git.push"), null);
+    try testing.expectEqual(Outcome.approved_by_user, second_outcome);
+    try testing.expect(second_outcome.permits());
+
+    // No second question: the waiter was never asked to wait, and the
+    // request count is still the one the first call wrote.
+    try testing.expectEqual(@as(usize, 0), second_waiter.waits);
+    try testing.expectEqual(@as(usize, 1), try countKind(gpa, io, store, .approval_request));
+
+    // The record the grant serving now writes: one more `approval.response`,
+    // `request_id` zero because no question was written for it, naming
+    // exactly what was decided and the tool call it belongs to, with nobody
+    // as the responder, since nobody acted this time.
+    try testing.expectEqual(@as(usize, 2), try countKind(gpa, io, store, .approval_response));
+    const answer = try theAnswer(gpa, io, store, 0);
+    defer freeAnswer(gpa, answer);
+    try testing.expectEqualStrings("approved_by_user_for_session", answer.decision_name);
+    try testing.expectEqualStrings("git.push", answer.action);
+    try testing.expectEqualStrings("call1", answer.tool_call_id);
+    try testing.expectEqualStrings("", answer.responder);
+
+    // **This record cannot become a second source of the grant it reports
+    // on.** `SessionGrants.apply` refuses a zero `request_id`, even for this
+    // exact decision: see that function's own doc comment. A fresh fold of
+    // the whole log, real grant and compact record both, still holds exactly
+    // one grant, never two.
+    var refolded = chock_proto.state.Session.init(gpa);
+    defer refolded.deinit();
+    var replay = try store.replay(gpa, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        try refolded.apply(parsed.value);
+    }
+    try testing.expect(refolded.grants.granted.contains("git.push"));
+    try testing.expectEqual(@as(u32, 1), refolded.grants.granted.count());
 }
 
 test "a promise the session made narrows the answer, and never widens it" {

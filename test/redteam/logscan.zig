@@ -1253,6 +1253,27 @@ const TestLog = struct {
             .responder = "ross",
         } });
     }
+
+    /// One `approval.response` a remembered grant served, with no
+    /// `approval.request` in front of it: `request_id` zero, and the action
+    /// and tool call id filled in directly. This is the shape
+    /// `Broker.request`'s own `ask` branch writes when `SessionGrants`
+    /// already holds a yes for `action`, so no fresh question is asked. See
+    /// `lib/chock-broker/Broker.zig`'s own top comment on that branch.
+    fn grantServed(
+        self: *TestLog,
+        io: std.Io,
+        action: []const u8,
+        tool_call_id: []const u8,
+    ) !void {
+        _ = try self.append(io, .{ .approval_response = .{
+            .request_id = 0,
+            .decision = .approved_by_user_for_session,
+            .responder = "",
+            .action = action,
+            .tool_call_id = tool_call_id,
+        } });
+    }
 };
 
 fn scanTestLog(gpa: std.mem.Allocator, io: std.Io, log: *TestLog, policy: [:0]const u8) !Scan {
@@ -1384,6 +1405,110 @@ test "a session scoped grant against a table that says deny is an impossible pai
     try testing.expect(result.policy[0].permitted);
     try testing.expect(result.breached());
     try testing.expectEqualStrings("deny", result.policy[0].expected);
+}
+
+test "an act a grant served, with no request in front of it, is attributed to the tool call that asked" {
+    // The shape `Broker.request`'s own `ask` branch now writes when a
+    // remembered grant answers: one `approval.response`, `request_id` zero,
+    // naming the tool call directly rather than through a request this scan
+    // would otherwise have to join to. `keyFor` reads `response.tool_call_id`
+    // for exactly this case: see its own comment on the join reading the
+    // request first and the response only where that fails. A rebuild that
+    // could not find the tool from the response alone would report this
+    // inconclusive instead of judging it, which is the fault an empty
+    // `tool_call_id` caused once already.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log: TestLog = undefined;
+    try log.open(gpa, io);
+    defer log.deinit();
+    try log.start(io);
+    _ = try log.append(io, .{ .tool_call = .{
+        .call_id = "call-9",
+        .tool = "git",
+        .arguments = "{\"args\":[\"push\"]}",
+    } });
+    try log.grantServed(io, "git.push", "call-9");
+
+    var result = try scanTestLog(gpa, io, &log,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "git.push", .decision = .ask } },
+        \\} }
+    );
+    defer result.deinit();
+
+    try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
+    try testing.expectEqual(@as(usize, 0), result.policy.len);
+    try testing.expect(!result.breached());
+}
+
+test "an act a grant served against a table that now says deny is a breach, not a silent pass" {
+    // The direction that matters. Nothing here goes through `askTheHuman`, so
+    // there is no `approval.request` this scan could fail to find: the
+    // response alone must still be judged, or a grant reused after a table
+    // tightened would read as clean because nothing ever reached the
+    // request/response matching this file's `judge` starts with.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log: TestLog = undefined;
+    try log.open(gpa, io);
+    defer log.deinit();
+    try log.start(io);
+    _ = try log.append(io, .{ .tool_call = .{
+        .call_id = "call-9",
+        .tool = "git",
+        .arguments = "{\"args\":[\"push\"]}",
+    } });
+    try log.grantServed(io, "git.push", "call-9");
+
+    var result = try scanTestLog(gpa, io, &log,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "git.push", .decision = .deny } },
+        \\} }
+    );
+    defer result.deinit();
+
+    try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
+    try testing.expectEqual(@as(usize, 1), result.policy.len);
+    try testing.expect(result.policy[0].permitted);
+    try testing.expect(result.breached());
+    try testing.expectEqualStrings("git.push", result.policy[0].action);
+    try testing.expectEqualStrings("deny", result.policy[0].expected);
+}
+
+test "a network summary reaches the log and the oracle reads past it without a finding of its own" {
+    // `network.summary` carries counts, not a decision: `Fold.take` folds it
+    // nowhere, the same `else` branch every kind this scan does not track
+    // yet falls into. This pins that a session which used the network still
+    // reads clean when nothing else in it disagrees with the table, so a
+    // build that gave the event its own judged branch by mistake would fail
+    // here as much as one that dropped it would fail the requirement it
+    // exists for.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var log: TestLog = undefined;
+    try log.open(gpa, io);
+    defer log.deinit();
+    try log.start(io);
+    _ = try log.append(io, .{ .tool_call = .{ .call_id = "call-1", .tool = "fetch_url", .arguments = "{}" } });
+    _ = try log.append(io, .{ .network_summary = .{ .granted = 2, .refused = 1, .diagnostic = "dns failed" } });
+
+    var result = try scanTestLog(gpa, io, &log,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "net.connect.*", .decision = .allow } },
+        \\} }
+    );
+    defer result.deinit();
+
+    try testing.expectEqualSlices([]const u8, &.{}, result.inconclusive);
+    try testing.expectEqual(@as(usize, 0), result.policy.len);
+    try testing.expect(!result.breached());
 }
 
 test "an act with no policy key at all is still reported inconclusive" {

@@ -5144,13 +5144,14 @@ const ToolNetwork = struct {
         };
     }
 
-    /// **A granted connection used to leave nothing behind.**
-    /// `network.granted` and `network.refused` were read by nobody, so a tool
-    /// call's own egress said nothing at all unless a person had been asked:
+    /// **A granted connection used to leave nothing behind but a terminal
+    /// line.** `network.granted` and `network.refused` were read by nobody
+    /// but a person watching the terminal at the moment the session ended, so
+    /// a tool call's own egress said nothing at all to the log:
     /// `SECURITY.md` and `docs/threat-model.md` both call the log the
-    /// evidence, and for this path there was none. `McpState.deinit` already
-    /// prints "refused N of M" for the same reason, one server at a time.
-    /// This is that argument over the whole session.
+    /// evidence, and a terminal line is not the log. `McpState.deinit` prints
+    /// "refused N of M" for the same reason, one server at a time, and it has
+    /// the same gap. `logSummary` below is what closes it.
     ///
     /// **A session end summary, and not one event per connection.** A
     /// `net.connect` question a person answers already writes an
@@ -5158,11 +5159,13 @@ const ToolNetwork = struct {
     /// `Network.answer` decides `allow` and `deny` itself and never calls the
     /// broker for either, exactly so that the common case keeps costing
     /// nothing: see `lib/chock-broker/network.zig`'s own top comment on the
-    /// volume that would create. Measured on 2026-09-05: one event per
-    /// connection cost 159074 bytes for 200 connections, against 820 bytes for
-    /// the two counters this struct already carries in memory. A summary line
-    /// costs the same whether the session opened one connection or a
-    /// thousand, so it is printed here rather than logged once per grant.
+    /// volume that would create. Measured on 2026-09-06, over the real
+    /// storage backend: 200 `approval.request` and `approval.response` pairs
+    /// cost 170047 bytes, against 228 bytes for the one `network.summary`
+    /// event this struct now writes, whatever the connection count. A
+    /// summary event costs the same whether the session opened one
+    /// connection or a thousand, so it is written once here rather than
+    /// logged per connection.
     fn deinit(self: *ToolNetwork) void {
         if (self.network.refused != 0) {
             tty.print(
@@ -5178,10 +5181,149 @@ const ToolNetwork = struct {
                 .{ self.network.granted, if (self.network.granted == 1) "" else "s" },
             );
         }
+        self.logSummary();
         if (self.network.diagnostic) |*one| one.deinit(self.gpa);
         self.session.deinit();
     }
+
+    /// Write `networkSummaryEvent`'s own event to the log, when there is one
+    /// to write. Formats the diagnostic here, where the type it belongs to is
+    /// in scope, and hands the rest to `logNetworkSummary`, which is a free
+    /// function so a test can call it without building a whole `ToolNetwork`.
+    fn logSummary(self: *ToolNetwork) void {
+        var diag_text: ?[]u8 = null;
+        defer if (diag_text) |t| self.gpa.free(t);
+        if (self.network.diagnostic) |*one| {
+            diag_text = std.fmt.allocPrint(self.gpa, "{f}", .{one}) catch null;
+        }
+        logNetworkSummary(
+            self.gpa,
+            self.io,
+            self.started.storage,
+            self.network.granted,
+            self.network.refused,
+            diag_text orelse "",
+        );
+    }
 };
+
+/// Write one `network.summary` event, when there is one to write. Best
+/// effort: `Loop.run` has already released the storage lock by the time
+/// `ToolNetwork.deinit` runs, see `chock_core.Loop.run`'s own top of function
+/// `defer`, so this takes it again for one append. A session whose log
+/// cannot be reached one more time at the very end still exits. It says so
+/// on the terminal instead, the same way every other best-effort append in
+/// this file does.
+fn logNetworkSummary(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    granted: usize,
+    refused: usize,
+    diagnostic_text: []const u8,
+) void {
+    const ev = networkSummaryEvent(granted, refused, diagnostic_text) orelse return;
+
+    var locked = storage.lock(io) catch |err| {
+        tty.print(
+            .warn,
+            "chock: a tool call's own network summary could not be written to the log: {s}\n",
+            .{@errorName(err)},
+        );
+        return;
+    };
+    defer locked.unlock(io) catch {};
+    _ = locked.append(
+        gpa,
+        io,
+        ev,
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
+    ) catch |err| {
+        tty.print(
+            .warn,
+            "chock: a tool call's own network summary could not be written to the log: {s}\n",
+            .{@errorName(err)},
+        );
+    };
+}
+
+/// The `network.summary` event `ToolNetwork.logSummary` writes, or null when
+/// the session opened no connection and had none refused. **Pure**, so its
+/// shape can be checked without touching storage: see the test below.
+fn networkSummaryEvent(
+    granted: usize,
+    refused: usize,
+    diagnostic_text: []const u8,
+) ?chock_proto.event.Event {
+    if (granted == 0 and refused == 0) return null;
+    return .{ .network_summary = .{
+        .granted = @intCast(granted),
+        .refused = @intCast(refused),
+        .diagnostic = diagnostic_text,
+    } };
+}
+
+test "a session with no network use writes no summary at all" {
+    try std.testing.expectEqual(@as(?chock_proto.event.Event, null), networkSummaryEvent(0, 0, ""));
+}
+
+test "a session's own network summary carries what the terminal line said, for the log this time" {
+    const ev = networkSummaryEvent(3, 1, "the host did not resolve") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(chock_proto.event.Kind.network_summary, std.meta.activeTag(ev));
+    try std.testing.expectEqual(@as(u64, 3), ev.network_summary.granted);
+    try std.testing.expectEqual(@as(u64, 1), ev.network_summary.refused);
+    try std.testing.expectEqualStrings("the host did not resolve", ev.network_summary.diagnostic);
+}
+
+test "a tool call's own network reaches the log, not only the terminal" {
+    // The requirement itself. Before this, `ToolNetwork.deinit` printed and
+    // wrote nothing, so `SECURITY.md`'s claim that the log is the evidence
+    // was false for a tool call's own network: see `logNetworkSummary`'s own
+    // top comment.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETSUMMARY0000000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    logNetworkSummary(gpa, io, storage, 4, 1, "the host did not resolve");
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .network_summary) continue;
+        found = true;
+        try std.testing.expectEqual(@as(u64, 4), parsed.value.event.network_summary.granted);
+        try std.testing.expectEqual(@as(u64, 1), parsed.value.event.network_summary.refused);
+        try std.testing.expectEqualStrings(
+            "the host did not resolve",
+            parsed.value.event.network_summary.diagnostic,
+        );
+    }
+    try std.testing.expect(found);
+}
+
+test "a session with nothing granted and nothing refused writes no summary to the log either" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NETSUMMARYNONE00000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    logNetworkSummary(gpa, io, storage, 0, 0, "");
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.event != .network_summary);
+    }
+}
 
 /// Re-fold `session` from `storage` and hand back this session's own
 /// promises, in the form the ratchet reads.
@@ -13302,6 +13444,45 @@ fn gateCountApprovalRequests(gpa: std.mem.Allocator, io: std.Io, storage: chock_
     return count;
 }
 
+/// Every `approval.response` with `request_id` zero: the shape a remembered
+/// grant now writes when it serves an act with no fresh question asked. See
+/// `Broker.request`'s own `ask` branch. The caller frees the result with
+/// `gpa`, and owns nothing inside each entry: every slice still points into
+/// the parsed line, which is only valid for as long as the log holds these
+/// exact bytes, true of every test log in this file.
+fn gateGrantServedResponses(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+) ![]chock_proto.event.ApprovalResponse {
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found: std.ArrayList(chock_proto.event.ApprovalResponse) = .empty;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .approval_response) continue;
+        const response = parsed.value.event.approval_response;
+        if (response.request_id != 0) continue;
+        try found.append(gpa, .{
+            .request_id = response.request_id,
+            .decision = response.decision,
+            .responder = try gpa.dupe(u8, response.responder),
+            .action = try gpa.dupe(u8, response.action),
+            .tool_call_id = try gpa.dupe(u8, response.tool_call_id),
+        });
+    }
+    return found.toOwnedSlice(gpa);
+}
+
+fn freeGrantServedResponses(gpa: std.mem.Allocator, responses: []chock_proto.event.ApprovalResponse) void {
+    for (responses) |one| {
+        gpa.free(one.responder);
+        gpa.free(one.action);
+        gpa.free(one.tool_call_id);
+    }
+    gpa.free(responses);
+}
+
 test "the loop's own tool gate remembers a for-session grant across separate questions" {
     // `SessionArbiter.decideFn` folds a brand new `state.Session` from the
     // log and builds a brand new `chock_broker.Broker` around it for every
@@ -13364,6 +13545,13 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         try std.testing.expectEqual(@as(usize, 1), waiter.waits);
     }
     try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
+    // The first answer came from a real question, so it carries its own
+    // request. Nothing has been served from memory yet.
+    {
+        const served = try gateGrantServedResponses(gpa, io, storage);
+        defer freeGrantServedResponses(gpa, served);
+        try std.testing.expectEqual(@as(usize, 0), served.len);
+    }
 
     // The second, identical tool call: `decideFn` runs again from nothing,
     // exactly as it would for a later turn of the same session. It folds a
@@ -13392,6 +13580,23 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         try std.testing.expectEqual(@as(usize, 0), waiter.waits);
     }
     try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
+    // **This is the fix.** No second question means no second
+    // `approval.request`, and it used to mean no record at all: the act a
+    // grant just served left nothing behind. It now leaves one compact
+    // `approval.response`, `request_id` zero, naming the exact action and
+    // tool call this milestone's own oracle attributes it by.
+    {
+        const served = try gateGrantServedResponses(gpa, io, storage);
+        defer freeGrantServedResponses(gpa, served);
+        try std.testing.expectEqual(@as(usize, 1), served.len);
+        try std.testing.expectEqual(
+            chock_proto.event.ApprovalDecision.approved_by_user_for_session,
+            served[0].decision,
+        );
+        try std.testing.expectEqualStrings("git.push", served[0].action);
+        try std.testing.expectEqualStrings("call1", served[0].tool_call_id);
+        try std.testing.expectEqualStrings("", served[0].responder);
+    }
 }
 
 test "a promise a parent made binds its subagents, out of the parent's own log" {

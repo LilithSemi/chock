@@ -438,13 +438,21 @@ pub const SessionGrants = struct {
     /// response the policy table answers on its own, `allowed_by_policy` and
     /// `denied_by_policy` both, always carries `request_id` zero, because no
     /// question was ever written for a person to answer: see
-    /// `event.ApprovalResponse.request_id`. Nothing in this build ever writes
-    /// `approved_by_user_for_session` with a zero `request_id`, because a
-    /// person can only give that answer to a question that was actually
-    /// asked, but a fold reads whatever the log holds and must not take a
-    /// line's word for what it claims when the line contradicts itself. This
-    /// is what keeps the read that follows scoped to the ask branch: nothing
-    /// reaches `granted` that did not first pass through a real question.
+    /// `event.ApprovalResponse.request_id`.
+    ///
+    /// **This build does now write `approved_by_user_for_session` with a
+    /// zero `request_id`, and this is exactly the line that keeps that safe.**
+    /// `Broker.request`'s own `ask` branch, the `.ask` case, writes one to
+    /// record that a remembered grant served an act, with no question asked
+    /// and so no `approval.request` in front of it. That record must never
+    /// become a second source of the grant it is reporting on, or a log an
+    /// attacker could shape would let one recorded use conjure the grant it
+    /// depends on. A person can only give this answer to a question that was
+    /// actually asked, so a fold reads whatever the log holds and must not
+    /// take a line's word for what it claims when the line contradicts
+    /// itself. This is what keeps the read that follows scoped to the ask
+    /// branch: nothing reaches `granted` that did not first pass through a
+    /// real question.
     pub fn apply(
         self: *SessionGrants,
         allocator: std.mem.Allocator,

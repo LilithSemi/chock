@@ -171,6 +171,7 @@ pub const Kind = enum {
     workspace_open,
     workspace_integrate,
     sandbox_open,
+    network_summary,
     unknown,
 
     /// Give the dotted wire name for a kind. Never call this with `.unknown`.
@@ -220,6 +221,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .workspace_open = "workspace.open",
     .workspace_integrate = "workspace.integrate",
     .sandbox_open = "sandbox.open",
+    .network_summary = "network.summary",
     .unknown = "unknown",
 });
 
@@ -1369,6 +1371,34 @@ pub const SandboxOpen = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// A tool call's own network use over the whole session, one line rather than
+/// one per connection.
+///
+/// **A count, and never a per-connection record.** `net.connect` is allowed
+/// or denied by policy alone for the ordinary case, with no question asked
+/// and no `approval.request` written: see `lib/chock-broker/network.zig`'s
+/// own top comment. Before this event, that decision reached a terminal line
+/// and nothing else, so `SECURITY.md`'s own claim that the log is the
+/// evidence was false for a tool call's own network. Written once, when the
+/// session ends, because the cost of this event does not grow with the
+/// number of connections and a line per connection's does: see
+/// `src/run.zig`'s `ToolNetwork.deinit` for the count measured against a
+/// line per connection.
+pub const NetworkSummary = struct {
+    /// How many connections a tool call's own sandbox reached.
+    granted: u64 = 0,
+    /// How many were refused.
+    refused: u64 = 0,
+    /// The first refusal's own diagnostic, already formatted to text. Empty
+    /// when `refused` is zero.
+    diagnostic: []const u8 = "",
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A sum of money. `value` is a float rather than an integer of minor units
 /// because a single turn on a cheap model costs a fraction of a cent, and a
 /// currency's minor unit cannot hold that.
@@ -1550,6 +1580,7 @@ pub const Event = union(Kind) {
     workspace_open: WorkspaceOpen,
     workspace_integrate: WorkspaceIntegrate,
     sandbox_open: SandboxOpen,
+    network_summary: NetworkSummary,
     /// A kind this reader does not recognize. See `UnknownEvent`.
     unknown: UnknownEvent,
 
@@ -2045,6 +2076,7 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
             .write_execute = .relaxed,
             .decision = nl,
         } },
+        .{ .network_summary = .{ .granted = 3, .refused = 1, .diagnostic = nl } },
         .{ .unknown = .{ .kind = "future.kind", .payload = .{ .string = nl } } },
     };
 

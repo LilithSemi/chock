@@ -1285,11 +1285,25 @@ test "a person who says session is not asked again, through a real Terminal and 
         if (terminal.failed) |err| return err;
     }
 
-    // Exactly one question was ever written, however many times the same act
-    // was asked about: the memory answered the second one before a request
-    // for it ever reached the log.
+    // Exactly one question was ever put to a person, however many times the
+    // same act was asked about: the memory answered the second one before a
+    // request for it ever reached the log. That is what `questions` pins,
+    // and it is the fact this test is named for.
+    //
+    // **A response count alone used to stand in for that fact, and it no
+    // longer can.** `Broker.request`'s own `ask` branch now writes a compact
+    // `approval.response` when a grant answers, `request_id` zero, so a
+    // session grant that works produces two responses on purpose: the real
+    // answer `Terminal.record` wrote to the first question, and the record
+    // of the second act the grant served with no question of its own. A bare
+    // count of two would pass whether or not the grant actually fired, since
+    // an unrelated second `askTheHuman` would also leave two responses
+    // behind. So this checks the two apart by what each one is: one answered
+    // request, real question and all, and one grant record with no request
+    // behind it, naming the exact tool call it served.
     var questions: usize = 0;
-    var responses: usize = 0;
+    var answered_requests: usize = 0;
+    var grant_records: usize = 0;
     var replay = try store.replay(gpa, io, 0);
     defer replay.deinit();
     while (try replay.next(io)) |parsed| {
@@ -1300,14 +1314,21 @@ test "a person who says session is not asked again, through a real Terminal and 
                 try testing.expectEqualStrings("workspace.apply", request.action);
             },
             .approval_response => |response| {
-                responses += 1;
                 try testing.expectEqualStrings("workspace.apply", response.action);
+                try testing.expectEqual(Decision.approved_by_user_for_session, response.decision);
+                if (response.request_id == 0) {
+                    grant_records += 1;
+                    try testing.expectEqualStrings("call1", response.tool_call_id);
+                } else {
+                    answered_requests += 1;
+                }
             },
             else => {},
         }
     }
     try testing.expectEqual(@as(usize, 1), questions);
-    try testing.expectEqual(@as(usize, 1), responses);
+    try testing.expectEqual(@as(usize, 1), answered_requests);
+    try testing.expectEqual(@as(usize, 1), grant_records);
 }
 
 test "a Ctrl-C at the prompt ends the wait and leaves the question open" {
