@@ -4850,9 +4850,23 @@ const ApprovalLock = @typeInfo(
 /// The loop holds a `state.Session` of its own and this seam is handed none, so
 /// the log is folded here. That is not a workaround: the fold is the truth of a
 /// session, and it is what makes this right about a session that was resumed,
-/// handed to the daemon, or compacted. It costs one replay per question, and
+/// handed to the daemon, or compacted.
+///
+/// **A full replay of the whole log used to run on every question, and
 /// `gateToolCall` now asks this for every ordinary tool call, not only a
-/// widening proposal.
+/// widening proposal, so that was quadratic in the length of the session.**
+/// Measured 2026-09-07, `ReleaseSafe`, real `JsonLines` storage: one full
+/// replay of a 1200 event, 404 KB log took 73 ms, and 400 gated calls against
+/// a session that started there, each folding from event 0 and then
+/// appending one `approval_response`, took 20.4 s. `folded` and `folded_at`
+/// below are what fixes that: `foldSessionSince` resumes each question's
+/// fold from where the previous one stopped, so the cost of a question is
+/// the events since the last one, not the whole session. The same 400 calls
+/// measured 83 ms with that change, and every one of them still starts by
+/// reading whatever the log holds up to that instant, so a mid session
+/// `restrict_self` still binds the very next question: see
+/// `foldSessionSince`'s own doc comment for why a partial, resumed fold
+/// reaches the same state a full one would.
 ///
 /// ## The reviewer, and the honest limit on it
 ///
@@ -4873,9 +4887,27 @@ const SessionArbiter = struct {
     /// only thing reading the terminal. Null for `chock run`, which asks at the
     /// prompt. See `Approvers.waiter`.
     screen: ?*ui.Ui = null,
+    /// What `decideFn` has folded of this session's own log so far. Null
+    /// until the first question, after which it is kept and only ever
+    /// caught up, never rebuilt: see `foldSessionSince`. Freed by `deinit`,
+    /// which the one caller that builds a `SessionArbiter` must run once the
+    /// session is over.
+    folded: ?chock_proto.state.Session = null,
+    /// The byte offset `folded` has been read up to, so the next fold knows
+    /// where to resume. Meaningless while `folded` is null, and 0 means
+    /// "from the start of the log", the same as `storage.replay`'s own
+    /// `offset` reads it: see `foldSessionSince`.
+    folded_at: u64 = 0,
 
     fn arbiter(self: *SessionArbiter) chock_core.arbiter.Arbiter {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Release what `decideFn` folded, if it ever ran. Safe to call on a
+    /// `SessionArbiter` no question ever reached, since `folded` is then
+    /// still null.
+    fn deinit(self: *SessionArbiter) void {
+        if (self.folded) |*session| session.deinit();
     }
 
     const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
@@ -4889,12 +4921,18 @@ const SessionArbiter = struct {
     ) chock_core.arbiter.Answer {
         const self: *SessionArbiter = @ptrCast(@alignCast(ptr));
 
-        var session = chock_proto.state.Session.init(gpa);
-        defer session.deinit();
-        foldSession(gpa, io, self.started.storage, &session);
+        // **Kept across every question this arbiter is ever asked, and
+        // caught up rather than rebuilt.** See this struct's own `folded`
+        // and `folded_at`, and `foldSessionSince`'s doc comment for why a
+        // fold resumed this way still reaches the same state a fold of the
+        // whole log from event 0 would, including a `restrict_self` that
+        // landed since the last question.
+        if (self.folded == null) self.folded = chock_proto.state.Session.init(self.gpa);
+        const session = &self.folded.?;
+        foldSessionSince(gpa, io, self.started.storage, session, &self.folded_at);
 
         var review_child = reviewChild(self.gpa, self.environ, self.env, self.started, self.options);
-        var review_spawner = reviewerFor(review_child.spawner(), self.started, &session);
+        var review_spawner = reviewerFor(review_child.spawner(), self.started, session);
 
         // The loop's own handle, so a reviewer this decision starts is appended
         // to the log as a child and counted against the width bound: see
@@ -4913,13 +4951,13 @@ const SessionArbiter = struct {
             // so the same values reach both. See `brokerRedaction`.
             .redaction = self.started.redact_values,
             // **The memory that stops this loop from asking the same
-            // question twice.** `session` was just folded from the whole
-            // log, so it already holds every `approved_by_user_for_session`
+            // question twice.** `session` was just caught up to the end of
+            // the log, so it already holds every `approved_by_user_for_session`
             // answer a person gave to an earlier question in this session.
             // Without this, a person who says "yes, for the rest of the
             // session" to one tool call would be asked again on the very
-            // next one, because `decideFn` folds a brand new `Session` and
-            // builds a brand new `Broker` every time it runs.
+            // next one, because `decideFn` builds a brand new `Broker` every
+            // time it runs, even though `session` itself is kept.
             .grants = &session.grants,
         };
 
@@ -4936,13 +4974,16 @@ const SessionArbiter = struct {
             io,
             self.started.paths.dir,
             self.options.parent_session,
-            &session,
+            session,
         ) catch &.{};
 
-        // Why the broker refused, or could not decide. Released after the
-        // answer is written, because a copy in it lives no longer than that.
-        // Freed with `session`'s own arena and not with `gpa`, to match the
-        // allocator the request below is passed: see the paragraph there.
+        // Why the broker refused, or could not decide. `d.deinit` is called so
+        // the arena's own bookkeeping stays honest, but the bytes themselves
+        // are not reclaimed until `session`'s arena is: `session` is now kept
+        // for the life of the run (see `SessionArbiter.folded`), not torn
+        // down at the end of this call the way it used to be. A `Diagnostic`
+        // is small and one is built per question, so this is bounded by the
+        // number of questions the session asks, not by the size of the log.
         var broker_diag: ?chock_broker.Diagnostic = null;
         defer if (broker_diag) |*d| d.deinit(session.arena.allocator());
         // **`session.arena.allocator()`, and not `gpa`.**
@@ -4951,8 +4992,9 @@ const SessionArbiter = struct {
         // and its `grow` (`lib/zig/std/hash_map.zig`) allocates the new
         // backing array with whatever allocator the *current* call passes
         // and frees the *old* array with that same value, whichever
-        // allocator actually built it. `foldSession` above filled
-        // `session.grants` through `session`'s own arena, so this call has
+        // allocator actually built it. `foldSessionSince` above filled
+        // `session.grants` through `session`'s own arena, and that arena
+        // never changes for as long as `session` is kept, so this call has
         // to use that same arena, or a later regrow frees arena memory
         // through the wrong allocator.
         //
@@ -8691,6 +8733,56 @@ fn foldSession(
     }
 }
 
+/// Fold only what `storage` has written since `at`, into `session`, and move
+/// `at` to the new end of what was read. The incremental twin of
+/// `foldSession`: the same fold, run in more than one piece.
+///
+/// **A fold split across many calls reaches the same state a single fold of
+/// the whole log would.** `state.Session.apply` only ever adds to `session`
+/// or overwrites one field with a newer value of the same kind: it never
+/// looks back at what it already applied to decide how to apply the next
+/// event. So applying events 1 through 400 and then 401 through 450 leaves
+/// `session` exactly where applying 1 through 450 in one call would.
+/// `SessionArbiter.decideFn` is built on that: see its own doc comment for
+/// the cost this removes and the measurement that proves it.
+///
+/// **This is not the mistake `ToolNetwork` made once already**, of folding a
+/// session and then never folding it again, on the reasoning that nothing
+/// else could change what it held: a mid session `restrict_self` proved that
+/// reasoning wrong. This function is never asked to skip a fold. Every call
+/// still reads everything written since the last one, all the way to the
+/// current end of the log, before `session` is used for anything. What it
+/// skips is only the part already read.
+///
+/// **A line that will not decode stops the fold and leaves `at` unmoved.**
+/// `foldSession`'s own full replay from event 0 would meet that same line at
+/// that same position on its very next call and stop there too, so a caller
+/// that keeps calling this with the same `at` sees the identical failure
+/// every time, never a silent skip past what could not be read. A torn tail
+/// is different: `log.Replay.next` reports one by returning null with its
+/// position put back at the tear's own start, so `at` moves there, and a
+/// later call that finds the tear closed by a fresh append reads the
+/// completed line instead of stopping again. See that function's own doc
+/// comment.
+fn foldSessionSince(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    session: *chock_proto.state.Session,
+    at: *u64,
+) void {
+    var replay = storage.replay(gpa, io, at.*) catch return;
+    defer replay.deinit();
+    while (true) {
+        const parsed = replay.next(io) catch return;
+        const envelope = parsed orelse break;
+        defer envelope.deinit();
+        session.apply(envelope.value) catch return;
+        at.* = replay.at();
+    }
+    at.* = replay.at();
+}
+
 /// Put what the log already holds on the display, oldest event first.
 ///
 /// ## Why a resumed session used to open empty
@@ -9250,6 +9342,11 @@ fn runSession(
         .options = options,
         .screen = screen,
     };
+    // `decideFn` keeps a folded `state.Session` live across every question
+    // it answers: see `SessionArbiter.folded`. Freed here rather than by a
+    // `defer` next to that field's own first use, since `decideFn` is called
+    // through a `vtable` and never owns the moment its last call happens.
+    defer session_arbiter.deinit();
 
     // What gives a tool call's own sandbox a network broker: see
     // `ToolNetwork`'s own top comment. The chain is the same one every other
@@ -13597,6 +13694,124 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         try std.testing.expectEqualStrings("call1", served[0].tool_call_id);
         try std.testing.expectEqualStrings("", served[0].responder);
     }
+}
+
+test "foldSessionSince, resumed across many calls, reaches the same state a single fold would" {
+    // The whole reason `SessionArbiter.decideFn` can keep its `state.Session`
+    // live instead of rebuilding it from event 0 on every question: applying
+    // events 1 through k and then k+1 through n must leave `session` exactly
+    // where applying 1 through n in one call would. This pins that at the
+    // level `foldSessionSince` actually works at, with no `SessionArbiter`
+    // needed to prove it.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01RESUME");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    // The same 30 events, folded ten at a time across three separate calls,
+    // the shape three separate gated tool calls actually take: append some,
+    // ask a question, append some more, ask again.
+    var resumed = chock_proto.state.Session.init(gpa);
+    defer resumed.deinit();
+    var at: u64 = 0;
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var locked = try storage.lock(io);
+        var i: usize = 0;
+        while (i < 10) : (i += 1) {
+            _ = try locked.append(gpa, io, .{ .usage = .{ .input_tokens = round * 10 + i } }, 0);
+        }
+        try locked.unlock(io);
+        foldSessionSince(gpa, io, storage, &resumed, &at);
+    }
+
+    // One fold, start to finish, over the same finished log.
+    var whole = chock_proto.state.Session.init(gpa);
+    defer whole.deinit();
+    foldSession(gpa, io, storage, &whole);
+
+    try std.testing.expectEqual(whole.last_input_tokens, resumed.last_input_tokens);
+    try std.testing.expectEqual(whole.spend.turns, resumed.spend.turns);
+    try std.testing.expectEqual(whole.spend.input_tokens, resumed.spend.input_tokens);
+}
+
+test "a mid session restrict_self invalidates a remembered grant on the very next question, and a cache that never refolds does not see it" {
+    // **The ratchet is load bearing.** `SessionGrants.invalidate` only runs
+    // when the log carrying a `policy.self` event is folded again, so a
+    // grant memory kept live but never refolded is exactly the bug
+    // `ToolNetwork` had once, before it started refolding before every call:
+    // see `SessionArbiter`'s own doc comment on `decideFn`. This proves the
+    // fix the other way around: it folds a narrowing in, and it shows what
+    // not folding it in would have looked like.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01NARROW");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    const action = "git.push";
+
+    // A person answers "yes, for the rest of the session" to the first
+    // question, the same record `Broker.request`'s own `.ask` branch writes.
+    var locked = try storage.lock(io);
+    const request_id = try locked.append(gpa, io, .{ .approval_request = .{
+        .action = action,
+        .summary = "push the branch to origin",
+        .detail = "",
+        .reason = "",
+        .agent_kind = "main",
+        .spawn_chain = &.{},
+        .timeout_at_ms = 0,
+        .tool_call_id = "call1",
+    } }, 0);
+    _ = try locked.append(gpa, io, .{ .approval_response = .{
+        .request_id = request_id,
+        .decision = .approved_by_user_for_session,
+        .responder = "person",
+        .action = action,
+        .tool_call_id = "call1",
+    } }, 0);
+    try locked.unlock(io);
+
+    // Two sessions, each asked its first question right after the grant,
+    // from the same starting point: `stale` never folds again, the way
+    // `ToolNetwork` used to keep `session` live with no second fold at all.
+    // `live` is `decideFn`'s own shape, caught up again before its next
+    // answer.
+    var stale = chock_proto.state.Session.init(gpa);
+    defer stale.deinit();
+    var stale_at: u64 = 0;
+    foldSessionSince(gpa, io, storage, &stale, &stale_at);
+    try std.testing.expect(stale.grants.get(action, true) != null);
+
+    var live = chock_proto.state.Session.init(gpa);
+    defer live.deinit();
+    var live_at: u64 = 0;
+    foldSessionSince(gpa, io, storage, &live, &live_at);
+    try std.testing.expect(live.grants.get(action, true) != null);
+
+    // Mid session, the agent narrows itself: `restrict_self` writes a
+    // `policy.self` event putting this exact action under a ceiling below
+    // `ask`, which `SessionGrants.invalidate` reads as dropping the grant.
+    var locked2 = try storage.lock(io);
+    _ = try locked2.append(gpa, io, .{ .policy_self = .{
+        .restrictions = &.{.{ .action = action, .ceiling = .deny, .reason = "narrowed mid session" }},
+        .authorised = false,
+    } }, 0);
+    try locked2.unlock(io);
+
+    // **The naive cache never asks the log again**, so it still answers
+    // `true`: exactly the stale, unsafe read the measured fault produced.
+    try std.testing.expect(stale.grants.get(action, true) != null);
+
+    // **The fix**: the very next question resumes the fold from where the
+    // last one stopped, reads the `policy.self` event that landed since, and
+    // the grant is gone before the broker is ever asked about it again.
+    foldSessionSince(gpa, io, storage, &live, &live_at);
+    try std.testing.expect(live.grants.get(action, true) == null);
 }
 
 test "a promise a parent made binds its subagents, out of the parent's own log" {
