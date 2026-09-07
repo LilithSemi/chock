@@ -163,13 +163,18 @@ pub const max_agents = 64;
 
 /// The largest amount of work the read time check may do. See
 /// `checkChildrenAreWeaker`, which walks the product of three representative
-/// lists for each declared parent link, and reads every rule two times for
-/// each key.
+/// lists for each declared parent link, and reads every rule of the file,
+/// plus every rule `lib/chock-policy/defaults.zig` ships, two times for each
+/// key. The defaults are read in the worst case, not in every case: they are
+/// read only for a key the file's own rules name nothing that matches, but
+/// the count of the work must assume that, because it runs before the walk
+/// and cannot yet know which keys those will be.
 ///
 /// One read compares the key against up to four patterns of one rule, so a
 /// read costs what those names are long. The unit of this budget is therefore
 /// one read of one byte, and `checkWorkFitsBudget` multiplies the number of
-/// reads by the longest name the file spells out.
+/// reads by the longest name the file spells out, or one of `defaults.zig`'s
+/// own patterns, whichever is longer.
 ///
 /// `max_rules`, `max_agents` and `max_file_bytes` bound neither half of that
 /// on their own:
@@ -178,20 +183,29 @@ pub const max_agents = 64;
 ///   spell out. 512 rules that each name a different model, a different tool,
 ///   and a different action reach 1.4 * 10^11 reads.
 /// - The length of a name is what the file says it is. 72 rules whose three
-///   names are 4600 bytes each make only 5.6 * 10^7 reads, and they measured
-///   26 seconds from a file of 998 KB.
+///   names are 4600 bytes each make 6.6 * 10^7 reads.
 ///
-/// This budget is 4.3 * 10^9. The most expensive file it admits measured 0.98
-/// seconds with `--release=safe`, which is the mode `pkgs/chock/default.nix`
-/// builds in: 75 rules of three names of 64 bytes, under one parent link, for
-/// 4.21 * 10^9 of the budget. The same 75 rules with names of 4600 bytes cost
-/// 72 times as much and are refused.
+/// This budget is 4.3 * 10^9. The most expensive file it admits measures
+/// about a second with `--release=safe`, which is the mode
+/// `pkgs/chock/default.nix` builds in: 72 rules of three names of 64 bytes,
+/// under one parent link, for 4.23 * 10^9 of the budget, with about one and
+/// a half percent to spare. One rule more, 73, reaches 4.46 * 10^9 and is
+/// refused. The same 72 rules with names of 4600 bytes cost about 72 times as
+/// much and are refused outright.
+///
+/// **These are measured against the current reader, which counts the
+/// defaults.** Before it did, the same shapes measured smaller: 75 rules of
+/// 64 byte names read at 4.21 * 10^9, three more than this reader now admits.
+/// A file of that shape is refused today, at a cost this reader did not use
+/// to see.
 ///
 /// The headroom above a plausible policy is real, and it is not large. 512
-/// rules that name an action each, under 64 agent kinds, cost 2.1 * 10^9 and
+/// rules that name an action each, under 64 agent kinds, cost 2.2 * 10^9 and
 /// are read. Give those same rules one shared model name and the cost is
-/// 4.2 * 10^9, which is inside the budget by two percent. Give them a shared
-/// tool name as well and it is 8.5 * 10^9, and the file is refused. An author
+/// 4.34 * 10^9, a little over the budget, and the file is refused: before
+/// this reader counted the rules `defaults.zig` ships, the same file
+/// measured 4.2 * 10^9 and was wrongly read. Give them a shared tool name as
+/// well and it is 8.69 * 10^9, and the file is refused either way. An author
 /// who reaches that point must spell out fewer names.
 pub const max_check_work: u64 = 1 << 32;
 
@@ -1330,7 +1344,9 @@ fn checkChildrenAreWeaker(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagn
         .actions = actions.len,
         .links = links,
         .rules = policy.rules.len,
-        .longest_name = longestPattern(policy.rules),
+        // `defaults.zig`'s own patterns are read too, whenever the file's own
+        // rules name nothing that matches. See `checkWorkFitsBudget`.
+        .longest_name = @max(longestPattern(policy.rules), longestPattern(defaults.rules)),
     }, diag);
 
     for (policy.agents) |agent| {
@@ -1395,7 +1411,13 @@ const Walk = struct {
     actions: u64,
     /// How many declared parent links the walk covers.
     links: u64,
-    /// How many rules each key is read against.
+    /// How many rules of the file itself each key is read against.
+    /// `checkWorkFitsBudget` adds `defaults.rules.len` to this before it
+    /// counts a read, because `evaluateRules` reads that many more whenever
+    /// this file's own rules name nothing that matches. This field stays the
+    /// file's own count, and not the sum, because `Diagnostic.format` reports
+    /// it as "the rules hold {d} lines", which must describe what the author
+    /// wrote and not a number that includes rules they did not write.
     rules: u64,
     /// The longest name any rule spells out, in bytes.
     longest_name: u64,
@@ -1406,6 +1428,14 @@ const Walk = struct {
 /// number of keys is the product of the three representative lists and the
 /// number of declared links, and one read costs what the names are long.
 ///
+/// **Every key is read against `defaults.zig`'s rules as well as the file's
+/// own.** `evaluateRules`, which `checkChildrenAreWeaker` calls to answer for
+/// a key, tries the file's own rules first and reads every one of
+/// `defaults.rules` only when none of those matched. That second read never
+/// happens for a key the file's own rules already answered, but the budget
+/// must count the case where it does, because the count of the work comes
+/// before the work runs and cannot yet know which keys those will be.
+///
 /// The count of the work comes before the work, so a hostile `chock.zon`
 /// cannot hold the start of a session. The count is in `u64` and the
 /// arithmetic saturates, because the product of six numbers a file controls
@@ -1413,7 +1443,8 @@ const Walk = struct {
 fn checkWorkFitsBudget(walk: Walk, diag: ?*?Diagnostic) ParseError!void {
     const name_cost = @max(walk.longest_name, shortest_billed_name);
     const keys = walk.models *| walk.tools *| walk.actions *| walk.links;
-    const reads = keys *| walk.rules *| 2;
+    const rules_per_key = walk.rules +| @as(u64, defaults.rules.len);
+    const reads = keys *| rules_per_key *| 2;
     const work = reads *| name_cost;
     if (work <= max_check_work) return;
 
@@ -2088,8 +2119,11 @@ test "a policy of few rules and long names is refused" {
     // The length of a name is what the file says it is, and a read of a rule
     // compares up to four of them. 72 rules of three names of 4600 bytes are
     // inside `max_rules`, inside `max_agents` and inside `max_file_bytes`, and
-    // they make only 5.6 * 10^7 reads. That file measured 26 seconds of
-    // startup with `--release=safe` while the bound counted reads alone.
+    // they make 6.6 * 10^7 reads, counting the rules `defaults.zig` ships as
+    // well as the file's own. That file measured 26 seconds of startup with
+    // `--release=safe`, before this reader counted reads at all: a bound that
+    // stopped at `max_rules`, `max_agents` and `max_file_bytes` alone would
+    // still have read it.
     const gpa = std.testing.allocator;
 
     const long = try wideSource(gpa, 72, 4600);
@@ -2843,4 +2877,70 @@ test "an org bundle is read as a ceiling, so a rule it never wrote narrows nothi
         Decision.deny,
         bound.evaluateChain(&chain, testKey("main", "provider.public.gpt-5"), null),
     );
+}
+
+test "the read time check counts the shipped defaults, and refuses what the file's own rules alone would not" {
+    // `evaluateRules` reads a key against `policy.rules` first and, when
+    // nothing there matches, against `defaults.zig`'s rules after. Every key
+    // `checkChildrenAreWeaker` walks costs both reads in the worst case, so
+    // the budget must count both lists. Before this fix it counted only
+    // `policy.rules.len`, so a file whose true cost crosses `max_check_work`
+    // only once the shipped defaults are counted still read.
+    //
+    // 73 rules of three distinct 64 byte names, under one declared parent
+    // link, is that file. Counting the file's rules alone its cost is under
+    // budget; counting the file's rules and the defaults together it is over.
+    const gpa = std.testing.allocator;
+
+    const source = try wideSource(gpa, 73, 64);
+    defer gpa.free(source);
+
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, source, &diag));
+
+    const walk = diag.?.policy_too_complex;
+    try std.testing.expectEqual(@as(u64, 73), walk.rules);
+    try std.testing.expectEqual(@as(u64, 64), walk.longest_name);
+
+    // 74 names in each of the three representative lists (73 distinct plus
+    // the "matches nothing" marker), cubed for the one declared link, read
+    // against the file's 73 rules plus the rules `defaults.zig` ships, twice
+    // per key.
+    const keys: u64 = 74 * 74 * 74;
+    const rules_per_key: u64 = walk.rules + @as(u64, defaults.rules.len);
+    try std.testing.expectEqual(keys * rules_per_key * 2, walk.reads);
+    try std.testing.expectEqual(keys * rules_per_key * 2 * 64, walk.work);
+}
+
+test "the corrected budget still reads a table under it and still refuses one clearly over it" {
+    // The point of this check is to refuse the right tables, so the fix above
+    // must not turn it into a check that refuses every table or none. One
+    // rule fewer than the refused table above, 72 rules of three distinct 64
+    // byte names under one declared parent link, is inside the corrected
+    // budget by a small margin and still reads.
+    const gpa = std.testing.allocator;
+
+    const admitted = try wideSource(gpa, 72, 64);
+    defer gpa.free(admitted);
+    const table = try Table.parse(gpa, admitted, null);
+    defer Table.destroy(gpa, table);
+
+    // The file that is read is a real table, and not an empty one.
+    var buffer: [64]u8 = undefined;
+    const name = try wideName(&buffer, 11, 64);
+    try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(.{
+        .agent_kind = "c",
+        .model = name,
+        .tool = name,
+        .action = name,
+    }));
+
+    // A table clearly over the budget, whatever the fix counts, is still
+    // refused. `max_rules` distinct 64 byte names is `1.4 * 10^11` reads
+    // before the shipped defaults are even added in, thousands of times the
+    // budget.
+    const clearly_over = try wideSource(gpa, max_rules, 64);
+    defer gpa.free(clearly_over);
+    try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, clearly_over, null));
 }
