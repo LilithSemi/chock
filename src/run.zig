@@ -4985,7 +4985,14 @@ const SessionArbiter = struct {
             // session" to one tool call would be asked again on the very
             // next one, because `decideFn` builds a brand new `Broker` every
             // time it runs, even though `session` itself is kept.
-            .grants = &session.grants,
+            //
+            // **`session.arena.allocator()`, paired with the memory in the
+            // same field.** `session.grants` is filled through that arena, so
+            // a live grant this broker records has to grow through it too:
+            // see `chock_broker.Broker.Grants`'s own doc comment. `request`
+            // below is given the same arena as its own `gpa`, so the two
+            // agree twice over.
+            .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
         };
 
         // The promises this session and every session above it made. The same
@@ -5261,7 +5268,18 @@ const ToolNetwork = struct {
             .policy = self.started.policy,
             .waiter = self.approvers.waiter(),
             .redaction = self.started.redact_values,
-            .grants = &self.session.grants,
+            // **The live bug this line used to be.** `self.session.grants` is
+            // filled through `self.session.arena`, by `PolicyFold.apply`
+            // inside `refreshToolPromises` above. `chock_broker.network.zig`
+            // then calls `asker.broker.request` with `Network.gpa`, a plain
+            // allocator, never the arena, so a `grants_allocator` left unset
+            // here used to let a `grow` past the map's first capacity free
+            // arena memory through that plain `gpa` instead: an invalid free
+            // and a leak, silent until a session made enough distinct
+            // `approved_by_user_for_session` grants to force a regrow. See
+            // `chock_broker.Broker.Grants`'s own doc comment for why the two
+            // are now one field, so this cannot be set without the other.
+            .grants = .{ .memory = &self.session.grants, .allocator = self.session.arena.allocator() },
         };
         self.network.asker = .{
             .broker = &self.broker,
@@ -6205,7 +6223,7 @@ fn carryCommit(
         // included. Without this, `docs/approvals.md`'s "rest of the session"
         // is offered here and never kept: see `SessionArbiter.decideFn`,
         // which wires the same field for the same reason.
-        .grants = &session.grants,
+        //
         // **`session.arena.allocator()`, and not `gpa`, for the reason
         // `decideFn` spends a whole paragraph on.** `chock_broker.actions.run`
         // below calls `perform`, which hands back a `Result` this function's
@@ -6214,9 +6232,9 @@ fn carryCommit(
         // plain allocator for that reason alone, so it cannot be the value
         // `broker.request` uses to grow `session.grants.granted` too: this
         // field is `Broker`'s seam for keeping the two apart. See
-        // `Broker.grants_allocator`'s own doc comment for the free-through-the-
+        // `Broker.Grants`'s own doc comment for the free-through-the-
         // wrong-allocator fault this exists to avoid.
-        .grants_allocator = session.arena.allocator(),
+        .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
     };
 
     // Why the broker refused, or why the act itself failed. The broker used
@@ -13813,7 +13831,7 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         const broker = chock_broker.Broker{
             .policy = ask_the_push,
             .waiter = waiter.waiter(),
-            .grants = &session.grants,
+            .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
         };
 
         const outcome = try broker.request(session.arena.allocator(), io, storage, &locked, ask, null);
@@ -13845,7 +13863,7 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         const broker = chock_broker.Broker{
             .policy = ask_the_push,
             .waiter = waiter.waiter(),
-            .grants = &session.grants,
+            .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
         };
 
         const outcome = try broker.request(session.arena.allocator(), io, storage, &locked, ask, null);

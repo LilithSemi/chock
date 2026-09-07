@@ -1635,7 +1635,11 @@ test "a second connection to the same host and port is answered from the session
         while (it.next()) |key| gpa.free(key.*);
         grants.granted.deinit(gpa);
     }
-    const broker = Broker{ .policy = bench.policy, .waiter = waiter.waiter(), .grants = &grants };
+    const broker = Broker{
+        .policy = bench.policy,
+        .waiter = waiter.waiter(),
+        .grants = .{ .memory = &grants, .allocator = gpa },
+    };
     network.asker = .{ .broker = &broker, .storage = store, .locked = &locked };
 
     const first = network.answer("api.anthropic.com", 443);

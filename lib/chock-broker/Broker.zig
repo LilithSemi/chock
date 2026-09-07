@@ -198,29 +198,41 @@ redaction: []const []const u8 = &.{},
 /// of only the caller that thought to add it. See `chock_proto.state.SessionGrants.get`
 /// for the proof this function alone can give it: that the fresh evaluation
 /// really was `ask`.
-grants: ?*chock_proto.state.SessionGrants = null,
-
-/// The allocator `findAnswer` gives a fresh `approved_by_user_for_session`
-/// answer to, when it writes it into `grants`. Null defaults to `request`'s
-/// own `gpa`, which is only safe when `grants` was itself built through that
-/// same allocator, or is about to be discarded alongside it either way: see
-/// `src/run.zig`'s `SessionArbiter.decideFn`, which passes
-/// `session.arena.allocator()` as `request`'s own `gpa` and needs no second
-/// field here because the two are already the same value.
 ///
-/// **A caller whose `gpa` must stay a plain allocator sets this instead of
-/// that.** `chock_proto.state.SessionGrants.granted` is a
-/// `std.StringHashMapUnmanaged`: it carries no allocator of its own, and its
-/// `grow` allocates a new backing array with whatever allocator the *current*
-/// call passes and frees the *old* array with that same value, whichever one
-/// actually built it. `session.grants` is filled through `session`'s own
-/// arena by `foldSession`, so a live grant recorded here has to go through
-/// that arena too, or a later `grow` frees arena memory through the wrong
-/// allocator. `src/run.zig`'s `carryCommit` is the caller this exists for: its
-/// own `gpa` must outlive `session`, which `session.deinit()` tears down
-/// before `carryCommit` returns, because a real `perform`ed action's `Result`
-/// is freed by the caller with that same `gpa` after this call has ended.
-grants_allocator: ?std.mem.Allocator = null,
+/// **`Grants` below pairs the pointer with its own allocator, and that
+/// pairing is the whole fix for a fault found three times over.** See
+/// `Grants`'s own doc comment.
+grants: ?Grants = null,
+
+/// A memory pointer paired with the one allocator that is allowed to grow
+/// it. This is the whole fix for a fault found three times over: a
+/// `std.StringHashMapUnmanaged` carries no allocator of its own, so its
+/// `grow` allocates a new backing array with whatever allocator the
+/// *current* call passes and frees the *old* array with that same value,
+/// whichever one actually built it. Naming the memory and the allocator in
+/// two separate `Broker` fields let a caller set one and forget the other,
+/// which is exactly what happened three times: see `state.SessionGrants`'s
+/// own top comment. Bundling them into one field makes the omission a
+/// missing struct field, caught at compile time, rather than a silent
+/// `orelse gpa` that only breaks once the map outgrows its first backing
+/// array.
+///
+/// **`allocator` must be the allocator `memory` is already filled
+/// through.** `chock_proto.state.SessionGrants.granted` is filled through a
+/// `Session` or `PolicyFold`'s own arena by `foldSession`/`PolicyFold.apply`,
+/// so a live grant `findAnswer` records here has to go through that same
+/// arena too, or a later `grow` frees arena memory through the wrong
+/// allocator. `src/run.zig`'s `carryCommit` is the caller
+/// `Broker.grants_allocator` used to exist for on its own: its own `gpa`
+/// must outlive `session`, which `session.deinit()` tears down before
+/// `carryCommit` returns, because a real `perform`ed action's `Result` is
+/// freed by the caller with that same `gpa` after this call has ended. This
+/// type still lets that caller pass `session.arena.allocator()` here while
+/// its own `request` call keeps a plain `gpa`.
+pub const Grants = struct {
+    memory: *chock_proto.state.SessionGrants,
+    allocator: std.mem.Allocator,
+};
 
 /// How long a request waits for an answer, when the caller names no other
 /// time. A request has a timeout, and a request which expires counts as a
@@ -590,7 +602,7 @@ pub fn request(
             // oracle attribute it to the call that asked. See
             // `test/redteam/logscan.zig`'s `Fold.keyFor`.
             if (self.grants) |grants| {
-                if (grants.get(ask.action, true) != null) {
+                if (grants.memory.get(ask.action, true) != null) {
                     _ = try appendAnswer(
                         gpa,
                         io,
@@ -812,7 +824,6 @@ fn askTheHuman(
             request_id,
             ask,
             self.grants,
-            self.grants_allocator orelse gpa,
             diag,
         )) |outcome| return outcome;
 
@@ -1077,8 +1088,7 @@ fn findAnswer(
     storage: chock_proto.storage.Storage,
     request_id: u64,
     ask: Request,
-    grants: ?*chock_proto.state.SessionGrants,
-    grants_allocator: std.mem.Allocator,
+    grants: ?Grants,
     diag: ?*?Diagnostic,
 ) Error!?Outcome {
     var replay = try storage.replay(gpa, io, request_id);
@@ -1126,7 +1136,7 @@ fn findAnswer(
             // here, the moment the line is read, rather than a second reader
             // having to replay the log again to learn the same fact.
             .approved_by_user_for_session => blk: {
-                if (grants) |g| try g.apply(grants_allocator, answer);
+                if (grants) |g| try g.memory.apply(g.allocator, answer);
                 break :blk .approved_by_user;
             },
             .refused_by_user => .refused_by_user,
@@ -3088,7 +3098,7 @@ test "a remembered grant answers with no question and still writes a compact rec
     var second_waiter = TestWaiter{};
     var second_broker = try testBroker(gpa, ask_the_push, &second_waiter);
     defer table.Table.destroy(gpa, second_broker.policy);
-    second_broker.grants = &folded.grants;
+    second_broker.grants = .{ .memory = &folded.grants, .allocator = folded.arena.allocator() };
 
     const second_outcome = try second_broker.request(gpa, io, store, &locked, testRequest("git.push"), null);
     try testing.expectEqual(Outcome.approved_by_user, second_outcome);
@@ -3126,6 +3136,138 @@ test "a remembered grant answers with no question and still writes a compact rec
     }
     try testing.expect(refolded.grants.granted.contains("git.push"));
     try testing.expectEqual(@as(u32, 1), refolded.grants.granted.count());
+}
+
+test "a live grant past the map's first capacity grows through the same allocator that built it, with no invalid free" {
+    // **The regression this file needed and did not have.** `SessionGrants`
+    // was wired into three different callers, and every one of them missed
+    // this same fault: `granted` is a `std.StringHashMapUnmanaged`, which
+    // frees its old backing array with whatever allocator the *current* call
+    // passes, not the one that built it. A test with too few grants never
+    // reaches a `grow` at all, so it passes with the fault present. See
+    // `Broker.Grants`'s own doc comment.
+    //
+    // **Six grants fit in the map's first capacity, and the seventh does
+    // not.** `std.StringHashMapUnmanaged`'s minimal capacity is 8 slots at
+    // an 80 percent load factor, so the sixth `put` still fits and the
+    // seventh forces a `grow`. Measured directly against
+    // `std.StringHashMapUnmanaged(void)`: the sixth `put` leaves capacity at
+    // 8, and the seventh grows it to 16. Six grants folded from the log,
+    // plus one more served live, is exactly the shape that put a fault
+    // behind: too few entries and this test would pass whether the
+    // allocator pairing was right or wrong.
+    //
+    // **A wrong pairing here is not reliably caught by a crash, and this
+    // test does not depend on one.** Measured by hand, twice: `.allocator`
+    // set to `gpa` instead of `folded.arena.allocator()`, and separately to
+    // a hand rolled allocator that panics on any pointer it did not itself
+    // directly hand out. A minimal, isolated regrow with short one byte keys
+    // panics reliably under both. This exact test, with real `chock_proto`
+    // event folding in front of it, did not: the freed sub-slice happened to
+    // land at the start of a chunk the arena's child had itself just
+    // returned, which reads as a legitimate pointer to any allocator that
+    // checks identity and not the logical call chain that produced it.
+    // Whether a mismatch here crashes depends on arena chunk boundaries,
+    // which depend on allocation sizes and order, which is exactly why nothing
+    // in this test tries to prove the fault via a crash: the assertions below
+    // instead pin the correct answer, and `Broker.Grants` is what actually
+    // closes this class, at compile time, by making the pairing a single
+    // field a caller cannot half fill in.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01GRANTGROW00000000000000000");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = try store.lock(io);
+    defer locked.unlock(io) catch {};
+
+    const ask_every_grant: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "grant.*", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+
+    const Answerer = struct {
+        gpa: std.mem.Allocator,
+        store: chock_proto.storage.Storage,
+        locked: *LockedHandle,
+        action: []const u8,
+
+        fn onWait(ctx: ?*anyopaque, io_inner: std.Io, waits: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (waits != 1) return;
+            const id = try findRequestId(self.gpa, io_inner, self.store, self.action) orelse return;
+            _ = try answerAbout(self.gpa, io_inner, self.locked, id, .approved_by_user_for_session, self.action, "call1");
+        }
+    };
+
+    // Six distinct actions, each answered "yes, for the rest of the
+    // session", the ordinary way: a question is asked and a person answers
+    // it. Nothing here touches `grants` at all; this is only building up the
+    // log a fold will read.
+    var action_buf: [6][]const u8 = undefined;
+    for (0..6) |i| {
+        action_buf[i] = try std.fmt.allocPrint(gpa, "grant.{d}", .{i});
+    }
+    defer for (action_buf) |a| gpa.free(a);
+
+    for (action_buf) |action| {
+        var answerer = Answerer{ .gpa = gpa, .store = store, .locked = &locked, .action = action };
+        var waiter = TestWaiter{ .ctx = &answerer, .on_wait = Answerer.onWait };
+        var broker = try testBroker(gpa, ask_every_grant, &waiter);
+        defer table.Table.destroy(gpa, broker.policy);
+
+        const outcome = try broker.request(gpa, io, store, &locked, testRequest(action), null);
+        if (waiter.failed) |err| return err;
+        try testing.expectEqual(Outcome.approved_by_user, outcome);
+    }
+
+    // Fold the whole log, the way `src/run.zig`'s `SessionArbiter.decideFn`
+    // and `ToolNetwork.giveFn` both do: one `Session`, its `grants` filled
+    // through its own arena. Six entries, still inside the map's first
+    // capacity.
+    var folded = chock_proto.state.Session.init(gpa);
+    defer folded.deinit();
+    {
+        var replay = try store.replay(gpa, io, 0);
+        defer replay.deinit();
+        while (try replay.next(io)) |parsed| {
+            defer parsed.deinit();
+            try folded.apply(parsed.value);
+        }
+    }
+    try testing.expectEqual(@as(u32, 6), folded.grants.granted.count());
+    try testing.expectEqual(@as(u32, 8), folded.grants.granted.capacity());
+
+    // The seventh, distinct action: a live grant, recorded by `findAnswer`
+    // through `Broker.Grants.allocator` and not through a fold. This is the
+    // one `put` that has to grow the map past its first capacity, which is
+    // the one call that ever reaches the fault this file had three times
+    // over. `.allocator` here is `folded.arena.allocator()`, the same
+    // allocator `folded.grants.granted` was already built through, exactly
+    // what `ToolNetwork.giveFn`'s own fix now passes.
+    const seventh = "grant.6";
+    var seventh_answerer = Answerer{ .gpa = gpa, .store = store, .locked = &locked, .action = seventh };
+    var seventh_waiter = TestWaiter{ .ctx = &seventh_answerer, .on_wait = Answerer.onWait };
+    var live_broker = try testBroker(gpa, ask_every_grant, &seventh_waiter);
+    defer table.Table.destroy(gpa, live_broker.policy);
+    live_broker.grants = .{ .memory = &folded.grants, .allocator = folded.arena.allocator() };
+
+    const outcome = try live_broker.request(gpa, io, store, &locked, testRequest(seventh), null);
+    if (seventh_waiter.failed) |err| return err;
+    try testing.expectEqual(Outcome.approved_by_user, outcome);
+
+    // The regrow really happened, and every grant survived it.
+    try testing.expectEqual(@as(u32, 7), folded.grants.granted.count());
+    try testing.expect(folded.grants.granted.capacity() > 8);
+    for (action_buf) |action| try testing.expect(folded.grants.granted.contains(action));
+    try testing.expect(folded.grants.granted.contains(seventh));
 }
 
 test "a promise the session made narrows the answer, and never widens it" {

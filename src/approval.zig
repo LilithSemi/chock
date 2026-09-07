@@ -1268,14 +1268,19 @@ test "a person who says always is not asked again, through a real Terminal and n
             .console = console.console(),
         };
 
-        const broker = Broker{ .policy = policy, .waiter = terminal.waiter(), .grants = &session.grants };
-        // `session.arena.allocator()`, and not `gpa`: `session.grants` is
-        // filled through that arena, and `Broker.grants_allocator`'s own doc
-        // comment says why a live grant recorded through a different
-        // allocator risks a later `grow` freeing arena memory through the
-        // wrong one. `src/run.zig`'s `SessionArbiter.decideFn` is the
-        // production caller this mirrors: nothing this call returns needs to
-        // outlive `session`, so the whole call can use its arena.
+        // `session.arena.allocator()`, and not `gpa`, both for `.grants` and
+        // for `request` below: `session.grants` is filled through that arena,
+        // and `Broker.Grants.allocator`'s own doc comment says why a live
+        // grant recorded through a different allocator risks a later `grow`
+        // freeing arena memory through the wrong one. `src/run.zig`'s
+        // `SessionArbiter.decideFn` is the production caller this mirrors:
+        // nothing this call returns needs to outlive `session`, so the whole
+        // call can use its arena.
+        const broker = Broker{
+            .policy = policy,
+            .waiter = terminal.waiter(),
+            .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
+        };
         const outcome = try broker.request(session.arena.allocator(), io, store, &locked, ask, null);
         try testing.expectEqual(Broker.Outcome.approved_by_user, outcome);
         if (terminal.failed) |err| return err;
@@ -1310,7 +1315,11 @@ test "a person who says always is not asked again, through a real Terminal and n
             .console = console.console(),
         };
 
-        const broker = Broker{ .policy = policy, .waiter = terminal.waiter(), .grants = &session.grants };
+        const broker = Broker{
+            .policy = policy,
+            .waiter = terminal.waiter(),
+            .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
+        };
         const outcome = try broker.request(session.arena.allocator(), io, store, &locked, ask, null);
         try testing.expectEqual(Broker.Outcome.approved_by_user, outcome);
         try testing.expectEqual(@as(usize, 0), console.reads);
