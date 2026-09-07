@@ -168,7 +168,11 @@ pub const max_agents = 64;
 /// key. The defaults are read in the worst case, not in every case: they are
 /// read only for a key the file's own rules name nothing that matches, but
 /// the count of the work must assume that, because it runs before the walk
-/// and cannot yet know which keys those will be.
+/// and cannot yet know which keys those will be. The action list itself also
+/// holds one representative for every pattern `defaults.zig` ships, for the
+/// same reason: `evaluateRules` can answer a key through either list, so the
+/// classes `representatives` samples must match the classes `evaluateRules`
+/// can actually tell apart, or the walk answers a question nobody asked it.
 ///
 /// One read compares the key against up to four patterns of one rule, so a
 /// read costs what those names are long. The unit of this budget is therefore
@@ -181,31 +185,35 @@ pub const max_agents = 64;
 ///
 /// - The number of keys grows with the cube of the number of names the rules
 ///   spell out. 512 rules that each name a different model, a different tool,
-///   and a different action reach 1.4 * 10^11 reads.
-/// - The length of a name is what the file says it is. 72 rules whose three
-///   names are 4600 bytes each make 6.6 * 10^7 reads.
+///   and a different action reach 1.45 * 10^11 reads.
+/// - The length of a name is what the file says it is. 69 rules whose three
+///   names are 4600 bytes each make 6.7 * 10^7 reads.
 ///
 /// This budget is 4.3 * 10^9. The most expensive file it admits measures
 /// about a second with `--release=safe`, which is the mode
-/// `pkgs/chock/default.nix` builds in: 72 rules of three names of 64 bytes,
-/// under one parent link, for 4.23 * 10^9 of the budget, with about one and
-/// a half percent to spare. One rule more, 73, reaches 4.46 * 10^9 and is
-/// refused. The same 72 rules with names of 4600 bytes cost about 72 times as
-/// much and are refused outright.
+/// `pkgs/chock/default.nix` builds in: 69 rules of three names of 64 bytes,
+/// under one parent link, for 4.27 * 10^9 of the budget, with about six
+/// tenths of one percent to spare. One rule more, 70, reaches 4.50 * 10^9 and
+/// is refused. The same 69 rules with names of 4600 bytes cost about 72
+/// times as much and are refused outright.
 ///
 /// **These are measured against the current reader, which counts the
-/// defaults.** Before it did, the same shapes measured smaller: 75 rules of
-/// 64 byte names read at 4.21 * 10^9, three more than this reader now admits.
-/// A file of that shape is refused today, at a cost this reader did not use
-/// to see.
+/// defaults both in the rule count and in the action space they add.**
+/// Before it counted either, the same shapes measured smaller: 75 rules of
+/// 64 byte names read at 4.21 * 10^9, six more than this reader now admits.
+/// A reader in between, which counted the defaults in the rule count alone
+/// and did not yet sample the action classes they add, admitted 72: folding
+/// the defaults into the action list as well moves the line down three
+/// rules further, from 72 to 69. A file of 70, 71 or 72 rules of this shape
+/// is refused today, at a cost neither of the earlier readers used to see.
 ///
 /// The headroom above a plausible policy is real, and it is not large. 512
 /// rules that name an action each, under 64 agent kinds, cost 2.2 * 10^9 and
 /// are read. Give those same rules one shared model name and the cost is
-/// 4.34 * 10^9, a little over the budget, and the file is refused: before
+/// 4.45 * 10^9, a little over the budget, and the file is refused: before
 /// this reader counted the rules `defaults.zig` ships, the same file
 /// measured 4.2 * 10^9 and was wrongly read. Give them a shared tool name as
-/// well and it is 8.69 * 10^9, and the file is refused either way. An author
+/// well and it is 8.91 * 10^9, and the file is refused either way. An author
 /// who reaches that point must spell out fewer names.
 pub const max_check_work: u64 = 1 << 32;
 
@@ -1316,8 +1324,9 @@ fn checkNoCycle(gpa: std.mem.Allocator, agents: []const Agent, diag: ?*?Diagnost
 }
 
 /// A declared child must hold no more than its declared parent, for every
-/// key. There is no need to walk every key that exists, because the
-/// rules can only tell a finite number of classes of key apart. See
+/// key. There is no need to walk every key that exists, because `rules`,
+/// together with the shipped defaults `evaluateRules` can also answer a key
+/// from, can only tell a finite number of classes of key apart. See
 /// `representatives`.
 ///
 /// Finite is not the same as small. `checkWorkFitsBudget` counts the walk
@@ -1486,27 +1495,62 @@ const fresh_marker = "\x00";
 
 /// One value for each class of value the rules can tell apart, for one field.
 /// Two values in the same class match exactly the same rules, so one of them
-/// answers for all of them. The list holds every name the rules spell out, one
-/// invented name below each class the rules name, and one invented name that
-/// no pattern in the file matches at all.
+/// answers for all of them. The list holds every name `rules` spells out, one
+/// invented name below each class `rules` names, one invented name that no
+/// pattern in `rules` matches at all, and the same again for every pattern
+/// `lib/chock-policy/defaults.zig` ships for this field.
+///
+/// **The defaults must be sampled too, or the walk below is answering a
+/// question `evaluateRules` was never actually asked.** `evaluateRules`
+/// answers a key from `defaults.zig`'s rules whenever `rules` itself names
+/// nothing that matches, so a class only a default tells apart is still a
+/// class `checkChildrenAreWeaker` must walk. `defaults.zig` currently names
+/// only `.action`, so this only widens the action list in practice, but the
+/// widening has to come from here and not from a special case in the caller,
+/// because the caller does not know which field a future default will name.
+///
+/// Before this, the action list held only the classes the file's own rules
+/// named, plus one invented name matching none of them. `evaluateRules`
+/// could still answer that invented name through a shipped default the walk
+/// had never sampled, because the invented name was chosen to match nothing
+/// in `rules` and it also, by construction, matched nothing in
+/// `defaults.zig`. A child that named no rule at all then read as `ask`
+/// against `ask` for every action the walk tried, and passed, while the same
+/// child read as `allow` for a real action such as `call.write_file`, which
+/// a shipped default answers and the walk never tried.
 ///
 /// This is what makes the check in `checkChildrenAreWeaker` finite. That check
 /// walks the product of three of these lists for each declared parent link, so
-/// it reads at most the cube of one more than the number of rules, for each
-/// link. `checkWorkFitsBudget` refuses a policy that reaches too far up that
-/// cube.
+/// it reads at most the cube of one more than the number of names either list
+/// spells out, for each field, for each link. `checkWorkFitsBudget` refuses a
+/// policy that reaches too far up that cube.
 ///
-/// A name that two rules share earns one entry, because a second entry would
-/// only make the walk read the same key again.
+/// A name that two rules share earns one entry, whichever of the two lists
+/// either rule comes from, because a second entry would only make the walk
+/// read the same key again.
 fn representatives(
     arena: std.mem.Allocator,
     rules: []const Rule,
     comptime field: []const u8,
 ) std.mem.Allocator.Error![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
-    try list.ensureTotalCapacity(arena, rules.len + 1);
+    try list.ensureTotalCapacity(arena, rules.len + defaults.rules.len + 1);
     list.appendAssumeCapacity(fresh_marker);
 
+    try appendRepresentatives(arena, &list, rules, field);
+    try appendRepresentatives(arena, &list, defaults.rules, field);
+    return list.items;
+}
+
+/// The half of `representatives` that reads one rule list. Called once for
+/// `rules` and once for `defaults.rules`, into the same list, so a name
+/// either list spells out earns exactly one entry between them.
+fn appendRepresentatives(
+    arena: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    rules: []const Rule,
+    comptime field: []const u8,
+) std.mem.Allocator.Error!void {
     for (rules) |rule| {
         const pattern = @field(rule, field) orelse continue;
         const name = if (classPrefix(pattern)) |prefix|
@@ -1516,7 +1560,6 @@ fn representatives(
         if (holdsName(list.items, name)) continue;
         list.appendAssumeCapacity(name);
     }
-    return list.items;
 }
 
 fn holdsName(names: []const []const u8, name: []const u8) bool {
@@ -1952,6 +1995,87 @@ test "a policy that gives a child more than its parent is refused when it is rea
     try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(testKey("reviewer", "git.push")));
 }
 
+test "a child with no rule at all can still outrank a parent's blanket rule, through a shipped default the walk never sampled" {
+    // `representatives` used to sample the file's own action classes only,
+    // plus one invented name built to match none of them. `evaluateRules`
+    // still answers an unmatched key from `lib/chock-policy/defaults.zig`
+    // whenever the file's own rules name nothing that matches, and a real
+    // action such as `call.write_file` matches one of those shipped defaults
+    // even though the invented name does not. The walk below tried only the
+    // invented name, so it never tried a key that told the child and the
+    // parent apart, and `Table.parse` accepted a child that could hold
+    // `allow` where its parent holds `ask`.
+    //
+    // The parent names one rule, and it names no action at all, so it
+    // answers `ask` for every key including `call.write_file`. The child
+    // names no rule at all, so `call.write_file` falls all the way through
+    // to the shipped default, which is `allow`.
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .agents = .{
+        \\            .{ .kind = "parent" },
+        \\            .{ .kind = "child", .parent = "parent" },
+        \\        },
+        \\        .rules = .{
+        \\            .{ .agent_kind = "parent", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+    try std.testing.expectError(error.ChildStrongerThanParent, Table.parse(gpa, source, null));
+}
+
+test "a child that narrows the same shipped default its parent narrows still loads" {
+    // The fix above must not turn the check into one that refuses every
+    // hierarchy that leans on a shipped default. A child whose own rule
+    // matches the parent's narrowing, action for action, is not a child
+    // stronger than its parent, and the file must still read.
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .agents = .{
+        \\            .{ .kind = "parent" },
+        \\            .{ .kind = "child", .parent = "parent" },
+        \\        },
+        \\        .rules = .{
+        \\            .{ .agent_kind = "parent", .decision = .ask },
+        \\            .{ .agent_kind = "child", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const table = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, table);
+    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("child", "call.write_file")));
+}
+
+test "an ordinary hierarchy with no chock.zon rules at all still loads" {
+    // Neither kind names a rule of its own, so both fall through to the same
+    // shipped defaults for every action, and the two must never disagree.
+    // A check that refused this would refuse the plainest hierarchy there is.
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .agents = .{
+        \\            .{ .kind = "main" },
+        \\            .{ .kind = "worker", .parent = "main" },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const table = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, table);
+    try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(testKey("worker", "call.write_file")));
+    try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("worker", "git.push")));
+}
+
 test "a field name with a typo inside the policy block is refused, not ignored" {
     // A rule with no `action` matches every action. If this reader ignored a
     // field name it did not know, `.actoin` would silently become a rule that
@@ -2119,11 +2243,11 @@ test "a policy of few rules and long names is refused" {
     // The length of a name is what the file says it is, and a read of a rule
     // compares up to four of them. 72 rules of three names of 4600 bytes are
     // inside `max_rules`, inside `max_agents` and inside `max_file_bytes`, and
-    // they make 6.6 * 10^7 reads, counting the rules `defaults.zig` ships as
-    // well as the file's own. That file measured 26 seconds of startup with
-    // `--release=safe`, before this reader counted reads at all: a bound that
-    // stopped at `max_rules`, `max_agents` and `max_file_bytes` alone would
-    // still have read it.
+    // they make 7.8 * 10^7 reads, counting the rules `defaults.zig` ships and
+    // the action classes they add, as well as the file's own. That file
+    // measured 26 seconds of startup with `--release=safe`, before this
+    // reader counted reads at all: a bound that stopped at `max_rules`,
+    // `max_agents` and `max_file_bytes` alone would still have read it.
     const gpa = std.testing.allocator;
 
     const long = try wideSource(gpa, 72, 4600);
@@ -2903,11 +3027,14 @@ test "the read time check counts the shipped defaults, and refuses what the file
     try std.testing.expectEqual(@as(u64, 73), walk.rules);
     try std.testing.expectEqual(@as(u64, 64), walk.longest_name);
 
-    // 74 names in each of the three representative lists (73 distinct plus
-    // the "matches nothing" marker), cubed for the one declared link, read
-    // against the file's 73 rules plus the rules `defaults.zig` ships, twice
-    // per key.
-    const keys: u64 = 74 * 74 * 74;
+    // 74 names in the model list and in the tool list (73 distinct plus the
+    // "matches nothing" marker), and 87 names in the action list: the same
+    // 74, plus one entry for each of the 13 patterns `defaults.zig` ships,
+    // because `representatives` now folds those in too, so the action space
+    // this check walks matches the one `evaluateRules` actually reads. The
+    // product is cubed for the one declared link, and read against the
+    // file's 73 rules plus the 13 rules `defaults.zig` ships, twice per key.
+    const keys: u64 = 74 * 74 * (74 + @as(u64, defaults.rules.len));
     const rules_per_key: u64 = walk.rules + @as(u64, defaults.rules.len);
     try std.testing.expectEqual(keys * rules_per_key * 2, walk.reads);
     try std.testing.expectEqual(keys * rules_per_key * 2 * 64, walk.work);
@@ -2915,13 +3042,15 @@ test "the read time check counts the shipped defaults, and refuses what the file
 
 test "the corrected budget still reads a table under it and still refuses one clearly over it" {
     // The point of this check is to refuse the right tables, so the fix above
-    // must not turn it into a check that refuses every table or none. One
-    // rule fewer than the refused table above, 72 rules of three distinct 64
-    // byte names under one declared parent link, is inside the corrected
-    // budget by a small margin and still reads.
+    // must not turn it into a check that refuses every table or none.
+    // Folding the shipped defaults into the action list as well as the rule
+    // count moves the ceiling down further, from 72 rules to 69: 69 rules of
+    // three distinct 64 byte names under one declared parent link is the
+    // largest file of this shape the corrected budget still reads, inside it
+    // by a small margin.
     const gpa = std.testing.allocator;
 
-    const admitted = try wideSource(gpa, 72, 64);
+    const admitted = try wideSource(gpa, 69, 64);
     defer gpa.free(admitted);
     const table = try Table.parse(gpa, admitted, null);
     defer Table.destroy(gpa, table);
@@ -2935,6 +3064,12 @@ test "the corrected budget still reads a table under it and still refuses one cl
         .tool = name,
         .action = name,
     }));
+
+    // One rule more, 70, is refused. The same shape crosses the budget at
+    // exactly one rule above what is admitted.
+    const one_more = try wideSource(gpa, 70, 64);
+    defer gpa.free(one_more);
+    try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, one_more, null));
 
     // A table clearly over the budget, whatever the fix counts, is still
     // refused. `max_rules` distinct 64 byte names is `1.4 * 10^11` reads
