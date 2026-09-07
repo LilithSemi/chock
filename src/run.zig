@@ -4981,9 +4981,31 @@ const SessionArbiter = struct {
         // the arena's own bookkeeping stays honest, but the bytes themselves
         // are not reclaimed until `session`'s arena is: `session` is now kept
         // for the life of the run (see `SessionArbiter.folded`), not torn
-        // down at the end of this call the way it used to be. A `Diagnostic`
-        // is small and one is built per question, so this is bounded by the
-        // number of questions the session asks, not by the size of the log.
+        // down at the end of this call the way it used to be.
+        //
+        // **Measured, not assumed, and it is not one Diagnostic a question.**
+        // `Broker.request`'s own `.allow` and `.deny` arms never touch `diag`
+        // at all, and neither does `findAnswer`'s success arm for
+        // `allowed_by_policy`, `denied_by_policy`, `approved_by_user`,
+        // `approved_by_user_for_session`, `refused_by_user`, or `expired`
+        // (`lib/chock-broker/Broker.zig`): an ordinary tool call that is
+        // decided outright, answered from a remembered grant, or answered by
+        // a person in the plain way costs nothing here. `diag` is written
+        // only on a path this build itself calls abnormal, and among those,
+        // only `answer_is_about_another_request` (two short strings) and
+        // `answer_names_an_unknown_decision` (one) own any bytes at all: see
+        // `lib/chock-broker/diagnostic.zig`'s own `deinit`, where every other
+        // variant `request` can reach from here is listed as owning nothing,
+        // borrowed from the `Ask` this call already holds. Standing in for
+        // the worse of those two, `ReleaseSafe`, a real `ArenaAllocator`: 400
+        // such diagnostics in a row, one a question and never freed early,
+        // cost 28166 bytes of arena capacity. 4000 cost 458062, about 450 KB.
+        // That is the ceiling of a session where *every* question takes an
+        // abnormal path, and a session like that has a problem elsewhere
+        // already. An ordinary session pays none of it. Bounded either way, so nothing
+        // here frees it early: see this file's own top comment on why
+        // `session`'s arena is kept for the life of the run in the first
+        // place, and the hazard freeing part of it early would risk.
         var broker_diag: ?chock_broker.Diagnostic = null;
         defer if (broker_diag) |*d| d.deinit(session.arena.allocator());
         // **`session.arena.allocator()`, and not `gpa`.**
@@ -5093,7 +5115,7 @@ const SessionArbiter = struct {
 /// decision refuses outright, the same as the MCP startup path already does
 /// for the whole of its own session.
 ///
-/// **The grant memory is refolded before every call, and not kept from
+/// **The grant memory is caught up before every call, and not kept from
 /// whatever `giveFn` last saw.** `chock_broker.Broker.request` is given
 /// `&session.grants`, a pointer into `self.session`, and every
 /// `approved_by_user_for_session` answer it writes updates that value in
@@ -5107,9 +5129,26 @@ const SessionArbiter = struct {
 /// when the log carrying it is folded again. Measured on 2026-09-05: a
 /// session that granted a connection and then restricted itself read `true`
 /// out of the grant this file kept live, and `null`, correctly invalidated,
-/// out of a fresh fold of the same log. `brokerFn` now refolds before every
-/// call, through `refreshToolPromises`, which is the same one replay per
-/// question `SessionArbiter.decideFn` already pays for `workspace.apply`.
+/// out of a fresh fold of the same log. `brokerFn` now catches up before
+/// every call, through `refreshToolPromises`.
+///
+/// **`brokerFn` runs on every tool call, not on a smaller subset of them.**
+/// `lib/chock-core/tools.zig`'s own dispatch sets `config.net_broker =
+/// net.broker(call.tool, call.call_id)` for every call `context.net` is set
+/// for, with no narrower condition, the same "every ordinary tool call" shape
+/// `SessionArbiter.decideFn` answers through `gateToolCall`. So a full replay
+/// from event 0 on every call here is exactly the same quadratic
+/// `SessionArbiter`'s own top comment measured, not a smaller instance of it.
+/// `refreshToolPromises` used to reset `session` and refold the whole log on
+/// every call, for the reason its own doc comment gives below. It now resumes
+/// from a kept offset instead, the same `foldSessionSince` shape `decideFn`
+/// uses, which sidesteps that reason rather than fighting it: see
+/// `refreshToolPromises`'s own doc comment. Measured against the identical
+/// scenario `SessionArbiter`'s own top comment used, chock-proto alone
+/// (`storage.JsonLines`, `ReleaseSafe`): 400 calls, each folding the whole log
+/// from event 0 and then appending one event, took 77.3 s against a log that
+/// started at 1200 events. The same 400 calls, resumed from a kept offset,
+/// took 0.83 s.
 const ToolNetwork = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5130,6 +5169,11 @@ const ToolNetwork = struct {
     approval_wait_ns: std.atomic.Value(u64) = .init(0),
 
     session: chock_proto.state.Session,
+    /// The byte offset `session` has been read up to, so the next call to
+    /// `refreshToolPromises` knows where to resume. 0 means "from the start
+    /// of the log", the same as `storage.replay`'s own `offset` reads it: see
+    /// `foldSessionSince` and `SessionArbiter.folded_at`, which this mirrors.
+    folded_at: u64 = 0,
     /// Who this session shows a question to, and who is attached to its
     /// approval socket. Built once, alongside `broker`, because both need the
     /// locked handle `giveFn` is given.
@@ -5155,10 +5199,10 @@ const ToolNetwork = struct {
         // counter it would read is whatever the call before it left behind:
         // see `chock_core.tools.Context.approval_wait_ns`'s own doc comment.
         self.approval_wait_ns.store(0, .monotonic);
-        // **Refolded before every call.** See this struct's own top comment
+        // **Caught up before every call.** See this struct's own top comment
         // on why a fold kept from `giveFn` alone misses a mid session
         // `restrict_self`.
-        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session);
+        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
         return self.network.netBroker();
     }
 
@@ -5170,7 +5214,7 @@ const ToolNetwork = struct {
 
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
-        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session);
+        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
         self.approvers.init(self.gpa, self.io, self.started, locked, self.screen);
         self.broker = .{
             .policy = self.started.policy,
@@ -5367,16 +5411,27 @@ test "a session with nothing granted and nothing refused writes no summary to th
     }
 }
 
-/// Re-fold `session` from `storage` and hand back this session's own
-/// promises, in the form the ratchet reads.
+/// Catch `session` up with what `storage` holds and hand back this session's
+/// own promises, in the form the ratchet reads.
 ///
 /// **Called before every tool call, not once at session start.** See
 /// `ToolNetwork`'s own top comment: a `policy.self` event written mid session
 /// narrows `session.grants` only when `Session.apply` sees it, which means
-/// folding the log again. `session` is reset first rather than folded a
-/// second time onto whatever it already held, because `Session.apply` only
-/// ever grows its lists: a second fold onto the same value would duplicate
-/// every context entry and every promise this session had already made.
+/// reading the log again.
+///
+/// **Resumed through `at`, not reset and refolded from event 0.** This used
+/// to `session.deinit()` and rebuild `session` from nothing on every call,
+/// because `Session.apply` only ever grows its lists, so folding the whole
+/// log a second time onto a `session` that already held the first fold would
+/// have duplicated every context entry and every promise. Resetting paid for
+/// that safety with the same quadratic cost `SessionArbiter.decideFn` was
+/// measured at and fixed for: `ToolNetwork`'s own top comment has the number.
+/// `foldSessionSince` sidesteps the duplication instead of paying for it: it
+/// is never asked to re-read an event this `session` already applied, only
+/// to read what `storage` holds past `at.*`, so there is nothing left for a
+/// second fold to duplicate. See `foldSessionSince`'s own doc comment for why
+/// a fold resumed that way reaches the same state a fold from event 0 would,
+/// including a `restrict_self` that landed since the last question.
 ///
 /// The returned slice is owned by `session.arena`, the same allocator
 /// `chock_core.self_policy.restrictionsFrom` is given, so it lives exactly as
@@ -5386,14 +5441,75 @@ fn refreshToolPromises(
     io: std.Io,
     storage: chock_proto.storage.Storage,
     session: *chock_proto.state.Session,
+    at: *u64,
 ) []const chock_policy.ratchet.Restriction {
-    session.deinit();
-    session.* = chock_proto.state.Session.init(gpa);
-    foldSession(gpa, io, storage, session);
+    foldSessionSince(gpa, io, storage, session, at);
     return chock_core.self_policy.restrictionsFrom(
         session.arena.allocator(),
         session.self_policy.restrictions.items,
     ) catch &.{};
+}
+
+test "a mid session restrict_self reaches refreshToolPromises on the very next call, and a fold-once cache does not see it" {
+    // **The same ratchet load bearing test `foldSessionSince` itself has, one
+    // level up.** `refreshToolPromises` is `ToolNetwork.brokerFn`'s own read
+    // of a session's promises, and a promise the agent made mid session has
+    // to bind the tool call right after it, not the one after that. This
+    // proves the resumed shape catches it, and shows what a cache that folded
+    // once and never again would have missed: exactly the bug `ToolNetwork`
+    // had before it started refolding before every call, see this file's own
+    // `ToolNetwork` top comment.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01TOOLPROMISE");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    const action = "net.connect";
+
+    // `stale` folds once, the way `ToolNetwork` used to keep `session` live
+    // with no second fold at all, and never calls `refreshToolPromises`
+    // again.
+    var stale = chock_proto.state.Session.init(gpa);
+    defer stale.deinit();
+    foldSession(gpa, io, storage, &stale);
+    const stale_promised = chock_core.self_policy.restrictionsFrom(
+        stale.arena.allocator(),
+        stale.self_policy.restrictions.items,
+    ) catch &.{};
+    try std.testing.expectEqual(@as(usize, 0), stale_promised.len);
+
+    // `live` is `ToolNetwork`'s own shape: one `session` and one `at`, kept
+    // across calls and caught up by `refreshToolPromises` on each one.
+    var live = chock_proto.state.Session.init(gpa);
+    defer live.deinit();
+    var live_at: u64 = 0;
+    const first = refreshToolPromises(gpa, io, storage, &live, &live_at);
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+
+    // Mid session, the agent narrows itself: the same `policy.self` event
+    // `Loop.runRestrictSelf` writes.
+    var locked = try storage.lock(io);
+    _ = try locked.append(gpa, io, .{ .policy_self = .{
+        .restrictions = &.{.{ .action = action, .ceiling = .deny, .reason = "narrowed mid session" }},
+        .authorised = false,
+    } }, 0);
+    try locked.unlock(io);
+
+    // **The naive cache never asks the log again**, so `stale`'s own copy of
+    // the promises is still the empty one it read before the narrowing:
+    // exactly the stale read the fold-once bug produced.
+    try std.testing.expectEqual(@as(usize, 0), stale.self_policy.restrictions.items.len);
+
+    // **The fix**: the very next call resumes from where the last one
+    // stopped, reads the `policy.self` event that landed since, and the
+    // promise is in the very next answer `refreshToolPromises` gives, before
+    // the broker is ever asked to honour it.
+    const second = refreshToolPromises(gpa, io, storage, &live, &live_at);
+    try std.testing.expectEqual(@as(usize, 1), second.len);
+    try std.testing.expectEqualStrings(action, second[0].action);
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, second[0].ceiling);
 }
 
 /// The broker, as `chock_core.Loop` carries an agent's work back mid session.
