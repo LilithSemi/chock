@@ -4868,6 +4868,25 @@ const ApprovalLock = @typeInfo(
 /// `foldSessionSince`'s own doc comment for why a partial, resumed fold
 /// reaches the same state a full one would.
 ///
+/// **Keeping `folded` alive traded a growing replay cost for a growing
+/// `folded` itself, and `context` was the part of it nobody had measured.**
+/// A `state.Session` mirrors the whole conversation in `context`, and that
+/// list only grows: `decideFn` never reads it, but a `state.Session` kept
+/// for the run's whole life used to carry it anyway. Measured 2026-09-07,
+/// `Debug`, a synthetic session of realistic gated tool calls (a user turn,
+/// an assistant turn with a tool call, a granted `net.connect`, and a
+/// `usage` event per turn, with a self-narrowing every fifth turn and a
+/// subagent spawn every fiftieth): a kept `state.Session`'s own arena held
+/// 117 KB at 100 turns, 449 KB at 400, and 7.3 MB at 4000, and `context`
+/// alone accounted for 80% of that at 100 turns and 96% of it at 4000. The
+/// part of the total that keeps growing is also the part that dominates.
+/// `folded` is now a `state.PolicyFold`, not a `state.Session`: over the
+/// identical traffic its own arena held 23.6 KB at 100 turns, 53 KB at 400,
+/// and 288 KB at 4000, because it carries `children`, `self_policy`,
+/// `grants`, and `spend` and nothing else. See `PolicyFold`'s own top
+/// comment for why a struct with no `context` field is the bound, rather
+/// than a `state.Session` whose `context` is dropped after each fold.
+///
 /// ## The reviewer, and the honest limit on it
 ///
 /// `agent_review` and `agent_then_human` want a reviewer subagent, and
@@ -4892,7 +4911,15 @@ const SessionArbiter = struct {
     /// caught up, never rebuilt: see `foldSessionSince`. Freed by `deinit`,
     /// which the one caller that builds a `SessionArbiter` must run once the
     /// session is over.
-    folded: ?chock_proto.state.Session = null,
+    ///
+    /// **`chock_proto.state.PolicyFold`, and not `chock_proto.state.Session`.**
+    /// A `Session` kept this way used to carry `context`, the mirrored
+    /// message history, which grows for the life of the run and which
+    /// nothing below ever reads: see `PolicyFold`'s own top comment for the
+    /// measurement. `PolicyFold` holds exactly what `decideFn` reads
+    /// (`children`, `self_policy`, `grants`, `spend`) and has no field to
+    /// misread `context` out of.
+    folded: ?chock_proto.state.PolicyFold = null,
     /// The byte offset `folded` has been read up to, so the next fold knows
     /// where to resume. Meaningless while `folded` is null, and 0 means
     /// "from the start of the log", the same as `storage.replay`'s own
@@ -4927,7 +4954,7 @@ const SessionArbiter = struct {
         // fold resumed this way still reaches the same state a fold of the
         // whole log from event 0 would, including a `restrict_self` that
         // landed since the last question.
-        if (self.folded == null) self.folded = chock_proto.state.Session.init(self.gpa);
+        if (self.folded == null) self.folded = chock_proto.state.PolicyFold.init(self.gpa);
         const session = &self.folded.?;
         foldSessionSince(gpa, io, self.started.storage, session, &self.folded_at);
 
@@ -5149,6 +5176,14 @@ const SessionArbiter = struct {
 /// from event 0 and then appending one event, took 77.3 s against a log that
 /// started at 1200 events. The same 400 calls, resumed from a kept offset,
 /// took 0.83 s.
+///
+/// **`session` below is a `chock_proto.state.PolicyFold`, for the same
+/// reason `SessionArbiter.folded` is.** `refreshToolPromises` reads
+/// `self_policy` and `grants` and nothing else, so a kept `state.Session`
+/// would carry `context` for the run's whole life for no reader here. See
+/// `SessionArbiter`'s own top comment for the measurement, and
+/// `PolicyFold`'s own top comment for why the type carries no such field to
+/// grow.
 const ToolNetwork = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5168,7 +5203,13 @@ const ToolNetwork = struct {
     /// about a connection that call opened.
     approval_wait_ns: std.atomic.Value(u64) = .init(0),
 
-    session: chock_proto.state.Session,
+    /// **`chock_proto.state.PolicyFold`, and not `chock_proto.state.Session`.**
+    /// Kept for the life of the run and caught up before every call, the same
+    /// as `SessionArbiter.folded`, and for the same reason it is a
+    /// `PolicyFold`: `refreshToolPromises` reads `self_policy` and `grants`
+    /// and nothing else, so this holds nothing else either. See
+    /// `PolicyFold`'s own top comment.
+    session: chock_proto.state.PolicyFold,
     /// The byte offset `session` has been read up to, so the next call to
     /// `refreshToolPromises` knows where to resume. 0 means "from the start
     /// of the log", the same as `storage.replay`'s own `offset` reads it: see
@@ -5440,7 +5481,7 @@ fn refreshToolPromises(
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    session: *chock_proto.state.Session,
+    session: *chock_proto.state.PolicyFold,
     at: *u64,
 ) []const chock_policy.ratchet.Restriction {
     foldSessionSince(gpa, io, storage, session, at);
@@ -5482,7 +5523,7 @@ test "a mid session restrict_self reaches refreshToolPromises on the very next c
 
     // `live` is `ToolNetwork`'s own shape: one `session` and one `at`, kept
     // across calls and caught up by `refreshToolPromises` on each one.
-    var live = chock_proto.state.Session.init(gpa);
+    var live = chock_proto.state.PolicyFold.init(gpa);
     defer live.deinit();
     var live_at: u64 = 0;
     const first = refreshToolPromises(gpa, io, storage, &live, &live_at);
@@ -8597,10 +8638,17 @@ const ReviewSpawner = struct {
 /// tested fact rather than a comment: the two happen in the same function, and
 /// only a test that runs the whole of it can see that they both happened. Every
 /// real caller passes `reviewChild`.
+///
+/// **`session: anytype`, because two shapes of fold pass through here.**
+/// `applyWork` passes a full `chock_proto.state.Session`, folded once and
+/// discarded at the end of the run. `SessionArbiter.decideFn` passes a
+/// `chock_proto.state.PolicyFold`, kept for the run's whole life: see that
+/// type's own top comment for why it carries no more than `children` and
+/// `spend`, which is exactly what this function reads off `session`.
 fn reviewerFor(
     child: chock_core.subagent.Spawner,
     started: *const Started,
-    session: *const chock_proto.state.Session,
+    session: anytype,
 ) ReviewSpawner {
     const bounds = reviewBounds(
         started.subagents,
@@ -8718,13 +8766,19 @@ const max_ancestor_sessions: usize = chock_policy.subagents.max_settable;
 /// a broken installation rather than of an attack: these files sit where no
 /// agent in the tree can reach them, so none of them can arrange this. Silence
 /// would be the fault, so this prints.
+///
+/// **`session: anytype`, for the same reason `reviewerFor` reads one that
+/// way.** This reads only `session.self_policy.restrictions.items`, which
+/// `chock_proto.state.Session` and `chock_proto.state.PolicyFold` both carry.
+/// The ancestor walk below builds its own full `Session` regardless, since an
+/// ancestor's fold is never kept past this one call.
 fn promisesFor(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: std.Io,
     dir: []const u8,
     parent_session: []const u8,
-    session: *const chock_proto.state.Session,
+    session: anytype,
 ) std.mem.Allocator.Error![]const chock_policy.ratchet.Restriction {
     var out: std.ArrayList(chock_policy.ratchet.Restriction) = .empty;
     try appendPromises(arena, &out, session.self_policy.restrictions.items);
@@ -8880,11 +8934,20 @@ fn foldSession(
 /// later call that finds the tear closed by a fresh append reads the
 /// completed line instead of stopping again. See that function's own doc
 /// comment.
+///
+/// **`session: anytype`, because two different folds are resumed this way.**
+/// `SessionArbiter.decideFn` resumes a `chock_proto.state.Session`, and
+/// `ToolNetwork.refreshToolPromises` resumes a `chock_proto.state.PolicyFold`,
+/// which holds the smaller part of a session's state those two callers
+/// actually read: see `PolicyFold`'s own top comment. Both types have the
+/// same `apply(Envelope) Allocator.Error!void` this loop calls, and the loop
+/// itself reads nothing else off `session`, so one function serves both
+/// without either fold pretending to be the other.
 fn foldSessionSince(
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    session: *chock_proto.state.Session,
+    session: anytype,
     at: *u64,
 ) void {
     var replay = storage.replay(gpa, io, at.*) catch return;
@@ -13851,6 +13914,120 @@ test "foldSessionSince, resumed across many calls, reaches the same state a sing
     try std.testing.expectEqual(whole.last_input_tokens, resumed.last_input_tokens);
     try std.testing.expectEqual(whole.spend.turns, resumed.spend.turns);
     try std.testing.expectEqual(whole.spend.input_tokens, resumed.spend.input_tokens);
+}
+
+test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork keep one, agrees with a full Session fold on everything either caller reads" {
+    // **The property a bound must not break.** `SessionArbiter.decideFn` and
+    // `ToolNetwork.refreshToolPromises` used to keep a `chock_proto.state.Session`
+    // alive across every question, and now keep a `chock_proto.state.PolicyFold`
+    // instead, so that `Session.context` stops accumulating for a run's whole
+    // life: see `PolicyFold`'s own top comment. This proves the swap changes
+    // nothing about what those two callers actually read: a `PolicyFold`,
+    // caught up in three separate bursts the same piecemeal way `decideFn`
+    // catches one up between questions, agrees with a single, full `Session`
+    // fold of the identical log on grants, self promises, children, and
+    // spend, the four things either caller ever asks for. The log also
+    // carries three `message` events, which only `Session.context` reads, to
+    // show that `PolicyFold` disagreeing about `context` is not a gap this
+    // test missed: `PolicyFold` has no such field to disagree with.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01POLICYFOLD");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    const grant_action = "net.connect:build-host";
+
+    var resumed = chock_proto.state.PolicyFold.init(gpa);
+    defer resumed.deinit();
+    var at: u64 = 0;
+
+    // Three bursts, each followed by a fold, the same "append some, ask a
+    // question, append some more, ask again" shape a real session takes.
+    // Round 0 grants a connection, round 1 spawns a child and spends, round 2
+    // narrows the grant round 0 made.
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        var locked = try storage.lock(io);
+        _ = try locked.append(gpa, io, .{ .message = .{
+            .role = .user,
+            .content = &.{.{ .text = "round text" }},
+        } }, 0);
+        if (round == 0) {
+            const request_id = try locked.append(gpa, io, .{ .approval_request = .{
+                .action = grant_action,
+                .summary = "reach the build host",
+                .detail = "",
+                .reason = "",
+                .agent_kind = "main",
+                .spawn_chain = &.{},
+                .timeout_at_ms = 0,
+                .tool_call_id = "call1",
+            } }, 0);
+            _ = try locked.append(gpa, io, .{ .approval_response = .{
+                .request_id = request_id,
+                .decision = .approved_by_user_for_session,
+                .responder = "person",
+                .action = grant_action,
+                .tool_call_id = "call1",
+            } }, 0);
+        }
+        if (round == 1) {
+            _ = try locked.append(gpa, io, .{ .session_spawn = .{
+                .child_session = "01CHILD",
+                .child_agent_kind = "subagent",
+                .reason = "look something up",
+                .budget_max_cost = 1.5,
+                .budget_currency = "USD",
+            } }, 0);
+            _ = try locked.append(gpa, io, .{ .usage = .{
+                .input_tokens = 500,
+                .output_tokens = 100,
+                .cost = .{ .known = .{ .value = 0.02, .currency = "USD" } },
+            } }, 0);
+        }
+        if (round == 2) {
+            // Narrows the grant round 0 made: `SessionGrants.invalidate` must
+            // clear it in both folds alike.
+            _ = try locked.append(gpa, io, .{ .policy_self = .{
+                .restrictions = &.{.{ .action = grant_action, .ceiling = .deny, .reason = "narrowed mid session" }},
+                .authorised = false,
+            } }, 0);
+        }
+        try locked.unlock(io);
+
+        foldSessionSince(gpa, io, storage, &resumed, &at);
+    }
+
+    // One fold, start to finish, over the same finished log: the ground
+    // truth `foldSession` already gives every other caller.
+    var whole = chock_proto.state.Session.init(gpa);
+    defer whole.deinit();
+    foldSession(gpa, io, storage, &whole);
+
+    // The four things either caller reads.
+    try std.testing.expectEqual(
+        whole.self_policy.restrictions.items.len,
+        resumed.self_policy.restrictions.items.len,
+    );
+    try std.testing.expectEqualStrings(
+        whole.self_policy.restrictions.items[0].action,
+        resumed.self_policy.restrictions.items[0].action,
+    );
+    try std.testing.expectEqual(whole.children.items.len, resumed.children.items.len);
+    try std.testing.expectEqualStrings(whole.children.items[0].session, resumed.children.items[0].session);
+    try std.testing.expectEqual(whole.spend.turns, resumed.spend.turns);
+    try std.testing.expectEqual(whole.spend.input_tokens, resumed.spend.input_tokens);
+    // The narrowing landed after the grant, so both folds have to have
+    // dropped it: `get` reads null on both, the same invalidated answer.
+    try std.testing.expect(whole.grants.get(grant_action, true) == null);
+    try std.testing.expect(resumed.grants.get(grant_action, true) == null);
+
+    // The one thing `PolicyFold` structurally cannot agree with `whole`
+    // about, because it carries no field to hold an answer in: the log wrote
+    // three `message` events, and `whole.context` has all three.
+    try std.testing.expectEqual(@as(usize, 3), whole.context.items.len);
 }
 
 test "a mid session restrict_self invalidates a remembered grant on the very next question, and a cache that never refolds does not see it" {

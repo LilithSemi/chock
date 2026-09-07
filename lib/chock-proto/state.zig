@@ -638,18 +638,12 @@ pub const Session = struct {
                 // Record that the child exists. Do not touch the child's log:
                 // the parent context gets the child's result later, through a
                 // different event, never the child's own transcript.
-                try self.children.append(allocator, .{
-                    .session = try allocator.dupe(u8, spawn.child_session),
-                    .agent_kind = try allocator.dupe(u8, spawn.child_agent_kind),
-                    .reason = try allocator.dupe(u8, spawn.reason),
-                    // What this child was allowed to spend. Folded here, and
-                    // not counted in the loop, so a parent that resumed knows
-                    // what it has already handed out. See
-                    // `chock_core.subagent.budgetSlice`: a slice a resumed
-                    // parent forgot would be a slice it could hand out twice.
-                    .budget_max_cost = spawn.budget_max_cost,
-                    .budget_currency = try allocator.dupe(u8, spawn.budget_currency),
-                });
+                //
+                // Built by `childFrom`, the same function `PolicyFold.apply`
+                // calls for the same event: see that struct's own top comment
+                // for why the two folds share this instead of each keeping a
+                // copy that could drift.
+                try self.children.append(allocator, try childFrom(allocator, spawn));
             },
             .workspace_open => |opened| {
                 // **The last one wins.** Each attempt at a session opens one
@@ -677,15 +671,10 @@ pub const Session = struct {
             .usage => |usage| {
                 // The currency is borrowed from the envelope, which the
                 // caller of `apply` owns and may release, so the arena keeps
-                // a copy the way every other field here does.
-                var owned = usage;
-                if (usage.cost == .known) {
-                    owned.cost = .{ .known = .{
-                        .value = usage.cost.known.value,
-                        .currency = try allocator.dupe(u8, usage.cost.known.currency),
-                    } };
-                }
-                self.spend.add(owned);
+                // a copy the way every other field here does. `ownedUsage` is
+                // the same function `PolicyFold.apply` calls for the same
+                // event: see that struct's own top comment.
+                self.spend.add(try ownedUsage(allocator, usage));
                 self.last_input_tokens = usage.input_tokens +
                     usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
             },
@@ -766,6 +755,142 @@ pub const Session = struct {
         // The old backing array is arena memory: nothing needs an explicit free
         // here, the whole arena goes away together in Session.deinit.
         self.context = folded;
+    }
+};
+
+/// Build one `Child` out of a `session.spawn` event, copied into `allocator`.
+/// Shared by `Session.apply` and `PolicyFold.apply`, so there is one place
+/// that decides what a spawn means and not two that could disagree.
+fn childFrom(allocator: std.mem.Allocator, spawn: event.SessionSpawn) std.mem.Allocator.Error!Child {
+    return .{
+        .session = try allocator.dupe(u8, spawn.child_session),
+        .agent_kind = try allocator.dupe(u8, spawn.child_agent_kind),
+        .reason = try allocator.dupe(u8, spawn.reason),
+        // What this child was allowed to spend. Folded here, and not counted
+        // in the loop, so a parent that resumed knows what it has already
+        // handed out. See `chock_core.subagent.budgetSlice`: a slice a
+        // resumed parent forgot would be a slice it could hand out twice.
+        .budget_max_cost = spawn.budget_max_cost,
+        .budget_currency = try allocator.dupe(u8, spawn.budget_currency),
+    };
+}
+
+/// `usage`, with a `known` cost's currency copied into `allocator` so it
+/// outlives the envelope `apply` was given. Shared by `Session.apply` and
+/// `PolicyFold.apply`, for the same reason `childFrom` is.
+fn ownedUsage(allocator: std.mem.Allocator, usage: event.Usage) std.mem.Allocator.Error!event.Usage {
+    var owned = usage;
+    if (usage.cost == .known) {
+        owned.cost = .{ .known = .{
+            .value = usage.cost.known.value,
+            .currency = try allocator.dupe(u8, usage.cost.known.currency),
+        } };
+    }
+    return owned;
+}
+
+/// What a session's own budget and its promises depend on, kept alive across
+/// many questions the way `src/run.zig`'s `SessionArbiter.decideFn` and
+/// `ToolNetwork.refreshToolPromises` need to, and grown by nothing else.
+///
+/// ## Why this exists, and not a `Session` kept the same way
+///
+/// `Session.context` mirrors the whole conversation, and it only grows: a
+/// `Session` kept alive for the life of a run and caught up on every tool
+/// call, as `decideFn` and `refreshToolPromises` both do, would carry that
+/// growth with it even though neither ever reads `context`. Measured
+/// 2026-09-07 (see `src/run.zig`'s own measurement in `SessionArbiter`'s
+/// top comment): `context` is the largest part of what such a kept
+/// `Session` holds, and it climbs with every turn of the session, without
+/// bound, for a cost nothing pays it for.
+///
+/// **A struct with no `context` field, rather than a `Session` whose
+/// `context` is dropped after each fold.** Dropping a field after the fact
+/// is a promise a caller has to keep by discipline: the moment another
+/// caller reads `session.context` off a value this file handed out, it
+/// reads whatever was last dropped and gets a wrong answer with no error,
+/// exactly the shape of bug this project has already shipped twice
+/// (`Network.io`, `ToolNetwork.session`, see `src/run.zig`'s own account of
+/// both). A `PolicyFold` cannot be misread this way, because there is
+/// nothing here to misread: a caller that writes `.context` gets a compile
+/// error, not a stale value.
+///
+/// ## What it folds, and why that is safe to say once
+///
+/// Exactly the event kinds `decideFn` and `refreshToolPromises` need:
+/// `session.spawn` for `children`, `usage` for `spend`, `policy.self` and
+/// `approval.response` for `self_policy` and `grants`. Every one of those is
+/// folded through the exact function `Session.apply` itself calls for the
+/// same event: `childFrom`, `ownedUsage`, `SelfPolicy.apply`,
+/// `SessionGrants.apply`, `SessionGrants.invalidate`. `apply` below is a
+/// second dispatcher and never a second decision: **if a future event kind
+/// changes what a promise, a grant, a child, or a spend means, the change
+/// belongs in one of those five functions, and both folds pick it up.**
+/// Only the dispatch itself, which kinds to look at, is written twice, the
+/// same way `Session.apply`'s own `switch` and `logscan.zig`'s are two
+/// separate readings of `event.Kind` today: see this project's own note on
+/// that enum's blast radius.
+///
+/// ## What it does not fold, on purpose
+///
+/// `context`, `plan`, `workspace`, `agent_kind`, `model_alias`,
+/// `parent_session`, `ended`, `end_reason`, `end_detail`, and
+/// `last_input_tokens`: every one of these is a real field of `Session`
+/// that a `PolicyFold` simply has none of. Nothing here is a stand-in for
+/// them and nothing here should ever grow one back without giving this
+/// struct a new name, because the day it holds `context` again it is a
+/// `Session` with extra ceremony, not a bound.
+pub const PolicyFold = struct {
+    /// Owns every slice this struct or its entries hold, the same way
+    /// `Session.arena` does for `Session`. One arena for the whole struct's
+    /// lifetime, so `deinit` releases it all at once and a caller never has
+    /// to say which allocator built which string.
+    arena: std.heap.ArenaAllocator,
+
+    /// Every child this session spawned. See `Session.children`, the same
+    /// field, on a smaller struct.
+    children: std.ArrayList(Child) = .empty,
+    /// What the agent has promised about itself. See `Session.self_policy`.
+    self_policy: SelfPolicy = .{},
+    /// Every `approved_by_user_for_session` answer this session has already
+    /// seen. See `Session.grants`.
+    grants: SessionGrants = .{},
+    /// What the session has spent so far. See `Session.spend`.
+    spend: Spend = .{},
+
+    pub fn init(allocator: std.mem.Allocator) PolicyFold {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    pub fn deinit(self: *PolicyFold) void {
+        self.arena.deinit();
+    }
+
+    /// Fold one more event into the state. See this struct's own top
+    /// comment for why this reads only four event kinds and why that is
+    /// safe: every kind it reads is folded through the same function
+    /// `Session.apply` calls for it.
+    pub fn apply(self: *PolicyFold, envelope: event.Envelope) std.mem.Allocator.Error!void {
+        const allocator = self.arena.allocator();
+        switch (envelope.event) {
+            .session_spawn => |spawn| try self.children.append(allocator, try childFrom(allocator, spawn)),
+            .usage => |usage| self.spend.add(try ownedUsage(allocator, usage)),
+            .policy_self => |update| {
+                // Same order note as `Session.apply`'s own `.policy_self`
+                // arm: `grants` and `self_policy` are independent, so the
+                // order between clearing one and folding the other does not
+                // matter.
+                for (update.restrictions) |restriction| {
+                    try self.grants.invalidate(allocator, restriction);
+                }
+                try self.self_policy.apply(allocator, update);
+            },
+            .approval_response => |response| try self.grants.apply(allocator, response),
+            // Everything else changes a field this struct does not carry.
+            // See this struct's own top comment for the list and why each
+            // one is left out on purpose.
+            else => {},
+        }
     }
 };
 
