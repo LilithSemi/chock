@@ -26,9 +26,11 @@ const chock_policy = @import("chock-policy");
 /// A real session log, in memory, for `askingEscape`: the reentrancy proof
 /// needs a real `Broker.request`, and `Broker.request` needs a real
 /// `chock_proto.storage.Storage` to write the question and the answer into.
-/// `Memory` touches no file and ignores the `io` it is handed, which is what
-/// keeps this probe's own `io` field safely `undefined`: see `Network.io`'s
-/// own comment on why nothing here may build a threaded one.
+/// `Memory` touches no file and ignores the `io` it is handed. `Network.io`
+/// itself is a real, threadless `std.Io`: see its own construction comment
+/// in `filteredEscape` and `askingEscape` for what reads it and why a
+/// threaded implementation is still the one thing that may not be built
+/// here.
 const chock_proto = @import("chock-proto");
 const linux = std.os.linux;
 
@@ -378,15 +380,22 @@ fn filteredEscape(
     const base = try baseEscapeConfig(arena);
     const policy = try chock_policy.table.Table.parse(arena, source, null);
 
+    // A real, threadless `Io`. `std.Io.Threaded.init_single_threaded` never
+    // spawns a worker thread, by its own doc comment, so it keeps this
+    // probe single threaded across `Sandbox.spawn`'s own `fork()` below.
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+
     var transport = ProbeTransport{ .resolves_to = resolves_to, .port = dial_port };
     var network = chock_broker.network.Network{
         .gpa = arena,
-        // **Never read.** The transport above ignores it, and this probe must
-        // stay single threaded because `Sandbox.spawn` forks: a `std.Io`
-        // implementation with threads behind it is the one thing that must not
-        // be built here. A field that is never read is the honest way to say
-        // that, and a real one would be the dishonest way.
-        .io = undefined,
+        // **Genuinely read, not a claim that nothing here reads it.**
+        // `finishConnect` (`lib/chock-broker/network.zig`) passes `self.io`
+        // to `transport.lookup` and `transport.dial` on every allowed
+        // connection, and `askPermits` reads it too whenever a caller sets
+        // `.asker`. `ProbeTransport` still ignores the value it is given,
+        // the same way it always did, but that is `ProbeTransport`'s own
+        // property and not a reason for this field to hold `undefined`.
+        .io = io_impl.io(),
         .table = policy,
         .chain = chain,
         .agent_kind = chain[chain.len - 1],
@@ -468,9 +477,10 @@ fn openRequest(gpa: std.mem.Allocator, store: chock_proto.storage.Storage) ?u64 
 /// stands in for the person who would otherwise answer through
 /// `lib/chock-broker/socket.zig`: a real arbiter, played by code that never
 /// touches `std.Io` and never starts a thread, for the same reason
-/// `ProbeTransport` does not. `nowMs` and `wait` both ignore the `io` they are
-/// handed, so this probe's own `network.io` field can stay `undefined`
-/// throughout, exactly as `filteredEscape`'s own comment requires.
+/// `ProbeTransport` does not. `nowMs` and `wait` both ignore the `io` they
+/// are handed, and do not need it: this probe's own `network.io` is a real,
+/// threadless `std.Io`, and this arbiter is free to ignore its own copy of
+/// that value without hiding a trap the way `undefined` once did.
 ///
 /// **This proves the log, lock and turn mechanics, not the production socket
 /// waiter.** `lib/chock-broker/socket.zig`'s own `Waiter` does real socket
@@ -601,20 +611,47 @@ fn askingEscape(
     };
     var broker = chock_broker.Broker{ .policy = policy, .waiter = arbiter.waiter() };
 
+    // **What forces `askPermits` to read `self.io` for real.** Every
+    // production caller wires `approval_wait_ns`, through
+    // `src/run.zig`'s own `ToolNetwork`: see `Asker.approval_wait_ns`'s own
+    // comment. Leaving it null here would let `askPermits` skip the read
+    // `self.io` was measured to segfault on, on 2026-09-05, and this probe
+    // would go back to proving nothing about it.
+    var approval_wait_ns: std.atomic.Value(u64) = .init(0);
+
+    // A real, threadless `Io`. `std.Io.Threaded.init_single_threaded` never
+    // spawns a worker thread, by its own doc comment, so it stays correct
+    // here too: this process has already forked, or is about to, inside
+    // `Sandbox.spawn` below.
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+
     var transport = ProbeTransport{ .resolves_to = resolves_to, .port = dial_port };
     var network = chock_broker.network.Network{
         .gpa = arena,
-        // **Never read**, for the reason `AskArbiter`'s own comment gives:
-        // this process has already forked, or is about to, and nothing here
-        // may start a thread through `std.Io`'s own machinery to get here.
-        .io = undefined,
+        // **Genuinely read, not a claim that nothing here reads it.** That
+        // claim used to be true only by accident: `askPermits`
+        // (`lib/chock-broker/network.zig`) reads `self.io` whenever a
+        // caller's `approval_wait_ns` is set, and a version of it that read
+        // `self.io` unconditionally segfaulted this probe on 2026-09-05, at
+        // this exact `undefined` value. `finishConnect` also passes it to
+        // `transport.lookup` and `transport.dial` on every allowed
+        // connection. `ProbeTransport` and `AskArbiter` both still ignore
+        // the value they are given, the same way they always did, but that
+        // is their own property and not a reason for this field to hold
+        // `undefined`.
+        .io = io_impl.io(),
         .table = policy,
         .chain = &.{"main"},
         .agent_kind = "main",
         .model = "main",
         .tool = "mcp",
         .transport = transport.transport(),
-        .asker = .{ .broker = &broker, .storage = store, .locked = &locked },
+        .asker = .{
+            .broker = &broker,
+            .storage = store,
+            .locked = &locked,
+            .approval_wait_ns = &approval_wait_ns,
+        },
     };
 
     const term = try sandbox.spawn(arena, .{
