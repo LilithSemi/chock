@@ -48,13 +48,16 @@
 //! `ubuntu-latest` and `ubuntu-24.04-arm` images alike.
 //!
 //! The driver has one and only one name for it: `error.NotAuthorized` with
-//! `Failure.not_authorized`, set at the single place in
-//! `lib/chock-pcsc/linux/driver.zig` that reads a closed connection as
-//! something specific. `refusedBeforeAnswering` below reads exactly that pair
-//! and nothing else, so a transport fault stays `NoService`, a refused version
-//! stays `ProtocolMismatch`, and a framing fault still fails the way it
-//! always did. **A skip here says the daemon was never reached, which is not a
-//! pass and must never be counted as one.**
+//! `Failure.not_authorized`. `lib/chock-pcsc/linux/driver.zig` sets that pair
+//! from two places, a read and a write, because a closed peer can be met
+//! either way: `readHandshake` meets it if the client's own write of the
+//! offer landed first, and `sendHandshake` meets it as a broken pipe if the
+//! close won that race instead. Both name the same daemon behaviour.
+//! `refusedBeforeAnswering` below reads exactly that pair and nothing else,
+//! so a transport fault stays `NoService`, a refused version stays
+//! `ProtocolMismatch`, and a framing fault still fails the way it always did.
+//! **A skip here says the daemon was never reached, which is not a pass and
+//! must never be counted as one.**
 //!
 //! Two things put a machine in that state and this file does not separate
 //! them: a `pcscd` whose polkit check refuses the client, and a
@@ -222,9 +225,9 @@ const Bench = struct {
 ///
 /// **One error and one failure, together, and nothing wider.** See this file's
 /// top comment for the state this names. The pair is what makes it narrow: the
-/// driver sets `Failure.not_authorized` at one place only, the read of the
-/// version reply, so a fault anywhere else keeps its own name and still fails
-/// the test that found it.
+/// driver sets `Failure.not_authorized` only from the handshake, on the read
+/// of the version reply or the write of the version offer, so a fault
+/// anywhere else keeps its own name and still fails the test that found it.
 fn refusedBeforeAnswering(err: anyerror, driver: *const chock_pcsc.Driver) bool {
     if (err != error.NotAuthorized) return false;
     const failure = driver.failure orelse return false;

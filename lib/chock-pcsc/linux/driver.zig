@@ -79,6 +79,13 @@ pub const Failure = union(enum) {
     /// `IsClientAuthorized` before it reads one byte. `libpcsclite` reads the
     /// same reset and calls it `SCARD_W_SECURITY_VIOLATION`, which is where the
     /// word in the sentence below comes from.
+    ///
+    /// **Set from two places, both the same fact.** A client discovers a peer
+    /// that closed before reading either on its own read of the handshake
+    /// reply (`readHandshake`'s `PeerClosed`) or on its own write of the
+    /// handshake offer, if the close won the race first (`sendHandshake`'s
+    /// `BrokenPipe`, an `EPIPE`). Which one fires is scheduling, not meaning:
+    /// both name the same daemon behaviour, so both set this same variant.
     not_authorized,
     /// The daemon speaks a protocol this build does not.
     version_mismatch: struct { offered: wire.Version, daemon: wire.Version },
@@ -272,9 +279,28 @@ pub const Driver = struct {
         try self.readHandshake();
     }
 
+    /// **The write side of the same race `readHandshake` names below.** This
+    /// is the very first write on a freshly opened connection, so a broken
+    /// pipe here can only mean one thing: the peer had already closed before
+    /// this got the chance to write, which is what `pcscd` does from inside
+    /// `IsClientAuthorized`. `EPIPE` on a stream socket is raised only once
+    /// the peer's end is gone, so this is not a guess between "closed" and
+    /// "some other transport fault": the kernel already told us which one it
+    /// is. A build that read this as a plain transport failure would send a
+    /// refused client to go start a daemon that is running and already said
+    /// no.
     fn sendHandshake(self: *Driver) iface.Error!void {
         const body = wire.encodeVersion(self.offered);
-        try self.sendMessage(.version, &body, "version handshake");
+        self.writeMessage(.version, &body) catch |err| switch (err) {
+            error.BrokenPipe => {
+                self.failure = .not_authorized;
+                return error.NotAuthorized;
+            },
+            error.Failed => {
+                self.failure = .{ .transport = "version handshake" };
+                return error.NoService;
+            },
+        };
     }
 
     /// **Split from the send so a test can put a refusal between the two.**
@@ -415,10 +441,15 @@ pub const Driver = struct {
         try self.sendMessage(.transmit, &body, "transmit");
         // The command bytes follow with no header of their own. This is the one
         // message in the protocol that is two writes.
-        if (!self.writeAll(command_bytes)) {
+        //
+        // **`BrokenPipe` and `Failed` read the same here.** This write only
+        // happens on a connection that already finished a handshake, so a
+        // closed peer met here is an ordinary disconnect mid-session, not the
+        // authorization race `sendHandshake` distinguishes.
+        self.writeAll(command_bytes) catch {
             self.failure = .{ .transport = "transmit" };
             return error.Unexpected;
-        }
+        };
 
         var reply: [wire.transmit_len]u8 = undefined;
         try self.recvMessage(&reply, "transmit");
@@ -455,14 +486,22 @@ pub const Driver = struct {
         } else |_| {}
     }
 
-    const SendError = error{Failed};
+    /// **`Failed` and `BrokenPipe` are kept apart because `sendHandshake`
+    /// reacts to them differently, and nothing else does.** `BrokenPipe` is
+    /// `EPIPE`: the peer had already closed the connection when this wrote to
+    /// it. On the very first write of a fresh connection, that is not a
+    /// generic transport fault, it is the other half of the race
+    /// `readHandshake` already names below. Every later write treats the two
+    /// the same, because by then a closed peer is an ordinary disconnect and
+    /// not the daemon's authorization refusal in disguise.
+    const WriteError = error{ Failed, BrokenPipe };
 
     /// Header and body, in that order, as two writes. That is what
     /// `MessageSendWithHeader` does and the daemon reads them as one message.
-    fn writeMessage(self: *Driver, command: wire.Command, body: []const u8) SendError!void {
+    fn writeMessage(self: *Driver, command: wire.Command, body: []const u8) WriteError!void {
         const header = wire.encodeHeader(command, @intCast(body.len));
-        if (!self.writeAll(&header)) return error.Failed;
-        if (body.len != 0 and !self.writeAll(body)) return error.Failed;
+        try self.writeAll(&header);
+        if (body.len != 0) try self.writeAll(body);
     }
 
     fn sendMessage(
@@ -477,7 +516,7 @@ pub const Driver = struct {
         };
     }
 
-    /// Write the whole of `bytes`, or answer false.
+    /// Write the whole of `bytes`, or say which of two ways it failed.
     ///
     /// **`sendto` with `MSG_NOSIGNAL` and not `write`.** A daemon that closed
     /// the connection would otherwise raise `SIGPIPE` and kill the process
@@ -486,8 +525,8 @@ pub const Driver = struct {
     ///
     /// A short write is not a failure: a socket takes what fits and says how
     /// much.
-    fn writeAll(self: *Driver, bytes: []const u8) bool {
-        const handle = (self.stream orelse return false).socket.handle;
+    fn writeAll(self: *Driver, bytes: []const u8) WriteError!void {
+        const handle = (self.stream orelse return error.Failed).socket.handle;
         var sent: usize = 0;
         while (sent < bytes.len) {
             const rc = std.posix.system.sendto(
@@ -506,10 +545,11 @@ pub const Driver = struct {
             switch (std.posix.errno(rc)) {
                 // Interrupted before anything was written. Nothing is lost.
                 .INTR => continue,
-                else => return false,
+                // The peer had already closed. See `WriteError.BrokenPipe`.
+                .PIPE => return error.BrokenPipe,
+                else => return error.Failed,
             }
         }
-        return true;
     }
 
     const RecvError = error{
@@ -706,6 +746,60 @@ test "a peer that closes without answering the handshake is read as not authoriz
 
     try testing.expectError(error.NotAuthorized, driver.readHandshake());
     try testing.expect(driver.failure.? == .not_authorized);
+
+    var said: [512]u8 = undefined;
+    const text = try std.fmt.bufPrint(&said, "{f}", .{driver.failure.?});
+    try testing.expect(std.mem.indexOf(u8, text, "access_pcsc") != null);
+}
+
+// **The other half of the same race, forced rather than waited for.**
+//
+// A CI runner hit this side once: `sendHandshake`'s write met a peer that
+// had already closed, and it came back as `error.NoService` with
+// `Failure.transport`, not `error.NotAuthorized` with `Failure.not_authorized`.
+// The test above proves the read side; this one proves the write side by the
+// same trick in the other order, closing before the client writes instead of
+// after, so which side of the race wins is decided here and not by luck.
+//
+// **Measured against the code before this test's own fix**: forcing this
+// order against the driver as it stood gave exactly the CI failure,
+// `error.NoService` and `Failure.transport`. This test pins the corrected
+// reading, and a regression back to the old one fails it.
+test "a peer that closes before the write is the same not authorized, met from the other side" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &path_buffer);
+    var socket_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&socket_buffer, "{s}/pcscd.comm", .{path_buffer[0..dir_len]});
+    if (path.len > std.Io.net.UnixAddress.max_len) return error.SkipZigTest;
+
+    const address = try std.Io.net.UnixAddress.init(path);
+    var server = try address.listen(testing.io, .{});
+    defer server.deinit(testing.io);
+
+    var driver = Driver.init(testing.io);
+    driver.socket_path = path;
+    driver.timeout_ms = 2_000;
+    defer driver.deinit();
+
+    // Connect, then accept and close before a single byte of the handshake is
+    // sent. **Both syscalls complete before this returns**, so the write
+    // below meets an already-closed peer every time this runs, not on
+    // whichever run the scheduler happens to lose.
+    try driver.open();
+    const accepted = try server.accept(testing.io);
+    accepted.close(testing.io);
+
+    try testing.expectError(error.NotAuthorized, driver.sendHandshake());
+    try testing.expect(driver.failure.? == .not_authorized);
+
+    // **Still distinguishable from the other two states this file's tests
+    // hold apart.** Neither `no_socket` (nothing at the path) nor
+    // `not_listening` (a socket nobody accepted) is what happened here: a
+    // connection was accepted and then closed, and that stays its own fact.
+    try testing.expect(driver.failure.? != .no_socket);
+    try testing.expect(driver.failure.? != .not_listening);
 
     var said: [512]u8 = undefined;
     const text = try std.fmt.bufPrint(&said, "{f}", .{driver.failure.?});
