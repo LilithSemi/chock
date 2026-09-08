@@ -2412,7 +2412,7 @@ test "a worktree starts at the head of the project" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // The worktree's own .git is left on disk exactly as git wrote it, so this
     // reads the worktree's HEAD directly, no sandbox needed.
@@ -2420,6 +2420,7 @@ test "a worktree starts at the head of the project" {
     defer head_output.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, head_output.term);
     try std.testing.expectEqualStrings(project.head_sha, std.mem.trimEnd(u8, head_output.stdout, "\n"));
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the mount list gives the worktree read write and the object store read only" {
@@ -2430,7 +2431,7 @@ test "the mount list gives the worktree read write and the object store read onl
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2443,6 +2444,7 @@ test "the mount list gives the worktree read write and the object store read onl
     defer allocator.free(objects_path);
     const objects_mount = mostSpecificMount(list, objects_path) orelse return error.NoMountCoversTheObjectStore;
     try std.testing.expectEqual(true, objects_mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the mount list never gives .git/hooks write access" {
@@ -2458,7 +2460,7 @@ test "the mount list never gives .git/hooks write access" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2467,6 +2469,7 @@ test "the mount list never gives .git/hooks write access" {
     defer allocator.free(hooks_path);
     const hooks_mount = mostSpecificMount(list, hooks_path) orelse return error.NoMountCoversHooks;
     try std.testing.expectEqual(true, hooks_mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the index of the worktree is writable, so git status works inside the sandbox" {
@@ -2480,7 +2483,7 @@ test "the index of the worktree is writable, so git status works inside the sand
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2489,6 +2492,7 @@ test "the index of the worktree is writable, so git status works inside the sand
     defer allocator.free(index_path);
     const index_mount = mostSpecificMount(list, index_path) orelse return error.NoMountCoversTheIndex;
     try std.testing.expectEqual(false, index_mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "HEAD and the logs of the worktree are writable, matching the index" {
@@ -2501,7 +2505,7 @@ test "HEAD and the logs of the worktree are writable, matching the index" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2515,6 +2519,7 @@ test "HEAD and the logs of the worktree are writable, matching the index" {
     defer allocator.free(logs_path);
     const logs_mount = mostSpecificMount(list, logs_path) orelse return error.NoMountCoversLogs;
     try std.testing.expectEqual(false, logs_mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "finding 4: the metadata directory the sandbox writes is the session's own copy" {
@@ -2529,7 +2534,7 @@ test "finding 4: the metadata directory the sandbox writes is the session's own 
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expect(worktree.worktree_meta_is_copy);
     try std.testing.expect(!std.mem.eql(u8, worktree.worktree_meta_bind_source, worktree.worktree_meta_source));
@@ -2550,6 +2555,7 @@ test "finding 4: the metadata directory the sandbox writes is the session's own 
         try std.testing.expectEqual(false, mount.read_only);
         try std.testing.expect(std.mem.startsWith(u8, mount.source, worktree.worktree_meta_bind_source));
     }
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "finding 4: the copy holds what git worktree add wrote, and a commondir a host git can follow" {
@@ -2566,7 +2572,7 @@ test "finding 4: the copy holds what git worktree add wrote, and a commondir a h
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     for ([_][]const u8{ "HEAD", "index", "gitdir", "logs/HEAD" }) |name| {
         const in_copy = try std.fs.path.join(allocator, &.{ worktree.worktree_meta_bind_source, name });
@@ -2586,6 +2592,7 @@ test "finding 4: the copy holds what git worktree add wrote, and a commondir a h
     const project_commondir = try readFile(allocator, worktree.worktree_commondir_source);
     defer allocator.free(project_commondir);
     try std.testing.expectEqualStrings("../..", std.mem.trimEnd(u8, project_commondir, "\n"));
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "finding 4: removing a worktree deletes the copy, and keeping one leaves it" {
@@ -2632,7 +2639,7 @@ test "finding 4: the in place layout gets the copy too, and reaches it by its ow
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .in_place, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expect(worktree.worktree_meta_is_copy);
     try std.testing.expect(!std.mem.eql(u8, worktree.worktree_meta_source, worktree.worktree_meta_bind_source));
@@ -2674,6 +2681,7 @@ test "finding 4: the in place layout gets the copy too, and reaches it by its ow
     }
     try std.testing.expect(git_dir_seen);
     try std.testing.expect(work_tree_seen);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the remapped layout names no GIT_DIR, because the checkout's own .git file already does" {
@@ -2688,7 +2696,7 @@ test "the remapped layout names no GIT_DIR, because the checkout's own .git file
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expectEqual(@as(?[]u8, null), worktree.git_dir_env);
     try std.testing.expectEqual(@as(?[]u8, null), worktree.git_work_tree_env);
@@ -2700,6 +2708,7 @@ test "the remapped layout names no GIT_DIR, because the checkout's own .git file
         try std.testing.expect(!std.mem.startsWith(u8, entry, "GIT_DIR="));
         try std.testing.expect(!std.mem.startsWith(u8, entry, "GIT_WORK_TREE="));
     }
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the mount list keeps commondir and gitdir of the worktree's own metadata read only" {
@@ -2717,7 +2726,7 @@ test "the mount list keeps commondir and gitdir of the worktree's own metadata r
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2728,6 +2737,7 @@ test "the mount list keeps commondir and gitdir of the worktree's own metadata r
         const mount = mostSpecificMount(list, path) orelse return error.NoMountCoversTheFile;
         try std.testing.expectEqual(true, mount.read_only);
     }
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "config.worktree stays read only when a project has one" {
@@ -2760,7 +2770,7 @@ test "config.worktree stays read only when a project has one" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, worktree_config_output.term);
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // git worktree add itself writes config.worktree once the extension is
     // on and the main checkout already has one. Confirmed here rather than
@@ -2776,6 +2786,7 @@ test "config.worktree stays read only when a project has one" {
     defer allocator.free(path);
     const mount = mostSpecificMount(list, path) orelse return error.NoMountCoversTheFile;
     try std.testing.expectEqual(true, mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "config.worktree is absent, so create writes an empty scratch file and mounts it read only" {
@@ -2795,7 +2806,7 @@ test "config.worktree is absent, so create writes an empty scratch file and moun
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expect(worktree.worktree_config_worktree_is_scratch);
     try std.testing.expect(!std.mem.eql(u8, worktree.worktree_config_worktree_source, worktree.worktree_meta_source));
@@ -2823,6 +2834,7 @@ test "config.worktree is absent, so create writes an empty scratch file and moun
     defer allocator.free(shared_config_path);
     const shared_config_mount = mostSpecificMount(list, shared_config_path) orelse return error.NoMountCoversTheSharedConfig;
     try std.testing.expectEqual(true, shared_config_mount.read_only);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "removing a worktree that never had a real config.worktree deletes the empty scratch file it wrote" {
@@ -2911,7 +2923,7 @@ test "no mount Chock builds is wide enough to shadow its own runtime prefix" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const list = try worktree.mounts(allocator);
     defer allocator.free(list);
@@ -2933,6 +2945,7 @@ test "no mount Chock builds is wide enough to shadow its own runtime prefix" {
     // is one parent to reason about and not three siblings.
     try std.testing.expect(std.mem.startsWith(u8, worktree.sandbox_git_root, chock_runtime_prefix ++ "/"));
     try std.testing.expect(std.mem.startsWith(u8, worktree.object_store_target, chock_runtime_prefix ++ "/"));
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "mostSpecificMount compares whole path components, not raw bytes" {
@@ -3083,7 +3096,7 @@ test "a modified file in the project appears in the worktree with the same conte
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // Change tracked.txt on disk in the project, without staging it: the
     // ordinary shape of a file someone is in the middle of editing.
@@ -3104,6 +3117,7 @@ test "a modified file in the project appears in the worktree with the same conte
     const worktree_contents = try readFile(allocator, worktree_tracked_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("hello, modified\n", worktree_contents);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a file the user has not committed yet appears in the worktree" {
@@ -3117,7 +3131,7 @@ test "a file the user has not committed yet appears in the worktree" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/new_work.txt", .{project.root_path});
@@ -3134,6 +3148,7 @@ test "a file the user has not committed yet appears in the worktree" {
     const worktree_contents = try readFile(allocator, worktree_new_file_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("brand new, never committed\n", worktree_contents);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a deleted file is deleted in the worktree too" {
@@ -3144,7 +3159,7 @@ test "a deleted file is deleted in the worktree too" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // tracked.txt exists in the worktree, checked out at HEAD, before this.
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3165,6 +3180,7 @@ test "a deleted file is deleted in the worktree too" {
 
     const stat_result = std.Io.Dir.cwd().statFile(std.testing.io, worktree_tracked_path, .{});
     try std.testing.expectError(error.FileNotFound, stat_result);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "the report names how many files came across, so Chock can tell the user" {
@@ -3179,7 +3195,7 @@ test "the report names how many files came across, so Chock can tell the user" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // One modified tracked file, one new untracked file, one deletion is not
     // possible on top of a single tracked.txt at once, so this test adds a
@@ -3210,6 +3226,7 @@ test "the report names how many files came across, so Chock can tell the user" {
     try std.testing.expectEqual(@as(usize, 1), report.added.items.len); // new_work.txt
     try std.testing.expectEqual(@as(usize, 1), report.deleted.items.len); // second.txt
     try std.testing.expectEqual(@as(usize, 3), report.total());
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "importing nothing from a clean project is not an error" {
@@ -3220,7 +3237,7 @@ test "importing nothing from a clean project is not an error" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
     defer report.deinit(allocator);
@@ -3228,6 +3245,7 @@ test "importing nothing from a clean project is not an error" {
     try std.testing.expectEqual(@as(usize, 0), report.added.items.len);
     try std.testing.expectEqual(@as(usize, 0), report.deleted.items.len);
     try std.testing.expectEqual(@as(usize, 0), report.total());
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "validateRelativePath rejects a path that escapes the project root" {
@@ -3291,7 +3309,7 @@ test "a symbolic link inside the project is recreated in the worktree, not follo
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // A link to another file already inside the project, the ordinary case:
     // a vendored binary pinned by a symlink, a "latest" pointer, and so on.
@@ -3313,6 +3331,7 @@ test "a symbolic link inside the project is recreated in the worktree, not follo
     const target_text = try readSymlinkTarget(allocator, worktree_link_path);
     defer allocator.free(target_text);
     try std.testing.expectEqualStrings("tracked.txt", target_text);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a symbolic link pointing outside the project never lands its target's content in the worktree" {
@@ -3335,7 +3354,7 @@ test "a symbolic link pointing outside the project never lands its target's cont
     try writeFile(outside_path, "OUTSIDE SECRET");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/key", .{project.root_path});
@@ -3359,6 +3378,7 @@ test "a symbolic link pointing outside the project never lands its target's cont
     // text is nowhere in it, not just absent from the one file a narrower
     // test would think to check.
     try std.testing.expect(!try treeContainsBytes(allocator, worktree.path, "OUTSIDE SECRET"));
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a broken symbolic link is recreated, not treated as a deletion" {
@@ -3374,7 +3394,7 @@ test "a broken symbolic link is recreated, not treated as a deletion" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/dangling", .{project.root_path});
@@ -3395,6 +3415,7 @@ test "a broken symbolic link is recreated, not treated as a deletion" {
     const target_text = try readSymlinkTarget(allocator, worktree_link_path);
     defer allocator.free(target_text);
     try std.testing.expectEqualStrings("this/path/does/not/exist.txt", target_text);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a symbolic link to a directory is recreated as a link, not followed into the directory" {
@@ -3412,7 +3433,7 @@ test "a symbolic link to a directory is recreated as a link, not followed into t
     try writeFile(inner_file_path, "inside a directory the link points at\n");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var link_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const link_path = try std.fmt.bufPrintZ(&link_path_buffer, "{s}/link_to_dir", .{project.root_path});
@@ -3434,6 +3455,7 @@ test "a symbolic link to a directory is recreated as a link, not followed into t
     const worktree_link_path = try std.fmt.bufPrintZ(&worktree_link_buffer, "{s}/link_to_dir", .{worktree.path});
     const kind = try classify(std.testing.io, worktree_link_path);
     try std.testing.expectEqual(std.Io.File.Kind.sym_link, kind.?);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a dirty submodule is skipped, not a crash" {
@@ -3481,7 +3503,7 @@ test "a dirty submodule is skipped, not a crash" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, submodule_commit.term);
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // Dirty the submodule's own working tree, uncommitted, so the
     // superproject's own git status names "sub" itself.
@@ -3500,6 +3522,7 @@ test "a dirty submodule is skipped, not a crash" {
         }
     }
     try std.testing.expect(saw_sub_skip);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "an untracked nested repository is skipped, not a crash" {
@@ -3515,7 +3538,7 @@ test "an untracked nested repository is skipped, not a crash" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var nested_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const nested_path = try std.fmt.bufPrintZ(&nested_path_buffer, "{s}/nested", .{project.root_path});
@@ -3535,6 +3558,7 @@ test "an untracked nested repository is skipped, not a crash" {
         if (std.mem.startsWith(u8, skip.path, "nested")) saw_nested_skip = true;
     }
     try std.testing.expect(saw_nested_skip);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a plain file replaced by a directory is skipped, not a crash" {
@@ -3550,7 +3574,7 @@ test "a plain file replaced by a directory is skipped, not a crash" {
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
@@ -3577,6 +3601,7 @@ test "a plain file replaced by a directory is skipped, not a crash" {
     const worktree_contents = try readFile(allocator, worktree_tracked_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("hello\n", worktree_contents);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a file that cannot be read is skipped, and the rest of the import still completes" {
@@ -3587,7 +3612,7 @@ test "a file that cannot be read is skipped, and the rest of the import still co
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var unreadable_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const unreadable_path = try std.fmt.bufPrintZ(&unreadable_buffer, "{s}/unreadable.txt", .{project.root_path});
@@ -3623,6 +3648,7 @@ test "a file that cannot be read is skipped, and the rest of the import still co
     const worktree_contents = try readFile(allocator, worktree_readable_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("you can read this\n", worktree_contents);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a path git rm --cached names twice is imported once, not double counted" {
@@ -3642,7 +3668,7 @@ test "a path git rm --cached names twice is imported once, not double counted" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, second_commit.term);
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // git rm --cached leaves the file on disk, untracked, but also leaves a
     // staged deletion: git status now names "second.txt" twice, once for
@@ -3674,6 +3700,7 @@ test "a path git rm --cached names twice is imported once, not double counted" {
     const worktree_contents = try readFile(allocator, worktree_second_path);
     defer allocator.free(worktree_contents);
     try std.testing.expectEqualStrings("second\n", worktree_contents);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 /// Everything about `root_path`, on disk and in git, that
@@ -3799,7 +3826,7 @@ test "the project's own tree, index, HEAD, refs, and stash are untouched by an i
     try writeFile(outside_path, "OUTSIDE SECRET");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
@@ -3850,6 +3877,7 @@ test "the project's own tree, index, HEAD, refs, and stash are untouched by an i
     try std.testing.expectEqualStrings(before.head, after.head);
     try std.testing.expectEqualStrings(before.refs, after.refs);
     try std.testing.expectEqualStrings(before.stash, after.stash);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a fresh worktree holds the committed state, and neither a modification nor an untracked file" {
@@ -3872,7 +3900,7 @@ test "a fresh worktree holds the committed state, and neither a modification nor
     try writeFile(new_file_path, "brand new, never committed\n");
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // The committed contents, not what is on disk in the project.
     var worktree_tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3888,6 +3916,7 @@ test "a fresh worktree holds the committed state, and neither a modification nor
         error.FileNotFound,
         std.Io.Dir.cwd().statFile(std.testing.io, worktree_new, .{}),
     );
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "countUncommitted names the split, and a clean project counts zero" {
@@ -3948,12 +3977,13 @@ test "countUncommitted counts a staged addition as modified, the same way the im
     try std.testing.expectEqual(@as(usize, 0), counted.untracked);
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
     var report = try worktree.importUncommitted(allocator, std.testing.io, &project.env, null);
     defer report.deinit(allocator);
     try std.testing.expectEqual(counted.modified, report.modified.items.len);
     try std.testing.expectEqual(counted.untracked, report.added.items.len);
     try std.testing.expectEqual(counted.total(), report.total());
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "an idle session moves no head, and a session that commits names its own commit" {
@@ -3967,7 +3997,7 @@ test "an idle session moves no head, and a session that commits names its own co
     defer project.deinit();
 
     var worktree = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer worktree.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer worktree.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expectEqualStrings(project.head_sha, worktree.base_commit);
     try std.testing.expectEqual(
@@ -4015,6 +4045,7 @@ test "an idle session moves no head, and a session that commits names its own co
     }, null);
     defer project_read.deinit(allocator);
     try std.testing.expect(project_read.term.exited != 0);
+    try worktree.remove(allocator, std.testing.io, &project.env, null);
 }
 
 /// Compare two `Worktree` values field by field, and fail on the first field
@@ -4108,7 +4139,7 @@ test "adopt rebuilds every field create built, and registers no second worktree"
     defer project.deinit();
 
     var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer made.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer made.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     // The main checkout plus the one worktree create made.
     try std.testing.expectEqual(
@@ -4136,6 +4167,7 @@ test "adopt rebuilds every field create built, and registers no second worktree"
         @as(usize, 2),
         try countRegisteredWorktrees(allocator, &project.env, project.root_path),
     );
+    try made.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "adopt keeps the work the checkout already holds" {
@@ -4173,7 +4205,7 @@ test "adopt keeps the work the checkout already holds" {
         .remapped,
         null,
     );
-    defer taken.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer taken.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const contents = try readFile(allocator, work_path);
     defer allocator.free(contents);
@@ -4186,6 +4218,7 @@ test "adopt keeps the work the checkout already holds" {
     const tracked = try readFile(allocator, tracked_path);
     defer allocator.free(tracked);
     try std.testing.expectEqualStrings("hello\n", tracked);
+    try taken.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "adopt carries the caller's base commit, and never the head the session left behind" {
@@ -4251,7 +4284,7 @@ test "adopt carries the caller's base commit, and never the head the session lef
         .remapped,
         null,
     );
-    defer taken.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer taken.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     try std.testing.expectEqualStrings(project.head_sha, taken.base_commit);
 
@@ -4259,6 +4292,7 @@ test "adopt carries the caller's base commit, and never the head the session lef
         return error.TheSessionsOwnCommitWouldNeverBeCarriedBack;
     defer allocator.free(moved);
     try std.testing.expectEqualStrings(session_head, moved);
+    try taken.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "a path with no checkout, and a checkout with no .git at all, are both refused as nothing to adopt" {
@@ -4408,7 +4442,7 @@ test "adopt writes over the scratch files of the session and leaves the same byt
     defer project.deinit();
 
     var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer made.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer made.remove(allocator, std.testing.io, &project.env, null) catch {};
 
     const pointer_before = try readFile(allocator, made.pointer_path);
     defer allocator.free(pointer_before);
@@ -4437,6 +4471,7 @@ test "adopt writes over the scratch files of the session and leaves the same byt
     const stand_in = try readFile(allocator, taken.worktree_config_worktree_source);
     defer allocator.free(stand_in);
     try std.testing.expectEqual(@as(usize, 0), stand_in.len);
+    try made.remove(allocator, std.testing.io, &project.env, null);
 }
 
 test "adopt binds the project's own config.worktree when the project has one" {
@@ -4465,7 +4500,7 @@ test "adopt binds the project's own config.worktree when the project has one" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, worktree_config_output.term);
 
     var made = try createWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
-    defer made.remove(allocator, std.testing.io, &project.env, null) catch unreachable;
+    errdefer made.remove(allocator, std.testing.io, &project.env, null) catch {};
     try std.testing.expect(!made.worktree_config_worktree_is_scratch);
 
     var taken = try adoptWithLayout(
@@ -4486,4 +4521,5 @@ test "adopt binds the project's own config.worktree when the project has one" {
         made.worktree_config_worktree_source,
         taken.worktree_config_worktree_source,
     );
+    try made.remove(allocator, std.testing.io, &project.env, null);
 }
