@@ -1679,8 +1679,8 @@ test "only a plain always is an always, and the two words never both fire" {
     try testing.expect(!saysSession("session"));
 
     const words = [_][]const u8{
-        "",       "y",     "yes",    "n",   "no",
-        "a",      "always", "yep",   "s",   "session",
+        "",       "y",      "yes", "n", "no",
+        "a",      "always", "yep", "s", "session",
         "alwyas", "maybe",
     };
     for (words) |word| {
