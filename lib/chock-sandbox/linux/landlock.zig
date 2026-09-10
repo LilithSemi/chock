@@ -4,6 +4,10 @@ const linux = std.os.linux;
 /// Ask for the ABI version instead of creating a ruleset.
 const CREATE_RULESET_VERSION: u32 = 1 << 0;
 
+/// `restrict_self` flags. ABI 7. See `auditFlags`'s doc comment for what a
+/// caller of this file can and cannot get out of them.
+const RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 1 << 1;
+
 /// What a Landlock ABI version can do. Each field names the version that added it.
 pub const Features = struct {
     /// The kernel has Landlock. ABI 1.
@@ -18,6 +22,9 @@ pub const Features = struct {
     ioctl_dev: bool,
     /// A scope for an abstract unix socket and for a signal. ABI 6.
     scope: bool,
+    /// `restrict_self` can ask the kernel to log a denied access to the
+    /// audit subsystem. ABI 7, kernel 6.15. See `auditFlags`.
+    audit: bool,
 };
 
 pub fn featuresFor(abi: i32) Features {
@@ -28,7 +35,35 @@ pub fn featuresFor(abi: i32) Features {
         .net = abi >= 4,
         .ioctl_dev = abi >= 5,
         .scope = abi >= 6,
+        .audit = abi >= 7,
     };
+}
+
+/// The `restrict_self` flags to ask for, given what this ruleset's ABI
+/// supports. `0` below ABI 7: the field does not exist there, and the kernel
+/// answers a nonzero value with `EINVAL`.
+///
+/// **This is not a log Chock can read.** By default, and unconditionally
+/// since ABI 7, a denied access from the thread that calls `restrict_self`
+/// is logged through the kernel's own audit subsystem, the same one `auditd`
+/// reads, but not one from a program this domain later execs into: the
+/// kernel's own reasoning is that "programs should know their own behavior,
+/// but not necessarily the behavior of other programs." `restrictSelf` here
+/// is called to sandbox exactly that other program, so this asks for
+/// `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`, which turns logging on for it.
+///
+/// That still lands nowhere Chock, or the unprivileged process that spawned
+/// the sandbox, can read on its own. The kernel's own admin guide for
+/// Landlock says so outright: audit logs and kernel trace events "require
+/// elevated privileges and are system-wide" and "are not designed for
+/// per-sandbox unprivileged monitoring." Reading them back needs
+/// `CAP_AUDIT_READ` or `CAP_AUDIT_CONTROL` and an audit daemon already
+/// listening, none of which this project's sandbox has or grants. What this
+/// buys is a diagnosability improvement for a user who runs `auditd` and
+/// knows to look there, and nothing Chock's own log can carry today.
+fn auditFlags(features: Features) u32 {
+    if (!features.audit) return 0;
+    return RESTRICT_SELF_LOG_NEW_EXEC_ON;
 }
 
 pub const ProbeError = error{
@@ -67,6 +102,94 @@ test "featuresFor gives each ABI version the features that version added" {
     try std.testing.expect(featuresFor(4).net);
     try std.testing.expect(featuresFor(5).ioctl_dev);
     try std.testing.expect(featuresFor(6).scope);
+    try std.testing.expect(!featuresFor(6).audit);
+    try std.testing.expect(featuresFor(7).audit);
+}
+
+test "auditFlags asks the kernel to log the exec'd program's denials at ABI 7, and asks nothing below it" {
+    // `1 << 1` is `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`, the bit a kernel
+    // below ABI 7 does not know and `restrict_self` refuses with `EINVAL` if
+    // it is ever sent one. A ruleset built for ABI 6 must ask for nothing.
+    try std.testing.expectEqual(@as(u32, 0), auditFlags(featuresFor(6)));
+    try std.testing.expectEqual(@as(u32, 1 << 1), auditFlags(featuresFor(7)));
+}
+
+test "restrictSelf on ABI 7 succeeds with the audit flag, proved on a real kernel" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const abi = probeAbi() catch return error.SkipZigTest;
+    // A kernel below ABI 7 has nothing to prove here: see the next test for
+    // the simulated case that does not need one.
+    if (!featuresFor(abi).audit) return error.SkipZigTest;
+    const ok = restrictSelfSucceeds(abi) orelse return error.SkipZigTest;
+    try std.testing.expect(ok);
+}
+
+test "restrictSelf below ABI 7 still succeeds, with no audit flag and no new refusal" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    _ = probeAbi() catch return error.SkipZigTest;
+    // Simulated, the same way "maskFor removes a right..." above proves its
+    // case without an old kernel: `Ruleset.init(6, ...)` computes ABI 6
+    // features even when the real kernel is newer, so this measures the
+    // floor kernel's path on whatever machine is running the test.
+    try std.testing.expect(!featuresFor(6).audit);
+    const ok = restrictSelfSucceeds(6) orelse return error.SkipZigTest;
+    try std.testing.expect(ok);
+}
+
+/// Fork, build a ruleset for `abi` in the child, and report whether
+/// `restrictSelf` succeeded. Never touches this process's own Landlock
+/// domain: that restriction can never be removed once applied, and this test
+/// binary has more tests to run after this one.
+///
+/// Returns `null` when nothing could be measured: no Landlock, or a pipe or a
+/// fork the kernel refused. A caller that gets `null` has proved nothing and
+/// must skip rather than treat it as a pass.
+fn restrictSelfSucceeds(abi: i32) ?bool {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return null;
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return null;
+    }
+
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        const record: [1]u8 = .{childRestrictSelf(abi)};
+        _ = linux.write(fds[1], &record, 1);
+        // Never a return: this is a forked child of a test binary, and none
+        // of what that binary holds is this process's to unwind.
+        std.process.exit(0);
+    }
+
+    _ = linux.close(fds[1]);
+    var record: [1]u8 = .{0};
+    var held: usize = 0;
+    while (held < record.len) {
+        const rc = linux.read(fds[0], record[held..].ptr, record.len - held);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        held += rc;
+    }
+    _ = linux.close(fds[0]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+
+    if (held != record.len) return null;
+    return record[0] == 2;
+}
+
+/// Runs only in the forked child `restrictSelfSucceeds` makes. `1` for a
+/// ruleset this ABI could not even build, `2` for `restrictSelf` succeeding,
+/// `0` for `restrictSelf` failing.
+fn childRestrictSelf(abi: i32) u8 {
+    var ruleset = Ruleset.init(abi, null) catch return 1;
+    if (ruleset.restrictSelf(null)) |_| return 2 else |_| return 0;
 }
 
 test "probeAbi reports a usable ABI version on a kernel with Landlock" {
@@ -359,7 +482,7 @@ pub const Ruleset = struct {
         const pr = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
         if (linux.errno(pr) != .SUCCESS) return error.Rejected;
 
-        const rc = linux.syscall2(.landlock_restrict_self, @intCast(self.fd), 0);
+        const rc = linux.syscall2(.landlock_restrict_self, @intCast(self.fd), auditFlags(self.features));
         switch (linux.errno(rc)) {
             .SUCCESS => return,
             else => |err| {

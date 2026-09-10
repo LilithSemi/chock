@@ -4398,16 +4398,27 @@ fn chosenLanding(
 /// missing, and `✓` beside a layer the driver gives is a claim about every call
 /// that ran, not a guess about one.
 ///
-/// **What is still missing is `unavailable`**, which is a layer this machine
-/// could apply and this process was not permitted. Nothing in `chock run` can
-/// answer it today: the per call records that hold it, `Sandbox.LimitsReport`
-/// and `Sandbox.LandlockReport`, are filled inside `chock_core.tools` and never
-/// carried back out. See `ui.Layer.State.unavailable`.
+/// **`unavailable` is a layer this machine could apply and this process was
+/// not permitted.** Nothing in `chock run` measures that for most layers
+/// today: the per call records that would hold it, `Sandbox.LimitsReport`
+/// and `Sandbox.LandlockReport`, are filled inside `chock_core.tools` and
+/// never carried back out. See `ui.Layer.State.unavailable`.
+///
+/// **Landlock is the one exception**, because `sandbox.landlock.probeAbi`
+/// changes nothing and needs no tool call to run: `src/doctor.zig` already
+/// reads it the same way, before this same session's first tool call, so a
+/// kernel that refuses Landlock right now reads `unavailable` in the header
+/// rather than `on`, and the session's first sandboxed call is not the first
+/// place that shows up. The caller passes what it measured in
+/// `unavailable`, a set naming every guarantee this run could not actually
+/// get even though `given` says the build carries it; this file does no
+/// measuring of its own.
 ///
 /// The result borrows only static strings, so a caller may keep it for as long
 /// as it likes.
 fn sandboxLayers(
     given: sandbox.Sandbox.Guarantees,
+    unavailable: sandbox.Sandbox.Guarantees,
     network: sandbox.namespace.Network,
     workspace: []const u8,
 ) [layer_names.len]ui.Layer {
@@ -4433,6 +4444,8 @@ fn sandboxLayers(
         };
         const state: ui.Layer.State = if (!given.contains(named.guarantee))
             .unsupported
+        else if (unavailable.contains(named.guarantee))
+            .unavailable
         else if (named.guarantee == .network_isolated and network == .host)
             .off
         else
@@ -4440,6 +4453,24 @@ fn sandboxLayers(
         slot.* = .{ .name = named.name, .note = note, .state = state };
     }
     return built;
+}
+
+/// What `sandboxLayers`'s `unavailable` set should hold for this session,
+/// measured once, here, before the header is drawn.
+///
+/// **Landlock only, and only when the driver under this build is the Linux
+/// one.** `sandbox.landlock.probeAbi` is the one guarantee this file can
+/// measure without a tool call: see `sandboxLayers`'s own doc comment for
+/// why. Darwin's `path_restricted` is Seatbelt, never Landlock, and a raw
+/// Landlock syscall asked of a kernel that is not Linux answers nothing true
+/// about that Seatbelt profile, so this asks nothing unless
+/// `builtin.target.os.tag` says the answer would mean something.
+fn measuredUnavailable(given: sandbox.Sandbox.Guarantees) sandbox.Sandbox.Guarantees {
+    var out = sandbox.Sandbox.Guarantees.initEmpty();
+    if (builtin.target.os.tag != .linux) return out;
+    if (!given.contains(.path_restricted)) return out;
+    if (sandbox.landlock.probeAbi()) |_| {} else |_| out.insert(.path_restricted);
+    return out;
 }
 
 /// What each layer of the header is called, and which guarantee it is.
@@ -9443,6 +9474,7 @@ fn runSession(
     // `sandboxLayers` for where each one comes from.
     const layers = sandboxLayers(
         sandbox.Sandbox.guarantees,
+        measuredUnavailable(sandbox.Sandbox.guarantees),
         started.sandbox_config.network,
         switch (started.workspace.kind) {
             .worktree => "worktree",
@@ -14827,7 +14859,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
     // the second block below claims a sandbox layer that is not there, which is
     // the "never quiet" rule turned into a lie.
     const every = sandbox.Sandbox.Guarantees.initFull();
-    const on = sandboxLayers(every, .none, "worktree");
+    const on = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
     try std.testing.expectEqual(@as(usize, 6), on.len);
     for (on) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
     // The header and the layer states both write these two words.
@@ -14838,7 +14870,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
 
     // A driver that gives nothing, which is the Darwin driver today: every
     // layer says so, and none of them is quietly left on.
-    const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
+    const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
     for (none) |one| {
         try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         try std.testing.expect(one.state.word().len != 0);
@@ -14848,12 +14880,48 @@ test "the header names every sandbox layer the driver gives, and says the word o
     // one that says so, and it is the layer this asked about.
     var short = every;
     short.remove(.path_restricted);
-    const missing = sandboxLayers(short, .none, "worktree");
+    const missing = sandboxLayers(short, sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
     for (missing) |one| {
         if (std.mem.eql(u8, one.name, "landlock")) {
             try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         } else {
             try std.testing.expectEqual(ui.Layer.State.on, one.state);
+        }
+    }
+}
+
+test "a layer the driver gives but this run could not get reads unavailable, not on" {
+    // **The third state, at last given something to produce it.** `given`
+    // alone cannot tell an on session from one Landlock refused for reasons
+    // of its own: a build that carries the driver is not the same claim as
+    // this process getting the layer today. A caller that measured that and
+    // found it missing marks it in `unavailable`, and the header must read
+    // that over `.on`, not beside it.
+    //
+    // Mutation check: read `.unavailable` as `.on` and a Landlock this
+    // machine just refused draws the same check mark as one that is holding.
+    const every = sandbox.Sandbox.Guarantees.initFull();
+    var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
+    landlock_only.insert(.path_restricted);
+
+    const blocked = sandboxLayers(every, landlock_only, .none, "worktree");
+    for (blocked) |one| {
+        if (std.mem.eql(u8, one.name, "landlock")) {
+            try std.testing.expectEqual(ui.Layer.State.unavailable, one.state);
+            try std.testing.expectEqualStrings("BLOCKED", one.state.word());
+        } else {
+            try std.testing.expectEqual(ui.Layer.State.on, one.state);
+        }
+    }
+
+    // A guarantee the driver never gave is `.unsupported` first: `unavailable`
+    // only narrows a layer that was there to begin with.
+    var short = every;
+    short.remove(.path_restricted);
+    const never_had = sandboxLayers(short, landlock_only, .none, "worktree");
+    for (never_had) |one| {
+        if (std.mem.eql(u8, one.name, "landlock")) {
+            try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         }
     }
 }
@@ -14869,11 +14937,11 @@ test "a session that gave the network layer up says so, and a filtered one does 
     // may reach one named host reads as a session with no network layer at all.
     const every = sandbox.Sandbox.Guarantees.initFull();
 
-    const filtered = sandboxLayers(every, .filtered, "overlay");
+    const filtered = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .filtered, "overlay");
     try std.testing.expectEqual(ui.Layer.State.on, filtered[0].state);
     try std.testing.expectEqualStrings("filtered", filtered[0].note);
 
-    const host = sandboxLayers(every, .host, "overlay");
+    const host = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .host, "overlay");
     try std.testing.expectEqual(ui.Layer.State.off, host[0].state);
     try std.testing.expectEqualStrings("host", host[0].note);
     try std.testing.expectEqualStrings("OFF", host[0].state.word());
@@ -14900,7 +14968,7 @@ test "the word beside the net layer is the name of the mode, for every mode ther
     // every other test of `sandboxLayers` still passes.
     const every = sandbox.Sandbox.Guarantees.initFull();
     for (std.enums.values(sandbox.namespace.Network)) |mode| {
-        const built = sandboxLayers(every, mode, "worktree");
+        const built = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), mode, "worktree");
         try std.testing.expectEqualStrings(@tagName(mode), built[0].note);
     }
 }
