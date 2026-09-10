@@ -1325,6 +1325,17 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-stdin-pipe") or
         std.mem.eql(u8, args[1], "spawn-proc-mask") or
         std.mem.eql(u8, args[1], "spawn-proc-live") or
+        // Plan 23 task 1, the six red team primitives. Each belongs here for
+        // the same reason as spawn-ptrace above: sandbox.spawn's own
+        // unshare must run without a filter already installed on this
+        // process, or it would die before the layer under test ever went on.
+        std.mem.eql(u8, args[1], "spawn-signal-middle-setsid") or
+        std.mem.eql(u8, args[1], "spawn-memfd-exec") or
+        std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-landlock") or
+        std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-mount") or
+        std.mem.eql(u8, args[1], "spawn-setns-proc1") or
+        std.mem.eql(u8, args[1], "spawn-cgroup-remount") or
+        std.mem.eql(u8, args[1], "cgroup-surface") or
         // The two setup fault operations. Each one lets `Sandbox.spawn` fail
         // to build a sandbox in a child of its own, so each belongs here for
         // the reason above: a filter installed on this process first would be
@@ -1562,6 +1573,94 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM, 0);
         return if (linux.errno(fd) == .SUCCESS) 0 else 1;
     }
+    if (std.mem.eql(u8, args[1], "netns-af-packet")) {
+        // Plan 23's AF_PACKET escape. This moves whole link layer frames and
+        // answers to no route at all: netns-connect above proves the
+        // routing table is empty, but an AF_PACKET socket never consults
+        // it. What this namespace can still hold back is which interfaces
+        // exist inside it, so the proof here is not "the socket refused"
+        // but "the socket exists and there is still nowhere for it to send
+        // a frame".
+        const eth_p_all: u16 = 0x0003;
+        const fd_rc = linux.socket(linux.AF.PACKET, linux.SOCK.RAW, std.mem.nativeToBig(u16, eth_p_all));
+        if (linux.errno(fd_rc) != .SUCCESS) {
+            // Not the predicted outcome: a capability refusal here would be
+            // a different story than the one this operation exists to
+            // tell. Report plainly rather than silently agreeing with it.
+            std.debug.print("netns-af-packet: socket(AF_PACKET): {s}\n", .{@tagName(linux.errno(fd_rc))});
+            return 4;
+        }
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+
+        // The routing table is not what confines this. The interface list
+        // is: /proc/net/dev is namespace aware regardless of which mount
+        // serves the file, the same property netns-connect's own reading of
+        // /proc/net/route relies on. Anything in this namespace beyond "lo"
+        // would mean this operation is not measuring what it claims to.
+        var dev_buf: [4096]u8 = undefined;
+        const dev_fd_rc = linux.open("/proc/net/dev", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(dev_fd_rc) != .SUCCESS) {
+            std.debug.print("netns-af-packet: open /proc/net/dev: {s}\n", .{@tagName(linux.errno(dev_fd_rc))});
+            return 4;
+        }
+        const dev_fd: i32 = @intCast(dev_fd_rc);
+        defer _ = linux.close(dev_fd);
+        const dev_read = linux.read(dev_fd, &dev_buf, dev_buf.len);
+        if (linux.errno(dev_read) != .SUCCESS) {
+            std.debug.print("netns-af-packet: read /proc/net/dev: {s}\n", .{@tagName(linux.errno(dev_read))});
+            return 4;
+        }
+        var iface_count: usize = 0;
+        var saw_lo = false;
+        var dev_lines = std.mem.splitScalar(u8, dev_buf[0..dev_read], '\n');
+        while (dev_lines.next()) |line| {
+            // Both header lines carry a colon of their own kind, so this
+            // reads the interface name off the part before ':' and skips a
+            // line that never had one.
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            if (name.len == 0 or std.mem.eql(u8, name, "Inter-|") or std.mem.eql(u8, name, "face")) continue;
+            iface_count += 1;
+            if (std.mem.eql(u8, name, "lo")) saw_lo = true;
+        }
+        if (!saw_lo or iface_count != 1) {
+            std.debug.print(
+                "netns-af-packet: expected only lo, found {d} interface(s)\n",
+                .{iface_count},
+            );
+            return 4;
+        }
+
+        // The socket exists and there is exactly one interface in this
+        // namespace: lo, which namespace.enter leaves down. Ask the kernel
+        // for its index and try to move a frame through it. ENETDOWN, not a
+        // route failure and not a permission failure, is the actual reason
+        // nothing goes anywhere: this network namespace was never given a
+        // second interface to fail over to, whatever this socket family can
+        // otherwise reach past a route table.
+        var ifr: linux.ifreq = std.mem.zeroes(linux.ifreq);
+        @memcpy(ifr.ifrn.name[0..2], "lo");
+        const ioctl_rc = linux.ioctl(fd, linux.SIOCGIFINDEX, @intFromPtr(&ifr));
+        if (linux.errno(ioctl_rc) != .SUCCESS) {
+            std.debug.print("netns-af-packet: SIOCGIFINDEX lo: {s}\n", .{@tagName(linux.errno(ioctl_rc))});
+            return 4;
+        }
+        const ifindex = ifr.ifru.ivalue;
+
+        var sll = std.mem.zeroes(linux.sockaddr.ll);
+        sll.family = linux.AF.PACKET;
+        sll.ifindex = ifindex;
+        sll.protocol = std.mem.nativeToBig(u16, eth_p_all);
+        var frame = [_]u8{0} ** 32;
+        const send_rc = linux.sendto(fd, &frame, frame.len, 0, @ptrCast(&sll), @sizeOf(linux.sockaddr.ll));
+        const send_errno = linux.errno(send_rc);
+        if (send_errno != .NETDOWN) {
+            std.debug.print("netns-af-packet: sendto did not fail with ENETDOWN, got {s}\n", .{@tagName(send_errno)});
+            return 4;
+        }
+        return 1;
+    }
 
     if (std.mem.eql(u8, args[1], "session-keyring-fresh")) {
         // Prove Finding 1's join actually replaces the session keyring, not just
@@ -1608,6 +1707,200 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // A seccomp filter that is actually installed kills this process before this
         // line runs. Reaching it at all means the filter spawn was supposed to
         // install never came up.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-setns-proc1")) {
+        // Plan 23's proc/1/ns/mnt escape. Control first: the path has to be
+        // reachable at all, or a refusal below would be the open failing and
+        // not the filter. /proc/1 here names this sandbox's own leader, not
+        // the host's real init: buildProcMount mounts a fresh procfs after
+        // the pid namespace already exists, and the kernel gives a procfs
+        // mounted from inside a pid namespace the view of that namespace.
+        // /proc/1/ns/mnt is not one of namespace.masked_proc_entries either:
+        // that list masks global files, and this one is per pid.
+        const fd_rc = linux.open("/proc/1/ns/mnt", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-setns-proc1: open /proc/1/ns/mnt: {s}\n", .{@tagName(linux.errno(fd_rc))});
+            return 5;
+        }
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+
+        // The attack. setns sits on blocked_calls unconditionally, the same
+        // as unshare, so the filter has no need to read the fd this carries
+        // or ask which namespace it names.
+        const rc = linux.setns(fd, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-proc-self-mem-write-landlock")) {
+        // Plan 23's /proc/self/mem escape, the ordinary configuration: /proc
+        // is mounted read only under Landlock, the same rule spawn-proc-mask
+        // and spawn-proc-live use. Neither ptrace nor process_vm_writev is
+        // called here, so neither of those two blocked calls has anything to
+        // say about this: a write to /proc/self/mem goes through open() and
+        // write() on a regular file, syscalls no correct tool could do
+        // without.
+        //
+        // **Measured, not guessed.** The predicted refusal was Landlock's
+        // EACCES, since the ruleset here grants /proc no write_file right at
+        // all. The kernel actually answers EROFS: on this kernel the
+        // read-only check `buildProcMount`'s own `markReadOnly` puts on the
+        // whole mount is what an O_WRONLY open reaches first, before
+        // Landlock's write_file check ever gets a say. See
+        // `spawned-proc-self-mem-write-mount` below, which removes Landlock
+        // from the question entirely and gets the same answer.
+        const fd_rc = linux.open("/proc/self/mem", .{ .ACCMODE = .WRONLY }, 0);
+        const open_errno = linux.errno(fd_rc);
+        if (open_errno == .SUCCESS) {
+            _ = linux.close(@intCast(fd_rc));
+            return 0;
+        }
+        return if (open_errno == .ROFS) 1 else 5;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-proc-self-mem-write-mount")) {
+        // The same attack, with Landlock's write_file right granted on
+        // /proc on purpose, so a refusal here cannot be Landlock's doing at
+        // all. This does not weaken anything a real caller configures: no
+        // production caller grants write on /proc, and this operation
+        // exists only to prove the mount's own read only flag refuses the
+        // write on its own, with no help from Landlock.
+        const fd_rc = linux.open("/proc/self/mem", .{ .ACCMODE = .WRONLY }, 0);
+        const open_errno = linux.errno(fd_rc);
+        if (open_errno == .SUCCESS) {
+            _ = linux.close(@intCast(fd_rc));
+            return 0;
+        }
+        return if (open_errno == .ROFS) 1 else 5;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-cgroup-remount")) {
+        // Plan 23's cgroup escape, the mount half. namespace.enter never
+        // takes CLONE_NEWCGROUP, so a fresh "cgroup2" mount would be a view
+        // of the entire host hierarchy, one directory per cgroup and not
+        // only this session's own: no cgroup namespace stands behind this
+        // refusal the way a pid namespace or a mount namespace would. The
+        // target does not need to exist, the same as umount-protected and
+        // open-tree-attr-protected above: mount sits on blocked_calls
+        // unconditionally, so the filter kills this before the kernel ever
+        // looks at the path.
+        const rc = linux.mount("cgroup2", "/nonexistent-cgroup-mount", "cgroup2", 0, 0);
+        // The filter kills the process, so this line never runs.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-memfd-exec")) {
+        // Plan 23's memfd escape. Read this program's own bytes, the way an
+        // attacker who already landed a first stage would: nothing here
+        // needs a payload the test could not have made itself.
+        const self_rc = linux.open("/probe", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(self_rc) != .SUCCESS) {
+            std.debug.print("spawned-memfd-exec: open /probe: {s}\n", .{@tagName(linux.errno(self_rc))});
+            return 5;
+        }
+        const self_fd: i32 = @intCast(self_rc);
+        defer _ = linux.close(self_fd);
+
+        var bytes: std.ArrayList(u8) = .empty;
+        var chunk: [65536]u8 = undefined;
+        while (true) {
+            const n = linux.read(self_fd, &chunk, chunk.len);
+            const read_errno = linux.errno(n);
+            if (read_errno == .INTR) continue;
+            if (read_errno != .SUCCESS) {
+                std.debug.print("spawned-memfd-exec: read /probe: {s}\n", .{@tagName(read_errno)});
+                return 5;
+            }
+            if (n == 0) break;
+            bytes.appendSlice(arena, chunk[0..n]) catch return 5;
+        }
+
+        // The control. The same bytes, written to a real path under /work,
+        // where the Landlock ruleset this operation is spawned under grants
+        // no execute right. A ruleset that handles the execute right denies
+        // it by default on every path with no rule granting it, so this has
+        // to fail before the memfd attempt below can mean anything.
+        const disk_path: [:0]const u8 = "/work/payload";
+        const disk_fd_rc = linux.open(disk_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o755);
+        if (linux.errno(disk_fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-memfd-exec: create /work/payload: {s}\n", .{@tagName(linux.errno(disk_fd_rc))});
+            return 5;
+        }
+        const disk_fd: i32 = @intCast(disk_fd_rc);
+        {
+            var written: usize = 0;
+            while (written < bytes.items.len) {
+                const n = linux.write(disk_fd, bytes.items.ptr + written, bytes.items.len - written);
+                if (linux.errno(n) != .SUCCESS) {
+                    std.debug.print("spawned-memfd-exec: write /work/payload: {s}\n", .{@tagName(linux.errno(n))});
+                    _ = linux.close(disk_fd);
+                    return 5;
+                }
+                written += n;
+            }
+        }
+        _ = linux.close(disk_fd);
+
+        const empty_envp = arena.allocSentinel(?[*:0]const u8, 0, null) catch return 5;
+        const disk_argv = arena.allocSentinel(?[*:0]const u8, 2, null) catch return 5;
+        disk_argv[0] = arena.dupeZ(u8, "probe") catch return 5;
+        disk_argv[1] = arena.dupeZ(u8, "spawned-memfd-direct-should-be-refused") catch return 5;
+
+        const direct_rc = linux.execve(disk_path, disk_argv, empty_envp);
+        // execve only returns on failure.
+        const direct_errno = linux.errno(direct_rc);
+        if (direct_errno != .ACCES) {
+            std.debug.print(
+                "spawned-memfd-exec: on-disk execve did not fail with EACCES, got {s}\n",
+                .{@tagName(direct_errno)},
+            );
+            return 5;
+        }
+
+        // The attack. The same bytes, the same Landlock ruleset, and this
+        // time no path at all: memfd_create makes an anonymous file with no
+        // directory entry, so there is nothing for a path based rule to
+        // match against.
+        const memfd_name: [:0]const u8 = "chock-probe-memfd";
+        const memfd_rc = linux.memfd_create(memfd_name, 0);
+        if (linux.errno(memfd_rc) != .SUCCESS) {
+            std.debug.print("spawned-memfd-exec: memfd_create: {s}\n", .{@tagName(linux.errno(memfd_rc))});
+            return 6;
+        }
+        const memfd: i32 = @intCast(memfd_rc);
+        {
+            var written: usize = 0;
+            while (written < bytes.items.len) {
+                const n = linux.write(memfd, bytes.items.ptr + written, bytes.items.len - written);
+                if (linux.errno(n) != .SUCCESS) {
+                    std.debug.print("spawned-memfd-exec: write memfd: {s}\n", .{@tagName(linux.errno(n))});
+                    return 6;
+                }
+                written += n;
+            }
+        }
+
+        const memfd_argv = arena.allocSentinel(?[*:0]const u8, 2, null) catch return 5;
+        memfd_argv[0] = arena.dupeZ(u8, "memfd-probe") catch return 5;
+        memfd_argv[1] = arena.dupeZ(u8, "spawned-memfd-landed") catch return 5;
+
+        const exec_rc = linux.execveat(memfd, "", memfd_argv, empty_envp, .{ .SYMLINK_NOFOLLOW = false, .EMPTY_PATH = true });
+        std.debug.print("spawned-memfd-exec: execveat on the memfd: {s}\n", .{@tagName(linux.errno(exec_rc))});
+        return 6;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-memfd-landed")) {
+        // Landed by fexecve on an anonymous memfd, with no path Landlock
+        // could ever have matched a rule against. The point is not that
+        // this process can run at all: /work already let an ordinary
+        // program do exactly this much. The point is what does not change.
+        // Seccomp installs once and cannot be shed by any execve, whatever
+        // image replaces this one's, so the same ptrace call spawned-ptrace
+        // makes above must still die here.
+        const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
         return if (linux.errno(rc) == .SUCCESS) 0 else 1;
     }
 
@@ -2316,6 +2609,71 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         while (true) _ = linux.nanosleep(&.{ .sec = 3600, .nsec = 0 }, null);
     }
 
+    if (std.mem.eql(u8, args[1], "spawned-setsid-fork-loop-write")) {
+        // Plan 23's setsid escape. Same shape as spawned-fork-loop-write
+        // above, except the grandchild calls setsid() before it starts
+        // writing: it leaves the process group `Sandbox.spawn` put it in
+        // and becomes the leader of a session of its own. `kill(0, sig)` no
+        // longer names it and a terminal's own Ctrl-C no longer reaches it,
+        // the same gap spawned-signal-group and spawned-group-press exist
+        // to close for a plain fork. Neither of the two mechanisms that
+        // actually tear this sandbox down reads a process group or a
+        // session: `PR_SET_PDEATHSIG` fires on the death of the process
+        // that armed it, and `cgroup.kill` reaches every process in the
+        // cgroup by membership, not by group.
+        const child = linux.fork();
+        if (linux.errno(child) != .SUCCESS) {
+            std.debug.print("spawned-setsid-fork-loop-write: fork failed\n", .{});
+            return 5;
+        }
+
+        if (@as(linux.pid_t, @intCast(child)) == 0) {
+            // setsid fails with EPERM for a process that is already a
+            // process group leader, which the first child of a fork never
+            // is: its pid is fresh and nothing has made it a leader yet.
+            // The marker below is the control: a run that never wrote it
+            // ran the attack, and a heartbeat that later stopped anyway
+            // would prove nothing about the teardown this operation exists
+            // to measure.
+            const setsid_rc = linux.setsid();
+            if (linux.errno(setsid_rc) != .SUCCESS) {
+                std.debug.print(
+                    "spawned-setsid-fork-loop-write: setsid: {s}\n",
+                    .{@tagName(linux.errno(setsid_rc))},
+                );
+                return 5;
+            }
+            writeTestFile(arena, "/work/setsid-ok", "ok\n") catch |err| {
+                std.debug.print(
+                    "spawned-setsid-fork-loop-write: could not write the setsid marker: {s}\n",
+                    .{@errorName(err)},
+                );
+                return 5;
+            };
+
+            while (true) {
+                const fd = linux.open("/work/heartbeat.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+                if (linux.errno(fd) == .SUCCESS) {
+                    const handle: i32 = @intCast(fd);
+                    _ = linux.write(handle, "x", 1);
+                    _ = linux.close(handle);
+                }
+                _ = linux.nanosleep(&.{ .sec = 0, .nsec = 5_000_000 }, null);
+            }
+        }
+
+        const marker = linux.open("/work/forked.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+        if (linux.errno(marker) == .SUCCESS) {
+            const handle: i32 = @intCast(marker);
+            _ = linux.write(handle, "f", 1);
+            _ = linux.close(handle);
+        }
+
+        // This process writes nothing else, ever. It is here only so the
+        // grandchild has a parent that a cancel does not name either.
+        while (true) _ = linux.nanosleep(&.{ .sec = 3600, .nsec = 0 }, null);
+    }
+
     if (std.mem.eql(u8, args[1], "spawned-signal-group")) {
         // The attack the pid namespace does not answer on its own. A signal to
         // a pid number is refused in here, which spawned-signal-host already
@@ -2377,6 +2735,24 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // never created, so opening it must fail with ENOENT. Any other errno
         // means something else broke, and must not be mistaken for the sandbox
         // doing its job.
+        return if (open_errno == .NOENT) 1 else 5;
+    }
+    if (std.mem.eql(u8, args[1], "cgroup-surface")) {
+        // Plan 23's cgroup escape, the surface half. The cgroup Chock builds
+        // for this call, and writes memory.max, pids.max and
+        // memory.swap.max into, is never bound into this mount tree. A
+        // process with no path to a file cannot widen what the file holds,
+        // whatever write permission it would otherwise have, so nothing
+        // else needs proving once this is: there is no cgroupfs mount here
+        // at all.
+        enterTestRoot(arena, root_arg) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        const fd = linux.open("/sys/fs/cgroup", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        const open_errno = linux.errno(fd);
+        if (open_errno == .SUCCESS) _ = linux.close(@intCast(fd));
+        if (open_errno == .SUCCESS) return 0;
         return if (open_errno == .NOENT) 1 else 5;
     }
     if (std.mem.eql(u8, args[1], "write-readonly")) {
@@ -2796,6 +3172,126 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
         }, &.{ "/probe", "spawned-ptrace" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-setns-proc1")) {
+        // Plan 23's proc/1/ns/mnt escape. /proc is mounted read only, the
+        // same as spawn-proc-mask and spawn-proc-live, so the target this
+        // operation opens really is reachable and the attack is not refused
+        // for the incidental reason that the path does not exist.
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .proc = .{} }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+        });
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-setns-proc1" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-landlock")) {
+        // The ordinary configuration: /proc read only under Landlock. See
+        // `spawned-proc-self-mem-write-landlock`.
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .proc = .{} }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }},
+        });
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-proc-self-mem-write-landlock" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-mount")) {
+        // The isolating configuration: /proc granted write under Landlock
+        // too, so only the mount's own read only flag is left. See
+        // `spawned-proc-self-mem-write-mount`.
+        const base = try baseEscapeConfig(arena);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .proc = .{} }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{
+                .path = "/proc",
+                .access = .{ .execute = true, .write_file = true, .read_file = true, .read_dir = true },
+            }},
+        });
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-proc-self-mem-write-mount" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-cgroup-remount")) {
+        // Plan 23's cgroup escape, the mount half. See
+        // `spawned-cgroup-remount`.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-cgroup-remount" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-memfd-exec")) {
+        // Plan 23's memfd escape. /work is granted every ordinary right
+        // except execute, so an on-disk execve there is the control this
+        // operation's own inner half proves refused before it ever tries
+        // the memfd. See `spawned-memfd-exec`.
+        const base = try baseEscapeConfig(arena);
+        const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
+        try makeTestDir(arena, work);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{
+                .path = "/work",
+                .access = .{ .write_file = true, .read_file = true, .read_dir = true, .make_reg = true },
+            }},
+        });
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-memfd-exec" }, null, null);
 
         return reportChildTerm(term);
     }
@@ -3661,7 +4157,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         return reportChildTerm(term);
     }
     if (std.mem.eql(u8, args[1], "spawn-signal-middle") or
-        std.mem.eql(u8, args[1], "spawn-signal-middle-forked"))
+        std.mem.eql(u8, args[1], "spawn-signal-middle-forked") or
+        std.mem.eql(u8, args[1], "spawn-signal-middle-setsid"))
     {
         // Finding 2 proof. Run sandbox.spawn on its own thread, so this thread
         // can hand the pid of the process spawn forked back to the caller over
@@ -3670,15 +4167,22 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // synchronous, so there is no other way to learn that pid before the
         // whole call finishes.
         //
-        // The two forms differ only in what runs inside the sandbox. The plain
-        // one runs a program that writes the heartbeat itself. **The `-forked`
-        // one runs a program that forks and lets its own child write it**, so
-        // the caller's one signal has to reach a process it never named and
-        // cannot see: a tool call that started a build is that shape, and a
-        // cancel that left the build running would be a leak the plain form
-        // cannot detect. See `spawned-fork-loop-write`.
+        // The three forms differ only in what runs inside the sandbox. The
+        // plain one runs a program that writes the heartbeat itself. **The
+        // `-forked` one runs a program that forks and lets its own child
+        // write it**, so the caller's one signal has to reach a process it
+        // never named and cannot see: a tool call that started a build is
+        // that shape, and a cancel that left the build running would be a
+        // leak the plain form cannot detect. See `spawned-fork-loop-write`.
+        // **The `-setsid` one is the same shape again, except the forked
+        // child leaves its process group and its session before it starts
+        // writing**, which is plan 23's setsid escape: a process that
+        // `kill(0, sig)` no longer names and a terminal's own Ctrl-C no
+        // longer reaches. See `spawned-setsid-fork-loop-write`.
         const inner: []const u8 = if (std.mem.eql(u8, args[1], "spawn-signal-middle-forked"))
             "spawned-fork-loop-write"
+        else if (std.mem.eql(u8, args[1], "spawn-signal-middle-setsid"))
+            "spawned-setsid-fork-loop-write"
         else
             "spawned-loop-write";
 

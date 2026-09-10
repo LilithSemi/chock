@@ -1764,3 +1764,262 @@ test "a full scratch area names itself, and does not read as the machine's own d
     const bounded = try limitRun("spawn-disk-files", scratch.path());
     try std.testing.expectEqual(@as(u8, limit_stopped_legibly), bounded);
 }
+
+// Plan 23 task 1: six red team primitives from vetto's src/redteam.rs, none of
+// which this file tested before. Every one below names the layer, or the
+// layers, that refuse it.
+
+test "a process that calls setsid still dies when the sandbox is torn down" {
+    // The setsid escape. `Sandbox.spawn` puts every process it starts in a
+    // process group of its own specifically because `kill(0, sig)` escapes a
+    // pid namespace: see the two tests below this file's own
+    // "a process cannot signal its caller's process group" test. setsid()
+    // is not on `seccomp.blocked_calls` or `seccomp.refused_calls`, so it
+    // succeeds, and the process that called it leaves that group and
+    // becomes the leader of a session of its own.
+    //
+    // **This does not help it.** Teardown does not read a process group or
+    // a session at all. `PR_SET_PDEATHSIG` fires on the death of the
+    // process that armed it, which the kernel tracks by real parent, not by
+    // group, and `cgroup.kill` reaches every process in the cgroup by
+    // membership, which setsid does not change either. This is the same
+    // shape as "a cancelled call takes the processes it started with it,
+    // not only the one that was signalled" above, with one more step in the
+    // grandchild: it calls setsid() before it starts writing, and the probe
+    // writes a marker first, so a run that reports the heartbeat stopping
+    // is provably reporting the outcome of a setsid that really happened,
+    // not of a setsid that silently failed.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ probe_path, "spawn-signal-middle-setsid", scratch.path() },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+
+    var pid_line_buf: [16]u8 = undefined;
+    var pid_line_len: usize = 0;
+    const handle = child.stdout.?.handle;
+    while (pid_line_len < pid_line_buf.len) {
+        var byte: [1]u8 = undefined;
+        const rc = linux.read(handle, &byte, 1);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        if (byte[0] == '\n') break;
+        pid_line_buf[pid_line_len] = byte[0];
+        pid_line_len += 1;
+    }
+    if (pid_line_len == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
+        return error.TestUnexpectedResult;
+    }
+    const middle_pid = try std.fmt.parseInt(linux.pid_t, pid_line_buf[0..pid_line_len], 10);
+
+    var setsid_ok_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const setsid_ok_path = try std.fmt.bufPrintZ(
+        &setsid_ok_path_buf,
+        "{s}/work/setsid-ok",
+        .{scratch.path()},
+    );
+    var heartbeat_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const heartbeat_path = try std.fmt.bufPrintZ(
+        &heartbeat_path_buf,
+        "{s}/work/heartbeat.txt",
+        .{scratch.path()},
+    );
+
+    // Bounded, never a fixed sleep guessed to be long enough.
+    var waited_ns: u64 = 0;
+    var size_before_signal: u64 = 0;
+    while (waited_ns < 5_000_000_000) : (waited_ns += 20_000_000) {
+        _ = linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+        if (fileSize(heartbeat_path)) |size| {
+            if (size > 0) {
+                size_before_signal = size;
+                break;
+            }
+        }
+    }
+    if (size_before_signal == 0) {
+        try skipIfNothingMeasured(try child.wait(std.testing.io));
+    }
+    try std.testing.expect(size_before_signal > 0);
+    // The control: setsid really ran, so the write below is not proving
+    // that a fork failed silently.
+    try std.testing.expect((fileSize(setsid_ok_path) orelse 0) > 0);
+
+    const pidfd_rc = linux.pidfd_open(middle_pid, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(pidfd_rc));
+    const middle_fd: i32 = @intCast(pidfd_rc);
+    defer _ = linux.close(middle_fd);
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pidfd_send_signal(middle_fd, .KILL, null, 0)),
+    );
+
+    const term = try child.wait(std.testing.io);
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = std.posix.SIG.KILL }, term);
+
+    // The direct proof: the session leader's own output has stopped.
+    _ = linux.nanosleep(&.{ .sec = 0, .nsec = 200_000_000 }, null);
+    const size_after_wait_one = fileSize(heartbeat_path) orelse size_before_signal;
+    _ = linux.nanosleep(&.{ .sec = 0, .nsec = 200_000_000 }, null);
+    const size_after_wait_two = fileSize(heartbeat_path) orelse size_after_wait_one;
+    try std.testing.expectEqual(size_after_wait_one, size_after_wait_two);
+}
+
+test "spawn applies every layer, and a spawned process cannot setns into /proc/1/ns/mnt" {
+    // The proc/1/ns/mnt escape. /proc/1 inside the sandbox names its own
+    // leader, not the host's real init: `buildProcMount` mounts a fresh
+    // procfs after the pid namespace already exists, and the kernel gives a
+    // procfs mounted from inside a pid namespace the view of that
+    // namespace. It is also not one of the 20 names
+    // `namespace.masked_proc_entries` hides: that list masks global files,
+    // and this one is per pid, so the path is freely readable.
+    //
+    // None of that matters, because seccomp refuses the join outright.
+    // `setns` sits on `blocked_calls` beside `unshare`, with no dependence
+    // on which fd or which namespace kind is named, so the filter kills
+    // this before the kernel ever looks at the argument.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-setns-proc1", scratch.path());
+    switch (term) {
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "spawn applies every layer, and a spawned process cannot write /proc/self/mem, refused by the mount's own read only flag" {
+    // The /proc/self/mem escape. Neither `ptrace` nor `process_vm_writev` is
+    // called here, so neither of the two calls the filter kills for exactly
+    // this reason has anything to say about it: a write to /proc/self/mem
+    // is an ordinary open() and write() on a regular file.
+    //
+    // **Measured, not guessed.** The predicted refusal, in the configuration
+    // every other test in this file uses `/proc` under, was Landlock: the
+    // ruleset grants only `read_only` there, the same rule spawn-proc-mask
+    // and spawn-proc-live read under, and a ruleset that handles the write
+    // right denies it by default on any path with no rule granting it. The
+    // errno that actually comes back is EROFS, not EACCES: `buildProcMount`
+    // marks the whole procfs mount read only with `mount_setattr`,
+    // recursively, right after it masks the twenty global files (see
+    // `namespace.markReadOnly`), and on this kernel that mount level check
+    // is what an O_WRONLY open reaches, before Landlock's write_file check
+    // ever gets a say. The next test removes Landlock from the question
+    // entirely and gets the same answer, which is the proof that this is
+    // really the mount and not a coincidence of check ordering. The probe
+    // reads the open() errno itself and answers 1 only for EROFS
+    // specifically.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-proc-self-mem-write-landlock", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "spawn applies every layer, and a spawned process cannot write /proc/self/mem even granted write there, refused by the mount's own read only flag" {
+    // The same escape, deliberately widened past what any real caller
+    // configures: this operation's own Landlock rule grants write_file on
+    // /proc, so a refusal here cannot be Landlock's doing at all. This does
+    // not weaken anything a production caller sets up; it exists only to
+    // prove the mount's own read only flag refuses the write on its own,
+    // with no help from Landlock, confirming the previous test's measured
+    // result rather than a quirk of that one configuration. The probe reads
+    // the open() errno itself and answers 1 only for EROFS specifically.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-proc-self-mem-write-mount", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a network namespace with no route still confines an AF_PACKET socket, refused by ENETDOWN and not by the route table" {
+    // The AF_PACKET escape. A raw packet socket moves whole link layer
+    // frames and never consults a routing table, so "a process in a network
+    // namespace cannot connect to a remote host" above, which turns on an
+    // empty routing table, says nothing about this socket family. The
+    // control this probe runs first: the socket really is created (nothing
+    // here refuses `socket(AF_PACKET, ...)` at all, which is the honest and
+    // slightly alarming half of this finding), and the namespace really
+    // does hold no interface beyond `lo`, which `namespace.enter` leaves
+    // down. What refuses the frame is that absence: ENETDOWN, not a routing
+    // failure and not a permission failure.
+    const term = try runProbe("netns-af-packet");
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "a sandboxed process has no path to its own cgroup, so it can neither read nor raise memory.max, pids.max or memory.swap.max" {
+    // The cgroup escape, the surface half. The cgroup Chock makes for this
+    // call, and writes `memory.max`, `pids.max` and `memory.swap.max` into,
+    // is never bound into the sandbox's own mount tree. A process with no
+    // path to a file cannot raise, read, or otherwise tamper with what the
+    // file holds, whatever write permission it would otherwise have. This
+    // is the mount tree doing the same job it does for the home directory
+    // in "a process in the mount tree cannot read the home directory": the
+    // refusal is ENOENT, not a permission fault, because there is nothing
+    // here to have a permission on.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("cgroup-surface", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+}
+
+test "spawn applies every layer, and a spawned process cannot mount a fresh view of the whole cgroup v2 tree" {
+    // The cgroup escape, the mount half. `namespace.enter`'s own flags never
+    // include `CLONE_NEWCGROUP`, so unlike the pid namespace or the mount
+    // namespace, there is no cgroup namespace standing behind this refusal.
+    // A fresh mount of "cgroup2" is a single, un-namespaced view of the
+    // entire host hierarchy, one directory per cgroup and not only this
+    // session's own, so if the mount family were ever reachable this would
+    // be a way past every limit this file's fork bomb, memory and
+    // descriptor tests measure, for this session and for every other one on
+    // the machine.
+    //
+    // **This is the one attack in this file where a single layer is doing
+    // the whole job.** `mount` sits on `seccomp.blocked_calls`
+    // unconditionally, so the filter kills the call before the kernel ever
+    // looks at the target, and nothing else in this sandbox stands behind
+    // it if that entry were ever dropped from the list.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-cgroup-remount", scratch.path());
+    switch (term) {
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "spawn applies every layer, and a spawned process cannot fexecve an anonymous memfd around the execute right Landlock refused it on disk" {
+    // The memfd escape. `Sandbox.spawn`'s Landlock ruleset handles the
+    // execute right the same way it handles read and write: a rule names a
+    // path, and any path with no rule is denied by default. This operation
+    // grants /work every ordinary right except execute, on purpose, and its
+    // own inner control proves the refusal first: an ordinary on-disk
+    // execve of a file it just wrote into /work fails with EACCES.
+    //
+    // Then it does the same thing again with no path at all.
+    // `memfd_create` makes an anonymous file with no directory entry, and
+    // `execveat` with `AT_EMPTY_PATH` runs it without ever naming one, so
+    // there is nothing for Landlock's path based rule to match against.
+    // **This succeeds**, which is the bypass the primitive is named for:
+    // Landlock's execute right cannot gate an object it was never given a
+    // path to.
+    //
+    // What this does not do is escape anything Chock actually promises. The
+    // seccomp filter installs once, before this program's first line runs,
+    // and no execve, however this process reached its own image, can shed
+    // it: the same ptrace call "spawn applies every layer, and a spawned
+    // process cannot call ptrace" makes still dies with SIGSYS once this
+    // one lands. So the overall term this test asserts on is the proof of
+    // two facts at once: the memfd execution really happened, because
+    // nothing else in this operation raises SIGSYS on its own, and seccomp
+    // survived it regardless.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-memfd-exec", scratch.path());
+    switch (term) {
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
