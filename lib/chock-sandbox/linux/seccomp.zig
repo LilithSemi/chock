@@ -500,22 +500,39 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
 }
 
 pub const InstallError = error{
-    /// The kernel has no seccomp filter mode.
+    /// This kernel has no `seccomp` system call at all.
     NotSupported,
-    /// `no_new_privs` was not set, or the filter is not valid.
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the filter was never
+    /// offered to the kernel.
+    NoNewPrivsRefused,
+    /// The kernel refused the filter because this process holds neither
+    /// `no_new_privs` nor `CAP_SYS_ADMIN`.
+    NotPermitted,
+    /// The kernel refused the filter itself. Either the instructions are not
+    /// valid, or this kernel was built with no filter mode.
     Rejected,
     Unexpected,
 };
 
 /// Install a filter on the calling thread. The filter can never be removed.
 /// Call this after the fork and before the exec.
+///
+/// **The `no_new_privs` flag goes on here, and never in a caller.** The filter
+/// and the flag that makes the kernel accept it go on together, or neither one
+/// goes on. A caller cannot get the order wrong, because it cannot get one
+/// without the other.
+///
+/// **Each way this can fail has a name of its own.** A refused flag, a missing
+/// privilege, and a filter the kernel could not read are three different
+/// faults with three different repairs. A caller that reads only `Rejected`
+/// looks for a bad filter when the real fault is one of the other two.
 pub fn install(prog: bpf.Prog) InstallError!void {
     // Without `no_new_privs`, an unprivileged process cannot install a filter, because a
     // set-user-ID program could then be given a filter that lies to it.
     const pr = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
     switch (linux.errno(pr)) {
         .SUCCESS => {},
-        else => return error.Rejected,
+        else => return error.NoNewPrivsRefused,
     }
 
     const rc = linux.seccomp(
@@ -526,7 +543,12 @@ pub fn install(prog: bpf.Prog) InstallError!void {
     return switch (linux.errno(rc)) {
         .SUCCESS => {},
         .NOSYS => error.NotSupported,
-        .INVAL, .ACCES => error.Rejected,
+        // The kernel answers EACCES only when the caller holds neither
+        // `no_new_privs` nor `CAP_SYS_ADMIN`. The call above says the flag is
+        // on, so this answer means the flag was lost between the two calls.
+        // It is a different fault from a filter the kernel could not read.
+        .ACCES => error.NotPermitted,
+        .INVAL => error.Rejected,
         else => error.Unexpected,
     };
 }
@@ -1089,4 +1111,116 @@ test "no syscall in std.os.linux.SYS is numbered past classified_through" {
     }
 
     try std.testing.expectEqualStrings("", found_new.items);
+}
+
+/// Wait for one child and give back its exit code. The caller asserts on the
+/// code. A signal interrupts `waitpid`, so the call is repeated on `EINTR`.
+fn waitForExitCode(pid: linux.pid_t) !u32 {
+    var status: u32 = undefined;
+    var rc = linux.waitpid(pid, &status, 0);
+    while (linux.errno(rc) == .INTR) rc = linux.waitpid(pid, &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+    return linux.W.EXITSTATUS(status);
+}
+
+/// A filter that answers `chdir` with EPERM and permits every other call.
+/// `chdir` is the probe because `execute`, in `driver.zig`, calls it after the
+/// real filter goes on. So a reader knows the real filter permits it, and a
+/// refusal here can only come from the filter that the test installs.
+fn chdirRefusedFilter() [4]bpf.Insn {
+    return .{
+        bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr),
+        bpf.jump(bpf.JMP_JEQ_K, @intFromEnum(linux.SYS.chdir), 0, 1),
+        bpf.stmt(bpf.RET_K, RET_ERRNO_PERM),
+        bpf.stmt(bpf.RET_K, RET_ALLOW),
+    };
+}
+
+/// Turn an `install` failure into an exit code. A child of these tests cannot
+/// print: `test/proto/lock.zig` refuses a line in `lib/` that names standard
+/// error, and this file obeys that rule. So the code carries the fault, and
+/// the parent's own `expectEqual` prints it.
+///
+/// **Only `NotSupported` may skip a test.** Every other code below is a fault
+/// on a machine that this project can run on at all. An earlier version of
+/// these tests skipped on any `install` failure, and a mutation that deleted
+/// the `prctl` call from `install` then turned both tests green by skipping
+/// them. That is the exact shape of failure these tests exist to catch.
+fn installFaultCode(err: InstallError) u8 {
+    return switch (err) {
+        error.NotSupported => 3,
+        error.Rejected => 4,
+        error.NotPermitted => 5,
+        error.NoNewPrivsRefused => 6,
+        error.Unexpected => 7,
+    };
+}
+
+// **The two tests below are the only ones in this file that call `install`.**
+// Every other test reads the instructions that `build` returns. Those prove the
+// filter is shaped correctly. None of them proves the kernel took it.
+//
+// Both tests run in a forked child, because a filter can never be removed. A
+// filter on the test runner itself would stay on for every test after it.
+//
+// The children share these exit codes:
+//   0     the child measured what the test asked for.
+//   3..7  `install` failed. See `installFaultCode` for which fault each is.
+//   10    the state before the measurement was not the state the test needs.
+//   11    a `prctl` read failed, so the measurement is not available.
+//   12    the measurement did not give the answer the test needs.
+
+test "install turns on no_new_privs, and does not rely on a caller to do it" {
+    // **A mutation that deletes the `prctl` call from `install` passes every
+    // other test in this file.** `applyLayers`, in `driver.zig`, calls
+    // `landlock.Ruleset.restrictSelf` first, and that call sets the same flag,
+    // so the flag is already on by the time `install` runs there. This test
+    // takes a child that has the flag off and measures `install` alone.
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        const before = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
+        if (linux.errno(before) != .SUCCESS) std.process.exit(11);
+        // A test runner that already runs with the flag on cannot see the
+        // change, and must not report a pass.
+        if (before != 0) std.process.exit(10);
+
+        var insns = chdirRefusedFilter();
+        install(bpf.Prog.init(&insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        const after = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
+        if (linux.errno(after) != .SUCCESS) std.process.exit(11);
+        if (after != 1) std.process.exit(12);
+        std.process.exit(0);
+    }
+
+    const code = try waitForExitCode(@intCast(fork_rc));
+    if (code == 3) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+test "the kernel enforces the filter that install returned success for" {
+    // **`install` returning no error is not the same fact as a filter that
+    // runs.** This test calls the one system call that the filter refuses, and
+    // reads the errno back. It is the only check in this project that the
+    // `bpf.Prog` layout, the mode number, and the argument order are all
+    // correct.
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        // The same call before the filter, so a refusal after it is the filter
+        // and never the path.
+        if (linux.errno(linux.chdir("/")) != .SUCCESS) std.process.exit(10);
+
+        var insns = chdirRefusedFilter();
+        install(bpf.Prog.init(&insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        if (linux.errno(linux.chdir("/")) != .PERM) std.process.exit(12);
+        std.process.exit(0);
+    }
+
+    const code = try waitForExitCode(@intCast(fork_rc));
+    if (code == 3) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), code);
 }

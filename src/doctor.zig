@@ -2835,7 +2835,7 @@ fn sayFilter(write_fd: i32, filter: ?[]sandbox.bpf.Insn) void {
     } else |err| {
         say(write_fd, .seccomp, switch (err) {
             error.NotSupported => .absent,
-            error.Rejected, error.Unexpected => .refused,
+            error.NoNewPrivsRefused, error.NotPermitted, error.Rejected, error.Unexpected => .refused,
         });
     }
 }
