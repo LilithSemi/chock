@@ -2002,22 +2002,104 @@ test "spawn applies every layer, and a spawned process cannot fexecve an anonymo
     // `memfd_create` makes an anonymous file with no directory entry, and
     // `execveat` with `AT_EMPTY_PATH` runs it without ever naming one, so
     // there is nothing for Landlock's path based rule to match against.
-    // **This succeeds**, which is the bypass the primitive is named for:
-    // Landlock's execute right cannot gate an object it was never given a
-    // path to.
     //
-    // What this does not do is escape anything Chock actually promises. The
-    // seccomp filter installs once, before this program's first line runs,
-    // and no execve, however this process reached its own image, can shed
-    // it: the same ptrace call "spawn applies every layer, and a spawned
-    // process cannot call ptrace" makes still dies with SIGSYS once this
-    // one lands. So the overall term this test asserts on is the proof of
-    // two facts at once: the memfd execution really happened, because
-    // nothing else in this operation raises SIGSYS on its own, and seccomp
-    // survived it regardless.
+    // **This used to succeed**, and that was the bypass the primitive is
+    // named for: Landlock's execute right cannot gate an object it was
+    // never given a path to. `seccomp.build` now closes it directly: it
+    // reads `execveat`'s own `flags` argument and kills the caller whenever
+    // `AT_EMPTY_PATH` is set, before the kernel acts on the call at all. So
+    // the fexecve attempt below never lands, and this operation's own
+    // "spawned-memfd-landed" target, which the fexecve used to hand
+    // control to, is never reached.
+    //
+    // **This is belt and braces stated as a fix, not luck relied on as
+    // one.** Nothing else in `Sandbox.spawn`'s applyLayers stood behind
+    // Landlock's execute right here: this was a real, measured way past a
+    // rule `SECURITY.md` names as a boundary, "defeats the Landlock
+    // rules", and it is closed by naming the flag that made it possible,
+    // not by guessing at memfd_create, which grants nothing by itself and
+    // stays reachable. Every runtime this measured against, Node, Python
+    // and Go, called neither `memfd_create` nor `execveat` at all in an
+    // ordinary run, so this costs none of them anything.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-memfd-exec", scratch.path());
+    switch (term) {
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "spawn applies every layer, and a spawned process cannot reopen a file by handle once its path is gone" {
+    // The file handle escape, the second way a path based rule can be
+    // sidestepped. `name_to_handle_at` turns an ordinary, already readable
+    // path into an opaque handle with no path encoded in it at all, and
+    // `open_by_handle_at` reopens that handle through any descriptor on
+    // the same mount. Landlock's rules attach to paths; a handle carries
+    // none, so a rule that would have refused the same file by path has
+    // nothing to check here.
+    //
+    // **Measured before this was blocked, with a small C program run
+    // directly on this machine's own root filesystem, outside Chock
+    // entirely.** `name_to_handle_at` succeeds for any process that can
+    // already reach the path by an ordinary open, no privilege needed.
+    // `open_by_handle_at` then fails with `EPERM`, and it fails the same
+    // way whether the caller is this repository's own unprivileged user or
+    // `root` inside a fresh `unshare -U -r` user namespace, the same shape
+    // of namespace `Sandbox.spawn` puts every sandboxed process in.
+    // `open_by_handle_at` requires `CAP_DAC_READ_SEARCH` in the user
+    // namespace that owns the filesystem's superblock, and a process born
+    // from `CLONE_NEWUSER` never holds a capability in an ancestor
+    // namespace over an object that namespace, and not this one, owns.
+    // Root-in-a-container is not root over the host's disk.
+    //
+    // **So this was never Landlock's doing, or seccomp's, or any layer
+    // `Sandbox.spawn` itself builds.** The kernel's own capability model
+    // already refuses `open_by_handle_at` for this entire class of
+    // process, sandboxed or not. `open_by_handle_at` sits on
+    // `blocked_calls` regardless, for the same reason this project already
+    // gives `kexec_file_load` and `delete_module` there: a call that
+    // reaches the kernel and is only refused by a capability check is
+    // refused by luck, not by design, and nothing here needs it. **Unlike
+    // `mount`**, where the comment on `spawn-cgroup-remount` above says a
+    // dropped entry would open a real hole, dropping this one would not:
+    // the capability check measured above stands on its own, with or
+    // without the filter. This is belt and braces, stated as such.
+    //
+    // `name_to_handle_at` stays off `blocked_calls` on purpose. It grants
+    // nothing by itself, no correct or incorrect program is stopped by
+    // leaving it reachable, and this test's own control step needs it
+    // working, to keep proving the handle it hands to `open_by_handle_at`
+    // was ever real and not just an uninitialised buffer.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-handle-escape", scratch.path());
+    switch (term) {
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "spawn applies every layer, and a spawned process cannot open an AF_VSOCK socket, regardless of the network mode" {
+    // The vsock escape. Not a path bypass, the same shape of gap the other
+    // two tests in this section are: a socket family Chock's argument rules
+    // never named. Every other family a tool call can reach is inside the
+    // network namespace `namespace.enter` always builds, `Network.none`
+    // included. `AF_VSOCK` answers to none of that: a vsock address names a
+    // hypervisor CID, not a route inside any network namespace, so on a
+    // host where the sandbox is itself a VM guest, this is a channel to the
+    // hypervisor no network namespace and no `Network` mode ever stood in
+    // front of.
+    //
+    // `.network = .none` is what this operation asks for on purpose: the
+    // point being measured is that the domain check kills the call before
+    // any network namespace question is reached at all, so which mode a
+    // real caller picked would not have changed the outcome either way.
+    // Codex already refuses `AF_VSOCK` for the same reason, even when its
+    // own network policy would otherwise allow a connection.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-vsock", scratch.path());
     switch (term) {
         .signal => |sig| try std.testing.expectEqual(std.posix.SIG.SYS, sig),
         else => return error.TestUnexpectedResult,

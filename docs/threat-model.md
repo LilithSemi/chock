@@ -111,11 +111,12 @@ project's policy allowed it, when a project turns the rule off for a JIT
 runtime such as V8, and the red team oracle in `test/redteam/scope.zig` is
 written to agree: a session
 that relaxed this rule and did nothing else must never be scored the same as
-a session that broke out. Landlock, the namespaces, and the 30 seccomp calls
-that kill the process outright are boundaries. Their absence, or a kernel that
-degrades one of them, is what `chock doctor` reports as a blocking row, and
-what a real defeat of one of them is a security bug under `SECURITY.md`'s own
-definition.
+a session that broke out. Landlock, the namespaces, the 31 seccomp calls that
+kill the process outright, and the two argument-inspecting rules that kill on
+`execveat`'s `AT_EMPTY_PATH` and `socket`'s `AF_VSOCK` are boundaries. Their
+absence, or a kernel that degrades one of them, is what `chock doctor` reports
+as a blocking row, and what a real defeat of one of them is a security bug
+under `SECURITY.md`'s own definition.
 
 Reading a relaxed boundary and a relaxed piece of hardening as the same kind
 of fact is the mistake this section exists to prevent. A project that allows

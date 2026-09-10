@@ -1331,6 +1331,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // process, or it would die before the layer under test ever went on.
         std.mem.eql(u8, args[1], "spawn-signal-middle-setsid") or
         std.mem.eql(u8, args[1], "spawn-memfd-exec") or
+        std.mem.eql(u8, args[1], "spawn-handle-escape") or
+        std.mem.eql(u8, args[1], "spawn-vsock") or
         std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-landlock") or
         std.mem.eql(u8, args[1], "spawn-proc-self-mem-write-mount") or
         std.mem.eql(u8, args[1], "spawn-setns-proc1") or
@@ -1702,11 +1704,83 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     // applyLayers. This is what Finding 1 needs: deleting any one layer from
     // applyLayers must change the outcome one of these sees, because nothing else
     // in this process could have produced it.
+    if (std.mem.eql(u8, args[1], "spawned-handle-escape")) {
+        // Plan 23's file handle escape. `name_to_handle_at` turns an
+        // ordinary path this operation already has read access to into an
+        // opaque handle with no path encoded in it at all, and
+        // `open_by_handle_at` reopens that handle through any descriptor on
+        // the same mount. If that second step worked, Landlock's path
+        // based rules would have nothing left to check: the object this
+        // reopens carries no path for a rule to match, whatever rule this
+        // sandbox's Landlock ruleset granted or refused for it.
+        //
+        // The control this operation proves first: /work grants ordinary
+        // read and write access, so an open by path succeeds and the write
+        // below lands.
+        const target: [:0]const u8 = "/work/handle-target";
+        const write_fd_rc = linux.open(target, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (linux.errno(write_fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-handle-escape: create /work/handle-target: {s}\n", .{@tagName(linux.errno(write_fd_rc))});
+            return 5;
+        }
+        const write_fd: i32 = @intCast(write_fd_rc);
+        _ = linux.write(write_fd, "handle\n", 7);
+        _ = linux.close(write_fd);
+
+        // The handle itself. `name_to_handle_at` needs no capability of its
+        // own: it only encodes what a normal path lookup already reached.
+        // Reaching this line at all proves the mechanism is real and not
+        // silently refused before it starts.
+        var raw: [136]u8 align(@alignOf(linux.file_handle)) = undefined;
+        const handle: *linux.file_handle = @ptrCast(&raw);
+        handle.handle_bytes = 128;
+        var mount_id: i32 = undefined;
+        const encode_rc = linux.name_to_handle_at(linux.AT.FDCWD, target, handle, &mount_id, 0);
+        if (linux.errno(encode_rc) != .SUCCESS) {
+            std.debug.print("spawned-handle-escape: name_to_handle_at: {s}\n", .{@tagName(linux.errno(encode_rc))});
+            return 5;
+        }
+
+        // A descriptor on the same mount, opened by path and not by
+        // handle, the way any process that reached this far already
+        // could. Not `O_PATH`: `open_by_handle_at`'s own mount descriptor
+        // check rejects one, since a path only descriptor carries no file
+        // operations for it to read.
+        const mount_fd_rc = linux.open("/work", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(mount_fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-handle-escape: open /work: {s}\n", .{@tagName(linux.errno(mount_fd_rc))});
+            return 5;
+        }
+        const mount_fd: i32 = @intCast(mount_fd_rc);
+
+        // The attack. No path is named here at all: everything a Landlock
+        // rule could ever have matched against is gone.
+        const open_rc = linux.syscall3(
+            .open_by_handle_at,
+            @as(usize, @bitCast(@as(isize, mount_fd))),
+            @intFromPtr(handle),
+            0,
+        );
+        std.debug.print("spawned-handle-escape: open_by_handle_at: {s}\n", .{@tagName(linux.errno(open_rc))});
+        return if (linux.errno(open_rc) == .SUCCESS) 0 else 6;
+    }
+
     if (std.mem.eql(u8, args[1], "spawned-ptrace")) {
         const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
         // A seccomp filter that is actually installed kills this process before this
         // line runs. Reaching it at all means the filter spawn was supposed to
         // install never came up.
+        return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawned-vsock")) {
+        // The vsock escape. A seccomp filter that is actually installed
+        // kills this process here, on the domain argument alone, before the
+        // kernel ever decides whether this host even has a vsock transport
+        // to offer. That is on purpose: the rule must not depend on this
+        // host being a VM guest today, only on the domain the caller asked
+        // for.
+        const rc = linux.socket(linux.AF.VSOCK, linux.SOCK.STREAM, 0);
         return if (linux.errno(rc) == .SUCCESS) 0 else 1;
     }
 
@@ -1793,7 +1867,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
 
     if (std.mem.eql(u8, args[1], "spawned-memfd-exec")) {
-        // Plan 23's memfd escape. Read this program's own bytes, the way an
+        // Plan 23's memfd escape, now closed by a `seccomp.build` rule that
+        // kills `execveat` whenever its `flags` argument sets
+        // `AT_EMPTY_PATH`, the flag that lets it run a bare descriptor with
+        // no path at all. Read this program's own bytes, the way an
         // attacker who already landed a first stage would: nothing here
         // needs a payload the test could not have made itself.
         const self_rc = linux.open("/probe", .{ .ACCMODE = .RDONLY }, 0);
@@ -1863,7 +1940,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // The attack. The same bytes, the same Landlock ruleset, and this
         // time no path at all: memfd_create makes an anonymous file with no
         // directory entry, so there is nothing for a path based rule to
-        // match against.
+        // match against. `memfd_create` itself stays off `seccomp.blocked_calls`:
+        // it grants nothing by itself, and this operation's own control
+        // above already needed it working.
         const memfd_name: [:0]const u8 = "chock-probe-memfd";
         const memfd_rc = linux.memfd_create(memfd_name, 0);
         if (linux.errno(memfd_rc) != .SUCCESS) {
@@ -1887,19 +1966,25 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         memfd_argv[0] = arena.dupeZ(u8, "memfd-probe") catch return 5;
         memfd_argv[1] = arena.dupeZ(u8, "spawned-memfd-landed") catch return 5;
 
+        // `AT_EMPTY_PATH` is what makes this the attack: it is what lets
+        // `execveat` accept an empty path string at all, relative to a
+        // descriptor rather than a directory. The seccomp filter reads this
+        // exact flag on this exact call and kills the process before the
+        // kernel acts on it, so this line does not return.
         const exec_rc = linux.execveat(memfd, "", memfd_argv, empty_envp, .{ .SYMLINK_NOFOLLOW = false, .EMPTY_PATH = true });
         std.debug.print("spawned-memfd-exec: execveat on the memfd: {s}\n", .{@tagName(linux.errno(exec_rc))});
         return 6;
     }
 
     if (std.mem.eql(u8, args[1], "spawned-memfd-landed")) {
-        // Landed by fexecve on an anonymous memfd, with no path Landlock
-        // could ever have matched a rule against. The point is not that
-        // this process can run at all: /work already let an ordinary
-        // program do exactly this much. The point is what does not change.
-        // Seccomp installs once and cannot be shed by any execve, whatever
-        // image replaces this one's, so the same ptrace call spawned-ptrace
-        // makes above must still die here.
+        // Unreachable through spawned-memfd-exec today: the execveat call
+        // that would land here now dies first, on the AT_EMPTY_PATH rule.
+        // Kept for what it still proves if that rule is ever the one that
+        // regresses: landing here at all would still not be an escape from
+        // anything else this sandbox promises. Seccomp installs once and
+        // cannot be shed by any execve, whatever image replaces this one's,
+        // so the same ptrace call spawned-ptrace makes above must still die
+        // here too.
         const rc = linux.syscall4(.ptrace, 0, 0, 0, 0);
         return if (linux.errno(rc) == .SUCCESS) 0 else 1;
     }
@@ -3175,6 +3260,24 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         return reportChildTerm(term);
     }
+    if (std.mem.eql(u8, args[1], "spawn-vsock")) {
+        // The vsock escape. See `spawned-vsock`. `.network = .none` on
+        // purpose: the point of this operation is that the domain check
+        // kills the call before any network namespace question is ever
+        // reached, so the network mode a real caller picks makes no
+        // difference to the outcome.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-vsock" }, null, null);
+
+        return reportChildTerm(term);
+    }
     if (std.mem.eql(u8, args[1], "spawn-setns-proc1")) {
         // Plan 23's proc/1/ns/mnt escape. /proc is mounted read only, the
         // same as spawn-proc-mask and spawn-proc-live, so the target this
@@ -3292,6 +3395,33 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
         }, &.{ "/probe", "spawned-memfd-exec" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-handle-escape")) {
+        // Plan 23's file handle escape. See `spawned-handle-escape`.
+        const base = try baseEscapeConfig(arena);
+        const work = try std.fs.path.join(arena, &.{ root_arg, "work" });
+        try makeTestDir(arena, work);
+        const mounts = try std.mem.concat(arena, sandbox.namespace.Mount, &.{
+            base.mounts,
+            &.{.{ .bind = .{ .source = work, .target = "/work", .read_only = false } }},
+        });
+        const rules = try std.mem.concat(arena, sandbox.Config.Rule, &.{
+            base.rules,
+            &.{.{
+                .path = "/work",
+                .access = .{ .write_file = true, .read_file = true, .read_dir = true, .make_reg = true },
+            }},
+        });
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-handle-escape" }, null, null);
 
         return reportChildTerm(term);
     }

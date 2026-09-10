@@ -87,7 +87,7 @@ The filter is a denylist. It reads the audit architecture first and kills a
 foreign one before it reads a system call number, and on x86_64 it kills an x32
 call as well.
 
-**30 calls are blocked, and a blocked call kills the process.** Not an errno: a
+**31 calls are blocked, and a blocked call kills the process.** Not an errno: a
 program that meant to escape does not get to handle the failure. The groups
 are:
 
@@ -101,6 +101,43 @@ are:
 - process introspection and injection: `ptrace`, `process_vm_readv`,
   `process_vm_writev`, `bpf`, `userfaultfd`
 - the machine: `reboot`, `syslog`, `sethostname`
+- `open_by_handle_at`. This one is measured belt and braces, not a hole
+  closed on faith: it reaches the kernel today and is already refused with
+  `EPERM` by the kernel's own capability check, because it needs
+  `CAP_DAC_READ_SEARCH` in the user namespace that owns the target
+  filesystem's superblock, and a process born from `CLONE_NEWUSER`, which
+  every sandboxed process here is, never holds a capability in an ancestor
+  namespace over an object that namespace owns. Measured directly, with a
+  small program run outside Chock entirely and again as a probe inside a
+  real sandbox: `EPERM`, both times, whether the caller is an ordinary user
+  or `root` inside a fresh `unshare -U -r`. `name_to_handle_at`, the call
+  that only encodes a handle and grants nothing on its own, is left
+  reachable.
+
+Two more rules inspect an argument and kill rather than answer `EPERM`,
+because each closes a boundary and not a cost:
+
+- `execveat`, when its `flags` argument sets `AT_EMPTY_PATH`. This is the
+  step that runs a file with no path at all: `memfd_create` makes an
+  anonymous file with no directory entry, and `execveat` with
+  `AT_EMPTY_PATH` can run it without ever naming one, so Landlock's
+  execute right, which attaches only to a path, has nothing to check.
+  Measured: before this rule existed, a ruleset granting a directory every
+  ordinary right except execute still let a process write those bytes into
+  a memfd and run them, right after the identical bytes on disk were
+  refused. `memfd_create` itself is left reachable: it grants nothing by
+  itself, and `strace` against Node, Python and Go each running an
+  ordinary program shows none of them calling either `memfd_create` or
+  `execveat` at all.
+- `socket`, when its `domain` argument is `AF_VSOCK`. Every other address
+  family a tool call can reach answers to the network namespace
+  `namespace.enter` always builds. A vsock address names a hypervisor CID,
+  and the kernel does not consult the calling process's network namespace
+  to decide whether one is reachable, so on a host where the sandbox is
+  itself a VM guest, this is a channel to the hypervisor with no
+  `Network` mode and no policy rule in front of it. Codex already refuses
+  `AF_VSOCK` for the same reason, even when its own network policy allows
+  a connection.
 
 **Three more calls are refused with `EPERM`, and io_uring is all three:**
 `io_uring_setup`, `io_uring_enter`, `io_uring_register`. A ring lets a kernel

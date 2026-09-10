@@ -46,6 +46,24 @@ pub const RET_ERRNO_PERM: u32 = 0x00050000 | @as(u32, @intFromEnum(linux.E.PERM)
 /// The three io_uring calls are **not** here. They are on `refused_calls` below, which
 /// answers `EPERM`. io_uring stays exactly as unavailable as it was; read that list for
 /// why the answer changed and why the security did not.
+///
+/// `open_by_handle_at` sits here for the same reason as `kexec_file_load` and
+/// `delete_module` above: it reaches the kernel today and is only refused because the
+/// caller lacks `CAP_DAC_READ_SEARCH` in the user namespace that owns the target
+/// filesystem's superblock, which a process born from `CLONE_NEWUSER` never holds over
+/// a host filesystem, no matter how many capabilities it carries in its own namespace.
+/// **Measured**, with a small C program run outside Chock entirely and then again as
+/// `spawn-handle-escape` inside a real `Sandbox.spawn`: `open_by_handle_at` fails with
+/// `EPERM` both times, for this repository's own unprivileged user and for `root`
+/// inside a plain `unshare -U -r`. That is the capability check doing its job on its
+/// own, with no help from Landlock or from this filter. See
+/// `test/sandbox/escape.zig`'s "cannot reopen a file by handle" test for the full
+/// account, including why dropping this entry would not open the hole that dropping
+/// `mount` would. It is blocked anyway: a call refused only by luck is not a call this
+/// project relies on being unlucky forever. `name_to_handle_at`, the call that only
+/// encodes a handle and grants nothing by itself, is deliberately not here; that same
+/// test needs it working to prove the handle it hands to `open_by_handle_at` was ever
+/// real.
 pub const blocked_calls = [_]linux.SYS{
     .ptrace,
     .bpf,
@@ -77,6 +95,7 @@ pub const blocked_calls = [_]linux.SYS{
     .syslog,
     .reboot,
     .sethostname,
+    .open_by_handle_at,
 };
 
 /// The calls the filter refuses with `EPERM` instead of killing the caller.
@@ -284,6 +303,107 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ERRNO_PERM));
     }
 
+    // Refuse `execveat` when its `flags` argument sets `AT_EMPTY_PATH`. This is
+    // unconditional, unlike the write-and-execute rules below: it closes a real
+    // boundary, not a hardening cost. `SECURITY.md`'s own definition of a security
+    // bug names it directly: "defeats the Landlock rules".
+    //
+    // `AT_EMPTY_PATH` is what lets `execveat` run a bare descriptor with an empty
+    // path string, rather than a real path it would otherwise resolve relative to
+    // `dirfd`. `memfd_create` makes an anonymous file with no directory entry at
+    // all, so `execveat(memfd, "", argv, envp, AT_EMPTY_PATH)` runs it without
+    // ever naming a path. Landlock's execute right attaches to a path and only a
+    // path, so a call that names none has nothing for that right to check.
+    //
+    // **Measured, in `test/sandbox/escape.zig`'s memfd escape test, before this
+    // rule existed: the run lands.** A ruleset that grants /work every ordinary
+    // right except execute still lets a process write those exact bytes into a
+    // memfd and run them, after the identical bytes on disk were refused with
+    // `EACCES` by the same ruleset. Nothing else Chock promises was defeated by
+    // that: the seccomp filter installs once before this process's first line and
+    // cannot be shed by any execve, so `ptrace` still dies with `SIGSYS`
+    // afterward, and every other layer, the mount tree, the network namespace,
+    // the resource limits, applies to whatever code lands exactly as it did
+    // before. Only Landlock's own execute right, one specific stated boundary,
+    // was the thing with nothing to check. This rule is what gives it something.
+    //
+    // This reads the `flags` argument, `execveat`'s fifth and index 4, rather
+    // than blocking `memfd_create` itself. `memfd_create` alone grants nothing:
+    // it makes memory a process already owns, and closing the step that never
+    // executes anything costs whatever legitimate use of an anonymous, exec-free
+    // memfd this sandbox's workload has, measured or not. The execute step is the
+    // one that matters, and it is also the narrower rule: `strace` against
+    // Node v24.19.0, Python 3.14 and Go 1.26 running an ordinary program each
+    // shows neither `memfd_create` nor `execveat` called at all, so this refuses
+    // a call none of them make and keeps every one of them running.
+    //
+    // An ordinary `execveat` call, with a real path and no empty-path flag, is
+    // left alone. Nothing measured here needed one refused, so narrower costs
+    // less than wider.
+    {
+        const execveat_number: u32 = @intCast(@intFromEnum(linux.SYS.execveat));
+        const at_empty_path: u32 = 0x1000;
+        // If this is not execveat, jump over the five instructions that follow.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, execveat_number, 0, 5));
+        // The kernel declares flags an int, so the low half is the whole value.
+        // The high half of the 64 bit argument slot carries nothing.
+        try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(4)));
+        try insns.append(allocator, bpf.stmt(bpf.ALU_AND_K, at_empty_path));
+        // The masked value equals AT_EMPTY_PATH only when the caller asked to run
+        // a bare descriptor with no path at all. Fall through to the kill.
+        // Otherwise skip past it.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, at_empty_path, 0, 1));
+        try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
+        // Put the call number back, because the checks that follow expect it.
+        try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
+    }
+
+    // Refuse `socket(AF_VSOCK, ...)`, unconditionally, the same as the
+    // `execveat` rule above and for the same reason: this closes a boundary
+    // this sandbox's own design already claims, not a cost this project is
+    // choosing to add.
+    //
+    // Every other address family a tool call can reach is inside the
+    // network namespace `namespace.enter` always builds: `Network.none`
+    // brings up no interface at all, and even `Network.filtered`'s one
+    // granted descriptor was made on the other side of the boundary, in a
+    // process that is not this one. `AF_VSOCK` answers to neither. A vsock
+    // address names a hypervisor CID, not a route inside any network
+    // namespace, and the kernel does not consult the calling process's
+    // netns to decide whether one is reachable: a guest's vsock transport
+    // is the same one every netns in that guest shares. So on any host
+    // where Chock's own sandbox is itself the guest of a hypervisor, this
+    // is a channel to that hypervisor with no network namespace, no
+    // `Network` mode, and no policy rule standing in front of it at all,
+    // for a process `Network.none` is supposed to leave with no route out
+    // whatsoever.
+    //
+    // Codex already reasons this way and refuses `AF_VSOCK` even when its
+    // own network policy would otherwise allow a connection, because a
+    // vsock reaches the hypervisor and is outside any network policy by
+    // construction. Nothing here depends on whether this particular host
+    // happens to be a VM guest today: a filter built once has to hold on
+    // every host it might run on, including the ones it does not know
+    // about yet, and the cost of naming a family no coding tool has any
+    // reason to open is nothing measured against.
+    {
+        const socket_number: u32 = @intCast(@intFromEnum(linux.SYS.socket));
+        const af_vsock: u32 = 40;
+        // If this is not socket, jump over the four instructions that follow.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, socket_number, 0, 4));
+        // The kernel declares domain an int, so the low half is the whole
+        // value. socket's first argument, index 0.
+        try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offsetOfArgLow(0)));
+        // AF_VSOCK and nothing else. Fall through to the kill on a match.
+        // Otherwise skip past it: every other family this sandbox already
+        // confines through the network namespace, and none of them needs
+        // this rule to say so again.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, af_vsock, 0, 1));
+        try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
+        // Put the call number back, because the checks that follow expect it.
+        try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
+    }
+
     // Refuse a request for a page that is writable and executable at the
     // same time. The `prot` argument is a scalar. The filter can read it directly. A
     // filter can never read memory through a pointer.
@@ -489,6 +609,28 @@ test "the architecture mismatch branch returns RET_KILL_PROCESS" {
     try std.testing.expectEqual(@as(u32, RET_KILL_PROCESS), prog[2].k);
 }
 
+/// True when `prog[i]` is a call number comparison the `blocked_calls` loop in
+/// `build` could have emitted, and not an argument comparison from some other
+/// rule that only coincidentally compares against the same numeric value.
+///
+/// **Why a numeric match on `k` is not enough on its own.** On aarch64,
+/// `mount` is syscall 40, and `AF_VSOCK` is also 40: the vsock rule's own
+/// inner comparison, `domain == AF_VSOCK`, carries the exact same `k` as
+/// `mount`'s call number check, with the same `jt`/`jf` shape, because both
+/// happen to kill on a match and fall through on a miss. Every genuine
+/// `blocked_calls` comparison reads the call number that was loaded once, at
+/// the top of the filter, into the accumulator, and every argument reading
+/// rule, `execveat`'s and the socket rule's alike, reloads the accumulator
+/// from `offsetOfArgLow` immediately beforehand. So the instruction directly
+/// before a real `blocked_calls` comparison is never an argument load: it is
+/// either that one initial load of `nr`, for the first entry, or the `RET_K`
+/// of the entry before it, for every one after.
+fn precededByArgumentLoad(prog: []const bpf.Insn, i: usize) bool {
+    if (i == 0) return false;
+    const before = prog[i - 1];
+    return before.code == bpf.LD_W_ABS and before.k != bpf.offset_of_nr;
+}
+
 test "every blocked call comparison is followed by a kill instruction" {
     const allocator = std.testing.allocator;
     const prog = try build(allocator, .{});
@@ -499,6 +641,7 @@ test "every blocked call comparison is followed by a kill instruction" {
     var checked: usize = 0;
     for (prog, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K) continue;
+        if (precededByArgumentLoad(prog, i)) continue;
         var is_blocked_call = false;
         for (blocked_calls) |call| {
             if (insn.k == @as(u32, @intCast(@intFromEnum(call)))) is_blocked_call = true;
@@ -521,8 +664,9 @@ test "every blocked call comparison jumps so the kill is reachable and the skip 
     // instruction on no match. A wrong offset here either misses the kill on a
     // match or skips past it into the next check, and this test must catch both.
     var checked: usize = 0;
-    for (prog) |insn| {
+    for (prog, 0..) |insn, i| {
         if (insn.code != bpf.JMP_JEQ_K) continue;
+        if (precededByArgumentLoad(prog, i)) continue;
         var is_blocked_call = false;
         for (blocked_calls) |call| {
             if (insn.k == @as(u32, @intCast(@intFromEnum(call)))) is_blocked_call = true;
@@ -607,7 +751,7 @@ test "the refusal block adds only itself, and leaves the call number for the che
     }
 }
 
-test "strict_wx off makes a shorter filter that does not read the protection flags" {
+test "strict_wx off makes a shorter filter that reads no protection flag, but still reads execveat's" {
     const allocator = std.testing.allocator;
     const strict = try build(allocator, .{ .strict_wx = true });
     defer allocator.free(strict);
@@ -615,9 +759,19 @@ test "strict_wx off makes a shorter filter that does not read the protection fla
     defer allocator.free(loose);
 
     try std.testing.expect(strict.len > loose.len);
+
+    // The execveat rule is a boundary, not hardening, so it is unconditional
+    // and stays whether or not strict_wx does: its own AND mask, against
+    // AT_EMPTY_PATH and nothing else, is the only one left once every
+    // strict_wx mask (personality, shmat, and the three memory_calls) is
+    // gone.
+    var loose_masks: usize = 0;
     for (loose) |insn| {
-        try std.testing.expect(insn.code != bpf.ALU_AND_K);
+        if (insn.code != bpf.ALU_AND_K) continue;
+        try std.testing.expectEqual(@as(u32, 0x1000), insn.k);
+        loose_masks += 1;
     }
+    try std.testing.expectEqual(@as(usize, 1), loose_masks);
 }
 
 test "the write and execute rule refuses with EPERM and does not kill" {
@@ -721,6 +875,116 @@ test "the shmat rule jumps over exactly its own five instructions" {
         try std.testing.expectEqual(@as(u8, 5), insn.jf);
 
         const inner = prog[i + 3];
+        try std.testing.expectEqual(bpf.JMP_JEQ_K, inner.code);
+        try std.testing.expectEqual(@as(u8, 0), inner.jt);
+        try std.testing.expectEqual(@as(u8, 1), inner.jf);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "the execveat rule kills on AT_EMPTY_PATH and does not read strict_wx" {
+    // Unlike shmat and the memory calls, this rule is not gated by
+    // options.strict_wx: it closes a boundary, not a hardening cost, so it must
+    // be present whether or not the caller turned write-and-execute off for a
+    // JIT runtime.
+    const allocator = std.testing.allocator;
+    const execveat_number: u32 = @intCast(@intFromEnum(linux.SYS.execveat));
+    const at_empty_path: u32 = 0x1000;
+
+    inline for (.{ true, false }) |wx| {
+        const prog = try build(allocator, .{ .strict_wx = wx });
+        defer allocator.free(prog);
+
+        var found = false;
+        for (prog, 0..) |insn, i| {
+            if (insn.code != bpf.JMP_JEQ_K or insn.k != execveat_number) continue;
+            // i + 1 loads flags. i + 2 masks it to AT_EMPTY_PATH. i + 3 compares
+            // the mask. i + 4 kills the process when AT_EMPTY_PATH was set: a
+            // kill, and never RET_ERRNO_PERM, because a program that meant to
+            // run a path-free descriptor is exactly the case this project does
+            // not hand a recoverable answer to.
+            try std.testing.expectEqual(bpf.LD_W_ABS, prog[i + 1].code);
+            try std.testing.expectEqual(bpf.offsetOfArgLow(4), prog[i + 1].k);
+            try std.testing.expectEqual(bpf.ALU_AND_K, prog[i + 2].code);
+            try std.testing.expectEqual(at_empty_path, prog[i + 2].k);
+            try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[i + 3].code);
+            try std.testing.expectEqual(at_empty_path, prog[i + 3].k);
+            try std.testing.expectEqual(bpf.RET_K, prog[i + 4].code);
+            try std.testing.expectEqual(RET_KILL_PROCESS, prog[i + 4].k);
+            found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "the execveat rule jumps over exactly its own five instructions" {
+    const allocator = std.testing.allocator;
+    const prog = try build(allocator, .{ .strict_wx = true });
+    defer allocator.free(prog);
+
+    const execveat_number: u32 = @intCast(@intFromEnum(linux.SYS.execveat));
+    var found = false;
+    for (prog, 0..) |insn, i| {
+        if (insn.code != bpf.JMP_JEQ_K or insn.k != execveat_number) continue;
+        try std.testing.expectEqual(@as(u8, 0), insn.jt);
+        try std.testing.expectEqual(@as(u8, 5), insn.jf);
+
+        const inner = prog[i + 3];
+        try std.testing.expectEqual(bpf.JMP_JEQ_K, inner.code);
+        try std.testing.expectEqual(@as(u8, 0), inner.jt);
+        try std.testing.expectEqual(@as(u8, 1), inner.jf);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "the socket rule kills on AF_VSOCK and does not read strict_wx or block_connect" {
+    // Neither option gates this: it is a boundary and not hardening, and it
+    // is not about connect's own re-aim risk, so it must be present in
+    // every combination of the two.
+    const allocator = std.testing.allocator;
+    const socket_number: u32 = @intCast(@intFromEnum(linux.SYS.socket));
+    const af_vsock: u32 = 40;
+
+    inline for (.{ true, false }) |wx| {
+        inline for (.{ true, false }) |connect| {
+            const prog = try build(allocator, .{ .strict_wx = wx, .block_connect = connect });
+            defer allocator.free(prog);
+
+            var found = false;
+            for (prog, 0..) |insn, i| {
+                if (insn.code != bpf.JMP_JEQ_K or insn.k != socket_number) continue;
+                // i + 1 loads domain. i + 2 compares it to AF_VSOCK. i + 3
+                // kills the process on a match: a kill, and never
+                // RET_ERRNO_PERM, the same choice the execveat rule makes
+                // and for the same reason.
+                try std.testing.expectEqual(bpf.LD_W_ABS, prog[i + 1].code);
+                try std.testing.expectEqual(bpf.offsetOfArgLow(0), prog[i + 1].k);
+                try std.testing.expectEqual(bpf.JMP_JEQ_K, prog[i + 2].code);
+                try std.testing.expectEqual(af_vsock, prog[i + 2].k);
+                try std.testing.expectEqual(bpf.RET_K, prog[i + 3].code);
+                try std.testing.expectEqual(RET_KILL_PROCESS, prog[i + 3].k);
+                found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+}
+
+test "the socket rule jumps over exactly its own four instructions" {
+    const allocator = std.testing.allocator;
+    const prog = try build(allocator, .{ .strict_wx = true });
+    defer allocator.free(prog);
+
+    const socket_number: u32 = @intCast(@intFromEnum(linux.SYS.socket));
+    var found = false;
+    for (prog, 0..) |insn, i| {
+        if (insn.code != bpf.JMP_JEQ_K or insn.k != socket_number) continue;
+        try std.testing.expectEqual(@as(u8, 0), insn.jt);
+        try std.testing.expectEqual(@as(u8, 4), insn.jf);
+
+        const inner = prog[i + 2];
         try std.testing.expectEqual(bpf.JMP_JEQ_K, inner.code);
         try std.testing.expectEqual(@as(u8, 0), inner.jt);
         try std.testing.expectEqual(@as(u8, 1), inner.jf);
