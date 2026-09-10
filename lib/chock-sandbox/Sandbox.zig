@@ -759,6 +759,10 @@ pub const SetupError = error{
     ScratchMountFailed,
     MountTreeFailed,
     PivotFailed,
+    /// The bounding set could not be dropped, `PR_SET_SECUREBITS` was
+    /// refused, or `capset` could not clear this process's own effective,
+    /// permitted, and inheritable sets. See `linux/capabilities.zig`.
+    CapabilitiesFailed,
     LandlockInitFailed,
     LandlockRuleFailed,
     LandlockRestrictFailed,

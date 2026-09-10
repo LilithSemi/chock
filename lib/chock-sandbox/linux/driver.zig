@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const landlock = @import("landlock.zig");
 const namespace = @import("namespace.zig");
+const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
 const bpf = @import("bpf.zig");
 const rlimits = @import("rlimits.zig");
@@ -61,6 +62,7 @@ const SetupStep = enum(u8) {
     scratch_mount,
     mount_tree,
     pivot,
+    capabilities,
     landlock_init,
     landlock_rule,
     landlock_restrict,
@@ -1254,6 +1256,7 @@ fn setupErrorFor(step: SetupStep) SetupError {
         .scratch_mount => error.ScratchMountFailed,
         .mount_tree => error.MountTreeFailed,
         .pivot => error.PivotFailed,
+        .capabilities => error.CapabilitiesFailed,
         .landlock_init => error.LandlockInitFailed,
         .landlock_rule => error.LandlockRuleFailed,
         .landlock_restrict => error.LandlockRestrictFailed,
@@ -1653,6 +1656,32 @@ fn dieLandlock(
     std.process.exit(1);
 }
 
+/// Same as `dieLandlock`, for the capability drop.
+///
+/// **The errno reaches the parent, and not only this process's stderr**, for
+/// the same reason `dieLandlock`'s own comment gives: this runs in the child
+/// after `fork`, where `std.debug.print` could already be stuck on a lock a
+/// thread of the parent held at the moment of the fork.
+fn dieCapabilities(
+    write_fd: i32,
+    stderr_fd: i32,
+    err: anyerror,
+    diag: ?capabilities.Diagnostic,
+) noreturn {
+    if (diag) |d| {
+        // The record first, and the text second, for the reason `die` gives.
+        reportSetupFailure(write_fd, .capabilities, @intFromEnum(d.errno));
+        var buffer: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "sandbox: {f}\n", .{d}) catch
+            "sandbox: dropping capabilities failed, and the reason was too long to print\n";
+        writeStderr(stderr_fd, line);
+    } else {
+        reportSetupFailure(write_fd, .capabilities, 0);
+        printFault(stderr_fd, err);
+    }
+    std.process.exit(1);
+}
+
 /// Same as `dieNamespace`, for a resource limit the kernel refused.
 ///
 /// **The errno reaches the parent**, for the reason `dieNamespace` gives: a
@@ -1837,6 +1866,15 @@ fn applyLayers(
     namespace.pivotInto(allocator, config.root, &diag) catch |err|
         dieNamespace(write_fd, config.stderr_fd, .pivot, err, diag);
 
+    // Right here, and nowhere else. `buildRoot` and `pivotInto`, just above,
+    // are the last two steps that still need `CAP_SYS_ADMIN`; nothing below
+    // this line, in this function, asks the kernel for anything a capability
+    // gates. See `capabilities.dropAll`'s own top comment for what each of
+    // its three calls closes and why the order inside it is fixed.
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.dropAll(&cap_diag) catch |err|
+        dieCapabilities(write_fd, config.stderr_fd, err, cap_diag);
+
     // One slot for all three calls, for the reason the mount slot above has
     // one: `note` keeps the first fault, and a rule can only be added to a
     // ruleset that was made.
@@ -1878,6 +1916,15 @@ fn restrictMiddle(abi: i32, insns: []const bpf.Insn) void {
     // `spawn`. So the reason is written straight to standard error, and
     // the slot is here only so that reason is the errno and not the bare
     // `error.Unexpected`.
+    //
+    // **A holds the same full capability set B does, until this runs.** A
+    // never calls `buildRoot` or `pivotInto` itself, so nothing above this
+    // line in A ever needed one, and A holds the caller's own provider
+    // credential in its memory: best effort here still costs A nothing, for
+    // the reason this whole function's own doc comment gives.
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.dropAll(&cap_diag) catch |err| printMiddleCapabilitiesFault(err, cap_diag);
+
     var diag: ?landlock.Diagnostic = null;
     if (landlock.Ruleset.init(abi, &diag)) |ruleset| {
         var owned = ruleset;
@@ -1888,6 +1935,25 @@ fn restrictMiddle(abi: i32, insns: []const bpf.Insn) void {
     }
 
     seccomp.install(bpf.Prog.init(insns)) catch |err| printMiddleFault(err, null);
+}
+
+/// Same as `printMiddleFault`, for the one call in `restrictMiddle` that is
+/// not a `landlock.Diagnostic`.
+fn printMiddleCapabilitiesFault(err: anyerror, diag: ?capabilities.Diagnostic) void {
+    var buffer: [256]u8 = undefined;
+    const line = if (diag) |d|
+        std.fmt.bufPrint(
+            &buffer,
+            "sandbox: the middle process could not drop its own capabilities: {f}\n",
+            .{d},
+        ) catch "sandbox: the middle process could not drop its own capabilities\n"
+    else
+        std.fmt.bufPrint(
+            &buffer,
+            "sandbox: the middle process could not drop its own capabilities: {s}\n",
+            .{@errorName(err)},
+        ) catch "sandbox: the middle process could not drop its own capabilities\n";
+    writeStderr(std.posix.STDERR_FILENO, line);
 }
 
 /// Name a layer the middle process could not put on itself. Its own line, so

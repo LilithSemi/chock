@@ -943,6 +943,43 @@ test "spawn gives the sandboxed process /dev/null on standard input, never a ter
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "the sandboxed process holds no capability in its own user namespace, and none can come back across an exec" {
+    // **Nothing in this tree drops a capability.** A process that creates a
+    // user namespace holds a full capability set inside it regardless of
+    // what `writeIdMaps` maps its uid to: measured directly, outside this
+    // project, with a standalone reproduction of `writeIdMaps`'s own two
+    // lines, mapping to self and mapping to 0 both read
+    // `CapEff/CapPrm/CapBnd = 000001ffffffffff`. The uid map decides what uid
+    // the process appears as. It decides nothing about what the kernel hands
+    // the creator of a namespace.
+    //
+    // So this is not a case that only appears when Chock runs as root, or
+    // when a mapping is written differently. It is the plain, unprivileged,
+    // every-day path.
+    //
+    // **The bounding set is the one record `execve` never clears on its
+    // own, which is why `spawned-caps-drop` reads that and nothing else.**
+    // An ordinary program with no file capability of its own already comes
+    // back from `execve` with an empty effective, permitted, and inheritable
+    // set, on every kernel, with no help from this project: measured
+    // directly, outside this project, execing a plain child from inside the
+    // same kind of unprivileged user namespace `namespace.enter` builds. A
+    // test that read those three sets after `execve` would read zero either
+    // way and prove nothing. `CapBnd` is not recomputed by `execve` at all,
+    // so it still carries the full set there today, and it is exactly what
+    // `PR_CAPBSET_DROP` closes: without it, a binary inside the sandbox that
+    // happens to carry a file capability of its own can still hand this
+    // process real, exercisable capabilities the next time it is `exec`'d,
+    // through the bounding set this test reads. `spawn-caps-drop` asks for
+    // nothing unusual, and `spawned-caps-drop` does no setup of its own.
+    // Before `applyLayers` drops the bounding set, this test fails against
+    // the real, default sandbox, not against a contrived one.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-caps-drop", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a named stdin descriptor reaches the program as a pipe, and widens nothing else" {
     // `Config.stdin_fd` is the one field that changes what descriptor 0 is,
     // and descriptor 0 is where `/dev/null` goes, for two security reasons. So this test asks the two questions that decide

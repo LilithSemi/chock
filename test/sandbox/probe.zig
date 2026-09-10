@@ -1325,6 +1325,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-stdin-pipe") or
         std.mem.eql(u8, args[1], "spawn-proc-mask") or
         std.mem.eql(u8, args[1], "spawn-proc-live") or
+        std.mem.eql(u8, args[1], "spawn-caps-drop") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -2448,6 +2449,36 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         var buffer: [16]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "{d}\n", .{linux.getpid()}) catch unreachable;
         _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-caps-drop")) {
+        // The property under test is the **bounding set**, and only the
+        // bounding set. `capget`'s three sets are the wrong thing to read
+        // here: an ordinary `execve`, of a program with no file capability
+        // and no inheritable set carried into it, already clears effective,
+        // permitted, and inheritable to zero on every kernel, with no help
+        // from this project at all. Measured directly, outside this project:
+        // a plain `execl` from inside the same kind of unprivileged user
+        // namespace `namespace.enter` builds reads
+        // `CapPrm = CapEff = CapInh = 0` in the child on its own, while
+        // `CapBnd` carries the full set through the very same `exec`
+        // unchanged. The bounding set is the one capability record `exec`
+        // never resets by itself, and it is the one `capabilities.dropAll`
+        // exists to close: see that file's own top comment.
+        //
+        // `PR_CAPBSET_READ` answers 1 or 0 as `prctl`'s own return value,
+        // never through a pointer, for whether `cap` is still in this
+        // process's bounding set. A single capability still present there,
+        // after a real `Sandbox.spawn`'s own `applyLayers` ran and this
+        // program was already `execve`'d, is the whole failure.
+        var cap: usize = 0;
+        while (cap <= linux.CAP.LAST_CAP) : (cap += 1) {
+            const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+            const cap_errno = linux.errno(rc);
+            if (cap_errno == .INVAL) break; // A kernel older than CAP.LAST_CAP: nothing above this exists.
+            if (cap_errno != .SUCCESS) return 5;
+            if (rc != 0) return 1; // Still in the bounding set. The drop did not run, or did not finish.
+        }
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawned-stdin-devnull")) {
@@ -4044,6 +4075,23 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
         }, &.{ "/probe", "spawned-report-pid" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-caps-drop")) {
+        // Run this same program through the whole sandbox, and let it read its
+        // own capability bounding set. spawned-caps-drop does no setup of its
+        // own, so whether it comes back empty is entirely a fact about spawn's
+        // own applyLayers.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-caps-drop" }, null, null);
 
         return reportChildTerm(term);
     }
