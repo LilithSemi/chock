@@ -330,6 +330,14 @@ pub const Transport = struct {
 ///   answer for it.
 /// * **`fd00:ec2::254`**, the EC2 instance metadata service over IPv6, which
 ///   hands out the same credentials as its IPv4 twin.
+/// * **`100.100.100.200`**, the Alibaba Cloud metadata service. It is the one
+///   metadata service that is not on `169.254.169.254`, and it answers with
+///   the instance's RAM role credentials.
+///
+/// **`100.64.0.0/10` is deliberately not refused**, and only the one address
+/// inside it above is. The range is carrier grade NAT, and a Tailscale network
+/// gives every machine an address in it, so it is the IPv4 form of exactly the
+/// case the private ranges below are permitted for.
 ///
 /// **The private ranges are deliberately not refused**, `10.0.0.0/8`,
 /// `172.16.0.0/12` and `192.168.0.0/16`. A company's own API on its own
@@ -387,8 +395,20 @@ fn ip4BytesAreReachable(bytes: [4]u8) bool {
     // `224.0.0.0/4` is multicast, and everything above it is reserved or the
     // broadcast address.
     if (bytes[0] >= 224) return false;
+    if (std.mem.eql(u8, &bytes, &alibaba_metadata_ip4)) return false;
     return true;
 }
+
+/// `100.100.100.200`, the Alibaba Cloud metadata service. It answers with the
+/// RAM role credentials of the instance, which is the same class of secret
+/// `169.254.169.254` gives out on the other providers.
+///
+/// **One address and not the range it sits in.** `100.64.0.0/10` is carrier
+/// grade NAT, and a Tailscale network puts every machine in it, so the range
+/// is the IPv4 form of exactly the case the private ranges are permitted for.
+/// This is the same shape `ec2_metadata_ip6` takes inside `fc00::/7`, and for
+/// the same reason.
+const alibaba_metadata_ip4 = [_]u8{ 100, 100, 100, 200 };
 
 /// What a `Network` needs to turn a refusal into a question. Every part of
 /// this is borrowed: the caller that builds one still owns the broker, the
@@ -1193,6 +1213,14 @@ test "a permitted name that resolves onto this machine is still refused" {
         .{ .ip6 = .{ .bytes = nat64_well_known_prefix ++ [_]u8{ 0, 0, 0, 0 }, .port = 0 } },
         // The EC2 metadata service over IPv6.
         .{ .ip6 = .{ .bytes = ec2_metadata_ip6, .port = 0 } },
+        // **`100.100.100.200`**, the Alibaba Cloud metadata service. It hands
+        // out the same class of credential as `169.254.169.254`, and it sits
+        // in a range no other provider puts a metadata service in.
+        .{ .ip4 = .{ .bytes = .{ 100, 100, 100, 200 }, .port = 0 } },
+        // The same address written the other two ways a resolver can answer
+        // with. Both go through the unwraps above.
+        .{ .ip6 = .fromIp4(.{ .bytes = .{ 100, 100, 100, 200 }, .port = 0 }) },
+        .{ .ip6 = .{ .bytes = nat64_well_known_prefix ++ [_]u8{ 100, 100, 100, 200 }, .port = 0 } },
     };
 
     for (refused) |address| {
@@ -1229,6 +1257,17 @@ test "a permitted name that resolves onto this machine is still refused" {
         // A public IPv6 address behind the NAT64 prefix, so the unwrap refuses
         // by the IPv4 rules and does not refuse the prefix itself.
         .{ .ip6 = .{ .bytes = nat64_well_known_prefix ++ [_]u8{ 93, 184, 216, 34 }, .port = 0 } },
+        // **`100.64.0.0/10` stays permitted, and only the one address inside
+        // it above is refused.** The range is carrier grade NAT, and a
+        // Tailscale network gives every machine an address in it. That is the
+        // IPv4 form of exactly the case `10.0.0.0/8` is permitted for, so a
+        // rule on the range would break a company's own API on its own
+        // network. These three lines are what stops a later reader widening
+        // the one address into the range, the same way the unique local line
+        // above guards `fd00:ec2::254`.
+        .{ .ip4 = .{ .bytes = .{ 100, 64, 0, 1 }, .port = 0 } },
+        .{ .ip4 = .{ .bytes = .{ 100, 100, 100, 1 }, .port = 0 } },
+        .{ .ip4 = .{ .bytes = .{ 100, 127, 255, 254 }, .port = 0 } },
     };
     for (permitted) |address| {
         const answers = [_]FakeTransport.Answer{
