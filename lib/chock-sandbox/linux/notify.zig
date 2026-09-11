@@ -39,6 +39,62 @@
 //!      pair closes when a process dies, so a blocked `read` on either side
 //!      reads end of file rather than waiting.
 //!
+//! ## The path reader, and why it is a third process
+//!
+//! Counting says `openat` happened 14,434 times. It does not say what was
+//! opened. Reading the path means reading a string out of the observed
+//! process's memory, and the only call that does that is `process_vm_readv`.
+//!
+//! **A cannot make that call, measured twice.** `process_vm_readv` is a member
+//! of `seccomp.blocked_calls`, and `linux/driver.zig`'s `restrictMiddle` puts
+//! that same filter on A: measured on 2026-09-11, A dies of `SIGSYS` on the
+//! call. A also puts a Landlock ruleset with no rule in it on itself, so A
+//! cannot open `/proc/PID/mem` either: measured the same day, `EACCES`.
+//!
+//! So the read happens in a third process, R, and R is forked by A **after**
+//! B, which puts R inside B's pid namespace. That placement is the whole
+//! safety argument, and it is the kernel that enforces it:
+//!
+//!   * `process_vm_readv` names a **pid**, and the kernel resolves a pid in
+//!     the pid namespace of the caller. R is a member of B's namespace, so
+//!     every number R can write down resolves to B, to a child of B, or to R
+//!     itself. There is no number R can pass that reaches `ssh-agent`, a
+//!     password manager, or any other process on the host.
+//!   * Measured on 2026-09-11: a process inside a fresh pid namespace asked to
+//!     read its own parent's memory by that parent's host pid number and was
+//!     answered `ESRCH`. Asked again for every number from 1 to 63, exactly
+//!     one answered, and that one was the reader itself.
+//!   * R does not choose the number at all. It uses `pid` out of the
+//!     notification, which the kernel fills in relative to the reader's own
+//!     namespace.
+//!
+//! ## Killing the auditor breaks your own opens
+//!
+//! R holds the notification descriptor, and **A closes its own copy the moment
+//! R exists**. That is a rule and not tidiness. A filter whose listener nobody
+//! holds makes the kernel answer every trapped call with `ENOSYS`, so a B that
+//! killed its own reader would find that `openat` had stopped working.
+//!
+//! Measured on 2026-09-11, including the hard case: a target held inside a
+//! trapped `openat` whose only listener holder was killed was answered
+//! `ENOSYS` at the instant of the kill, and did not wait. The same measurement
+//! with a second holder still open showed the target waiting forever, which is
+//! why the rule above is written as a rule.
+//!
+//! ## The record is telemetry and never evidence
+//!
+//! The answer to a notification is `CONTINUE`, so the kernel runs the call
+//! with the arguments it finds **after** R has read them. A process that wants
+//! to lie about a filename can write one string, wait to be let go, and then
+//! open another. So a path here is what the process **said**, and
+//! `seccomp.TrapCall.pathArg` names the argument rather than a number written
+//! at the read site. Two things carry that caveat outward: the field is called
+//! `unverified_paths`, and the event carries `paths_verified: false` as a
+//! machine readable fact a later mode can flip. See `lib/chock-proto/event.zig`.
+//!
+//! The counts are a different thing and stay unforgeable: the call number
+//! comes from the kernel inside the notification.
+//!
 //! ## What the descriptor number is worth
 //!
 //! B sends a number, and A takes whatever descriptor sits on it. B is this
@@ -66,6 +122,123 @@ pub const Counts = [call_count]u64;
 
 /// A histogram with nothing counted yet.
 pub const empty_counts: Counts = @splat(0);
+
+/// How many bytes of a path the reader copies out of the observed process.
+///
+/// **Measured, and the reason for the number.** A read of up to 4 KB costs
+/// about 3.5 microseconds. Clamping the read to 256 bytes costs about 0.9
+/// microseconds, against the 11 microseconds the notification itself costs. A
+/// path longer than this is recorded as far as it was read and counted as
+/// truncated, so a long name is short in the record and never a silent lie.
+pub const path_read_clamp = 256;
+
+/// How many distinct paths outside the workspace one record names.
+///
+/// **A cap, and the overflow is counted rather than dropped in silence.** A
+/// clean `zig build` opens 14,434 files. Naming each one would grow the
+/// session log without bound, which is a cost this project has already paid
+/// once. Eight names of 64 bytes is 512 bytes of text, which keeps the whole
+/// record small enough to write once for a whole session: measured on
+/// 2026-09-11, a full record with every counter saturated is one line of 1,503
+/// bytes and a real one that named three paths is 743 bytes. **The size does
+/// not grow with the number of opens**, which is the fault this cap exists to
+/// stop.
+pub const kept_path_cap = 8;
+
+/// How many bytes of one kept path the record holds. See `kept_path_cap`.
+///
+/// **A name longer than this is kept as its first bytes**, and the `truncated`
+/// count is about the read clamp rather than about this. A reader of the log
+/// knows this width, because it is the same for every record a build writes.
+/// The paths worth reading outside a workspace are short ones such as
+/// `/etc/shadow` or `/home/someone/.ssh/id_ed25519`. The long ones are
+/// toolchain paths, which are the boring half.
+pub const kept_path_bytes = 64;
+
+/// What the reader saw, in memory both the reader and the caller of `spawn`
+/// can reach.
+///
+/// **Shared memory, and not the middle pipe.** The reader is killed by the
+/// kernel the moment the observed process ends, because the observed process
+/// is process 1 of the pid namespace they share. A reader that reported at the
+/// end of its loop would be killed before it ever reported. A page written as
+/// the reader goes is read by the caller afterwards, whether the reader was
+/// killed or not.
+///
+/// **The observed process never holds this mapping when it can write to it.**
+/// `spawn` makes the mapping before it forks, so B inherits it, and B gives it
+/// up in `applyLayers` before it applies a single layer. B is this project's
+/// own code until that point. `execve` would take the mapping away in any
+/// case, because it replaces the whole address space, but the give up is
+/// written down rather than left to that.
+///
+/// **A count and not a line for each call.** See `kept_path_cap`, and
+/// `SandboxSyscalls` in `lib/chock-proto/event.zig` for the same argument
+/// about the log.
+pub const PathRecord = extern struct {
+    /// One when the reader finished confining itself and reached its loop.
+    /// **Zero is the fact an audit reads**: the reader never ran, so every
+    /// number below is short.
+    ready: u32 = 0,
+    /// One when the reader's own loop returned rather than being killed.
+    ///
+    /// **Leaving its own loop is the ordinary end**, because the reader
+    /// watches the observed program's process descriptor as well as the
+    /// notification descriptor, so that program's end wakes it. Measured on
+    /// 2026-09-11: every ordinary run ends that way. The kernel would kill the
+    /// reader in any case, as it tears down the pid namespace they share, and
+    /// a reader killed before its loop returned leaves this at zero.
+    ended: u32 = 0,
+    /// Set by the supervisor after it has reaped the reader. One means the
+    /// reader ended in a way that the ordinary teardown does not explain, so
+    /// the observed process ran part of its life with nothing watching it and
+    /// its own trapped calls answered `ENOSYS`.
+    reader_lost: u32 = 0,
+    /// How many slots of `names` hold a path.
+    kept: u32 = 0,
+    /// The histogram, the same one `serve` fills in. Read by the supervisor
+    /// after the observed process has ended, and reported the way an
+    /// unobserved run is reported.
+    counts: Counts = empty_counts,
+    /// Calls whose path was under the workspace. Counted and never named.
+    inside: Counts = empty_counts,
+    /// Calls whose path was not. Named below until the cap is reached.
+    outside: Counts = empty_counts,
+    /// Calls whose path was outside the workspace and is **not** among the
+    /// names below. The explicit overflow count.
+    outside_unnamed: Counts = empty_counts,
+    /// Calls whose path could not be read out of the observed process at all.
+    unread: Counts = empty_counts,
+    /// Calls whose path was longer than `path_read_clamp`, or ran off the end
+    /// of the pages the reader could reach. The name kept for such a call is a
+    /// prefix of the real one.
+    truncated: Counts = empty_counts,
+    /// Which call each kept name belongs to, by `seccomp.TrapCall` tag value.
+    name_call: [kept_path_cap]u32 = @splat(0),
+    /// How many calls each kept name stands for.
+    ///
+    /// **Not written to the log, and it is here for the sum.** One record is
+    /// merged into another when a session adds up its tool calls, and a name
+    /// the second set has no room for has to add its own calls to
+    /// `outside_unnamed`. Without this the merge would add one, and a name
+    /// that stood for five hundred opens would read as one.
+    name_hits: [kept_path_cap]u64 = @splat(0),
+    /// How many bytes of each kept name are real.
+    name_len: [kept_path_cap]u32 = @splat(0),
+    /// The kept names themselves, not terminated and not trusted.
+    names: [kept_path_cap][kept_path_bytes]u8 = @splat(@splat(0)),
+
+    /// The bytes of slot `slot`, or an empty slice for a slot nothing filled.
+    pub fn name(self: *const PathRecord, slot: usize) []const u8 {
+        if (slot >= self.kept or slot >= kept_path_cap) return &.{};
+        // **Clamped, and never trusted as it stands.** This length was written
+        // by another process into shared memory. A caller that indexed with it
+        // straight would read past the slot the day anything wrote a wrong
+        // number there.
+        const len = @min(self.name_len[slot], kept_path_bytes);
+        return self.names[slot][0..len];
+    }
+};
 
 /// The byte A sends when it holds the notification descriptor.
 const ack_holding: u8 = 1;
@@ -165,6 +338,39 @@ fn take(handshake_fd: i32, child_pidfd: i32) i32 {
 ///
 /// The caller owns both descriptors and closes them.
 pub fn serve(listener: i32, child_pidfd: i32, counts: *Counts) Outcome {
+    return loop(listener, child_pidfd, counts, null);
+}
+
+/// The same loop, in a process that may also read the path each call names.
+///
+/// **Only the path reader may call this**, because the read it adds is
+/// `process_vm_readv`, and every other process this project starts is killed
+/// for making that call. See this file's own top comment for where the reader
+/// lives and why the kernel bounds what it can name. `record` is the shared
+/// page the reader writes and the caller of `spawn` reads.
+///
+/// `workspace` is the path the observed program's own work lives under, as
+/// that program sees it. A path under it is counted and never named. See
+/// `note`.
+pub fn serveRecording(
+    listener: i32,
+    child_pidfd: i32,
+    record: *PathRecord,
+    workspace: []const u8,
+) Outcome {
+    return loop(listener, child_pidfd, &record.counts, .{
+        .record = record,
+        .workspace = workspace,
+    });
+}
+
+/// What the loop needs to turn one notification into a path in the record.
+const Recorder = struct {
+    record: *PathRecord,
+    workspace: []const u8,
+};
+
+fn loop(listener: i32, child_pidfd: i32, counts: *Counts, recorder: ?Recorder) Outcome {
     var watched = [2]linux.pollfd{
         .{ .fd = listener, .events = linux.POLL.IN, .revents = 0 },
         .{ .fd = child_pidfd, .events = linux.POLL.IN, .revents = 0 },
@@ -185,7 +391,7 @@ pub fn serve(listener: i32, child_pidfd: i32, counts: *Counts) Outcome {
         // answered even when the observed process has ended in the same
         // moment, so nothing is lost between the two reads.
         if (watched[0].revents & linux.POLL.IN != 0) {
-            switch (answerOne(listener, counts)) {
+            switch (answerOne(listener, counts, recorder)) {
                 .served => continue,
                 .fault => return .fault,
             }
@@ -200,7 +406,7 @@ pub fn serve(listener: i32, child_pidfd: i32, counts: *Counts) Outcome {
 /// What one turn of the serve loop came to.
 const Answered = enum { served, fault };
 
-fn answerOne(listener: i32, counts: *Counts) Answered {
+fn answerOne(listener: i32, counts: *Counts, recorder: ?Recorder) Answered {
     var note: SECCOMP.notif = undefined;
     @memset(std.mem.asBytes(&note), 0);
     const rc = linux.ioctl(listener, SECCOMP.IOCTL_NOTIF.RECV, @intFromPtr(&note));
@@ -218,6 +424,13 @@ fn answerOne(listener: i32, counts: *Counts) Answered {
     // counted against the first member.
     if (seccomp.TrapCall.fromNumber(note.data.nr)) |call| {
         counts[@intFromEnum(call)] += 1;
+        // **Before the answer below, and that order is the whole point.** The
+        // observed process is held inside the call until this loop answers, so
+        // this is the one moment its argument is still the one the kernel will
+        // use. It can still be changed afterwards, which is why the record
+        // says `unverified`. Reading after the answer would make it not even
+        // that.
+        if (recorder) |r| readAndNote(r, call, &note);
     }
 
     // **Continue, and never a spoofed answer.** This loop counts. It decides
@@ -239,6 +452,161 @@ fn answerOne(listener: i32, counts: *Counts) Answered {
         .SUCCESS, .NOENT => .served,
         else => .fault,
     };
+}
+
+/// Read the path one notification names, and put it in the record.
+///
+/// **Nothing here refuses, spoils or delays the call.** A read that fails is
+/// counted and the call still runs.
+fn readAndNote(recorder: Recorder, call: seccomp.TrapCall, note: *const SECCOMP.notif) void {
+    const slot = @intFromEnum(call);
+    const arg = call.pathArg() orelse return;
+    const address = argAt(&note.data, arg);
+
+    var buffer: [path_read_clamp]u8 = undefined;
+    // **The pid comes from the kernel, inside the notification, and the kernel
+    // wrote it in this process's own pid namespace.** So this number cannot
+    // name a process outside the namespace the reader shares with the observed
+    // program, whatever the observed program does. See this file's own top
+    // comment for the measurement.
+    const read = readPath(@intCast(note.pid), address, &buffer) orelse {
+        recorder.record.unread[slot] +|= 1;
+        return;
+    };
+    if (read.truncated) recorder.record.truncated[slot] +|= 1;
+    countPath(recorder.record, call, read.path, recorder.workspace);
+}
+
+/// One argument of a held call, by index. A switch and not an array index,
+/// because the kernel's own structure names each argument one at a time. Four
+/// of them, which is every index `seccomp.TrapCall.pathArg` can give back.
+fn argAt(data: *const SECCOMP.data, index: u2) u64 {
+    return switch (index) {
+        0 => data.arg0,
+        1 => data.arg1,
+        2 => data.arg2,
+        3 => data.arg3,
+    };
+}
+
+/// What one path read came back with.
+const PathRead = struct {
+    path: []const u8,
+    /// True when no terminator was found in what was read, so the path is
+    /// longer than this or runs into a page the reader could not reach.
+    truncated: bool,
+};
+
+/// Copy a path out of the observed process, clamped.
+///
+/// **Two remote pieces and one call.** A read that ran into an unmapped page
+/// would give back nothing at all, so the first piece stops at the end of the
+/// page the string starts in. The second piece carries the rest of the clamp.
+/// The kernel reads the pieces in order and gives back what it managed, so a
+/// string that ends inside the first page costs the same one call as one that
+/// does not.
+///
+/// Null when nothing at all could be read. That is the ordinary answer for a
+/// call whose argument is not a pointer to readable memory, and for a process
+/// the reader may not read at all.
+fn readPath(target: linux.pid_t, address: u64, buffer: *[path_read_clamp]u8) ?PathRead {
+    if (address == 0) return null;
+
+    const page: u64 = 4096;
+    const to_page_end = page - (address & (page - 1));
+    const want: u64 = buffer.len;
+    const first = @min(to_page_end, want);
+
+    const local: [1]std.posix.iovec = .{.{ .base = buffer, .len = @intCast(want) }};
+    var remote: [2]std.posix.iovec_const = .{
+        .{ .base = @ptrFromInt(address), .len = @intCast(first) },
+        .{ .base = @ptrFromInt(address + first), .len = @intCast(want - first) },
+    };
+    const pieces: usize = if (want > first) 2 else 1;
+
+    const rc = linux.process_vm_readv(target, &local, remote[0..pieces], 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    if (rc == 0) return null;
+
+    const got = buffer[0..@min(rc, buffer.len)];
+    const end = std.mem.indexOfScalar(u8, got, 0) orelse
+        return .{ .path = got, .truncated = true };
+    return .{ .path = got[0..end], .truncated = false };
+}
+
+/// True when `path` names something under `workspace`.
+///
+/// **A relative path counts as inside.** The sandboxed program's working
+/// directory is the workspace, so a name with no leading separator resolves
+/// there. An empty workspace makes every path outside, which is what a caller
+/// that named no workspace asked for.
+///
+/// This is a decision about a **string the observed process wrote**, and never
+/// about a file. It says nothing about where the kernel then went. See this
+/// file's own top comment.
+pub fn insideWorkspace(path: []const u8, workspace: []const u8) bool {
+    if (path.len == 0) return true;
+    if (path[0] != '/') return true;
+    if (workspace.len == 0) return false;
+    if (!std.mem.startsWith(u8, path, workspace)) return false;
+    // `/work` must not swallow `/workspace-of-somebody-else`.
+    if (path.len == workspace.len) return true;
+    return path[workspace.len] == '/' or workspace[workspace.len - 1] == '/';
+}
+
+/// Count one path, and name it when it is outside the workspace and the record
+/// still has room.
+fn countPath(
+    record: *PathRecord,
+    call: seccomp.TrapCall,
+    path: []const u8,
+    workspace: []const u8,
+) void {
+    const slot = @intFromEnum(call);
+    if (insideWorkspace(path, workspace)) {
+        record.inside[slot] +|= 1;
+        return;
+    }
+    record.outside[slot] +|= 1;
+    keepName(record, @intCast(slot), path, 1);
+}
+
+/// Put one name in the record's capped set, or count it as one the set had no
+/// room for.
+///
+/// `call_tag` is a `seccomp.TrapCall` tag value. **A tag no member holds is
+/// dropped and never counted against the first member**, because this is also
+/// the function that merges one process's record into another's, and the
+/// record it reads from was written by a process that could have written
+/// anything there.
+///
+/// `hits` is how many calls this name stands for. One for a call as it
+/// happens, and the source name's own total when one record is merged into
+/// another. See `name_hits`.
+pub fn keepName(record: *PathRecord, call_tag: u32, path: []const u8, hits: u64) void {
+    if (call_tag >= call_count) return;
+
+    const kept = @min(record.kept, kept_path_cap);
+    const text = path[0..@min(path.len, kept_path_bytes)];
+    var slot_index: u32 = 0;
+    while (slot_index < kept) : (slot_index += 1) {
+        if (record.name_call[slot_index] != call_tag) continue;
+        if (std.mem.eql(u8, record.name(slot_index), text)) {
+            record.name_hits[slot_index] +|= hits;
+            return;
+        }
+    }
+    if (kept >= kept_path_cap) {
+        // **The overflow is a number and never a silent drop**, and it counts
+        // calls rather than names. See `kept_path_cap` and `name_hits`.
+        record.outside_unnamed[call_tag] +|= hits;
+        return;
+    }
+    @memcpy(record.names[kept][0..text.len], text);
+    record.name_len[kept] = @intCast(text.len);
+    record.name_call[kept] = call_tag;
+    record.name_hits[kept] = hits;
+    record.kept = kept + 1;
 }
 
 /// Write every byte to the handshake socket, retrying a short write and a
@@ -412,4 +780,254 @@ test "a read that ends early is a failure, and never a half filled answer" {
 
     var four: [4]u8 = undefined;
     try std.testing.expect(!readAll(pair[1], &four));
+}
+
+test "a path under the workspace is inside it, and a name that only starts the same way is not" {
+    // **The prefix check is the whole classification.** A check written with
+    // `startsWith` alone would read `/workspace-of-someone-else` as a path
+    // inside `/workspace`, and every open under it would be counted and never
+    // named, which is the one direction this record must not fail in.
+    //
+    // Mutation check: drop the separator check at the end of `insideWorkspace`
+    // and the fourth expectation below fails.
+    try std.testing.expect(insideWorkspace("/work/src/main.zig", "/work"));
+    try std.testing.expect(insideWorkspace("/work", "/work"));
+    try std.testing.expect(!insideWorkspace("/etc/passwd", "/work"));
+    try std.testing.expect(!insideWorkspace("/work-of-someone-else/key", "/work"));
+    // A relative name resolves against the working directory, which is the
+    // workspace.
+    try std.testing.expect(insideWorkspace("src/main.zig", "/work"));
+    // A caller that named no workspace put nothing inside one.
+    try std.testing.expect(!insideWorkspace("/anything", ""));
+}
+
+test "an open inside the workspace is counted and never named" {
+    // The numerous and boring half. A record that named these would be
+    // thousands of lines for one tool call.
+    //
+    // Mutation check: make `countPath` fall through to the naming code for an
+    // inside path and the `kept` expectation below fails.
+    var record: PathRecord = .{};
+    countPath(&record, .openat, "/work/src/main.zig", "/work");
+    countPath(&record, .openat, "/work/build.zig", "/work");
+
+    try std.testing.expectEqual(@as(u64, 2), record.inside[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u64, 0), record.outside[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u32, 0), record.kept);
+}
+
+test "an open outside the workspace is named once, and a repeat adds no second name" {
+    // Mutation check: take the `std.mem.eql` check out of `keepName`'s scan and
+    // `kept` below becomes 2.
+    var record: PathRecord = .{};
+    countPath(&record, .openat, "/etc/passwd", "/work");
+    countPath(&record, .openat, "/etc/passwd", "/work");
+
+    try std.testing.expectEqual(@as(u64, 2), record.outside[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u32, 1), record.kept);
+    try std.testing.expectEqualStrings("/etc/passwd", record.name(0));
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(seccomp.TrapCall.openat)),
+        record.name_call[0],
+    );
+}
+
+test "the same path under two calls is named for each of them" {
+    // The names are read back one call at a time, so a name kept under
+    // `openat` must not answer for `execve`.
+    //
+    // Mutation check: drop the `name_call` comparison from `keepName`'s scan and
+    // `kept` below becomes 1, so the `execve` row loses its only name.
+    var record: PathRecord = .{};
+    countPath(&record, .openat, "/bin/sh", "/work");
+    countPath(&record, .execve, "/bin/sh", "/work");
+
+    try std.testing.expectEqual(@as(u32, 2), record.kept);
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(seccomp.TrapCall.openat)),
+        record.name_call[0],
+    );
+    try std.testing.expectEqual(
+        @as(u32, @intFromEnum(seccomp.TrapCall.execve)),
+        record.name_call[1],
+    );
+}
+
+test "a record that is full counts what it cannot name rather than dropping it" {
+    // **The cap is the reason this record stays in the hundreds of bytes**,
+    // and the overflow count is what stops a reader mistaking a full record
+    // for the whole truth. See `kept_path_cap`.
+    //
+    // Mutation check: make `keepName` return early when the record is full
+    // without touching `outside_unnamed` and the last expectation fails.
+    var record: PathRecord = .{};
+    var made: usize = 0;
+    while (made < kept_path_cap + 5) : (made += 1) {
+        var buffer: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&buffer, "/etc/thing-{d}", .{made}) catch unreachable;
+        countPath(&record, .openat, path, "/work");
+    }
+
+    const slot = @intFromEnum(seccomp.TrapCall.openat);
+    try std.testing.expectEqual(@as(u32, kept_path_cap), record.kept);
+    try std.testing.expectEqual(@as(u64, kept_path_cap + 5), record.outside[slot]);
+    try std.testing.expectEqual(@as(u64, 5), record.outside_unnamed[slot]);
+}
+
+test "a name longer than a slot is kept as its first bytes and never past the slot" {
+    // Mutation check: take the `@min` out of the `text` line in `keepName` and
+    // the `@memcpy` there writes past the slot, which the safety check in a
+    // test build turns into a panic.
+    var record: PathRecord = .{};
+    var long: [kept_path_bytes * 2]u8 = @splat('a');
+    long[0] = '/';
+    countPath(&record, .openat, &long, "/work");
+
+    try std.testing.expectEqual(@as(u32, 1), record.kept);
+    try std.testing.expectEqual(@as(usize, kept_path_bytes), record.name(0).len);
+    try std.testing.expectEqualStrings(long[0..kept_path_bytes], record.name(0));
+}
+
+test "a name length written past the end of a slot is clamped rather than believed" {
+    // `PathRecord` lives in memory another process writes, so a length read
+    // back from it is untrusted input and never a fact. See `PathRecord.name`.
+    //
+    // Mutation check: take the `@min` out of `PathRecord.name` and this test
+    // reads past the slot, which the safety check turns into a panic.
+    var record: PathRecord = .{};
+    record.kept = 1;
+    record.name_len[0] = kept_path_bytes * 4;
+    try std.testing.expectEqual(@as(usize, kept_path_bytes), record.name(0).len);
+}
+
+test "the whole record stays in the hundreds of bytes" {
+    // **The size is the requirement and not an accident.** A session log with
+    // one of these for each tool call is what the cap exists to bound. See
+    // `kept_path_cap`.
+    //
+    // Mutation check: raise `kept_path_cap` to 64 and this fails.
+    try std.testing.expect(@sizeOf(PathRecord) <= 2048);
+}
+
+test "only a call that names a path has an argument to read" {
+    // **The argument index belongs to the call and not to the read site.** A
+    // number written where the memory is read would be wrong for one call the
+    // day the trap set grows. See `seccomp.TrapCall.pathArg`.
+    //
+    // Mutation check: give `connect` a `pathArg` of 1 and the third
+    // expectation fails.
+    try std.testing.expectEqual(@as(?u2, 1), seccomp.TrapCall.openat.pathArg());
+    try std.testing.expectEqual(@as(?u2, 0), seccomp.TrapCall.execve.pathArg());
+    try std.testing.expectEqual(@as(?u2, null), seccomp.TrapCall.connect.pathArg());
+    try std.testing.expectEqual(@as(?u2, null), seccomp.TrapCall.getdents64.pathArg());
+}
+
+test "the reader reads a path out of another process and stops at the clamp" {
+    // **The one call this whole design is built around**, run against a real
+    // process. A child holds two strings and waits. This process reads them
+    // both by that child's pid.
+    //
+    // Mutation check: make `readPath` report `truncated = false` always and
+    // the truncation expectation fails. Make it give back the whole buffer
+    // rather than stopping at the terminator and the first string comparison
+    // fails.
+    //
+    // **Raising `path_read_clamp` is not a mutation this can catch, and that
+    // is on purpose.** The clamp is the size of the buffer the read fills, so
+    // no value of it can make the read run past what was asked for. What this
+    // pins is that the read stops at whatever the clamp is, rather than
+    // following the string to its end.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    // Held in this process, and read back through the kernel rather than by
+    // pointer, so nothing here can pass by reading its own memory: the read
+    // below names the child's pid, and the child is a fork with its own copy.
+    var short: [16]u8 = @splat(0);
+    @memcpy(short[0.."/etc/passwd".len], "/etc/passwd");
+    var long: [path_read_clamp * 2]u8 = @splat('b');
+    long[long.len - 1] = 0;
+
+    var pair: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair)),
+    );
+    const forked = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(forked));
+    if (forked == 0) {
+        // The child touches both strings so the pages are its own, then waits
+        // for the parent to finish reading.
+        short[short.len - 1] = 0;
+        long[0] = 'b';
+        _ = linux.close(pair[0]);
+        var wait: [1]u8 = undefined;
+        _ = linux.read(pair[1], &wait, 1);
+        linux.exit(0);
+    }
+    const child: linux.pid_t = @intCast(forked);
+    defer {
+        _ = linux.close(pair[0]);
+        var status: u32 = 0;
+        _ = linux.wait4(child, &status, 0, null);
+    }
+    _ = linux.close(pair[1]);
+
+    var buffer: [path_read_clamp]u8 = undefined;
+    const near = readPath(child, @intFromPtr(&short), &buffer) orelse {
+        // A kernel or a policy that refuses the read at all is not this test
+        // failing, and it must not read as a pass either.
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqualStrings("/etc/passwd", near.path);
+    try std.testing.expect(!near.truncated);
+
+    const far = readPath(child, @intFromPtr(&long), &buffer).?;
+    try std.testing.expectEqual(@as(usize, path_read_clamp), far.path.len);
+    try std.testing.expect(far.truncated);
+}
+
+test "a path the reader cannot reach is counted and never guessed at" {
+    // Mutation check: make `readPath` give back an empty path instead of null
+    // on a failed read and `unread` below stays zero while a name nobody ever
+    // opened appears in the record.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    var buffer: [path_read_clamp]u8 = undefined;
+    // Address zero is the argument a program passes when it has nothing. No
+    // process maps it.
+    try std.testing.expectEqual(@as(?PathRead, null), readPath(linux.getpid(), 0, &buffer));
+}
+
+test "the reader's own filter permits the one call the sandbox kills, and nothing the sandbox needs" {
+    // **The reader is a process of its own exactly because of this call.** A
+    // build in which the reader's filter and the sandbox's filter agreed about
+    // `process_vm_readv` would mean the separation had quietly been undone.
+    //
+    // Mutation check: take `.process_vm_readv` out of `seccomp.reader_calls`
+    // and the build stops at the `comptime` block beside it.
+    var reads_memory = false;
+    var writes_memory = false;
+    var opens = false;
+    for (seccomp.reader_calls) |call| {
+        if (call == .process_vm_readv) reads_memory = true;
+        if (call == .process_vm_writev) writes_memory = true;
+        if (call == .openat) opens = true;
+    }
+    try std.testing.expect(reads_memory);
+    // The reader reads. A reader that could write into the observed process
+    // would be able to change the very call it is recording.
+    try std.testing.expect(!writes_memory);
+    // Nothing the reader does needs a path, and it holds an empty Landlock
+    // ruleset in any case.
+    try std.testing.expect(!opens);
+
+    var blocked_and_allowed: usize = 0;
+    for (seccomp.reader_calls) |call| {
+        for (seccomp.blocked_calls) |killed| {
+            if (call == killed) blocked_and_allowed += 1;
+        }
+    }
+    // Exactly one: `process_vm_readv`, and no second call has quietly joined
+    // it.
+    try std.testing.expectEqual(@as(usize, 1), blocked_and_allowed);
 }

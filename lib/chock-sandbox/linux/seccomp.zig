@@ -196,6 +196,27 @@ pub const TrapCall = enum {
         };
     }
 
+    /// Which argument of this call is a pointer to a path, or null for a call
+    /// that names no path at all.
+    ///
+    /// **A property of the member, and never a number written at the place
+    /// that reads memory.** A member added above answers this question here,
+    /// once, beside the syscall number it already answers. A reader that
+    /// guessed would read the wrong pointer for one call and record a
+    /// filename that was never a filename.
+    ///
+    /// `connect` is null on purpose. Its second argument is a `sockaddr` and
+    /// not a path, and the one family that carries a path inside it needs the
+    /// address to be decoded rather than copied. `getdents64` takes a
+    /// descriptor, which names no path at all.
+    pub fn pathArg(self: TrapCall) ?u2 {
+        return switch (self) {
+            .openat => 1,
+            .execve => 0,
+            .connect, .getdents64 => null,
+        };
+    }
+
     /// The member a notification names, or null for a number no member holds.
     ///
     /// **The number comes from the kernel, inside the notification.** The
@@ -636,6 +657,94 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
     }
 
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ALLOW));
+    return insns.toOwnedSlice(allocator);
+}
+
+/// Every call the path reader may make, and the only ones it may make.
+///
+/// **An allowlist, where every other filter in this file is a denylist.** The
+/// reader is one loop of about forty lines and its whole job is four calls, so
+/// the set of calls it needs can be written down completely. Nothing else can
+/// be said about the process that holds `process_vm_readv`, which every other
+/// process Chock starts is killed for making, so nothing else is permitted.
+///
+/// What each one is for:
+///
+///   * `process_vm_readv` copies the path out of the observed process. It is
+///     the reason the reader exists, and it is a call on `blocked_calls`, so
+///     the reader can never run under the filter the rest of the sandbox runs
+///     under. `process_vm_writev` is **not** here: the reader reads.
+///   * `ioctl` carries `SECCOMP_IOCTL_NOTIF_RECV` and `SECCOMP_IOCTL_NOTIF_SEND`.
+///     The reader holds exactly one descriptor when this filter goes on,
+///     which is the notification descriptor, so the descriptor argument can
+///     reach nothing else. See `notify.runReader`, which closes every other
+///     descriptor before it installs this.
+///   * `poll` and `ppoll` wait for a notification. Which of the two the
+///     standard library calls depends on the architecture, so both are named
+///     when the architecture has both.
+///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
+///     process ends and how it comes back from a signal. A process that could
+///     not make them could not die cleanly or survive an interrupted wait.
+///
+/// **No `write`, no `openat`, no `socket`, no `connect`, and no `close`.** The
+/// reader has no way to put a byte anywhere except the shared record it was
+/// given before the filter went on, so a reader that was somehow turned
+/// against its owner still reaches nothing.
+pub const reader_calls = blk: {
+    var list: []const linux.SYS = &.{
+        .process_vm_readv,
+        .ioctl,
+        .ppoll,
+        .exit_group,
+        .exit,
+        .rt_sigreturn,
+        .restart_syscall,
+    };
+    // `poll` exists on x86_64 and does not exist on aarch64, where the
+    // standard library calls `ppoll` instead. Naming a member the table does
+    // not have would not build at all.
+    if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
+    break :blk list;
+};
+
+comptime {
+    // **The reader's filter must permit a call the sandbox kills.** That is
+    // the whole reason the reader is a process of its own, so a build in which
+    // the two lists agreed would mean the separation had quietly been undone.
+    var reads_memory = false;
+    for (reader_calls) |call| {
+        if (call == .process_vm_readv) reads_memory = true;
+    }
+    if (!reads_memory) @compileError(
+        "the path reader cannot read a path without process_vm_readv. See reader_calls.",
+    );
+}
+
+/// The filter the path reader runs under. **An allowlist**: every call not in
+/// `reader_calls` kills the process.
+///
+/// The caller owns the memory.
+pub fn buildReader(allocator: std.mem.Allocator) ![]bpf.Insn {
+    var insns: std.ArrayList(bpf.Insn) = .empty;
+    errdefer insns.deinit(allocator);
+
+    // Refuse any architecture but this one, before anything reads a call
+    // number. The same first three instructions `build` writes, and for the
+    // same reason: a call number means nothing until the architecture is known.
+    try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_arch));
+    try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, nativeAuditArch(), 1, 0));
+    try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
+
+    try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
+    for (reader_calls) |call| {
+        const number: u32 = @intCast(@intFromEnum(call));
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
+        try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ALLOW));
+    }
+
+    // **The default is death, and it is the last instruction.** A call that
+    // matched nothing above falls here.
+    try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
     return insns.toOwnedSlice(allocator);
 }
 
@@ -1498,4 +1607,49 @@ test "every syscall number a notification can carry maps back to the call it nam
         @as(?TrapCall, null),
         TrapCall.fromNumber(@intCast(@intFromEnum(linux.SYS.getppid))),
     );
+}
+
+test "the reader's filter permits its own four calls and kills the rest" {
+    // **An allowlist is only an allowlist if the kernel enforces it.** The
+    // list itself is checked in `linux/notify.zig`. This drives the filter the
+    // list builds, in a real process, against one call it must permit and one
+    // it must kill.
+    //
+    // A signal 31 death is the pass for the second half: the filter kills the
+    // process rather than refusing the call, which is how every other denial
+    // in this file behaves.
+    //
+    // Mutation check: make `buildReader` end with `RET_ALLOW` instead of
+    // `RET_KILL_PROCESS` and the child exits 12 rather than dying.
+    const allocator = std.testing.allocator;
+    const insns = try buildReader(allocator);
+    defer allocator.free(insns);
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        // A permitted call, so a death below is the filter and not this line.
+        // Zero descriptors and no timeout, which the kernel answers at once.
+        var none: [0]linux.pollfd = .{};
+        var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
+            std.process.exit(11);
+        }
+
+        // A call nobody put on the list. The filter kills this process here,
+        // so the exit below is never reached.
+        _ = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY }, 0);
+        std.process.exit(12);
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(std.posix.SIG.SYS, linux.W.TERMSIG(status));
 }

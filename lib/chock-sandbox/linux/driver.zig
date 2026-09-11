@@ -409,6 +409,22 @@ pub fn spawn(
         insns;
     defer if (watching) allocator.free(child_insns);
 
+    // The third program, for R, the path reader. **Built here for the reason
+    // the other two are**: a fork of a process with more than one thread may
+    // find the allocator's own lock held by a thread that no longer exists,
+    // and R is forked from A. See the thread safety note above.
+    //
+    // **A path audit with no trap set records nothing**, because a path is
+    // read out of a call the kernel is holding. The two are asked for apart,
+    // so the config that asks for one and not the other is honest about
+    // getting nothing rather than being refused.
+    const recording = watching and config.path_audit != null;
+    const reader_insns = if (recording)
+        seccomp.buildReader(allocator) catch |err| return err
+    else
+        &[_]bpf.Insn{};
+    defer if (recording) allocator.free(reader_insns);
+
     // The cgroup, made here in the parent for the same reason the seccomp
     // filter is built here: the child that has to move into it is a child
     // that has already given up its ability to open a path, and A's own
@@ -504,6 +520,18 @@ pub fn spawn(
             return error.NetBrokerSocketFailed;
         };
     }
+
+    // The page the path reader writes and this process reads. **Shared memory
+    // and not the middle pipe**, because the reader is killed by the kernel
+    // the instant the observed program ends: see `notify.PathRecord`.
+    //
+    // **Made before the fork on purpose, and given up by B before B applies a
+    // single layer.** B inherits it, and B is this project's own code until
+    // its own `execve`, which would replace the whole address space in any
+    // case. So the observed program never holds a mapping it could write a
+    // forged count into. See `applyLayers`.
+    const path_record: ?*notify.PathRecord = if (recording) mapPathRecord() else null;
+    defer if (path_record) |record| unmapPathRecord(record);
 
     // **The one place the two promises differ in what the kernel is asked
     // for.** A supplied cgroup is not joined after the fork: the child is
@@ -670,6 +698,15 @@ pub fn spawn(
             // See `namespace.Mount.Proc`, and `applyLayers` for the order of
             // the layers themselves, which is unchanged.
             if (notify_fds[0] >= 0) _ = linux.close(notify_fds[0]);
+            // **B gives up the shared record before it does anything else.**
+            // B inherited the mapping across the fork above, and B is the one
+            // process here that will later run code nobody in this project
+            // wrote. A mapping it kept would let it write its own numbers into
+            // a record that claims to come from the kernel. `execve` would
+            // take the mapping away in any case, because it replaces the whole
+            // address space, but this is written down rather than left to
+            // that. See `notify.PathRecord`.
+            if (path_record) |record| unmapPathRecord(record);
             applyLayers(allocator, config, abi, child_insns, write_fd, notify_fds[1]);
             armPdeathsig(write_fd, config.stderr_fd, middle_pidfd);
             execute(allocator, config, argv, write_fd, broker_fds[1]);
@@ -765,6 +802,41 @@ pub fn spawn(
             notify_fds[0] = -1;
         }
 
+        // **The path reader, forked here and nowhere else.** It has to be a
+        // child of A rather than of B, and it has to come after B, because
+        // `unshare(CLONE_NEWPID)` puts every child A makes from now on into
+        // the namespace whose process 1 is B. That placement is what bounds
+        // the reader: `process_vm_readv` names a pid, and a pid means nothing
+        // outside the namespace of the process that wrote it down. See
+        // `notify.zig`'s own top comment for the measurement.
+        //
+        // **A gives up its own copy of the listener the moment the reader has
+        // one.** Two holders would mean that killing the reader left the
+        // observed program waiting for an answer nobody would give. One holder
+        // means the kernel answers `ENOSYS` instead, so a program that kills
+        // its own auditor breaks its own opens. Measured on 2026-09-11, both
+        // ways round.
+        var reader_pid: linux.pid_t = -1;
+        if (listener >= 0 and path_record != null) {
+            const reader_rc = linux.fork();
+            if (linux.errno(reader_rc) == .SUCCESS) {
+                if (reader_rc == 0) runReader(
+                    listener,
+                    child_pidfd,
+                    reader_insns,
+                    path_record.?,
+                    config.path_audit.?.workspace,
+                );
+                reader_pid = @intCast(reader_rc);
+                _ = linux.close(listener);
+                listener = -1;
+            }
+            // A fork that failed leaves `reader_pid` at -1 and the listener in
+            // A's own hands, so the loop below runs and the counts still
+            // arrive. `ready` stays zero in the record, which is how the
+            // session log says the paths are missing.
+        }
+
         // A applied no layer to itself, because B applies them all: see the
         // comment on the fork above. So A takes the two that cost it nothing
         // and keep the promise it used to keep by accident, that a process
@@ -772,7 +844,12 @@ pub fn spawn(
         // dangerous call while it waits.
         restrictMiddle(abi, insns, middle_write_fd);
 
-        if (listener >= 0) {
+        if (reader_pid >= 0) {
+            // **The reader holds the listener, so A counts nothing here.**
+            // The numbers are in the shared record and they are not final
+            // until B has ended, so they are reported from inside
+            // `waitAndRelay` below and not from this line.
+        } else if (listener >= 0) {
             var counts = notify.empty_counts;
             const outcome = notify.serve(listener, child_pidfd, &counts);
             // **Closed before the wait below.** A process B left behind
@@ -798,7 +875,10 @@ pub fn spawn(
         // waits for B and relays B's outcome as its own, so the real parent's
         // single waitpid on A, further down in this function, still sees the
         // caller's program's real Term.
-        waitAndRelay(inner_pid, &areas, middle_write_fd);
+        waitAndRelay(inner_pid, &areas, middle_write_fd, if (reader_pid >= 0) .{
+            .pid = reader_pid,
+            .record = path_record.?,
+        } else null);
         unreachable;
     }
 
@@ -969,6 +1049,16 @@ pub fn spawn(
         .observed => audit.record(.{ .observed = middle_report.trap_counts }),
         .unobserved => audit.record(.unobserved),
     };
+
+    // The paths the reader wrote, which never went through the middle pipe at
+    // all: the reader is killed by the kernel when the sandboxed program ends,
+    // so it reports as it goes into memory this process shares with it. See
+    // `notify.PathRecord`. **Every number read out of it is untrusted input**,
+    // which `SyscallAudit.recordPaths` and `notify.PathRecord.name` are what
+    // bound.
+    if (config.syscall_audit) |audit| {
+        if (path_record) |record| audit.recordPaths(record);
+    }
 
     // The program has ended, so the kernel's own counters are final and the
     // cgroup can be read. **Read before `destroy` removes it**, which the
@@ -2044,7 +2134,27 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
 /// the kernel kills every other process left in that namespace. Chock wants
 /// exactly that: a tool call that leaves stray children behind cannot outlive
 /// the program the caller asked to run.
-fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, middle_write_fd: i32) noreturn {
+fn waitAndRelay(
+    pid: linux.pid_t,
+    areas: *const ScratchAreas,
+    middle_write_fd: i32,
+    reader: ?ReaderWatch,
+) noreturn {
+    // **The reader is reaped first, and that order is a deadlock rule.**
+    // Measured on 2026-09-11: with the two waits the other way round, this
+    // process waited for the sandboxed program, the sandboxed program waited
+    // inside `zap_pid_ns_processes`, and the reader sat between them as a
+    // zombie. The kernel does not let process 1 of a pid namespace finish
+    // leaving until every pid in that namespace has been freed, and a pid is
+    // freed when the task is reaped and not when it is killed. The reader is a
+    // child of this process, so nobody else can reap it.
+    //
+    // Waiting for the reader first costs nothing. The reader lives exactly as
+    // long as the sandboxed program does, because the kernel kills it when
+    // that program leaves the namespace they share. A reader that died early
+    // is reaped early, and the wait below then reads the program's own end.
+    if (reader) |watch| reapReader(watch, middle_write_fd);
+
     var status: u32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     // A signal caught by this process while it waits interrupts the call with
@@ -2199,6 +2309,161 @@ fn applyLayers(
     // not exist. A setup failure names the step instead.
     if (!notify.handOver(notify_fd, listener))
         die(write_fd, config.stderr_fd, .notify_handover, error.Unexpected);
+}
+
+/// The path reader A forked, and the page it writes. See `runReader`.
+const ReaderWatch = struct {
+    pid: linux.pid_t,
+    record: *notify.PathRecord,
+};
+
+/// Make the page the path reader and this process share.
+///
+/// **`MAP_SHARED` and anonymous.** Anonymous, so it has no name anywhere and
+/// the sandboxed program cannot ask for it by one. Shared, so a write by the
+/// reader is a write this process reads. Null when the kernel refused, which
+/// turns the path audit off for this call and leaves everything else working.
+fn mapPathRecord() ?*notify.PathRecord {
+    // Zig 0.16's `linux.mmap` takes the flags as packed structs. The plain
+    // numbers are what the kernel's own header calls `MAP_SHARED` and
+    // `MAP_ANONYMOUS`, and `probe.zig` reads them the same way.
+    const prot: linux.PROT = @bitCast(@as(u32, 0x1 | 0x2));
+    const flags: linux.MAP = @bitCast(@as(u32, 0x01 | 0x20));
+    const rc = linux.mmap(null, @sizeOf(notify.PathRecord), prot, flags, -1, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const record: *notify.PathRecord = @ptrFromInt(rc);
+    record.* = .{};
+    return record;
+}
+
+fn unmapPathRecord(record: *notify.PathRecord) void {
+    _ = linux.munmap(@ptrCast(record), @sizeOf(notify.PathRecord));
+}
+
+/// Wait for the path reader, say whether its end explains itself, and report
+/// the counts it made.
+///
+/// **The reader ends by leaving its own loop, and anything else is a loss.**
+/// The reader watches the observed program's own process descriptor as well as
+/// the notification descriptor, so the program's end wakes it and its loop
+/// returns. Measured on 2026-09-11: that is what happens on every ordinary
+/// run, and the reader exits 0.
+///
+/// A reader that ends any other way stopped early, and a reader that stopped
+/// early is not a silent loss: from that moment the kernel answered every held
+/// call with `ENOSYS`, because A gave up its own copy of the listener when the
+/// reader took it. This is the field that says so.
+///
+/// **The doubtful case is counted as a loss and not as a clean run.** The
+/// kernel also kills the reader as it tears the pid namespace down, and a
+/// reader killed that way before its loop returned cannot be told from one the
+/// observed program killed. Reading that as "the record may be short" is the
+/// safe direction for a field an audit reads.
+fn reapReader(watch: ReaderWatch, middle_write_fd: i32) void {
+    var status: u32 = undefined;
+    var rc = linux.waitpid(watch.pid, &status, 0);
+    while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
+
+    const ordinary = linux.errno(rc) == .SUCCESS and
+        !linux.W.IFSIGNALED(status) and
+        linux.W.EXITSTATUS(status) == 0;
+    if (!ordinary or watch.record.ready == 0) watch.record.reader_lost = 1;
+
+    // The same route the counts always took. See `reportTraps`.
+    reportTraps(middle_write_fd, &watch.record.counts);
+}
+
+/// The path reader, R. Never returns.
+///
+/// **Confines itself before it reads anything**, and in this order: every
+/// descriptor but the two it was given, then every capability but the one its
+/// read needs, then a seccomp allowlist. Only then does it touch the
+/// notification descriptor. It puts no Landlock ruleset on itself, and the
+/// body below says why that is a measurement rather than an oversight.
+///
+/// What it is permitted afterwards is `seccomp.reader_calls` and nothing else:
+/// `process_vm_readv`, `ioctl`, a wait, and the calls a process needs to end.
+/// It cannot open a path, make a socket, or write a byte to any descriptor.
+///
+/// **It does hold a copy of this program's own memory, and that is the one
+/// thing here that is not closed.** The reader is a fork of the supervisor,
+/// which is a fork of the process that holds the caller's provider credential,
+/// so that credential is in the reader's address space the way it is in the
+/// supervisor's. Nothing here can scrub it: this code does not know where it
+/// is. What is closed instead is every way out. The reader holds two
+/// descriptors, neither of which it may write to; it may not open a path, make
+/// a socket, or signal a process; and the sandboxed program cannot read the
+/// reader's memory either, because `process_vm_readv` and `ptrace` are both on
+/// `seccomp.blocked_calls`. A reader is worth attacking only for what it can
+/// then do, and it can do nothing.
+///
+/// **A layer that will not go on ends this process rather than weakening it.**
+/// The reader's whole reason to exist is that it may make a call every other
+/// process here is killed for making, so a reader running with less than its
+/// full confinement is the one outcome that must not happen quietly. Ending it
+/// is safe for the session: A has already given up the listener, so the kernel
+/// answers the observed program's held calls with `ENOSYS`, and `ready` stays
+/// zero in the record so the session log says the paths are missing.
+fn runReader(
+    listener: i32,
+    child_pidfd: i32,
+    reader_insns: []const bpf.Insn,
+    record: *notify.PathRecord,
+    workspace: []const u8,
+) noreturn {
+    keepOnlyDescriptors(listener, child_pidfd);
+
+    // **One capability is kept, and only one.** `CAP_SYS_PTRACE` in the
+    // sandbox's own user namespace is what lets this process read the observed
+    // program's memory at all under Yama's restricted ptrace mode, which is
+    // the default on this project's machine. It is held in a namespace made a
+    // moment earlier that owns nothing of the host's, and the filter below
+    // names no call a capability could otherwise be spent on. See
+    // `capabilities.keepOnly`.
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.keepOnly(linux.CAP.SYS_PTRACE, &cap_diag) catch linux.exit(1);
+
+    // **No Landlock ruleset of its own, and that is a measurement and not an
+    // oversight.** Landlock has a rule about `ptrace`: a process in a domain
+    // may only reach a process whose domain is that same domain or one nested
+    // inside it. The reader is forked by the supervisor and the observed
+    // program builds its own domain, so the two domains are siblings and
+    // neither one contains the other. Measured on 2026-09-11: a reader that
+    // put an empty ruleset on itself read nothing at all, and every path came
+    // back in the record's `unread` count.
+    //
+    // **It costs the reader nothing, because the filter above already denies
+    // more.** `seccomp.reader_calls` names no call that opens a path, makes a
+    // socket, or writes a byte, so there is no file operation for a Landlock
+    // rule to refuse. Landlock bounds which paths a process may reach. This
+    // process may reach none, because it cannot ask.
+    seccomp.install(bpf.Prog.init(reader_insns)) catch linux.exit(1);
+
+    // **Set after the layers and before the loop.** A zero here is the fact
+    // that says the reader never got as far as watching anything.
+    record.ready = 1;
+    const outcome = notify.serveRecording(listener, child_pidfd, record, workspace);
+    record.ended = 1;
+    linux.exit(if (outcome == .fault) 1 else 0);
+}
+
+/// Close every descriptor this process holds except the two named.
+///
+/// **Before the filter goes on, because `close_range` is not on the reader's
+/// allowlist.** The reader is left holding exactly two descriptors, so the
+/// `ioctl` its filter permits can reach the notification descriptor and the
+/// liveness handle and nothing else. `closeInheritedFds` already ran in A, so
+/// what is left here is A's own working set: the middle pipe, the caller's
+/// output descriptors, and the scratch areas.
+fn keepOnlyDescriptors(first: i32, second: i32) void {
+    const low = @min(first, second);
+    const high = @max(first, second);
+    const all: u32 = std.math.maxInt(u32);
+    if (low > 0) _ = linux.syscall3(.close_range, 0, @intCast(low - 1), 0);
+    if (high > low + 1) {
+        _ = linux.syscall3(.close_range, @intCast(low + 1), @intCast(high - 1), 0);
+    }
+    _ = linux.syscall3(.close_range, @intCast(high + 1), all, 0);
 }
 
 /// What A holds while it waits for B: a Landlock ruleset with no rule in it,

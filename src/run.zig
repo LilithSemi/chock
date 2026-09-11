@@ -5501,10 +5501,21 @@ fn logSyscallAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    audit: *const sandbox.Sandbox.SyscallAudit,
+    audit: *sandbox.Sandbox.SyscallAudit,
 ) void {
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
-    const ev = syscallEvent(audit.counts(), &rows);
+    var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
+    var names: [syscall_name_cap][]const u8 = undefined;
+    // **Called with the tool calls already stopped.** The names it gives back
+    // point into the audit's own storage, and a call still in flight could
+    // add one. See `SyscallAudit.pathCounts`.
+    const ev = syscallEvent(
+        audit.counts(),
+        audit.pathCounts(),
+        &rows,
+        &path_rows,
+        &names,
+    );
 
     var locked = storage.lock(io) catch |err| {
         reportSyscallRecord(err);
@@ -5533,6 +5544,10 @@ fn reportSyscallRecord(err: anyerror) void {
 /// sandbox can watch, read from the sandbox itself so the two cannot drift.
 const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".fields.len;
 
+/// How many paths one `sandbox.syscalls` event can name, read from the sandbox
+/// for the reason the row count above is.
+const syscall_name_cap = sandbox.Sandbox.SyscallAudit.name_cap;
+
 /// The `sandbox.syscalls` event `logSyscallAudit` writes. **Pure**, so its
 /// shape can be checked without touching storage: see the tests below.
 ///
@@ -5540,17 +5555,59 @@ const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".fields.len
 /// borrows it rather than owning it.
 fn syscallEvent(
     counts: sandbox.Sandbox.SyscallAudit.Counts,
+    paths: sandbox.Sandbox.SyscallAudit.PathCounts,
     rows: *[syscall_row_count]chock_proto.event.SyscallCount,
+    path_rows: *[syscall_row_count]chock_proto.event.UnverifiedPaths,
+    names: *[syscall_name_cap][]const u8,
 ) chock_proto.event.Event {
+    // The names come back from the audit in the order the reader kept them,
+    // which mixes the calls together. The event gives each call its own list,
+    // so they are grouped here, one call at a time, into the caller's storage.
+    var filled: usize = 0;
     inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
+        const first = filled;
+        var kept: u32 = 0;
+        while (kept < paths.kept) : (kept += 1) {
+            if (paths.name_call[kept] != field.value) continue;
+            if (filled >= names.len) break;
+            names[filled] = paths.names[kept];
+            filled += 1;
+        }
         rows[field.value] = .{ .name = field.name, .count = counts.calls[field.value] };
+        path_rows[field.value] = .{
+            .inside_workspace = paths.inside[field.value],
+            .outside_workspace = paths.outside[field.value],
+            .outside_unnamed = paths.outside_unnamed[field.value],
+            .unread = paths.unread[field.value],
+            .truncated = paths.truncated[field.value],
+            .outside_names = names[first..filled],
+        };
+        // **Left out for a call that recorded nothing**, rather than written
+        // as a row of zeros. A path audit is off by default, most calls name
+        // no path at all, and a row of zeros for each of them would be most
+        // of the line. `paths_verified` below is always there, so a reader
+        // still learns the mechanism exists and what its output is worth.
+        const row = path_rows[field.value];
+        const said_something = row.inside_workspace != 0 or row.outside_workspace != 0 or
+            row.outside_unnamed != 0 or row.unread != 0 or row.truncated != 0 or
+            row.outside_names.len != 0;
+        if (said_something) rows[field.value].unverified_paths = row;
     }
-    return .{ .sandbox_syscalls = .{
-        .mechanism = sandbox.Sandbox.SyscallAudit.mechanism_name,
-        .observed = counts.observed,
-        .unobserved = counts.unobserved,
-        .calls = rows,
-    } };
+    return .{
+        .sandbox_syscalls = .{
+            .mechanism = sandbox.Sandbox.SyscallAudit.mechanism_name,
+            .observed = counts.observed,
+            .unobserved = counts.unobserved,
+            .calls = rows,
+            // **False, and a field rather than a word in a comment.** The
+            // supervisor lets the held call run, so the program can change the
+            // argument after the reader read it. See
+            // `chock_proto.event.UnverifiedPaths`.
+            .paths_verified = false,
+            .path_readers_lost = paths.readers_lost,
+            .path_readers_absent = paths.readers_absent,
+        },
+    };
 }
 
 /// The `network.summary` event `ToolNetwork.logSummary` writes, or null when
@@ -5679,11 +5736,13 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     // expectation fails. Fill `rows` from a fixed list instead of from
     // `TrapCall` and the row count stops moving with the sandbox.
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
+    var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
+    var names: [syscall_name_cap][]const u8 = undefined;
     const ev = syscallEvent(.{
         .observed = 4,
         .unobserved = 1,
         .calls = .{ 900, 4, 0, 12 },
-    }, &rows);
+    }, emptyPathCounts(), &rows, &path_rows, &names);
 
     try std.testing.expectEqual(chock_proto.event.Kind.sandbox_syscalls, std.meta.activeTag(ev));
     const said = ev.sandbox_syscalls;
@@ -5707,6 +5766,160 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     try std.testing.expectEqual(
         @as(u64, 0),
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].count,
+    );
+    // A session that asked for no path audit leaves the path field out
+    // altogether rather than writing a row of zeros for every call. The
+    // machine readable flag is still there, so a reader learns the mechanism
+    // exists and that nothing it could produce would be verified.
+    //
+    // Mutation check: write `unverified_paths` whether or not anything was
+    // recorded and the first expectation below fails.
+    try std.testing.expectEqual(
+        @as(?chock_proto.event.UnverifiedPaths, null),
+        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].unverified_paths,
+    );
+    try std.testing.expectEqual(false, said.paths_verified);
+    try std.testing.expectEqual(@as(u64, 0), said.path_readers_lost);
+}
+
+test "a full path record is still one short line of the session log" {
+    // **The requirement, and it is a number.** A session that names a path for
+    // every call would grow the log without bound, which is a cost this
+    // project has already paid once: 200 network connections cost 159 KB
+    // before that record was made a summary. The cap in
+    // `sandbox.notify.kept_path_cap` is what bounds it, and this is what
+    // checks the cap was chosen well rather than only written down.
+    //
+    // This builds the worst case the reader can produce: every slot full, and
+    // every name as long as a slot holds.
+    //
+    // Mutation check: raise `notify.kept_path_bytes` to 512 and this fails.
+    const gpa = std.testing.allocator;
+    var longest: [sandbox.notify.kept_path_bytes]u8 = @splat('n');
+    longest[0] = '/';
+
+    var counted = emptyPathCounts();
+    counted.kept = syscall_name_cap;
+    for (0..syscall_name_cap) |slot| {
+        counted.name_call[slot] = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        counted.names[slot] = &longest;
+        counted.inside[slot % sandbox.notify.call_count] = std.math.maxInt(u32);
+    }
+
+    var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
+    var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
+    var names: [syscall_name_cap][]const u8 = undefined;
+    const ev = syscallEvent(.{
+        .observed = 1000,
+        .unobserved = 0,
+        .calls = @splat(std.math.maxInt(u32)),
+    }, counted, &rows, &path_rows, &names);
+
+    const line = try chock_proto.event.toJson(gpa, .{
+        .id = 0,
+        .session = "01JQ0000000000000000000000",
+        .time_ms = 1_700_000_000_000,
+        .event = ev,
+    });
+    defer gpa.free(line);
+
+    // **Under two kilobytes for the worst case, and written once for a whole
+    // session.** Measured on 2026-09-11: this line is 1,503 bytes with every
+    // slot full and every counter saturated, and a real record that named
+    // three paths is 743 bytes. The fault this cap exists to stop is a record
+    // that grows with the number of opens, and this one does not grow at all.
+    try std.testing.expect(line.len < 2048);
+}
+
+/// A path record with nothing in it, for the tests that are about the counts.
+fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
+    return .{
+        .readers_lost = 0,
+        .readers_absent = 0,
+        .inside = sandbox.notify.empty_counts,
+        .outside = sandbox.notify.empty_counts,
+        .outside_unnamed = sandbox.notify.empty_counts,
+        .unread = sandbox.notify.empty_counts,
+        .truncated = sandbox.notify.empty_counts,
+        .kept = 0,
+        .name_call = @splat(0),
+        .names = @splat(&.{}),
+    };
+}
+
+test "the syscall event names each call's own paths, and says they are not verified" {
+    // **The requirement, and the caveat that must survive a refactor.** A
+    // machine reading the log answers "what did this session's programs open
+    // outside the workspace" from `outside_names`, "how much is missing" from
+    // `outside_unnamed`, and "is any of this proof" from `paths_verified`.
+    //
+    // The names come back from the sandbox mixed together, one list for every
+    // call, so the grouping here is what gives each call its own. A row that
+    // took the whole list would report the program's `execve` target as a file
+    // it opened.
+    //
+    // Mutation check: drop the `name_call` comparison in `syscallEvent` and
+    // the `openat` row picks up the `execve` name, so the count of two below
+    // becomes three.
+    const openat = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+    const execve = @intFromEnum(sandbox.seccomp.TrapCall.execve);
+
+    var counted = emptyPathCounts();
+    counted.readers_lost = 2;
+    counted.readers_absent = 1;
+    counted.inside[openat] = 812;
+    counted.outside[openat] = 9;
+    counted.outside_unnamed[openat] = 6;
+    counted.truncated[openat] = 1;
+    counted.outside[execve] = 1;
+    counted.kept = 3;
+    counted.name_call[0] = openat;
+    counted.names[0] = "/etc/passwd";
+    counted.name_call[1] = execve;
+    counted.names[1] = "/bin/sh";
+    counted.name_call[2] = openat;
+    counted.names[2] = "/home/someone/.ssh/id_ed25519";
+
+    var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
+    var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
+    var names: [syscall_name_cap][]const u8 = undefined;
+    const ev = syscallEvent(.{
+        .observed = 1,
+        .unobserved = 0,
+        .calls = .{ 821, 1, 0, 0 },
+    }, counted, &rows, &path_rows, &names);
+
+    const said = ev.sandbox_syscalls;
+    // **The word an auditor has to type.** See `chock_proto.event.UnverifiedPaths`.
+    try std.testing.expectEqual(false, said.paths_verified);
+    try std.testing.expectEqual(@as(u64, 2), said.path_readers_lost);
+    try std.testing.expectEqual(@as(u64, 1), said.path_readers_absent);
+
+    const opens = said.calls[openat].unverified_paths.?;
+    try std.testing.expectEqual(@as(u64, 812), opens.inside_workspace);
+    try std.testing.expectEqual(@as(u64, 9), opens.outside_workspace);
+    // **The explicit overflow count.** Without it a full set reads as the
+    // whole truth.
+    try std.testing.expectEqual(@as(u64, 6), opens.outside_unnamed);
+    try std.testing.expectEqual(@as(u64, 1), opens.truncated);
+    try std.testing.expectEqual(@as(usize, 2), opens.outside_names.len);
+    try std.testing.expectEqualStrings("/etc/passwd", opens.outside_names[0]);
+    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.outside_names[1]);
+
+    const execs = said.calls[execve].unverified_paths.?;
+    try std.testing.expectEqual(@as(usize, 1), execs.outside_names.len);
+    try std.testing.expectEqualStrings("/bin/sh", execs.outside_names[0]);
+
+    // **A call that recorded nothing gets no row at all.** `connect` names a
+    // socket address and never a path, so a row of zeros for it would be a
+    // quarter of this line saying nothing. The `count` field beside it still
+    // says how many times the call was made.
+    //
+    // Mutation check: write the row whether or not it said anything and this
+    // expectation fails.
+    try std.testing.expectEqual(
+        @as(?chock_proto.event.UnverifiedPaths, null),
+        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].unverified_paths,
     );
 }
 
@@ -5769,7 +5982,7 @@ test "a session that watched nothing still writes the event, so an absence is ne
     const storage = backing.storage();
     defer storage.close(io);
 
-    const audit: sandbox.Sandbox.SyscallAudit = .{};
+    var audit: sandbox.Sandbox.SyscallAudit = .{};
     logSyscallAudit(gpa, io, storage, &audit);
 
     var replay = try storage.replay(gpa, io, 0);

@@ -1446,15 +1446,68 @@ pub const SyscallCount = struct {
     name: []const u8,
     /// How many times the sandboxed programs of this session made it.
     count: u64 = 0,
-    /// **This is where a path list joins, and it joins here.** Counting is
-    /// what this event carries today. The call a program made is known, and
-    /// the path it named is not. When the supervisor reads the path too, it
-    /// becomes another field on this struct, beside `count`, and every reader
-    /// of this kind keeps working: a reader with no field for it keeps it in
-    /// `extra` and writes it back out, which is what this file's own top
-    /// comment promises for a struct that gains a field. No new kind, no new
-    /// wire name, and no reader anywhere has to learn anything to keep
-    /// reading the counts.
+    /// The paths this call named, as the programs that made it **said** they
+    /// were. Null for a session that asked for no path audit, and for a call
+    /// that names no path at all.
+    ///
+    /// **The field is named for what the paths are worth, and that is the
+    /// point of the name.** A reader who quotes this in an audit has typed the
+    /// word `unverified` themselves. See `UnverifiedPaths`, and
+    /// `SandboxSyscalls.paths_verified`, which is the machine readable half of
+    /// the same fact.
+    ///
+    /// **A field on this struct and not a kind of its own.** A reader with no
+    /// field for it keeps it in `extra` and writes it back out, which is what
+    /// this file's own top comment promises for a struct that gains a field.
+    /// No new kind, no new wire name, and no reader anywhere has to learn
+    /// anything to keep reading the counts.
+    unverified_paths: ?UnverifiedPaths = null,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// The paths one system call named, as the programs that made it said they
+/// were.
+///
+/// **This is telemetry and it is not audit evidence.** The supervisor lets
+/// every held call run, so the kernel reads the argument again after the
+/// reader has read it. A process that wants to lie about a filename can write
+/// one string, wait to be let go, and then open another. Everything here is
+/// what the process **said**.
+///
+/// Two things carry that outward rather than leaving it in a comment. The
+/// first is this type's own name, which a reader quoting a field has to type.
+/// The second is `SandboxSyscalls.paths_verified`, a flag a mode that reads
+/// the path the kernel actually used can set to true on this same event kind,
+/// beside a field of its own. See `lib/chock-sandbox/linux/notify.zig`.
+///
+/// **The counts on `SyscallCount` are a different thing and stay
+/// unforgeable.** The call number comes from the kernel inside the
+/// notification and the process it is about cannot change it.
+pub const UnverifiedPaths = struct {
+    /// Calls whose path was under the session's workspace. **Counted and
+    /// never named**: one tool call makes thousands of these, and a record
+    /// that named them would grow the log without bound.
+    inside_workspace: u64 = 0,
+    /// Calls whose path was not. These are the few a reader of this record
+    /// wants, so they are named in `outside_names` until that set is full.
+    outside_workspace: u64 = 0,
+    /// Calls outside the workspace whose path is **not** in `outside_names`.
+    /// The explicit overflow count. Anything above zero means the set below
+    /// is short, and by how much.
+    outside_unnamed: u64 = 0,
+    /// Calls whose path the reader could not read out of the observed process
+    /// at all. Counted rather than guessed at.
+    unread: u64 = 0,
+    /// Calls whose path was longer than the reader's clamp, so the name kept
+    /// for it is a prefix of what the process wrote.
+    truncated: u64 = 0,
+    /// The distinct paths outside the workspace, capped. See `outside_unnamed`
+    /// for what a full set leaves out.
+    outside_names: []const []const u8 = &.{},
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1506,6 +1559,25 @@ pub const SandboxSyscalls = struct {
     /// gets a row, so a reader can tell a call that was watched and never made
     /// from a call this build does not watch at all.
     calls: []const SyscallCount = &.{},
+    /// Whether the paths in the rows above are what the kernel used, or only
+    /// what the observed program said.
+    ///
+    /// **False today, on purpose, and it is a field rather than a word in a
+    /// comment.** The supervisor lets the held call run, so the program can
+    /// change the argument after the path was read. A mode that hands the
+    /// kernel a descriptor the supervisor opened itself would know the real
+    /// path, and it sets this to true on this same event kind rather than
+    /// making a kind of its own. The precedent is `SandboxSupervisor.layer`.
+    paths_verified: bool = false,
+    /// Tool calls whose path reader stopped before the program did. **This is
+    /// the field an audit reads** for the path rows, the way `unobserved` is
+    /// the field it reads for the counts. From the moment a reader stops, the
+    /// kernel answers the program's own held calls with `ENOSYS`, so the
+    /// program cannot go on unrecorded in silence, but the rows above are
+    /// short by whatever it did first.
+    path_readers_lost: u64 = 0,
+    /// Tool calls whose path reader never started at all.
+    path_readers_absent: u64 = 0,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1887,6 +1959,75 @@ test "an envelope survives a round trip through JSON" {
     try std.testing.expectEqual(original.time_ms, parsed.value.time_ms);
     try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
     try std.testing.expectEqualStrings("hello", parsed.value.event.message.content[0].text);
+}
+
+test "a path record survives a round trip, caveat and overflow count included" {
+    // **A record a reader cannot parse back is not a record.** The paths are
+    // an optional struct inside a list of structs, and the names inside it are
+    // a list of strings, which is the deepest shape this event kind has. A
+    // reader that lost `paths_verified` on the way through would read a set of
+    // unverified names as though a supervisor had proved them.
+    //
+    // Mutation check: give `paths_verified` a default of `true` and the
+    // caveat expectation below fails, which is the one field a reader uses to
+    // decide whether any of this is proof. Delete `unverified_paths` from
+    // `SyscallCount` and this test stops building at all.
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "/etc/shadow", "/home/someone/.ssh/id_ed25519" };
+    const rows = [_]SyscallCount{
+        .{ .name = "openat", .count = 900, .unverified_paths = .{
+            .inside_workspace = 812,
+            .outside_workspace = 9,
+            .outside_unnamed = 7,
+            .truncated = 1,
+            .outside_names = &names,
+        } },
+        .{ .name = "connect", .count = 0 },
+    };
+    const original = Envelope{
+        .id = 8192,
+        .session = "01H0",
+        .time_ms = 1_700_000_000_000,
+        .event = .{ .sandbox_syscalls = .{
+            .mechanism = "seccomp_user_notif",
+            .observed = 3,
+            .calls = &rows,
+            .path_readers_lost = 1,
+        } },
+    };
+
+    const text = try toJson(allocator, original);
+    defer allocator.free(text);
+
+    // **The wire names, checked as text.** Requirement two of this record is
+    // that a person quoting it in an audit types the caveat themselves, so
+    // the name on the wire is the name that carries it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"unverified_paths\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"paths_verified\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"outside_unnamed\"") != null);
+
+    const parsed = try fromJson(allocator, text);
+    defer parsed.deinit();
+
+    const said = parsed.value.event.sandbox_syscalls;
+    // **The machine readable caveat.** A mode that reads the path the kernel
+    // actually used sets this true on this same kind, beside a field of its
+    // own. See `UnverifiedPaths`.
+    try std.testing.expectEqual(false, said.paths_verified);
+    try std.testing.expectEqual(@as(u64, 1), said.path_readers_lost);
+
+    const opens = said.calls[0].unverified_paths.?;
+    try std.testing.expectEqual(@as(u64, 812), opens.inside_workspace);
+    try std.testing.expectEqual(@as(u64, 9), opens.outside_workspace);
+    try std.testing.expectEqual(@as(u64, 7), opens.outside_unnamed);
+    try std.testing.expectEqual(@as(u64, 1), opens.truncated);
+    try std.testing.expectEqual(@as(usize, 2), opens.outside_names.len);
+    try std.testing.expectEqualStrings("/etc/shadow", opens.outside_names[0]);
+    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.outside_names[1]);
+
+    // A call that recorded nothing carries no path record at all, and that
+    // reads back as null rather than as a set of zeros.
+    try std.testing.expectEqual(@as(?UnverifiedPaths, null), said.calls[1].unverified_paths);
 }
 
 test "a reasoning block's signature survives a round trip byte for byte" {

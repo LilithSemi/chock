@@ -45,6 +45,39 @@ const stdin_pipe_token = "chock-helper-request";
 /// against whatever happened.
 const opens_in_probe = 17;
 
+/// The path outside the workspace that `spawned-name-paths` names, and that
+/// `spawn-path-audit` then looks for in the record. **Nothing is ever there**:
+/// the kernel tells the reader before it runs the call, so a path that does
+/// not exist is recorded exactly as one that does.
+const named_outside = "/etc/chock-probe-secret";
+
+/// The path inside the workspace the same program opens. It must be counted
+/// and never named. `/nix/store` is the workspace for that run.
+const named_inside = "/nix/store";
+
+/// The workspace `spawn-path-audit` names. The big tree every loader open
+/// lands in, so the names the record keeps are the few a reader wants.
+const audited_workspace = "/nix/store";
+
+/// End `spawned-kill-the-reader` when its own alarm goes off. **One system
+/// call and nothing else**, because this runs in a signal handler.
+///
+/// The status says which fault it was: the sandboxed program was held inside a
+/// call that nothing answered, which is the shape a supervisor that kept its
+/// own copy of the notification descriptor leaves behind.
+fn endOnAlarm(_: std.posix.SIG) callconv(.c) void {
+    linux.exit(alarm_exit_status);
+}
+
+/// What `endOnAlarm` ends with. Not zero, so the caller reads it as the
+/// failure it is.
+const alarm_exit_status = 9;
+
+/// Where the path reader is, as the sandboxed program sees it. The supervisor
+/// forks the program first, so the program is process 1 of the new pid
+/// namespace, and forks the reader second, so the reader is process 2.
+const reader_pid_in_namespace: linux.pid_t = 2;
+
 /// End this program with `nothing_measured_exit_status` when `err` is the
 /// sandbox refusing to be built at all.
 ///
@@ -1473,6 +1506,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-syscall-audit") or
         std.mem.eql(u8, args[1], "spawn-syscall-audit-off") or
         std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon") or
+        // The three path audit runs, for the same reason again.
+        std.mem.eql(u8, args[1], "spawn-path-audit") or
+        std.mem.eql(u8, args[1], "spawn-path-audit-off") or
+        std.mem.eql(u8, args[1], "spawn-path-audit-killed") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -2617,6 +2654,97 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             _ = linux.close(@intCast(rc));
         }
         return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-name-paths")) {
+        // Two names outside the workspace, one of them three times, and one
+        // name inside it. The workspace for this run is `/nix/store`, which
+        // is the tree the toolchain lives in, so the two names below are the
+        // few a reader of the record actually wants. **This program is
+        // statically linked**, so nothing but these calls opens anything at
+        // all, and the counts the caller checks are exact rather than a floor.
+        //
+        // **The opens do not have to succeed.** The kernel holds the call and
+        // tells the reader before it runs the call at all, so a path that is
+        // not there is recorded exactly as one that is. That is the point: an
+        // attempt on a path the sandbox does not hold is the interesting event.
+        var made: usize = 0;
+        while (made < 3) : (made += 1) {
+            const rc = linux.openat(linux.AT.FDCWD, named_outside, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
+        }
+        const second = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(second) != .SUCCESS) return 5;
+        _ = linux.close(@intCast(second));
+
+        const inside = linux.openat(linux.AT.FDCWD, named_inside, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(inside) == .SUCCESS) _ = linux.close(@intCast(inside));
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-kill-the-reader")) {
+        // **Killing your own auditor breaks your own opens.** This process is
+        // process 1 of its own pid namespace and the reader is process 2 of
+        // the same one, so this process can reach it with an ordinary signal.
+        // The supervisor gave up its copy of the notification descriptor when
+        // the reader took it, so the reader's death releases the listener and
+        // the kernel answers every held call with ENOSYS from that moment.
+        //
+        // The open below succeeded before the kill: see `spawned-name-paths`,
+        // which opens the same path under a live reader.
+        const before = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(before) != .SUCCESS) return 5;
+        _ = linux.close(@intCast(before));
+
+        // **An alarm, because the failure this test is about is a wait with no
+        // end.** With the supervisor still holding a copy of the notification
+        // descriptor, the first open after the kill is held by the kernel for
+        // an answer nobody will ever give, and this process would never reach
+        // the loop below at all. A test that hangs when the code it guards is
+        // broken is worth no more than a test that skips, so the kernel ends
+        // this process instead and the caller reads a program killed by a
+        // signal rather than waiting for the whole suite.
+        //
+        // **A handler, and not the default action.** This process is process 1
+        // of its own pid namespace, and the kernel discards every signal whose
+        // action is the default for such a process. Measured on 2026-09-11: an
+        // alarm with the default action left this run waiting with no end at
+        // all. A handler is delivered, so the alarm ends this process the way
+        // it was meant to.
+        const on_alarm = std.posix.Sigaction{
+            .handler = .{ .handler = endOnAlarm },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        if (linux.errno(linux.sigaction(.ALRM, &on_alarm, null)) != .SUCCESS) return 10;
+
+        // `setitimer` counts whole seconds here, so the sub second field is
+        // zero and the unit the kernel reads for it does not matter.
+        const alarm: linux.itimerspec = .{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{ .sec = 10, .nsec = 0 },
+        };
+        if (linux.errno(linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
+            return 9;
+
+        if (linux.errno(linux.kill(reader_pid_in_namespace, std.posix.SIG.KILL)) != .SUCCESS) return 6;
+
+        // The kill is delivered to another process, so this loop is what
+        // waits for it to take effect. Bounded as well as alarmed, so a build
+        // where the reader never dies fails rather than hanging.
+        var tries: usize = 0;
+        while (tries < 1000) : (tries += 1) {
+            const after = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+            switch (linux.errno(after)) {
+                .SUCCESS => {
+                    _ = linux.close(@intCast(after));
+                    var pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+                    _ = linux.nanosleep(&pause, null);
+                },
+                // The one answer this whole test is about.
+                .NOSYS => return 0,
+                else => return 7,
+            }
+        }
+        return 8;
     }
     if (std.mem.eql(u8, args[1], "spawned-leave-daemon")) {
         // Fork a process that outlives this one, then end. The supervisor must
@@ -4380,6 +4508,118 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-path-audit") or
+        std.mem.eql(u8, args[1], "spawn-path-audit-off"))
+    {
+        // **The whole chain again, one level deeper.** The counting run above
+        // says `openat` happened. This run says what was named. A third
+        // process, forked inside the sandboxed program's own pid namespace,
+        // holds the notification descriptor and copies the path argument out
+        // of the held call before it answers.
+        //
+        // The second name is the control: the identical program runs with no
+        // path audit asked for, and nothing may be recorded.
+        //
+        // The exit status is the answer, because nothing here may print: the
+        // audit lives in this process's own memory.
+        const auditing = std.mem.eql(u8, args[1], "spawn-path-audit");
+        const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .syscall_audit = &audit,
+            .path_audit = if (auditing) .{ .workspace = audited_workspace } else null,
+        }, &.{ "/probe", "spawned-name-paths" }, null, null);
+
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+
+        const slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        const seen = &audit.paths.seen;
+        if (!auditing) {
+            // Nothing was asked for, so nothing may be there. A count above
+            // zero would mean the record comes from somewhere other than a
+            // reader this config asked for.
+            if (seen.kept != 0) return 5;
+            if (seen.inside[slot] != 0 or seen.outside[slot] != 0) return 6;
+            if (audit.paths.readers_lost != 0 or audit.paths.readers_absent != 0) return 7;
+            // The counting still works with no path audit, which is the
+            // promise that the default costs nothing.
+            if (audit.counts().calls[slot] == 0) return 8;
+            return 0;
+        }
+
+        // The reader reached its loop and ended the way the teardown explains.
+        if (audit.paths.readers_absent != 0) return 9;
+        if (audit.paths.readers_lost != 0) return 10;
+
+        // The program opened one path under the workspace on purpose, so a
+        // zero here means the classification put it on the wrong side or the
+        // reader read nothing at all.
+        if (seen.inside[slot] == 0) return 11;
+
+        var named_the_secret = false;
+        var named_the_workspace = false;
+        var kept: u32 = 0;
+        while (kept < seen.kept) : (kept += 1) {
+            const name = seen.name(kept);
+            if (std.mem.eql(u8, name, named_outside)) named_the_secret = true;
+            if (std.mem.startsWith(u8, name, audited_workspace)) named_the_workspace = true;
+        }
+        // **The one fact this whole feature exists for.** A path outside the
+        // workspace is named, and the program named it three times, so the
+        // set holds it once.
+        if (!named_the_secret) return 12;
+        // **The other half, and the one that keeps the record small.** Not one
+        // of the thousands of opens under the workspace is named.
+        if (named_the_workspace) return 13;
+        if (seen.outside[slot] < 4) return 14;
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-path-audit-killed")) {
+        // **The fail closed half.** The sandboxed program kills the reader
+        // that is watching it. The supervisor has no copy of the notification
+        // descriptor left, so the kernel answers every held call with ENOSYS
+        // from that moment, and the program proves it by reading that errno
+        // back. This process then reads the record and finds the loss written
+        // down rather than passed over.
+        const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .syscall_audit = &audit,
+            .path_audit = .{ .workspace = audited_workspace },
+        }, &.{ "/probe", "spawned-kill-the-reader" }, null, null);
+
+        // The program itself says whether the kernel answered ENOSYS. Any
+        // other status is that check failing and not this one.
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+        // The reader reached its loop, so the loss below is a reader that was
+        // killed and not one that never ran.
+        if (audit.paths.readers_absent != 0) return 5;
+        // **The field an audit reads.** Without it a session could not tell a
+        // program that was watched all the way through from one that killed
+        // what was watching it.
+        if (audit.paths.readers_lost != 1) return 6;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-syscall-audit") or

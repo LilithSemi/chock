@@ -1107,6 +1107,67 @@ test "a sandbox that was asked to watch nothing counts nothing and still runs" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "the supervisor names the paths the sandboxed program asked for outside its workspace" {
+    // **The counting run above says `openat` happened 14,434 times. It does
+    // not say what was opened.** This is the chain that answers that, and it
+    // is a chain no unit test can stand in for: a third process, forked inside
+    // the sandboxed program's own pid namespace, holds the notification
+    // descriptor and copies the path out of the held call with
+    // `process_vm_readv`, a call the supervisor itself is killed for making.
+    //
+    // **What comes back is what the program said, and never proof.** The
+    // answer to the notification is `CONTINUE`, so the program is free to
+    // write one name, wait to be let go, and open another. The record says so
+    // in the field name and in `paths_verified`. See `linux/notify.zig`.
+    //
+    // Mutation check: delete the `readAndNote` call in `notify.answerOne` and
+    // the run exits 11, which is the count of opens inside the workspace.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-path-audit", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a sandbox that was asked to record no path records none and still counts" {
+    // The control for the test above. The identical program runs with no path
+    // audit asked for: no reader is forked, no memory is read anywhere, and
+    // the record stays empty. **The counts still arrive**, which is the
+    // promise that turning this on is the only thing that changes anything.
+    //
+    // Mutation check: make `spawn` map a record whether or not a path audit
+    // was asked for, and this run exits 7, because a record with no reader
+    // behind it counts the reader as one that never started.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-path-audit-off", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a program that kills the reader watching it breaks its own opens" {
+    // **The fail closed property, measured through the whole system.** The
+    // reader is inside the sandboxed program's own pid namespace, so that
+    // program can signal it. The supervisor gave up its own copy of the
+    // notification descriptor the moment the reader took it, so the reader is
+    // the last holder, and a filter whose listener nobody holds makes the
+    // kernel answer every held call with `ENOSYS`. The sandboxed program
+    // reads that errno back itself.
+    //
+    // **And the loss is visible.** A session that could not tell a watched
+    // program from one that killed its watcher would be worse than no record
+    // at all.
+    //
+    // Mutation check: stop `spawn` from closing A's own copy of the listener
+    // after the reader fork and this run exits 4, because the sandboxed
+    // program is then held in an `openat` that a second holder never answers
+    // and its own alarm ends it. **Measured first without that alarm, when
+    // the same mutation made this run hang with no end at all**, which is
+    // worth no more than a test that skips.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-path-audit-killed", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a program that leaves a process behind does not hold the tool call open" {
     // Every process the sandboxed program forks carries the same filter, so
     // the kernel keeps the notification descriptor alive until the last of

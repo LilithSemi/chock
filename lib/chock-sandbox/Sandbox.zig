@@ -366,6 +366,39 @@ pub const Config = struct {
     /// `supervisor_audit` above gives, and a copy that outlives one call is
     /// the point for the same reason.
     syscall_audit: ?*SyscallAudit = null,
+    /// Whether the supervisor also records **which paths** the sandboxed
+    /// program named, and not only how many calls it made. Null is the
+    /// default, and null changes nothing for a caller that never asked.
+    ///
+    /// **It needs `seccomp_options.traps` as well.** A path is read out of a
+    /// held call, so a call nobody holds names nothing. A config that sets
+    /// this and traps nothing records nothing, and says so with a record of
+    /// zeros rather than by failing.
+    ///
+    /// **What comes back is telemetry and never evidence.** See
+    /// `linux/notify.zig`, and `PathAudit` below.
+    path_audit: ?PathAudit = null,
+
+    /// How the supervisor records the paths a held call named.
+    ///
+    /// **The paths are what the program said, and a program can lie.** The
+    /// kernel runs the call after the reader has read the argument, so the
+    /// program is free to write one name, wait to be let go, and then open
+    /// another. Everything this produces is labelled for that: the field in
+    /// the session log is called `unverified_paths`, and the event carries
+    /// `paths_verified: false` as a fact a later mode can flip. See
+    /// `linux/notify.zig`'s own top comment.
+    pub const PathAudit = struct {
+        /// The directory the program's own work lives under, as the program
+        /// sees it. A path under this is counted and never named, because a
+        /// tool call makes thousands of them. A path outside it is named,
+        /// until the record is full. See `linux/notify.zig`'s own
+        /// `kept_path_cap`.
+        ///
+        /// An empty string puts every path outside, so every path competes
+        /// for the few slots there are. Name the workspace.
+        workspace: []const u8,
+    };
 
     pub const Rule = struct {
         path: []const u8,
@@ -401,6 +434,9 @@ pub const Config = struct {
         var out = self;
         out.root = try allocator.dupe(u8, self.root);
         out.cwd = try allocator.dupe(u8, self.cwd);
+        if (self.path_audit) |audit| out.path_audit = .{
+            .workspace = try allocator.dupe(u8, audit.workspace),
+        };
         out.env = try copyStrings(allocator, self.env);
 
         const mounts = try allocator.alloc(namespace.Mount, self.mounts.len);
@@ -1028,6 +1064,28 @@ pub const SyscallAudit = struct {
     /// One count for each member of `seccomp.TrapCall`, by its tag value.
     calls: [notify.call_count]std.atomic.Value(u64) = @splat(.init(0)),
 
+    /// The paths the sandboxed programs of this session named, added up the
+    /// same way. **A lock and not an atomic**, because a name is bytes and a
+    /// set of names is read and written together. See `recordPaths`.
+    ///
+    /// Zero for a session that asked for no path audit, and that is why the
+    /// session log says which of the two it was: see `Config.path_audit` and
+    /// `linux/notify.zig`.
+    paths: PathTotals = .{},
+
+    /// What one tool call's reader left behind, added up over the session.
+    pub const PathTotals = struct {
+        lock: Lock = .{},
+        /// Calls whose reader ended in a way the ordinary teardown does not
+        /// explain. **This is the field an audit reads**: the program ran
+        /// part of its life with nothing recording it.
+        readers_lost: u64 = 0,
+        /// Calls whose reader never reached its loop at all.
+        readers_absent: u64 = 0,
+        /// The record itself, with the names of every tool call merged.
+        seen: notify.PathRecord = .{},
+    };
+
     /// What one call's supervisor came back with.
     pub const Outcome = union(enum) {
         /// The supervisor watched the call, and this is what it counted.
@@ -1049,6 +1107,58 @@ pub const SyscallAudit = struct {
         }
     }
 
+    /// Plain atomics and a yield, the same shape `chock_core.subagent`'s own
+    /// lock takes and for the same reason: `std.Io.Mutex.lock` needs an `Io`,
+    /// and `spawn` has none to give. Held for a few hundred bytes of copying
+    /// and never across a system call.
+    pub const Lock = struct {
+        held: std.atomic.Value(bool) = .init(false),
+
+        fn lock(self: *Lock) void {
+            while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+                // A yield this platform refuses leaves the spin, which is
+                // correct and only slower.
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        }
+
+        fn unlock(self: *Lock) void {
+            self.held.store(false, .release);
+        }
+    };
+
+    /// Add one call's path record to the session's own. Safe to call from any
+    /// thread.
+    ///
+    /// **Everything read out of `seen` is untrusted input.** It is memory the
+    /// reader process wrote, and `notify.PathRecord.name` is what clamps a
+    /// length before anything indexes with it.
+    pub fn recordPaths(self: *SyscallAudit, seen: *const notify.PathRecord) void {
+        self.paths.lock.lock();
+        defer self.paths.lock.unlock();
+
+        if (seen.reader_lost != 0) self.paths.readers_lost +|= 1;
+        if (seen.ready == 0) self.paths.readers_absent +|= 1;
+
+        const into = &self.paths.seen;
+        for (0..notify.call_count) |slot| {
+            into.inside[slot] +|= seen.inside[slot];
+            into.outside[slot] +|= seen.outside[slot];
+            into.outside_unnamed[slot] +|= seen.outside_unnamed[slot];
+            into.unread[slot] +|= seen.unread[slot];
+            into.truncated[slot] +|= seen.truncated[slot];
+        }
+
+        // **Each name carries its own call total across the merge.** A name
+        // the session's own set has no room for adds that total to
+        // `outside_unnamed`, so a name that stood for five hundred opens does
+        // not read as one. See `notify.PathRecord.name_hits`.
+        var slot: u32 = 0;
+        while (slot < @min(seen.kept, notify.kept_path_cap)) : (slot += 1) {
+            notify.keepName(into, seen.name_call[slot], seen.name(slot), seen.name_hits[slot]);
+        }
+    }
+
     /// The counts as plain numbers, for a caller that is about to write them
     /// down. Reads each field once, so two fields can disagree by one while a
     /// call is in flight. Call it when the calls have stopped.
@@ -1067,6 +1177,66 @@ pub const SyscallAudit = struct {
         observed: u64,
         unobserved: u64,
         calls: notify.Counts,
+    };
+
+    /// How many paths one session's record names at most. Read from
+    /// `linux/notify.zig`, so a caller that lays out a row list cannot drift
+    /// away from what the reader keeps.
+    pub const name_cap = notify.kept_path_cap;
+
+    /// The path record as plain numbers and borrowed names, for a caller that
+    /// is about to write it down.
+    ///
+    /// **The names point into this audit's own storage.** They are valid for
+    /// as long as the audit is, and only a caller that has stopped making
+    /// tool calls may read them: a call still in flight can add a name.
+    pub fn pathCounts(self: *SyscallAudit) PathCounts {
+        self.paths.lock.lock();
+        defer self.paths.lock.unlock();
+
+        const seen = &self.paths.seen;
+        var out: PathCounts = .{
+            .readers_lost = self.paths.readers_lost,
+            .readers_absent = self.paths.readers_absent,
+            .inside = seen.inside,
+            .outside = seen.outside,
+            .outside_unnamed = seen.outside_unnamed,
+            .unread = seen.unread,
+            .truncated = seen.truncated,
+            .kept = @min(seen.kept, name_cap),
+            .name_call = seen.name_call,
+            .names = @splat(&.{}),
+        };
+        for (&out.names, 0..) |*slot, index| slot.* = seen.name(index);
+        return out;
+    }
+
+    /// What `pathCounts` gives back.
+    pub const PathCounts = struct {
+        readers_lost: u64,
+        readers_absent: u64,
+        inside: notify.Counts,
+        outside: notify.Counts,
+        outside_unnamed: notify.Counts,
+        unread: notify.Counts,
+        truncated: notify.Counts,
+        kept: u32,
+        /// Which call each name belongs to, by `seccomp.TrapCall` tag value.
+        name_call: [name_cap]u32,
+        names: [name_cap][]const u8,
+
+        /// True when nothing was ever recorded, so a caller can leave the
+        /// field out rather than write a row of zeros for every call.
+        pub fn empty(self: PathCounts) bool {
+            if (self.kept != 0) return false;
+            if (self.readers_lost != 0 or self.readers_absent != 0) return false;
+            for (0..notify.call_count) |slot| {
+                if (self.inside[slot] != 0 or self.outside[slot] != 0) return false;
+                if (self.outside_unnamed[slot] != 0) return false;
+                if (self.unread[slot] != 0 or self.truncated[slot] != 0) return false;
+            }
+            return true;
+        }
     };
 };
 
@@ -1421,6 +1591,7 @@ test "a copied config shares no memory with the original, scratch areas included
         .scratch = &.{ .{ .target = "/run/chock/scratch" }, .{ .target = "/run/chock/tasks" } },
         .cwd = "/",
         .env = &.{"PATH=/bin"},
+        .path_audit = .{ .workspace = "/work" },
     };
 
     const copied = try original.copy(arena);
@@ -1431,6 +1602,16 @@ test "a copied config shares no memory with the original, scratch areas included
         try std.testing.expect(from.target.ptr != to.target.ptr);
     }
     try std.testing.expect(original.scratch.ptr != copied.scratch.ptr);
+
+    // The workspace a path audit names is a string in the caller's own arena,
+    // the same as `root` and `cwd`, so it is duplicated the same way.
+    //
+    // Mutation check: take the `path_audit` line out of `copy` and this fails.
+    try std.testing.expectEqualStrings(
+        original.path_audit.?.workspace,
+        copied.path_audit.?.workspace,
+    );
+    try std.testing.expect(original.path_audit.?.workspace.ptr != copied.path_audit.?.workspace.ptr);
 
     // The fields that were already copied before scratch areas existed, so a
     // later reader can see this test covers the whole shape and not one field.
@@ -1679,4 +1860,70 @@ test "a gap names the path and says which of the two lists is short" {
         "mount /proc has no landlock rule, so it is present and unreachable",
         try std.fmt.bufPrint(&buffer, "{f}", .{LayerGap{ .mount_without_rule = "/proc" }}),
     );
+}
+
+test "one tool call's paths are added to the session's own, and a name with no room keeps its count" {
+    // **A session is many tool calls and one record.** Each call's reader
+    // writes a record of its own, and this is where they are added up. A merge
+    // that added one for a name it had no room for would say a path opened
+    // five hundred times was opened once.
+    //
+    // Mutation check: pass `1` instead of `seen.name_hits[slot]` in
+    // `recordPaths` and the overflow expectation reads 1.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const openat = @intFromEnum(seccomp.TrapCall.openat);
+
+    var audit: SyscallAudit = .{};
+
+    // The first call fills the set to the cap.
+    var first: notify.PathRecord = .{ .ready = 1 };
+    var made: u32 = 0;
+    while (made < notify.kept_path_cap) : (made += 1) {
+        var buffer: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "/etc/thing-{d}", .{made});
+        first.outside[openat] += 1;
+        notify.keepName(&first, openat, path, 1);
+    }
+    audit.recordPaths(&first);
+
+    // The second call names one more path, five hundred times over, and the
+    // session's set is already full.
+    var second: notify.PathRecord = .{ .ready = 1 };
+    second.outside[openat] = 500;
+    notify.keepName(&second, openat, "/home/someone/.ssh/id_ed25519", 500);
+    audit.recordPaths(&second);
+
+    const counted = audit.pathCounts();
+    try std.testing.expectEqual(@as(u32, notify.kept_path_cap), counted.kept);
+    try std.testing.expectEqual(
+        @as(u64, notify.kept_path_cap + 500),
+        counted.outside[openat],
+    );
+    try std.testing.expectEqual(@as(u64, 500), counted.outside_unnamed[openat]);
+    try std.testing.expectEqual(@as(u64, 0), counted.readers_lost);
+    try std.testing.expectEqual(@as(u64, 0), counted.readers_absent);
+}
+
+test "a reader that was lost, and one that never started, are counted apart" {
+    // **Two different facts with two different repairs.** A reader that never
+    // started means the paths for that call are missing from the beginning. A
+    // reader that was lost means they stop part way, and the program's own
+    // held calls answered `ENOSYS` from that moment. A session that read one
+    // number for both could not tell them apart.
+    //
+    // Mutation check: count both in `readers_lost` and the second expectation
+    // reads 2.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var audit: SyscallAudit = .{};
+
+    var never_started: notify.PathRecord = .{ .ready = 0 };
+    audit.recordPaths(&never_started);
+    var stopped_early: notify.PathRecord = .{ .ready = 1, .reader_lost = 1 };
+    audit.recordPaths(&stopped_early);
+    var whole_way: notify.PathRecord = .{ .ready = 1, .ended = 1 };
+    audit.recordPaths(&whole_way);
+
+    const counted = audit.pathCounts();
+    try std.testing.expectEqual(@as(u64, 1), counted.readers_absent);
+    try std.testing.expectEqual(@as(u64, 1), counted.readers_lost);
 }

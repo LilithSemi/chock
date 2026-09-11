@@ -126,6 +126,33 @@ const capability_version_3: u32 = 0x20080522;
 /// for what each of the three calls below closes, and for the order they
 /// must run in.
 pub fn dropAll(diag: ?*?Diagnostic) Error!void {
+    return dropAllBut(null, diag);
+}
+
+/// Drop every capability except the one named, which stays in the permitted
+/// and the effective set.
+///
+/// **For one caller: `linux/driver.zig`'s own `runReader`.** The path reader
+/// needs `CAP_SYS_PTRACE` and nothing else. Yama's restricted ptrace mode,
+/// which is the default on this project's own machine, permits a read of
+/// another process's memory only from an ancestor of that process or from a
+/// holder of that capability in that process's user namespace, and the reader
+/// is a sibling of the process it reads. Measured on 2026-09-11: a sibling
+/// read is answered `EPERM`, and a read by the parent succeeds.
+///
+/// **The capability is held in the sandbox's own user namespace, which owns
+/// nothing.** That namespace was made by `unshare(CLONE_NEWUSER)` a moment
+/// earlier, so a capability in it confers nothing at all over any object the
+/// host owns. What it does confer is the one power the reader exists to have.
+///
+/// **The bounding set still goes empty**, so the capability cannot be regained
+/// or carried across an `execve`. `capset` does not check the bounding set: it
+/// only refuses a permitted set that is not a subset of the old one.
+pub fn keepOnly(capability: u32, diag: ?*?Diagnostic) Error!void {
+    return dropAllBut(capability, diag);
+}
+
+fn dropAllBut(keep: ?u32, diag: ?*?Diagnostic) Error!void {
     var cap: u32 = 0;
     while (cap <= linux.CAP.LAST_CAP) : (cap += 1) {
         const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), @as(usize, cap), 0, 0, 0);
@@ -156,6 +183,17 @@ pub fn dropAll(diag: ?*?Diagnostic) Error!void {
         .{ .effective = 0, .permitted = 0, .inheritable = 0 },
         .{ .effective = 0, .permitted = 0, .inheritable = 0 },
     };
+    // **Inheritable stays empty for the kept capability too.** Inheritable is
+    // what crosses an `execve`, and the one caller that keeps a capability
+    // never execs.
+    if (keep) |capability| {
+        const word = capability / 32;
+        const bit = @as(u32, 1) << @intCast(capability % 32);
+        if (word < data.len) {
+            data[word].permitted |= bit;
+            data[word].effective |= bit;
+        }
+    }
     const capset_rc = linux.capset(&header, &data[0]);
     if (linux.errno(capset_rc) != .SUCCESS) {
         note(diag, .capset, linux.errno(capset_rc));
@@ -189,6 +227,44 @@ test "dropAll clears effective, permitted, and inheritable, in a fresh user name
             data[0].permitted == 0 and data[1].permitted == 0 and
             data[0].inheritable == 0 and data[1].inheritable == 0;
         std.process.exit(if (all_zero) 0 else 1);
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status)) return error.SkipZigTest;
+
+    const code = linux.W.EXITSTATUS(status);
+    if (code == 63) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+test "keepOnly leaves one capability and takes every other one away" {
+    // **The path reader needs `CAP_SYS_PTRACE` and must hold nothing else.**
+    // A `keepOnly` that kept the whole set would give a process that reads
+    // another process's memory every power the supervisor had.
+    //
+    // Mutation check: make `dropAllBut` ignore `keep` and the first
+    // expectation fails; make it write the bit into every word and the
+    // second fails.
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) return error.SkipZigTest;
+
+    if (fork_rc == 0) {
+        namespace.enter(.{}, null) catch std.process.exit(63);
+        keepOnly(linux.CAP.SYS_PTRACE, null) catch std.process.exit(63);
+
+        var header = linux.cap_user_header_t{ .version = capability_version_3, .pid = 0 };
+        var data: [2]linux.cap_user_data_t = undefined;
+        if (linux.errno(linux.capget(&header, &data[0])) != .SUCCESS) std.process.exit(63);
+
+        const only_ptrace: u32 = @as(u32, 1) << linux.CAP.SYS_PTRACE;
+        const kept = data[0].effective == only_ptrace and data[0].permitted == only_ptrace;
+        const rest_clear = data[1].effective == 0 and data[1].permitted == 0 and
+            data[0].inheritable == 0 and data[1].inheritable == 0;
+        if (!kept) std.process.exit(1);
+        if (!rest_clear) std.process.exit(2);
+        std.process.exit(0);
     }
 
     var status: u32 = undefined;
