@@ -641,21 +641,21 @@ test "a tool call inside the sandbox cannot reach the session's approval socket"
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a Landlock rule refuses a write outside the workspace" {
+test "a Landlock rule refuses a write outside the directory it granted" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("landlock-write-outside", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a Landlock rule permits a write inside the workspace" {
+test "a Landlock rule permits a write inside the directory it granted" {
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("landlock-write-inside", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
-test "a Landlock rule refuses a truncate outside the workspace" {
+test "a Landlock rule refuses a truncate outside the directory it granted" {
     // A reviewer proved this on a live kernel: with truncate left unhandled,
     // truncate("/other/secret", 0) succeeded and emptied a file Landlock was
     // supposed to protect, even though open() for read and for write on that
@@ -667,7 +667,7 @@ test "a Landlock rule refuses a truncate outside the workspace" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a Landlock rule permits a truncate inside the workspace" {
+test "a Landlock rule permits a truncate inside the directory it granted" {
     // Truncate is granted inside the permitted directory, so an ordinary shell
     // redirect or editor save must keep working there.
     var scratch = try scratchRoot();
@@ -1107,7 +1107,7 @@ test "a sandbox that was asked to watch nothing counts nothing and still runs" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
-test "the supervisor names the paths the sandboxed program asked for outside its workspace" {
+test "the supervisor names the paths the sandboxed program asked for that nothing granted" {
     // **The counting run above says `openat` happened 14,434 times. It does
     // not say what was opened.** This is the chain that answers that, and it
     // is a chain no unit test can stand in for: a third process, forked inside
@@ -1115,16 +1115,51 @@ test "the supervisor names the paths the sandboxed program asked for outside its
     // descriptor and copies the path out of the held call with
     // `process_vm_readv`, a call the supervisor itself is killed for making.
     //
+    // **The boundary is what the sandbox configuration granted**, which is the
+    // mount set and the scratch areas, and never the workspace directory.
+    //
     // **What comes back is what the program said, and never proof.** The
     // answer to the notification is `CONTINUE`, so the program is free to
     // write one name, wait to be let go, and open another. The record says so
     // in the field name and in `paths_verified`. See `linux/notify.zig`.
     //
     // Mutation check: delete the `readAndNote` call in `notify.answerOne` and
-    // the run exits 11, which is the count of opens inside the workspace.
+    // the run exits 11, which is the count of opens the configuration granted.
+    //
+    // **This run does not assert how the reader ended, and the probe says
+    // why.** The pid namespace teardown races the reader's own report and wins
+    // on a busy machine. What is asserted instead is that the record is
+    // complete, which is the fact the reader exists to produce.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-path-audit", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a dynamically linked program's loader opens are counted, not named" {
+    // **The blind spot the statically linked probe left.** Every other path
+    // audit test runs a program that opens exactly what it asks for, so a
+    // record split on the wrong boundary still looked clean. A dynamic loader
+    // runs before the program's own first line, and it opens dozens of files.
+    // Split on the workspace, those are the first eight names the record has
+    // room for, and the one path a reader would act on lands in the overflow
+    // count with no name at all.
+    //
+    // The split is on what this sandbox's own configuration granted, so the
+    // loader's opens are the numerous half and the record keeps one name.
+    //
+    // Mutation check, three ways. Pass `&.{}` instead of `granted` to
+    // `runReader` in `linux/driver.zig` and this run exits 7, because every
+    // open is then a path nothing granted, so the granted count reads zero.
+    // Make `countPath` name a granted path as well and it exits 8, because
+    // the eight slots fill with the loader's own opens. **And build the
+    // program with `link_libc = false` and it exits 7 too**, which is what
+    // says this test really needs a dynamic loader rather than only claiming
+    // to: a statically linked build of the same source opens nothing it was
+    // not asked to.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-path-audit-dynamic", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 

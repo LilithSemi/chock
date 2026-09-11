@@ -32,6 +32,9 @@ const chock_policy = @import("chock-policy");
 /// threaded implementation is still the one thing that may not be built
 /// here.
 const chock_proto = @import("chock-proto");
+/// Where the dynamically linked program is on this machine, as a build time
+/// constant. See `spawn-path-audit-dynamic`.
+const dynamic_probe_path = @import("dynamic_probe_path").dynamic_probe_path;
 const linux = std.os.linux;
 
 /// What `spawn-stdin-pipe` writes into the pipe it names in `Config.stdin_fd`,
@@ -45,19 +48,17 @@ const stdin_pipe_token = "chock-helper-request";
 /// against whatever happened.
 const opens_in_probe = 17;
 
-/// The path outside the workspace that `spawned-name-paths` names, and that
-/// `spawn-path-audit` then looks for in the record. **Nothing is ever there**:
-/// the kernel tells the reader before it runs the call, so a path that does
-/// not exist is recorded exactly as one that does.
-const named_outside = "/etc/chock-probe-secret";
+/// The path nothing in the sandbox's own configuration grants, which
+/// `spawned-name-paths` names and `spawn-path-audit` then looks for in the
+/// record. **Nothing is ever there**: the kernel tells the reader before it
+/// runs the call, so a path that does not exist is recorded exactly as one
+/// that does.
+const named_ungranted = "/etc/chock-probe-secret";
 
-/// The path inside the workspace the same program opens. It must be counted
-/// and never named. `/nix/store` is the workspace for that run.
-const named_inside = "/nix/store";
-
-/// The workspace `spawn-path-audit` names. The big tree every loader open
-/// lands in, so the names the record keeps are the few a reader wants.
-const audited_workspace = "/nix/store";
+/// A path the configuration does grant, which the same program opens. It must
+/// be counted and never named. `baseEscapeConfig` mounts this tree, so it is a
+/// grant of that run and not a workspace.
+const named_granted = "/nix/store";
 
 /// End `spawned-kill-the-reader` when its own alarm goes off. **One system
 /// call and nothing else**, because this runs in a signal handler.
@@ -158,6 +159,27 @@ fn writeTestFile(arena: std.mem.Allocator, path: []const u8, contents: []const u
     // write to be a realistic outcome, so a short write is treated as a failure.
     const written = linux.write(fd, contents.ptr, contents.len);
     if (linux.errno(written) != .SUCCESS or written != contents.len) return error.SetupFailed;
+}
+
+/// `path` as an absolute path, resolved against this process's own working
+/// directory when it is relative.
+///
+/// **A build time path from `addOptionPath` is relative to the build root.**
+/// That is enough for a caller that only spawns the program, because the test
+/// that spawns it runs from the build root. It is not enough for a bind mount
+/// source: the kernel resolves that inside a process that has already begun
+/// building a root of its own, so a relative source names something else or
+/// nothing. See `spawn-path-audit-dynamic`.
+fn absolutePath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (path.len != 0 and path[0] == '/') return path;
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = linux.getcwd(&buffer, buffer.len);
+    if (linux.errno(rc) != .SUCCESS) return error.SetupFailed;
+    // `getcwd` counts the terminator it wrote. A cwd of `/` must not become
+    // `//path`, so the separator is added only when there is none already.
+    const cwd = std.mem.sliceTo(buffer[0..rc], 0);
+    if (std.mem.eql(u8, cwd, "/")) return std.fmt.allocPrint(arena, "/{s}", .{path});
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ cwd, path });
 }
 
 /// Read the path of this running binary through /proc/self/exe. Used only by
@@ -1506,9 +1528,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-syscall-audit") or
         std.mem.eql(u8, args[1], "spawn-syscall-audit-off") or
         std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon") or
-        // The three path audit runs, for the same reason again.
+        // The four path audit runs, for the same reason again.
         std.mem.eql(u8, args[1], "spawn-path-audit") or
         std.mem.eql(u8, args[1], "spawn-path-audit-off") or
+        std.mem.eql(u8, args[1], "spawn-path-audit-dynamic") or
         std.mem.eql(u8, args[1], "spawn-path-audit-killed") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
@@ -2656,12 +2679,13 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawned-name-paths")) {
-        // Two names outside the workspace, one of them three times, and one
-        // name inside it. The workspace for this run is `/nix/store`, which
-        // is the tree the toolchain lives in, so the two names below are the
-        // few a reader of the record actually wants. **This program is
-        // statically linked**, so nothing but these calls opens anything at
-        // all, and the counts the caller checks are exact rather than a floor.
+        // One name the configuration grants nothing for, opened three times,
+        // and two names it does grant. The grant set for this run is the mount
+        // list `baseEscapeConfig` builds, which is `/nix/store` and `/probe`,
+        // so the one name below is the only one a reader of the record wants.
+        // **This program is statically linked**, so nothing but these calls
+        // opens anything at all, and the counts the caller checks are exact
+        // rather than a floor.
         //
         // **The opens do not have to succeed.** The kernel holds the call and
         // tells the reader before it runs the call at all, so a path that is
@@ -2669,14 +2693,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // attempt on a path the sandbox does not hold is the interesting event.
         var made: usize = 0;
         while (made < 3) : (made += 1) {
-            const rc = linux.openat(linux.AT.FDCWD, named_outside, .{ .ACCMODE = .RDONLY }, 0);
+            const rc = linux.openat(linux.AT.FDCWD, named_ungranted, .{ .ACCMODE = .RDONLY }, 0);
             if (linux.errno(rc) == .SUCCESS) _ = linux.close(@intCast(rc));
         }
         const second = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(second) != .SUCCESS) return 5;
         _ = linux.close(@intCast(second));
 
-        const inside = linux.openat(linux.AT.FDCWD, named_inside, .{ .ACCMODE = .RDONLY }, 0);
+        const inside = linux.openat(linux.AT.FDCWD, named_granted, .{ .ACCMODE = .RDONLY }, 0);
         if (linux.errno(inside) == .SUCCESS) _ = linux.close(@intCast(inside));
         return 0;
     }
@@ -4536,7 +4560,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .network = .none,
             .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
             .syscall_audit = &audit,
-            .path_audit = if (auditing) .{ .workspace = audited_workspace } else null,
+            .path_audit = auditing,
         }, &.{ "/probe", "spawned-name-paths" }, null, null);
 
         switch (term) {
@@ -4551,39 +4575,143 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             // zero would mean the record comes from somewhere other than a
             // reader this config asked for.
             if (seen.kept != 0) return 5;
-            if (seen.inside[slot] != 0 or seen.outside[slot] != 0) return 6;
-            if (audit.paths.readers_lost != 0 or audit.paths.readers_absent != 0) return 7;
+            if (seen.granted[slot] != 0 or seen.ungranted[slot] != 0) return 6;
+            if (audit.paths.readers_unreported != 0 or audit.paths.readers_absent != 0) return 7;
             // The counting still works with no path audit, which is the
             // promise that the default costs nothing.
             if (audit.counts().calls[slot] == 0) return 8;
             return 0;
         }
 
-        // The reader reached its loop and ended the way the teardown explains.
+        // The reader reached its loop. **That is asserted and the way it
+        // ended is not**, and this is the one place in the suite that says
+        // why. The observed program is process 1 of a pid namespace, so the
+        // kernel kills the reader the instant that program exits, and on a
+        // busy machine that kill beats the reader's own report: measured on
+        // 2026-09-11, with the supervisor and the program pinned to one busy
+        // processor, 27 healthy runs in 30 ended with no report. **Nothing is
+        // lost when that happens**, because the kill comes from inside the
+        // program's own exit, so the program makes no further call. The same
+        // measurement, with this check taken out, found a complete record in
+        // 19 of 19 such runs.
+        //
+        // So the completeness of the record is what is asserted below, and
+        // that is the fact the reader exists to produce. See
+        // `notify.PathRecord.reader_unreported` for why the supervisor cannot
+        // say which of the two endings it got.
         if (audit.paths.readers_absent != 0) return 9;
-        if (audit.paths.readers_lost != 0) return 10;
 
-        // The program opened one path under the workspace on purpose, so a
-        // zero here means the classification put it on the wrong side or the
-        // reader read nothing at all.
-        if (seen.inside[slot] == 0) return 11;
+        // The program opened two paths the configuration grants on purpose,
+        // so a zero here means the classification put them on the wrong side
+        // or the reader read nothing at all.
+        if (seen.granted[slot] == 0) return 11;
 
         var named_the_secret = false;
-        var named_the_workspace = false;
+        var named_a_grant = false;
         var kept: u32 = 0;
         while (kept < seen.kept) : (kept += 1) {
             const name = seen.name(kept);
-            if (std.mem.eql(u8, name, named_outside)) named_the_secret = true;
-            if (std.mem.startsWith(u8, name, audited_workspace)) named_the_workspace = true;
+            if (std.mem.eql(u8, name, named_ungranted)) named_the_secret = true;
+            if (std.mem.startsWith(u8, name, named_granted)) named_a_grant = true;
         }
-        // **The one fact this whole feature exists for.** A path outside the
-        // workspace is named, and the program named it three times, so the
-        // set holds it once.
+        // **The one fact this whole feature exists for.** A path the
+        // configuration granted nothing for is named, and the program named it
+        // three times, so the set holds it once.
         if (!named_the_secret) return 12;
         // **The other half, and the one that keeps the record small.** Not one
-        // of the thousands of opens under the workspace is named.
-        if (named_the_workspace) return 13;
-        if (seen.outside[slot] < 4) return 14;
+        // of the opens under a granted tree is named.
+        if (named_a_grant) return 13;
+        // The three attempts on the one ungranted path, and nothing else: the
+        // program is statically linked, so the two granted opens are the only
+        // others it makes.
+        if (seen.ungranted[slot] != 3) return 14;
+        if (seen.kept != 1) return 15;
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-path-audit-dynamic")) {
+        // **The case the statically linked probe cannot reach.** A dynamic
+        // loader runs before the program's own first line and opens dozens of
+        // files. Every one of them is under the toolchain tree, which this
+        // configuration declares as a mount, so a record split on the grant
+        // counts them and keeps the names for the one path nobody granted.
+        //
+        // Measured on 2026-09-11 on this machine: this program made 3 opens,
+        // of which 2 were the loader's and granted, 1 was the path below and
+        // ungranted, and the record kept exactly that one name.
+        //
+        // **Measured again with a real `git status` in place of this program**,
+        // and a cap raised to hold every name, because a program this small
+        // loads one library and a real one loads several: 115 opens, of which
+        // 17 were granted, 98 were relative, and none were ungranted, so the
+        // record kept no name at all. The same run split on the workspace kept
+        // 9 names, and 8 of them were the loader's own toolchain paths, so the
+        // shipped cap of 8 would have held nothing else.
+        //
+        // The exit status is the answer, because nothing here may print.
+        const base = try baseEscapeConfig(arena);
+        const mounts = try arena.alloc(sandbox.namespace.Mount, base.mounts.len + 1);
+        @memcpy(mounts[0..base.mounts.len], base.mounts);
+        mounts[base.mounts.len] = .{ .bind = .{
+            .source = try absolutePath(arena, dynamic_probe_path),
+            .target = "/dynamic",
+            .read_only = true,
+        } };
+        const rules = try arena.alloc(sandbox.Config.Rule, base.rules.len + 1);
+        @memcpy(rules[0..base.rules.len], base.rules);
+        // A file and not a directory, so `read_only_file` and never
+        // `read_only`: the kernel refuses a directory right over a file. The
+        // same reason `baseEscapeConfig` spells out for `/probe`.
+        rules[base.rules.len] = .{
+            .path = "/dynamic",
+            .access = sandbox.landlock.AccessFs.read_only_file,
+        };
+
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts,
+            .rules = rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .syscall_audit = &audit,
+            .path_audit = true,
+        }, &.{"/dynamic"}, null, null);
+
+        // **The program has to have run all the way through its loader.** A
+        // dynamic program that could not find its interpreter dies before
+        // `main`, and the counts below would then be about a loader failure
+        // rather than about a program that ran.
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+
+        const slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        const seen = &audit.paths.seen;
+        // The reader reached its loop. The way it ended is not asserted, for
+        // the reason `spawn-path-audit` above spells out: the pid namespace
+        // teardown races the reader's own report and wins on a busy machine,
+        // and the record is complete either way. The checks below are what
+        // prove the reader did its job.
+        if (audit.paths.readers_absent != 0) return 5;
+
+        // **The loader really ran, and its opens are the granted ones.** The
+        // program itself opens exactly one path and that path is ungranted, so
+        // every granted open here belongs to the dynamic loader. Measured on
+        // 2026-09-11 on this machine: two, both under the toolchain tree.
+        if (seen.granted[slot] == 0) return 7;
+
+        // **The one fact this split exists for.** The set holds the one path
+        // nothing granted, and holds nothing else. A name count above one is
+        // the defect coming back: the loader's opens taking the slots.
+        if (seen.kept != 1) return 8;
+        if (!std.mem.eql(u8, seen.name(0), named_ungranted)) return 9;
+        if (seen.name_call[0] != slot) return 10;
+        // Nothing was lost to the cap, which is what makes the name count
+        // above a whole answer rather than the first eight of a longer list.
+        if (seen.ungranted_unnamed[slot] != 0) return 11;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-path-audit-killed")) {
@@ -4604,7 +4732,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .network = .none,
             .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
             .syscall_audit = &audit,
-            .path_audit = .{ .workspace = audited_workspace },
+            .path_audit = true,
         }, &.{ "/probe", "spawned-kill-the-reader" }, null, null);
 
         // The program itself says whether the kernel answered ENOSYS. Any
@@ -4613,13 +4741,16 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
-        // The reader reached its loop, so the loss below is a reader that was
-        // killed and not one that never ran.
+        // The reader reached its loop, so what is counted below is a reader
+        // that was killed and not one that never ran.
         if (audit.paths.readers_absent != 0) return 5;
-        // **The field an audit reads.** Without it a session could not tell a
-        // program that was watched all the way through from one that killed
-        // what was watching it.
-        if (audit.paths.readers_lost != 1) return 6;
+        // **The warning a session gets.** A reader that was killed wrote no
+        // report, and the session counts that. **It is not proof of a kill**:
+        // the ordinary teardown leaves the same record on a busy machine. What
+        // proves the kill here is the program's own exit status above, which
+        // says the kernel answered its next held call `ENOSYS`. See
+        // `notify.PathRecord.reader_unreported`.
+        if (audit.paths.readers_unreported != 1) return 6;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-syscall-audit") or

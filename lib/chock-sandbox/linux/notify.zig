@@ -106,6 +106,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const seccomp = @import("seccomp.zig");
+const grants = @import("../grants.zig");
 const SECCOMP = linux.SECCOMP;
 
 /// How many members `seccomp.TrapCall` has. `Counts` is indexed by the tag
@@ -132,7 +133,7 @@ pub const empty_counts: Counts = @splat(0);
 /// truncated, so a long name is short in the record and never a silent lie.
 pub const path_read_clamp = 256;
 
-/// How many distinct paths outside the workspace one record names.
+/// How many distinct paths outside every grant one record names.
 ///
 /// **A cap, and the overflow is counted rather than dropped in silence.** A
 /// clean `zig build` opens 14,434 files. Naming each one would grow the
@@ -143,6 +144,12 @@ pub const path_read_clamp = 256;
 /// bytes and a real one that named three paths is 743 bytes. **The size does
 /// not grow with the number of opens**, which is the fault this cap exists to
 /// stop.
+///
+/// **Eight is enough because the split is on the grant and not on the
+/// workspace.** A healthy run names nothing at all: measured on 2026-09-11, a
+/// real `git status` inside a sandbox that granted the toolchain tree made 115
+/// opens and named none of them. The same run split on the workspace named 9
+/// paths, of which 8 were the dynamic loader's own.
 pub const kept_path_cap = 8;
 
 /// How many bytes of one kept path the record holds. See `kept_path_cap`.
@@ -150,9 +157,9 @@ pub const kept_path_cap = 8;
 /// **A name longer than this is kept as its first bytes**, and the `truncated`
 /// count is about the read clamp rather than about this. A reader of the log
 /// knows this width, because it is the same for every record a build writes.
-/// The paths worth reading outside a workspace are short ones such as
+/// The paths worth reading outside every grant are short ones such as
 /// `/etc/shadow` or `/home/someone/.ssh/id_ed25519`. The long ones are
-/// toolchain paths, which are the boring half.
+/// toolchain paths, which are under a granted tree and are never named.
 pub const kept_path_bytes = 64;
 
 /// What the reader saw, in memory both the reader and the caller of `spawn`
@@ -190,23 +197,66 @@ pub const PathRecord = extern struct {
     /// a reader killed before its loop returned leaves this at zero.
     ended: u32 = 0,
     /// Set by the supervisor after it has reaped the reader. One means the
-    /// reader ended in a way that the ordinary teardown does not explain, so
-    /// the observed process ran part of its life with nothing watching it and
-    /// its own trapped calls answered `ENOSYS`.
-    reader_lost: u32 = 0,
+    /// reader never wrote `ended`, so **it did not report that it saw the
+    /// observed program end**.
+    ///
+    /// **It says the report is missing, and never why.** Two different things
+    /// leave this at one, and measured on 2026-09-11 they are identical at
+    /// the reap, down to the raw wait status:
+    ///
+    ///   * The ordinary teardown won a race. The observed program is process 1
+    ///     of a pid namespace, so the kernel kills the reader the moment that
+    ///     program exits. The reader is woken by the same exit and usually
+    ///     reaches `ended` first, but a loaded machine reverses that: measured
+    ///     with the supervisor and the program pinned to one busy processor,
+    ///     27 of 30 healthy runs ended this way. **Nothing is lost in this
+    ///     case**: the kill happens inside the program's own `exit`, so the
+    ///     program makes no further call. Measured the same day, 19 of 19 such
+    ///     runs held a complete record.
+    ///   * The observed program killed its own reader. From that moment the
+    ///     kernel answers its held calls `ENOSYS`, and the record is short by
+    ///     whatever it did first.
+    ///
+    /// **The supervisor cannot tell those apart, and this is the measurement
+    /// that says so.** Three candidate discriminators were tried and all
+    /// three failed: the reader's raw wait status is `SIGKILL` in both; the
+    /// program's own process descriptor is not readable in either, because the
+    /// kernel holds a departing process 1 inside `zap_pid_ns_processes` until
+    /// the reader's pid is freed, which is the supervisor's own reap; and
+    /// `PF_EXITING` read out of `/proc` at the one instant the supervisor can
+    /// freeze, before it reaps, was already set in 2 of 3 deliberate kills,
+    /// because a program that kills its reader is free to exit immediately
+    /// afterwards. Every fact the program itself emits is a fact the program
+    /// can forge.
+    ///
+    /// So this field is a **warning and not a finding**. `ended` is the
+    /// positive fact, and a reader of the log compares the reports it got
+    /// against the calls that were observed.
+    reader_unreported: u32 = 0,
     /// How many slots of `names` hold a path.
     kept: u32 = 0,
     /// The histogram, the same one `serve` fills in. Read by the supervisor
     /// after the observed process has ended, and reported the way an
     /// unobserved run is reported.
     counts: Counts = empty_counts,
-    /// Calls whose path was under the workspace. Counted and never named.
-    inside: Counts = empty_counts,
-    /// Calls whose path was not. Named below until the cap is reached.
-    outside: Counts = empty_counts,
-    /// Calls whose path was outside the workspace and is **not** among the
-    /// names below. The explicit overflow count.
-    outside_unnamed: Counts = empty_counts,
+    /// Calls whose path was at or below something the caller's own config
+    /// puts inside the sandbox. **Counted and never named**: this is the
+    /// numerous half, and it holds every open the dynamic loader makes.
+    granted: Counts = empty_counts,
+    /// Calls whose path was at or below none of them. **These are the few a
+    /// reader wants**, so they are named below until the cap is reached.
+    ungranted: Counts = empty_counts,
+    /// Calls whose path was ungranted and is **not** among the names below.
+    /// The explicit overflow count.
+    ungranted_unnamed: Counts = empty_counts,
+    /// Calls whose path had no leading separator, so it resolves against a
+    /// directory the reader cannot see.
+    ///
+    /// **Its own count, because neither side would be true.** `openat` with a
+    /// descriptor takes a relative name, and the reader is given the name and
+    /// not the descriptor. Counting these as granted would claim a boundary
+    /// nothing checked, and naming them would fill the cap with ordinary work.
+    relative: Counts = empty_counts,
     /// Calls whose path could not be read out of the observed process at all.
     unread: Counts = empty_counts,
     /// Calls whose path was longer than `path_read_clamp`, or ran off the end
@@ -220,7 +270,7 @@ pub const PathRecord = extern struct {
     /// **Not written to the log, and it is here for the sum.** One record is
     /// merged into another when a session adds up its tool calls, and a name
     /// the second set has no room for has to add its own calls to
-    /// `outside_unnamed`. Without this the merge would add one, and a name
+    /// `ungranted_unnamed`. Without this the merge would add one, and a name
     /// that stood for five hundred opens would read as one.
     name_hits: [kept_path_cap]u64 = @splat(0),
     /// How many bytes of each kept name are real.
@@ -349,25 +399,25 @@ pub fn serve(listener: i32, child_pidfd: i32, counts: *Counts) Outcome {
 /// lives and why the kernel bounds what it can name. `record` is the shared
 /// page the reader writes and the caller of `spawn` reads.
 ///
-/// `workspace` is the path the observed program's own work lives under, as
-/// that program sees it. A path under it is counted and never named. See
-/// `note`.
+/// `granted` is every path inside the sandbox that the caller's own config
+/// puts something at, which `Sandbox.grantPrefixes` builds. A path at or below
+/// one of them is counted and never named. See `classify`.
 pub fn serveRecording(
     listener: i32,
     child_pidfd: i32,
     record: *PathRecord,
-    workspace: []const u8,
+    granted: []const []const u8,
 ) Outcome {
     return loop(listener, child_pidfd, &record.counts, .{
         .record = record,
-        .workspace = workspace,
+        .granted = granted,
     });
 }
 
 /// What the loop needs to turn one notification into a path in the record.
 const Recorder = struct {
     record: *PathRecord,
-    workspace: []const u8,
+    granted: []const []const u8,
 };
 
 fn loop(listener: i32, child_pidfd: i32, counts: *Counts, recorder: ?Recorder) Outcome {
@@ -474,7 +524,7 @@ fn readAndNote(recorder: Recorder, call: seccomp.TrapCall, note: *const SECCOMP.
         return;
     };
     if (read.truncated) recorder.record.truncated[slot] +|= 1;
-    countPath(recorder.record, call, read.path, recorder.workspace);
+    countPath(recorder.record, call, read.path, recorder.granted);
 }
 
 /// One argument of a held call, by index. A switch and not an array index,
@@ -534,41 +584,58 @@ fn readPath(target: linux.pid_t, address: u64, buffer: *[path_read_clamp]u8) ?Pa
     return .{ .path = got[0..end], .truncated = false };
 }
 
-/// True when `path` names something under `workspace`.
+/// Which of the record's three buckets one path a program named belongs in.
+pub const Side = enum {
+    /// At or below a path the caller's own config puts something at.
+    granted,
+    /// At or below none of them. This is the anomaly, and it is named.
+    ungranted,
+    /// No leading separator, so it resolves against a directory the reader
+    /// cannot see. See `PathRecord.relative`.
+    relative,
+};
+
+/// Which side of the grant set `path` falls on.
 ///
-/// **A relative path counts as inside.** The sandboxed program's working
-/// directory is the workspace, so a name with no leading separator resolves
-/// there. An empty workspace makes every path outside, which is what a caller
-/// that named no workspace asked for.
+/// **The split is on the grant and not on the workspace, and that is the whole
+/// value of the record.** Measured on 2026-09-11: a plain `git status` inside
+/// a sandbox made 115 opens. Split on the workspace it named 9 distinct paths,
+/// and 8 of them were Nix store paths the caller granted on purpose. The
+/// loader's opens come first, so a set of eight names holds eight toolchain
+/// paths and nothing a reader would act on. Split on the grant, the same run
+/// counted 17 granted opens, 98 relative ones, and named nothing at all.
+///
+/// An empty grant set puts every absolute path on the `ungranted` side, which
+/// is the honest answer for a config that granted nothing.
 ///
 /// This is a decision about a **string the observed process wrote**, and never
 /// about a file. It says nothing about where the kernel then went. See this
 /// file's own top comment.
-pub fn insideWorkspace(path: []const u8, workspace: []const u8) bool {
-    if (path.len == 0) return true;
-    if (path[0] != '/') return true;
-    if (workspace.len == 0) return false;
-    if (!std.mem.startsWith(u8, path, workspace)) return false;
-    // `/work` must not swallow `/workspace-of-somebody-else`.
-    if (path.len == workspace.len) return true;
-    return path[workspace.len] == '/' or workspace[workspace.len - 1] == '/';
+pub fn classify(path: []const u8, granted: []const []const u8) Side {
+    if (path.len == 0 or path[0] != '/') return .relative;
+    // `grants.holds` is the same comparison `Sandbox.firstGap` makes against
+    // this same mount set. A second spelling of it here is how the two would
+    // quietly stop agreeing.
+    return if (grants.setHolds(granted, path)) .granted else .ungranted;
 }
 
-/// Count one path, and name it when it is outside the workspace and the record
-/// still has room.
+/// Count one path, and name it when the caller granted nothing that holds it
+/// and the record still has room.
 fn countPath(
     record: *PathRecord,
     call: seccomp.TrapCall,
     path: []const u8,
-    workspace: []const u8,
+    granted: []const []const u8,
 ) void {
     const slot = @intFromEnum(call);
-    if (insideWorkspace(path, workspace)) {
-        record.inside[slot] +|= 1;
-        return;
+    switch (classify(path, granted)) {
+        .granted => record.granted[slot] +|= 1,
+        .relative => record.relative[slot] +|= 1,
+        .ungranted => {
+            record.ungranted[slot] +|= 1;
+            keepName(record, @intCast(slot), path, 1);
+        },
     }
-    record.outside[slot] +|= 1;
-    keepName(record, @intCast(slot), path, 1);
 }
 
 /// Put one name in the record's capped set, or count it as one the set had no
@@ -599,7 +666,7 @@ pub fn keepName(record: *PathRecord, call_tag: u32, path: []const u8, hits: u64)
     if (kept >= kept_path_cap) {
         // **The overflow is a number and never a silent drop**, and it counts
         // calls rather than names. See `kept_path_cap` and `name_hits`.
-        record.outside_unnamed[call_tag] +|= hits;
+        record.ungranted_unnamed[call_tag] +|= hits;
         return;
     }
     @memcpy(record.names[kept][0..text.len], text);
@@ -782,48 +849,113 @@ test "a read that ends early is a failure, and never a half filled answer" {
     try std.testing.expect(!readAll(pair[1], &four));
 }
 
-test "a path under the workspace is inside it, and a name that only starts the same way is not" {
-    // **The prefix check is the whole classification.** A check written with
-    // `startsWith` alone would read `/workspace-of-someone-else` as a path
-    // inside `/workspace`, and every open under it would be counted and never
-    // named, which is the one direction this record must not fail in.
+/// The grant set of an ordinary tool call: the toolchain tree, the project's
+/// own workspace, and a scratch area. Written once here, because every test
+/// below is about which side of it a path falls on.
+const test_grants = [_][]const u8{ "/nix/store", "/work", "/run/chock/scratch" };
+
+test "a path the config granted is granted, and a name that only starts the same way is not" {
+    // **The boundary is what the caller granted, and not the workspace.** The
+    // whole toolchain tree is a mount the caller declared, so every open under
+    // it is the numerous half and never the interesting one.
     //
-    // Mutation check: drop the separator check at the end of `insideWorkspace`
-    // and the fourth expectation below fails.
-    try std.testing.expect(insideWorkspace("/work/src/main.zig", "/work"));
-    try std.testing.expect(insideWorkspace("/work", "/work"));
-    try std.testing.expect(!insideWorkspace("/etc/passwd", "/work"));
-    try std.testing.expect(!insideWorkspace("/work-of-someone-else/key", "/work"));
-    // A relative name resolves against the working directory, which is the
-    // workspace.
-    try std.testing.expect(insideWorkspace("src/main.zig", "/work"));
-    // A caller that named no workspace put nothing inside one.
-    try std.testing.expect(!insideWorkspace("/anything", ""));
+    // Mutation check: make `classify` give back `.ungranted` for a path
+    // `grants.setHolds` accepts and the first expectation fails.
+    try std.testing.expectEqual(Side.granted, classify("/work/src/main.zig", &test_grants));
+    try std.testing.expectEqual(
+        Side.granted,
+        classify("/nix/store/abc-glibc-2.40/lib/libc.so.6", &test_grants),
+    );
+    try std.testing.expectEqual(Side.granted, classify("/work", &test_grants));
+    try std.testing.expectEqual(Side.ungranted, classify("/etc/passwd", &test_grants));
+    // `/work` must not swallow `/work-of-someone-else`. This is the one
+    // direction the record must not fail in, and `grants.holds` is where the
+    // separator check lives.
+    try std.testing.expectEqual(
+        Side.ungranted,
+        classify("/work-of-someone-else/key", &test_grants),
+    );
+    // A config that granted nothing put every absolute path outside.
+    try std.testing.expectEqual(Side.ungranted, classify("/anything", &.{}));
 }
 
-test "an open inside the workspace is counted and never named" {
-    // The numerous and boring half. A record that named these would be
-    // thousands of lines for one tool call.
+test "a relative name is neither granted nor ungranted, because the reader cannot resolve it" {
+    // **`openat` with a descriptor takes a relative name.** The reader is
+    // given the name and never the descriptor, so it cannot say which
+    // directory the name resolves against. Calling it granted would claim a
+    // boundary nothing checked; naming it would fill the cap with ordinary
+    // work.
     //
-    // Mutation check: make `countPath` fall through to the naming code for an
-    // inside path and the `kept` expectation below fails.
-    var record: PathRecord = .{};
-    countPath(&record, .openat, "/work/src/main.zig", "/work");
-    countPath(&record, .openat, "/work/build.zig", "/work");
+    // Mutation check: make `classify` give back `.granted` for a name with no
+    // leading separator and the `relative` count below reads 0 while
+    // `granted` reads 2.
+    try std.testing.expectEqual(Side.relative, classify("src/main.zig", &test_grants));
+    try std.testing.expectEqual(Side.relative, classify("", &test_grants));
 
-    try std.testing.expectEqual(@as(u64, 2), record.inside[@intFromEnum(seccomp.TrapCall.openat)]);
-    try std.testing.expectEqual(@as(u64, 0), record.outside[@intFromEnum(seccomp.TrapCall.openat)]);
+    var record: PathRecord = .{};
+    countPath(&record, .openat, "src/main.zig", &test_grants);
+    countPath(&record, .openat, "build.zig", &test_grants);
+
+    const slot = @intFromEnum(seccomp.TrapCall.openat);
+    try std.testing.expectEqual(@as(u64, 2), record.relative[slot]);
+    try std.testing.expectEqual(@as(u64, 0), record.granted[slot]);
+    try std.testing.expectEqual(@as(u64, 0), record.ungranted[slot]);
     try std.testing.expectEqual(@as(u32, 0), record.kept);
 }
 
-test "an open outside the workspace is named once, and a repeat adds no second name" {
+test "the loader's opens are counted and never named, so the cap is left for the anomaly" {
+    // **The defect this split exists to fix.** A dynamically linked program's
+    // first opens are the loader's, and every one of them is under the
+    // toolchain mount the caller declared. Split on the workspace, those eight
+    // slots are full before the program has run a line of its own, and the one
+    // path nobody granted lands in the overflow count with no name at all.
+    //
+    // Mutation check: pass a grant set of `&.{}` to `countPath` below and
+    // `kept` reads 8 with the planted name nowhere in the set.
+    var record: PathRecord = .{};
+    var made: usize = 0;
+    while (made < 12) : (made += 1) {
+        var buffer: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(
+            &buffer,
+            "/nix/store/aaaaaaaaaaaa{d}-glibc-2.40/lib/libc.so.6",
+            .{made},
+        ) catch unreachable;
+        countPath(&record, .openat, path, &test_grants);
+    }
+    countPath(&record, .openat, "/etc/chock-probe-secret", &test_grants);
+
+    const slot = @intFromEnum(seccomp.TrapCall.openat);
+    try std.testing.expectEqual(@as(u64, 12), record.granted[slot]);
+    try std.testing.expectEqual(@as(u64, 1), record.ungranted[slot]);
+    try std.testing.expectEqual(@as(u64, 0), record.ungranted_unnamed[slot]);
+    try std.testing.expectEqual(@as(u32, 1), record.kept);
+    try std.testing.expectEqualStrings("/etc/chock-probe-secret", record.name(0));
+}
+
+test "an open the config granted is counted and never named" {
+    // The numerous and boring half. A record that named these would be
+    // thousands of lines for one tool call.
+    //
+    // Mutation check: make `countPath` fall through to the naming code for a
+    // granted path and the `kept` expectation below fails.
+    var record: PathRecord = .{};
+    countPath(&record, .openat, "/work/src/main.zig", &test_grants);
+    countPath(&record, .openat, "/work/build.zig", &test_grants);
+
+    try std.testing.expectEqual(@as(u64, 2), record.granted[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u64, 0), record.ungranted[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u32, 0), record.kept);
+}
+
+test "an open the config granted nothing for is named once, and a repeat adds no second name" {
     // Mutation check: take the `std.mem.eql` check out of `keepName`'s scan and
     // `kept` below becomes 2.
     var record: PathRecord = .{};
-    countPath(&record, .openat, "/etc/passwd", "/work");
-    countPath(&record, .openat, "/etc/passwd", "/work");
+    countPath(&record, .openat, "/etc/passwd", &test_grants);
+    countPath(&record, .openat, "/etc/passwd", &test_grants);
 
-    try std.testing.expectEqual(@as(u64, 2), record.outside[@intFromEnum(seccomp.TrapCall.openat)]);
+    try std.testing.expectEqual(@as(u64, 2), record.ungranted[@intFromEnum(seccomp.TrapCall.openat)]);
     try std.testing.expectEqual(@as(u32, 1), record.kept);
     try std.testing.expectEqualStrings("/etc/passwd", record.name(0));
     try std.testing.expectEqual(
@@ -839,8 +971,8 @@ test "the same path under two calls is named for each of them" {
     // Mutation check: drop the `name_call` comparison from `keepName`'s scan and
     // `kept` below becomes 1, so the `execve` row loses its only name.
     var record: PathRecord = .{};
-    countPath(&record, .openat, "/bin/sh", "/work");
-    countPath(&record, .execve, "/bin/sh", "/work");
+    countPath(&record, .openat, "/bin/sh", &test_grants);
+    countPath(&record, .execve, "/bin/sh", &test_grants);
 
     try std.testing.expectEqual(@as(u32, 2), record.kept);
     try std.testing.expectEqual(
@@ -859,19 +991,19 @@ test "a record that is full counts what it cannot name rather than dropping it" 
     // for the whole truth. See `kept_path_cap`.
     //
     // Mutation check: make `keepName` return early when the record is full
-    // without touching `outside_unnamed` and the last expectation fails.
+    // without touching `ungranted_unnamed` and the last expectation fails.
     var record: PathRecord = .{};
     var made: usize = 0;
     while (made < kept_path_cap + 5) : (made += 1) {
         var buffer: [32]u8 = undefined;
         const path = std.fmt.bufPrint(&buffer, "/etc/thing-{d}", .{made}) catch unreachable;
-        countPath(&record, .openat, path, "/work");
+        countPath(&record, .openat, path, &test_grants);
     }
 
     const slot = @intFromEnum(seccomp.TrapCall.openat);
     try std.testing.expectEqual(@as(u32, kept_path_cap), record.kept);
-    try std.testing.expectEqual(@as(u64, kept_path_cap + 5), record.outside[slot]);
-    try std.testing.expectEqual(@as(u64, 5), record.outside_unnamed[slot]);
+    try std.testing.expectEqual(@as(u64, kept_path_cap + 5), record.ungranted[slot]);
+    try std.testing.expectEqual(@as(u64, 5), record.ungranted_unnamed[slot]);
 }
 
 test "a name longer than a slot is kept as its first bytes and never past the slot" {
@@ -881,7 +1013,7 @@ test "a name longer than a slot is kept as its first bytes and never past the sl
     var record: PathRecord = .{};
     var long: [kept_path_bytes * 2]u8 = @splat('a');
     long[0] = '/';
-    countPath(&record, .openat, &long, "/work");
+    countPath(&record, .openat, &long, &test_grants);
 
     try std.testing.expectEqual(@as(u32, 1), record.kept);
     try std.testing.expectEqual(@as(usize, kept_path_bytes), record.name(0).len);

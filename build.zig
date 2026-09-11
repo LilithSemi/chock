@@ -447,12 +447,43 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
+        // **A second, dynamically linked program, for the path record.** The
+        // probe above is statically linked, so it never runs a dynamic loader,
+        // and a path audit tested only against it is tested against a program
+        // that opens nothing it did not ask for. Linking libc is what makes
+        // this one dynamic: the interpreter and every library it opens live
+        // under the toolchain tree, which is a mount every "spawn-" operation
+        // declares. See test/sandbox/dynamic_probe.zig.
+        const dynamic_probe = b.addExecutable(.{
+            .name = "chock-sandbox-dynamic-probe",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/sandbox/dynamic_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+
         // The test needs the path of the probe program. Zig 0.16 removed the argv access
         // that would let addArtifactArg hand the path to a test at run time, and the
         // default test runner panics on any argv it does not recognize. Embed the path
         // as a build time constant instead.
         const probe_path_options = b.addOptions();
         probe_path_options.addOptionPath("probe_path", probe.getEmittedBin());
+
+        // The same trick again, for the probe that runs the dynamic program:
+        // the path is a build time constant inside the probe rather than an
+        // argument, because the probe is what binds the program into a sandbox
+        // root of its own.
+        const dynamic_probe_path_options = b.addOptions();
+        dynamic_probe_path_options.addOptionPath(
+            "dynamic_probe_path",
+            dynamic_probe.getEmittedBin(),
+        );
+        probe.root_module.addImport(
+            "dynamic_probe_path",
+            dynamic_probe_path_options.createModule(),
+        );
 
         const escape_tests = b.addTest(.{
             .root_module = b.createModule(.{

@@ -418,12 +418,33 @@ pub fn spawn(
     // read out of a call the kernel is holding. The two are asked for apart,
     // so the config that asks for one and not the other is honest about
     // getting nothing rather than being refused.
-    const recording = watching and config.path_audit != null;
+    const recording = watching and config.path_audit;
     const reader_insns = if (recording)
         seccomp.buildReader(allocator) catch |err| return err
     else
         &[_]bpf.Insn{};
     defer if (recording) allocator.free(reader_insns);
+
+    // **The boundary R splits paths on, built here for the reason the three
+    // programs above are**, and before any fork for the same reason again.
+    //
+    // R cannot open a file: `seccomp.reader_calls` names no `openat`. It does
+    // not have to. R is a fork of A and A is a fork of this process, and a
+    // fork copies the whole address space, so this list is at the same address
+    // in R the moment R starts. The strings it points at are the caller's own,
+    // alive for the whole of this call. This is how the workspace this
+    // replaces already reached R.
+    //
+    // **Not the shared page.** B inherits that mapping and gives it up in
+    // `applyLayers`, so a boundary written there would be memory the observed
+    // program's own process once held. This copy is private to R.
+    //
+    // See `iface.grantPrefixes` for what is in the set and what is not.
+    const granted: []const []const u8 = if (recording)
+        iface.grantPrefixes(allocator, config) catch |err| return err
+    else
+        &.{};
+    defer if (recording) allocator.free(granted);
 
     // The cgroup, made here in the parent for the same reason the seccomp
     // filter is built here: the child that has to move into it is a child
@@ -825,7 +846,7 @@ pub fn spawn(
                     child_pidfd,
                     reader_insns,
                     path_record.?,
-                    config.path_audit.?.workspace,
+                    granted,
                 );
                 reader_pid = @intCast(reader_rc);
                 _ = linux.close(listener);
@@ -2340,37 +2361,101 @@ fn unmapPathRecord(record: *notify.PathRecord) void {
     _ = linux.munmap(@ptrCast(record), @sizeOf(notify.PathRecord));
 }
 
-/// Wait for the path reader, say whether its end explains itself, and report
-/// the counts it made.
+/// Wait for the path reader, say whether it reported a complete record, and
+/// report the counts it made.
 ///
-/// **The reader ends by leaving its own loop, and anything else is a loss.**
-/// The reader watches the observed program's own process descriptor as well as
-/// the notification descriptor, so the program's end wakes it and its loop
-/// returns. Measured on 2026-09-11: that is what happens on every ordinary
-/// run, and the reader exits 0.
+/// **The report is the reader's own `ended`, and never its exit status.** The
+/// reader watches the observed program's own process descriptor as well as the
+/// notification descriptor, so the program's end wakes it, its loop returns,
+/// and it writes `ended` into the shared page before it exits. The kernel is
+/// racing it: the observed program is process 1 of a pid namespace, so its
+/// exit also kills the reader. Measured on 2026-09-11, with the supervisor and
+/// the program pinned to one busy processor, the kernel won 27 times in 30 on
+/// a healthy run.
 ///
-/// A reader that ends any other way stopped early, and a reader that stopped
-/// early is not a silent loss: from that moment the kernel answered every held
-/// call with `ENOSYS`, because A gave up its own copy of the listener when the
-/// reader took it. This is the field that says so.
+/// **A reader that lost that race still wrote a complete record.** The kill
+/// comes from inside the program's own `exit`, so the program makes no further
+/// call. Measured the same day: 19 of 19 such runs held every path the program
+/// named. So the exit status alone must not decide, and `ended` is read first.
 ///
-/// **The doubtful case is counted as a loss and not as a clean run.** The
-/// kernel also kills the reader as it tears the pid namespace down, and a
-/// reader killed that way before its loop returned cannot be told from one the
-/// observed program killed. Reading that as "the record may be short" is the
-/// safe direction for a field an audit reads.
+/// **What is left over cannot be explained, and `PathRecord.reader_unreported`
+/// says only that.** See that field for the three discriminators that were
+/// measured and rejected.
 fn reapReader(watch: ReaderWatch, middle_write_fd: i32) void {
     var status: u32 = undefined;
     var rc = linux.waitpid(watch.pid, &status, 0);
     while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
 
-    const ordinary = linux.errno(rc) == .SUCCESS and
-        !linux.W.IFSIGNALED(status) and
-        linux.W.EXITSTATUS(status) == 0;
-    if (!ordinary or watch.record.ready == 0) watch.record.reader_lost = 1;
+    const ending: ReaderEnd.Ending = if (linux.errno(rc) != .SUCCESS)
+        .unknown
+    else if (linux.W.IFSIGNALED(status))
+        .signalled
+    else
+        .{ .exited = linux.W.EXITSTATUS(status) };
+    if (!readerReported(.{
+        .ready = watch.record.ready,
+        .ended = watch.record.ended,
+        .ending = ending,
+    })) watch.record.reader_unreported = 1;
 
     // The same route the counts always took. See `reportTraps`.
     reportTraps(middle_write_fd, &watch.record.counts);
+}
+
+/// What the supervisor knows about one reader when it reaps it.
+pub const ReaderEnd = struct {
+    /// `PathRecord.ready`, as the reader wrote it.
+    ready: u32,
+    /// `PathRecord.ended`, as the reader wrote it.
+    ended: u32,
+    /// How the reader's own process came to an end.
+    ending: Ending,
+
+    /// **A union and not a status number beside a flag.** The kernel's own
+    /// wait status carries an exit code only for a process that ended itself,
+    /// and `W.EXITSTATUS` of a status that names a signal is zero. A rule
+    /// written on that number alone would read "killed by SIGKILL" as "exited
+    /// cleanly" by accident rather than on purpose, and no test could tell the
+    /// two apart.
+    pub const Ending = union(enum) {
+        /// The reader ended itself, with this status.
+        exited: u32,
+        /// A signal ended the reader.
+        signalled,
+        /// The wait gave back no status at all.
+        unknown,
+    };
+};
+
+/// True when the reader reported a complete record.
+///
+/// **Pure, so the rule can be checked without forking anything.** Every input
+/// is something the supervisor already holds when it reaps, and the two that
+/// come out of the shared page are untrusted: the reader writes them, and a
+/// reader that never ran leaves them at zero. See `ReaderEnd`.
+pub fn readerReported(end: ReaderEnd) bool {
+    if (end.ready == 0) return false;
+    // **The positive fact, and the reason the way the reader died is not it.**
+    // The reader writes this the instant its loop returns, and the teardown
+    // kill can land between that write and the reader's own `exit`.
+    if (end.ended == 0) return false;
+    return switch (end.ending) {
+        // A non zero status is the reader's own loop saying it hit something
+        // it could not carry on from, so the record may be short even though
+        // the loop returned.
+        .exited => |status| status == 0,
+        // **A signal after the report is not a fault, and this arm is the
+        // fix.** The observed program is process 1 of a pid namespace, so its
+        // exit kills the reader, and on a busy machine that kill lands after
+        // the report and before the reader can leave. Measured on 2026-09-11,
+        // with the supervisor and the program pinned to one busy processor: 27
+        // healthy runs in 30 ended this way, and 19 of 19 of those held a
+        // complete record. Refusing the report here puts a warning in an audit
+        // record for an ordinary run.
+        .signalled => true,
+        // Nothing was read back, so there is nothing to believe.
+        .unknown => false,
+    };
 }
 
 /// The path reader, R. Never returns.
@@ -2409,7 +2494,7 @@ fn runReader(
     child_pidfd: i32,
     reader_insns: []const bpf.Insn,
     record: *notify.PathRecord,
-    workspace: []const u8,
+    granted: []const []const u8,
 ) noreturn {
     keepOnlyDescriptors(listener, child_pidfd);
 
@@ -2442,7 +2527,7 @@ fn runReader(
     // **Set after the layers and before the loop.** A zero here is the fact
     // that says the reader never got as far as watching anything.
     record.ready = 1;
-    const outcome = notify.serveRecording(listener, child_pidfd, record, workspace);
+    const outcome = notify.serveRecording(listener, child_pidfd, record, granted);
     record.ended = 1;
     linux.exit(if (outcome == .fault) 1 else 0);
 }
@@ -4405,4 +4490,80 @@ fn nullTerminate(buffer: []u8, text: []const u8) ?[:0]const u8 {
     @memcpy(buffer[0..text.len], text);
     buffer[text.len] = 0;
     return buffer[0..text.len :0];
+}
+
+test "a reader killed after it reported is still a reader that reported" {
+    // **The race this rule exists for, as a unit, and the regression it
+    // pins.** The observed program is process 1 of a pid namespace, so its
+    // exit kills the reader. That kill can land after the reader has written
+    // `ended` and before it reaches its own `exit`, and the rule this replaced
+    // read the wait status alone, so it called that healthy run a reader that
+    // was lost. Measured on 2026-09-11, with the supervisor and the program
+    // pinned to one busy processor: 27 healthy runs in 30 ended that way, and
+    // 19 of 19 of those held a complete record.
+    //
+    // Mutation check: change the `.signalled` arm of `readerReported` to
+    // `false` and this first expectation fails. **Measured first with the
+    // status carried as a plain number beside a flag, where deleting that same
+    // arm changed nothing at all**, because `W.EXITSTATUS` of a signal status
+    // is zero and the clean exit arm answered for it by accident. That is why
+    // `ReaderEnd.Ending` is a union.
+    try std.testing.expect(readerReported(.{
+        .ready = 1,
+        .ended = 1,
+        .ending = .signalled,
+    }));
+    // The uncontended shape of the same healthy run: the reader won the race
+    // and ended itself.
+    try std.testing.expect(readerReported(.{
+        .ready = 1,
+        .ended = 1,
+        .ending = .{ .exited = 0 },
+    }));
+}
+
+test "a reader that never started, never ended, or faulted reported nothing" {
+    // The four ways a report is missing, each pinned on its own, because each
+    // one is a different repair. **A reader that never ran leaves every field
+    // at zero**, and that must never read as a clean run.
+    //
+    // Mutation check: delete the `ready` line, delete the `ended` line, change
+    // the `.exited` arm to `true`, or change the `.unknown` arm to `true`, and
+    // the matching expectation below fails.
+    try std.testing.expect(!readerReported(.{
+        .ready = 0,
+        .ended = 0,
+        .ending = .{ .exited = 0 },
+    }));
+    // **The one that catches a program killing its own reader.** The reader
+    // was killed before its loop returned, so it wrote no report.
+    try std.testing.expect(!readerReported(.{
+        .ready = 1,
+        .ended = 0,
+        .ending = .signalled,
+    }));
+    try std.testing.expect(!readerReported(.{
+        .ready = 1,
+        .ended = 1,
+        .ending = .{ .exited = 1 },
+    }));
+    try std.testing.expect(!readerReported(.{
+        .ready = 1,
+        .ended = 1,
+        .ending = .unknown,
+    }));
+}
+
+test "a reader that only claims to have started has still reported nothing" {
+    // **Every number out of the shared page is untrusted input.** `ready`
+    // alone is not a report, and a rule that believed it would call a reader
+    // killed in its first instant a complete one.
+    //
+    // Mutation check: make `readerReported` give back `end.ready != 0` and
+    // this fails.
+    try std.testing.expect(!readerReported(.{
+        .ready = 1,
+        .ended = 0,
+        .ending = .signalled,
+    }));
 }

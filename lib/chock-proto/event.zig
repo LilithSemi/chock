@@ -1447,8 +1447,9 @@ pub const SyscallCount = struct {
     /// How many times the sandboxed programs of this session made it.
     count: u64 = 0,
     /// The paths this call named, as the programs that made it **said** they
-    /// were. Null for a session that asked for no path audit, and for a call
-    /// that names no path at all.
+    /// were, split on what the sandbox's own configuration granted. Null for a
+    /// session that asked for no path audit, and for a call that names no path
+    /// at all.
     ///
     /// **The field is named for what the paths are worth, and that is the
     /// point of the name.** A reader who quotes this in an audit has typed the
@@ -1488,26 +1489,44 @@ pub const SyscallCount = struct {
 /// unforgeable.** The call number comes from the kernel inside the
 /// notification and the process it is about cannot change it.
 pub const UnverifiedPaths = struct {
-    /// Calls whose path was under the session's workspace. **Counted and
-    /// never named**: one tool call makes thousands of these, and a record
-    /// that named them would grow the log without bound.
-    inside_workspace: u64 = 0,
-    /// Calls whose path was not. These are the few a reader of this record
-    /// wants, so they are named in `outside_names` until that set is full.
-    outside_workspace: u64 = 0,
-    /// Calls outside the workspace whose path is **not** in `outside_names`.
-    /// The explicit overflow count. Anything above zero means the set below
-    /// is short, and by how much.
-    outside_unnamed: u64 = 0,
+    /// Calls whose path was at or below something the sandbox's own
+    /// configuration put inside it: a mount target or a scratch area.
+    /// **Counted and never named**: one tool call makes thousands of these,
+    /// the dynamic loader makes the first of them, and a record that named
+    /// them would grow the log without bound.
+    ///
+    /// **The boundary is the grant and not the workspace, and the difference
+    /// is what makes this record worth reading.** Measured on 2026-09-11: a
+    /// plain `git status` inside a sandbox made 115 opens. Split on the
+    /// workspace it named 9 distinct paths, of which 8 were the dynamic
+    /// loader's own toolchain paths, so a set of 8 names held nothing else.
+    /// Split on the grant, the same run named nothing at all.
+    granted: u64 = 0,
+    /// Calls whose path the configuration granted nothing for. These are the
+    /// few a reader of this record wants, so they are named in
+    /// `ungranted_names` until that set is full.
+    ungranted: u64 = 0,
+    /// Calls that were ungranted and whose path is **not** in
+    /// `ungranted_names`. The explicit overflow count. Anything above zero
+    /// means the set below is short, and by how much.
+    ungranted_unnamed: u64 = 0,
+    /// Calls whose path had no leading separator, so it resolves against a
+    /// directory the reader could not see.
+    ///
+    /// **Its own count, because neither side would be true.** `openat` with a
+    /// descriptor takes a relative name, and the reader reads the name and
+    /// never the descriptor. Counting these as granted would claim a boundary
+    /// nothing checked.
+    relative: u64 = 0,
     /// Calls whose path the reader could not read out of the observed process
     /// at all. Counted rather than guessed at.
     unread: u64 = 0,
     /// Calls whose path was longer than the reader's clamp, so the name kept
     /// for it is a prefix of what the process wrote.
     truncated: u64 = 0,
-    /// The distinct paths outside the workspace, capped. See `outside_unnamed`
-    /// for what a full set leaves out.
-    outside_names: []const []const u8 = &.{},
+    /// The distinct paths the configuration granted nothing for, capped. See
+    /// `ungranted_unnamed` for what a full set leaves out.
+    ungranted_names: []const []const u8 = &.{},
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -1569,13 +1588,25 @@ pub const SandboxSyscalls = struct {
     /// path, and it sets this to true on this same event kind rather than
     /// making a kind of its own. The precedent is `SandboxSupervisor.layer`.
     paths_verified: bool = false,
-    /// Tool calls whose path reader stopped before the program did. **This is
-    /// the field an audit reads** for the path rows, the way `unobserved` is
-    /// the field it reads for the counts. From the moment a reader stops, the
-    /// kernel answers the program's own held calls with `ENOSYS`, so the
-    /// program cannot go on unrecorded in silence, but the rows above are
-    /// short by whatever it did first.
-    path_readers_lost: u64 = 0,
+    /// Tool calls whose path reader did not report that it saw the program
+    /// end.
+    ///
+    /// **A warning and not a finding, and the name says which.** Two things
+    /// leave a reader without a report, and measured on 2026-09-11 they are
+    /// identical at the reap. The ordinary teardown is one: the program is
+    /// process 1 of a pid namespace, so its exit kills the reader, and on a
+    /// busy machine that kill beats the reader's own report 27 times in 30.
+    /// **Nothing is lost that way**, because the kill happens inside the
+    /// program's own exit, and 19 of 19 such runs held a complete record. A
+    /// program that killed its own reader is the other, and there the rows
+    /// above are short by whatever it did next.
+    ///
+    /// A count above zero on a busy machine is ordinary. A count that is high
+    /// against `observed`, or one on an otherwise idle machine, is worth
+    /// reading. See `lib/chock-sandbox/linux/notify.zig`'s own
+    /// `PathRecord.reader_unreported` for the discriminators that were tried
+    /// and rejected.
+    path_readers_unreported: u64 = 0,
     /// Tool calls whose path reader never started at all.
     path_readers_absent: u64 = 0,
     extra: Extra = .{},
@@ -1976,11 +2007,12 @@ test "a path record survives a round trip, caveat and overflow count included" {
     const names = [_][]const u8{ "/etc/shadow", "/home/someone/.ssh/id_ed25519" };
     const rows = [_]SyscallCount{
         .{ .name = "openat", .count = 900, .unverified_paths = .{
-            .inside_workspace = 812,
-            .outside_workspace = 9,
-            .outside_unnamed = 7,
+            .granted = 812,
+            .ungranted = 9,
+            .ungranted_unnamed = 7,
+            .relative = 71,
             .truncated = 1,
-            .outside_names = &names,
+            .ungranted_names = &names,
         } },
         .{ .name = "connect", .count = 0 },
     };
@@ -1992,7 +2024,7 @@ test "a path record survives a round trip, caveat and overflow count included" {
             .mechanism = "seccomp_user_notif",
             .observed = 3,
             .calls = &rows,
-            .path_readers_lost = 1,
+            .path_readers_unreported = 1,
         } },
     };
 
@@ -2004,7 +2036,7 @@ test "a path record survives a round trip, caveat and overflow count included" {
     // the name on the wire is the name that carries it.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"unverified_paths\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"paths_verified\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"outside_unnamed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"ungranted_unnamed\"") != null);
 
     const parsed = try fromJson(allocator, text);
     defer parsed.deinit();
@@ -2014,16 +2046,17 @@ test "a path record survives a round trip, caveat and overflow count included" {
     // actually used sets this true on this same kind, beside a field of its
     // own. See `UnverifiedPaths`.
     try std.testing.expectEqual(false, said.paths_verified);
-    try std.testing.expectEqual(@as(u64, 1), said.path_readers_lost);
+    try std.testing.expectEqual(@as(u64, 1), said.path_readers_unreported);
 
     const opens = said.calls[0].unverified_paths.?;
-    try std.testing.expectEqual(@as(u64, 812), opens.inside_workspace);
-    try std.testing.expectEqual(@as(u64, 9), opens.outside_workspace);
-    try std.testing.expectEqual(@as(u64, 7), opens.outside_unnamed);
+    try std.testing.expectEqual(@as(u64, 812), opens.granted);
+    try std.testing.expectEqual(@as(u64, 9), opens.ungranted);
+    try std.testing.expectEqual(@as(u64, 7), opens.ungranted_unnamed);
+    try std.testing.expectEqual(@as(u64, 71), opens.relative);
     try std.testing.expectEqual(@as(u64, 1), opens.truncated);
-    try std.testing.expectEqual(@as(usize, 2), opens.outside_names.len);
-    try std.testing.expectEqualStrings("/etc/shadow", opens.outside_names[0]);
-    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.outside_names[1]);
+    try std.testing.expectEqual(@as(usize, 2), opens.ungranted_names.len);
+    try std.testing.expectEqualStrings("/etc/shadow", opens.ungranted_names[0]);
+    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.ungranted_names[1]);
 
     // A call that recorded nothing carries no path record at all, and that
     // reads back as null rather than as a set of zeros.

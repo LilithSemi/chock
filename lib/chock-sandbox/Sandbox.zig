@@ -34,6 +34,7 @@ const seccomp = @import("linux/seccomp.zig");
 const notify = @import("linux/notify.zig");
 const rlimits = @import("linux/rlimits.zig");
 const cgroup = @import("linux/cgroup.zig");
+const grants = @import("grants.zig");
 
 /// `landlock.zig`, `namespace.zig`, and `seccomp.zig` are Linux-only
 /// mechanisms, and every line in them that reaches the kernel says so with
@@ -367,38 +368,28 @@ pub const Config = struct {
     /// the point for the same reason.
     syscall_audit: ?*SyscallAudit = null,
     /// Whether the supervisor also records **which paths** the sandboxed
-    /// program named, and not only how many calls it made. Null is the
-    /// default, and null changes nothing for a caller that never asked.
+    /// program named, and not only how many calls it made. False is the
+    /// default, and false changes nothing for a caller that never asked.
     ///
     /// **It needs `seccomp_options.traps` as well.** A path is read out of a
     /// held call, so a call nobody holds names nothing. A config that sets
     /// this and traps nothing records nothing, and says so with a record of
     /// zeros rather than by failing.
     ///
-    /// **What comes back is telemetry and never evidence.** See
-    /// `linux/notify.zig`, and `PathAudit` below.
-    path_audit: ?PathAudit = null,
-
-    /// How the supervisor records the paths a held call named.
+    /// **The boundary is this config's own mount set and scratch areas**, and
+    /// no caller names it. A path the config granted is counted and never
+    /// named, because a tool call makes thousands of those and the loader
+    /// makes the first of them. A path the config granted nothing for is the
+    /// anomaly, so that name is kept. See `grantPrefixes`.
     ///
-    /// **The paths are what the program said, and a program can lie.** The
-    /// kernel runs the call after the reader has read the argument, so the
-    /// program is free to write one name, wait to be let go, and then open
-    /// another. Everything this produces is labelled for that: the field in
-    /// the session log is called `unverified_paths`, and the event carries
-    /// `paths_verified: false` as a fact a later mode can flip. See
-    /// `linux/notify.zig`'s own top comment.
-    pub const PathAudit = struct {
-        /// The directory the program's own work lives under, as the program
-        /// sees it. A path under this is counted and never named, because a
-        /// tool call makes thousands of them. A path outside it is named,
-        /// until the record is full. See `linux/notify.zig`'s own
-        /// `kept_path_cap`.
-        ///
-        /// An empty string puts every path outside, so every path competes
-        /// for the few slots there are. Name the workspace.
-        workspace: []const u8,
-    };
+    /// **What comes back is telemetry and never evidence.** The kernel runs
+    /// the call after the reader has read the argument, so the program is free
+    /// to write one name, wait to be let go, and then open another. Everything
+    /// this produces is labelled for that: the field in the session log is
+    /// called `unverified_paths`, and the event carries `paths_verified:
+    /// false` as a fact a later mode can flip. See `linux/notify.zig`'s own
+    /// top comment.
+    path_audit: bool = false,
 
     pub const Rule = struct {
         path: []const u8,
@@ -434,9 +425,6 @@ pub const Config = struct {
         var out = self;
         out.root = try allocator.dupe(u8, self.root);
         out.cwd = try allocator.dupe(u8, self.cwd);
-        if (self.path_audit) |audit| out.path_audit = .{
-            .workspace = try allocator.dupe(u8, audit.workspace),
-        };
         out.env = try copyStrings(allocator, self.env);
 
         const mounts = try allocator.alloc(namespace.Mount, self.mounts.len);
@@ -578,34 +566,52 @@ fn mountTarget(mount: namespace.Mount) ?[]const u8 {
 fn mountSetHolds(config: Config, target_path: []const u8) bool {
     for (config.mounts) |mount| {
         const target = mountTarget(mount) orelse continue;
-        if (holdsPath(target, target_path)) return true;
+        if (grants.holds(target, target_path)) return true;
     }
     for (config.scratch) |area| {
-        if (holdsPath(area.target, target_path)) return true;
+        if (grants.holds(area.target, target_path)) return true;
     }
     return false;
 }
 
 fn ruleSetHolds(config: Config, target_path: []const u8) bool {
     for (config.rules) |rule| {
-        if (holdsPath(rule.path, target_path)) return true;
+        if (grants.holds(rule.path, target_path)) return true;
     }
     return false;
 }
 
-/// True when `parent` is `child`, or is a directory that holds `child`.
+/// Every path inside the sandbox that `config` puts something at, in
+/// `allocator`.
 ///
-/// This is the reach of one `LANDLOCK_RULE_PATH_BENEATH` rule and the reach of
-/// one mount, which are the same shape: both cover the named path and
-/// everything below it. The comparison is on the spelling alone. Every mount
-/// target, scratch area and rule path in this project is an absolute path with
-/// no trailing separator and no `.` or `..` component, because each one is
-/// built by `std.fs.path.join` or written out as a literal.
-fn holdsPath(parent: []const u8, child: []const u8) bool {
-    if (parent.len == 0 or child.len == 0) return false;
-    if (std.mem.eql(u8, parent, "/")) return true;
-    if (!std.mem.startsWith(u8, child, parent)) return false;
-    return child.len == parent.len or child[parent.len] == '/';
+/// **This is the boundary the path audit splits on**, and it is the same set
+/// `mountSetHolds` above compares a Landlock rule against. A path a sandboxed
+/// program names that is at or below one of these is a path the caller granted
+/// it, so the record counts it and never keeps the name. A path at or below
+/// none of them is the anomaly, so the record keeps that name. See
+/// `linux/notify.zig`'s own `classify`.
+///
+/// **Derived here and never named by a caller.** A caller that wrote the
+/// boundary out by hand beside the mount list would be one judgement written
+/// twice, which is the fault `firstGap` above exists to catch.
+///
+/// **A `Mount.deny` target is not in the set**, the same as in `firstGap`: it
+/// takes bytes away and grants no reach. What it does not do is take a path
+/// out of a wider grant that covers it, so a denial below a granted tree still
+/// reads as granted. That is a known limit of a comparison on spellings alone.
+pub fn grantPrefixes(
+    allocator: std.mem.Allocator,
+    config: Config,
+) std.mem.Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacityPrecise(allocator, config.mounts.len + config.scratch.len);
+    for (config.mounts) |mount| {
+        const target = mountTarget(mount) orelse continue;
+        out.appendAssumeCapacity(target);
+    }
+    for (config.scratch) |area| out.appendAssumeCapacity(area.target);
+    return out.toOwnedSlice(allocator);
 }
 
 /// A copy of every string in `from`, in `allocator`. Used by `Config.copy` and
@@ -1076,10 +1082,14 @@ pub const SyscallAudit = struct {
     /// What one tool call's reader left behind, added up over the session.
     pub const PathTotals = struct {
         lock: Lock = .{},
-        /// Calls whose reader ended in a way the ordinary teardown does not
-        /// explain. **This is the field an audit reads**: the program ran
-        /// part of its life with nothing recording it.
-        readers_lost: u64 = 0,
+        /// Calls whose reader did not report that it saw the program end.
+        ///
+        /// **A warning and not a finding.** The ordinary pid namespace
+        /// teardown and a program that kills its own reader are identical at
+        /// the reap, so this counts both. See
+        /// `notify.PathRecord.reader_unreported` for the three discriminators
+        /// that were measured and rejected.
+        readers_unreported: u64 = 0,
         /// Calls whose reader never reached its loop at all.
         readers_absent: u64 = 0,
         /// The record itself, with the names of every tool call merged.
@@ -1137,22 +1147,23 @@ pub const SyscallAudit = struct {
         self.paths.lock.lock();
         defer self.paths.lock.unlock();
 
-        if (seen.reader_lost != 0) self.paths.readers_lost +|= 1;
+        if (seen.reader_unreported != 0) self.paths.readers_unreported +|= 1;
         if (seen.ready == 0) self.paths.readers_absent +|= 1;
 
         const into = &self.paths.seen;
         for (0..notify.call_count) |slot| {
-            into.inside[slot] +|= seen.inside[slot];
-            into.outside[slot] +|= seen.outside[slot];
-            into.outside_unnamed[slot] +|= seen.outside_unnamed[slot];
+            into.granted[slot] +|= seen.granted[slot];
+            into.ungranted[slot] +|= seen.ungranted[slot];
+            into.ungranted_unnamed[slot] +|= seen.ungranted_unnamed[slot];
+            into.relative[slot] +|= seen.relative[slot];
             into.unread[slot] +|= seen.unread[slot];
             into.truncated[slot] +|= seen.truncated[slot];
         }
 
         // **Each name carries its own call total across the merge.** A name
         // the session's own set has no room for adds that total to
-        // `outside_unnamed`, so a name that stood for five hundred opens does
-        // not read as one. See `notify.PathRecord.name_hits`.
+        // `ungranted_unnamed`, so a name that stood for five hundred opens
+        // does not read as one. See `notify.PathRecord.name_hits`.
         var slot: u32 = 0;
         while (slot < @min(seen.kept, notify.kept_path_cap)) : (slot += 1) {
             notify.keepName(into, seen.name_call[slot], seen.name(slot), seen.name_hits[slot]);
@@ -1196,11 +1207,12 @@ pub const SyscallAudit = struct {
 
         const seen = &self.paths.seen;
         var out: PathCounts = .{
-            .readers_lost = self.paths.readers_lost,
+            .readers_unreported = self.paths.readers_unreported,
             .readers_absent = self.paths.readers_absent,
-            .inside = seen.inside,
-            .outside = seen.outside,
-            .outside_unnamed = seen.outside_unnamed,
+            .granted = seen.granted,
+            .ungranted = seen.ungranted,
+            .ungranted_unnamed = seen.ungranted_unnamed,
+            .relative = seen.relative,
             .unread = seen.unread,
             .truncated = seen.truncated,
             .kept = @min(seen.kept, name_cap),
@@ -1213,11 +1225,19 @@ pub const SyscallAudit = struct {
 
     /// What `pathCounts` gives back.
     pub const PathCounts = struct {
-        readers_lost: u64,
+        /// Calls whose reader did not report that it saw the program end.
+        /// See `PathTotals.readers_unreported`.
+        readers_unreported: u64,
         readers_absent: u64,
-        inside: notify.Counts,
-        outside: notify.Counts,
-        outside_unnamed: notify.Counts,
+        /// Calls whose path the caller's own config granted. Counted and never
+        /// named. See `Config.path_audit` and `grantPrefixes`.
+        granted: notify.Counts,
+        /// Calls whose path it granted nothing for. Named until the set fills.
+        ungranted: notify.Counts,
+        /// Calls that were ungranted and that the set had no room for.
+        ungranted_unnamed: notify.Counts,
+        /// Calls whose path was relative, so the reader could not place it.
+        relative: notify.Counts,
         unread: notify.Counts,
         truncated: notify.Counts,
         kept: u32,
@@ -1229,10 +1249,10 @@ pub const SyscallAudit = struct {
         /// field out rather than write a row of zeros for every call.
         pub fn empty(self: PathCounts) bool {
             if (self.kept != 0) return false;
-            if (self.readers_lost != 0 or self.readers_absent != 0) return false;
+            if (self.readers_unreported != 0 or self.readers_absent != 0) return false;
             for (0..notify.call_count) |slot| {
-                if (self.inside[slot] != 0 or self.outside[slot] != 0) return false;
-                if (self.outside_unnamed[slot] != 0) return false;
+                if (self.granted[slot] != 0 or self.ungranted[slot] != 0) return false;
+                if (self.ungranted_unnamed[slot] != 0 or self.relative[slot] != 0) return false;
                 if (self.unread[slot] != 0 or self.truncated[slot] != 0) return false;
             }
             return true;
@@ -1570,6 +1590,49 @@ test "a fresh audit claims nothing, so an absent answer is never a confined one"
     try std.testing.expectEqual(@as(?SupervisorAudit.FilterFault, null), counts.first_fault);
 }
 
+test "the grant set is every mount target and every scratch area, and no denial" {
+    // **The boundary the path record splits on.** A caller never names it, so
+    // this is the one place a mount that stopped being counted as a grant
+    // would show. A missing entry turns every open below that mount into a
+    // path nothing granted, which fills the record's few name slots with
+    // ordinary work and pushes the anomaly into the overflow count.
+    //
+    // A `Mount.deny` target is left out for the reason `firstGap` leaves it
+    // out: it takes bytes away and grants no reach.
+    //
+    // Mutation check: drop the scratch loop in `grantPrefixes` and the length
+    // below reads 3 with `/run/chock/scratch` missing. Give `.deny` a target
+    // in `mountTarget` and the length reads 5.
+    const config = Config{
+        .root = "/tmp/root",
+        .mounts = &.{
+            .{ .bind = .{ .source = "/host/work", .target = "/work" } },
+            .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
+            .{ .proc = .{ .target = "/proc" } },
+            .{ .deny = .{ .target = "/work/.ssh" } },
+        },
+        .rules = &.{},
+        .scratch = &.{.{ .target = "/run/chock/scratch" }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+
+    const set = try grantPrefixes(std.testing.allocator, config);
+    defer std.testing.allocator.free(set);
+
+    try std.testing.expectEqual(@as(usize, 4), set.len);
+    try std.testing.expectEqualStrings("/work", set[0]);
+    try std.testing.expectEqualStrings("/nix/store", set[1]);
+    try std.testing.expectEqualStrings("/proc", set[2]);
+    try std.testing.expectEqualStrings("/run/chock/scratch", set[3]);
+
+    // **The same judgement `firstGap` makes.** A path a rule may name is a
+    // path the record calls granted, and the two answers come from one
+    // function so they cannot drift.
+    try std.testing.expect(grants.setHolds(set, "/nix/store/abc-glibc/lib/libc.so.6"));
+    try std.testing.expect(!grants.setHolds(set, "/etc/shadow"));
+}
+
 test "a copied config shares no memory with the original, scratch areas included" {
     // **`Config.copy` exists so a caller can outlive the arena its config was
     // built in**, which `chock_core.tasks.Table` and `chock_core.helper.Helper`
@@ -1591,7 +1654,7 @@ test "a copied config shares no memory with the original, scratch areas included
         .scratch = &.{ .{ .target = "/run/chock/scratch" }, .{ .target = "/run/chock/tasks" } },
         .cwd = "/",
         .env = &.{"PATH=/bin"},
-        .path_audit = .{ .workspace = "/work" },
+        .path_audit = true,
     };
 
     const copied = try original.copy(arena);
@@ -1603,15 +1666,10 @@ test "a copied config shares no memory with the original, scratch areas included
     }
     try std.testing.expect(original.scratch.ptr != copied.scratch.ptr);
 
-    // The workspace a path audit names is a string in the caller's own arena,
-    // the same as `root` and `cwd`, so it is duplicated the same way.
-    //
-    // Mutation check: take the `path_audit` line out of `copy` and this fails.
-    try std.testing.expectEqualStrings(
-        original.path_audit.?.workspace,
-        copied.path_audit.?.workspace,
-    );
-    try std.testing.expect(original.path_audit.?.workspace.ptr != copied.path_audit.?.workspace.ptr);
+    // **A path audit names no path of its own.** Its boundary is the mount
+    // set and the scratch areas, which the two pointer checks below already
+    // cover, so what has to survive the copy is the flag and nothing else.
+    try std.testing.expectEqual(true, copied.path_audit);
 
     // The fields that were already copied before scratch areas existed, so a
     // later reader can see this test covers the whole shape and not one field.
@@ -1881,7 +1939,7 @@ test "one tool call's paths are added to the session's own, and a name with no r
     while (made < notify.kept_path_cap) : (made += 1) {
         var buffer: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, "/etc/thing-{d}", .{made});
-        first.outside[openat] += 1;
+        first.ungranted[openat] += 1;
         notify.keepName(&first, openat, path, 1);
     }
     audit.recordPaths(&first);
@@ -1889,7 +1947,12 @@ test "one tool call's paths are added to the session's own, and a name with no r
     // The second call names one more path, five hundred times over, and the
     // session's set is already full.
     var second: notify.PathRecord = .{ .ready = 1 };
-    second.outside[openat] = 500;
+    second.ungranted[openat] = 500;
+    // A relative name is neither side, so it has to survive the merge on its
+    // own. Without this the session would read a call that named a directory
+    // the reader could not see as a call that named nothing.
+    second.relative[openat] = 7;
+    second.granted[openat] = 11;
     notify.keepName(&second, openat, "/home/someone/.ssh/id_ed25519", 500);
     audit.recordPaths(&second);
 
@@ -1897,33 +1960,37 @@ test "one tool call's paths are added to the session's own, and a name with no r
     try std.testing.expectEqual(@as(u32, notify.kept_path_cap), counted.kept);
     try std.testing.expectEqual(
         @as(u64, notify.kept_path_cap + 500),
-        counted.outside[openat],
+        counted.ungranted[openat],
     );
-    try std.testing.expectEqual(@as(u64, 500), counted.outside_unnamed[openat]);
-    try std.testing.expectEqual(@as(u64, 0), counted.readers_lost);
+    try std.testing.expectEqual(@as(u64, 500), counted.ungranted_unnamed[openat]);
+    // Mutation check: drop the `relative` or the `granted` line from
+    // `recordPaths`'s merge loop and one of these two reads 0.
+    try std.testing.expectEqual(@as(u64, 7), counted.relative[openat]);
+    try std.testing.expectEqual(@as(u64, 11), counted.granted[openat]);
+    try std.testing.expectEqual(@as(u64, 0), counted.readers_unreported);
     try std.testing.expectEqual(@as(u64, 0), counted.readers_absent);
 }
 
-test "a reader that was lost, and one that never started, are counted apart" {
+test "a reader that never started, and one that never reported, are counted apart" {
     // **Two different facts with two different repairs.** A reader that never
     // started means the paths for that call are missing from the beginning. A
-    // reader that was lost means they stop part way, and the program's own
-    // held calls answered `ENOSYS` from that moment. A session that read one
-    // number for both could not tell them apart.
+    // reader that started and never reported means the record may stop part
+    // way, or may be complete and the teardown simply won a race. A session
+    // that read one number for both could not tell them apart.
     //
-    // Mutation check: count both in `readers_lost` and the second expectation
-    // reads 2.
+    // Mutation check: count both in `readers_unreported` and the second
+    // expectation reads 2.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var audit: SyscallAudit = .{};
 
     var never_started: notify.PathRecord = .{ .ready = 0 };
     audit.recordPaths(&never_started);
-    var stopped_early: notify.PathRecord = .{ .ready = 1, .reader_lost = 1 };
-    audit.recordPaths(&stopped_early);
+    var no_report: notify.PathRecord = .{ .ready = 1, .reader_unreported = 1 };
+    audit.recordPaths(&no_report);
     var whole_way: notify.PathRecord = .{ .ready = 1, .ended = 1 };
     audit.recordPaths(&whole_way);
 
     const counted = audit.pathCounts();
     try std.testing.expectEqual(@as(u64, 1), counted.readers_absent);
-    try std.testing.expectEqual(@as(u64, 1), counted.readers_lost);
+    try std.testing.expectEqual(@as(u64, 1), counted.readers_unreported);
 }

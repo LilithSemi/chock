@@ -5575,12 +5575,13 @@ fn syscallEvent(
         }
         rows[field.value] = .{ .name = field.name, .count = counts.calls[field.value] };
         path_rows[field.value] = .{
-            .inside_workspace = paths.inside[field.value],
-            .outside_workspace = paths.outside[field.value],
-            .outside_unnamed = paths.outside_unnamed[field.value],
+            .granted = paths.granted[field.value],
+            .ungranted = paths.ungranted[field.value],
+            .ungranted_unnamed = paths.ungranted_unnamed[field.value],
+            .relative = paths.relative[field.value],
             .unread = paths.unread[field.value],
             .truncated = paths.truncated[field.value],
-            .outside_names = names[first..filled],
+            .ungranted_names = names[first..filled],
         };
         // **Left out for a call that recorded nothing**, rather than written
         // as a row of zeros. A path audit is off by default, most calls name
@@ -5588,9 +5589,9 @@ fn syscallEvent(
         // of the line. `paths_verified` below is always there, so a reader
         // still learns the mechanism exists and what its output is worth.
         const row = path_rows[field.value];
-        const said_something = row.inside_workspace != 0 or row.outside_workspace != 0 or
-            row.outside_unnamed != 0 or row.unread != 0 or row.truncated != 0 or
-            row.outside_names.len != 0;
+        const said_something = row.granted != 0 or row.ungranted != 0 or
+            row.ungranted_unnamed != 0 or row.relative != 0 or row.unread != 0 or
+            row.truncated != 0 or row.ungranted_names.len != 0;
         if (said_something) rows[field.value].unverified_paths = row;
     }
     return .{
@@ -5604,7 +5605,7 @@ fn syscallEvent(
             // argument after the reader read it. See
             // `chock_proto.event.UnverifiedPaths`.
             .paths_verified = false,
-            .path_readers_lost = paths.readers_lost,
+            .path_readers_unreported = paths.readers_unreported,
             .path_readers_absent = paths.readers_absent,
         },
     };
@@ -5779,7 +5780,7 @@ test "the syscall event names one row for each call the sandbox can watch, and s
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].unverified_paths,
     );
     try std.testing.expectEqual(false, said.paths_verified);
-    try std.testing.expectEqual(@as(u64, 0), said.path_readers_lost);
+    try std.testing.expectEqual(@as(u64, 0), said.path_readers_unreported);
 }
 
 test "a full path record is still one short line of the session log" {
@@ -5803,7 +5804,16 @@ test "a full path record is still one short line of the session log" {
     for (0..syscall_name_cap) |slot| {
         counted.name_call[slot] = @intFromEnum(sandbox.seccomp.TrapCall.openat);
         counted.names[slot] = &longest;
-        counted.inside[slot % sandbox.notify.call_count] = std.math.maxInt(u32);
+    }
+    // Every counter of every row saturated, so a row is never left out for
+    // saying nothing and no field is missing from the measurement.
+    for (0..sandbox.notify.call_count) |slot| {
+        counted.granted[slot] = std.math.maxInt(u32);
+        counted.ungranted[slot] = std.math.maxInt(u32);
+        counted.ungranted_unnamed[slot] = std.math.maxInt(u32);
+        counted.relative[slot] = std.math.maxInt(u32);
+        counted.unread[slot] = std.math.maxInt(u32);
+        counted.truncated[slot] = std.math.maxInt(u32);
     }
 
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
@@ -5834,11 +5844,12 @@ test "a full path record is still one short line of the session log" {
 /// A path record with nothing in it, for the tests that are about the counts.
 fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
     return .{
-        .readers_lost = 0,
+        .readers_unreported = 0,
         .readers_absent = 0,
-        .inside = sandbox.notify.empty_counts,
-        .outside = sandbox.notify.empty_counts,
-        .outside_unnamed = sandbox.notify.empty_counts,
+        .granted = sandbox.notify.empty_counts,
+        .ungranted = sandbox.notify.empty_counts,
+        .ungranted_unnamed = sandbox.notify.empty_counts,
+        .relative = sandbox.notify.empty_counts,
         .unread = sandbox.notify.empty_counts,
         .truncated = sandbox.notify.empty_counts,
         .kept = 0,
@@ -5850,8 +5861,9 @@ fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
 test "the syscall event names each call's own paths, and says they are not verified" {
     // **The requirement, and the caveat that must survive a refactor.** A
     // machine reading the log answers "what did this session's programs open
-    // outside the workspace" from `outside_names`, "how much is missing" from
-    // `outside_unnamed`, and "is any of this proof" from `paths_verified`.
+    // that nothing in its own sandbox configuration granted" from
+    // `ungranted_names`, "how much is missing" from `ungranted_unnamed`, and
+    // "is any of this proof" from `paths_verified`.
     //
     // The names come back from the sandbox mixed together, one list for every
     // call, so the grouping here is what gives each call its own. A row that
@@ -5865,13 +5877,14 @@ test "the syscall event names each call's own paths, and says they are not verif
     const execve = @intFromEnum(sandbox.seccomp.TrapCall.execve);
 
     var counted = emptyPathCounts();
-    counted.readers_lost = 2;
+    counted.readers_unreported = 2;
     counted.readers_absent = 1;
-    counted.inside[openat] = 812;
-    counted.outside[openat] = 9;
-    counted.outside_unnamed[openat] = 6;
+    counted.granted[openat] = 812;
+    counted.ungranted[openat] = 9;
+    counted.ungranted_unnamed[openat] = 6;
+    counted.relative[openat] = 71;
     counted.truncated[openat] = 1;
-    counted.outside[execve] = 1;
+    counted.ungranted[execve] = 1;
     counted.kept = 3;
     counted.name_call[0] = openat;
     counted.names[0] = "/etc/passwd";
@@ -5892,23 +5905,24 @@ test "the syscall event names each call's own paths, and says they are not verif
     const said = ev.sandbox_syscalls;
     // **The word an auditor has to type.** See `chock_proto.event.UnverifiedPaths`.
     try std.testing.expectEqual(false, said.paths_verified);
-    try std.testing.expectEqual(@as(u64, 2), said.path_readers_lost);
+    try std.testing.expectEqual(@as(u64, 2), said.path_readers_unreported);
     try std.testing.expectEqual(@as(u64, 1), said.path_readers_absent);
 
     const opens = said.calls[openat].unverified_paths.?;
-    try std.testing.expectEqual(@as(u64, 812), opens.inside_workspace);
-    try std.testing.expectEqual(@as(u64, 9), opens.outside_workspace);
+    try std.testing.expectEqual(@as(u64, 812), opens.granted);
+    try std.testing.expectEqual(@as(u64, 9), opens.ungranted);
     // **The explicit overflow count.** Without it a full set reads as the
     // whole truth.
-    try std.testing.expectEqual(@as(u64, 6), opens.outside_unnamed);
+    try std.testing.expectEqual(@as(u64, 6), opens.ungranted_unnamed);
+    try std.testing.expectEqual(@as(u64, 71), opens.relative);
     try std.testing.expectEqual(@as(u64, 1), opens.truncated);
-    try std.testing.expectEqual(@as(usize, 2), opens.outside_names.len);
-    try std.testing.expectEqualStrings("/etc/passwd", opens.outside_names[0]);
-    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.outside_names[1]);
+    try std.testing.expectEqual(@as(usize, 2), opens.ungranted_names.len);
+    try std.testing.expectEqualStrings("/etc/passwd", opens.ungranted_names[0]);
+    try std.testing.expectEqualStrings("/home/someone/.ssh/id_ed25519", opens.ungranted_names[1]);
 
     const execs = said.calls[execve].unverified_paths.?;
-    try std.testing.expectEqual(@as(usize, 1), execs.outside_names.len);
-    try std.testing.expectEqualStrings("/bin/sh", execs.outside_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), execs.ungranted_names.len);
+    try std.testing.expectEqualStrings("/bin/sh", execs.ungranted_names[0]);
 
     // **A call that recorded nothing gets no row at all.** `connect` names a
     // socket address and never a path, so a row of zeros for it would be a
