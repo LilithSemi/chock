@@ -1434,11 +1434,12 @@ fn chdirRefusedFilter() [4]bpf.Insn {
 /// error, and this file obeys that rule. So the code carries the fault, and
 /// the parent's own `expectEqual` prints it.
 ///
-/// **Only `NotSupported` may skip a test.** Every other code below is a fault
-/// on a machine that this project can run on at all. An earlier version of
-/// these tests skipped on any `install` failure, and a mutation that deleted
-/// the `prctl` call from `install` then turned both tests green by skipping
-/// them. That is the exact shape of failure these tests exist to catch.
+/// **Only `NotSupported` may skip an install failure.** Every other code below
+/// is a fault on a machine that this project can run on at all. An earlier
+/// version of these tests skipped on any `install` failure, and a mutation
+/// that deleted the `prctl` call from `install` then turned both tests green
+/// by skipping them. That is the exact shape of failure these tests exist to
+/// catch.
 fn installFaultCode(err: InstallError) u8 {
     return switch (err) {
         error.NotSupported => 3,
@@ -1469,13 +1470,21 @@ test "install turns on no_new_privs, and does not rely on a caller to do it" {
     // `landlock.Ruleset.restrictSelf` first, and that call sets the same flag,
     // so the flag is already on by the time `install` runs there. This test
     // takes a child that has the flag off and measures `install` alone.
+    // no_new_privs is inherited and cannot be cleared. A Nix builder can set
+    // it before the test runner starts, so that environment cannot make the
+    // required before-and-after measurement. Skip only that precondition. An
+    // install failure in a measurable environment still fails below.
+    const runner_nnp = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(runner_nnp));
+    if (runner_nnp != 0) return error.SkipZigTest;
+
     const fork_rc = linux.fork();
     try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
     if (fork_rc == 0) {
         const before = linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0);
         if (linux.errno(before) != .SUCCESS) std.process.exit(11);
-        // A test runner that already runs with the flag on cannot see the
-        // change, and must not report a pass.
+        // Detect an unexpected state change between the parent check and the
+        // measurement. This is a failure, not an environment skip.
         if (before != 0) std.process.exit(10);
 
         var insns = chdirRefusedFilter();

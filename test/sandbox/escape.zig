@@ -2172,13 +2172,10 @@ test "a process that calls setsid still dies when the sandbox is torn down" {
 }
 
 test "spawn applies every layer, and a spawned process cannot setns into /proc/1/ns/mnt" {
-    // The proc/1/ns/mnt escape. /proc/1 inside the sandbox names its own
-    // leader, not the host's real init: `buildProcMount` mounts a fresh
-    // procfs after the pid namespace already exists, and the kernel gives a
-    // procfs mounted from inside a pid namespace the view of that
-    // namespace. It is also not one of the 20 names
-    // `namespace.masked_proc_entries` hides: that list masks global files,
-    // and this one is per pid, so the path is freely readable.
+    // The proc/1/ns/mnt escape. /proc/1 inside the sandbox names the keeper,
+    // not the host's real init. The keeper has dropped its capabilities, so
+    // the kernel can refuse the open before setns runs. The probe uses its
+    // own namespace fd as a control when that happens.
     //
     // None of that matters, because seccomp refuses the join outright.
     // `setns` sits on `blocked_calls` beside `unshare`, with no dependence

@@ -2000,18 +2000,21 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
 
     if (std.mem.eql(u8, args[1], "spawned-setns-proc1")) {
-        // Plan 23's proc/1/ns/mnt escape. Control first: the path has to be
-        // reachable at all, or a refusal below would be the open failing and
-        // not the filter. /proc/1 here names this sandbox's own leader, not
-        // the host's real init: buildProcMount mounts a fresh procfs after
-        // the pid namespace already exists, and the kernel gives a procfs
-        // mounted from inside a pid namespace the view of that namespace.
-        // /proc/1/ns/mnt is not one of namespace.masked_proc_entries either:
-        // that list masks global files, and this one is per pid.
-        const fd_rc = linux.open("/proc/1/ns/mnt", .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) {
-            std.debug.print("spawned-setns-proc1: open /proc/1/ns/mnt: {s}\n", .{@tagName(linux.errno(fd_rc))});
+        // PID 1 is the keeper. A kernel can refuse access to its namespace fd
+        // after the keeper drops capabilities. That refusal closes the named
+        // escape already. Use this process's namespace fd as the control in
+        // that case, so the test still proves that seccomp kills setns.
+        var fd_rc = linux.open("/proc/1/ns/mnt", .{ .ACCMODE = .RDONLY }, 0);
+        const init_errno = linux.errno(fd_rc);
+        if (init_errno == .ACCES or init_errno == .PERM) {
+            fd_rc = linux.open("/proc/self/ns/mnt", .{ .ACCMODE = .RDONLY }, 0);
+        } else if (init_errno != .SUCCESS) {
+            std.debug.print("spawned-setns-proc1: open /proc/1/ns/mnt: {s}\n", .{@tagName(init_errno)});
             return 5;
+        }
+        if (linux.errno(fd_rc) != .SUCCESS) {
+            std.debug.print("spawned-setns-proc1: open control namespace: {s}\n", .{@tagName(linux.errno(fd_rc))});
+            return 6;
         }
         const fd: i32 = @intCast(fd_rc);
         defer _ = linux.close(fd);
