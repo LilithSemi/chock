@@ -79,6 +79,12 @@ pub const runtime_prefix = Sandbox.runtime_prefix;
 pub const expresses = Sandbox.expresses;
 /// See `Sandbox.resolvedPath`.
 pub const resolvedPath = Sandbox.resolvedPath;
+/// See `Sandbox.firstGap`. Re-exported because the two lists it compares are
+/// built outside this library: `chock-workspace` writes the workspace half
+/// and `chock-core` writes the toolchain half and the per call half.
+pub const firstGap = Sandbox.firstGap;
+/// See `Sandbox.LayerGap`.
+pub const LayerGap = Sandbox.LayerGap;
 
 /// Imported directly, not only through `Sandbox.zig`'s own comptime driver
 /// dispatch, so this driver's tests run on every host this project builds

@@ -456,14 +456,15 @@ pub const Workspace = struct {
                     .path = wt.sandbox_git_root,
                     .access = sandbox.landlock.AccessFs.read_only,
                 });
-                // The scratch object store, read write: nested under
-                // sandbox_git_root, so without a rule of its own it would
-                // only ever inherit the read only rule just above. Landlock
-                // rights accumulate on a nested path; they are never
-                // narrowed by a wider rule the way a mount is. The mount
-                // layer is still what actually refuses a write to the real
-                // object store: this rule only lets git open the scratch
-                // one for write at all.
+                // The scratch object store, read write. **It is not nested
+                // under sandbox_git_root**, and it cannot be: see
+                // worktree.zig's own object_store_prefix, which gives it a
+                // top level path of its own because a mount point under an
+                // already read only mount cannot be created. So no rule
+                // above covers it, and without this rule the mount for it
+                // would be present and unreachable. The mount layer is
+                // still what refuses a write to the real object store: this
+                // rule only lets git open the scratch one for write at all.
                 try rules.append(allocator, .{
                     .path = wt.object_store_target,
                     .access = sandbox.landlock.AccessFs.read_write,
@@ -812,10 +813,16 @@ const TestProject = struct {
     /// reach the checkout, and the fallback those tests pin would then hold
     /// for the wrong reason.
     fn commitChockZon(self: TestProject) !void {
+        return self.commitChockZonSaying(".{}\n");
+    }
+
+    /// `commitChockZon`, with the file's own bytes named. A test that needs a
+    /// real `deny_read` block writes one here.
+    fn commitChockZonSaying(self: TestProject, source: []const u8) !void {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{self.root_path});
         var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-        try file.writeStreamingAll(std.testing.io, ".{}\n");
+        try file.writeStreamingAll(std.testing.io, source);
         file.close(std.testing.io);
 
         var add_output = try git.run(self.allocator, std.testing.io, &self.env, self.root_path, &.{ "add", "chock.zon" }, null);
@@ -1240,6 +1247,73 @@ test "sandboxConfig for the overlay kind needs no namespace either, so an ordina
         .bind, .proc, .deny => return error.ExpectedAnOverlayEntry,
     };
     try std.testing.expectEqualStrings(workspace.kind.overlay.project, overlay_entry.target);
+}
+
+test "every landlock rule sandboxConfig writes names a path its own mount list holds" {
+    // **The two lists are one judgement written twice.** This function appends
+    // a mount, then appends a rule, by hand, a few lines apart. Nothing
+    // computes either list from the other, so a path added to one and not the
+    // other compiles and runs. `sandbox.firstGap` reads both real lists, and
+    // never a copy of them written into this test: a copy would be a third
+    // place to drift.
+    //
+    // Both kinds are driven, and both layouts, because the layout is what
+    // decides whether a target is moved or is its own source.
+    const allocator = std.testing.allocator;
+
+    for ([_]Layout{ .remapped, .in_place }) |layout| {
+        // The worktree kind, with a `chock.zon` that also denies a file, so
+        // the run covers the bind for the policy file and the denial beside
+        // it.
+        var git_tmp = std.testing.tmpDir(.{});
+        defer git_tmp.cleanup();
+        var git_project = try TestProject.init(allocator, git_tmp);
+        defer git_project.deinit();
+        try git_project.makeGitRepository();
+        try git_project.commitChockZonSaying(".{ .deny_read = .{ \".env\" } }\n");
+
+        var worktree_workspace = try Workspace.openWithLayout(allocator, std.testing.io, &git_project.env, git_project.root_path, git_project.scratch_path, "sess1", layout, null);
+        defer worktree_workspace.close(allocator, std.testing.io, &git_project.env, null) catch unreachable;
+
+        const worktree_config = try worktree_workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
+        defer allocator.free(worktree_config.mounts);
+        defer allocator.free(worktree_config.rules);
+        defer allocator.free(worktree_config.env);
+
+        try expectLayersAgree(worktree_config);
+
+        // The overlay kind, which is a project with no git of its own.
+        var plain_tmp = std.testing.tmpDir(.{});
+        defer plain_tmp.cleanup();
+        var plain_project = try TestProject.init(allocator, plain_tmp);
+        defer plain_project.deinit();
+
+        var overlay_workspace = try Workspace.openWithLayout(allocator, std.testing.io, &plain_project.env, plain_project.root_path, plain_project.scratch_path, "sess1", layout, null);
+        defer overlay_workspace.close(allocator, std.testing.io, &plain_project.env, null) catch unreachable;
+
+        const overlay_config = try overlay_workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
+        defer allocator.free(overlay_config.mounts);
+        defer allocator.free(overlay_config.rules);
+        defer allocator.free(overlay_config.env);
+
+        try expectLayersAgree(overlay_config);
+    }
+}
+
+/// Fail when `config`'s mount list and its Landlock rule list disagree, and
+/// name the path they disagree about. See `sandbox.LayerGap`.
+///
+/// **Compared against an empty string, and never printed.** `expectEqualStrings`
+/// puts both sides in the failure, so a reader sees which path moved, and this
+/// file keeps the rule that no line outside `main` names standard error: see
+/// `test/proto/lock.zig`.
+fn expectLayersAgree(config: sandbox.Config) !void {
+    var buffer: [256]u8 = undefined;
+    const said = if (sandbox.firstGap(config)) |gap|
+        try std.fmt.bufPrint(&buffer, "{f}", .{gap})
+    else
+        "";
+    try std.testing.expectEqualStrings("", said);
 }
 
 test "adopt takes the worktree a first process left, with the work still in it" {

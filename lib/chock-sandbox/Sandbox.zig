@@ -424,6 +424,140 @@ pub const Config = struct {
     }
 };
 
+/// Where one `Config`'s mount list and its Landlock rule list disagree about
+/// a path.
+///
+/// **The two lists are one judgement written twice, and nothing computes one
+/// from the other.** `chock-workspace`'s own `Workspace.sandboxConfig`,
+/// `chock-core`'s own `withStore`, and `chock-core`'s own `prepare` each
+/// append a mount and then append a rule for the same path, by hand, a few
+/// lines apart. A path added to one list and not to the other compiles, runs,
+/// and changes what the sandbox holds. `firstGap` is what finds it.
+///
+/// Both halves of the disagreement matter, for different reasons:
+///
+///   * A rule for a path that no mount holds is dead on a build that pivots
+///     into a fresh root, because nothing is there to open. It is not dead on
+///     a build that does not pivot: `expresses.moved_paths` is false on macOS,
+///     the rule then names the host's own path, and Seatbelt grants what the
+///     rule says. See `darwin/driver.zig`'s own `optionsFor`.
+///   * A mount that no rule holds is present and unreachable. Landlock refuses
+///     every open below it, and the tool call then fails with a Landlock
+///     denial rather than with the missing rule.
+///
+/// A rule whose path is above a mount target, and not at or below one, counts
+/// as outside the mount set. Landlock rights accumulate downwards: a rule on
+/// `/` over a tree that mounts only `/work` permits every path in the tree, so
+/// the mount list would be the whole boundary again.
+pub const LayerGap = union(enum) {
+    /// This rule's path is at or below no mount target and at or below no
+    /// scratch area.
+    rule_outside_mounts: []const u8,
+    /// This mount target is at or below no rule's path.
+    mount_without_rule: []const u8,
+
+    /// The path the two lists disagree about.
+    pub fn path(self: LayerGap) []const u8 {
+        return switch (self) {
+            .rule_outside_mounts, .mount_without_rule => |value| value,
+        };
+    }
+
+    pub fn format(self: LayerGap, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return switch (self) {
+            .rule_outside_mounts => |value| writer.print(
+                "landlock rule {s} names a path the mount set does not hold",
+                .{value},
+            ),
+            .mount_without_rule => |value| writer.print(
+                "mount {s} has no landlock rule, so it is present and unreachable",
+                .{value},
+            ),
+        };
+    }
+};
+
+/// The first place `config`'s two filesystem layers disagree, or null when
+/// every rule and every mount agree. See `LayerGap`.
+///
+/// **A denied path is in neither half.** `Mount.deny` takes bytes away and
+/// grants no reach, so it needs no rule of its own, and it makes nothing
+/// reachable that a rule would have to name.
+///
+/// **`mount_without_rule` is not an invariant of every config, and a caller
+/// asks for this check only where the pairing is the intent.** A tool call, a
+/// workspace and a toolchain each pair a mount with a rule on purpose.
+/// `chock-core`'s own `plugin_host.lockdown` does the opposite on purpose: it
+/// keeps the tool call's whole mount tree and throws every rule away, so the
+/// workspace is present in the tree and unreachable through it. Landlock is
+/// the only layer holding that boundary, which is the clearest case in this
+/// project of the two layers not being one judgement.
+///
+/// **The root itself is in neither half either, and that is a real gap this
+/// cannot see.** `namespace.buildRoot` binds `config.root` over itself, read
+/// write, before it reads the mount list, so `/` and every parent directory
+/// `makePath` creates for a mount target are writable through the mount layer
+/// alone. Landlock is the only layer that refuses them, because no rule names
+/// them. That is a property of `buildRoot` and not of this config, so it
+/// belongs in a test of `buildRoot`, not here.
+pub fn firstGap(config: Config) ?LayerGap {
+    for (config.rules) |rule| {
+        if (!mountSetHolds(config, rule.path)) return .{ .rule_outside_mounts = rule.path };
+    }
+    for (config.mounts) |mount| {
+        const target = mountTarget(mount) orelse continue;
+        if (!ruleSetHolds(config, target)) return .{ .mount_without_rule = target };
+    }
+    for (config.scratch) |area| {
+        if (!ruleSetHolds(config, area.target)) return .{ .mount_without_rule = area.target };
+    }
+    return null;
+}
+
+/// The path inside the sandbox that `mount` puts something at, or null for a
+/// mount that puts nothing there. See `firstGap` for why a denial is null.
+fn mountTarget(mount: namespace.Mount) ?[]const u8 {
+    return switch (mount) {
+        .bind => |bind| bind.target,
+        .overlay => |overlay| overlay.target,
+        .proc => |proc| proc.target,
+        .deny => null,
+    };
+}
+
+fn mountSetHolds(config: Config, target_path: []const u8) bool {
+    for (config.mounts) |mount| {
+        const target = mountTarget(mount) orelse continue;
+        if (holdsPath(target, target_path)) return true;
+    }
+    for (config.scratch) |area| {
+        if (holdsPath(area.target, target_path)) return true;
+    }
+    return false;
+}
+
+fn ruleSetHolds(config: Config, target_path: []const u8) bool {
+    for (config.rules) |rule| {
+        if (holdsPath(rule.path, target_path)) return true;
+    }
+    return false;
+}
+
+/// True when `parent` is `child`, or is a directory that holds `child`.
+///
+/// This is the reach of one `LANDLOCK_RULE_PATH_BENEATH` rule and the reach of
+/// one mount, which are the same shape: both cover the named path and
+/// everything below it. The comparison is on the spelling alone. Every mount
+/// target, scratch area and rule path in this project is an absolute path with
+/// no trailing separator and no `.` or `..` component, because each one is
+/// built by `std.fs.path.join` or written out as a literal.
+fn holdsPath(parent: []const u8, child: []const u8) bool {
+    if (parent.len == 0 or child.len == 0) return false;
+    if (std.mem.eql(u8, parent, "/")) return true;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    return child.len == parent.len or child[parent.len] == '/';
+}
+
 /// A copy of every string in `from`, in `allocator`. Used by `Config.copy` and
 /// by callers that copy an argv beside a config.
 pub fn copyStrings(
@@ -1306,5 +1440,140 @@ test "a path a rule will name is resolved where a mount cannot be" {
     try std.testing.expectEqualStrings(
         "/no/such/directory/here",
         resolvedPath(std.testing.io, "/no/such/directory/here", &missing_buffer),
+    );
+}
+
+test "a rule below a mount agrees, and a rule beside one does not" {
+    // The ordinary shape every caller builds: one mount, one rule that names
+    // the same path, plus a second rule for a file inside it.
+    const agreeing = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{
+            .{ .path = "/work", .access = landlock.AccessFs.read_write },
+            .{ .path = "/work/build.zig", .access = landlock.AccessFs.read_only_file },
+        },
+        .cwd = "/work",
+        .env = &.{},
+    };
+    try std.testing.expectEqual(@as(?LayerGap, null), firstGap(agreeing));
+
+    // The drift this exists to catch: somebody added a rule and forgot the
+    // mount. On a build that pivots the rule is dead. On a build that does
+    // not, it grants the host's own `/etc`.
+    const extra_rule = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{
+            .{ .path = "/work", .access = landlock.AccessFs.read_write },
+            .{ .path = "/etc", .access = landlock.AccessFs.read_only },
+        },
+        .cwd = "/work",
+        .env = &.{},
+    };
+    const gap = firstGap(extra_rule) orelse return error.TestExpectedGap;
+    try std.testing.expectEqual(std.meta.Tag(LayerGap).rule_outside_mounts, std.meta.activeTag(gap));
+    try std.testing.expectEqualStrings("/etc", gap.path());
+}
+
+test "a rule above every mount is a gap, because landlock rights reach downwards" {
+    // `/` is not a narrower way of saying `/work`. A rule there permits every
+    // path in the tree, so the mount list would be the whole boundary again.
+    const too_wide = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{.{ .path = "/", .access = landlock.AccessFs.read_write }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    const gap = firstGap(too_wide) orelse return error.TestExpectedGap;
+    try std.testing.expectEqualStrings("/", gap.path());
+
+    // And a prefix that is not a path component boundary is not a parent:
+    // `/work` must not be read as holding `/workshop`.
+    const neighbour = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{.{ .path = "/workshop", .access = landlock.AccessFs.read_write }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    const neighbour_gap = firstGap(neighbour) orelse return error.TestExpectedGap;
+    try std.testing.expectEqualStrings("/workshop", neighbour_gap.path());
+}
+
+test "a mount with no rule is a gap, and a denied path is not" {
+    // A mount nothing permits is present and unreachable: every open below it
+    // is refused by Landlock, and the tool call fails naming Landlock rather
+    // than the missing rule.
+    const unreachable_mount = Config{
+        .root = "/root",
+        .mounts = &.{
+            .{ .bind = .{ .source = "/host/work", .target = "/work" } },
+            .{ .bind = .{ .source = "/host/tool", .target = "/run/chock/bin", .read_only = true } },
+        },
+        .rules = &.{.{ .path = "/work", .access = landlock.AccessFs.read_write }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    const gap = firstGap(unreachable_mount) orelse return error.TestExpectedGap;
+    try std.testing.expectEqual(std.meta.Tag(LayerGap).mount_without_rule, std.meta.activeTag(gap));
+    try std.testing.expectEqualStrings("/run/chock/bin", gap.path());
+
+    // A denial is in neither half. It takes bytes away and grants no reach,
+    // so no rule goes with it, and `Workspace.sandboxConfig` writes none.
+    const denied = Config{
+        .root = "/root",
+        .mounts = &.{
+            .{ .bind = .{ .source = "/host/work", .target = "/work" } },
+            .{ .deny = .{ .target = "/work/.env" } },
+        },
+        .rules = &.{.{ .path = "/work", .access = landlock.AccessFs.read_write }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    try std.testing.expectEqual(@as(?LayerGap, null), firstGap(denied));
+}
+
+test "a capped scratch area is a mount the sandbox makes, and it needs a rule of its own" {
+    // `Config.scratch` is a tmpfs `mountScratch` makes, so it is in the mount
+    // set although no `Mount` entry names it. A rule for it must count as
+    // held, and the area itself must still need a rule.
+    const with_rule = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{
+            .{ .path = "/work", .access = landlock.AccessFs.read_write },
+            .{ .path = "/run/chock/tmp", .access = landlock.AccessFs.read_write },
+        },
+        .scratch = &.{.{ .target = "/run/chock/tmp" }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    try std.testing.expectEqual(@as(?LayerGap, null), firstGap(with_rule));
+
+    const without_rule = Config{
+        .root = "/root",
+        .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
+        .rules = &.{.{ .path = "/work", .access = landlock.AccessFs.read_write }},
+        .scratch = &.{.{ .target = "/run/chock/tmp" }},
+        .cwd = "/work",
+        .env = &.{},
+    };
+    const gap = firstGap(without_rule) orelse return error.TestExpectedGap;
+    try std.testing.expectEqualStrings("/run/chock/tmp", gap.path());
+}
+
+test "a gap names the path and says which of the two lists is short" {
+    // A reader has to be able to tell the two apart: one is a rule that
+    // reaches past the tree, the other is a mount nothing can open.
+    var buffer: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "landlock rule /etc names a path the mount set does not hold",
+        try std.fmt.bufPrint(&buffer, "{f}", .{LayerGap{ .rule_outside_mounts = "/etc" }}),
+    );
+    try std.testing.expectEqualStrings(
+        "mount /proc has no landlock rule, so it is present and unreachable",
+        try std.fmt.bufPrint(&buffer, "{f}", .{LayerGap{ .mount_without_rule = "/proc" }}),
     );
 }

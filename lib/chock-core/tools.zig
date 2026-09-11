@@ -5301,7 +5301,16 @@ pub fn prepare(
     // The procfs above, read only: a mount with no rule is present and
     // unreachable, and Landlock has to permit the read for `/proc/self/exe`
     // to be readable at all.
-    try rules.append(allocator, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only });
+    //
+    // **Guarded exactly as the mount above is.** A build with no procfs
+    // mounts nothing at this path, and a rule with no mount behind it is the
+    // other half of the same fault: `darwin/driver.zig` turns every rule into
+    // a Seatbelt allowance over the host's own path, so a rule left here
+    // would name a path this build never put anything at. See
+    // `sandbox.firstGap`.
+    if (sandbox.expresses.procfs) {
+        try rules.append(allocator, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only });
+    }
     try rules.appendSlice(allocator, extra_rules);
 
     var full_argv: std.ArrayList([]const u8) = .empty;
@@ -8154,6 +8163,133 @@ test "prepare carries a config's own network through untouched, whatever it was"
 
     try std.testing.expectEqual(sandbox.namespace.Network.none, prepared.config.network);
     try std.testing.expect(prepared.config.net_broker == null);
+}
+
+test "every landlock rule a tool call is built from names a path its own mount list holds" {
+    // **The two lists are one judgement written twice.** `withStore` adds a
+    // mount and a rule per store path, `prepare` adds a mount and a rule for
+    // the program and for `/dev/null` and for the procfs, and
+    // `Registry.dispatchWith` adds a mount and a rule per writable surface.
+    // Each pair is written by hand, a few lines apart, and nothing computes
+    // one list from the other. A path added to one and not the other compiles
+    // and runs.
+    //
+    // `sandbox.firstGap` reads the two real slices the pipeline produced. It
+    // is never given a hand written copy of what they should hold, because a
+    // copy is a third place to drift.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp_buffer[0..try tmp.dir.realPath(io, &tmp_buffer)];
+
+    // A toolchain of two store paths: one package directory holding the
+    // program, and one single file, which is the shape that once made
+    // Landlock answer `EINVAL` for a directory right over a file.
+    const package = try std.fmt.allocPrint(arena, "{s}/pkg", .{tmp_path});
+    const bin_dir = try std.fmt.allocPrint(arena, "{s}/bin", .{package});
+    try std.Io.Dir.createDirAbsolute(io, package, .default_dir);
+    try std.Io.Dir.createDirAbsolute(io, bin_dir, .default_dir);
+    const program = try std.fmt.allocPrint(arena, "{s}/parser", .{bin_dir});
+    var program_file = try std.Io.Dir.createFileAbsolute(io, program, .{});
+    program_file.close(io);
+
+    const hook = try std.fmt.allocPrint(arena, "{s}/setup-hook", .{tmp_path});
+    var hook_file = try std.Io.Dir.createFileAbsolute(io, hook, .{});
+    hook_file.close(io);
+
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("PATH", bin_dir);
+
+    // The writable surfaces a real dispatch adds, each named through the
+    // module that owns the path rather than spelled again here.
+    const cache_host = try std.fmt.allocPrint(arena, "{s}/cache", .{tmp_path});
+    const scratch_host = try std.fmt.allocPrint(arena, "{s}/scratch", .{tmp_path});
+    const tasks_host = try std.fmt.allocPrint(arena, "{s}/tasks", .{tmp_path});
+    const cache_inside = cache.sandboxDirFor(cache_host);
+    const scratch_inside = scratchpad.sandboxDirFor(scratch_host);
+    const tasks_inside = tasks.sandboxDirFor(tasks_host);
+
+    const extra_mounts = [_]sandbox.namespace.Mount{
+        .{ .bind = .{ .source = cache_host, .target = cache_inside, .read_only = false } },
+        .{ .bind = .{ .source = scratch_host, .target = scratch_inside, .read_only = false } },
+        .{ .bind = .{ .source = tasks_host, .target = tasks_inside, .read_only = true } },
+    };
+    const extra_rules = [_]sandbox.Config.Rule{
+        .{ .path = cache_inside, .access = sandbox.landlock.AccessFs.read_write },
+        .{ .path = scratch_inside, .access = sandbox.landlock.AccessFs.read_write },
+        .{ .path = tasks_inside, .access = sandbox.landlock.AccessFs.read_only },
+        .{ .path = scratchpad.tmp_sandbox_dir, .access = sandbox.landlock.AccessFs.read_write },
+    };
+
+    const workspace_config = sandbox.Config{
+        .root = "/does-not-need-to-exist-for-this-check",
+        .mounts = &.{.{ .bind = .{
+            .source = "/work/checkout",
+            .target = "/work/checkout",
+            .read_only = false,
+        } }},
+        .rules = &.{.{ .path = "/work/checkout", .access = sandbox.landlock.AccessFs.read_write }},
+        .cwd = "/work/checkout",
+        .env = &.{},
+        // The capped temporary area, which is a mount `mountScratch` makes
+        // and no `Mount` entry names. It is in the mount set all the same.
+        .scratch = &.{.{ .target = scratchpad.tmp_sandbox_dir }},
+    };
+
+    const store_paths = [_][]const u8{ package, hook };
+    const with_toolchain = try withStore(arena, io, workspace_config, &store_paths, &.{});
+
+    // 1. The program lives inside a toolchain mount, so it runs where it is
+    //    and the call adds no bind for it.
+    const in_store_argv = [_][]const u8{"parser"};
+    const in_store = try prepare(arena, io, &env, with_toolchain, &in_store_argv, &extra_mounts, &extra_rules);
+    try expectLayersAgree(in_store.config);
+
+    // 2. The program is on `PATH` and under no mount, so the call binds it
+    //    and writes the rule that lets it be read and run. This is the pair a
+    //    reader would most easily add one half of.
+    const loose_dir = try std.fmt.allocPrint(arena, "{s}/loose", .{tmp_path});
+    try std.Io.Dir.createDirAbsolute(io, loose_dir, .default_dir);
+    const loose_program = try std.fmt.allocPrint(arena, "{s}/lexer", .{loose_dir});
+    var loose_file = try std.Io.Dir.createFileAbsolute(io, loose_program, .{});
+    loose_file.close(io);
+    try env.put("PATH", loose_dir);
+
+    const loose_argv = [_][]const u8{"lexer"};
+    const bound = try prepare(arena, io, &env, with_toolchain, &loose_argv, &extra_mounts, &extra_rules);
+    try expectLayersAgree(bound.config);
+
+    // And the bind really happened, so case 2 measured the branch it says it
+    // did rather than repeating case 1.
+    var found_program_mount = false;
+    for (bound.config.mounts) |mount| switch (mount) {
+        .bind => |bind| if (std.mem.eql(u8, bind.source, loose_program)) {
+            found_program_mount = true;
+        },
+        .overlay, .proc, .deny => {},
+    };
+    try std.testing.expect(found_program_mount);
+}
+
+/// Fail when `config`'s mount list and its Landlock rule list disagree, and
+/// name the path they disagree about. See `sandbox.LayerGap`.
+///
+/// **Compared against an empty string, and never printed.** `expectEqualStrings`
+/// puts both sides in the failure, so a reader sees which path moved, and this
+/// file keeps the rule that no line outside `main` names standard error: see
+/// `test/proto/lock.zig`.
+fn expectLayersAgree(config: sandbox.Config) !void {
+    var buffer: [256]u8 = undefined;
+    const said = if (sandbox.firstGap(config)) |gap|
+        try std.fmt.bufPrint(&buffer, "{f}", .{gap})
+    else
+        "";
+    try std.testing.expectEqualStrings("", said);
 }
 
 test "a staged file holds exactly the bytes it was given, and is gone afterwards" {
