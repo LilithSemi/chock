@@ -1009,6 +1009,61 @@ test "a named stdin descriptor reaches the program as a pipe, and widens nothing
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "the only descriptors that cross execve are the standard streams" {
+    // **An already open descriptor bypasses Landlock and the mount namespace
+    // together.** Neither layer can revoke a file that is already open: a
+    // descriptor goes through path resolution once, when it is opened, and
+    // never again. So one descriptor that crosses `execve` is a hole through
+    // two layers at the same time, and `closeInheritedFds` is the only thing
+    // that closes it.
+    //
+    // `spawn-open-fd-set` holds one of every shape a real harness holds while
+    // it spawns a tool call: the session log, the credential store as a
+    // `memfd`, a control channel to another process, an epoll ring, an
+    // io_uring ring, the provider's own network connection, and the workspace
+    // as a directory descriptor, which is the shape that still reaches the
+    // host tree after `pivot_root`. None is marked close-on-exec, because a
+    // descriptor whose owner already marked it would be revoked by the kernel
+    // rather than by anything this project wrote.
+    //
+    // **The set is named exactly, which is what makes this a guard and not a
+    // spot check.** The test above reads one descriptor number the caller
+    // chose and would stay green for a descriptor `spawn` itself grew later.
+    // This one fails until the new descriptor is written down, so a pipe, a
+    // socket, or a ring added to the setup path cannot reach a sandboxed
+    // program in silence.
+    //
+    // Mutation check: skip the `closeInheritedFds` call in `enterNamespaces`
+    // and the run reports the first held descriptor as one that crossed.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-open-fd-set", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a filtered sandbox adds the broker socket to that set and nothing else" {
+    // The other half, and the one that pins what the exemption is worth. A
+    // filtered call is the only shape where a descriptor above standard error
+    // is meant to cross, and it is meant to be one socket on one fixed
+    // number: see `net_broker.fd_number` and `placeBrokerFd`.
+    //
+    // **Both halves are needed.** The plain run alone would stay green for a
+    // second descriptor that only appears under `.filtered`, and this run
+    // alone would stay green for a `placeBrokerFd` that left the setup pipe
+    // open beside the socket.
+    //
+    // Mutation check: take `SOCK_CLOEXEC` off `net_broker.makePair` **and**
+    // drop `placeBrokerFd`'s own close of the original descriptor, and the
+    // run reports the number that copy sat on as one that crossed. Both have
+    // to go together: measured on 2026-09-10, either one alone leaves every
+    // test green, because each closes that copy on its own. The plain run
+    // above stays green under this mutation, which is why there are two.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-open-fd-set-filtered", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a setup failure is written to the descriptor the caller named, and not to descriptor 2" {
     // `Config.stderr_fd` says where a sandboxed program's own diagnostics go.
     // It used to be obeyed only from `execve` onwards, because the setup

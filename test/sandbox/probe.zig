@@ -928,6 +928,130 @@ fn limitOutcome(term: std.process.Child.Term, cap: u8, named: bool) u8 {
 /// Turn the Term of a process spawned through sandbox.spawn into this process's
 /// own exit status, so the test that started this probe can read the inner
 /// sandbox's outcome straight off this probe's own Term.
+/// How far `spawned-open-fd-set` reads the descriptor table.
+///
+/// A leaked descriptor is one the kernel gave the lowest free number to, in a
+/// process whose whole table is the three standard streams plus what `spawn`
+/// itself opens, so every number a leak can land on is far below this. The
+/// bound is here because a loop with no end is not a test.
+const open_fd_set_scan_limit: i32 = 1024;
+
+/// The file type bits of whatever `fd` names, or 0 when it cannot be read.
+/// Zero matches no `S.IF*` constant, so a `statx` that failed reads as a
+/// mismatch and never as the type the caller hoped for.
+fn fileTypeOf(fd: i32) u32 {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stx);
+    if (linux.errno(rc) != .SUCCESS) return 0;
+    return stx.mode & linux.S.IFMT;
+}
+
+/// A `NetBroker` that refuses every request, for `spawn-open-fd-set-filtered`.
+///
+/// That operation is about which descriptors reach the program, not about
+/// what the broker answers, and the program it spawns never asks. Refusing is
+/// the answer that needs no host, no policy table, and no transport.
+const RefusingBroker = struct {
+    fn connectFn(_: *anyopaque, _: []const u8, _: u16) sandbox.NetBroker.Grant {
+        return .refused;
+    }
+
+    const vtable = sandbox.NetBroker.VTable{ .connect = connectFn };
+
+    fn broker(self: *RefusingBroker) sandbox.NetBroker {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// The descriptors a real harness is holding when it spawns a tool call, in
+/// the shapes that would each be a different kind of escape.
+///
+/// Every one is opened without `FD_CLOEXEC`, because a descriptor that was
+/// already close-on-exec proves nothing: the point is that `spawn` revokes a
+/// descriptor whose owner never marked it. `io_uring` is the one entry that
+/// may be absent, because a kernel can be built without it and a machine can
+/// forbid it; `openCount` says how many were really opened, so the caller can
+/// refuse to run a check that would pass because nothing was there.
+const HarnessDescriptors = struct {
+    /// The session log.
+    log: i32,
+    /// The credential store, which never touches a filesystem.
+    credential: i32,
+    /// A control channel to another process in the harness.
+    control: [2]i32,
+    /// An epoll ring.
+    epoll: i32,
+    /// An io_uring ring, or -1 on a machine that would not make one.
+    ring: i32,
+    /// The provider's own network connection.
+    upstream: i32,
+    /// The workspace git directory, reached as a directory descriptor, which
+    /// is the shape that still reaches the host tree after `pivot_root`.
+    workspace: i32,
+
+    fn open(arena: std.mem.Allocator, root: []const u8) !HarnessDescriptors {
+        const log_path = try std.fs.path.joinZ(arena, &.{ root, "session.log" });
+        const log_rc = linux.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (linux.errno(log_rc) != .SUCCESS) return error.SetupFailed;
+
+        const credential_rc = linux.memfd_create("chock-credential", 0);
+        if (linux.errno(credential_rc) != .SUCCESS) return error.SetupFailed;
+
+        var control: [2]i32 = undefined;
+        const control_rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &control);
+        if (linux.errno(control_rc) != .SUCCESS) return error.SetupFailed;
+
+        const epoll_rc = linux.epoll_create1(0);
+        if (linux.errno(epoll_rc) != .SUCCESS) return error.SetupFailed;
+
+        var params: linux.io_uring_params = std.mem.zeroes(linux.io_uring_params);
+        const ring_rc = linux.io_uring_setup(4, &params);
+        const ring: i32 = if (linux.errno(ring_rc) == .SUCCESS) @intCast(ring_rc) else -1;
+
+        const upstream_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        if (linux.errno(upstream_rc) != .SUCCESS) return error.SetupFailed;
+
+        const workspace_rc = linux.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+        if (linux.errno(workspace_rc) != .SUCCESS) return error.SetupFailed;
+
+        return .{
+            .log = @intCast(log_rc),
+            .credential = @intCast(credential_rc),
+            .control = control,
+            .epoll = @intCast(epoll_rc),
+            .ring = ring,
+            .upstream = @intCast(upstream_rc),
+            .workspace = @intCast(workspace_rc),
+        };
+    }
+
+    /// How many of the shapes above this machine really gave. A check that
+    /// found nothing open would pass with every layer gone, so the caller
+    /// reads this rather than assuming.
+    fn openCount(self: HarnessDescriptors) usize {
+        var count: usize = 0;
+        for ([_]i32{
+            self.log,
+            self.credential,
+            self.control[0],
+            self.control[1],
+            self.epoll,
+            self.ring,
+            self.upstream,
+            self.workspace,
+        }) |fd| {
+            if (fd < 0) continue;
+            if (linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS) count += 1;
+        }
+        return count;
+    }
+};
+
+/// The number of `HarnessDescriptors` entries that must be open before a
+/// descriptor check means anything. Seven of the eight, because `io_uring` is
+/// the one a machine is allowed to refuse.
+const required_harness_descriptors: usize = 7;
+
 fn reportChildTerm(term: std.process.Child.Term) u8 {
     switch (term) {
         .signal => |sig| {
@@ -1326,6 +1450,12 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-proc-mask") or
         std.mem.eql(u8, args[1], "spawn-proc-live") or
         std.mem.eql(u8, args[1], "spawn-caps-drop") or
+        // Both descriptor set runs, for the reason every "spawn-" operation
+        // above is here: each forks and lets `sandbox.spawn` build the whole
+        // sandbox inside that child, and a filter installed on this process
+        // first would be inherited and would kill that child's own `unshare`.
+        std.mem.eql(u8, args[1], "spawn-open-fd-set") or
+        std.mem.eql(u8, args[1], "spawn-open-fd-set-filtered") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -1410,6 +1540,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // caller knows which number it landed on, and the whole point of the
         // check is that the number names nothing by the time it is read.
         std.mem.eql(u8, args[1], "spawned-stdin-pipe") or
+        // Which set the child must find: "plain" for a sandbox with no
+        // network, "filtered" for one with the broker socket. The child
+        // cannot read the network mode of the sandbox it woke up in, so the
+        // operation that spawned it says which answer is right.
+        std.mem.eql(u8, args[1], "spawned-open-fd-set") or
         // The two ports a filtered child is given: the one a granted
         // connection really goes to, and the one it must not be able to
         // reach. Both are ephemeral, so no rule and no constant could name
@@ -2561,6 +2696,55 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const escape_fd = std.fmt.parseInt(i32, id_arg, 10) catch return 5;
         if (linux.errno(linux.fcntl(escape_fd, linux.F.GETFD, 0)) != .BADF) {
             std.debug.print("spawned-stdin-pipe: an inherited descriptor survived\n", .{});
+            return 1;
+        }
+
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-open-fd-set")) {
+        // **The exact set of descriptors that survived `execve`, and nothing
+        // else.** An already open descriptor goes through no path resolution
+        // again, so neither Landlock nor the mount namespace can revoke one:
+        // a single descriptor that crosses is a hole through both layers at
+        // once. `spawned-open-fd-set` does no setup of its own, so what it
+        // finds open is entirely what `spawn` left it.
+        //
+        // **Exact, and not "the one the caller named is gone".** The other
+        // check of this property, `spawned-stdin-pipe`'s own fifth, reads one
+        // descriptor number the caller chose, so it stays green for a
+        // descriptor `spawn` itself grew later. This one names the whole set,
+        // so a new pipe, socket, or ring that reaches the program has to be
+        // written down here before the suite goes green again.
+        const filtered = std.mem.eql(u8, id_arg, "filtered");
+        if (!filtered and !std.mem.eql(u8, id_arg, "plain")) return 5;
+
+        var fd: i32 = 0;
+        while (fd < open_fd_set_scan_limit) : (fd += 1) {
+            // `F_GETFD` answers `EBADF` for a number that names nothing, so
+            // it reads the table without `/proc`, which the sandbox a real
+            // tool call runs in does not mount.
+            const is_open = linux.errno(linux.fcntl(fd, linux.F.GETFD, 0)) == .SUCCESS;
+            const belongs = fd <= std.posix.STDERR_FILENO or
+                (filtered and fd == sandbox.net_broker.fd_number);
+            if (is_open == belongs) continue;
+            if (is_open) {
+                std.debug.print("spawned-open-fd-set: descriptor {d} crossed execve\n", .{fd});
+            } else {
+                std.debug.print("spawned-open-fd-set: descriptor {d} did not reach the program\n", .{fd});
+            }
+            return 1;
+        }
+
+        // What each survivor is, and not only that a number is taken. A
+        // regression that put the caller's own log file on descriptor 0 would
+        // keep the set the same size and would still be the leak this
+        // operation is about.
+        if (fileTypeOf(std.posix.STDIN_FILENO) != linux.S.IFCHR) {
+            std.debug.print("spawned-open-fd-set: descriptor 0 is not a character device\n", .{});
+            return 1;
+        }
+        if (filtered and fileTypeOf(sandbox.net_broker.fd_number) != linux.S.IFSOCK) {
+            std.debug.print("spawned-open-fd-set: the broker descriptor is not a socket\n", .{});
             return 1;
         }
 
@@ -4075,6 +4259,42 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
         }, &.{ "/probe", "spawned-report-pid" }, null, null);
+
+        return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-open-fd-set") or
+        std.mem.eql(u8, args[1], "spawn-open-fd-set-filtered"))
+    {
+        // Hold every shape of descriptor a real harness holds, then run this
+        // same program through the whole sandbox and let it name the set that
+        // reached it. See `spawned-open-fd-set` for what it checks.
+        //
+        // **The descriptors are opened before `spawn`, and none is marked
+        // close-on-exec.** That is the leak the whole pass exists to revoke,
+        // and a descriptor the caller had already marked would be revoked by
+        // the kernel instead of by anything this project wrote.
+        const filtered = std.mem.eql(u8, args[1], "spawn-open-fd-set-filtered");
+        const base = try baseEscapeConfig(arena);
+        const held = try HarnessDescriptors.open(arena, root_arg);
+        if (held.openCount() < required_harness_descriptors) {
+            std.debug.print("spawn-open-fd-set: this machine gave too few descriptors to check\n", .{});
+            return 5;
+        }
+
+        var refuser = RefusingBroker{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = if (filtered) .filtered else .none,
+            .net_broker = if (filtered) refuser.broker() else null,
+        }, &.{
+            "/probe",
+            "spawned-open-fd-set",
+            if (filtered) "filtered" else "plain",
+        }, null, null);
 
         return reportChildTerm(term);
     }
