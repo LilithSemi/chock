@@ -5423,6 +5423,69 @@ fn logNetworkSummary(
     };
 }
 
+/// Write this session's one `sandbox.supervisor` event.
+///
+/// **Always, and not only when something degraded.** A reader that finds no
+/// event cannot tell a session where every supervisor confined itself from a
+/// session written by a build that did not know the fact, and an audit that
+/// cannot tell those apart is not an audit. See
+/// `chock_proto.event.SandboxSupervisor`.
+///
+/// Best effort, for the reason `logNetworkSummary` gives: `Loop.run` has
+/// already given the storage lock back by the time this runs, so this takes it
+/// again for one append, and a session whose log cannot be reached one more
+/// time still exits. It says so on the terminal instead.
+fn logSupervisorAudit(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    audit: *const sandbox.Sandbox.SupervisorAudit,
+) void {
+    const ev = supervisorEvent(audit.counts());
+
+    var locked = storage.lock(io) catch |err| {
+        reportSupervisorRecord(err);
+        return;
+    };
+    defer locked.unlock(io) catch {};
+    _ = locked.append(
+        gpa,
+        io,
+        ev,
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
+    ) catch |err| reportSupervisorRecord(err);
+}
+
+/// The one message a failed `logSupervisorAudit` writes.
+fn reportSupervisorRecord(err: anyerror) void {
+    tty.print(
+        .warn,
+        "chock: whether the process that holds the credential could confine itself " ++
+            "could not be written to the log: {s}\n",
+        .{@errorName(err)},
+    );
+}
+
+/// The `sandbox.supervisor` event `logSupervisorAudit` writes. **Pure**, so
+/// its shape can be checked without touching storage: see the tests below.
+fn supervisorEvent(
+    counts: sandbox.Sandbox.SupervisorAudit.Counts,
+) chock_proto.event.Event {
+    return .{
+        .sandbox_supervisor = .{
+            .process = sandbox.Sandbox.SupervisorAudit.process_name,
+            .layer = sandbox.Sandbox.SupervisorAudit.layer_name,
+            .confined = counts.confined,
+            .unconfined = counts.unconfined,
+            .unreported = counts.unreported,
+            // Empty when nothing went unconfined, and empty as well for a fault
+            // code this build has no name for. `unconfined` above is the field
+            // that carries the fact either way, so a missing name never hides it.
+            .reason = if (counts.first_fault) |fault| @tagName(fault) else "",
+        },
+    };
+}
+
 /// The `network.summary` event `ToolNetwork.logSummary` writes, or null when
 /// the session opened no connection and had none refused. **Pure**, so its
 /// shape can be checked without touching storage: see the test below.
@@ -5437,6 +5500,105 @@ fn networkSummaryEvent(
         .refused = @intCast(refused),
         .diagnostic = diagnostic_text,
     } };
+}
+
+test "the supervisor event names the fault, and the audit question is one field" {
+    // **The requirement.** A machine reading the log answers "did the process
+    // that holds the credential run unfiltered in this session" from
+    // `unconfined` alone, and a person reading it learns the repair from
+    // `reason`. Before this, both facts reached standard error and died with
+    // the terminal.
+    //
+    // Mutation check: write a bare "failed" for `reason` in `supervisorEvent`
+    // and the `no_new_privs_refused` expectation fails, which is the whole
+    // value of the split `seccomp.InstallError` carries.
+    const ev = supervisorEvent(.{
+        .confined = 11,
+        .unconfined = 2,
+        .unreported = 1,
+        .first_fault = .no_new_privs_refused,
+    });
+    try std.testing.expectEqual(chock_proto.event.Kind.sandbox_supervisor, std.meta.activeTag(ev));
+    try std.testing.expectEqualStrings("supervisor", ev.sandbox_supervisor.process);
+    try std.testing.expectEqualStrings("seccomp", ev.sandbox_supervisor.layer);
+    try std.testing.expectEqual(@as(u64, 11), ev.sandbox_supervisor.confined);
+    try std.testing.expectEqual(@as(u64, 2), ev.sandbox_supervisor.unconfined);
+    try std.testing.expectEqual(@as(u64, 1), ev.sandbox_supervisor.unreported);
+    try std.testing.expectEqualStrings("no_new_privs_refused", ev.sandbox_supervisor.reason);
+}
+
+test "a session where every supervisor confined itself still writes the event" {
+    // **An absent event is not an answer.** A reader that found nothing could
+    // not tell a clean session from one written by a build that never knew the
+    // fact, so the event goes in whichever way it went. `SandboxOpen` is
+    // written on every attempt for the same reason, and `NetworkSummary` is
+    // the one event that is deliberately not: nobody audits an absence of
+    // connections.
+    //
+    // Mutation check: make `logSupervisorAudit` return before the append when
+    // `unconfined` is zero, the shape `logNetworkSummary` has, and `found`
+    // stays false here while every other test in this file stays green.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SUPERVISORCLEAN000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    audit.record(.on);
+    audit.record(.on);
+    logSupervisorAudit(gpa, io, storage, &audit);
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .sandbox_supervisor) continue;
+        found = true;
+        const said = parsed.value.event.sandbox_supervisor;
+        try std.testing.expectEqual(@as(u64, 2), said.confined);
+        try std.testing.expectEqual(@as(u64, 0), said.unconfined);
+        // No fault, so no name. An invented one would read as a degradation
+        // that never happened.
+        try std.testing.expectEqualStrings("", said.reason);
+    }
+    try std.testing.expect(found);
+}
+
+test "the supervisor's own degradation reaches the log, not only the terminal" {
+    // The whole chain above storage: the audit a driver filled, the event, and
+    // the line in the log a replay reads back.
+    //
+    // Mutation check: make `logSupervisorAudit` append nothing and `found`
+    // stays false.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SUPERVISOR00000000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    audit.record(.on);
+    audit.record(.{ .off = .not_permitted });
+    logSupervisorAudit(gpa, io, storage, &audit);
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .sandbox_supervisor) continue;
+        found = true;
+        const said = parsed.value.event.sandbox_supervisor;
+        try std.testing.expectEqual(@as(u64, 1), said.confined);
+        try std.testing.expectEqual(@as(u64, 1), said.unconfined);
+        try std.testing.expectEqualStrings("seccomp", said.layer);
+        try std.testing.expectEqualStrings("not_permitted", said.reason);
+    }
+    try std.testing.expect(found);
 }
 
 test "a session with no network use writes no summary at all" {
@@ -9115,6 +9277,23 @@ fn runSession(
         .anthropic => chock_provider.Client.HttpClient.initAnthropic(gpa, io, started.base_url, started.credential.token),
     };
     defer http.deinit();
+
+    // Where every tool call's own sandbox says whether the process that holds
+    // the credential could confine itself. **Attached here, before the tool
+    // runner takes its copy of the config**, and given back at the very end as
+    // one event. See `chock_sandbox.Sandbox.SupervisorAudit` for why the fact
+    // has to reach the log at all, and `logSupervisorAudit` for the write.
+    //
+    // The pointer is taken off the config again on the way out, because
+    // `started` outlives this frame and the record does not.
+    var supervisor_audit: sandbox.Sandbox.SupervisorAudit = .{};
+    started.sandbox_config.supervisor_audit = &supervisor_audit;
+    defer started.sandbox_config.supervisor_audit = null;
+    // **Registered above every defer that ends a tool call**, so it runs after
+    // them: the background task table ends the calls that are still running,
+    // and a call still inside `Sandbox.spawn` would otherwise be counted after
+    // this event was already written.
+    defer logSupervisorAudit(gpa, io, started.storage, &supervisor_audit);
 
     // The toolchain this session mounts, **always named here and never left
     // at the library's own default**. Phase 1 decided it once, out of the dev

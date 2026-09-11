@@ -1041,6 +1041,33 @@ test "the only descriptors that cross execve are the standard streams" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "the supervisor says whether it could filter itself, and the answer leaves the process" {
+    // **The process that holds the provider credential is the supervisor**, the
+    // first of the two children `Sandbox.spawn` forks. It puts a seccomp filter
+    // on itself while it waits for the sandboxed program. That install is best
+    // effort on purpose: the caller's program is already running by then, so
+    // ending the supervisor would end the caller's program for a layer that
+    // guards nothing of the caller's.
+    //
+    // **The degradation used to be invisible.** The failure reached standard
+    // error and died with the terminal, and the supervisor cannot write the
+    // session log itself: `closeInheritedFds` revoked that descriptor long
+    // before. So the answer now travels the middle pipe and the real parent
+    // counts it, which is what lets a session say afterwards whether the
+    // credential holding process ran unfiltered.
+    //
+    // This run is the ordinary machine, where the filter goes on, and it pins
+    // the two halves that a unit test cannot: that the supervisor really
+    // reaches the report, and that the report really crosses the pipe.
+    //
+    // Mutation check: delete the `reportMiddleFilter` call in `restrictMiddle`
+    // and the run exits 5, "the supervisor said nothing".
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-supervisor-audit", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a filtered sandbox adds the broker socket to that set and nothing else" {
     // The other half, and the one that pins what the exemption is worth. A
     // filtered call is the only shape where a descriptor above standard error

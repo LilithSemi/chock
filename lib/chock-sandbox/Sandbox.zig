@@ -339,6 +339,20 @@ pub const Config = struct {
     /// exists for, must name storage that outlives it too, or leave this
     /// null.
     limits_report: ?*LimitsReport = null,
+    /// Where `spawn` counts whether the supervisor process could confine
+    /// itself. Null is the ordinary case, and a caller that leaves it null
+    /// still gets the terminal line.
+    ///
+    /// **One record for a whole session, and never one per call.** The answer
+    /// is the same for every call on one machine, so the counts here are what
+    /// a session writes down once at the end. See `SupervisorAudit`, which
+    /// holds the argument for why the fact has to reach the log at all.
+    ///
+    /// **`Config.copy` carries this pointer across as it is**, for the reason
+    /// `limits_report` above gives. Unlike `limits_report`, a copy that
+    /// outlives one call is the point: the record belongs to the session and
+    /// not to the call.
+    supervisor_audit: ?*SupervisorAudit = null,
 
     pub const Rule = struct {
         path: []const u8,
@@ -362,8 +376,8 @@ pub const Config = struct {
     /// The three descriptor fields are carried across as they are: a
     /// descriptor is a number in this process, not memory to duplicate. So
     /// are `limits`, which is five numbers and owns no memory, and
-    /// `limits_report`, which points at a caller's own storage that this
-    /// function has no business duplicating.
+    /// `limits_report` and `supervisor_audit`, which point at a caller's own
+    /// storage that this function has no business duplicating.
     ///
     /// It lives here, in the library that owns the type, because a second
     /// spelling of this function is how two copies quietly stop agreeing when
@@ -680,6 +694,151 @@ pub const LimitsReport = struct {
     }
 };
 
+/// Whether the supervisor process could confine itself, counted over every
+/// `spawn` a caller attached this to.
+///
+/// **The supervisor is the process that holds the provider credential.**
+/// `spawn` forks twice. The first child, the supervisor, waits for the second
+/// and relays its outcome, and it holds this program's own memory while it
+/// waits. It puts a Landlock ruleset and a seccomp filter on itself for that
+/// reason alone: see the Linux driver's own `restrictMiddle`.
+///
+/// **That install is best effort, and it stays best effort.** Killing the
+/// supervisor because it could not confine itself would end the caller's
+/// running program for a layer that guards nothing of the caller's. So a
+/// failure is printed and the process goes on.
+///
+/// **What was missing is the record.** The printed line reaches a terminal and
+/// dies with it, so nothing could answer "did the credential holding process
+/// run unfiltered in this session" afterwards. This is that answer. A caller
+/// points `Config.supervisor_audit` at one of these, reads the counts when the
+/// session ends, and writes them to the session log.
+///
+/// **Every field is atomic**, because `lib/chock-core/tools.zig` calls `spawn`
+/// from a thread of its own and a session can have more than one tool call
+/// running at a time.
+pub const SupervisorAudit = struct {
+    /// The name the session log uses for the process these counts are about.
+    /// Here, beside the counts, so the log and the driver cannot drift apart
+    /// on what they call it.
+    pub const process_name = "supervisor";
+    /// The name the session log uses for the layer these counts are about.
+    /// One layer today: the Landlock ruleset the supervisor puts on itself
+    /// beside the filter has no error set that names a repair, so it is still
+    /// only printed. See `linux/driver.zig`'s own `restrictMiddle`.
+    pub const layer_name = "seccomp";
+
+    /// Supervisors that said the filter went on.
+    confined: std.atomic.Value(u64) = .init(0),
+    /// Supervisors that said it did not.
+    unconfined: std.atomic.Value(u64) = .init(0),
+    /// Calls where the supervisor said nothing at all.
+    ///
+    /// **Not the same fact as either count above, and not a zero.** A tool
+    /// call that a person cancelled, or that ran past its deadline, kills the
+    /// supervisor before it reaches the point where it confines itself, so
+    /// there is no answer to record and a count of zero would be a claim.
+    ///
+    /// A call that never built a sandbox at all is counted nowhere here. It
+    /// had no supervisor, so it has no answer, and `spawn` gives that caller a
+    /// setup error instead.
+    unreported: std.atomic.Value(u64) = .init(0),
+    /// Why the first unconfined supervisor went without the filter. Zero while
+    /// `unconfined` is zero. **The first and not the last**, because the first
+    /// is the one whose reason a reader can still match against the terminal
+    /// line that named it.
+    first_fault: std.atomic.Value(u8) = .init(0),
+
+    /// Which way the supervisor's own filter install failed. One member for
+    /// each member of `linux/seccomp.zig`'s own `InstallError`, because the
+    /// repair differs for each: a refused `no_new_privs` flag, a missing
+    /// privilege, and a filter the kernel would not read are three different
+    /// faults. Before that error set was split, every one of them arrived as
+    /// `Rejected` and a record of it would have been worth nothing.
+    ///
+    /// The numbers are the wire form on the driver's own middle pipe, so zero
+    /// is left free to mean "no fault named".
+    pub const FilterFault = enum(u8) {
+        /// This kernel has no `seccomp` system call at all.
+        ///
+        /// **Recorded the same way as every other member, and that is
+        /// deliberate.** It names a machine that cannot rather than a kernel
+        /// that refused, and the repair is different, which is why it keeps a
+        /// name of its own. The outcome an audit asks about is not different:
+        /// the process holding the credential ran with no filter on it either
+        /// way. A softer treatment would invite a reader to discount it, and
+        /// "the machine cannot" is exactly the answer an audit must still
+        /// count.
+        ///
+        /// It is also the member least likely to be true. The sandboxed
+        /// process installs the same filter from the same instructions, and
+        /// that install is fatal: see the Linux driver's own `applyLayers`. A
+        /// machine with no seccomp at all fails there first and the call never
+        /// reaches a supervisor to report anything. So this member arriving
+        /// means the kernel answered two processes differently, which is worth
+        /// recording loudly rather than quietly.
+        not_supported = 1,
+        /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the filter was never
+        /// offered to the kernel.
+        no_new_privs_refused = 2,
+        /// The kernel refused the filter because the process held neither
+        /// `no_new_privs` nor `CAP_SYS_ADMIN`.
+        not_permitted = 3,
+        /// The kernel refused the filter itself.
+        rejected = 4,
+        /// Anything else the kernel answered.
+        unexpected = 5,
+    };
+
+    /// What one supervisor said about its own filter.
+    pub const Filter = union(enum) {
+        /// The filter went on.
+        on,
+        /// It did not, for this reason.
+        off: FilterFault,
+        /// The supervisor never said. See `unreported`.
+        unsaid,
+    };
+
+    /// Count one call. Safe to call from any thread.
+    pub fn record(self: *SupervisorAudit, filter: Filter) void {
+        switch (filter) {
+            .on => _ = self.confined.fetchAdd(1, .monotonic),
+            .unsaid => _ = self.unreported.fetchAdd(1, .monotonic),
+            .off => |fault| {
+                _ = self.unconfined.fetchAdd(1, .monotonic);
+                // Keeps the first, so a second call with a different fault
+                // cannot overwrite the one a person already read on the
+                // terminal.
+                _ = self.first_fault.cmpxchgStrong(0, @intFromEnum(fault), .monotonic, .monotonic);
+            },
+        }
+    }
+
+    /// The counts as plain numbers, for a caller that is about to write them
+    /// down. Reads each field once, so two fields can disagree by one while a
+    /// call is in flight. Call it when the calls have stopped.
+    pub fn counts(self: *const SupervisorAudit) Counts {
+        const raw = self.first_fault.load(.monotonic);
+        return .{
+            .confined = self.confined.load(.monotonic),
+            .unconfined = self.unconfined.load(.monotonic),
+            .unreported = self.unreported.load(.monotonic),
+            .first_fault = std.enums.fromInt(FilterFault, raw),
+        };
+    }
+
+    /// What `counts` gives back.
+    pub const Counts = struct {
+        confined: u64,
+        unconfined: u64,
+        unreported: u64,
+        /// Null when `unconfined` is zero, and also when a fault code arrived
+        /// that this build has no name for.
+        first_fault: ?FilterFault,
+    };
+};
+
 /// The guarantees a driver can give. A driver declares which guarantees it
 /// gives, Chock compares the policy against the driver, and refuses when the
 /// driver is short. Nothing compares against this set yet, and only two
@@ -959,6 +1118,50 @@ pub fn closeMiddle(middle: *Middle) void {
 /// one Linux test hook; no real caller, on either platform, has a reason to
 /// call this directly.
 pub const joinFreshSessionKeyring = driver.joinFreshSessionKeyring;
+
+test "the audit counts each of the three answers apart, and keeps the first fault" {
+    // **Three answers and not two.** A supervisor that was confined, one that
+    // was not, and one that never got far enough to say are three different
+    // facts, and folding the third into either of the others is how a call
+    // that was never measured comes to read as a call that passed.
+    //
+    // The first fault is kept rather than the last, because the first is the
+    // one whose reason a person may still have seen on the terminal.
+    //
+    // Mutation check: drop the `cmpxchgStrong` guard in `record` and write the
+    // fault every time, and the `not_supported` expectation below fails with
+    // `rejected`.
+    var audit: SupervisorAudit = .{};
+    try std.testing.expectEqual(@as(?SupervisorAudit.FilterFault, null), audit.counts().first_fault);
+
+    audit.record(.on);
+    audit.record(.on);
+    audit.record(.unsaid);
+    audit.record(.{ .off = .not_supported });
+    audit.record(.{ .off = .rejected });
+
+    const counts = audit.counts();
+    try std.testing.expectEqual(@as(u64, 2), counts.confined);
+    try std.testing.expectEqual(@as(u64, 2), counts.unconfined);
+    try std.testing.expectEqual(@as(u64, 1), counts.unreported);
+    try std.testing.expectEqual(
+        @as(?SupervisorAudit.FilterFault, .not_supported),
+        counts.first_fault,
+    );
+}
+
+test "a fresh audit claims nothing, so an absent answer is never a confined one" {
+    // The default state, pinned. A session that built no sandbox at all must
+    // not write an event that says a supervisor was confined.
+    //
+    // Mutation check: start `confined` at one and this fails.
+    const audit: SupervisorAudit = .{};
+    const counts = audit.counts();
+    try std.testing.expectEqual(@as(u64, 0), counts.confined);
+    try std.testing.expectEqual(@as(u64, 0), counts.unconfined);
+    try std.testing.expectEqual(@as(u64, 0), counts.unreported);
+    try std.testing.expectEqual(@as(?SupervisorAudit.FilterFault, null), counts.first_fault);
+}
 
 test "a copied config shares no memory with the original, scratch areas included" {
     // **`Config.copy` exists so a caller can outlive the arena its config was

@@ -171,6 +171,7 @@ pub const Kind = enum {
     workspace_open,
     workspace_integrate,
     sandbox_open,
+    sandbox_supervisor,
     network_summary,
     unknown,
 
@@ -221,6 +222,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .workspace_open = "workspace.open",
     .workspace_integrate = "workspace.integrate",
     .sandbox_open = "sandbox.open",
+    .sandbox_supervisor = "sandbox.supervisor",
     .network_summary = "network.summary",
     .unknown = "unknown",
 });
@@ -1371,6 +1373,67 @@ pub const SandboxOpen = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// Whether the supervisor process could put one layer on itself, counted over
+/// the whole session.
+///
+/// **The supervisor holds the provider credential.** `Sandbox.spawn` forks
+/// twice. The first child waits for the second and relays its outcome, and it
+/// holds this program's own memory while it waits, which on the `chock run`
+/// path includes the credential. It puts a Landlock ruleset and a seccomp
+/// filter on itself for that reason alone.
+///
+/// **That install is best effort, and the degradation used to be invisible.**
+/// The supervisor cannot be killed for a layer that guards nothing of the
+/// caller's: the caller's program is already running by then, and ending the
+/// supervisor ends it. So the supervisor prints and goes on. The printed line
+/// reaches a terminal and dies with it, and the supervisor cannot write the
+/// log itself, because the sandbox revoked that descriptor before it got
+/// there. So nothing in the log could answer "did the credential holding
+/// process run unfiltered in this session". This event is that answer.
+///
+/// **Written once per session and whichever way it went**, for the reason
+/// `SandboxOpen` is written on every attempt: a fact recorded only when it is
+/// interesting is missing whenever somebody disagrees about what is
+/// interesting, and an absent event would leave a reader unable to tell a
+/// session with nothing to report from a session written by an older build.
+///
+/// **A count and not a line per call.** The answer is a property of the
+/// machine, so it is the same for every tool call of one session, and a line
+/// per call would repeat one fact a thousand times. `NetworkSummary` is the
+/// same shape for the same reason.
+pub const SandboxSupervisor = struct {
+    /// The process these counts are about, by the name the driver gives it.
+    process: []const u8,
+    /// The layer these counts are about, by the name of the mechanism that
+    /// carries it. **A field and not part of the kind**, so a second layer of
+    /// the same process is a second event of this kind rather than a second
+    /// kind.
+    layer: []const u8,
+    /// Calls whose supervisor said the layer went on.
+    confined: u64 = 0,
+    /// Calls whose supervisor said it did not. **This is the field an audit
+    /// reads.** Anything above zero means a process holding the credential ran
+    /// without this layer.
+    unconfined: u64 = 0,
+    /// Calls whose supervisor said nothing at all, because it was killed
+    /// before it reached the point where it puts the layer on. A cancelled
+    /// tool call and one that ran past its deadline both land here.
+    unreported: u64 = 0,
+    /// Why the first unconfined supervisor went without the layer, by the name
+    /// the driver's own fault type gives it. Empty when `unconfined` is zero.
+    ///
+    /// **The specific fault and never a bare "failed".** A refused
+    /// `no_new_privs` flag, a missing privilege, a filter the kernel would not
+    /// read, and a kernel with no seccomp at all are four different faults with
+    /// four different repairs.
+    reason: []const u8 = "",
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A tool call's own network use over the whole session, one line rather than
 /// one per connection.
 ///
@@ -1580,6 +1643,7 @@ pub const Event = union(Kind) {
     workspace_open: WorkspaceOpen,
     workspace_integrate: WorkspaceIntegrate,
     sandbox_open: SandboxOpen,
+    sandbox_supervisor: SandboxSupervisor,
     network_summary: NetworkSummary,
     /// A kind this reader does not recognize. See `UnknownEvent`.
     unknown: UnknownEvent,
@@ -2075,6 +2139,14 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
             .attempt = nl,
             .write_execute = .relaxed,
             .decision = nl,
+        } },
+        .{ .sandbox_supervisor = .{
+            .process = nl,
+            .layer = nl,
+            .confined = 7,
+            .unconfined = 1,
+            .unreported = 2,
+            .reason = nl,
         } },
         .{ .network_summary = .{ .granted = 3, .refused = 1, .diagnostic = nl } },
         .{ .unknown = .{ .kind = "future.kind", .payload = .{ .string = nl } } },

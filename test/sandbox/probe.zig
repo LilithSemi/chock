@@ -1456,6 +1456,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // first would be inherited and would kill that child's own `unshare`.
         std.mem.eql(u8, args[1], "spawn-open-fd-set") or
         std.mem.eql(u8, args[1], "spawn-open-fd-set-filtered") or
+        // The supervisor audit run, for the same reason: it forks and lets
+        // `sandbox.spawn` build the whole sandbox in that child, and a filter
+        // installed on this process first would be inherited and would kill
+        // that child's own `unshare`.
+        std.mem.eql(u8, args[1], "spawn-supervisor-audit") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -4261,6 +4266,50 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }, &.{ "/probe", "spawned-report-pid" }, null, null);
 
         return reportChildTerm(term);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-supervisor-audit")) {
+        // **The whole chain, through a real spawn.** The supervisor process is
+        // the one that holds the provider credential while it waits for the
+        // sandboxed program, and it puts a seccomp filter on itself for that
+        // reason. That install is best effort, so a failure used to reach
+        // standard error and nothing else. This asks the record instead: it
+        // runs one ordinary sandboxed program and reads back what the
+        // supervisor said about its own filter.
+        //
+        // The exit status is the answer, because nothing here may print: the
+        // audit lives in this process's own memory and the test process cannot
+        // read it any other way.
+        const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SupervisorAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .supervisor_audit = &audit,
+        }, &.{ "/probe", "spawned-report-pid" }, null, null);
+
+        // The program itself has to have run, or the counts below are about
+        // nothing.
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+
+        const counts = audit.counts();
+        // **Nothing said is its own answer, and it is a failure here.** This
+        // machine builds sandboxes, so the supervisor reached the point where
+        // it confines itself, and a silent one means the record never left it.
+        if (counts.unreported != 0) return 5;
+        // The supervisor could not filter itself on a machine that gave it a
+        // whole sandbox. Real, and this is the case the record exists for, so
+        // it gets a status of its own rather than sharing one.
+        if (counts.unconfined != 0) return 6;
+        if (counts.confined != 1) return 7;
+        if (counts.first_fault != null) return 8;
+        return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-open-fd-set") or
         std.mem.eql(u8, args[1], "spawn-open-fd-set-filtered"))

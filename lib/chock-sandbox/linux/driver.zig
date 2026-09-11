@@ -446,23 +446,29 @@ pub fn spawn(
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
 
-    // The scratch pipe, and a second pipe rather than one more record on the
+    // The middle pipe, and a second pipe rather than more records on the
     // setup pipe. **The setup pipe answers "did the sandbox come up", and this
     // process learns that answer as soon as `execve` closes the child's copy,
     // not whenever the program eventually finishes.** A writer that stayed open
     // past `execve` would hold that read open for the whole call, and the
     // comment on A's own `close(write_fd)` below is the record of why that
-    // matters. So the one fact that can only be known *after* the program has
-    // ended travels a channel of its own, which this process reads after
-    // `waitpid` has already returned: see `reportScratch`.
-    var scratch_pipe: [2]i32 = undefined;
-    if (linux.errno(linux.pipe2(&scratch_pipe, .{ .CLOEXEC = true })) != .SUCCESS) {
+    // matters. So every fact A has to give back *after* the setup pipe is
+    // closed travels a channel of its own, which this process reads after
+    // `waitpid` has already returned.
+    //
+    // Two facts travel it today: whether a scratch area was full, which is
+    // only knowable once the program has ended, and whether A could put a
+    // seccomp filter on itself, which happens after A has already closed its
+    // own end of the setup pipe. See `MiddleReport` for the record format and
+    // `restrictMiddle` for the second fact.
+    var middle_pipe: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&middle_pipe, .{ .CLOEXEC = true })) != .SUCCESS) {
         _ = linux.close(read_fd);
         _ = linux.close(write_fd);
         return error.Unexpected;
     }
-    const scratch_read_fd = scratch_pipe[0];
-    const scratch_write_fd = scratch_pipe[1];
+    const middle_read_fd = middle_pipe[0];
+    const middle_write_fd = middle_pipe[1];
 
     // The broker pair, for a filtered call and for no other. `[0]` stays in
     // this process and is what the serve loop below reads. `[1]` crosses into
@@ -475,8 +481,8 @@ pub fn spawn(
         broker_fds = netbroker.makePair() catch {
             _ = linux.close(read_fd);
             _ = linux.close(write_fd);
-            _ = linux.close(scratch_read_fd);
-            _ = linux.close(scratch_write_fd);
+            _ = linux.close(middle_read_fd);
+            _ = linux.close(middle_write_fd);
             return error.NetBrokerSocketFailed;
         };
     }
@@ -499,8 +505,8 @@ pub fn spawn(
     if (linux.errno(fork_rc) != .SUCCESS) {
         _ = linux.close(read_fd);
         _ = linux.close(write_fd);
-        _ = linux.close(scratch_read_fd);
-        _ = linux.close(scratch_write_fd);
+        _ = linux.close(middle_read_fd);
+        _ = linux.close(middle_write_fd);
         closeBrokerPair(&broker_fds);
         // **A placement that was refused is named, and never retried without
         // the cgroup.** No process was created, so nothing ran outside the
@@ -517,7 +523,7 @@ pub fn spawn(
         // The child, called A in the comments below. A never reads the setup
         // pipe, only ever writes to it.
         _ = linux.close(read_fd);
-        _ = linux.close(scratch_read_fd);
+        _ = linux.close(middle_read_fd);
         // The parent's own end of the broker pair. **Nothing on this side of
         // the boundary may keep it**: a copy held here would be a second
         // reader of the requests, and it would also mean that a sandboxed
@@ -559,7 +565,7 @@ pub fn spawn(
         // Point descriptor 0 at /dev/null before any layer goes on. See the
         // comment on `redirectStdinToDevNull` for why.
         redirectStdinToDevNull(write_fd, config.stderr_fd);
-        enterNamespaces(config, write_fd, scratch_write_fd, broker_fds[1]);
+        enterNamespaces(config, write_fd, middle_write_fd, broker_fds[1]);
 
         // The capped scratch areas, mounted here in A and not in B with the
         // rest of the mount tree. **A has to hold a descriptor on each one**,
@@ -626,7 +632,7 @@ pub fn spawn(
         // across the fork above, is untouched by closing this one.
         _ = linux.close(middle_pidfd);
 
-        // A's own copy of the scratch pipe's write end stays open until
+        // A's own copy of the middle pipe's write end stays open until
         // `waitAndRelay` has read the areas and written its record. B's copy is
         // CLOEXEC, so B's own `execve` closes it, and `closeInheritedFds`
         // already ran in A before any of this: nothing the caller's program
@@ -684,13 +690,13 @@ pub fn spawn(
         // and keep the promise it used to keep by accident, that a process
         // holding this program's own memory reaches no path and makes no
         // dangerous call while it waits.
-        restrictMiddle(abi, insns);
+        restrictMiddle(abi, insns, middle_write_fd);
 
         // A is not process 1 anywhere, so it keeps ordinary signal semantics. It
         // waits for B and relays B's outcome as its own, so the real parent's
         // single waitpid on A, further down in this function, still sees the
         // caller's program's real Term.
-        waitAndRelay(inner_pid, &areas, scratch_write_fd);
+        waitAndRelay(inner_pid, &areas, middle_write_fd);
         unreachable;
     }
 
@@ -736,8 +742,8 @@ pub fn spawn(
             }
             _ = linux.close(read_fd);
             _ = linux.close(write_fd);
-            _ = linux.close(scratch_read_fd);
-            _ = linux.close(scratch_write_fd);
+            _ = linux.close(middle_read_fd);
+            _ = linux.close(middle_write_fd);
             return error.Unexpected;
         }
         out.fd = @intCast(pidfd_rc);
@@ -753,8 +759,8 @@ pub fn spawn(
     // a read on a pipe blocks until every write end is closed, and this
     // process holds one of them too.
     _ = linux.close(write_fd);
-    // Same rule for the scratch pipe, whose only writer is A.
-    _ = linux.close(scratch_write_fd);
+    // Same rule for the middle pipe, whose only writer is A.
+    _ = linux.close(middle_write_fd);
 
     // Both descriptors are closed on the way out of every branch below,
     // including this one. A caller such as `lib/chock-core/tools.zig` runs
@@ -762,13 +768,13 @@ pub fn spawn(
     // error path is a leak that ends with the harness unable to open a file.
     const maybe_failure = readSetupReport(read_fd) catch |err| {
         _ = linux.close(read_fd);
-        _ = linux.close(scratch_read_fd);
+        _ = linux.close(middle_read_fd);
         return err;
     };
     _ = linux.close(read_fd);
 
     if (maybe_failure) |record| {
-        _ = linux.close(scratch_read_fd);
+        _ = linux.close(middle_read_fd);
         // A setup failure. Reap A regardless of whatever it exited with. The
         // record above is the only outcome that matters here, never A's own
         // exit code, which this process must never read as meaningful again.
@@ -805,7 +811,7 @@ pub fn spawn(
     if (broker_fds[0] >= 0) {
         serveBroker(pid, broker_fds[0], config.net_broker.?) catch |err| {
             closeBrokerPair(&broker_fds);
-            _ = linux.close(scratch_read_fd);
+            _ = linux.close(middle_read_fd);
             // A is still running and this process is its only reaper, so end
             // it rather than leave a call nobody is watching.
             _ = linux.kill(pid, .KILL);
@@ -832,16 +838,24 @@ pub fn spawn(
         wait_rc = linux.waitpid(pid, &status, 0);
     }
     if (linux.errno(wait_rc) != .SUCCESS) {
-        _ = linux.close(scratch_read_fd);
+        _ = linux.close(middle_read_fd);
         return error.Unexpected;
     }
 
-    // A has exited, so its copy of the scratch pipe's write end is closed and
+    // A has exited, so its copy of the middle pipe's write end is closed and
     // this read cannot block. **It has to happen after the wait**: the areas
     // only exist inside A's mount namespace, and A reads them once, after the
     // program it was watching has ended.
-    const scratch_full = readScratchReport(scratch_read_fd);
-    _ = linux.close(scratch_read_fd);
+    const middle_report = readMiddleReport(middle_read_fd);
+    _ = linux.close(middle_read_fd);
+
+    // **The one place the supervisor's own degradation stops being a printed
+    // line.** A had no way to write the session log: `closeInheritedFds`
+    // revoked every descriptor it did not name, and a second writer on a log
+    // descriptor would interleave with this process anyway. So A said it on
+    // the middle pipe and this process, which does hold the log, counts it.
+    // See `iface.SupervisorAudit`.
+    if (config.supervisor_audit) |audit| audit.record(middle_report.filter);
 
     // The program has ended, so the kernel's own counters are final and the
     // cgroup can be read. **Read before `destroy` removes it**, which the
@@ -850,7 +864,7 @@ pub fn spawn(
         .{ .signal = linux.W.TERMSIG(status) }
     else
         .{ .exited = linux.W.EXITSTATUS(status) };
-    reportLimitOutcome(config, &group, term, scratch_full);
+    reportLimitOutcome(config, &group, term, middle_report.scratch_full);
     return term;
 }
 
@@ -1050,38 +1064,128 @@ fn mountScratchAreas(config: Config, write_fd: i32) ScratchAreas {
     return areas;
 }
 
-/// The one byte A writes on the scratch pipe to say an area was full.
+/// One record on the middle pipe: a tag byte that says which fact it carries,
+/// and a value byte that carries it.
 ///
-/// A fixed value rather than a bare 1, so a read that ever landed on something
-/// else is ignored instead of trusted. There is no forgery to defend against
-/// here, unlike on the setup pipe: both ends are `CLOEXEC`, A is the only
-/// writer, and `closeInheritedFds` already ran, so the sandboxed program never
-/// holds either end.
-const scratch_full_byte: u8 = 0xD1;
+/// **Fixed width, and no length field.** A reader that meets a tag it does not
+/// know steps over the record and reads the one after it, and a reader built
+/// from a different version of this file cannot exist: both ends come from one
+/// `pipe2` call in `spawn`, in one process, and the only writer is that
+/// process's own first child. Two bytes is far below `PIPE_BUF`, so each
+/// record reaches the reader whole even though A writes two of them at two
+/// different moments.
+///
+/// The tag values are fixed rather than counted from zero, so a read that ever
+/// landed on something else is ignored instead of trusted. There is no forgery
+/// to defend against here, unlike on the setup pipe: both ends are `CLOEXEC`,
+/// A is the only writer, and `closeInheritedFds` already ran, so the sandboxed
+/// program never holds either end.
+const record_bytes = 2;
 
-/// Say whether any scratch area was full when the program ended, on the
-/// scratch pipe.
+/// A scratch area had no space left in it when the program ended. The value
+/// byte is 1.
+const tag_scratch_full: u8 = 0xD1;
+
+/// Whether A put a seccomp filter on itself. The value byte is 0 for a filter
+/// that went on, and otherwise a `SupervisorAudit.FilterFault`.
 ///
-/// Best effort. A write that fails costs the caller the sentence that names the
-/// limit and nothing else, and the program's own outcome is untouched by it.
-fn reportScratch(areas: *const ScratchAreas, scratch_write_fd: i32) void {
-    if (!areas.anyFull()) return;
-    const byte = [1]u8{scratch_full_byte};
-    _ = linux.write(scratch_write_fd, &byte, byte.len);
+/// **Written whichever way it went**, so that "A said nothing" stays a third
+/// answer of its own rather than reading as success. A tool call a person
+/// cancelled kills A before it reaches `restrictMiddle` at all, and that call
+/// must not be counted as one whose supervisor was confined.
+const tag_middle_filter: u8 = 0xD2;
+
+/// What `readMiddleReport` found on the middle pipe.
+const MiddleReport = struct {
+    /// True when a scratch area had no space left in it.
+    scratch_full: bool = false,
+    /// What A said about its own seccomp filter. `.unsaid` when A never
+    /// reached `restrictMiddle`, or could not write.
+    filter: iface.SupervisorAudit.Filter = .unsaid,
+};
+
+/// Write one record. Best effort, for the reason `restrictMiddle` and
+/// `reportScratch` both give: a write that fails costs the caller a fact and
+/// never the program's own outcome.
+fn writeMiddleRecord(middle_write_fd: i32, tag: u8, value: u8) void {
+    const record = [record_bytes]u8{ tag, value };
+    _ = linux.write(middle_write_fd, &record, record.len);
 }
 
-/// Read the scratch pipe, which A has already closed by the time this runs.
-/// False on end of file with no data, which is the ordinary case of a call that
-/// filled nothing.
-fn readScratchReport(scratch_read_fd: i32) bool {
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const rc = linux.read(scratch_read_fd, &byte, byte.len);
+/// Say whether any scratch area was full when the program ended, on the
+/// middle pipe.
+fn reportScratch(areas: *const ScratchAreas, middle_write_fd: i32) void {
+    if (!areas.anyFull()) return;
+    writeMiddleRecord(middle_write_fd, tag_scratch_full, 1);
+}
+
+/// Say whether A could put a seccomp filter on itself, on the middle pipe.
+/// `fault` is null for a filter that went on.
+fn reportMiddleFilter(middle_write_fd: i32, fault: ?iface.SupervisorAudit.FilterFault) void {
+    const value: u8 = if (fault) |one| @intFromEnum(one) else 0;
+    writeMiddleRecord(middle_write_fd, tag_middle_filter, value);
+}
+
+/// Name the fault a failed `seccomp.install` in A is recorded as.
+///
+/// **Exhaustive on purpose.** A member added to `seccomp.InstallError` stops
+/// this file compiling until it is named here too, so a new fault cannot reach
+/// the log as one of the old ones. Before that error set was split, every
+/// failure arrived as `Rejected`, and a record that said so would have named
+/// the wrong repair.
+fn filterFaultFor(err: seccomp.InstallError) iface.SupervisorAudit.FilterFault {
+    return switch (err) {
+        error.NotSupported => .not_supported,
+        error.NoNewPrivsRefused => .no_new_privs_refused,
+        error.NotPermitted => .not_permitted,
+        error.Rejected => .rejected,
+        error.Unexpected => .unexpected,
+    };
+}
+
+/// Read the value byte of a `tag_middle_filter` record.
+///
+/// A value this build has no name for still reads as "no filter went on", with
+/// `unexpected` standing in for the name. A record only A writes cannot carry
+/// one, and reading it as success would be the one mistake this whole record
+/// exists to stop.
+fn filterFor(value: u8) iface.SupervisorAudit.Filter {
+    if (value == 0) return .on;
+    const fault = std.enums.fromInt(iface.SupervisorAudit.FilterFault, value) orelse .unexpected;
+    return .{ .off = fault };
+}
+
+/// Read the middle pipe, which A has already closed by the time this runs.
+/// Every field keeps its default on end of file with no data, which is what a
+/// call whose A was killed before it could say anything leaves behind.
+fn readMiddleReport(middle_read_fd: i32) MiddleReport {
+    // Room for eight records, against the two A writes. A reader that stopped
+    // early would leave bytes in a pipe nobody reads again, and the cost of
+    // the margin is six bytes of stack.
+    var buffer: [record_bytes * 8]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const rc = linux.read(middle_read_fd, buffer[filled..].ptr, buffer.len - filled);
         const read_errno = linux.errno(rc);
         if (read_errno == .INTR) continue;
-        if (read_errno != .SUCCESS or rc == 0) return false;
-        return byte[0] == scratch_full_byte;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        filled += rc;
     }
+
+    var report = MiddleReport{};
+    var at: usize = 0;
+    // A trailing byte that is not a whole record is dropped. Nothing writes a
+    // half record, so meeting one means the pipe was cut, and half a tag names
+    // no fact.
+    while (at + record_bytes <= filled) : (at += record_bytes) {
+        const value = buffer[at + 1];
+        switch (buffer[at]) {
+            tag_scratch_full => report.scratch_full = value != 0,
+            tag_middle_filter => report.filter = filterFor(value),
+            else => {},
+        }
+    }
+    return report;
 }
 
 /// Work out whether a resource limit is what ended the program, and say so.
@@ -1759,7 +1863,7 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
 /// the kernel kills every other process left in that namespace. Chock wants
 /// exactly that: a tool call that leaves stray children behind cannot outlive
 /// the program the caller asked to run.
-fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, scratch_write_fd: i32) noreturn {
+fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, middle_write_fd: i32) noreturn {
     var status: u32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     // A signal caught by this process while it waits interrupts the call with
@@ -1778,7 +1882,7 @@ fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, scratch_write_fd: 
     // only place and the only moment the reading means anything. It happens
     // before the relay below, because every branch of that relay ends this
     // process.
-    reportScratch(areas, scratch_write_fd);
+    reportScratch(areas, middle_write_fd);
 
     if (linux.W.IFSIGNALED(status)) {
         const sig = linux.W.TERMSIG(status);
@@ -1832,8 +1936,8 @@ fn waitAndRelay(pid: linux.pid_t, areas: *const ScratchAreas, scratch_write_fd: 
 /// close that pidfd along with the rest. The namespaces are taken here because
 /// `unshare(CLONE_NEWPID)` never moves its own caller into the namespace it
 /// makes: only a child forked afterwards lands there, and that child is B.
-fn enterNamespaces(config: Config, write_fd: i32, scratch_write_fd: i32, broker_fd: i32) void {
-    closeInheritedFds(write_fd, scratch_write_fd, config.stdout_fd, config.stderr_fd, config.stdin_fd, broker_fd);
+fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_fd: i32) void {
+    closeInheritedFds(write_fd, middle_write_fd, config.stdout_fd, config.stderr_fd, config.stdin_fd, broker_fd);
 
     // The slot is here for the reason `applyLayers` has one, and for one more:
     // `error.NamespaceFailed` on its own cannot tell a policy that refuses an
@@ -1909,7 +2013,15 @@ fn applyLayers(
 /// Best effort, and never fatal. B already runs, and killing A here would kill
 /// the caller's program for a layer that protects nothing of the caller's. A
 /// failure is printed, because a recovery nobody can see is not a recovery.
-fn restrictMiddle(abi: i32, insns: []const bpf.Insn) void {
+///
+/// **Printed and also recorded.** The printed line reaches a terminal and dies
+/// with it, so nothing could answer afterwards whether the process holding the
+/// provider credential ran with no filter on it. A cannot write the session
+/// log itself: `closeInheritedFds` revoked that descriptor before any of this.
+/// So the answer goes back on the middle pipe, and the real parent, which does
+/// hold the log, counts it. See `tag_middle_filter` and
+/// `iface.SupervisorAudit`.
+fn restrictMiddle(abi: i32, insns: []const bpf.Insn, middle_write_fd: i32) void {
     // **This is the one caller with nowhere to send a diagnostic.** The
     // setup pipe is already closed, the caller's own program is already
     // running, and nothing here may ever look like a setup failure to
@@ -1934,7 +2046,15 @@ fn restrictMiddle(abi: i32, insns: []const bpf.Insn) void {
         printMiddleFault(err, diag);
     }
 
-    seccomp.install(bpf.Prog.init(insns)) catch |err| printMiddleFault(err, null);
+    // **The line first and the record second**, so the behaviour a person sees
+    // is the behaviour they always saw, and the record is added behind it.
+    // Written whichever way the install went: see `tag_middle_filter`.
+    seccomp.install(bpf.Prog.init(insns)) catch |err| {
+        printMiddleFault(err, null);
+        reportMiddleFilter(middle_write_fd, filterFaultFor(err));
+        return;
+    };
+    reportMiddleFilter(middle_write_fd, null);
 }
 
 /// Same as `printMiddleFault`, for the one call in `restrictMiddle` that is
@@ -2160,7 +2280,7 @@ fn redirectStdinToDevNull(write_fd: i32, stderr_fd: i32) void {
 }
 
 /// Close every file descriptor above standard error, except `write_fd`,
-/// `scratch_write_fd`, `stdout_fd`, `stderr_fd`, and `stdin_fd`, so a
+/// `middle_write_fd`, `stdout_fd`, `stderr_fd`, and `stdin_fd`, so a
 /// descriptor opened before
 /// the sandbox was entered cannot be used to reach the host filesystem after
 /// `pivot_root`. A descriptor does not go through path resolution again once
@@ -2190,25 +2310,25 @@ fn redirectStdinToDevNull(write_fd: i32, stderr_fd: i32) void {
 /// holds by one pipe and by nothing else. See `Config.stdin_fd` for what a
 /// pipe there does and does not give.
 ///
-/// `scratch_write_fd` is the second pipe, and it is the one exemption this
+/// `middle_write_fd` is the second pipe, and it is the one exemption this
 /// pass gained after the fact, so the reason is written down rather than left
 /// to be guessed at. **It could not be avoided by making the pipe later.** The
 /// real parent has to hold the read end, so the pipe has to exist before the
-/// fork, and the fact it carries, whether a scratch area was full, is only
-/// knowable after the sandboxed program has ended. So this process keeps the
-/// write end through every layer and writes on it once, in `waitAndRelay`.
-/// It reaches nothing: a pipe has no name in any filesystem, both ends are
-/// `CLOEXEC` so the sandboxed program's own `execve` drops its copy, and the
-/// only thing ever written on it is one byte this file chooses. Compare
-/// `joinCgroup`, which closes its descriptor before this pass on purpose,
-/// because it could.
+/// fork, and every fact it carries is knowable only after this process has
+/// already given up its own end of the setup pipe. So this process keeps the
+/// write end through every layer and writes two short records on it, in
+/// `restrictMiddle` and in `waitAndRelay`. It reaches nothing: a pipe has no
+/// name in any filesystem, both ends are `CLOEXEC` so the sandboxed program's
+/// own `execve` drops its copy, and the only thing ever written on it is the
+/// fixed records this file chooses. Compare `joinCgroup`, which closes its
+/// descriptor before this pass on purpose, because it could.
 ///
 /// This runs before any namespace or mount is set up, while `/proc` still shows
 /// the host's view of this process's own descriptor table. The sandbox's mount
 /// tree is never required to carry its own `/proc` mount for this to work.
 fn closeInheritedFds(
     write_fd: i32,
-    scratch_write_fd: i32,
+    middle_write_fd: i32,
     stdout_fd: i32,
     stderr_fd: i32,
     stdin_fd: ?i32,
@@ -2255,7 +2375,7 @@ fn closeInheritedFds(
                 // descriptor is one the parent held before this process was
                 // ever meant to run.
                 if (fd > std.posix.STDERR_FILENO and fd != dir_fd and fd != write_fd and
-                    fd != scratch_write_fd and fd != broker_fd and
+                    fd != middle_write_fd and fd != broker_fd and
                     fd != stdout_fd and fd != stderr_fd and fd != (stdin_fd orelse -1))
                 {
                     const close_errno = linux.errno(linux.close(fd));
@@ -2564,6 +2684,114 @@ fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     return buffer[0..len :0];
 }
 
+test "the middle pipe carries the scratch fact and the filter fact, and a reader tells them apart" {
+    // **The record format itself, writer against reader.** Before this, the
+    // pipe carried one unframed byte with one meaning, so a second fact could
+    // not be added without a reader that could tell two records apart. Both
+    // records go in here, in the order A writes them, and both come back.
+    //
+    // Mutation check: make `readMiddleReport` stop after the first record and
+    // the scratch fact is lost, because A writes the filter record first.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[0]);
+
+    reportMiddleFilter(fds[1], .no_new_privs_refused);
+    writeMiddleRecord(fds[1], tag_scratch_full, 1);
+    // The reader stops at end of file, and only the writer's own close gives
+    // it one.
+    _ = linux.close(fds[1]);
+
+    const report = readMiddleReport(fds[0]);
+    try std.testing.expect(report.scratch_full);
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Filter{ .off = .no_new_privs_refused },
+        report.filter,
+    );
+}
+
+test "a supervisor that said nothing is not a supervisor that was confined" {
+    // **The third answer, and the reason the filter record is written both
+    // ways.** A tool call a person cancelled kills A before it reaches
+    // `restrictMiddle`, so nothing is written at all. Reading that as "the
+    // filter went on" would count a call that was never measured as a call
+    // that passed, which is the shape of the vacuous test this project has
+    // been caught by before.
+    //
+    // Mutation check: give `MiddleReport.filter` a default of `.on` and this
+    // fails; `readMiddleReport` never writes the field for an empty pipe.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[0]);
+    _ = linux.close(fds[1]);
+
+    const report = readMiddleReport(fds[0]);
+    try std.testing.expect(!report.scratch_full);
+    try std.testing.expectEqual(iface.SupervisorAudit.Filter.unsaid, report.filter);
+}
+
+test "every way the filter can be refused reaches the reader as its own fault" {
+    // **The distinction `seccomp.InstallError` was split to carry.** Before
+    // that split every failure was `error.Rejected`, and a record that said so
+    // would have named the wrong repair for four faults out of five. This pins
+    // that the split survives the pipe: each error is a fault of its own, no
+    // two share a value byte, and none of them arrives as `.on`.
+    //
+    // Mutation check: map two of the errors to the same member of
+    // `FilterFault` in `filterFaultFor` and the `expect` on distinctness
+    // fails.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[0]);
+
+    const errors = [_]seccomp.InstallError{
+        error.NotSupported,
+        error.NoNewPrivsRefused,
+        error.NotPermitted,
+        error.Rejected,
+        error.Unexpected,
+    };
+    var seen: [errors.len]iface.SupervisorAudit.FilterFault = undefined;
+    for (errors, 0..) |err, index| {
+        reportMiddleFilter(fds[1], filterFaultFor(err));
+        var record: [record_bytes]u8 = undefined;
+        const rc = linux.read(fds[0], &record, record.len);
+        try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+        try std.testing.expectEqual(@as(usize, record_bytes), rc);
+        try std.testing.expectEqual(tag_middle_filter, record[0]);
+
+        switch (filterFor(record[1])) {
+            .off => |fault| seen[index] = fault,
+            // A filter that went on, or nothing said at all, for an install
+            // that failed. Either one would make the whole record worthless.
+            .on, .unsaid => return error.TestUnexpectedResult,
+        }
+    }
+    _ = linux.close(fds[1]);
+
+    for (seen, 0..) |fault, index| {
+        for (seen[index + 1 ..]) |other| try std.testing.expect(fault != other);
+    }
+}
+
+test "a filter that went on is the only value byte that reads as confined" {
+    // The other half of the record's meaning. `reportMiddleFilter(fd, null)`
+    // is what A writes when the install worked, and nothing else may read that
+    // way, including a fault code from a build this one has never seen.
+    //
+    // Mutation check: return `.on` for the unrecognised value in `filterFor`
+    // and the last case here fails.
+    try std.testing.expectEqual(iface.SupervisorAudit.Filter.on, filterFor(0));
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Filter{ .off = .rejected },
+        filterFor(@intFromEnum(iface.SupervisorAudit.FilterFault.rejected)),
+    );
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Filter{ .off = .unexpected },
+        filterFor(200),
+    );
+}
+
 test "closeInheritedFds closes every descriptor above stderr, and leaves stderr open" {
     // Model a descriptor a long lived host process would still be holding at the
     // moment it forks a sandboxed child, the exact leak the design review found:
@@ -2616,8 +2844,8 @@ test "closeInheritedFds closes every descriptor above stderr, and leaves stderr 
     try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
 }
 
-test "closeInheritedFds keeps exactly the scratch pipe's write end, and no other" {
-    // The scratch pipe is the one exemption this pass gained after it was
+test "closeInheritedFds keeps exactly the middle pipe's write end, and no other" {
+    // The middle pipe is the one exemption this pass gained after it was
     // written, and the pass is what stops a directory descriptor opened before
     // the sandbox reaching the host tree by name after `pivot_root`. So the
     // exemption has to be exactly one number wide, the same as the one
@@ -2629,7 +2857,7 @@ test "closeInheritedFds keeps exactly the scratch pipe's write end, and no other
     // a full scratch area came back as "something stopped the program" with no
     // limit named. Every other check still passed.
     //
-    // Mutation check: drop `scratch_write_fd` from the guard and `extra_b` is
+    // Mutation check: drop `middle_write_fd` from the guard and `extra_b` is
     // closed, which fails the second assertion. Widen the guard to keep
     // anything more, and `extra_a` survives and fails the first.
     const extra_a = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
@@ -2652,8 +2880,8 @@ test "closeInheritedFds keeps exactly the scratch pipe's write end, and no other
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
         const closed_the_other = linux.errno(a_result) == .BADF;
-        const kept_the_scratch_pipe = linux.errno(b_result) == .SUCCESS;
-        std.process.exit(if (closed_the_other and kept_the_scratch_pipe) 0 else 1);
+        const kept_the_middle_pipe = linux.errno(b_result) == .SUCCESS;
+        std.process.exit(if (closed_the_other and kept_the_middle_pipe) 0 else 1);
     }
 
     var status: u32 = undefined;
