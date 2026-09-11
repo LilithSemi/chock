@@ -1126,10 +1126,8 @@ test "the supervisor names the paths the sandboxed program asked for that nothin
     // Mutation check: delete the `readAndNote` call in `notify.answerOne` and
     // the run exits 11, which is the count of opens the configuration granted.
     //
-    // **This run does not assert how the reader ended, and the probe says
-    // why.** The pid namespace teardown races the reader's own report and wins
-    // on a busy machine. What is asserted instead is that the record is
-    // complete, which is the fact the reader exists to produce.
+    // The probe requires a complete record and a clean reader report. The
+    // keeper prevents B's exit from killing the reader.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-path-audit", scratch.path());
@@ -1203,6 +1201,19 @@ test "a program that kills the reader watching it breaks its own opens" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "a program that stops its reader cannot hold teardown" {
+    // A resumes the reader after B exits. The reader then observes B's pidfd,
+    // reports, and exits. The outer probe has a three second alarm so deleting
+    // the bounded reap fails instead of hanging the suite.
+    //
+    // Mutation check: remove the SIGCONT in `reapReader`. The bounded fallback
+    // kills R and this probe exits 6 with a missing report.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-path-audit-stopped", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a program that leaves a process behind does not hold the tool call open" {
     // Every process the sandboxed program forks carries the same filter, so
     // the kernel keeps the notification descriptor alive until the last of
@@ -1210,15 +1221,12 @@ test "a program that leaves a process behind does not hold the tool call open" {
     // the program would hold the tool call for as long as that leftover
     // process ran. **The whole test is that this run finishes.**
     //
-    // **What this test does not distinguish, measured on 2026-09-11.** Taking
-    // the process descriptor out of the poll set in `notify.serve` leaves this
-    // run exactly as fast, because the sandboxed program is process 1 of its
-    // own pid namespace and the kernel kills every other member of that
-    // namespace the moment process 1 exits. So the leftover process is already
-    // gone by the time the supervisor could wait for it. The descriptor in
-    // that poll set is what makes `notify.serve` correct on its own terms
-    // rather than through a fact that lives in `namespace.zig`, and no test
-    // here can tell the two apart while the pid namespace is there.
+    // The leftover process waits before it opens `/probe`. The reader must
+    // stop on B's pidfd before that open. The probe checks that the open was
+    // not recorded.
+    //
+    // Mutation check: remove B's pidfd from `notify.loop`. The delayed open is
+    // served and recorded, and the probe exits 6.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-syscall-audit-daemon", scratch.path());
@@ -1443,12 +1451,10 @@ test "the session keyring join gives the sandbox a keyring the host cannot see i
 }
 
 test "the sandboxed process sees a fresh process id space, not the host's" {
-    // The grandchild Sandbox.spawn runs the caller's program in is the first process
-    // the kernel ever creates in the new namespace, so it is pid 1 there. A host pid
-    // is never that small. This very test process is already a much larger number by
-    // the time the suite reaches this line. Pid 1 outside a container is normally
-    // init, a process this test must never be able to name or affect, so a small
-    // number here is a fresh space, not a lucky host pid.
+    // The keeper is process 1 of the new namespace. The caller's program is
+    // process 2. A host pid is never that small on this test machine.
+    //
+    // Mutation check: fork the program before the keeper and this reads 1.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const result = try runReportPid(scratch.path());
@@ -1456,7 +1462,31 @@ test "the sandboxed process sees a fresh process id space, not the host's" {
 
     const text = std.mem.trimEnd(u8, result.text(), "\n");
     const pid = try std.fmt.parseInt(u32, text, 10);
-    try std.testing.expectEqual(@as(u32, 1), pid);
+    try std.testing.expectEqual(@as(u32, 2), pid);
+}
+
+test "the sandboxed program has ordinary default signal behavior" {
+    // B is process 2, so the kernel applies the default SIGTERM action.
+    // This is an intentional change from running the program as process 1.
+    //
+    // Mutation check: fork B before the keeper. B reaches its sentinel exit 8
+    // and the outer probe exits 6.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-default-signal", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "the pid namespace keeper reaps an adopted zombie" {
+    // B creates a grandchild and lets its direct child exit. The grandchild is
+    // then adopted by process 1. B waits until that pid no longer exists.
+    //
+    // Mutation check: remove the waitpid loop from `runKeeper`. The zombie
+    // remains visible and the inner probe exits 11.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-keeper-reaps", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
 test "Finding 1: a forged exit code from the old setup-failure range is relayed untouched, and the file it wrote survives" {
@@ -1554,10 +1584,8 @@ test "Finding 2: signalling the process spawn forked also ends the sandboxed pro
     }
     try std.testing.expect(size_before_signal > 0);
 
-    // SIGTERM, an ordinary cancellation, not SIGKILL: process 1 of a pid
-    // namespace ignores a plain SIGTERM sent to it directly, which is exactly
-    // why this signals the middle process instead. See spawn's own doc
-    // comment on middle_pid.
+    // SIGTERM is an ordinary cancellation. Signal the stable middle handle
+    // rather than a namespace relative pid that can be reused.
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.kill(middle_pid, .TERM)));
 
     // A bounded wait for the relay and the pid death signal to land, not a
@@ -1590,9 +1618,8 @@ test "a cancelled call takes the processes it started with it, not only the one 
     // `Sandbox.spawn` forked, and nothing else directly.
     //
     // That would be a leak if it stopped there. It does not, and two
-    // mechanisms are why: the sandboxed program's own `PR_SET_PDEATHSIG` fires
-    // when the signalled process dies, and the kernel then kills every other
-    // process in the pid namespace whose process 1 has just died.
+    // mechanisms are why: B and the keeper each get `PR_SET_PDEATHSIG`. The
+    // keeper's death clears every process left in its pid namespace.
     // `Cgroup.destroy` writes `cgroup.kill` on the way out of `spawn`. See
     // `Sandbox.spawn`'s own doc comment, which records both and says why
     // neither is decoration.
@@ -1745,9 +1772,7 @@ test "a signal to the caller's process group leaves the running call alone, and 
     // The probe takes a group of its own, which stands in for a session's
     // foreground group, then signals that whole group by group and never by
     // process, exactly as a terminal does. The sandboxed program catches the
-    // signal rather than dying from it, because process 1 of a pid namespace
-    // ignores every signal whose action is the default one, so its death is
-    // not a thing this could rely on either way.
+    // signal so it can report whether the signal arrived.
     //
     // Exit 0 is the pair of facts this pins: the press reached nothing inside
     // the call, **and** the call ran on to its own end and exited 0 afterward.

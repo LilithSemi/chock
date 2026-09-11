@@ -263,20 +263,15 @@ test "a caller supplied cgroup is refused below 5.7, and chock's own cgroup is r
 /// `middle`, if not null, is filled in with a handle on the process this
 /// function forks, right after that fork succeeds and before anything else
 /// runs. Cancel a running call by signalling through that handle, never the
-/// sandboxed program directly: the sandboxed program is process 1 of its own
-/// pid namespace, and process 1 of a namespace with default signal handlers
-/// cannot be killed by an ordinary signal such as SIGTERM. The process the
-/// handle names is not process 1 anywhere, so it dies normally from any
-/// signal, and its death takes the sandboxed program down with it: see the
-/// comment on `waitAndRelay` for the relay, and `armPdeathsig` for why the
-/// sandboxed program does not outlive it.
+/// sandboxed program directly. The handle does not depend on a pid number
+/// that can be reused. Its death takes the sandboxed program down with it.
+/// See `waitAndRelay` for the relay and `armPdeathsig` for the parent link.
 ///
 /// **One signal to that one process ends every process of the call, and the
 /// pid namespace is why.** `signalMiddle` has no group form, so this reaches
-/// only the middle process. That is enough: the middle process dies, the
-/// sandboxed program's own `PR_SET_PDEATHSIG` fires and kills it, and the
-/// kernel then kills every other process in the pid namespace whose process 1
-/// has just died.
+/// only the middle process. That is enough. The middle process dies. The
+/// sandboxed program and the keeper each get `PR_SET_PDEATHSIG`. The keeper's
+/// death then clears every process left in the pid namespace.
 ///
 /// **Two mechanisms do this and either one is enough, which is worth stating
 /// so a reader does not remove one believing the other is decoration.** The
@@ -425,6 +420,11 @@ pub fn spawn(
         &[_]bpf.Insn{};
     defer if (recording) allocator.free(reader_insns);
 
+    // The keeper is always present, so its filter is built before any fork.
+    // The keeper holds process 1 in the pid namespace and reaps orphans.
+    const keeper_insns = seccomp.buildKeeper(allocator) catch |err| return err;
+    defer allocator.free(keeper_insns);
+
     // **The boundary R splits paths on, built here for the reason the three
     // programs above are**, and before any fork for the same reason again.
     //
@@ -542,9 +542,8 @@ pub fn spawn(
         };
     }
 
-    // The page the path reader writes and this process reads. **Shared memory
-    // and not the middle pipe**, because the reader is killed by the kernel
-    // the instant the observed program ends: see `notify.PathRecord`.
+    // The page the path reader writes and this process reads. It is shared
+    // memory so the reader can report without a write capable descriptor.
     //
     // **Made before the fork on purpose, and given up by B before B applies a
     // single layer.** B inherits it, and B is this project's own code until
@@ -615,9 +614,10 @@ pub fn spawn(
 
         // The cgroup, before anything closes a descriptor and before any
         // namespace. Moving this process moves every process it goes on to
-        // make, which is B and everything B starts, so one write here bounds
-        // the whole call. See `Cgroup.join` for why it is a descriptor and
-        // not a path, and why the pid written is `0`.
+        // make. This includes the keeper, B, the optional reader, and every
+        // process B starts. One write here bounds the whole call. See
+        // `Cgroup.join` for why it is a descriptor and not a path, and why the
+        // pid written is `0`.
         //
         // **A supplied cgroup is never joined here, and the switch says so
         // rather than leaving it to a descriptor that happens to be -1.** This
@@ -676,15 +676,13 @@ pub fn spawn(
         }
 
         // namespace.enter above called unshare(CLONE_NEWPID), but unshare never
-        // moves the calling process into the namespace it just made. Only a
-        // child forked after that call lands there, as its process 1.
-        // This process, A, stays in the pid namespace it already had. The second
-        // fork here makes B, which becomes process 1 of the new namespace and is
-        // the process that actually runs the caller's program.
+        // moves its caller. A stays outside the new pid namespace. The first
+        // child below is the keeper and becomes process 1. B is the next child
+        // and gets ordinary process signal and exit behavior as process 2.
         //
         // A opens a pidfd on itself first, so B can inherit a working liveness
         // handle for A across the fork. B cannot open this itself: B is about to
-        // become process 1 of a pid namespace A is not a member of, so A's pid
+        // enter a pid namespace A is not a member of, so A's pid
         // number means nothing inside B's own namespace, and pidfd_open needs a
         // pid number in the caller's own namespace to resolve. A fd, once open,
         // needs no such resolution. It is just inherited across the fork like any
@@ -701,6 +699,46 @@ pub fn spawn(
         }
         const middle_pidfd: i32 = @intCast(middle_pidfd_rc);
 
+        var keeper_fds: [2]i32 = undefined;
+        const keeper_pair_rc = linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+            0,
+            &keeper_fds,
+        );
+        if (linux.errno(keeper_pair_rc) != .SUCCESS) {
+            dieErrno(
+                write_fd,
+                config.stderr_fd,
+                .fork,
+                "socketpair for the pid namespace keeper",
+                linux.errno(keeper_pair_rc),
+            );
+        }
+
+        const keeper_fork_rc = linux.fork();
+        if (linux.errno(keeper_fork_rc) != .SUCCESS) {
+            die(write_fd, config.stderr_fd, .fork, error.Unexpected);
+        }
+        const keeper_pid: linux.pid_t = @intCast(keeper_fork_rc);
+        if (keeper_pid == 0) {
+            _ = linux.close(keeper_fds[0]);
+            runKeeper(keeper_fds[1], middle_pidfd, write_fd, config.stderr_fd, keeper_insns);
+        }
+
+        _ = linux.close(keeper_fds[1]);
+        keeper_fds[1] = -1;
+        var keeper_ready: [1]u8 = undefined;
+        var keeper_read_rc = linux.read(keeper_fds[0], &keeper_ready, keeper_ready.len);
+        while (linux.errno(keeper_read_rc) == .INTR) {
+            keeper_read_rc = linux.read(keeper_fds[0], &keeper_ready, keeper_ready.len);
+        }
+        if (linux.errno(keeper_read_rc) != .SUCCESS or keeper_read_rc != keeper_ready.len or
+            keeper_ready[0] != 1)
+        {
+            die(write_fd, config.stderr_fd, .fork, error.Unexpected);
+        }
+
         const inner_fork_rc = linux.fork();
         if (linux.errno(inner_fork_rc) != .SUCCESS) {
             die(write_fd, config.stderr_fd, .fork, error.Unexpected);
@@ -708,6 +746,7 @@ pub fn spawn(
         const inner_pid: linux.pid_t = @intCast(inner_fork_rc);
 
         if (inner_pid == 0) {
+            _ = linux.close(keeper_fds[0]);
             // **The layers are applied here, in B, and not in A.** B is inside
             // the pid namespace A only made, and the kernel gives a procfs the
             // view of the pid namespace of whichever process mounts it, and
@@ -824,9 +863,9 @@ pub fn spawn(
         }
 
         // **The path reader, forked here and nowhere else.** It has to be a
-        // child of A rather than of B, and it has to come after B, because
-        // `unshare(CLONE_NEWPID)` puts every child A makes from now on into
-        // the namespace whose process 1 is B. That placement is what bounds
+        // child of A rather than of B, and it has to come after B. Every child
+        // A makes after `unshare(CLONE_NEWPID)` enters the same namespace.
+        // That placement is what bounds
         // the reader: `process_vm_readv` names a pid, and a pid means nothing
         // outside the namespace of the process that wrote it down. See
         // `notify.zig`'s own top comment for the measurement.
@@ -878,9 +917,7 @@ pub fn spawn(
             // observed call for as long as this descriptor lived. Closing it
             // makes the kernel answer that process `ENOSYS` instead, which is
             // a cost this project takes on purpose over a session that never
-            // ends. B is process 1 of its own pid namespace, so in practice
-            // the kernel has already killed anything B left behind by the
-            // time this runs.
+            // ends. The keeper clears anything B left behind during teardown.
             _ = linux.close(listener);
             reportTraps(middle_write_fd, &counts);
             // **A fault must never leave the session waiting.** B may be held
@@ -896,7 +933,7 @@ pub fn spawn(
         // waits for B and relays B's outcome as its own, so the real parent's
         // single waitpid on A, further down in this function, still sees the
         // caller's program's real Term.
-        waitAndRelay(inner_pid, &areas, middle_write_fd, if (reader_pid >= 0) .{
+        waitAndRelay(inner_pid, keeper_pid, keeper_fds[0], &areas, middle_write_fd, if (reader_pid >= 0) .{
             .pid = reader_pid,
             .record = path_record.?,
         } else null);
@@ -1071,9 +1108,8 @@ pub fn spawn(
         .unobserved => audit.record(.unobserved),
     };
 
-    // The paths the reader wrote, which never went through the middle pipe at
-    // all: the reader is killed by the kernel when the sandboxed program ends,
-    // so it reports as it goes into memory this process shares with it. See
+    // The paths the reader wrote never went through the middle pipe. The
+    // reader reports into memory this process shares with it. See
     // `notify.PathRecord`. **Every number read out of it is untrusted input**,
     // which `SyscallAudit.recordPaths` and `notify.PathRecord.name` are what
     // bound.
@@ -2138,9 +2174,9 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
     std.process.exit(1);
 }
 
-/// Wait for `pid`, the grandchild running the caller's program as process 1 of
-/// the new pid namespace, and end this process the same way that grandchild
-/// ended: by the same signal, or with the same exit code. Never returns.
+/// Wait for `pid`, the grandchild running the caller's program as process 2 of
+/// the new pid namespace. End this process with the same signal or exit code.
+/// Never returns.
 ///
 /// This process, the intermediate between the real parent and the sandboxed
 /// program, is an ordinary process in its own right pid namespace, not process 1
@@ -2151,31 +2187,17 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
 /// waitpid, further up the call stack, reads this process's own death as the
 /// grandchild's.
 ///
-/// When the grandchild, process 1 of the new namespace, exits for any reason,
-/// the kernel kills every other process left in that namespace. Chock wants
-/// exactly that: a tool call that leaves stray children behind cannot outlive
-/// the program the caller asked to run.
+/// The keeper is process 1 of the new namespace. It stays alive until the
+/// program and reader are reaped. Closing its control socket makes it exit.
+/// The kernel then kills every process that the program left behind.
 fn waitAndRelay(
     pid: linux.pid_t,
+    keeper_pid: linux.pid_t,
+    keeper_fd: i32,
     areas: *const ScratchAreas,
     middle_write_fd: i32,
     reader: ?ReaderWatch,
 ) noreturn {
-    // **The reader is reaped first, and that order is a deadlock rule.**
-    // Measured on 2026-09-11: with the two waits the other way round, this
-    // process waited for the sandboxed program, the sandboxed program waited
-    // inside `zap_pid_ns_processes`, and the reader sat between them as a
-    // zombie. The kernel does not let process 1 of a pid namespace finish
-    // leaving until every pid in that namespace has been freed, and a pid is
-    // freed when the task is reaped and not when it is killed. The reader is a
-    // child of this process, so nobody else can reap it.
-    //
-    // Waiting for the reader first costs nothing. The reader lives exactly as
-    // long as the sandboxed program does, because the kernel kills it when
-    // that program leaves the namespace they share. A reader that died early
-    // is reaped early, and the wait below then reads the program's own end.
-    if (reader) |watch| reapReader(watch, middle_write_fd);
-
     var status: u32 = undefined;
     var wait_rc = linux.waitpid(pid, &status, 0);
     // A signal caught by this process while it waits interrupts the call with
@@ -2186,6 +2208,25 @@ fn waitAndRelay(
     }
     if (linux.errno(wait_rc) != .SUCCESS) {
         dieRelayErrno("waitpid on the sandboxed program", linux.errno(wait_rc));
+    }
+
+    // B is not process 1, so its exit does not wait for R to be reaped. R
+    // watches B's pidfd and reports after this wait observes the same exit.
+    if (reader) |watch| reapReader(watch, middle_write_fd);
+
+    // Closing this socket tells process 1 to leave. Its exit kills any process
+    // that B left behind. Reap it last because its pid namespace cannot close
+    // until every remaining member is gone.
+    _ = linux.close(keeper_fd);
+    var keeper_status: u32 = undefined;
+    var keeper_wait_rc = linux.waitpid(keeper_pid, &keeper_status, 0);
+    while (linux.errno(keeper_wait_rc) == .INTR) {
+        keeper_wait_rc = linux.waitpid(keeper_pid, &keeper_status, 0);
+    }
+    if (linux.errno(keeper_wait_rc) != .SUCCESS or !linux.W.IFEXITED(keeper_status) or
+        linux.W.EXITSTATUS(keeper_status) != 0)
+    {
+        dieRelay(error.Unexpected);
     }
 
     // **Read the scratch areas here, and nowhere else.** They live in this
@@ -2208,6 +2249,49 @@ fn waitAndRelay(
     }
 
     std.process.exit(linux.W.EXITSTATUS(status));
+}
+
+/// Process 1 of the sandbox pid namespace. It reaps orphans until A closes
+/// the control socket. It holds no other descriptor and has no capability.
+fn runKeeper(
+    control_fd: i32,
+    middle_pidfd: i32,
+    write_fd: i32,
+    stderr_fd: i32,
+    insns: []const bpf.Insn,
+) noreturn {
+    armPdeathsig(write_fd, stderr_fd, middle_pidfd);
+    keepOnlyDescriptors(control_fd, control_fd);
+
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.dropAll(&cap_diag) catch linux.exit(1);
+    seccomp.install(bpf.Prog.init(insns)) catch linux.exit(1);
+
+    const ready = [1]u8{1};
+    if (linux.errno(linux.write(control_fd, &ready, ready.len)) != .SUCCESS) linux.exit(1);
+
+    var watched = [1]linux.pollfd{.{ .fd = control_fd, .events = linux.POLL.IN, .revents = 0 }};
+    while (true) {
+        var status: u32 = undefined;
+        while (true) {
+            const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
+            switch (linux.errno(wait_rc)) {
+                .SUCCESS => if (wait_rc == 0) break,
+                .INTR => continue,
+                .CHILD => break,
+                else => linux.exit(1),
+            }
+        }
+
+        watched[0].revents = 0;
+        var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+        const poll_rc = linux.ppoll(&watched, watched.len, &pause, null);
+        switch (linux.errno(poll_rc)) {
+            .SUCCESS => if (watched[0].revents != 0) linux.exit(0),
+            .INTR => {},
+            else => linux.exit(1),
+        }
+    }
 }
 
 // The order of the layers, and which of the two child processes runs each one.
@@ -2242,12 +2326,10 @@ fn waitAndRelay(
 /// Steps 0 and 1, in A: close every inherited descriptor, then take the
 /// namespaces.
 ///
-/// **These two stay in A, and everything below them runs in B.** The
-/// descriptors are closed here because A opens a pidfd on itself right after
-/// this, hands it to B for `armPdeathsig`, and a close that ran in B would
-/// close that pidfd along with the rest. The namespaces are taken here because
-/// `unshare(CLONE_NEWPID)` never moves its own caller into the namespace it
-/// makes: only a child forked afterwards lands there, and that child is B.
+/// **These two stay in A.** The descriptors are closed here because A opens a
+/// pidfd on itself afterward and gives it to the keeper and B. The namespaces
+/// are taken here because `unshare(CLONE_NEWPID)` never moves its own caller.
+/// The keeper is the first child made afterward. B runs steps 2 to 6.
 fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_fd: i32) void {
     closeInheritedFds(write_fd, middle_write_fd, config.stdout_fd, config.stderr_fd, config.stdin_fd, broker_fd);
 
@@ -2263,9 +2345,9 @@ fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_f
 
 /// Steps 2 to 6 of the order above, in B, the process that runs the caller's
 /// program. **The mount tree is built here and not in A**, because a procfs
-/// mount takes the pid namespace of whichever process makes it: see the
-/// comment on the second fork in `spawn`. A puts its own two layers on
-/// afterwards, in `restrictMiddle`.
+/// mount takes the pid namespace of whichever process makes it. See the
+/// comment on B's fork in `spawn`. A puts its own two layers on afterward in
+/// `restrictMiddle`.
 fn applyLayers(
     allocator: std.mem.Allocator,
     config: Config,
@@ -2367,24 +2449,40 @@ fn unmapPathRecord(record: *notify.PathRecord) void {
 /// **The report is the reader's own `ended`, and never its exit status.** The
 /// reader watches the observed program's own process descriptor as well as the
 /// notification descriptor, so the program's end wakes it, its loop returns,
-/// and it writes `ended` into the shared page before it exits. The kernel is
-/// racing it: the observed program is process 1 of a pid namespace, so its
-/// exit also kills the reader. Measured on 2026-09-11, with the supervisor and
-/// the program pinned to one busy processor, the kernel won 27 times in 30 on
-/// a healthy run.
-///
-/// **A reader that lost that race still wrote a complete record.** The kill
-/// comes from inside the program's own `exit`, so the program makes no further
-/// call. Measured the same day: 19 of 19 such runs held every path the program
-/// named. So the exit status alone must not decide, and `ended` is read first.
-///
-/// **What is left over cannot be explained, and `PathRecord.reader_unreported`
-/// says only that.** See that field for the three discriminators that were
-/// measured and rejected.
+/// and it writes `ended` into the shared page before it exits. The keeper is
+/// process 1, so the observed program's exit does not kill the reader.
+/// A missing report therefore means the reader ended early.
 fn reapReader(watch: ReaderWatch, middle_write_fd: i32) void {
     var status: u32 = undefined;
-    var rc = linux.waitpid(watch.pid, &status, 0);
-    while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
+    // B can stop R before B exits. Resume R after B is reaped so it can read
+    // the pidfd and report. A fixed bound prevents a stopped or hostile reader
+    // from holding teardown forever. The pid cannot be reused before this wait.
+    const continue_errno = linux.errno(linux.kill(watch.pid, .CONT));
+    switch (continue_errno) {
+        .SUCCESS, .SRCH => {},
+        else => dieRelayErrno("resume the path reader", continue_errno),
+    }
+    var rc: usize = 0;
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        rc = linux.waitpid(watch.pid, &status, linux.W.NOHANG);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc != 0) break,
+            .INTR => continue,
+            else => break,
+        }
+        var pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    if (linux.errno(rc) == .SUCCESS and rc == 0) {
+        const kill_errno = linux.errno(linux.kill(watch.pid, .KILL));
+        switch (kill_errno) {
+            .SUCCESS, .SRCH => {},
+            else => dieRelayErrno("end the path reader", kill_errno),
+        }
+        rc = linux.waitpid(watch.pid, &status, 0);
+        while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
+    }
 
     const ending: ReaderEnd.Ending = if (linux.errno(rc) != .SUCCESS)
         .unknown
@@ -2444,14 +2542,7 @@ pub fn readerReported(end: ReaderEnd) bool {
         // it could not carry on from, so the record may be short even though
         // the loop returned.
         .exited => |status| status == 0,
-        // **A signal after the report is not a fault, and this arm is the
-        // fix.** The observed program is process 1 of a pid namespace, so its
-        // exit kills the reader, and on a busy machine that kill lands after
-        // the report and before the reader can leave. Measured on 2026-09-11,
-        // with the supervisor and the program pinned to one busy processor: 27
-        // healthy runs in 30 ended this way, and 19 of 19 of those held a
-        // complete record. Refusing the report here puts a warning in an audit
-        // record for an ordinary run.
+        // A signal after `ended` cannot make the completed record short.
         .signalled => true,
         // Nothing was read back, so there is nothing to believe.
         .unknown => false,
@@ -2948,9 +3039,8 @@ fn closeInheritedFds(
     }
 }
 
-/// Arm `PR_SET_PDEATHSIG` in B, the grandchild that is about to run the
-/// caller's program, and close the one race that makes it unreliable on its
-/// own.
+/// Arm `PR_SET_PDEATHSIG` in a child of A and close the one race that makes it
+/// unreliable on its own. Both the keeper and B use this function.
 ///
 /// The kernel delivers a process's death signal exactly once, at the moment
 /// `exit_notify` runs for its parent, A. If A already died before this
@@ -2960,7 +3050,7 @@ fn closeInheritedFds(
 /// invisible, parent.
 ///
 /// `getppid` cannot reveal that A is already gone. This process is about to
-/// become process 1 of a pid namespace A is not a member of, and a pid
+/// enter a pid namespace A is not a member of, and a pid
 /// namespace only shows processes that are members of it or one of its
 /// descendants. A predates this namespace and belongs to neither, so A has no
 /// pid number in here at all, whether A is alive or dead. `getppid` reads 0
@@ -4493,14 +4583,9 @@ fn nullTerminate(buffer: []u8, text: []const u8) ?[:0]const u8 {
 }
 
 test "a reader killed after it reported is still a reader that reported" {
-    // **The race this rule exists for, as a unit, and the regression it
-    // pins.** The observed program is process 1 of a pid namespace, so its
-    // exit kills the reader. That kill can land after the reader has written
-    // `ended` and before it reaches its own `exit`, and the rule this replaced
-    // read the wait status alone, so it called that healthy run a reader that
-    // was lost. Measured on 2026-09-11, with the supervisor and the program
-    // pinned to one busy processor: 27 healthy runs in 30 ended that way, and
-    // 19 of 19 of those held a complete record.
+    // A signal can land after the reader wrote `ended` and before its exit.
+    // The record is complete at that point. The wait status cannot undo the
+    // positive report in shared memory.
     //
     // Mutation check: change the `.signalled` arm of `readerReported` to
     // `false` and this first expectation fails. **Measured first with the
@@ -4513,8 +4598,7 @@ test "a reader killed after it reported is still a reader that reported" {
         .ended = 1,
         .ending = .signalled,
     }));
-    // The uncontended shape of the same healthy run: the reader won the race
-    // and ended itself.
+    // The ordinary healthy shape is a clean reader exit.
     try std.testing.expect(readerReported(.{
         .ready = 1,
         .ended = 1,

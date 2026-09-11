@@ -407,8 +407,11 @@ pub const Limits = struct {
     /// different thing: see `default_mapped_memory_bytes`, which holds the
     /// measurement that made these two separate fields.
     mapped_memory_bytes: ?u64 = default_mapped_memory_bytes,
-    /// The process and thread ceiling. Carried by `pids.max`, and by
-    /// `RLIMIT_NPROC` on a kernel where that is per user namespace.
+    /// The process and thread ceiling for the whole call. This includes
+    /// Chock's supervisor, pid namespace keeper, and optional path reader.
+    /// It is carried by `pids.max`, and by `RLIMIT_NPROC` on a kernel where
+    /// that is per user namespace. A normal call needs at least three slots.
+    /// A call with a path reader needs at least four.
     processes: ?u64 = default_processes,
     /// The open descriptor ceiling, per process. `RLIMIT_NOFILE`.
     open_files: ?u64 = default_open_files,

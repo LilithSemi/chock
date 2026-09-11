@@ -725,6 +725,28 @@ comptime {
 ///
 /// The caller owns the memory.
 pub fn buildReader(allocator: std.mem.Allocator) ![]bpf.Insn {
+    return buildAllowlist(allocator, reader_calls);
+}
+
+/// Every call the pid namespace keeper may make, and the only ones it may
+/// make. The keeper reaps orphaned processes, waits for its control socket,
+/// reports that its filter is active, and exits.
+pub const keeper_calls: []const linux.SYS = &.{
+    .wait4,
+    .ppoll,
+    .write,
+    .exit_group,
+    .exit,
+    .rt_sigreturn,
+    .restart_syscall,
+};
+
+/// The allowlist for the pid namespace keeper. The caller owns the memory.
+pub fn buildKeeper(allocator: std.mem.Allocator) ![]bpf.Insn {
+    return buildAllowlist(allocator, keeper_calls);
+}
+
+fn buildAllowlist(allocator: std.mem.Allocator, calls: []const linux.SYS) ![]bpf.Insn {
     var insns: std.ArrayList(bpf.Insn) = .empty;
     errdefer insns.deinit(allocator);
 
@@ -736,7 +758,7 @@ pub fn buildReader(allocator: std.mem.Allocator) ![]bpf.Insn {
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_KILL_PROCESS));
 
     try insns.append(allocator, bpf.stmt(bpf.LD_W_ABS, bpf.offset_of_nr));
-    for (reader_calls) |call| {
+    for (calls) |call| {
         const number: u32 = @intCast(@intFromEnum(call));
         try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
         try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ALLOW));
@@ -1650,6 +1672,76 @@ test "the reader's filter permits its own four calls and kills the rest" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
 
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(std.posix.SIG.SYS, linux.W.TERMSIG(status));
+}
+
+test "the keeper filter permits reap wait and readiness calls" {
+    // Mutation check: remove wait4, ppoll, or write from keeper_calls. The
+    // child then dies from SIGSYS at the missing call.
+    const allocator = std.testing.allocator;
+    const insns = try buildKeeper(allocator);
+    defer allocator.free(insns);
+
+    var pipe: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        var status: u32 = undefined;
+        const reap_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
+        if (linux.errno(reap_rc) != .CHILD) std.process.exit(11);
+
+        var none: [0]linux.pollfd = .{};
+        var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
+            std.process.exit(12);
+        }
+
+        const byte = [1]u8{1};
+        if (linux.errno(linux.write(pipe[1], &byte, byte.len)) != .SUCCESS) {
+            std.process.exit(13);
+        }
+        std.process.exit(0);
+    }
+
+    _ = linux.close(pipe[1]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), linux.read(pipe[0], &byte, byte.len));
+    _ = linux.close(pipe[0]);
+}
+
+test "the keeper filter kills a call outside its allowlist" {
+    // Mutation check: end buildKeeper with RET_ALLOW. The child exits 12
+    // instead of dying from SIGSYS.
+    const allocator = std.testing.allocator;
+    const insns = try buildKeeper(allocator);
+    defer allocator.free(insns);
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
+        _ = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY }, 0);
+        std.process.exit(12);
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
     try std.testing.expect(linux.W.IFSIGNALED(status));
     try std.testing.expectEqual(std.posix.SIG.SYS, linux.W.TERMSIG(status));
 }

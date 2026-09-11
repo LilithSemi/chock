@@ -11,9 +11,9 @@
 //!
 //! ## The handover, and why it cannot stop forever
 //!
-//! `linux/driver.zig` forks twice. A is the supervisor, and it already exists
-//! and already waits. B is the process that runs the caller's program, and B is
-//! the process the filter goes on. A is not subject to B's filter.
+//! A is the supervisor. It forks a pid namespace keeper before B. B runs the
+//! caller's program and gets the notification filter. A is not subject to B's
+//! filter.
 //!
 //! **`execve` is in the trap set, so B's own `execve` is held.** If A does not
 //! hold the notification descriptor by that moment, B waits for an answer that
@@ -165,12 +165,8 @@ pub const kept_path_bytes = 64;
 /// What the reader saw, in memory both the reader and the caller of `spawn`
 /// can reach.
 ///
-/// **Shared memory, and not the middle pipe.** The reader is killed by the
-/// kernel the moment the observed process ends, because the observed process
-/// is process 1 of the pid namespace they share. A reader that reported at the
-/// end of its loop would be killed before it ever reported. A page written as
-/// the reader goes is read by the caller afterwards, whether the reader was
-/// killed or not.
+/// **Shared memory, and not the middle pipe.** The reader writes while it
+/// serves notifications. The caller reads the page after it reaps the reader.
 ///
 /// **The observed process never holds this mapping when it can write to it.**
 /// `spawn` makes the mapping before it forks, so B inherits it, and B gives it
@@ -191,47 +187,16 @@ pub const PathRecord = extern struct {
     ///
     /// **Leaving its own loop is the ordinary end**, because the reader
     /// watches the observed program's process descriptor as well as the
-    /// notification descriptor, so that program's end wakes it. Measured on
-    /// 2026-09-11: every ordinary run ends that way. The kernel would kill the
-    /// reader in any case, as it tears down the pid namespace they share, and
-    /// a reader killed before its loop returned leaves this at zero.
+    /// notification descriptor, so that program's end wakes it. The keeper is
+    /// process 1 of their namespace. The program's exit does not kill R.
     ended: u32 = 0,
     /// Set by the supervisor after it has reaped the reader. One means the
     /// reader never wrote `ended`, so **it did not report that it saw the
     /// observed program end**.
     ///
-    /// **It says the report is missing, and never why.** Two different things
-    /// leave this at one, and measured on 2026-09-11 they are identical at
-    /// the reap, down to the raw wait status:
-    ///
-    ///   * The ordinary teardown won a race. The observed program is process 1
-    ///     of a pid namespace, so the kernel kills the reader the moment that
-    ///     program exits. The reader is woken by the same exit and usually
-    ///     reaches `ended` first, but a loaded machine reverses that: measured
-    ///     with the supervisor and the program pinned to one busy processor,
-    ///     27 of 30 healthy runs ended this way. **Nothing is lost in this
-    ///     case**: the kill happens inside the program's own `exit`, so the
-    ///     program makes no further call. Measured the same day, 19 of 19 such
-    ///     runs held a complete record.
-    ///   * The observed program killed its own reader. From that moment the
-    ///     kernel answers its held calls `ENOSYS`, and the record is short by
-    ///     whatever it did first.
-    ///
-    /// **The supervisor cannot tell those apart, and this is the measurement
-    /// that says so.** Three candidate discriminators were tried and all
-    /// three failed: the reader's raw wait status is `SIGKILL` in both; the
-    /// program's own process descriptor is not readable in either, because the
-    /// kernel holds a departing process 1 inside `zap_pid_ns_processes` until
-    /// the reader's pid is freed, which is the supervisor's own reap; and
-    /// `PF_EXITING` read out of `/proc` at the one instant the supervisor can
-    /// freeze, before it reaps, was already set in 2 of 3 deliberate kills,
-    /// because a program that kills its reader is free to exit immediately
-    /// afterwards. Every fact the program itself emits is a fact the program
-    /// can forge.
-    ///
-    /// So this field is a **warning and not a finding**. `ended` is the
-    /// positive fact, and a reader of the log compares the reports it got
-    /// against the calls that were observed.
+    /// A healthy reader reports before A closes the keeper. A program can
+    /// still kill its reader. That closes the last listener and makes trapped
+    /// calls answer `ENOSYS`. This field records that missing report.
     reader_unreported: u32 = 0,
     /// How many slots of `names` hold a path.
     kept: u32 = 0,
@@ -377,14 +342,9 @@ fn take(handshake_fd: i32, child_pidfd: i32) i32 {
 /// for that process too, and a tool call that started a daemon would hold the
 /// session.
 ///
-/// **Belt as well as braces, and said plainly.** `linux/driver.zig` runs the
-/// observed process as process 1 of a pid namespace of its own, and the kernel
-/// kills every other member of such a namespace the moment process 1 exits, so
-/// the leftover process is already gone today and this descriptor never
-/// decides anything. Measured on 2026-09-11: taking it out of the poll set
-/// changes no test. It is here so that this function is correct by itself,
-/// rather than through a fact that belongs to another file and could change
-/// there.
+/// The pidfd is load bearing. The keeper stays alive after the observed
+/// process exits. A process left behind can still hold the listener. The pidfd
+/// ends this loop at B's exit rather than at the last filtered process's exit.
 ///
 /// The caller owns both descriptors and closes them.
 pub fn serve(listener: i32, child_pidfd: i32, counts: *Counts) Outcome {
@@ -442,7 +402,12 @@ fn loop(listener: i32, child_pidfd: i32, counts: *Counts, recorder: ?Recorder) O
         // moment, so nothing is lost between the two reads.
         if (watched[0].revents & linux.POLL.IN != 0) {
             switch (answerOne(listener, counts, recorder)) {
-                .served => continue,
+                .served => {
+                    // Do not let a busy orphan starve B's exit. One pending
+                    // call is complete. The pidfd now takes priority.
+                    if (watched[1].revents != 0) return .child_ended;
+                    continue;
+                },
                 .fault => return .fault,
             }
         }

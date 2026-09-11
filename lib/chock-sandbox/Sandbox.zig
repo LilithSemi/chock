@@ -888,10 +888,11 @@ pub const LimitsReport = struct {
 /// `spawn` a caller attached this to.
 ///
 /// **The supervisor is the process that holds the provider credential.**
-/// `spawn` forks twice. The first child, the supervisor, waits for the second
-/// and relays its outcome, and it holds this program's own memory while it
-/// waits. It puts a Landlock ruleset and a seccomp filter on itself for that
-/// reason alone: see the Linux driver's own `restrictMiddle`.
+/// `spawn` first forks the supervisor. The supervisor forks a pid namespace
+/// keeper and the caller's program. It can also fork a path reader. The
+/// supervisor waits and relays the program's outcome. It holds this program's
+/// own memory while it waits, so it puts a Landlock ruleset and a seccomp
+/// filter on itself. See the Linux driver's own `restrictMiddle`.
 ///
 /// **That install is best effort, and it stays best effort.** Killing the
 /// supervisor because it could not confine itself would end the caller's

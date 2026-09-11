@@ -4437,9 +4437,8 @@ test "the procfs a tool call sees is the sandbox's own, and holds no host proces
     try std.testing.expectEqual(@as(?u8, null), listed.fault);
     try std.testing.expect(!listed.is_error);
 
-    // The sandboxed program is process 1 of its own namespace, so this entry
-    // is the program itself. Its presence is what says the mount is a real
-    // procfs and not an empty directory.
+    // The keeper is process 1 of the sandbox pid namespace. Its presence says
+    // the mount is a real procfs and not an empty directory.
     try std.testing.expect(std.mem.indexOf(u8, listed.output, "\n1\n") != null);
 
     // And this test process, which is a real process on the host, is not in

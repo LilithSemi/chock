@@ -74,10 +74,9 @@ fn endOnAlarm(_: std.posix.SIG) callconv(.c) void {
 /// failure it is.
 const alarm_exit_status = 9;
 
-/// Where the path reader is, as the sandboxed program sees it. The supervisor
-/// forks the program first, so the program is process 1 of the new pid
-/// namespace, and forks the reader second, so the reader is process 2.
-const reader_pid_in_namespace: linux.pid_t = 2;
+/// Where the path reader is, as the sandboxed program sees it. The keeper is
+/// process 1, the program is process 2, and the reader is process 3.
+const reader_pid_in_namespace: linux.pid_t = 3;
 
 /// End this program with `nothing_measured_exit_status` when `err` is the
 /// sandbox refusing to be built at all.
@@ -1505,6 +1504,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-signal-host") or
         std.mem.eql(u8, args[1], "spawn-shm-attach") or
         std.mem.eql(u8, args[1], "spawn-report-pid") or
+        std.mem.eql(u8, args[1], "spawn-default-signal") or
+        std.mem.eql(u8, args[1], "spawn-keeper-reaps") or
         std.mem.eql(u8, args[1], "spawn-stdin-devnull") or
         std.mem.eql(u8, args[1], "spawn-stdin-pipe") or
         std.mem.eql(u8, args[1], "spawn-proc-mask") or
@@ -1533,6 +1534,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         std.mem.eql(u8, args[1], "spawn-path-audit-off") or
         std.mem.eql(u8, args[1], "spawn-path-audit-dynamic") or
         std.mem.eql(u8, args[1], "spawn-path-audit-killed") or
+        std.mem.eql(u8, args[1], "spawn-path-audit-stopped") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -2483,9 +2485,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // would count too, as a zombie, but only until something reaped it,
         // and "only until" is not a property a test should rest on.
         //
-        // This process is process 1 of its own pid namespace, so when it
-        // returns the kernel kills every child it left behind. Nothing here
-        // has to clean up, and nothing can outlive the call.
+        // The keeper is process 1. Its teardown kills every child this process
+        // leaves behind. Nothing can outlive the call.
         var fds: [2]i32 = undefined;
         if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return 3;
 
@@ -2663,6 +2664,56 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
         return 0;
     }
+    if (std.mem.eql(u8, args[1], "spawned-default-signal")) {
+        _ = linux.kill(linux.getpid(), .TERM);
+        return 8;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-keeper-reaps")) {
+        var pipe: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return 4;
+
+        const parent_rc = linux.fork();
+        if (linux.errno(parent_rc) != .SUCCESS) return 5;
+        const parent_pid: linux.pid_t = @intCast(parent_rc);
+        if (parent_pid == 0) {
+            _ = linux.close(pipe[0]);
+            const orphan_rc = linux.fork();
+            if (linux.errno(orphan_rc) != .SUCCESS) linux.exit(6);
+            const orphan_pid: linux.pid_t = @intCast(orphan_rc);
+            if (orphan_pid == 0) linux.exit(0);
+            const pid_bytes = std.mem.asBytes(&orphan_pid);
+            if (linux.errno(linux.write(pipe[1], pid_bytes.ptr, pid_bytes.len)) != .SUCCESS) {
+                linux.exit(7);
+            }
+            linux.exit(0);
+        }
+
+        _ = linux.close(pipe[1]);
+        var orphan_pid: linux.pid_t = undefined;
+        const pid_bytes = std.mem.asBytes(&orphan_pid);
+        const read_rc = linux.read(pipe[0], pid_bytes.ptr, pid_bytes.len);
+        _ = linux.close(pipe[0]);
+        if (linux.errno(read_rc) != .SUCCESS or read_rc != @sizeOf(linux.pid_t)) return 8;
+
+        var status: u32 = undefined;
+        var wait_rc = linux.waitpid(parent_pid, &status, 0);
+        while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(parent_pid, &status, 0);
+        if (linux.errno(wait_rc) != .SUCCESS or !linux.W.IFEXITED(status) or
+            linux.W.EXITSTATUS(status) != 0)
+        {
+            return 9;
+        }
+
+        var tries: usize = 0;
+        while (tries < 2000) : (tries += 1) {
+            const exists_rc = linux.kill(orphan_pid, @enumFromInt(0));
+            if (linux.errno(exists_rc) == .SRCH) return 0;
+            if (linux.errno(exists_rc) != .SUCCESS) return 10;
+            var pause: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        return 11;
+    }
     if (std.mem.eql(u8, args[1], "spawned-count-opens")) {
         // Make a fixed number of one observed call, and none of two others.
         // The supervisor's histogram is read by `spawn-syscall-audit`, which
@@ -2706,7 +2757,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     }
     if (std.mem.eql(u8, args[1], "spawned-kill-the-reader")) {
         // **Killing your own auditor breaks your own opens.** This process is
-        // process 1 of its own pid namespace and the reader is process 2 of
+        // process 2 of its own pid namespace and the reader is process 3 of
         // the same one, so this process can reach it with an ordinary signal.
         // The supervisor gave up its copy of the notification descriptor when
         // the reader took it, so the reader's death releases the listener and
@@ -2727,12 +2778,8 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // this process instead and the caller reads a program killed by a
         // signal rather than waiting for the whole suite.
         //
-        // **A handler, and not the default action.** This process is process 1
-        // of its own pid namespace, and the kernel discards every signal whose
-        // action is the default for such a process. Measured on 2026-09-11: an
-        // alarm with the default action left this run waiting with no end at
-        // all. A handler is delivered, so the alarm ends this process the way
-        // it was meant to.
+        // **A handler, so timeout has its own status.** The caller can tell a
+        // stuck notification from another signal death.
         const on_alarm = std.posix.Sigaction{
             .handler = .{ .handler = endOnAlarm },
             .mask = std.posix.sigemptyset(),
@@ -2770,6 +2817,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         }
         return 8;
     }
+    if (std.mem.eql(u8, args[1], "spawned-stop-the-reader")) {
+        // This trapped call cannot finish before R exists and serves it.
+        const before = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(before) != .SUCCESS) return 5;
+        _ = linux.close(@intCast(before));
+        if (linux.errno(linux.kill(reader_pid_in_namespace, .STOP)) != .SUCCESS) return 6;
+        return 0;
+    }
     if (std.mem.eql(u8, args[1], "spawned-leave-daemon")) {
         // Fork a process that outlives this one, then end. The supervisor must
         // not wait for that process: it still carries the filter, so a
@@ -2778,14 +2833,12 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const forked = linux.fork();
         if (linux.errno(forked) != .SUCCESS) return 5;
         if (forked == 0) {
-            // Long enough that a supervisor which waited for this would be
-            // plainly stuck, and still finite, so a fault here ends rather
-            // than holding the whole test run.
-            var left: usize = 60;
-            while (left > 0) : (left -= 1) {
-                var second: linux.timespec = .{ .sec = 1, .nsec = 0 };
-                _ = linux.nanosleep(&second, null);
-            }
+            // B must exit before this call. A reader that ignores B's pidfd
+            // serves and records this open. A working reader has already left.
+            var pause: linux.timespec = .{ .sec = 0, .nsec = 250_000_000 };
+            _ = linux.nanosleep(&pause, null);
+            const opened = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(opened) == .SUCCESS) _ = linux.close(@intCast(opened));
             return 0;
         }
         return 0;
@@ -3203,9 +3256,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // process group, so this process must be in a group the caller's own
         // press cannot name. It catches the signal rather than dying from it,
         // because "the press arrived here" and "this process died" have to be
-        // two different answers: process 1 of a pid namespace ignores every
-        // signal whose action is the default one, so a death is not a thing
-        // this process can be relied on to have.
+        // two different answers.
         catchSignal(.USR1);
         writeTestFile(arena, "/work/started", "started\n") catch |err| {
             std.debug.print("spawned-group-press: could not write the marker: {s}\n", .{@errorName(err)});
@@ -4466,6 +4517,34 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         return reportChildTerm(term);
     }
+    if (std.mem.eql(u8, args[1], "spawn-default-signal")) {
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-default-signal" }, null, null);
+
+        return switch (term) {
+            .signal => |signal| if (signal == .TERM) 0 else 5,
+            else => 6,
+        };
+    }
+    if (std.mem.eql(u8, args[1], "spawn-keeper-reaps")) {
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+        }, &.{ "/probe", "spawned-keeper-reaps" }, null, null);
+        return reportChildTerm(term);
+    }
     if (std.mem.eql(u8, args[1], "spawn-supervisor-audit")) {
         // **The whole chain, through a real spawn.** The supervisor process is
         // the one that holds the provider credential while it waits for the
@@ -4515,9 +4594,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // that still carries the filter. The supervisor watches the program
         // and not the filter, so this call has to come back at once.
         //
-        // Nothing is asserted about the counts here. The one fact under test
-        // is that `spawn` returns at all.
+        // The delayed child open must not be recorded. This checks that the
+        // reader stopped on B's pidfd and did not wait for the listener.
         const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
         const term = try sandbox.spawn(arena, .{
             .root = root_arg,
             .mounts = base.mounts,
@@ -4526,12 +4606,17 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             .env = &.{},
             .network = .none,
             .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .syscall_audit = &audit,
+            .path_audit = true,
         }, &.{ "/probe", "spawned-leave-daemon" }, null, null);
 
         switch (term) {
             .exited => |code| if (code != 0) return 4,
             else => return 4,
         }
+        if (audit.paths.readers_absent != 0 or audit.paths.readers_unreported != 0) return 5;
+        const openat_slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
+        if (audit.counts().calls[openat_slot] != 0) return 6;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-path-audit") or
@@ -4583,23 +4668,10 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 0;
         }
 
-        // The reader reached its loop. **That is asserted and the way it
-        // ended is not**, and this is the one place in the suite that says
-        // why. The observed program is process 1 of a pid namespace, so the
-        // kernel kills the reader the instant that program exits, and on a
-        // busy machine that kill beats the reader's own report: measured on
-        // 2026-09-11, with the supervisor and the program pinned to one busy
-        // processor, 27 healthy runs in 30 ended with no report. **Nothing is
-        // lost when that happens**, because the kill comes from inside the
-        // program's own exit, so the program makes no further call. The same
-        // measurement, with this check taken out, found a complete record in
-        // 19 of 19 such runs.
-        //
-        // So the completeness of the record is what is asserted below, and
-        // that is the fact the reader exists to produce. See
-        // `notify.PathRecord.reader_unreported` for why the supervisor cannot
-        // say which of the two endings it got.
+        // The reader reached its loop and reported its end. The keeper holds
+        // process 1, so B's exit cannot kill the reader during its report.
         if (audit.paths.readers_absent != 0) return 9;
+        if (audit.paths.readers_unreported != 0) return 10;
 
         // The program opened two paths the configuration grants on purpose,
         // so a zero here means the classification put them on the wrong side
@@ -4690,12 +4762,9 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         const slot = @intFromEnum(sandbox.seccomp.TrapCall.openat);
         const seen = &audit.paths.seen;
-        // The reader reached its loop. The way it ended is not asserted, for
-        // the reason `spawn-path-audit` above spells out: the pid namespace
-        // teardown races the reader's own report and wins on a busy machine,
-        // and the record is complete either way. The checks below are what
-        // prove the reader did its job.
+        // The reader reached its loop. The checks below prove it did its job.
         if (audit.paths.readers_absent != 0) return 5;
+        if (audit.paths.readers_unreported != 0) return 6;
 
         // **The loader really ran, and its opens are the granted ones.** The
         // program itself opens exactly one path and that path is ungranted, so
@@ -4745,12 +4814,46 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // that was killed and not one that never ran.
         if (audit.paths.readers_absent != 0) return 5;
         // **The warning a session gets.** A reader that was killed wrote no
-        // report, and the session counts that. **It is not proof of a kill**:
-        // the ordinary teardown leaves the same record on a busy machine. What
-        // proves the kill here is the program's own exit status above, which
-        // says the kernel answered its next held call `ENOSYS`. See
-        // `notify.PathRecord.reader_unreported`.
+        // report, and the session counts that. The field does not name the
+        // cause. The program's own exit status above proves this case because
+        // the kernel answered its next held call `ENOSYS`.
         if (audit.paths.readers_unreported != 1) return 6;
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-path-audit-stopped")) {
+        const on_alarm = std.posix.Sigaction{
+            .handler = .{ .handler = endOnAlarm },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        if (linux.errno(linux.sigaction(.ALRM, &on_alarm, null)) != .SUCCESS) return 10;
+        const alarm: linux.itimerspec = .{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{ .sec = 3, .nsec = 0 },
+        };
+        if (linux.errno(linux.setitimer(@intFromEnum(linux.ITIMER.REAL), &alarm, null)) != .SUCCESS)
+            return 11;
+
+        const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+            .syscall_audit = &audit,
+            .path_audit = true,
+        }, &.{ "/probe", "spawned-stop-the-reader" }, null, null);
+
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+        if (audit.paths.readers_absent != 0) return 5;
+        if (audit.paths.readers_unreported != 0) return 6;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-syscall-audit") or
