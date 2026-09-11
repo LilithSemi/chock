@@ -19,6 +19,7 @@ const landlock = @import("landlock.zig");
 const namespace = @import("namespace.zig");
 const capabilities = @import("capabilities.zig");
 const seccomp = @import("seccomp.zig");
+const notify = @import("notify.zig");
 const bpf = @import("bpf.zig");
 const rlimits = @import("rlimits.zig");
 const cgroup = @import("cgroup.zig");
@@ -68,6 +69,7 @@ const SetupStep = enum(u8) {
     landlock_restrict,
     session_keyring,
     seccomp_install,
+    notify_handover,
     fork,
     pdeathsig_pidfd,
     pdeathsig_prctl,
@@ -388,8 +390,24 @@ pub fn spawn(
     // instructions without any allocation or IPC of its own, and one less
     // allocating step runs between the fork and the exec. See the thread
     // safety note above.
-    const insns = seccomp.build(allocator, seccomp_options) catch |err| return err;
+    // **The supervisor never gets the trap instructions, and never can.** A
+    // filter that returns `RET_USER_NOTIF` with no listener behind it makes
+    // the kernel answer the call with `ENOSYS`, so A would be told that
+    // `openat` does not exist on this machine. Only B installs its filter with
+    // a listener, so only B can carry a trap set. See `seccomp.Options.traps`.
+    var middle_options = seccomp_options;
+    middle_options.traps = .initEmpty();
+    const insns = seccomp.build(allocator, middle_options) catch |err| return err;
     defer allocator.free(insns);
+
+    // The second program, for B. Identical to A's when nothing is observed, so
+    // the ordinary call allocates once and not twice.
+    const watching = seccomp_options.traps.count() != 0;
+    const child_insns = if (watching)
+        seccomp.build(allocator, seccomp_options) catch |err| return err
+    else
+        insns;
+    defer if (watching) allocator.free(child_insns);
 
     // The cgroup, made here in the parent for the same reason the seccomp
     // filter is built here: the child that has to move into it is a child
@@ -579,6 +597,35 @@ pub fn spawn(
         // what the descriptors are for.
         const areas = mountScratchAreas(config, write_fd);
 
+        // The channel that carries the notification descriptor from B to A.
+        // See `notify.zig`'s own top comment for the handover and for why it
+        // cannot stop either process forever.
+        //
+        // **Made here, after `enterNamespaces` and not before it.**
+        // `closeInheritedFds` runs inside that call and closes every
+        // descriptor it was not told to keep, so a pair made earlier would
+        // need an exemption of its own, and an exemption is a thing that can
+        // later be got wrong. `CLOEXEC` as well, so neither end can cross
+        // `execve` even if a close were ever missed.
+        var notify_fds: [2]i32 = .{ -1, -1 };
+        if (watching) {
+            const pair_rc = linux.socketpair(
+                linux.AF.UNIX,
+                linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+                0,
+                &notify_fds,
+            );
+            if (linux.errno(pair_rc) != .SUCCESS) {
+                dieErrno(
+                    write_fd,
+                    config.stderr_fd,
+                    .fork,
+                    "socketpair for the notification handover",
+                    linux.errno(pair_rc),
+                );
+            }
+        }
+
         // namespace.enter above called unshare(CLONE_NEWPID), but unshare never
         // moves the calling process into the namespace it just made. Only a
         // child forked after that call lands there, as its process 1.
@@ -622,7 +669,8 @@ pub fn spawn(
             // mount tree is built by the process that lives in the namespace.
             // See `namespace.Mount.Proc`, and `applyLayers` for the order of
             // the layers themselves, which is unchanged.
-            applyLayers(allocator, config, abi, insns, write_fd);
+            if (notify_fds[0] >= 0) _ = linux.close(notify_fds[0]);
+            applyLayers(allocator, config, abi, child_insns, write_fd, notify_fds[1]);
             armPdeathsig(write_fd, config.stderr_fd, middle_pidfd);
             execute(allocator, config, argv, write_fd, broker_fds[1]);
             unreachable;
@@ -685,12 +733,66 @@ pub fn spawn(
                 _ = linux.close(fd);
         }
 
+        // **The notification descriptor is taken here, before
+        // `restrictMiddle` below, and that order is a rule and not a
+        // preference.** `pidfd_getfd` needs ptrace level access to B. B has
+        // already dropped every capability of its own inside `applyLayers`,
+        // and the kernel makes a process undumpable when a credential change
+        // takes a capability away, so from that moment the take is permitted
+        // only for a process holding `CAP_SYS_PTRACE` in B's user namespace. A
+        // still holds that here. `restrictMiddle` is where A gives it up.
+        //
+        // **B is waiting for the answer while this runs**, and
+        // `notify.takeListener` writes one whichever way the take went. See
+        // `notify.zig`'s own top comment for the whole case list.
+        var listener: i32 = -1;
+        var child_pidfd: i32 = -1;
+        if (notify_fds[0] >= 0) {
+            // **B's end goes first, and before the read below.** A copy held
+            // here would keep the socket's writing side open, so a B that
+            // died before it said anything would leave this read waiting
+            // instead of giving it end of file.
+            _ = linux.close(notify_fds[1]);
+            notify_fds[1] = -1;
+            // Opened before the take, and used for both the take and the wait
+            // below. A pidfd that could not be opened makes the take fail, so
+            // B is told "no" and ends, rather than running on into a call
+            // nothing would answer.
+            const child_pidfd_rc = linux.pidfd_open(inner_pid, 0);
+            if (linux.errno(child_pidfd_rc) == .SUCCESS) child_pidfd = @intCast(child_pidfd_rc);
+            listener = notify.takeListener(notify_fds[0], child_pidfd);
+            _ = linux.close(notify_fds[0]);
+            notify_fds[0] = -1;
+        }
+
         // A applied no layer to itself, because B applies them all: see the
         // comment on the fork above. So A takes the two that cost it nothing
         // and keep the promise it used to keep by accident, that a process
         // holding this program's own memory reaches no path and makes no
         // dangerous call while it waits.
         restrictMiddle(abi, insns, middle_write_fd);
+
+        if (listener >= 0) {
+            var counts = notify.empty_counts;
+            const outcome = notify.serve(listener, child_pidfd, &counts);
+            // **Closed before the wait below.** A process B left behind
+            // that still carries the filter would be held in its next
+            // observed call for as long as this descriptor lived. Closing it
+            // makes the kernel answer that process `ENOSYS` instead, which is
+            // a cost this project takes on purpose over a session that never
+            // ends. B is process 1 of its own pid namespace, so in practice
+            // the kernel has already killed anything B left behind by the
+            // time this runs.
+            _ = linux.close(listener);
+            reportTraps(middle_write_fd, &counts);
+            // **A fault must never leave the session waiting.** B may be held
+            // in a call that nothing will answer now, and the wait below would
+            // never return. End B instead.
+            if (outcome == .fault) _ = linux.kill(inner_pid, std.posix.SIG.KILL);
+        } else if (watching) {
+            reportTraps(middle_write_fd, null);
+        }
+        if (child_pidfd >= 0) _ = linux.close(child_pidfd);
 
         // A is not process 1 anywhere, so it keeps ordinary signal semantics. It
         // waits for B and relays B's outcome as its own, so the real parent's
@@ -856,6 +958,17 @@ pub fn spawn(
     // the middle pipe and this process, which does hold the log, counts it.
     // See `iface.SupervisorAudit`.
     if (config.supervisor_audit) |audit| audit.record(middle_report.filter);
+
+    // The same route, for the same reason, carrying what the sandboxed program
+    // asked the kernel for. A is the only process that can see it, and A holds
+    // no log descriptor. See `iface.SyscallAudit` and `linux/notify.zig`.
+    if (config.syscall_audit) |audit| switch (middle_report.traps) {
+        // Nothing was asked for, so there is nothing to count. A zero here
+        // would read as a program that opened nothing.
+        .unasked => {},
+        .observed => audit.record(.{ .observed = middle_report.trap_counts }),
+        .unobserved => audit.record(.unobserved),
+    };
 
     // The program has ended, so the kernel's own counters are final and the
     // cgroup can be read. **Read before `destroy` removes it**, which the
@@ -1065,35 +1178,62 @@ fn mountScratchAreas(config: Config, write_fd: i32) ScratchAreas {
 }
 
 /// One record on the middle pipe: a tag byte that says which fact it carries,
-/// and a value byte that carries it.
+/// a slot byte that says which member of that fact, and an eight byte value.
 ///
 /// **Fixed width, and no length field.** A reader that meets a tag it does not
 /// know steps over the record and reads the one after it, and a reader built
 /// from a different version of this file cannot exist: both ends come from one
 /// `pipe2` call in `spawn`, in one process, and the only writer is that
-/// process's own first child. Two bytes is far below `PIPE_BUF`, so each
-/// record reaches the reader whole even though A writes two of them at two
-/// different moments.
+/// process's own first child. Ten bytes is far below `PIPE_BUF`, so each
+/// record reaches the reader whole even though A writes several of them at
+/// several different moments.
+///
+/// **The slot byte and the wide value are what carry a histogram.** A count of
+/// system calls does not fit in a byte, and there is one count for each member
+/// of `seccomp.TrapCall`. See `tag_trap_count`.
 ///
 /// The tag values are fixed rather than counted from zero, so a read that ever
 /// landed on something else is ignored instead of trusted. There is no forgery
 /// to defend against here, unlike on the setup pipe: both ends are `CLOEXEC`,
 /// A is the only writer, and `closeInheritedFds` already ran, so the sandboxed
 /// program never holds either end.
-const record_bytes = 2;
+const record_bytes = 10;
 
 /// A scratch area had no space left in it when the program ended. The value
-/// byte is 1.
+/// is 1.
 const tag_scratch_full: u8 = 0xD1;
 
-/// Whether A put a seccomp filter on itself. The value byte is 0 for a filter
-/// that went on, and otherwise a `SupervisorAudit.FilterFault`.
+/// Whether A put a seccomp filter on itself. The value is 0 for a filter that
+/// went on, and otherwise a `SupervisorAudit.FilterFault`.
 ///
 /// **Written whichever way it went**, so that "A said nothing" stays a third
 /// answer of its own rather than reading as success. A tool call a person
 /// cancelled kills A before it reaches `restrictMiddle` at all, and that call
 /// must not be counted as one whose supervisor was confined.
 const tag_middle_filter: u8 = 0xD2;
+
+/// Whether A held the notification descriptor for this call. The value is 1
+/// when it did and 0 when it did not.
+///
+/// **Written only when the caller asked for an observation**, so a session
+/// that asked for none is a third answer of its own rather than a call that
+/// failed to be watched. See `iface.SyscallAudit`.
+const tag_traps_observed: u8 = 0xD3;
+
+/// One member of the system call histogram. The slot byte is the tag value of
+/// a `seccomp.TrapCall`, and the value is how many times the sandboxed program
+/// made that call.
+const tag_trap_count: u8 = 0xD4;
+
+/// Whether A was asked to watch this call, and whether it could.
+const TrapState = enum {
+    /// The caller asked for no observation at all.
+    unasked,
+    /// A held the notification descriptor, so the counts are about this call.
+    observed,
+    /// A was asked and could not, so this call ran with nothing watching it.
+    unobserved,
+};
 
 /// What `readMiddleReport` found on the middle pipe.
 const MiddleReport = struct {
@@ -1102,13 +1242,22 @@ const MiddleReport = struct {
     /// What A said about its own seccomp filter. `.unsaid` when A never
     /// reached `restrictMiddle`, or could not write.
     filter: iface.SupervisorAudit.Filter = .unsaid,
+    /// What A said about watching the sandboxed program's system calls.
+    traps: TrapState = .unasked,
+    /// The histogram A counted. All zero unless `traps` is `.observed`.
+    trap_counts: notify.Counts = notify.empty_counts,
 };
 
 /// Write one record. Best effort, for the reason `restrictMiddle` and
 /// `reportScratch` both give: a write that fails costs the caller a fact and
 /// never the program's own outcome.
-fn writeMiddleRecord(middle_write_fd: i32, tag: u8, value: u8) void {
-    const record = [record_bytes]u8{ tag, value };
+fn writeMiddleRecord(middle_write_fd: i32, tag: u8, slot: u8, value: u64) void {
+    var record: [record_bytes]u8 = undefined;
+    record[0] = tag;
+    record[1] = slot;
+    // A byte order is named rather than left native, so a reader of this file
+    // does not have to work out that both ends are always the same machine.
+    std.mem.writeInt(u64, record[2..record_bytes], value, .little);
     _ = linux.write(middle_write_fd, &record, record.len);
 }
 
@@ -1116,14 +1265,30 @@ fn writeMiddleRecord(middle_write_fd: i32, tag: u8, value: u8) void {
 /// middle pipe.
 fn reportScratch(areas: *const ScratchAreas, middle_write_fd: i32) void {
     if (!areas.anyFull()) return;
-    writeMiddleRecord(middle_write_fd, tag_scratch_full, 1);
+    writeMiddleRecord(middle_write_fd, tag_scratch_full, 0, 1);
 }
 
 /// Say whether A could put a seccomp filter on itself, on the middle pipe.
 /// `fault` is null for a filter that went on.
 fn reportMiddleFilter(middle_write_fd: i32, fault: ?iface.SupervisorAudit.FilterFault) void {
     const value: u8 = if (fault) |one| @intFromEnum(one) else 0;
-    writeMiddleRecord(middle_write_fd, tag_middle_filter, value);
+    writeMiddleRecord(middle_write_fd, tag_middle_filter, 0, value);
+}
+
+/// Say what A saw of the sandboxed program's system calls, on the middle pipe.
+///
+/// `counts` is null for a call A was asked to watch and could not. See
+/// `tag_traps_observed` for why that is not the same record as a histogram of
+/// zeros.
+fn reportTraps(middle_write_fd: i32, counts: ?*const notify.Counts) void {
+    writeMiddleRecord(middle_write_fd, tag_traps_observed, 0, if (counts == null) 0 else 1);
+    const seen = counts orelse return;
+    for (seen, 0..) |count, slot| {
+        // A call nobody made says nothing a zero does not already say, and the
+        // pipe has room for a fixed number of records.
+        if (count == 0) continue;
+        writeMiddleRecord(middle_write_fd, tag_trap_count, @intCast(slot), count);
+    }
 }
 
 /// Name the fault a failed `seccomp.install` in A is recorded as.
@@ -1159,10 +1324,12 @@ fn filterFor(value: u8) iface.SupervisorAudit.Filter {
 /// Every field keeps its default on end of file with no data, which is what a
 /// call whose A was killed before it could say anything leaves behind.
 fn readMiddleReport(middle_read_fd: i32) MiddleReport {
-    // Room for eight records, against the two A writes. A reader that stopped
-    // early would leave bytes in a pipe nobody reads again, and the cost of
-    // the margin is six bytes of stack.
-    var buffer: [record_bytes * 8]u8 = undefined;
+    // Room for twice as many records as A can write: two of its own, one that
+    // says whether it watched the program, and one for each member of
+    // `seccomp.TrapCall` that the program used. A reader that stopped early
+    // would leave bytes in a pipe nobody reads again, and the cost of the
+    // margin is a few bytes of stack.
+    var buffer: [record_bytes * 2 * (3 + notify.call_count)]u8 = undefined;
     var filled: usize = 0;
     while (filled < buffer.len) {
         const rc = linux.read(middle_read_fd, buffer[filled..].ptr, buffer.len - filled);
@@ -1178,10 +1345,18 @@ fn readMiddleReport(middle_read_fd: i32) MiddleReport {
     // half record, so meeting one means the pipe was cut, and half a tag names
     // no fact.
     while (at + record_bytes <= filled) : (at += record_bytes) {
-        const value = buffer[at + 1];
+        const slot = buffer[at + 1];
+        const value = std.mem.readInt(u64, buffer[at + 2 ..][0..8], .little);
         switch (buffer[at]) {
             tag_scratch_full => report.scratch_full = value != 0,
-            tag_middle_filter => report.filter = filterFor(value),
+            tag_middle_filter => report.filter = filterFor(@truncate(value)),
+            tag_traps_observed => report.traps = if (value != 0) .observed else .unobserved,
+            // A slot this build has no member for is dropped. Counting it
+            // against a member that exists would put a number under the wrong
+            // name, which is worse than a number that is missing.
+            tag_trap_count => if (slot < notify.call_count) {
+                report.trap_counts[slot] = value;
+            },
             else => {},
         }
     }
@@ -1366,6 +1541,12 @@ fn setupErrorFor(step: SetupStep) SetupError {
         .landlock_restrict => error.LandlockRestrictFailed,
         .session_keyring => error.SessionKeyringFailed,
         .seccomp_install => error.SeccompInstallFailed,
+        // **Its own member, and not `SeccompInstallFailed`.** The filter went
+        // on. What failed is the handover of its notification descriptor to
+        // the supervisor, and the repair is a different one: see
+        // `notify.takeListener` for what the kernel checks before it permits
+        // the take.
+        .notify_handover => error.NotifyHandoverFailed,
         .fork => error.ForkFailed,
         .pdeathsig_pidfd, .pdeathsig_prctl => error.PdeathsigSetupFailed,
         .exec => error.ExecFailed,
@@ -1960,6 +2141,7 @@ fn applyLayers(
     abi: i32,
     insns: []const bpf.Insn,
     write_fd: i32,
+    notify_fd: i32,
 ) void {
     // One slot for both calls: `note` keeps the first fault, and a pivot can
     // only fail after a mount tree that did not, so the first is the one that
@@ -1996,8 +2178,27 @@ fn applyLayers(
     joinFreshSessionKeyring(config.stderr_fd) catch |err|
         die(write_fd, config.stderr_fd, .session_keyring, err);
 
-    seccomp.install(bpf.Prog.init(insns)) catch |err|
+    if (notify_fd < 0) {
+        seccomp.install(bpf.Prog.init(insns)) catch |err|
+            die(write_fd, config.stderr_fd, .seccomp_install, err);
+        return;
+    }
+
+    // **The filter and the handover are one step, and nothing may run between
+    // them.** `execve` is in the trap set, so this process's own `execve` is
+    // held by the kernel until a supervisor answers it. `notify.handOver`
+    // gives the notification descriptor to A and waits for A to say it holds
+    // it. Every call that runs in that window is named in
+    // `seccomp.bootstrap_calls`, which no trap set can hold. See `notify.zig`.
+    const listener = seccomp.installListening(bpf.Prog.init(insns)) catch |err|
         die(write_fd, config.stderr_fd, .seccomp_install, err);
+
+    // **A "no" ends this process rather than letting it run on.** A filter
+    // whose listener nobody holds makes the kernel answer every observed call
+    // with `ENOSYS`, so the caller's program would be told that `openat` does
+    // not exist. A setup failure names the step instead.
+    if (!notify.handOver(notify_fd, listener))
+        die(write_fd, config.stderr_fd, .notify_handover, error.Unexpected);
 }
 
 /// What A holds while it waits for B: a Landlock ruleset with no rule in it,
@@ -2697,7 +2898,7 @@ test "the middle pipe carries the scratch fact and the filter fact, and a reader
     defer _ = linux.close(fds[0]);
 
     reportMiddleFilter(fds[1], .no_new_privs_refused);
-    writeMiddleRecord(fds[1], tag_scratch_full, 1);
+    writeMiddleRecord(fds[1], tag_scratch_full, 0, 1);
     // The reader stops at end of file, and only the writer's own close gives
     // it one.
     _ = linux.close(fds[1]);
@@ -2760,7 +2961,11 @@ test "every way the filter can be refused reaches the reader as its own fault" {
         try std.testing.expectEqual(@as(usize, record_bytes), rc);
         try std.testing.expectEqual(tag_middle_filter, record[0]);
 
-        switch (filterFor(record[1])) {
+        // Byte 1 is the slot, which this record does not use, and the value
+        // starts at byte 2. See `record_bytes`.
+        try std.testing.expectEqual(@as(u8, 0), record[1]);
+        const value = std.mem.readInt(u64, record[2..record_bytes], .little);
+        switch (filterFor(@truncate(value))) {
             .off => |fault| seen[index] = fault,
             // A filter that went on, or nothing said at all, for an install
             // that failed. Either one would make the whole record worthless.

@@ -31,6 +31,7 @@ const builtin = @import("builtin");
 const landlock = @import("linux/landlock.zig");
 const namespace = @import("linux/namespace.zig");
 const seccomp = @import("linux/seccomp.zig");
+const notify = @import("linux/notify.zig");
 const rlimits = @import("linux/rlimits.zig");
 const cgroup = @import("linux/cgroup.zig");
 
@@ -353,6 +354,18 @@ pub const Config = struct {
     /// outlives one call is the point: the record belongs to the session and
     /// not to the call.
     supervisor_audit: ?*SupervisorAudit = null,
+    /// Where `spawn` counts the calls the sandboxed program made. Null is the
+    /// ordinary case, and a caller that leaves it null loses only the counts:
+    /// the observation itself is asked for by `seccomp_options.traps`.
+    ///
+    /// **One record for a whole session, and never one per call.** See
+    /// `SyscallAudit`, which holds the argument, and `seccomp.TrapCall`, which
+    /// holds what can be counted and what it costs.
+    ///
+    /// **`Config.copy` carries this pointer across as it is**, for the reason
+    /// `supervisor_audit` above gives, and a copy that outlives one call is
+    /// the point for the same reason.
+    syscall_audit: ?*SyscallAudit = null,
 
     pub const Rule = struct {
         path: []const u8,
@@ -376,8 +389,9 @@ pub const Config = struct {
     /// The three descriptor fields are carried across as they are: a
     /// descriptor is a number in this process, not memory to duplicate. So
     /// are `limits`, which is five numbers and owns no memory, and
-    /// `limits_report` and `supervisor_audit`, which point at a caller's own
-    /// storage that this function has no business duplicating.
+    /// `limits_report`, `supervisor_audit`, and `syscall_audit`, which point
+    /// at a caller's own storage that this function has no business
+    /// duplicating.
     ///
     /// It lives here, in the library that owns the type, because a second
     /// spelling of this function is how two copies quietly stop agreeing when
@@ -973,6 +987,89 @@ pub const SupervisorAudit = struct {
     };
 };
 
+/// What the sandboxed program asked the kernel for, counted over the whole
+/// session.
+///
+/// **Chock's log could say which program an agent ran, and not what that
+/// program then opened.** `tool.call` carries the argument vector, and nothing
+/// after it says a word about the calls the program made. This is that answer,
+/// at the one level a program cannot talk its way around: the kernel holds the
+/// call, tells the supervisor the number, and the supervisor counts it. See
+/// `linux/notify.zig` for the mechanism and `linux/seccomp.zig`'s own
+/// `TrapCall` for what is counted and what each member costs.
+///
+/// **A count and not a line for each call.** A session makes thousands of tool
+/// calls and one tool call makes thousands of opens. `SupervisorAudit` above
+/// and `NetworkSummary` have the same shape for the same reason.
+///
+/// **`observed` and `unobserved` are what make a zero readable.** A histogram
+/// of zeros is the honest record of a session that asked for no observation at
+/// all, and it is also what a session whose supervisor could not take the
+/// notification descriptor leaves behind. Those are different facts with
+/// different repairs, so they are counted apart and neither reads as "the
+/// program opened nothing".
+///
+/// **Every field is atomic**, because `lib/chock-core/tools.zig` calls `spawn`
+/// from a thread of its own and a session can have more than one tool call
+/// running at a time.
+pub const SyscallAudit = struct {
+    /// The name the session log uses for what produced these counts. Here,
+    /// beside the counts, so the log and the driver cannot drift apart on what
+    /// they call it.
+    pub const mechanism_name = "seccomp_user_notif";
+
+    /// Calls whose supervisor held the notification descriptor, so the counts
+    /// below are about them.
+    observed: std.atomic.Value(u64) = .init(0),
+    /// Calls that asked for an observation and did not get one. **This is the
+    /// field an audit reads.** Anything above zero means a tool call ran with
+    /// nothing watching it, and the counts below are short by a whole call.
+    unobserved: std.atomic.Value(u64) = .init(0),
+    /// One count for each member of `seccomp.TrapCall`, by its tag value.
+    calls: [notify.call_count]std.atomic.Value(u64) = @splat(.init(0)),
+
+    /// What one call's supervisor came back with.
+    pub const Outcome = union(enum) {
+        /// The supervisor watched the call, and this is what it counted.
+        observed: notify.Counts,
+        /// The supervisor never held the notification descriptor.
+        unobserved,
+    };
+
+    /// Count one call. Safe to call from any thread.
+    pub fn record(self: *SyscallAudit, outcome: Outcome) void {
+        switch (outcome) {
+            .unobserved => _ = self.unobserved.fetchAdd(1, .monotonic),
+            .observed => |made| {
+                _ = self.observed.fetchAdd(1, .monotonic);
+                for (made, &self.calls) |count, *total| {
+                    _ = total.fetchAdd(count, .monotonic);
+                }
+            },
+        }
+    }
+
+    /// The counts as plain numbers, for a caller that is about to write them
+    /// down. Reads each field once, so two fields can disagree by one while a
+    /// call is in flight. Call it when the calls have stopped.
+    pub fn counts(self: *const SyscallAudit) Counts {
+        var out: Counts = .{
+            .observed = self.observed.load(.monotonic),
+            .unobserved = self.unobserved.load(.monotonic),
+            .calls = notify.empty_counts,
+        };
+        for (&self.calls, &out.calls) |*total, *slot| slot.* = total.load(.monotonic);
+        return out;
+    }
+
+    /// What `counts` gives back.
+    pub const Counts = struct {
+        observed: u64,
+        unobserved: u64,
+        calls: notify.Counts,
+    };
+};
+
 /// The guarantees a driver can give. A driver declares which guarantees it
 /// gives, Chock compares the policy against the driver, and refuses when the
 /// driver is short. Nothing compares against this set yet, and only two
@@ -1061,6 +1158,12 @@ pub const SetupError = error{
     LandlockRestrictFailed,
     SessionKeyringFailed,
     SeccompInstallFailed,
+    /// The filter went on, but its notification descriptor never reached the
+    /// supervisor, so nothing could answer the calls the filter holds. A
+    /// program that ran on from here would be told by the kernel that those
+    /// calls do not exist. Only a caller that asked for an observation can
+    /// meet this: see `seccomp.Options.traps` and `linux/notify.zig`.
+    NotifyHandoverFailed,
     ForkFailed,
     PdeathsigSetupFailed,
     ExecFailed,

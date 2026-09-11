@@ -5486,6 +5486,73 @@ fn supervisorEvent(
     };
 }
 
+/// Write this session's one `sandbox.syscalls` event.
+///
+/// **Always, and not only when something was watched.** A reader that finds no
+/// event cannot tell a session that watched nothing from a session written by
+/// a build that could not watch at all, the same argument
+/// `logSupervisorAudit` above makes. See
+/// `chock_proto.event.SandboxSyscalls`.
+///
+/// Best effort, and for the reason that function gives: the storage lock is
+/// already back, so this takes it again for one append, and a session whose
+/// log cannot be reached one more time still exits.
+fn logSyscallAudit(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    audit: *const sandbox.Sandbox.SyscallAudit,
+) void {
+    var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
+    const ev = syscallEvent(audit.counts(), &rows);
+
+    var locked = storage.lock(io) catch |err| {
+        reportSyscallRecord(err);
+        return;
+    };
+    defer locked.unlock(io) catch {};
+    _ = locked.append(
+        gpa,
+        io,
+        ev,
+        std.Io.Timestamp.now(io, .real).toMilliseconds(),
+    ) catch |err| reportSyscallRecord(err);
+}
+
+/// The one message a failed `logSyscallAudit` writes.
+fn reportSyscallRecord(err: anyerror) void {
+    tty.print(
+        .warn,
+        "chock: what the sandboxed programs of this session asked the kernel for " ++
+            "could not be written to the log: {s}\n",
+        .{@errorName(err)},
+    );
+}
+
+/// How many rows a `sandbox.syscalls` event carries. One for each call the
+/// sandbox can watch, read from the sandbox itself so the two cannot drift.
+const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".fields.len;
+
+/// The `sandbox.syscalls` event `logSyscallAudit` writes. **Pure**, so its
+/// shape can be checked without touching storage: see the tests below.
+///
+/// `rows` is the caller's own storage for the row list, because the event
+/// borrows it rather than owning it.
+fn syscallEvent(
+    counts: sandbox.Sandbox.SyscallAudit.Counts,
+    rows: *[syscall_row_count]chock_proto.event.SyscallCount,
+) chock_proto.event.Event {
+    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
+        rows[field.value] = .{ .name = field.name, .count = counts.calls[field.value] };
+    }
+    return .{ .sandbox_syscalls = .{
+        .mechanism = sandbox.Sandbox.SyscallAudit.mechanism_name,
+        .observed = counts.observed,
+        .unobserved = counts.unobserved,
+        .calls = rows,
+    } };
+}
+
 /// The `network.summary` event `ToolNetwork.logSummary` writes, or null when
 /// the session opened no connection and had none refused. **Pure**, so its
 /// shape can be checked without touching storage: see the test below.
@@ -5597,6 +5664,125 @@ test "the supervisor's own degradation reaches the log, not only the terminal" {
         try std.testing.expectEqual(@as(u64, 1), said.unconfined);
         try std.testing.expectEqualStrings("seccomp", said.layer);
         try std.testing.expectEqualStrings("not_permitted", said.reason);
+    }
+    try std.testing.expect(found);
+}
+
+test "the syscall event names one row for each call the sandbox can watch, and says nothing was watched" {
+    // **The requirement.** A machine reading the log answers "what did this
+    // session's programs open" from the rows, and answers "is this record
+    // complete" from `observed` and `unobserved`. A row of zeros with no
+    // `observed` count would read as a session whose programs opened nothing,
+    // which is a claim and not a fact.
+    //
+    // Mutation check: drop `observed` from `syscallEvent` and the first
+    // expectation fails. Fill `rows` from a fixed list instead of from
+    // `TrapCall` and the row count stops moving with the sandbox.
+    var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
+    const ev = syscallEvent(.{
+        .observed = 4,
+        .unobserved = 1,
+        .calls = .{ 900, 4, 0, 12 },
+    }, &rows);
+
+    try std.testing.expectEqual(chock_proto.event.Kind.sandbox_syscalls, std.meta.activeTag(ev));
+    const said = ev.sandbox_syscalls;
+    try std.testing.expectEqualStrings("seccomp_user_notif", said.mechanism);
+    try std.testing.expectEqual(@as(u64, 4), said.observed);
+    try std.testing.expectEqual(@as(u64, 1), said.unobserved);
+    try std.testing.expectEqual(syscall_row_count, said.calls.len);
+
+    // Each row carries the name the sandbox gives the call, so a reader never
+    // has to know the syscall numbers of the machine that wrote the log.
+    inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
+        try std.testing.expectEqualStrings(field.name, said.calls[field.value].name);
+    }
+    try std.testing.expectEqual(
+        @as(u64, 900),
+        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].count,
+    );
+    // A call nobody made still gets a row. Without it a reader cannot tell a
+    // call that was watched and never made from a call this build cannot
+    // watch.
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].count,
+    );
+}
+
+test "what the sandboxed programs asked the kernel for reaches the log, not only the counter" {
+    // The whole chain above storage: the audit a driver filled, the event, and
+    // the line in the log a replay reads back.
+    //
+    // Mutation check: make `logSyscallAudit` append nothing and `found` stays
+    // false.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SYSCALLS0000000000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    var audit: sandbox.Sandbox.SyscallAudit = .{};
+    var counts = sandbox.notify.empty_counts;
+    counts[@intFromEnum(sandbox.seccomp.TrapCall.openat)] = 31;
+    counts[@intFromEnum(sandbox.seccomp.TrapCall.execve)] = 1;
+    audit.record(.{ .observed = counts });
+    audit.record(.unobserved);
+    logSyscallAudit(gpa, io, storage, &audit);
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .sandbox_syscalls) continue;
+        found = true;
+        const said = parsed.value.event.sandbox_syscalls;
+        try std.testing.expectEqual(@as(u64, 1), said.observed);
+        // **The field an audit reads.** One tool call ran with nothing
+        // watching it, so the rows are short by a whole call.
+        try std.testing.expectEqual(@as(u64, 1), said.unobserved);
+        try std.testing.expectEqualStrings("seccomp_user_notif", said.mechanism);
+        for (said.calls) |row| {
+            if (std.mem.eql(u8, row.name, "openat")) {
+                try std.testing.expectEqual(@as(u64, 31), row.count);
+            }
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "a session that watched nothing still writes the event, so an absence is never an answer" {
+    // **An absent event is not an answer.** A reader that found nothing could
+    // not tell a session that watched nothing from a session written by a
+    // build that could not watch at all. `SandboxSupervisor` is written on
+    // every session for the same reason.
+    //
+    // Mutation check: make `logSyscallAudit` return before the append when
+    // `observed` is zero and `found` stays false here, while every other test
+    // in this file stays green.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SYSCALLSQUIET00000000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    const audit: sandbox.Sandbox.SyscallAudit = .{};
+    logSyscallAudit(gpa, io, storage, &audit);
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .sandbox_syscalls) continue;
+        found = true;
+        const said = parsed.value.event.sandbox_syscalls;
+        try std.testing.expectEqual(@as(u64, 0), said.observed);
+        try std.testing.expectEqual(@as(u64, 0), said.unobserved);
+        try std.testing.expectEqual(syscall_row_count, said.calls.len);
     }
     try std.testing.expect(found);
 }
@@ -9294,6 +9480,16 @@ fn runSession(
     // and a call still inside `Sandbox.spawn` would otherwise be counted after
     // this event was already written.
     defer logSupervisorAudit(gpa, io, started.storage, &supervisor_audit);
+
+    // The same route, for the same reason, carrying what the programs those
+    // tool calls ran asked the kernel for. **Off unless a policy asks**: the
+    // sandbox watches nothing until `Config.seccomp_options.traps` names a
+    // call, so this event reads as "nothing was asked for" on an ordinary
+    // session. See `chock_sandbox.Sandbox.SyscallAudit`.
+    var syscall_audit: sandbox.Sandbox.SyscallAudit = .{};
+    started.sandbox_config.syscall_audit = &syscall_audit;
+    defer started.sandbox_config.syscall_audit = null;
+    defer logSyscallAudit(gpa, io, started.storage, &syscall_audit);
 
     // The toolchain this session mounts, **always named here and never left
     // at the library's own default**. Phase 1 decided it once, out of the dev

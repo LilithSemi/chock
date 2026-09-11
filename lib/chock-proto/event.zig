@@ -172,6 +172,7 @@ pub const Kind = enum {
     workspace_integrate,
     sandbox_open,
     sandbox_supervisor,
+    sandbox_syscalls,
     network_summary,
     unknown,
 
@@ -223,6 +224,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .workspace_integrate = "workspace.integrate",
     .sandbox_open = "sandbox.open",
     .sandbox_supervisor = "sandbox.supervisor",
+    .sandbox_syscalls = "sandbox.syscalls",
     .network_summary = "network.summary",
     .unknown = "unknown",
 });
@@ -1434,6 +1436,83 @@ pub const SandboxSupervisor = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// How many times the sandboxed programs of one session made one system call.
+///
+/// **A field and not a kind for each call.** A member added to the trap set is
+/// another row here, and never another event kind, so a reader written today
+/// reads a log written by a build that watches more calls.
+pub const SyscallCount = struct {
+    /// The call, by the name the sandbox's own trap set gives it.
+    name: []const u8,
+    /// How many times the sandboxed programs of this session made it.
+    count: u64 = 0,
+    /// **This is where a path list joins, and it joins here.** Counting is
+    /// what this event carries today. The call a program made is known, and
+    /// the path it named is not. When the supervisor reads the path too, it
+    /// becomes another field on this struct, beside `count`, and every reader
+    /// of this kind keeps working: a reader with no field for it keeps it in
+    /// `extra` and writes it back out, which is what this file's own top
+    /// comment promises for a struct that gains a field. No new kind, no new
+    /// wire name, and no reader anywhere has to learn anything to keep
+    /// reading the counts.
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
+/// What the sandboxed programs of one session asked the kernel for.
+///
+/// **Chock's log could say which program an agent ran, and not what that
+/// program then opened.** `tool.call` carries the argument vector, and nothing
+/// after it says a word about the calls the program made. This is the answer,
+/// taken at the one level a program cannot talk its way around: the kernel
+/// holds the call, gives the supervisor the call number, and the supervisor
+/// counts it. The number comes from the kernel, so the count cannot be forged
+/// by the program it is about.
+///
+/// **A count and not a line for each call.** One tool call makes thousands of
+/// opens, and a session makes thousands of tool calls. A record for each one
+/// would grow the log without bound, which is a cost this project has already
+/// paid once. `SandboxSupervisor` and `NetworkSummary` have the same shape for
+/// the same reason.
+///
+/// **Written once per session and whichever way it went**, the same rule
+/// `SandboxSupervisor` follows: a reader that found nothing could not tell a
+/// session that watched nothing from a session written by a build that could
+/// not watch at all.
+///
+/// **`observed` and `unobserved` are what make a row of zeros readable.** A
+/// histogram of zeros is the honest record of a session that asked for no
+/// observation, and it is also what a session whose supervisor never got the
+/// notification descriptor leaves behind. Those are different facts with
+/// different repairs, so they are counted apart and neither one reads as "the
+/// program opened nothing".
+pub const SandboxSyscalls = struct {
+    /// What produced these counts, by the name the sandbox gives it. **A field
+    /// and not part of the kind**, the same choice `SandboxSupervisor.layer`
+    /// makes, so a second mechanism is a second event of this kind rather than
+    /// a second kind.
+    mechanism: []const u8,
+    /// Tool calls whose supervisor watched them, so the rows below are about
+    /// them.
+    observed: u64 = 0,
+    /// Tool calls that asked to be watched and were not. **This is the field
+    /// an audit reads.** Anything above zero means the rows below are short by
+    /// a whole tool call.
+    unobserved: u64 = 0,
+    /// One row for each call the sandbox can watch. A call nobody made still
+    /// gets a row, so a reader can tell a call that was watched and never made
+    /// from a call this build does not watch at all.
+    calls: []const SyscallCount = &.{},
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A tool call's own network use over the whole session, one line rather than
 /// one per connection.
 ///
@@ -1644,6 +1723,7 @@ pub const Event = union(Kind) {
     workspace_integrate: WorkspaceIntegrate,
     sandbox_open: SandboxOpen,
     sandbox_supervisor: SandboxSupervisor,
+    sandbox_syscalls: SandboxSyscalls,
     network_summary: NetworkSummary,
     /// A kind this reader does not recognize. See `UnknownEvent`.
     unknown: UnknownEvent,

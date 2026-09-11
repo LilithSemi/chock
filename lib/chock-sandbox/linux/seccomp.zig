@@ -6,6 +6,9 @@ pub const RET_ALLOW: u32 = 0x7fff0000;
 pub const RET_KILL_PROCESS: u32 = 0x80000000;
 /// Return EPERM to the caller instead of killing it.
 pub const RET_ERRNO_PERM: u32 = 0x00050000 | @as(u32, @intFromEnum(linux.E.PERM));
+/// Hold the call, tell the supervisor it happened, and then let it run.
+/// **Not a denial.** See `TrapCall`.
+pub const RET_USER_NOTIF: u32 = linux.SECCOMP.RET.USER_NOTIF;
 
 /// The calls Chock blocks outright. No correct tool needs one of these.
 /// `unshare` and `setns` are here because the sandbox is already built when the filter
@@ -151,6 +154,108 @@ pub const refused_calls = [_]linux.SYS{
     .io_uring_register,
 };
 
+/// The calls a supervisor can be asked to observe, and the only calls it can
+/// ever observe.
+///
+/// **A third category, beside the kill list and the refusal list.** A trapped
+/// call is not stopped. The kernel holds it, tells another process that it
+/// happened, and then lets it run. So this list answers a different question
+/// from the two above: not "may this call happen", but "is this call counted".
+///
+/// **A closed set, and that is the whole safety argument.** A policy picks a
+/// member of this enum. It never picks a syscall number. Two faults are
+/// impossible because of that:
+///
+///   * A call on `blocked_calls` can never become a call that is only counted.
+///     The `comptime` block below `bootstrap_calls` stops the build on any
+///     overlap.
+///   * A call that the handover itself makes can never be trapped. See
+///     `bootstrap_calls`, which states why that would stop two processes
+///     forever.
+///
+/// **The four members were measured on 2026-09-10, on this kernel.** `execve`,
+/// `connect`, and `getdents64` are near zero in every workload measured, so
+/// they cost nothing at all. `openat` costs about 11 microseconds for each
+/// call, which is under 0.5% of a clean `zig build` and below the noise of
+/// this machine. `connect` is the member that makes the network story
+/// auditable. `statx`, `brk`, and `mmap` were measured beside them: they
+/// double the cost and give no audit value, so they are deliberately not here.
+pub const TrapCall = enum {
+    openat,
+    execve,
+    connect,
+    getdents64,
+
+    /// The syscall this member names, for the architecture of this binary.
+    pub fn number(self: TrapCall) linux.SYS {
+        return switch (self) {
+            .openat => .openat,
+            .execve => .execve,
+            .connect => .connect,
+            .getdents64 => .getdents64,
+        };
+    }
+
+    /// The member a notification names, or null for a number no member holds.
+    ///
+    /// **The number comes from the kernel, inside the notification.** The
+    /// observed process cannot change it after the filter read it, so a count
+    /// made from it cannot be forged.
+    pub fn fromNumber(nr: i64) ?TrapCall {
+        inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
+            const call: TrapCall = @enumFromInt(field.value);
+            if (@intFromEnum(call.number()) == nr) return call;
+        }
+        return null;
+    }
+};
+
+/// Which calls one filter hands to a supervisor. Empty is the default, and an
+/// empty set builds exactly the filter this project always built.
+pub const TrapSet = std.EnumSet(TrapCall);
+
+/// The calls the observed process makes between the filter going on and the
+/// supervisor holding the notification descriptor.
+///
+/// **A trap on one of these is not a slow call. It is a stop that never
+/// ends.** `linux/driver.zig` installs the filter in B, the process that runs
+/// the caller's program. B then writes the descriptor number to A, the
+/// supervisor, and waits for A to answer. A takes the descriptor with
+/// `pidfd_getfd`. Until that is finished, no process holds the descriptor, so
+/// nothing can answer a notification. A trapped `write` or `read` in that
+/// window would wait for a supervisor that does not exist yet, and A would
+/// wait for B at the same moment.
+///
+/// `sendto` is here beside `write` because `linux/notify.zig` sends on that
+/// socket with `MSG_NOSIGNAL`, so the death of the other process reaches it as
+/// an `EPIPE` it can read rather than as a `SIGPIPE` that ends it.
+///
+/// **A comment is not the guarantee.** The `comptime` block below stops the
+/// build if a `TrapCall` member ever names one of these calls. The test
+/// "no call the handover makes can ever be trapped" reads the same fact again.
+pub const bootstrap_calls = [_]linux.SYS{ .read, .write, .close, .sendto };
+
+comptime {
+    for (@typeInfo(TrapCall).@"enum".fields) |field| {
+        const call: TrapCall = @enumFromInt(field.value);
+        for (bootstrap_calls) |boot| {
+            if (call.number() == boot) @compileError(
+                "trapping " ++ field.name ++ " would stop the handover forever. See bootstrap_calls.",
+            );
+        }
+        for (blocked_calls) |killed| {
+            if (call.number() == killed) @compileError(
+                "a killed call cannot also be an observed call: " ++ field.name,
+            );
+        }
+        for (refused_calls) |refused| {
+            if (call.number() == refused) @compileError(
+                "a refused call cannot also be an observed call: " ++ field.name,
+            );
+        }
+    }
+}
+
 /// The calls whose `prot` argument the filter reads. `prot` is argument index
 /// 2 for all three.
 pub const memory_calls = [_]linux.SYS{ .mmap, .mprotect, .pkey_mprotect };
@@ -250,6 +355,25 @@ pub const Options = struct {
     /// a program that meets a refusal can answer it, and a program that is
     /// killed cannot.
     block_connect: bool = false,
+    /// Which calls the supervisor observes. See `TrapCall`.
+    ///
+    /// **Empty by default, so nothing changes for a caller that does not
+    /// ask.** An empty set adds no instruction at all, and the filter is byte
+    /// for byte the filter this project always built.
+    ///
+    /// **Only for a filter that goes on with `installListening`.** A filter
+    /// that returns `RET_USER_NOTIF` with no listener behind it makes the
+    /// kernel answer the call with `ENOSYS`, which is worse than either a kill
+    /// or a refusal: the program is told the call does not exist. So a filter
+    /// built with a trap set must go on with that one call and no other.
+    /// `linux/driver.zig` builds a second filter, with this field empty, for
+    /// the supervisor process itself.
+    ///
+    /// **A refusal wins over an observation.** `block_connect` above emits its
+    /// rule first, so a filter that both refuses `connect` and observes it
+    /// refuses it and never counts it. That is the narrow answer, and it is
+    /// the safe direction.
+    traps: TrapSet = .initEmpty(),
 };
 
 /// Build the filter. The caller owns the memory.
@@ -495,6 +619,22 @@ pub fn build(allocator: std.mem.Allocator, options: Options) ![]bpf.Insn {
         }
     }
 
+    // See `TrapCall`. Two instructions for each observed call, the same shape
+    // the refusal loop has, and neither one touches the accumulator, so the
+    // call number is still in it when the allow below is reached.
+    //
+    // **Last, after every rule that kills or refuses.** The sets are already
+    // disjoint at compile time, so nothing here can take a boundary away. The
+    // position says it a second time, for free: a call that some rule above
+    // answered never reaches this point at all.
+    var traps = options.traps.iterator();
+    while (traps.next()) |call| {
+        const number: u32 = @intCast(@intFromEnum(call.number()));
+        // If the number matches, fall to the notification. If not, skip over it.
+        try insns.append(allocator, bpf.jump(bpf.JMP_JEQ_K, number, 0, 1));
+        try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_USER_NOTIF));
+    }
+
     try insns.append(allocator, bpf.stmt(bpf.RET_K, RET_ALLOW));
     return insns.toOwnedSlice(allocator);
 }
@@ -527,6 +667,27 @@ pub const InstallError = error{
 /// faults with three different repairs. A caller that reads only `Rejected`
 /// looks for a bad filter when the real fault is one of the other two.
 pub fn install(prog: bpf.Prog) InstallError!void {
+    _ = try setModeFilter(prog, 0);
+}
+
+/// Install a filter and give back the notification descriptor for it. Every
+/// word of `install` above applies here too.
+///
+/// **The only install a filter with a trap set may use.** A filter that
+/// returns `RET_USER_NOTIF` with no listener behind it makes the kernel answer
+/// the call with `ENOSYS`. See `Options.traps`.
+///
+/// The caller owns the descriptor. `linux/driver.zig` hands it to the
+/// supervisor with `pidfd_getfd` and then closes its own copy, so the observed
+/// process never holds a descriptor that could answer its own notifications.
+pub fn installListening(prog: bpf.Prog) InstallError!i32 {
+    const rc = try setModeFilter(prog, linux.SECCOMP.FILTER_FLAG.NEW_LISTENER);
+    return @intCast(rc);
+}
+
+/// The one body both installs share, so the flag is the only difference
+/// between them and the `no_new_privs` step cannot be lost from one of the two.
+fn setModeFilter(prog: bpf.Prog, flags: u32) InstallError!usize {
     // Without `no_new_privs`, an unprivileged process cannot install a filter, because a
     // set-user-ID program could then be given a filter that lies to it.
     const pr = linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0);
@@ -537,11 +698,11 @@ pub fn install(prog: bpf.Prog) InstallError!void {
 
     const rc = linux.seccomp(
         linux.SECCOMP.SET_MODE_FILTER,
-        0,
+        flags,
         @ptrCast(&prog),
     );
     return switch (linux.errno(rc)) {
-        .SUCCESS => {},
+        .SUCCESS => rc,
         .NOSYS => error.NotSupported,
         // The kernel answers EACCES only when the caller holds neither
         // `no_new_privs` nor `CAP_SYS_ADMIN`. The call above says the flag is
@@ -1223,4 +1384,118 @@ test "the kernel enforces the filter that install returned success for" {
     const code = try waitForExitCode(@intCast(fork_rc));
     if (code == 3) return error.SkipZigTest;
     try std.testing.expectEqual(@as(u32, 0), code);
+}
+
+test "a trap set puts a user notification return in the filter, and an empty one puts nothing" {
+    // **Both halves, and the second is the one a later reader could lose.**
+    // The default must stay the filter this project always built, or every
+    // caller that never asked for an observation starts paying for one.
+    //
+    // Mutation check: delete the trap loop at the end of `build` and the
+    // `observed` count here is zero.
+    const allocator = std.testing.allocator;
+
+    const plain = try build(allocator, .{});
+    defer allocator.free(plain);
+    for (plain) |insn| {
+        try std.testing.expect(!(insn.code == bpf.RET_K and insn.k == RET_USER_NOTIF));
+    }
+
+    const watching = try build(allocator, .{ .traps = TrapSet.initMany(&.{ .openat, .execve }) });
+    defer allocator.free(watching);
+
+    var observed: usize = 0;
+    for (&[_]TrapCall{ .openat, .execve }) |call| {
+        const wanted: u32 = @intCast(@intFromEnum(call.number()));
+        for (watching, 0..) |insn, i| {
+            if (insn.code != bpf.JMP_JEQ_K or insn.k != wanted) continue;
+            // jt = 0 falls into the notification on a match. jf = 1 skips
+            // exactly that one instruction on no match, the same shape the
+            // refusal loop has.
+            try std.testing.expectEqual(@as(u8, 0), insn.jt);
+            try std.testing.expectEqual(@as(u8, 1), insn.jf);
+            try std.testing.expectEqual(bpf.RET_K, watching[i + 1].code);
+            try std.testing.expectEqual(RET_USER_NOTIF, watching[i + 1].k);
+            observed += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), observed);
+
+    // A member that was not asked for is named nowhere.
+    const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
+    for (watching) |insn| {
+        try std.testing.expect(!(insn.code == bpf.JMP_JEQ_K and insn.k == connect_number));
+    }
+}
+
+test "no call the handover makes can ever be trapped" {
+    // **This is the deadlock guard, read at run time.** The `comptime` block
+    // beside `bootstrap_calls` already stops the build on an overlap. This
+    // test says the same thing where a person looking for the rule will find
+    // it, and it fails for the right reason if that block is ever deleted.
+    //
+    // Mutation check: add `.read` to `TrapCall` and give it a `number` of
+    // `.read`, and the build stops with the message `bootstrap_calls` names.
+    // Delete the `comptime` block as well and this test fails instead.
+    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
+        const call: TrapCall = @enumFromInt(field.value);
+        for (bootstrap_calls) |boot| {
+            try std.testing.expect(call.number() != boot);
+        }
+    }
+}
+
+test "nothing on the kill list and nothing on the refusal list can be trapped" {
+    // **A trapped call runs.** A configuration that turned a killed call into
+    // a trapped one would take a boundary away and leave a count in its place,
+    // and the filter would still build and still install. The `comptime` block
+    // beside `bootstrap_calls` is what stops that. This reads it again.
+    //
+    // Mutation check: add `.ptrace` to `TrapCall` and the build stops.
+    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
+        const call: TrapCall = @enumFromInt(field.value);
+        for (blocked_calls) |killed| {
+            try std.testing.expect(call.number() != killed);
+        }
+        for (refused_calls) |refused| {
+            try std.testing.expect(call.number() != refused);
+        }
+    }
+}
+
+test "a trapped call is never reached by a filter that already kills or refuses it" {
+    // The two lists are disjoint from the trap set by construction, so this
+    // checks the one overlap a runtime option can still make: `block_connect`
+    // and an observed `connect`. The refusal must come first, so the call is
+    // refused and never counted.
+    const allocator = std.testing.allocator;
+    const prog = try build(allocator, .{
+        .block_connect = true,
+        .traps = TrapSet.initMany(&.{.connect}),
+    });
+    defer allocator.free(prog);
+
+    const connect_number: u32 = @intCast(@intFromEnum(linux.SYS.connect));
+    var first_answer: ?u32 = null;
+    for (prog, 0..) |insn, i| {
+        if (insn.code != bpf.JMP_JEQ_K or insn.k != connect_number) continue;
+        if (first_answer == null) first_answer = prog[i + 1].k;
+    }
+    try std.testing.expectEqual(@as(?u32, RET_ERRNO_PERM), first_answer);
+}
+
+test "every syscall number a notification can carry maps back to the call it names" {
+    inline for (@typeInfo(TrapCall).@"enum".fields) |field| {
+        const call: TrapCall = @enumFromInt(field.value);
+        try std.testing.expectEqual(
+            @as(?TrapCall, call),
+            TrapCall.fromNumber(@intCast(@intFromEnum(call.number()))),
+        );
+    }
+    // `getppid` is on no list here. A number with no member must read as none
+    // rather than as the first member.
+    try std.testing.expectEqual(
+        @as(?TrapCall, null),
+        TrapCall.fromNumber(@intCast(@intFromEnum(linux.SYS.getppid))),
+    );
 }

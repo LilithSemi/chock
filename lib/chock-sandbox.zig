@@ -32,6 +32,10 @@ pub const landlock = @import("chock-sandbox/linux/landlock.zig");
 pub const bpf = @import("chock-sandbox/linux/bpf.zig");
 pub const seccomp = @import("chock-sandbox/linux/seccomp.zig");
 pub const namespace = @import("chock-sandbox/linux/namespace.zig");
+/// The supervisor half of the seccomp user notification, re-exported beside
+/// `seccomp` above because a caller that names a `seccomp.TrapSet` reads the
+/// counts this module defines. See its own top comment for the handover.
+pub const notify = @import("chock-sandbox/linux/notify.zig");
 /// The exchange a `namespace.Network.filtered` process uses to reach a host.
 /// Re-exported here beside the four above, and for the same reason: the
 /// program that runs **inside** a filtered sandbox calls `net_broker.ask`, and

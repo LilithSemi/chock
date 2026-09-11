@@ -1068,6 +1068,67 @@ test "the supervisor says whether it could filter itself, and the answer leaves 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "the supervisor counts what the sandboxed program asked the kernel for" {
+    // **Chock's log could say which program ran and not what that program then
+    // opened.** This is the whole chain that answers it: a filter with a trap
+    // set, installed in the process that runs the caller's program, its
+    // notification descriptor handed to the supervisor, and a count the
+    // supervisor makes from the call number the kernel gives it.
+    //
+    // **This run is also the deadlock proof.** `execve` is one of the observed
+    // calls, so the sandboxed process's own `execve` is held by the kernel
+    // until the supervisor answers it. A handover that stopped either process
+    // would make this test hang and never report at all, and the exact count
+    // of one `execve` says the hold really happened rather than being skipped.
+    //
+    // Mutation check: delete the `counts[...] += 1` line in
+    // `notify.answerOne` and the run exits 9, which is the `execve` count.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-syscall-audit", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a sandbox that was asked to watch nothing counts nothing and still runs" {
+    // The control for the test above, and the half that says the default costs
+    // nothing. The identical program runs with an empty trap set: the filter
+    // holds no call, no descriptor is handed over, and the audit stays at
+    // zero rather than reporting a call it never watched.
+    //
+    // **Both runs are needed.** Without this one, a count that came from
+    // somewhere other than the filter would still look like a pass above.
+    //
+    // Mutation check: make `spawn` build the child filter with the caller's
+    // trap set whether or not one was asked for, and this run exits 5,
+    // because the supervisor then watches a call nobody asked it to watch.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-syscall-audit-off", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a program that leaves a process behind does not hold the tool call open" {
+    // Every process the sandboxed program forks carries the same filter, so
+    // the kernel keeps the notification descriptor alive until the last of
+    // them ends. A supervisor that waited for the descriptor rather than for
+    // the program would hold the tool call for as long as that leftover
+    // process ran. **The whole test is that this run finishes.**
+    //
+    // **What this test does not distinguish, measured on 2026-09-11.** Taking
+    // the process descriptor out of the poll set in `notify.serve` leaves this
+    // run exactly as fast, because the sandboxed program is process 1 of its
+    // own pid namespace and the kernel kills every other member of that
+    // namespace the moment process 1 exits. So the leftover process is already
+    // gone by the time the supervisor could wait for it. The descriptor in
+    // that poll set is what makes `notify.serve` correct on its own terms
+    // rather than through a fact that lives in `namespace.zig`, and no test
+    // here can tell the two apart while the pid namespace is there.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-syscall-audit-daemon", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a filtered sandbox adds the broker socket to that set and nothing else" {
     // The other half, and the one that pins what the exemption is worth. A
     // filtered call is the only shape where a descriptor above standard error

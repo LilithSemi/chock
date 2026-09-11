@@ -40,6 +40,11 @@ const linux = std.os.linux;
 /// something did.
 const stdin_pipe_token = "chock-helper-request";
 
+/// How many times `spawned-count-opens` opens a file. A fixed number, so the
+/// supervisor's count is checked against a floor this test set rather than
+/// against whatever happened.
+const opens_in_probe = 17;
+
 /// End this program with `nothing_measured_exit_status` when `err` is the
 /// sandbox refusing to be built at all.
 ///
@@ -1461,6 +1466,13 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // installed on this process first would be inherited and would kill
         // that child's own `unshare`.
         std.mem.eql(u8, args[1], "spawn-supervisor-audit") or
+        // The two system call audit runs, for the same reason again: each one
+        // forks and lets `sandbox.spawn` build the whole sandbox in that
+        // child, and a filter installed on this process first would be
+        // inherited and would kill that child's own `unshare`.
+        std.mem.eql(u8, args[1], "spawn-syscall-audit") or
+        std.mem.eql(u8, args[1], "spawn-syscall-audit-off") or
+        std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon") or
         // Plan 23 task 1, the six red team primitives. Each belongs here for
         // the same reason as spawn-ptrace above: sandbox.spawn's own
         // unshare must run without a filter already installed on this
@@ -2589,6 +2601,41 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         var buffer: [16]u8 = undefined;
         const line = std.fmt.bufPrint(&buffer, "{d}\n", .{linux.getpid()}) catch unreachable;
         _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-count-opens")) {
+        // Make a fixed number of one observed call, and none of two others.
+        // The supervisor's histogram is read by `spawn-syscall-audit`, which
+        // is the process that holds it: this process cannot see it at all.
+        //
+        // `/probe` is the one path that is certainly there and certainly
+        // readable: `baseEscapeConfig` binds it and gives it a read rule.
+        var made: usize = 0;
+        while (made < opens_in_probe) : (made += 1) {
+            const rc = linux.openat(linux.AT.FDCWD, "/probe", .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(rc) != .SUCCESS) return 5;
+            _ = linux.close(@intCast(rc));
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-leave-daemon")) {
+        // Fork a process that outlives this one, then end. The supervisor must
+        // not wait for that process: it still carries the filter, so a
+        // supervisor that waited for the filter to be released would hold the
+        // tool call for as long as the leftover process ran.
+        const forked = linux.fork();
+        if (linux.errno(forked) != .SUCCESS) return 5;
+        if (forked == 0) {
+            // Long enough that a supervisor which waited for this would be
+            // plainly stuck, and still finite, so a fault here ends rather
+            // than holding the whole test run.
+            var left: usize = 60;
+            while (left > 0) : (left -= 1) {
+                var second: linux.timespec = .{ .sec = 1, .nsec = 0 };
+                _ = linux.nanosleep(&second, null);
+            }
+            return 0;
+        }
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawned-caps-drop")) {
@@ -4309,6 +4356,107 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         if (counts.unconfined != 0) return 6;
         if (counts.confined != 1) return 7;
         if (counts.first_fault != null) return 8;
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon")) {
+        // **The no hang case.** The program ends and leaves a process behind
+        // that still carries the filter. The supervisor watches the program
+        // and not the filter, so this call has to come back at once.
+        //
+        // Nothing is asserted about the counts here. The one fact under test
+        // is that `spawn` returns at all.
+        const base = try baseEscapeConfig(arena);
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{ .traps = sandbox.seccomp.TrapSet.initFull() },
+        }, &.{ "/probe", "spawned-leave-daemon" }, null, null);
+
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawn-syscall-audit") or
+        std.mem.eql(u8, args[1], "spawn-syscall-audit-off"))
+    {
+        // **The whole chain, through a real spawn.** A filter with a trap set
+        // goes on in the process that runs the program, that process hands the
+        // notification descriptor to the supervisor, and the supervisor counts
+        // what the kernel tells it. This runs a program that makes a known
+        // number of one observed call and none of two others, then reads the
+        // counts back.
+        //
+        // The second name runs the identical program with **no** trap set at
+        // all. That run is the control: it says the numbers come from the
+        // observation and not from somewhere else, and it says the default
+        // costs nothing.
+        //
+        // The exit status is the answer, because nothing here may print: the
+        // audit lives in this process's own memory.
+        const watching = std.mem.eql(u8, args[1], "spawn-syscall-audit");
+        const base = try baseEscapeConfig(arena);
+        var audit: sandbox.Sandbox.SyscallAudit = .{};
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = base.mounts,
+            .rules = base.rules,
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .seccomp_options = .{
+                .traps = if (watching)
+                    sandbox.seccomp.TrapSet.initFull()
+                else
+                    sandbox.seccomp.TrapSet.initEmpty(),
+            },
+            .syscall_audit = &audit,
+        }, &.{ "/probe", "spawned-count-opens" }, null, null);
+
+        // The program itself has to have run, or the counts below are about
+        // nothing. **This is also the deadlock check.** A handover that stopped
+        // either process would never reach this line at all.
+        switch (term) {
+            .exited => |code| if (code != 0) return 4,
+            else => return 4,
+        }
+
+        const counts = audit.counts();
+        const opens = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)];
+        const execs = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.execve)];
+        const dirs = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.getdents64)];
+        const connects = counts.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)];
+
+        if (!watching) {
+            // Nothing was asked for, so nothing was watched and nothing was
+            // counted. A count above zero here would mean the numbers come
+            // from somewhere other than the filter.
+            if (counts.observed != 0 or counts.unobserved != 0) return 5;
+            if (opens != 0 or execs != 0 or dirs != 0 or connects != 0) return 6;
+            return 0;
+        }
+
+        // The supervisor could not watch the call on a machine that gave it a
+        // whole sandbox. Real, and the case the record exists for, so it gets
+        // a status of its own.
+        if (counts.unobserved != 0) return 7;
+        if (counts.observed != 1) return 8;
+        // **Exactly one, and this is the number that proves the hard part.**
+        // That one `execve` is the sandboxed process's own, the call the
+        // handover had to be finished before. A count of zero means it was
+        // never held; a count above one means something else ran.
+        if (execs != 1) return 9;
+        // At least what the program made. The loader opens more on the way
+        // in, and that number is a property of this machine.
+        if (opens < opens_in_probe) return 10;
+        // The program asked for neither, so a count above zero means the
+        // histogram is putting numbers under the wrong name.
+        if (dirs != 0 or connects != 0) return 11;
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-open-fd-set") or
