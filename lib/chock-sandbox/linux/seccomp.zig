@@ -1450,14 +1450,14 @@ fn installFaultCode(err: InstallError) u8 {
     };
 }
 
-// **The two tests below are the only ones in this file that call `install`.**
-// Every other test reads the instructions that `build` returns. Those prove the
-// filter is shaped correctly. None of them proves the kernel took it.
+// **Five tests below are the only ones in this file that call `install`.**
+// Every other test reads the instructions that a builder returns. Those prove
+// a filter is shaped correctly. None of them proves the kernel took it.
 //
-// Both tests run in a forked child, because a filter can never be removed. A
+// Each test runs the filter in a forked child, because a filter can never be removed. A
 // filter on the test runner itself would stay on for every test after it.
 //
-// The children share these exit codes:
+// The children reserve these exit codes:
 //   0     the child measured what the test asked for.
 //   3..7  `install` failed. See `installFaultCode` for which fault each is.
 //   10    the state before the measurement was not the state the test needs.
@@ -1465,6 +1465,8 @@ fn installFaultCode(err: InstallError) u8 {
 //   12    the measurement did not give the answer the test needs.
 
 test "install turns on no_new_privs, and does not rely on a caller to do it" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // **A mutation that deletes the `prctl` call from `install` passes every
     // other test in this file.** `applyLayers`, in `driver.zig`, calls
     // `landlock.Ruleset.restrictSelf` first, and that call sets the same flag,
@@ -1502,6 +1504,8 @@ test "install turns on no_new_privs, and does not rely on a caller to do it" {
 }
 
 test "the kernel enforces the filter that install returned success for" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // **`install` returning no error is not the same fact as a filter that
     // runs.** This test calls the one system call that the filter refuses, and
     // reads the errno back. It is the only check in this project that the
@@ -1641,6 +1645,8 @@ test "every syscall number a notification can carry maps back to the call it nam
 }
 
 test "the reader's filter permits its own four calls and kills the rest" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // **An allowlist is only an allowlist if the kernel enforces it.** The
     // list itself is checked in `linux/notify.zig`. This drives the filter the
     // list builds, in a real process, against one call it must permit and one
@@ -1686,6 +1692,8 @@ test "the reader's filter permits its own four calls and kills the rest" {
 }
 
 test "the keeper filter permits reap wait and readiness calls" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // Mutation check: remove wait4, ppoll, or write from keeper_calls. The
     // child then dies from SIGSYS at the missing call.
     const allocator = std.testing.allocator;
@@ -1732,6 +1740,8 @@ test "the keeper filter permits reap wait and readiness calls" {
 }
 
 test "the keeper filter kills a call outside its allowlist" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // Mutation check: end buildKeeper with RET_ALLOW. The child exits 12
     // instead of dying from SIGSYS.
     const allocator = std.testing.allocator;

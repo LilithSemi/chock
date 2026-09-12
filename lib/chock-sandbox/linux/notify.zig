@@ -705,6 +705,8 @@ test "a histogram has one slot for each call a policy can observe" {
 }
 
 test "the handover answers a supervisor that took nothing, so the other side is never left waiting" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // **The deadlock this whole file is written around.** B waits for the
     // answer byte. A that took no descriptor and wrote nothing would leave B
     // in `read` while A waited for B to end, and the tool call would never
@@ -743,6 +745,8 @@ test "the handover answers a supervisor that took nothing, so the other side is 
 }
 
 test "a supervisor that says no stops the observed process rather than letting it run on" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // The other half of the same rule. B that ran on with no supervisor would
     // meet ENOSYS on its first held call, because that is how the kernel
     // answers a filter whose listener nobody holds.
@@ -767,6 +771,8 @@ test "a supervisor that says no stops the observed process rather than letting i
 }
 
 test "the observed side does not wait when the supervisor has already gone" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // Case two of the deadlock argument: A dies before it ever answers. The
     // socket pair is what turns that into a refused call rather than a wait
     // with no end. The send fails with EPIPE, and `MSG_NOSIGNAL` is what keeps
@@ -788,6 +794,8 @@ test "the observed side does not wait when the supervisor has already gone" {
 }
 
 test "a read that ends early is a failure, and never a half filled answer" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
     // **The one line the case above cannot reach.** There the send fails
     // first, so the read never runs. This drives the read itself: the other
     // end shuts down its writing half after two bytes, so a four byte read
