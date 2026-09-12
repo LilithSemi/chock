@@ -4044,7 +4044,7 @@ test "a handle answers Gone once the process it names has been reaped" {
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(pid, &status, 0);
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
     try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(std.posix.SIG.KILL, linux.W.TERMSIG(status));
+    try std.testing.expectEqual(linux.SIG.KILL, linux.W.TERMSIG(status));
 
     // And now the number is free. The handle is not: it survived the reap,
     // which is the whole reason the caller of `spawn` owns it and `spawn`

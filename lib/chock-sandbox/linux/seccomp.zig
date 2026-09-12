@@ -1682,7 +1682,7 @@ test "the reader's filter permits its own four calls and kills the rest" {
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
 
     try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(std.posix.SIG.SYS, linux.W.TERMSIG(status));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
 }
 
 test "the keeper filter permits reap wait and readiness calls" {
@@ -1752,5 +1752,5 @@ test "the keeper filter kills a call outside its allowlist" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
     try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(std.posix.SIG.SYS, linux.W.TERMSIG(status));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
 }
