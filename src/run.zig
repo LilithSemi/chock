@@ -4317,6 +4317,21 @@ fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Er
 }
 
 /// The question `apply.mode = .ask` puts, and the answers it takes.
+/// The words the display's own question region offers.
+///
+/// **Each one is a `Mode.fromAnswer` word.** A person who chooses by number and
+/// a person who types the word reach the same answer, because
+/// `chock_core.ask.chosen` turns the number into the word before this reads it.
+const landing_options = [_][]const u8{ "ref", "merge", "rebase", "squash" };
+
+/// What the display asks. `landing_question` below is the console's own wording,
+/// which can afford more rows than a region has.
+const landing_text =
+    "How should this session's work land? " ++
+    "ref leaves it at the ref, and no branch of yours moves. " ++
+    "merge, rebase and squash carry it onto the branch you have checked out. " ++
+    "Anything else keeps the work at the ref.";
+
 const landing_question =
     \\
     \\chock: this project asks you how the session's work should land.
@@ -4345,15 +4360,43 @@ const landing_question =
 /// at the ref, which is the narrow answer and the one every session had before
 /// modes existed. `chock_core.ask` refuses the same three the same way and for
 /// the same reason.
+/// The landing one answer names, and `ref` for every answer that names none.
+///
+/// **Its own function so it can be driven without a display.** The region a
+/// person answers in cannot be built in a test here, so the part that can be
+/// wrong is the reading of the answer, and that part is this.
+///
+/// **Only a landing word moves a branch.** A person who typed something else,
+/// who pressed Enter, who was never there, or who ran out of time all get the
+/// answer that moves nothing. That is the same rule the console path keeps.
+fn landingFor(answer: chock_core.ask.Answer) chock_policy.apply.Landing {
+    return switch (answer) {
+        .answered => |said| chock_policy.apply.Mode.fromAnswer(said) orelse .ref,
+        .declined, .nobody, .timed_out, .stopped => .ref,
+    };
+}
+
 fn chosenLanding(
+    gpa: std.mem.Allocator,
     io: std.Io,
     mode: chock_policy.apply.Mode,
     screen: ?*ui.Ui,
 ) chock_policy.apply.Landing {
     if (mode.settled()) |landing| return landing;
-    // The display owns this terminal. A bare prompt written into it would be a
-    // second writer of cells the display believes it owns.
-    if (screen != null) return .ref;
+    // **A display has a region for a question, so the question goes there.**
+    // `Ui.showQuestion` carries the options and the countdown, and it is the
+    // region a person is already reached through while a screen is up. A bare
+    // prompt written around the display would land in cells the display
+    // believes it owns, which is why the console path below is not used here.
+    if (screen) |up| {
+        var display = DisplayAsker{ .screen = up };
+        const answer = display.ask(gpa, io, .{
+            .text = landing_text,
+            .options = &landing_options,
+        }) catch return .ref;
+        defer if (answer == .answered) gpa.free(answer.answered);
+        return landingFor(answer);
+    }
     if (!approval.hasTerminal(io)) return .ref;
 
     const stdin = approval.Stdin{};
@@ -6966,7 +7009,7 @@ fn carryCommit(
     defer if (describe_diag) |*d| d.deinit(arena);
     // **Answered before the act is described**, so the description a person
     // reads names the shape they picked. See `chosenLanding`.
-    const landing = chosenLanding(io, started.apply_mode.mode, params.screen);
+    const landing = chosenLanding(gpa, io, started.apply_mode.mode, params.screen);
     const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
         .repository = params.tree.project_root,
         .scratch_object_store = params.tree.object_store_source,
@@ -14431,6 +14474,38 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     try std.testing.expectEqual(chock_policy.apply.Mode.ref, child.mode);
 }
 
+test "only a landing word moves a branch, whichever way the answer arrived" {
+    // The display and the console read one answer the same way, so a person who
+    // chose in the region and a person who typed at a prompt reach the same
+    // landing. Mutation check: make any arm below answer something other than
+    // `.ref` and the half under it fails.
+    const gpa = std.testing.allocator;
+
+    for ([_][]const u8{ "ref", "merge", "rebase", "squash" }) |word| {
+        const said = try gpa.dupe(u8, word);
+        defer gpa.free(said);
+        try std.testing.expectEqualStrings(
+            word,
+            landingFor(.{ .answered = said }).wireName(),
+        );
+    }
+
+    // The words a region shows are surrounded by what a terminal adds, and
+    // `fromAnswer` trims before it reads.
+    const padded = try gpa.dupe(u8, " merge\r\n");
+    defer gpa.free(padded);
+    try std.testing.expectEqual(chock_policy.apply.Landing.merge, landingFor(.{ .answered = padded }));
+
+    // Anything that is not a landing word, and every answer that is not words
+    // at all, moves nothing.
+    const nonsense = try gpa.dupe(u8, "yes please");
+    defer gpa.free(nonsense);
+    try std.testing.expectEqual(chock_policy.apply.Landing.ref, landingFor(.{ .answered = nonsense }));
+    for ([_]chock_core.ask.Answer{ .declined, .nobody, .timed_out, .stopped }) |none| {
+        try std.testing.expectEqual(chock_policy.apply.Landing.ref, landingFor(none));
+    }
+}
+
 test "a session with nobody at the keyboard never lands the work on a branch by itself" {
     // `ask` puts the choice to a person, and a subagent, a daemon session and a
     // `chock run` behind a pipe all have nobody to put it to. The narrow answer
@@ -14443,14 +14518,14 @@ test "a session with nobody at the keyboard never lands the work on a branch by 
     // a terminal, so this is the real reader answering for the real case.
     try std.testing.expectEqual(
         chock_policy.apply.Landing.ref,
-        chosenLanding(io, .ask, null),
+        chosenLanding(std.testing.allocator, io, .ask, null),
     );
 
     // A settled mode needs nobody and is answered without a question.
     for ([_]chock_policy.apply.Mode{ .ref, .merge, .rebase, .squash }) |mode| {
         try std.testing.expectEqualStrings(
             mode.wireName(),
-            chosenLanding(io, mode, null).wireName(),
+            chosenLanding(std.testing.allocator, io, mode, null).wireName(),
         );
     }
 }
