@@ -24,6 +24,9 @@
 //! 3. **A tool result is untrusted text**, exactly like a diagnostic. See
 //!    `textForModel`.
 //! 4. **A server cannot widen what the agent may do while the session runs.**
+//!    And a tool it already declared is decided again on every call, so a
+//!    promise the session made after the list was read still binds. See
+//!    `Session.dispatch`.
 //!
 //! ## The tool list is read one time, and that is the answer to the ratchet
 //!
@@ -35,12 +38,19 @@
 //!
 //! **That is deliberate and it is the ratchet's own rule.** Narrowing is free:
 //! a server that drops a tool answers its own error when the tool is called,
-//! and nothing here has to notice. Widening needs authorisation, and there is
-//! nobody to authorise it at that moment: `Loop.run` holds the session log's
-//! exclusive lock for the whole session, so a question asked from inside a
-//! turn cannot be answered. `lib/chock-broker/network.zig` refuses for the
-//! same reason, and `src/run.zig`'s own `provisionDecision` reads its policy
-//! once at the start for the same reason again.
+//! and nothing here has to notice. Widening needs authorisation, and a tool
+//! that appeared half way through the session was never weighed by anybody at
+//! all, so there is nothing to authorise it against.
+//!
+//! **A question asked from inside a turn can be answered now, and that is a
+//! different fact from the one above.** It used to be that `Loop.run` held the
+//! session log's exclusive lock for the whole session, so a question written
+//! into that log could only be answered by the very loop that was waiting on
+//! it. `lib/chock-broker/socket.zig` ended that, and
+//! `lib/chock-broker/network.zig`'s own top comment carries the reasoning in
+//! full. So `Session.dispatch` does ask, on every call, and the list of tools
+//! is still fixed at the start: what a server may not do is add a tool, and
+//! what this host may do is decide about one of the tools it already admitted.
 //!
 //! So discovery happens one time, at the start, and a `list_changed`
 //! notification changes nothing at all. `chock_core.mcp_driver.Protocol.list_changed`
@@ -68,7 +78,9 @@
 const std = @import("std");
 
 const chock_policy = @import("chock-policy");
+const chock_proto = @import("chock-proto");
 
+const arbiter = @import("arbiter.zig");
 const lsp = @import("lsp.zig");
 const notices = @import("notices.zig");
 const tools = @import("tools.zig");
@@ -416,7 +428,10 @@ pub const Refusal = enum {
     already_declared,
     /// The server declared more than `max_tools_per_server`.
     too_many,
-    /// This project's policy does not answer `allow` for the tool's action.
+    /// This project's policy denies the tool's action outright.
+    ///
+    /// **Only `deny`.** Every other answer the table can give leaves the tool
+    /// offered and decided one call at a time: see `Session.dispatch`.
     policy,
 
     /// One sentence for the person reading the session start.
@@ -426,7 +441,7 @@ pub const Refusal = enum {
             .shadows_built_in => "its name is one of Chock's own tools",
             .already_declared => "another server already declared that name",
             .too_many => "the server declared more tools than this host carries",
-            .policy => "this project's policy does not allow it",
+            .policy => "this project's policy denies it",
         };
     }
 };
@@ -447,6 +462,13 @@ pub const Offer = struct {
     /// What this project's policy answered for `action`, folded over the whole
     /// spawn chain. Filled by the caller: **`chock-core` evaluates no policy
     /// table**, which stays the broker's job. See `src/run.zig`.
+    ///
+    /// **Read once, at the start, and never the last word on a call.** Only
+    /// `deny` decides anything on its own here, and it decides that the tool is
+    /// not offered at all. Every other answer is asked again on each call
+    /// through `Session.asker`, because the table is not the only thing that
+    /// answers: a session can narrow its own policy half way through, and only
+    /// the broker folds those promises in. See `Session.dispatch`.
     decision: chock_policy.table.Decision,
     /// Why this tool is not offered, or null when it is.
     refused: ?Refusal,
@@ -602,6 +624,18 @@ pub const Session = struct {
     /// `dispatch`.
     offers: std.ArrayList(Offer) = .empty,
 
+    /// Who decides one call to a tool this session offers, and the handle that
+    /// question is written through.
+    ///
+    /// **Null refuses every call, and that is the safe direction.** A session
+    /// whose caller never filled this in can reach nobody, so it says so and
+    /// runs nothing: see `chock_core.arbiter.not_asked`. The failure is loud
+    /// rather than silent, which is the point. `src/run.zig` fills it with the
+    /// same `SessionArbiter` every other mid session question in this project
+    /// goes through, and `chock_core.Loop.GiveLocked` fills the handle inside
+    /// it once `Loop.run` holds the log.
+    asker: ?arbiter.Asker = null,
+
     pub fn init(gpa: std.mem.Allocator) Session {
         return .{ .arena = .init(gpa) };
     }
@@ -612,6 +646,19 @@ pub const Session = struct {
         self.offers.deinit(self.arena.child_allocator);
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// Hand this session the log handle its questions are written through.
+    ///
+    /// **Once, after `Loop.run` has taken the lock, and never per call.** See
+    /// `chock_core.Loop.GiveLocked`, which is the seam this is called from, and
+    /// `src/run.zig`'s `GiveLockedToAll`, which is the caller.
+    ///
+    /// **Does nothing for a session that has nobody to ask.** A handle with no
+    /// arbiter behind it decides nothing, so such a session still runs no tool,
+    /// which is the direction `dispatch` takes for it.
+    pub fn giveLocked(self: *Session, locked: *arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
     }
 
     /// Whether this session has any MCP tool at all. A caller reads this
@@ -664,8 +711,13 @@ pub const Session = struct {
                 actionInto(&buffer, server.name, one.name) orelse "";
             const action = try keep.dupe(u8, built);
 
+            // **An action nobody can name is refused and never asked about.**
+            // An empty action matches no rule and reaches no table, and
+            // `dispatch` asks about the action itself, so a question built out
+            // of nothing is a question nobody could answer. `deny` is what
+            // keeps such a tool out of the session the way it always was.
             const decision: chock_policy.table.Decision = if (action.len == 0)
-                .ask
+                .deny
             else
                 policy.decide(one.name, action);
 
@@ -685,7 +737,13 @@ pub const Session = struct {
                 .name = name,
                 .action = action,
                 .decision = decision,
-                .refused = refusal orelse if (decision == .allow) null else .policy,
+                // **Only `deny` keeps a tool out of the session.** `ask`,
+                // `agent_review` and `agent_then_human` all used to land here
+                // as a refusal, which made a row an author wrote to have
+                // somebody asked into a tool nobody was ever offered and
+                // nobody was ever asked about. They are decided one call at a
+                // time now: see `dispatch`.
+                .refused = refusal orelse if (decision == .deny) .policy else null,
                 .definition = .{
                     .name = name,
                     .description = description,
@@ -739,14 +797,38 @@ pub const Session = struct {
     /// reads and acts on, the same rule `chock_core.tools.Registry.dispatch`
     /// already keeps for a tool name the model invented.
     ///
+    /// ## This is the gate, and the one at session start is not
+    ///
+    /// `admit` reads the table once, before the loop runs, and only a `deny`
+    /// decides anything there. Everything else is decided here, on every call,
+    /// through `asker`. Two faults are what put it here.
+    ///
+    /// * **A row of `ask` used to mean "unavailable".** An author who wrote
+    ///   `ask` for an MCP tool got a tool nobody was offered and nobody was
+    ///   ever asked about, which is the answer `deny` already had a word for.
+    ///   `agent_review` and `agent_then_human` went the same way. All three
+    ///   reach the broker now, which is what runs a review and what shows a
+    ///   person a question.
+    /// * **A promise made half way through a session could not bind a tool
+    ///   admitted before it.** `chock_policy.ratchet.narrow` folds a session's
+    ///   own promises into the answer, and only the broker reads them, so a
+    ///   decision taken before the first turn cannot carry one. Asking here
+    ///   means the answer is read after every `restrict_self` the session has
+    ///   made so far.
+    ///
+    /// **Nothing here widens anything.** The question is asked at a later
+    /// moment and of somebody who can answer it, and the answer is still the
+    /// broker's. A tool the table denies is not offered at all, exactly as
+    /// before.
+    ///
     /// The caller owns `text` in the answer and frees it with `gpa.free`.
     pub fn dispatch(
         self: *Session,
         gpa: std.mem.Allocator,
         io: std.Io,
-        name: []const u8,
-        arguments: []const u8,
+        call: tools.ToolCall,
     ) std.mem.Allocator.Error!?Outcome {
+        const name = call.tool;
         const offer = self.find(name) orelse return null;
 
         // **The policy first, and the server second.** A refused tool never
@@ -768,6 +850,17 @@ pub const Session = struct {
             .is_error = true,
         };
 
+        // **After the cheap local checks, and before anything reaches the
+        // process.** A question spent on a call that could not have run either
+        // way costs a person's attention for nothing, which is the rule
+        // `chock_broker.Broker.reviewed` already keeps for a review it knows
+        // cannot finish. Nothing above this line reaches the server.
+        const answer_about_call = try self.askAbout(gpa, io, offer, call.call_id);
+        if (!answer_about_call.permitted) return .{
+            .text = try arbiter.refusalText(gpa, name, answer_about_call),
+            .is_error = true,
+        };
+
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
 
@@ -775,7 +868,7 @@ pub const Session = struct {
             arena_state.allocator(),
             io,
             name,
-            arguments,
+            call.arguments,
             call_budget_ns,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -794,6 +887,46 @@ pub const Session = struct {
         };
 
         return .{ .text = try textForModel(gpa, answer.text), .is_error = answer.is_error };
+    }
+
+    /// Ask about one call to a tool this session offers.
+    ///
+    /// **`offer.action` and never a rebuilt key.** The action was built by
+    /// `actionInto` when the tool was admitted, out of the project's own name
+    /// for the server and the name the server declared, so the key a question
+    /// carries is the key the table was already read with.
+    fn askAbout(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        offer: *const Offer,
+        call_id: []const u8,
+    ) std.mem.Allocator.Error!arbiter.Answer {
+        // An offered tool always has an action: `admit` answers `deny` for a
+        // name it could not build a key out of, and a denied tool never
+        // reaches this function. A broken caller would otherwise reach the
+        // broker with an empty key, which `Broker.request` asserts against.
+        std.debug.assert(offer.action.len > 0);
+
+        const summary = try std.fmt.allocPrint(
+            gpa,
+            "run the tool \"{s}\" that the MCP server \"{s}\" supplies",
+            .{ offer.name, offer.server },
+        );
+        defer gpa.free(summary);
+
+        return arbiter.Asker.decide(self.asker, gpa, io, .{
+            .action = offer.action,
+            .summary = summary,
+            // **The whole effect, and never the arguments.** The same rule
+            // `chock_core.Loop.gateToolCall` keeps: the arguments are written
+            // by a model and read by a program nobody here wrote, and a
+            // question is not the place to put them in front of a person.
+            .detail = offer.action,
+            .reason = "",
+            .tool = offer.name,
+            .tool_call_id = call_id,
+        });
     }
 
     fn serverNamed(self: *Session, name: []const u8) ?*Server {
@@ -1172,6 +1305,66 @@ const FakeDecider = struct {
     }
 };
 
+/// An `Arbiter` that answers what a test tells it to, and records every
+/// question it was asked.
+///
+/// **Counting is what most of these tests actually pin.** A refused call must
+/// never reach the server, and a call the table allowed outright must still
+/// reach this, because that is the whole of how a mid session promise binds a
+/// tool admitted before it was made.
+const FakeArbiter = struct {
+    answer: arbiter.Answer = .{ .permitted = true, .outcome = "allowed_by_policy" },
+    asks: usize = 0,
+    /// The action of the last question, copied out. Bounded by the longest key
+    /// this host builds.
+    last_action: [max_action_bytes]u8 = @splat(0),
+    last_action_len: usize = 0,
+    /// The tool name of the last question, which is part of the policy key.
+    last_tool: [max_name_bytes]u8 = @splat(0),
+    last_tool_len: usize = 0,
+    last_call_id: [max_name_bytes]u8 = @splat(0),
+    last_call_id_len: usize = 0,
+
+    fn arbiterSeam(self: *FakeArbiter) arbiter.Arbiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *arbiter.Locked,
+        ask: arbiter.Ask,
+    ) arbiter.Answer {
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        const self: *FakeArbiter = @ptrCast(@alignCast(ptr));
+        self.asks += 1;
+        self.last_action_len = @min(ask.action.len, self.last_action.len);
+        @memcpy(self.last_action[0..self.last_action_len], ask.action[0..self.last_action_len]);
+        self.last_tool_len = @min(ask.tool.len, self.last_tool.len);
+        @memcpy(self.last_tool[0..self.last_tool_len], ask.tool[0..self.last_tool_len]);
+        self.last_call_id_len = @min(ask.tool_call_id.len, self.last_call_id.len);
+        @memcpy(self.last_call_id[0..self.last_call_id_len], ask.tool_call_id[0..self.last_call_id_len]);
+        return self.answer;
+    }
+
+    fn action(self: *const FakeArbiter) []const u8 {
+        return self.last_action[0..self.last_action_len];
+    }
+
+    fn tool(self: *const FakeArbiter) []const u8 {
+        return self.last_tool[0..self.last_tool_len];
+    }
+
+    fn callId(self: *const FakeArbiter) []const u8 {
+        return self.last_call_id[0..self.last_call_id_len];
+    }
+};
+
 /// One server, one fake host, and a session that admitted its list. The whole
 /// bench, so a test reads as the fact it pins.
 const Bench = struct {
@@ -1179,6 +1372,14 @@ const Bench = struct {
     server: Server,
     fake: FakeHost,
     policy: FakeDecider,
+    judge: FakeArbiter,
+    /// The log a question would be written through. **Real storage and a real
+    /// lock**, because `arbiter.Asker` holds the very handle `Loop.run` holds
+    /// and a stand-in pointer would prove nothing about the shape.
+    backing: chock_proto.storage.Memory = undefined,
+    store: chock_proto.storage.Storage = undefined,
+    locked: arbiter.Locked = undefined,
+    armed: bool = false,
 
     fn init(gpa: std.mem.Allocator) Bench {
         return .{
@@ -1186,7 +1387,27 @@ const Bench = struct {
             .server = undefined,
             .fake = .{},
             .policy = .{},
+            .judge = .{},
         };
+    }
+
+    /// Open a real log and take its lock, the way `Loop.run` does.
+    ///
+    /// **Separate from `init` for the reason `admit` is**: the handle points at
+    /// the storage beside it, and a struct returned by value moves.
+    fn openLog(self: *Bench, io: std.Io) !void {
+        const gpa = self.session.arena.child_allocator;
+        self.backing = try chock_proto.storage.Memory.init(gpa, "01MCPBENCH");
+        self.store = self.backing.storage();
+        self.locked = try self.store.lock(io);
+        self.armed = true;
+    }
+
+    /// Give this session somebody to ask, over that handle. A test that never
+    /// calls this pins what a session with nobody to ask does.
+    fn arm(self: *Bench, io: std.Io) !void {
+        try self.openLog(io);
+        self.session.asker = .{ .arbiter = self.judge.arbiterSeam(), .locked = &self.locked };
     }
 
     /// Finish building and admit `declared`. Separate from `init` because
@@ -1199,9 +1420,18 @@ const Bench = struct {
     }
 
     fn deinit(self: *Bench) void {
+        if (self.armed) {
+            self.locked.unlock(testing.io) catch {};
+            self.store.close(testing.io);
+        }
         self.session.deinit();
     }
 };
+
+/// One `ToolCall` for a bench test, so a test names the tool and nothing else.
+fn callOf(name: []const u8, arguments: []const u8) tools.ToolCall {
+    return .{ .call_id = "call1", .tool = name, .arguments = arguments };
+}
 
 test "a project that names no MCP server has no settings, and no block is the same answer" {
     // The first rule of this whole file: a project with no server must cost
@@ -1240,8 +1470,8 @@ test "a session with no server offers nothing, dispatches nothing, and starts no
     try session.appendDefinitions(gpa, &out);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 
-    try testing.expect(try session.dispatch(gpa, testing.io, "read_file", "{}") == null);
-    try testing.expect(try session.dispatch(gpa, testing.io, "anything", "{}") == null);
+    try testing.expect(try session.dispatch(gpa, testing.io, callOf("read_file", "{}")) == null);
+    try testing.expect(try session.dispatch(gpa, testing.io, callOf("anything", "{}")) == null);
     try testing.expect(session.find("read_file") == null);
 }
 
@@ -1434,64 +1664,59 @@ test "a name a second server already declared is refused, and the first server k
     try testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
-test "an MCP tool the policy does not allow is not offered, and calling it runs nothing" {
+test "an MCP tool the policy denies is not offered, and calling it runs nothing" {
     // "Refused by policy the same way any other action is": the key goes
-    // through the same `Decision` every other question answers, and only
-    // `allow` permits. `ask` is a refusal here for the reason
-    // `lib/chock-broker/network.zig` gives in full: the loop holds the session
-    // log's exclusive lock, so a question asked from inside a turn cannot be
-    // answered by anybody.
+    // through the same `Decision` every other question answers. **`deny` is
+    // the only answer that keeps a tool out of the session**, and a tool kept
+    // out is never reached even when a model names it anyway.
     //
-    // Mutation check: read `decision != .deny` instead of `decision == .allow`
-    // in `admit` and the first four cases below offer the tool.
+    // Mutation check: read `decision != .allow` instead of `decision == .deny`
+    // in `admit` and the `ask` case below is turned away with the deny case,
+    // which the next test catches.
     const gpa = testing.allocator;
 
-    const refusing = [_]chock_policy.table.Decision{
-        .ask,
-        .deny,
-        .agent_review,
-        .agent_then_human,
-    };
-    for (refusing) |answer| {
-        var bench = Bench.init(gpa);
-        defer bench.deinit();
-        bench.policy.answer = answer;
-        try bench.admit("time", &.{.{ .name = "get_current_time" }});
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    bench.policy.answer = .deny;
+    try bench.arm(testing.io);
+    try bench.admit("time", &.{.{ .name = "get_current_time" }});
 
-        // The action really was asked about, so this is the policy and not a
-        // shape rule turning it away.
-        try testing.expectEqual(@as(usize, 1), bench.policy.asks);
-        try testing.expectEqualStrings("mcp.time.tool.get_current_time", bench.policy.asked(0));
+    // The action really was asked about, so this is the policy and not a
+    // shape rule turning it away.
+    try testing.expectEqual(@as(usize, 1), bench.policy.asks);
+    try testing.expectEqualStrings("mcp.time.tool.get_current_time", bench.policy.asked(0));
 
-        var out: std.ArrayList(tools.Definition) = .empty;
-        defer out.deinit(gpa);
-        try bench.session.appendDefinitions(gpa, &out);
-        try testing.expectEqual(@as(usize, 0), out.items.len);
+    var out: std.ArrayList(tools.Definition) = .empty;
+    defer out.deinit(gpa);
+    try bench.session.appendDefinitions(gpa, &out);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
 
-        // And a model that names it anyway gets a refusal, not a run. **The
-        // count is the test**: the server was never reached.
-        const outcome = (try bench.session.dispatch(gpa, testing.io, "get_current_time", "{}")).?;
-        defer gpa.free(outcome.text);
-        try testing.expect(outcome.is_error);
-        try testing.expect(std.mem.indexOf(u8, outcome.text, not_offered) != null);
-        try testing.expectEqual(@as(usize, 0), bench.fake.calls);
-    }
+    // And a model that names it anyway gets a refusal, not a run. **The two
+    // counts are the test**: neither the server nor an arbiter was reached, so
+    // a denied tool costs nobody a question.
+    const outcome = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(outcome.text);
+    try testing.expect(outcome.is_error);
+    try testing.expect(std.mem.indexOf(u8, outcome.text, not_offered) != null);
+    try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+    try testing.expectEqual(@as(usize, 0), bench.judge.asks);
 
     // And `allow` on the same tool really does offer it and really does run
-    // it, or every case above is vacuous.
+    // it, or the case above is vacuous.
     var permitted = Bench.init(gpa);
     defer permitted.deinit();
     permitted.policy.answer = .allow;
     permitted.fake.answer = .{ .text = "it is noon", .is_error = false };
+    try permitted.arm(testing.io);
     try permitted.admit("time", &.{.{ .name = "get_current_time" }});
 
-    var out: std.ArrayList(tools.Definition) = .empty;
-    defer out.deinit(gpa);
-    try permitted.session.appendDefinitions(gpa, &out);
-    try testing.expectEqual(@as(usize, 1), out.items.len);
-    try testing.expectEqualStrings("get_current_time", out.items[0].name);
+    var offered: std.ArrayList(tools.Definition) = .empty;
+    defer offered.deinit(gpa);
+    try permitted.session.appendDefinitions(gpa, &offered);
+    try testing.expectEqual(@as(usize, 1), offered.items.len);
+    try testing.expectEqualStrings("get_current_time", offered.items[0].name);
 
-    const ran = (try permitted.session.dispatch(gpa, testing.io, "get_current_time", "{\"tz\":\"UTC\"}")).?;
+    const ran = (try permitted.session.dispatch(gpa, testing.io, callOf("get_current_time", "{\"tz\":\"UTC\"}"))).?;
     defer gpa.free(ran.text);
     try testing.expect(!ran.is_error);
     try testing.expectEqualStrings("it is noon", ran.text);
@@ -1499,6 +1724,163 @@ test "an MCP tool the policy does not allow is not offered, and calling it runs 
     // The arguments crossed unchanged, so the seam really is the production
     // one and not a stand-in that rewrites them.
     try testing.expectEqualStrings("{\"tz\":\"UTC\"}", permitted.fake.last_arguments);
+}
+
+test "an MCP tool whose row asks is offered, and every call reaches a person before the server" {
+    // **The defect this pins.** A row of `ask` used to mean the tool was never
+    // offered and nobody was ever asked, which is what `deny` already means. A
+    // project owner who wrote `ask` got a silent refusal instead of a question.
+    // `agent_review` and `agent_then_human` went the same way, and the broker
+    // is what runs a review, so all three belong on the same path.
+    //
+    // **Which of the three ends at a person, at a reviewer, or at both is
+    // `chock_broker.Broker.request`'s own switch on the decision**, and it is
+    // not this file's to decide. What this file owes is the question: all
+    // three reach the broker, and the broker answers each the way its row
+    // says.
+    //
+    // Mutation check: drop the `askAbout` call from `dispatch` and the server
+    // is reached with nobody asked, which `judge.asks` catches.
+    const gpa = testing.allocator;
+
+    const asking = [_]chock_policy.table.Decision{ .ask, .agent_review, .agent_then_human };
+    for (asking) |answer| {
+        var bench = Bench.init(gpa);
+        defer bench.deinit();
+        bench.policy.answer = answer;
+        bench.fake.answer = .{ .text = "it is noon", .is_error = false };
+        try bench.arm(testing.io);
+        try bench.admit("time", &.{.{ .name = "get_current_time" }});
+
+        // Offered, which is the first half: a model cannot be asked about a
+        // tool it was never told exists.
+        var out: std.ArrayList(tools.Definition) = .empty;
+        defer out.deinit(gpa);
+        try bench.session.appendDefinitions(gpa, &out);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+
+        // Refused, and the server never reached, when the answer is no.
+        bench.judge.answer = .{ .permitted = false, .outcome = "refused_by_user" };
+        const refused = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+        defer gpa.free(refused.text);
+        try testing.expect(refused.is_error);
+        try testing.expect(std.mem.indexOf(u8, refused.text, "refused_by_user") != null);
+        try testing.expectEqual(@as(usize, 1), bench.judge.asks);
+        try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+
+        // The question named the tool's own key, the tool itself, and the call
+        // it came from, so it lands on the rule the project owner wrote.
+        try testing.expectEqualStrings("mcp.time.tool.get_current_time", bench.judge.action());
+        try testing.expectEqualStrings("get_current_time", bench.judge.tool());
+        try testing.expectEqualStrings("call1", bench.judge.callId());
+
+        // And permitted, the same tool really runs, so the refusal above is
+        // the answer and not the path.
+        bench.judge.answer = .{ .permitted = true, .outcome = "approved_by_user" };
+        const ran = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+        defer gpa.free(ran.text);
+        try testing.expect(!ran.is_error);
+        try testing.expectEqualStrings("it is noon", ran.text);
+        try testing.expectEqual(@as(usize, 2), bench.judge.asks);
+        try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+    }
+}
+
+test "an MCP tool the table allowed is still asked about on every call, so a later promise binds it" {
+    // **The second half of the defect.** The tool list and its decisions are
+    // read once, before the loop runs, and a session can narrow its own policy
+    // after that. `chock_policy.ratchet.narrow` folds those promises into the
+    // answer and only the broker reads them, so a gate that trusted the
+    // decision taken at the start could not see a promise made half way
+    // through. Asking on every call is what makes one bind.
+    //
+    // Mutation check: ask only when `offer.decision != .allow` in `dispatch`
+    // and the refusal below becomes a run.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    bench.policy.answer = .allow;
+    bench.fake.answer = .{ .text = "it is noon", .is_error = false };
+    try bench.arm(testing.io);
+    try bench.admit("time", &.{.{ .name = "get_current_time" }});
+    try testing.expect(bench.session.find("get_current_time").?.refused == null);
+
+    // The first call runs, and the arbiter was asked even though the table
+    // said `allow` outright.
+    const first = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(first.text);
+    try testing.expect(!first.is_error);
+    try testing.expectEqual(@as(usize, 1), bench.judge.asks);
+
+    // Now somebody narrows the session. The table has not changed and the
+    // offer has not changed, and the very next call is refused anyway.
+    bench.judge.answer = .{ .permitted = false, .outcome = "denied_by_policy" };
+    const second = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(second.text);
+    try testing.expect(second.is_error);
+    try testing.expect(std.mem.indexOf(u8, second.text, "denied_by_policy") != null);
+    try testing.expectEqual(@as(usize, 2), bench.judge.asks);
+    try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+}
+
+test "an MCP session with nobody to ask runs nothing, and says that is what happened" {
+    // **Fail closed, and loudly.** A caller that never filled in `asker` can
+    // reach nobody, so every call is refused and the refusal says nobody was
+    // asked rather than that somebody said no. The two are different facts,
+    // and a session that got this wrong in the permissive direction would run
+    // a third party tool with no gate at all.
+    //
+    // Mutation check: have `arbiter.Asker.decide` permit when the asker is
+    // null and the server below is reached.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    bench.policy.answer = .allow;
+    bench.fake.answer = .{ .text = "it is noon", .is_error = false };
+    try bench.admit("time", &.{.{ .name = "get_current_time" }});
+
+    const outcome = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(outcome.text);
+    try testing.expect(outcome.is_error);
+    try testing.expect(std.mem.indexOf(u8, outcome.text, arbiter.not_asked.outcome) != null);
+    try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+}
+
+test "a session whose log handle has not arrived asks nobody, and the handle is what changes that" {
+    // **The seam that is easy to build and easy to forget to wire.** An
+    // arbiter is known before the session starts and the log handle is not:
+    // `Loop.run` takes the lock, and only then does `Loop.GiveLocked` hand the
+    // handle over. Until that happens a question has nothing to travel
+    // through, so a call is refused and says nobody was asked.
+    //
+    // Mutation check: have `arbiter.Asker.decide` permit when `locked` is null
+    // and the first call below reaches the server with no handle at all.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    bench.policy.answer = .allow;
+    bench.fake.answer = .{ .text = "it is noon", .is_error = false };
+    try bench.admit("time", &.{.{ .name = "get_current_time" }});
+
+    // An arbiter, and no handle yet. This is the state every session is in
+    // between the caller naming an arbiter and the loop taking the lock.
+    bench.session.asker = .{ .arbiter = bench.judge.arbiterSeam() };
+    const early = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(early.text);
+    try testing.expect(early.is_error);
+    try testing.expect(std.mem.indexOf(u8, early.text, arbiter.not_asked.outcome) != null);
+    try testing.expectEqual(@as(usize, 0), bench.judge.asks);
+    try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+
+    // The handle arrives through the one seam that carries it, and the same
+    // call reaches the arbiter and then the server.
+    try bench.openLog(testing.io);
+    bench.session.giveLocked(&bench.locked);
+    const later = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
+    defer gpa.free(later.text);
+    try testing.expect(!later.is_error);
+    try testing.expectEqual(@as(usize, 1), bench.judge.asks);
+    try testing.expectEqual(@as(usize, 1), bench.fake.calls);
 }
 
 test "a tool whose name is not a name is refused, and no policy key is ever built from it" {
@@ -1615,9 +1997,10 @@ test "a tool result really does reach the context through the flattening, and no
     var bench = Bench.init(gpa);
     defer bench.deinit();
     bench.fake.answer = .{ .text = "ok\x1b[2Jgone", .is_error = false };
+    try bench.arm(testing.io);
     try bench.admit("s", &.{.{ .name = "t" }});
 
-    const outcome = (try bench.session.dispatch(gpa, testing.io, "t", "{}")).?;
+    const outcome = (try bench.session.dispatch(gpa, testing.io, callOf("t", "{}"))).?;
     defer gpa.free(outcome.text);
     try testing.expectEqualStrings("ok[2Jgone", outcome.text);
 }
@@ -1633,10 +2016,11 @@ test "a server that is late answers this call and still answers the next one" {
     const gpa = testing.allocator;
     var bench = Bench.init(gpa);
     defer bench.deinit();
+    try bench.arm(testing.io);
     try bench.admit("s", &.{.{ .name = "t" }});
 
     bench.fake.call_fails = error.Late;
-    const late = (try bench.session.dispatch(gpa, testing.io, "t", "{}")).?;
+    const late = (try bench.session.dispatch(gpa, testing.io, callOf("t", "{}"))).?;
     defer gpa.free(late.text);
     try testing.expect(late.is_error);
     try testing.expect(bench.server.failure == null);
@@ -1644,7 +2028,7 @@ test "a server that is late answers this call and still answers the next one" {
     // The server answers after all, and the tool works.
     bench.fake.call_fails = null;
     bench.fake.answer = .{ .text = "here", .is_error = false };
-    const good = (try bench.session.dispatch(gpa, testing.io, "t", "{}")).?;
+    const good = (try bench.session.dispatch(gpa, testing.io, callOf("t", "{}"))).?;
     defer gpa.free(good.text);
     try testing.expect(!good.is_error);
     try testing.expectEqualStrings("here", good.text);
@@ -1661,17 +2045,18 @@ test "a server that died answers at once for the rest of the session, and never 
     const gpa = testing.allocator;
     var bench = Bench.init(gpa);
     defer bench.deinit();
+    try bench.arm(testing.io);
     try bench.admit("s", &.{.{ .name = "t" }});
 
     bench.fake.call_fails = error.Gone;
-    const first = (try bench.session.dispatch(gpa, testing.io, "t", "{}")).?;
+    const first = (try bench.session.dispatch(gpa, testing.io, callOf("t", "{}"))).?;
     defer gpa.free(first.text);
     try testing.expect(first.is_error);
     try testing.expectEqualStrings(start_failed, bench.server.failure.?);
     try testing.expectEqual(@as(usize, 1), bench.fake.calls);
 
     // Every later call is refused without reaching the server at all.
-    const second = (try bench.session.dispatch(gpa, testing.io, "t", "{}")).?;
+    const second = (try bench.session.dispatch(gpa, testing.io, callOf("t", "{}"))).?;
     defer gpa.free(second.text);
     try testing.expect(second.is_error);
     try testing.expectEqual(@as(usize, 1), bench.fake.calls);
@@ -1683,7 +2068,7 @@ test "a server that died answers at once for the rest of the session, and never 
     var both = [_]Server{ bench.server, other };
     bench.session.servers = &both;
     try bench.session.admit(&both[1], &.{.{ .name = "u" }}, bench.policy.decider());
-    const still = (try bench.session.dispatch(gpa, testing.io, "u", "{}")).?;
+    const still = (try bench.session.dispatch(gpa, testing.io, callOf("u", "{}"))).?;
     defer gpa.free(still.text);
     try testing.expect(!still.is_error);
     try testing.expectEqualStrings("fine", still.text);
@@ -1700,9 +2085,10 @@ test "a tool that says it failed is a result and not a fault of the harness" {
     var bench = Bench.init(gpa);
     defer bench.deinit();
     bench.fake.answer = .{ .text = "Invalid timezone", .is_error = true };
+    try bench.arm(testing.io);
     try bench.admit("time", &.{.{ .name = "get_current_time" }});
 
-    const outcome = (try bench.session.dispatch(gpa, testing.io, "get_current_time", "{}")).?;
+    const outcome = (try bench.session.dispatch(gpa, testing.io, callOf("get_current_time", "{}"))).?;
     defer gpa.free(outcome.text);
     try testing.expect(outcome.is_error);
     try testing.expectEqualStrings("Invalid timezone", outcome.text);

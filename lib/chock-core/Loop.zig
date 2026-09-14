@@ -2248,16 +2248,23 @@ fn askForSummary(
 /// `self.state.session.dispatch(...) orelse return self.inner.dispatch(...)`,
 /// and `chock_core.mcp.Session.dispatch` answers a real outcome for any
 /// admitted name without ever falling through, so the call runs. This
-/// function does not tell the two cases apart. It does not need to, because
-/// an MCP or plugin tool was already gated once, before the loop ever ran,
-/// when its own server list was admitted against `mcp.<server>.<tool>`.
+/// function does not tell the two cases apart, and it does not need to.
 ///
-/// **That session start gate has two limits worth recording here, because a
-/// future reader needs them.** It never consults `deps.arbiter`, so a row of
-/// `.ask` for an MCP or plugin tool becomes a permanent refusal at session
-/// start, and no person or reviewer is ever asked. And it is evaluated once,
-/// before the loop runs, so a mid-session `restrict_self` narrowing cannot
-/// bind an MCP or plugin tool call.
+/// **An MCP or plugin tool is gated at its own door instead, and that door is
+/// the one this file cannot reach.** The gate used to be the session start
+/// admission alone, which had two faults. It never consulted an arbiter, so a
+/// row of `.ask` was a permanent refusal that no person or reviewer ever saw.
+/// And it ran once, before the loop, so a mid session `restrict_self` could
+/// not bind a tool that was admitted before the promise was made. Both are
+/// fixed where the call reaches the third party process:
+/// `chock_core.mcp.Session.dispatch` and `chock_core.plugin.Session.dispatch`
+/// now ask through `chock_core.arbiter.Asker` on every call, with the same
+/// broker and the same `Answer` this function reads, and they refuse with the
+/// same `arbiter_mod.refusalText`. Admission still refuses a `.deny` outright,
+/// so a tool nobody may call is never offered and costs no context. The gate
+/// is at the door and not here because the action name belongs to the session
+/// that admitted the tool, and because `Session.dispatch` is the only route to
+/// the process at all.
 fn gateToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2322,23 +2329,13 @@ fn gateToolCall(
 
     if (answer.permitted) return null;
 
-    // **The rule and the alternative, never the reason.** `answer.outcome`
-    // and `answer.review_text` are the only two fields `Answer` carries
-    // beside `permitted`, and neither ever holds a reviewer's own reasoning:
-    // see `lib/chock-core/arbiter.zig`'s own top comment. A model told why a
-    // wall exists is a model handed the same map a red team session already
-    // used once: see the changelog entry this rule comes from.
-    return try gateRefusal(allocator, call, try std.fmt.allocPrint(
-        allocator,
-        "nothing ran: \"{s}\" needs approval to run and the answer was \"{s}\". {s}{s}Do the part " ++
-            "of the task that does not need it, or stop and say what is left and why.",
-        .{
-            call.tool,
-            answer.outcome,
-            answer.review_text,
-            if (answer.review_text.len == 0) "" else " ",
-        },
-    ));
+    // **One sentence, written once.** `arbiter_mod.refusalText` is the same
+    // text `chock_core.mcp.Session.dispatch` and
+    // `chock_core.plugin.Session.dispatch` refuse a third party tool with, and
+    // it carries the rule and the alternative and never the reason: a model
+    // told why a wall exists is a model handed the same map a red team session
+    // already used once.
+    return try gateRefusal(allocator, call, try arbiter_mod.refusalText(allocator, call.tool, answer));
 }
 
 /// What `gateToolCall` answers when `Tool.actionInto` itself could not name

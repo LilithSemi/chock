@@ -55,6 +55,8 @@ const helper = chock_core.helper;
 const mcp = chock_core.mcp;
 const mcp_driver = chock_core.mcp_driver;
 
+const chock_proto = @import("chock-proto");
+
 /// The server this suite runs, found on the dev shell's own `PATH` when the
 /// project was built. **Null is an ordinary answer**: a machine whose shell has
 /// no MCP server skips these tests rather than failing them, and a test that
@@ -62,6 +64,62 @@ const mcp_driver = chock_core.mcp_driver;
 const server_path: ?[]const u8 = @import("mcp_real_path").mcp_server_time_path;
 
 const testing = std.testing;
+
+/// An `Arbiter` that permits every call, so this file measures the protocol and
+/// not the policy.
+///
+/// **A session with no arbiter runs no MCP tool at all**, which is the rule
+/// `chock_core.mcp.Session.dispatch` keeps: a third party tool is decided one
+/// call at a time by whoever the caller named, and a caller that named nobody
+/// refuses. This file names this.
+const PermitAll = struct {
+    var anchor: u8 = 0;
+
+    fn arbiter() chock_core.arbiter.Arbiter {
+        return .{ .ptr = &anchor, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *chock_core.arbiter.Locked,
+        ask: chock_core.arbiter.Ask,
+    ) chock_core.arbiter.Answer {
+        _ = ptr;
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        _ = ask;
+        return .{ .permitted = true, .outcome = "allowed_by_policy" };
+    }
+};
+
+/// A real session log, locked the way `Loop.run` locks one, so the handle an
+/// arbiter is given here is the shape a real one is given.
+const LockedLog = struct {
+    backing: chock_proto.storage.Memory,
+    store: chock_proto.storage.Storage = undefined,
+    locked: chock_core.arbiter.Locked = undefined,
+
+    fn init(gpa: std.mem.Allocator) !LockedLog {
+        return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01MCPREAL") };
+    }
+
+    /// Separate from `init` because the handle points at the storage beside it,
+    /// and a struct returned by value moves.
+    fn arm(self: *LockedLog, io: std.Io) !void {
+        self.store = self.backing.storage();
+        self.locked = try self.store.lock(io);
+    }
+
+    fn deinit(self: *LockedLog, io: std.Io) void {
+        self.locked.unlock(io) catch {};
+        self.store.close(io);
+    }
+};
 
 /// A real server on two real pipes, and the production channel over them.
 const RealServer = struct {
@@ -173,13 +231,22 @@ test "a real tool runs, and its answer reaches the context through the flattenin
     );
     try session.admit(&one, declared, policy.decider());
 
+    var log = try LockedLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    session.asker = .{ .arbiter = PermitAll.arbiter(), .locked = &log.locked };
+
     // Not one real tool name shadows a built-in, so the server loads.
     try testing.expect(one.failure == null);
     try testing.expect(!session.isEmpty());
 
-    const outcome = (try session.dispatch(gpa, io, "get_current_time",
+    const outcome = (try session.dispatch(gpa, io, .{
+        .call_id = "call1",
+        .tool = "get_current_time",
+        .arguments =
         \\{"timezone":"UTC"}
-    )).?;
+        ,
+    })).?;
     defer gpa.free(outcome.text);
 
     try testing.expect(!outcome.is_error);

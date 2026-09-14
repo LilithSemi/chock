@@ -35,6 +35,7 @@ const builtin = @import("builtin");
 
 const chock_core = @import("chock-core");
 const chock_policy = @import("chock-policy");
+const chock_proto = @import("chock-proto");
 const core = @import("chock-plugin-core");
 const paths = @import("engine_paths");
 const sandbox = @import("chock-sandbox");
@@ -45,6 +46,62 @@ const plugin_host = chock_core.plugin_host;
 const plugin_module = chock_core.plugin_module;
 
 const testing = std.testing;
+
+/// One `ToolCall` for a test, so a test names the tool and nothing else.
+fn callOf(name: []const u8) chock_core.tools.ToolCall {
+    return .{ .call_id = "call1", .tool = name, .arguments = "{}" };
+}
+
+/// An `Arbiter` that permits every call, so this file measures the engine and
+/// the sandbox and not the policy.
+const PermitAll = struct {
+    var anchor: u8 = 0;
+
+    fn arbiter() chock_core.arbiter.Arbiter {
+        return .{ .ptr = &anchor, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *chock_core.arbiter.Locked,
+        ask: chock_core.arbiter.Ask,
+    ) chock_core.arbiter.Answer {
+        _ = ptr;
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        _ = ask;
+        return .{ .permitted = true, .outcome = "allowed_by_policy" };
+    }
+};
+
+/// A real session log, locked the way `Loop.run` locks one, so the handle an
+/// arbiter is given here is the shape a real one is given.
+const LockedLog = struct {
+    backing: chock_proto.storage.Memory,
+    store: chock_proto.storage.Storage = undefined,
+    locked: chock_core.arbiter.Locked = undefined,
+
+    fn init(gpa: std.mem.Allocator) !LockedLog {
+        return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01PLUGREAL") };
+    }
+
+    /// Separate from `init` because the handle points at the storage beside it,
+    /// and a struct returned by value moves.
+    fn arm(self: *LockedLog, io: std.Io) !void {
+        self.store = self.backing.storage();
+        self.locked = try self.store.lock(io);
+    }
+
+    fn deinit(self: *LockedLog, io: std.Io) void {
+        self.locked.unlock(io) catch {};
+        self.store.close(io);
+    }
+};
 
 /// The plugin the project ships, built for `wasm32-freestanding`.
 const wasm_path: []const u8 = paths.plugin_wasm_path;
@@ -456,11 +513,11 @@ test "a project with no plugin starts no process at all" {
     try testing.expectEqual(@as(usize, 0), session.plugins.len);
     try testing.expectEqual(
         @as(?plugin.Outcome, null),
-        try session.dispatch(gpa, testing.io, "read_file", "{}"),
+        try session.dispatch(gpa, testing.io, callOf("read_file")),
     );
     try testing.expectEqual(
         @as(?plugin.Outcome, null),
-        try session.dispatch(gpa, testing.io, "hello", "{}"),
+        try session.dispatch(gpa, testing.io, callOf("hello")),
     );
 
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
@@ -612,7 +669,16 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     var loaded = [_]plugin.Loaded{.{ .name = "hello", .host = driver.host() }};
     session.plugins = &loaded;
 
-    const outcome = (try session.dispatch(gpa, io, "hello", "{}")).?;
+    // **A tool a plugin supplies is decided one call at a time now**, so a
+    // session with nobody to ask runs nothing: see
+    // `chock_core.plugin.Session.asker`. This file measures the engine and the
+    // sandbox, so the answer here is always yes.
+    var log = try LockedLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    session.asker = .{ .arbiter = PermitAll.arbiter(), .locked = &log.locked };
+
+    const outcome = (try session.dispatch(gpa, io, callOf("hello"))).?;
     defer gpa.free(outcome.text);
 
     // **No skip here, and none is possible.** This test runs on Linux only,
@@ -625,7 +691,7 @@ test "a tool name reaches a real plugin host in a real sandbox, and the guest's 
     // is what makes the runner above pass every built-in call straight through.
     try testing.expectEqual(
         @as(?plugin.Outcome, null),
-        try session.dispatch(gpa, io, "read_file", "{}"),
+        try session.dispatch(gpa, io, callOf("read_file")),
     );
 }
 

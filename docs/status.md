@@ -101,11 +101,34 @@ tenth.
   `net.connect.*`. `request_action` is decided at the requested act's own
   name. `update_plan`, `ask_user` and `set_title` grant no capability and
   need no key at all. An MCP or plugin tool is not asked about by this gate
-  either: it is gated once, at session start, against
-  `mcp.<server>.<tool>`, and that gate never consults `deps.arbiter` and
-  never runs again, so an `.ask` row for one becomes a permanent refusal
-  with no person asked, and a mid-session `restrict_self` narrowing does not
-  bind it.
+  either, and it is gated at its own door instead.
+  `chock_core.mcp.Session.dispatch` and
+  `chock_core.plugin.Session.dispatch` ask `chock_core.arbiter.Asker` on
+  every call, through the same broker every other mid-session question goes
+  through. Session start still reads the table once, and a `deny` there
+  keeps the tool out of the session entirely, so a denied tool costs no
+  context and nobody a question. An `.ask`, `agent_review` or
+  `agent_then_human` row is put to the broker, which answers each the way
+  its row says, and a mid-session `restrict_self` narrowing binds the very
+  next call. A session with nobody to ask runs no such tool at all.
+
+  **The two key shapes, written out, because a rule that matches nothing
+  looks exactly like a rule that allows.** An MCP tool is
+  `mcp.<server>.tool.<tool>` and a plugin tool is
+  `plugin.<plugin>.tool.<tool>`. The `tool` segment is there so that a tool
+  a third party names `network` cannot become a rule about
+  `mcp.<server>.network`, which is a separate key about whether that
+  server's process reaches a host at all. A plugin tool is also priced
+  against each capability it declares, under that capability's own ordinary
+  action name such as `fs.write`, and those are asked about per call too.
+  So:
+
+  ```zon
+  .{ .action = "mcp.*", .decision = .deny },                            // no MCP tool at all
+  .{ .action = "mcp.time.tool.*", .decision = .allow },                 // every tool of that server
+  .{ .action = "mcp.time.tool.get_current_time", .decision = .ask },    // that one tool, per call
+  .{ .action = "plugin.hello.tool.greet", .decision = .agent_review },  // that one plugin tool
+  ```
 
   What is still missing is a way for the agent to ask about a wider act.
   `request_action` is now in `chock_core.tools.Tool`, and it takes
@@ -177,9 +200,13 @@ tenth.
   **Measured on a real Mac, macOS 15.7.9 with Nix 2.34.8 and `sandbox =
   relaxed`, on 2026-08-26**, both ways on the one machine: from a login shell
   the suite ran 103 of 103 steps with 2168 of 2192 tests passed and 24 skipped,
-  and the two Darwin escape suites ran 13 and 3 tests with nothing skipped.
+  and the two Darwin escape suites ran 17 and 3 tests with nothing skipped.
   Inside `nix build` the same suite skipped 46, and the two escape suites
-  skipped whole.
+  skipped whole. **Every figure in this paragraph but the escape suite counts
+  is that one measurement and is not re-measured here.** The counts are read
+  from the files themselves: `test/sandbox/darwin_escape.zig` holds 17 tests
+  and `test/workspace/darwin_escape.zig` holds 3, and the first of those was
+  13 until `fff60fe` added four Mach tests.
   The `test-sandbox` job runs the same suite on a macOS runner, outside any Nix
   builder, which is also how a person runs Chock. That job first proves the
   runner can enter a profile, and it fails rather than skips when it cannot,

@@ -443,12 +443,27 @@ pub const Runner = struct {
     }
 };
 
-/// The union of the capabilities every offered tool of one plugin declared.
+/// The union of the capabilities every allowed tool of one plugin declared.
 ///
 /// One instance serves every tool of a plugin, so the import set has to cover
 /// all of them. **A refused tool contributes nothing**, because a tool the
 /// policy did not allow must not widen what the plugin's guest code can reach
 /// through some other tool.
+///
+/// **And neither does a tool that still has to ask.** A tool whose own action
+/// is `ask`, `agent_review` or `agent_then_human` is offered to the model and
+/// decided one call at a time by `plugin.Session.dispatch`, so it may never
+/// run at all. An import is supplied once, before instantiation, and cannot be
+/// taken back: a guest handed one because of a tool nobody has approved yet
+/// would reach it from inside a tool that was allowed outright. So the import
+/// set is what the table allowed and nothing more, which is exactly what it
+/// was before such a tool was offered at all.
+///
+/// **The honest limit of that.** A tool that has to ask, and that declares a
+/// capability, runs without the imports its capability would supply. In this
+/// build that changes nothing, because `importsFor` answers empty for every
+/// capability. A build that supplies a real import has to decide that case
+/// deliberately, and the safe direction is this one.
 pub fn unionOfCapabilities(
     gpa: std.mem.Allocator,
     session: *const plugin.Session,
@@ -458,6 +473,7 @@ pub fn unionOfCapabilities(
     errdefer out.deinit(gpa);
     for (session.offers.items) |offer| {
         if (offer.refused != null) continue;
+        if (offer.decision != .allow) continue;
         if (!std.mem.eql(u8, offer.plugin, name)) continue;
         for (offer.capabilities) |capability| {
             var already = false;
@@ -904,6 +920,62 @@ test "the union of capabilities leaves out a tool the policy refused" {
     try testing.expectEqual(@as(usize, 1), union_of.len);
     try testing.expectEqualStrings("fs.read", union_of[0]);
 }
+
+test "the union of capabilities leaves out a tool that still has to ask" {
+    // **A tool that may never run must not widen the import set.** A row of
+    // `ask` on a tool's own action means it is offered and decided one call at
+    // a time by `plugin.Session.dispatch`, so nobody has approved it yet. An
+    // import is supplied once, before instantiation, and cannot be taken back:
+    // a guest handed `fs.write` because of a tool nobody approved would reach
+    // it from inside the tool that was allowed outright.
+    //
+    // Mutation check: drop the `offer.decision != .allow` skip in
+    // `unionOfCapabilities` and `fs.write` appears here.
+    var session: plugin.Session = .init(testing.allocator);
+    defer session.deinit();
+
+    var policy: AskOne = .{ .asking = "plugin.two.tool.writer" };
+    const record: core.Metadata = .{
+        .name = "two",
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .chock_version = .{ .min = .{ .major = 0, .minor = 1, .patch = 0 } },
+        .author = "somebody",
+        .tools = &.{
+            .{ .name = "reader", .capabilities = &.{"fs.read"} },
+            .{ .name = "writer", .capabilities = &.{"fs.write"} },
+        },
+    };
+    _ = try session.admit("two", record, policy.decider());
+
+    // The asking tool really is offered, or this test proves nothing: it is
+    // the import set and not the offer that this rule holds back.
+    try testing.expectEqual(@as(?plugin.Refusal, null), session.find("writer").?.refused);
+
+    const union_of = try unionOfCapabilities(testing.allocator, &session, "two");
+    defer testing.allocator.free(union_of);
+    try testing.expectEqual(@as(usize, 1), union_of.len);
+    try testing.expectEqualStrings("fs.read", union_of[0]);
+}
+
+/// A policy that allows everything but one action, which it answers `ask` for.
+const AskOne = struct {
+    asking: []const u8,
+
+    fn decider(self: *AskOne) plugin.Decider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = plugin.Decider.VTable{ .decide = decideFn };
+    fn decideFn(
+        ptr: *anyopaque,
+        tool: []const u8,
+        action: []const u8,
+    ) @import("chock-policy").table.Decision {
+        const self: *AskOne = @ptrCast(@alignCast(ptr));
+        _ = tool;
+        if (std.mem.eql(u8, action, self.asking)) return .ask;
+        return .allow;
+    }
+};
 
 /// A policy that allows everything but one action.
 const DenyOne = struct {

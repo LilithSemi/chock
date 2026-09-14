@@ -124,23 +124,36 @@
 //! ## Where a promise is enforced today, and where it is not
 //!
 //! **`Broker.request` is the only place a promise changes an outcome**, and
-//! `workspace.apply` is the act it reaches it for. `chock run` asks at the end
-//! of a session, and an agent asks mid session with `request_action`. That is a
-//! real act with a real consequence, and it is also the only one an agent can
-//! be stopped from by a promise today.
+//! that is still true. What has grown is the set of acts that reach it:
 //!
-//! Two places read the policy and do not read a promise, and both are honest
-//! gaps rather than oversights:
+//! * `workspace.apply`, asked by `chock run` at the end of a session and by an
+//!   agent mid session with `request_action`.
+//! * `widen_action`, asked by `chock_core.Loop.runWiden`.
+//! * Every ordinary built-in tool call, asked by
+//!   `chock_core.Loop.gateToolCall` at the tool's own action name.
+//! * Every host a tool call opens, asked by `chock_broker.network` at
+//!   `net.connect.*`, and every page `fetch_url` reads, at `net.fetch.*`.
+//! * Every call to a tool an MCP server or a plugin supplies, asked by
+//!   `chock_core.mcp.Session.dispatch` and
+//!   `chock_core.plugin.Session.dispatch` at `mcp.<server>.tool.<name>` and
+//!   `plugin.<name>.tool.<tool>`, and for a plugin tool at each capability it
+//!   declared as well. **Asked on every call**, which is what lets a promise
+//!   made half way through a session bind a tool admitted before it.
 //!
-//! * `src/run.zig`'s `provisionDecision` answers `nix.build` once, before the
-//!   first turn, to decide whether the `provide_tool` tool exists at all. A
-//!   promise made during that session comes too late to change a tool list
-//!   that was fixed before it started.
-//! * An ordinary tool call inside the sandbox reaches no broker at all.
-//!   `request_action` is the tool that would change that and it takes one act,
-//!   `workspace.apply`, and refuses every other name. Widening it needs each
-//!   act's own parameters to come from the model, which is a much larger thing
-//!   to get right and is not built.
+//! Two places read the policy once, before the loop runs, and a promise made
+//! during that session comes too late to change either. Both are honest limits
+//! rather than oversights:
+//!
+//! * `src/run.zig`'s `provisionDecision` answers `nix.build` once to decide
+//!   whether the `provide_tool` tool exists at all.
+//! * `mcp.Session.admit` and `plugin.Session.admit` answer once to decide
+//!   which third party tools exist at all. Only a `deny` is spent there, so
+//!   the tool list a session starts with can be narrower than a promise would
+//!   make it and never wider.
+//!
+//! And `request_action` still takes one act, `workspace.apply`, and refuses
+//! every other name. Widening it needs each act's own parameters to come from
+//! the model, which is a much larger thing to get right and is not built.
 //!
 //! ## May a self imposed restriction cite a clause of the constitution? No
 //!
@@ -621,6 +634,57 @@ test "a promise covers the class it names, and nothing covers what nobody promis
     };
     try testing.expectEqual(Decision.deny, ceilingFor(&wider, "git.push"));
     try testing.expectEqual(Decision.agent_review, ceilingFor(&wider, "git.commit"));
+}
+
+test "a promise about a class of third party tools narrows one of those tools" {
+    // **The meeting point of two halves that were built apart.** A tool an MCP
+    // server or a plugin supplies lands on an ordinary dotted action, and a
+    // session narrows itself with ordinary dotted patterns, so a promise about
+    // `mcp.*` has to reach `mcp.time.tool.get_current_time`. It does, and it
+    // has to keep doing so: `chock_core.mcp.Session.dispatch` and
+    // `chock_core.plugin.Session.dispatch` ask about exactly these keys on
+    // every call, and `Broker.request` folds the session's promises in with
+    // `narrow` below. Without this, a session that promised away every MCP
+    // tool would keep calling one.
+    //
+    // Mutation check: compare the action for equality instead of through
+    // `table.patternCovers` in `ceilingFor` and every case below stops
+    // narrowing.
+    const promises = [_]Restriction{
+        .{ .action = "mcp.*", .ceiling = .deny, .reason = "no third party tool for this task" },
+        .{ .action = "plugin.hello.*", .ceiling = .ask, .reason = "a person weighs this plugin" },
+    };
+
+    try testing.expectEqual(Decision.deny, ceilingFor(&promises, "mcp.time.tool.get_current_time"));
+    try testing.expectEqual(Decision.ask, ceilingFor(&promises, "plugin.hello.tool.greet"));
+    // A capability a plugin tool declares is an ordinary action too, so a
+    // promise about it binds the call that needs it.
+    const no_writes = [_]Restriction{
+        .{ .action = "fs.write", .ceiling = .deny, .reason = "read only from here" },
+    };
+    try testing.expectEqual(Decision.deny, ceilingFor(&no_writes, "fs.write"));
+
+    // And the whole point: a table that says `allow` is overruled by the
+    // session's own word, and only ever downwards.
+    try testing.expectEqual(
+        Decision.deny,
+        narrow(.allow, &promises, "mcp.time.tool.get_current_time"),
+    );
+    try testing.expectEqual(
+        Decision.ask,
+        narrow(.allow, &promises, "plugin.hello.tool.greet"),
+    );
+    // A plugin nobody promised about is left to the table, which is what stops
+    // this from being a second policy system.
+    try testing.expectEqual(
+        Decision.allow,
+        narrow(.allow, &promises, "plugin.other.tool.greet"),
+    );
+    // And a promise cannot raise a table that already refused.
+    try testing.expectEqual(
+        Decision.deny,
+        narrow(.deny, &promises, "plugin.other.tool.greet"),
+    );
 }
 
 test "a ceiling a model misspells is refused, and one already in a log narrows to deny" {

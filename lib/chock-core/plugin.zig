@@ -56,8 +56,10 @@
 const std = @import("std");
 
 const chock_policy = @import("chock-policy");
+const chock_proto = @import("chock-proto");
 const core = @import("chock-plugin-core");
 
+const arbiter = @import("arbiter.zig");
 const lsp = @import("lsp.zig");
 const mcp = @import("mcp.zig");
 const plugin_module = @import("plugin_module.zig");
@@ -239,9 +241,23 @@ pub const Refusal = enum {
     /// It declares a capability that is not an action name, or more of them
     /// than this host reads.
     capability_unusable,
-    /// This project's policy does not answer `allow` for the tool's own action
-    /// or for one of the capabilities it declares.
+    /// This project's policy denies the tool's own action outright.
+    ///
+    /// **Only `deny`.** Every other answer the table can give for the tool's
+    /// own action leaves it offered and decided one call at a time: see
+    /// `Session.dispatch`.
     policy,
+    /// This project's policy does not answer `allow` for one of the
+    /// capabilities the tool declares.
+    ///
+    /// **A capability is not asked about at the door, and it cannot be.** The
+    /// capabilities of every offered tool decide the import set the whole
+    /// plugin is instantiated with, once, before any guest code runs, and an
+    /// import cannot be taken back afterwards: a guest that holds one reaches
+    /// it from inside any tool of the same plugin. So anything short of
+    /// `allow` refuses the tool here, and this keeps that fact apart from the
+    /// tool's own action being denied.
+    capability_policy,
 
     /// One sentence for the person reading the session start.
     pub fn text(self: Refusal) []const u8 {
@@ -249,7 +265,8 @@ pub const Refusal = enum {
             .name_unusable => "its name holds bytes a tool name cannot hold",
             .already_declared => "another tool of this session already holds that name",
             .capability_unusable => "it declares a capability that is not an action name",
-            .policy => "this project's policy does not allow it",
+            .policy => "this project's policy denies it",
+            .capability_policy => "this project's policy does not allow a capability it declares",
         };
     }
 };
@@ -283,6 +300,15 @@ pub const Offer = struct {
     /// and every capability it declared, and over the whole spawn chain.
     /// Filled by the caller: **`chock-core` evaluates no policy table**, which
     /// stays the broker's job. See `src/run.zig`.
+    ///
+    /// **Read once, at the start, and never the last word on a call.** The
+    /// tool's own action is asked again on every call through `Session.asker`,
+    /// because the table is not the only thing that answers: a session can
+    /// narrow its own policy half way through, and only the broker folds those
+    /// promises in. What this value still decides on its own is whether the
+    /// tool is offered at all, and whether its capabilities join the import set
+    /// the plugin is instantiated with: see
+    /// `chock_core.plugin_engine.unionOfCapabilities`.
     decision: chock_policy.table.Decision,
     /// Why this tool is not offered, or null when it is.
     refused: ?Refusal,
@@ -399,6 +425,14 @@ pub const Session = struct {
     /// that names one anyway can be told why rather than "unknown tool".
     offers: std.ArrayList(Offer) = .empty,
 
+    /// Who decides one call to a tool this session offers, and the handle that
+    /// question is written through.
+    ///
+    /// **Null refuses every call, and that is the safe direction.** The same
+    /// rule and the same reason `chock_core.mcp.Session.asker` carries, over
+    /// the same seam. See `Session.dispatch`.
+    asker: ?arbiter.Asker = null,
+
     /// The name of each plugin that loaded, in the order they were admitted.
     /// Borrowed from the caller's own names.
     loaded: std.ArrayList([]const u8) = .empty,
@@ -432,6 +466,13 @@ pub const Session = struct {
         self.loaded.deinit(gpa);
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// Hand this session the log handle its questions are written through.
+    ///
+    /// The same rule and the same caller `mcp.Session.giveLocked` has.
+    pub fn giveLocked(self: *Session, locked: *arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
     }
 
     /// Whether this session has any plugin tool at all. A caller reads this
@@ -495,20 +536,40 @@ pub const Session = struct {
             else
                 &.{};
 
-            // **The fold.** The tool's own action first, then every action it
-            // declared it needs. `Decision.intersect` is the same operation
+            // **The tool's own action, and an action nobody can name is a
+            // refusal.** An empty action matches no rule and reaches no table,
+            // and `dispatch` asks about the action itself, so a question built
+            // out of nothing is a question nobody could answer.
+            const own: chock_policy.table.Decision = if (action.len == 0)
+                .deny
+            else
+                policy.decide(tool.name, action);
+
+            // **Every action it declared it needs, folded on its own.**
+            // `Decision.intersect` is the same operation
             // `chock_policy.table.evaluateChain` folds a spawn chain with, so
             // a capability the project denies makes the tool as refused as a
             // parent agent that lacks a permission makes its child.
-            var decision: chock_policy.table.Decision = if (action.len == 0)
-                .ask
-            else
-                policy.decide(tool.name, action);
+            //
+            // **Kept apart from the tool's own answer, because the two are
+            // answered at different moments.** The tool's own action is asked
+            // again on every call, and a capability cannot be: it decides the
+            // import set the whole plugin is instantiated with before any
+            // guest code runs. See `Refusal.capability_policy`.
+            var declared: chock_policy.table.Decision = .allow;
             if (refusal == null) {
                 for (capabilities) |capability| {
-                    decision = decision.intersect(policy.decide(tool.name, capability));
+                    declared = declared.intersect(policy.decide(tool.name, capability));
                 }
             }
+
+            const decision = own.intersect(declared);
+            const priced: ?Refusal = if (declared != .allow)
+                .capability_policy
+            else if (own == .deny)
+                .policy
+            else
+                null;
 
             // Flattened, because a description is written by somebody else and
             // goes straight into the system prompt. `lsp.flattenMessage` is
@@ -528,7 +589,14 @@ pub const Session = struct {
                 .action = action,
                 .capabilities = capabilities,
                 .decision = decision,
-                .refused = refusal orelse if (decision == .allow) null else .policy,
+                // **Only a `deny`, or a capability short of `allow`, keeps a
+                // tool out of the session.** `ask`, `agent_review` and
+                // `agent_then_human` on the tool's own action all used to land
+                // here as a refusal, which made a row an author wrote to have
+                // somebody asked into a tool nobody was ever offered and
+                // nobody was ever asked about. They are decided one call at a
+                // time now: see `dispatch`.
+                .refused = refusal orelse priced,
                 .definition = .{
                     .name = kept_name,
                     .description = description,
@@ -589,14 +657,29 @@ pub const Session = struct {
     /// and acts on, the same rule `mcp.Session.dispatch` and
     /// `chock_core.tools.Registry.dispatch` already keep.
     ///
+    /// ## This is the gate, and the one at load time is not
+    ///
+    /// `admit` reads the table once, before the loop runs. What it still
+    /// decides on its own is whether the tool is offered at all. What it no
+    /// longer decides is the answer to a call: that is asked here, every time,
+    /// through `asker`. `mcp.Session.dispatch` carries the two faults this
+    /// fixes in full, and they are the same two, in the same words.
+    ///
+    /// **The tool's own action and every capability it declared, each one on
+    /// its own, and all of them have to permit.** A conjunction is never
+    /// weaker than the minimum `admit` folds, because the minimum is one of
+    /// the terms of it. Asking about a capability is what makes a mid session
+    /// promise about `fs.write` bind a plugin tool that declared `fs.write`,
+    /// which the tool's own action alone could not do.
+    ///
     /// The caller owns `text` in the answer and frees it with `gpa.free`.
     pub fn dispatch(
         self: *Session,
         gpa: std.mem.Allocator,
         io: std.Io,
-        name: []const u8,
-        arguments: []const u8,
+        call: tools.ToolCall,
     ) std.mem.Allocator.Error!?Outcome {
+        const name = call.tool;
         const offer = self.find(name) orelse return null;
 
         // **A name that is somebody else's is not this session's to answer.**
@@ -626,6 +709,16 @@ pub const Session = struct {
             .is_error = true,
         };
 
+        // **After the cheap local checks, and before anything reaches the
+        // host.** A question spent on a call that could not have run either
+        // way costs a person's attention for nothing, the rule
+        // `chock_broker.Broker.reviewed` already keeps for a review it knows
+        // cannot finish. Nothing above this line reaches the plugin.
+        if (try self.refusalFrom(gpa, io, offer, call.call_id)) |text| return .{
+            .text = text,
+            .is_error = true,
+        };
+
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
 
@@ -634,7 +727,7 @@ pub const Session = struct {
             io,
             offer.index,
             name,
-            arguments,
+            call.arguments,
             call_budget_ns,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -656,6 +749,69 @@ pub const Session = struct {
         // The same cleaning every third party result goes through, reused
         // whole rather than argued a second time: see `mcp.textForModel`.
         return .{ .text = try mcp.textForModel(gpa, answer.text), .is_error = answer.is_error };
+    }
+
+    /// Why this call may not run, or null when every question it raises was
+    /// permitted. The caller owns the text and frees it with `gpa.free`.
+    ///
+    /// **The first refusal stops the walk.** A call that was already refused
+    /// has nothing left to decide, and asking a person the rest of the
+    /// questions would be asking about an act that is not going to happen.
+    fn refusalFrom(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        offer: *const Offer,
+        call_id: []const u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        // An offered tool always has an action: `admit` answers `deny` for a
+        // name it could not build a key out of, and a denied tool never
+        // reaches this function. A broken caller would otherwise reach the
+        // broker with an empty key, which `Broker.request` asserts against.
+        std.debug.assert(offer.action.len > 0);
+
+        const own = try self.askAbout(gpa, io, offer, offer.action, call_id);
+        if (!own.permitted) return try arbiter.refusalText(gpa, offer.name, own);
+
+        for (offer.capabilities) |capability| {
+            const answer = try self.askAbout(gpa, io, offer, capability, call_id);
+            if (!answer.permitted) return try arbiter.refusalText(gpa, capability, answer);
+        }
+        return null;
+    }
+
+    /// Ask about one action a call to `offer` needs.
+    ///
+    /// `action` is either `offer.action` or one of the capabilities the tool
+    /// declared. Both are keys the table was already read with at load time,
+    /// under the same tool name, so a question here lands on the same rule the
+    /// project owner wrote.
+    fn askAbout(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        offer: *const Offer,
+        action: []const u8,
+        call_id: []const u8,
+    ) std.mem.Allocator.Error!arbiter.Answer {
+        const summary = try std.fmt.allocPrint(
+            gpa,
+            "run the tool \"{s}\" that the plugin \"{s}\" supplies, which needs \"{s}\"",
+            .{ offer.name, offer.plugin, action },
+        );
+        defer gpa.free(summary);
+
+        return arbiter.Asker.decide(self.asker, gpa, io, .{
+            .action = action,
+            .summary = summary,
+            // **The whole effect, and never the arguments.** The same rule
+            // `chock_core.Loop.gateToolCall` keeps: the arguments are written
+            // by a model and read by code nobody here wrote.
+            .detail = action,
+            .reason = "",
+            .tool = offer.name,
+            .tool_call_id = call_id,
+        });
     }
 
     /// Whether any plugin of this session really offers `name`. False when the
@@ -1037,6 +1193,11 @@ const testing = std.testing;
 /// A policy that answers the same thing for everything, and records what it
 /// was asked. Bounded, because a test that overran it would silently stop
 /// recording.
+/// One `ToolCall` for a test, so a test names the tool and nothing else.
+fn callOf(name: []const u8, arguments: []const u8) tools.ToolCall {
+    return .{ .call_id = "call1", .tool = name, .arguments = arguments };
+}
+
 const FakeDecider = struct {
     answer: chock_policy.table.Decision = .allow,
     /// One action per entry, in the order they were asked.
@@ -1045,6 +1206,10 @@ const FakeDecider = struct {
     asks: usize = 0,
     /// An action that answers `deny` whatever `answer` says.
     denied: []const u8 = "",
+    /// An action that answers `ask` whatever `answer` says. **The tool's own
+    /// action and a capability are answered at different moments now**, so a
+    /// test needs to be able to move one of them without moving the other.
+    asking: []const u8 = "",
 
     fn decider(self: *FakeDecider) Decider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1061,6 +1226,7 @@ const FakeDecider = struct {
         }
         self.asks += 1;
         if (self.denied.len != 0 and std.mem.eql(u8, action, self.denied)) return .deny;
+        if (self.asking.len != 0 and std.mem.eql(u8, action, self.asking)) return .ask;
         return self.answer;
     }
 
@@ -1204,7 +1370,10 @@ test "one denied capability refuses the tool even when the tool's own action is 
     _ = try session.admit("hello", oneTool("greet", &.{ "fs.read", "fs.write" }).record(), policy.decider());
 
     const offer = session.find("greet").?;
-    try testing.expectEqual(Refusal.policy, offer.refused.?);
+    // **`capability_policy` and not `policy`.** The tool's own action was
+    // allowed, so what refuses it is the claim it made, and a person reading
+    // the session start needs to be told which of the two answered.
+    try testing.expectEqual(Refusal.capability_policy, offer.refused.?);
     try testing.expectEqual(chock_policy.table.Decision.deny, offer.decision);
 
     var offered: std.ArrayList(tools.Definition) = .empty;
@@ -1429,18 +1598,63 @@ test "the offers a session keeps outlive the record they were read from" {
     try testing.expectEqualStrings("plugin.hello.tool.greet", offer.action);
 }
 
-test "a tool the policy does not allow is not in the definitions the model reads" {
+test "a tool the policy denies is not in the definitions the model reads, and costs nobody a question" {
+    // **A denied tool costs no context and asks nobody.** Session start is
+    // still where a `deny` is spent: the tool is not offered, so the model
+    // never carries its name or its description, and a model that names it
+    // anyway is turned away here rather than at an arbiter.
+    //
+    // Mutation check: offer a denied tool and decide it per call instead, and
+    // both counts below move.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    var policy: FakeDecider = .{ .answer = .deny };
+
+    _ = try bench.session.admit("hello", oneTool("greet", &.{}).record(), policy.decider());
+    try bench.arm(testing.io, "hello");
+    try testing.expectEqual(Refusal.policy, bench.session.find("greet").?.refused.?);
+
+    var offered: std.ArrayList(tools.Definition) = .empty;
+    defer offered.deinit(gpa);
+    try bench.session.appendDefinitions(gpa, &offered);
+    try testing.expectEqual(@as(usize, 0), offered.items.len);
+
+    const outcome = (try bench.session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+    defer gpa.free(outcome.text);
+    try testing.expect(outcome.is_error);
+    try testing.expect(std.mem.startsWith(u8, outcome.text, not_offered));
+    try testing.expectEqual(@as(usize, 0), bench.judge.asks);
+    try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+}
+
+test "a tool whose row asks is in the definitions the model reads" {
+    // **Two halves of the same defect fix.** A row of `ask` for a plugin tool
+    // used to mean the tool was never offered and nobody was ever asked, which
+    // is what `deny` already means. It is offered now and decided one call at
+    // a time.
+    //
+    // **The import set does not move with it**, which is the half
+    // `plugin_engine.zig` pins: see "the union of capabilities leaves out a
+    // tool that still has to ask".
+    //
+    // Mutation check: read `decision != .allow` instead of the split in
+    // `admit` and this tool is turned away with a denied one.
     var session: Session = .init(testing.allocator);
     defer session.deinit();
-    var policy: FakeDecider = .{ .answer = .ask };
+    var policy: FakeDecider = .{ .answer = .allow, .asking = "plugin.hello.tool.greet" };
 
-    _ = try session.admit("hello", oneTool("greet", &.{}).record(), policy.decider());
-    try testing.expectEqual(Refusal.policy, session.find("greet").?.refused.?);
+    _ = try session.admit("hello", oneTool("greet", &.{"fs.read"}).record(), policy.decider());
+
+    const offer = session.find("greet").?;
+    try testing.expectEqual(@as(?Refusal, null), offer.refused);
+    try testing.expectEqual(chock_policy.table.Decision.ask, offer.decision);
 
     var offered: std.ArrayList(tools.Definition) = .empty;
     defer offered.deinit(testing.allocator);
     try session.appendDefinitions(testing.allocator, &offered);
-    try testing.expectEqual(@as(usize, 0), offered.items.len);
+    try testing.expectEqual(@as(usize, 1), offered.items.len);
+    try testing.expectEqualStrings("greet", offered.items[0].name);
 }
 
 test "an offered tool's parameters are a JSON object and not an array" {
@@ -1667,7 +1881,7 @@ test "a call to a name this session lost passes through, so its real owner answe
     try testing.expectEqual(Refusal.already_declared, session.find("greet").?.refused.?);
     try testing.expectEqual(
         @as(?Outcome, null),
-        try session.dispatch(testing.allocator, testing.io, "greet", "{}"),
+        try session.dispatch(testing.allocator, testing.io, callOf("greet", "{}")),
     );
 
     // And a tool this session really does hold, and refuses for a reason of its
@@ -1677,8 +1891,245 @@ test "a call to a name this session lost passes through, so its real owner answe
     var deny: FakeDecider = .{ .answer = .deny };
     _ = try denied.admit("hello", oneTool("greet", &.{}).record(), deny.decider());
 
-    const answer = (try denied.dispatch(testing.allocator, testing.io, "greet", "{}")).?;
+    const answer = (try denied.dispatch(testing.allocator, testing.io, callOf("greet", "{}"))).?;
     defer testing.allocator.free(answer.text);
     try testing.expect(answer.is_error);
     try testing.expect(std.mem.startsWith(u8, answer.text, not_offered));
+}
+
+/// A `Host` that answers from a table and counts what it was asked, so a test
+/// can pin that a refused call reached no plugin at all.
+const FakeHost = struct {
+    answer: Outcome = .{ .text = "hello", .is_error = false },
+    calls: usize = 0,
+
+    fn host(self: *FakeHost) Host {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Host.VTable{ .call = callFn };
+
+    fn callFn(
+        ptr: *anyopaque,
+        arena: std.mem.Allocator,
+        io: std.Io,
+        index: u32,
+        name: []const u8,
+        arguments: []const u8,
+        budget_ns: u64,
+    ) Error!Outcome {
+        _ = arena;
+        _ = io;
+        _ = index;
+        _ = name;
+        _ = arguments;
+        _ = budget_ns;
+        const self: *FakeHost = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return self.answer;
+    }
+};
+
+/// An `Arbiter` that answers what a test tells it to, and records the action of
+/// every question it was asked. A plugin tool raises one question for its own
+/// action and one for each capability it declared, so the order matters and the
+/// list is what a test reads.
+const FakeArbiter = struct {
+    permits: bool = true,
+    /// The action this one refuses, or empty when it permits everything.
+    refuses: []const u8 = "",
+    asks: usize = 0,
+    seen: [8][max_capability_bytes]u8 = @splat(@splat(0)),
+    seen_len: [8]usize = @splat(0),
+
+    fn arbiterSeam(self: *FakeArbiter) arbiter.Arbiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *arbiter.Locked,
+        ask: arbiter.Ask,
+    ) arbiter.Answer {
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        const self: *FakeArbiter = @ptrCast(@alignCast(ptr));
+        if (self.asks < self.seen.len) {
+            const length = @min(ask.action.len, self.seen[self.asks].len);
+            @memcpy(self.seen[self.asks][0..length], ask.action[0..length]);
+            self.seen_len[self.asks] = length;
+        }
+        self.asks += 1;
+        if (self.refuses.len != 0 and std.mem.eql(u8, self.refuses, ask.action))
+            return .{ .permitted = false, .outcome = "refused_by_user" };
+        if (!self.permits) return .{ .permitted = false, .outcome = "refused_by_user" };
+        return .{ .permitted = true, .outcome = "approved_by_user" };
+    }
+
+    fn asked(self: *const FakeArbiter, index: usize) []const u8 {
+        return self.seen[index][0..self.seen_len[index]];
+    }
+};
+
+/// A session with one plugin, one fake host, one fake arbiter and a real locked
+/// log handle. The handle is real because `arbiter.Asker` holds the very one
+/// `Loop.run` holds, and a stand-in pointer would prove nothing about the shape.
+const Bench = struct {
+    session: Session,
+    fake: FakeHost = .{},
+    judge: FakeArbiter = .{},
+    loaded: [1]Loaded = undefined,
+    backing: chock_proto.storage.Memory = undefined,
+    store: chock_proto.storage.Storage = undefined,
+    locked: arbiter.Locked = undefined,
+
+    fn init(gpa: std.mem.Allocator) Bench {
+        return .{ .session = .init(gpa) };
+    }
+
+    /// Finish building. Separate from `init` because a `Loaded` points at the
+    /// fake beside it, and a struct returned by value moves.
+    fn arm(self: *Bench, io: std.Io, name: []const u8) !void {
+        const gpa = self.session.arena.child_allocator;
+        self.loaded[0] = .{ .name = name, .host = self.fake.host() };
+        self.session.plugins = &self.loaded;
+        self.backing = try chock_proto.storage.Memory.init(gpa, "01PLUGBENCH");
+        self.store = self.backing.storage();
+        self.locked = try self.store.lock(io);
+        self.session.asker = .{ .arbiter = self.judge.arbiterSeam(), .locked = &self.locked };
+    }
+
+    fn deinit(self: *Bench) void {
+        self.locked.unlock(testing.io) catch {};
+        self.store.close(testing.io);
+        self.session.deinit();
+    }
+};
+
+test "a plugin tool whose row asks is asked about on every call, and a refusal never reaches the plugin" {
+    // **The defect this pins.** A row of `ask` for a plugin tool used to mean
+    // the tool was never offered and nobody was ever asked, which is what
+    // `deny` already means. It is offered now, and every call raises the
+    // question the row asked for.
+    //
+    // Mutation check: drop the `refusalFrom` call from `dispatch` and the
+    // plugin is reached with nobody asked, which `fake.calls` catches.
+    // **All three rows, and not `ask` alone.** `agent_review` and
+    // `agent_then_human` were refused at load time for the same reason and by
+    // the same line, so all three have to reach the broker. Which of them ends
+    // at a reviewer, at a person, or at both is `chock_broker.Broker.request`'s
+    // own switch on the decision: this file's job is to put the question in
+    // front of it at all.
+    const gpa = testing.allocator;
+
+    const asking = [_]chock_policy.table.Decision{ .ask, .agent_review, .agent_then_human };
+    for (asking) |answer| {
+        var bench = Bench.init(gpa);
+        defer bench.deinit();
+        var policy: FakeDecider = .{ .answer = answer };
+
+        _ = try bench.session.admit("hello", oneTool("greet", &.{}).record(), policy.decider());
+        try bench.arm(testing.io, "hello");
+        try testing.expectEqual(@as(?Refusal, null), bench.session.find("greet").?.refused);
+
+        // Offered, which is the first half: a model cannot call a tool it was
+        // never told exists.
+        var offered: std.ArrayList(tools.Definition) = .empty;
+        defer offered.deinit(gpa);
+        try bench.session.appendDefinitions(gpa, &offered);
+        try testing.expectEqual(@as(usize, 1), offered.items.len);
+
+        bench.judge.permits = false;
+        const refused = (try bench.session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+        defer gpa.free(refused.text);
+        try testing.expect(refused.is_error);
+        try testing.expect(std.mem.indexOf(u8, refused.text, "refused_by_user") != null);
+        try testing.expectEqual(@as(usize, 1), bench.judge.asks);
+        try testing.expectEqualStrings("plugin.hello.tool.greet", bench.judge.asked(0));
+        try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+
+        // And permitted, the same call really reaches the plugin, so the
+        // refusal above is the answer and not the path.
+        bench.judge.permits = true;
+        const ran = (try bench.session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+        defer gpa.free(ran.text);
+        try testing.expect(!ran.is_error);
+        try testing.expectEqualStrings("hello", ran.text);
+        try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+    }
+}
+
+test "a plugin tool the table allowed raises a question for its own action and for each capability it declared" {
+    // **The second half of the defect.** The table is read once, before the
+    // loop runs, and a session can narrow its own policy after that. Only the
+    // broker folds those promises in, so every action a call needs is asked
+    // again here, on every call. A promise about `fs.write` binds a tool that
+    // declared `fs.write`, which the tool's own action alone could not do.
+    //
+    // Mutation check: ask only about `offer.action` in `refusalFrom` and the
+    // refusal below becomes a run.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    var policy: FakeDecider = .{ .answer = .allow };
+
+    _ = try bench.session.admit(
+        "hello",
+        oneTool("greet", &.{ "fs.read", "fs.write" }).record(),
+        policy.decider(),
+    );
+    try bench.arm(testing.io, "hello");
+    try testing.expectEqual(@as(?Refusal, null), bench.session.find("greet").?.refused);
+
+    // Three questions, in the order the tool declared them, and the tool's own
+    // action first.
+    const ran = (try bench.session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+    defer gpa.free(ran.text);
+    try testing.expect(!ran.is_error);
+    try testing.expectEqual(@as(usize, 3), bench.judge.asks);
+    try testing.expectEqualStrings("plugin.hello.tool.greet", bench.judge.asked(0));
+    try testing.expectEqualStrings("fs.read", bench.judge.asked(1));
+    try testing.expectEqualStrings("fs.write", bench.judge.asked(2));
+    try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+
+    // A promise made half way through the session refuses one of those, and the
+    // very next call does not reach the plugin. **The walk stops at the first
+    // refusal**, so the third question is never asked.
+    bench.judge.asks = 0;
+    bench.judge.refuses = "fs.read";
+    const refused = (try bench.session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+    defer gpa.free(refused.text);
+    try testing.expect(refused.is_error);
+    try testing.expect(std.mem.indexOf(u8, refused.text, "fs.read") != null);
+    try testing.expectEqual(@as(usize, 2), bench.judge.asks);
+    try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+}
+
+test "a plugin session with nobody to ask runs nothing, and says that is what happened" {
+    // **Fail closed, and loudly.** A caller that never filled in `asker` can
+    // reach nobody, so every call is refused and the refusal says nobody was
+    // asked rather than that somebody said no.
+    //
+    // Mutation check: have `arbiter.Asker.decide` permit when the asker is
+    // null and the plugin below is reached.
+    const gpa = testing.allocator;
+    var session: Session = .init(gpa);
+    defer session.deinit();
+    var policy: FakeDecider = .{ .answer = .allow };
+    var fake: FakeHost = .{};
+
+    _ = try session.admit("hello", oneTool("greet", &.{}).record(), policy.decider());
+    var loaded = [_]Loaded{.{ .name = "hello", .host = fake.host() }};
+    session.plugins = &loaded;
+
+    const outcome = (try session.dispatch(gpa, testing.io, callOf("greet", "{}"))).?;
+    defer gpa.free(outcome.text);
+    try testing.expect(outcome.is_error);
+    try testing.expect(std.mem.indexOf(u8, outcome.text, arbiter.not_asked.outcome) != null);
+    try testing.expectEqual(@as(usize, 0), fake.calls);
 }

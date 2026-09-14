@@ -151,17 +151,36 @@ taking `sysctl-read` away breaks ordinary software that expects to enumerate
 processes, so it stays granted. The program still cannot act on any process
 it sees this way. It can only see that the process exists, under what name.
 
-**An MCP or plugin tool is gated once, at session start, and never again.**
-`chock_core.mcp.Session.admit` decides each declared tool against
-`mcp.<server>.<tool>` before `Loop.run` ever takes the session log's lock, and
-it never consults an arbiter, because there is nobody to ask yet. A policy row
-of `ask` for one of these tools is not deferred to a person. It is read as a
-refusal, once, for the rest of the session, and the tool is never offered. A
-`restrict_self` call made mid session cannot narrow this either, in either
-direction: the admission already ran before the loop started, and nothing
-about an MCP or plugin tool call reaches `Broker.request` a second time to
-read a fresher answer. `lib/chock-core/Loop.zig`'s own `gateToolCall` states
-both limits next to the code.
+**An MCP or plugin tool is decided twice: once at session start, and then on
+every call.** `chock_core.mcp.Session.admit` and
+`chock_core.plugin.Session.admit` read the policy table once, before
+`Loop.run` takes the session log's lock, against `mcp.<server>.tool.<tool>`
+and `plugin.<plugin>.tool.<tool>`. **Only a `deny` is spent there**, and it
+keeps the tool out of the session entirely, so a denied tool costs no context
+and asks nobody. Every other answer leaves the tool offered and decided one
+call at a time: `chock_core.mcp.Session.dispatch` and
+`chock_core.plugin.Session.dispatch` put the same key to
+`chock_core.arbiter.Asker` before anything reaches the third party process, so
+a row of `ask`, `agent_review` or `agent_then_human` reaches
+`Broker.request`, which answers each the way its row says. Because the
+question is asked again on each call, `Broker.request` folds this session's
+own `restrict_self` promises in with `chock_policy.ratchet.narrow`, and a
+promise made half way through a session binds the very next call.
+
+**A session with nobody to ask runs no such tool at all.** The asker is
+filled in by `src/run.zig`, and the session log handle inside it arrives from
+`chock_core.Loop.GiveLocked` once the loop holds the lock. Until both are
+there, `chock_core.arbiter.Asker.decide` answers `not_asked`, which does not
+permit. So a wiring nobody finished is a supplier of tools that stops
+working, and never a tool that runs ungated.
+
+**Two limits stay.** A plugin tool's declared capabilities decide the import
+set the whole plugin is instantiated with, once, before any guest code runs,
+so a capability the table does not allow outright refuses the tool at load
+time rather than asking per call: an import cannot be taken back once
+supplied. And the set of tools a session holds is still fixed at the start,
+so a server that gains a tool mid session is proposing a widening with
+nowhere to land.
 
 **As of this milestone, a foreground tool call holds a network descriptor
 whether or not any policy rule grants a host.** `lib/chock-core/tools.zig`

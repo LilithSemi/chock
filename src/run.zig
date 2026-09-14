@@ -5262,10 +5262,11 @@ const SessionArbiter = struct {
 /// **`network.asker` starts null and is filled exactly once.** Nothing here
 /// can build a `chock_broker.Broker` before the session's own locked handle
 /// exists, and that handle belongs to `Loop.run`, not to this file: see
-/// `giveFn`, which `chock_core.Loop.GiveLocked` calls once, right after
-/// `Loop.run` takes it and before the first turn starts. Until then an `ask`
-/// decision refuses outright, the same as the MCP startup path already does
-/// for the whole of its own session.
+/// `giveFn`, which `GiveLockedToAll` calls once from the seam
+/// `chock_core.Loop.GiveLocked` reaches, right after `Loop.run` takes the
+/// handle and before the first turn starts. Until then an `ask` decision
+/// refuses outright, which is the same direction
+/// `chock_core.arbiter.Asker.decide` takes for a handle that has not arrived.
 ///
 /// **The grant memory is caught up before every call, and not kept from
 /// whatever `giveFn` last saw.** `chock_broker.Broker.request` is given
@@ -5372,14 +5373,11 @@ const ToolNetwork = struct {
         return self.network.netBroker();
     }
 
-    fn giveLocked(self: *ToolNetwork) chock_core.Loop.GiveLocked {
-        return .{ .ptr = self, .vtable = &give_vtable };
-    }
-
-    const give_vtable = chock_core.Loop.GiveLocked.VTable{ .give = giveFn };
-
-    fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
-        const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
+    /// Take the session's own locked handle and build everything that needed
+    /// it. **Called by `GiveLockedToAll`, which is what
+    /// `chock_core.Loop.GiveLocked` reaches**: three parties need this one
+    /// handle and the seam carries one, so the fan out is there and not here.
+    fn giveFn(self: *ToolNetwork, locked: *chock_core.arbiter.Locked) void {
         self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
         self.approvers.init(self.gpa, self.io, self.started, locked, self.screen);
         self.broker = .{
@@ -5469,6 +5467,59 @@ const ToolNetwork = struct {
         );
     }
 };
+
+/// Hands the session's own locked handle to every party that asks a question
+/// from inside a turn.
+///
+/// **`chock_core.Loop.Deps.give_locked` is one seam and three parties need
+/// what it carries.** A tool call's own network broker asks about a host, an
+/// MCP session asks about a tool a server supplies, and a plugin session asks
+/// about a tool a module supplies. All three run inside the turn that
+/// `Loop.run` holds the log's exclusive lock for, so all three need the very
+/// handle it holds, and none of them may open the log a second time.
+///
+/// **The same pointer to all of them, once.** See
+/// `chock_core.Loop.GiveLocked`'s own top comment: `run` holds this handle at
+/// the same address from the moment it hands it over until the session ends,
+/// so there is nothing here to refresh and nothing to unlock.
+///
+/// **A session whose asker is null runs no third party tool at all.** That is
+/// deliberate: `chock_core.mcp.Session.asker` answers `not_asked` for a
+/// session that was never wired, so a wiring this file forgot is a loud
+/// failure and never a silent grant.
+const GiveLockedToAll = struct {
+    network: *ToolNetwork,
+    mcp: *chock_core.mcp.Session,
+    plugins: *chock_core.plugin.Session,
+
+    fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.GiveLocked.VTable{ .give = giveFn };
+
+    fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
+        const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
+        ToolNetwork.giveFn(self.network, locked);
+        giveLockedToSessions(self.mcp, self.plugins, locked);
+    }
+};
+
+/// Hand the handle to both third party tool sessions.
+///
+/// **A free function, so a test can drive the fan out without a `ToolNetwork`,
+/// which needs a whole started session behind it.** Both sessions have to be
+/// reached from the one seam: a session that keeps a null handle asks nobody
+/// and runs none of its tools, so a half wired fan out is a supplier of tools
+/// that quietly stops working.
+fn giveLockedToSessions(
+    mcp_session: *chock_core.mcp.Session,
+    plugin_session: *chock_core.plugin.Session,
+    locked: *chock_core.arbiter.Locked,
+) void {
+    mcp_session.giveLocked(locked);
+    plugin_session.giveLocked(locked);
+}
 
 /// Write one `network.summary` event, when there is one to write. Best
 /// effort: `Loop.run` has already released the storage lock by the time
@@ -7584,7 +7635,7 @@ const McpToolRunner = struct {
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *McpToolRunner = @ptrCast(@alignCast(ptr));
 
-        const outcome = (try self.state.session.dispatch(gpa, io, call.tool, call.arguments)) orelse
+        const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
             return self.inner.dispatch(gpa, io, call);
 
         // A server may have said its tools changed while that call was being
@@ -8087,10 +8138,22 @@ fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
     if (session.isEmpty()) return;
 
     var offered: usize = 0;
+    var asking: usize = 0;
     for (session.offers.items) |offer| {
-        if (offer.refused == null) offered += 1;
+        if (offer.refused != null) continue;
+        offered += 1;
+        if (offer.decision != .allow) asking += 1;
     }
     tty.detail("chock: {d} MCP tools in this session\n", .{offered});
+    // **A person needs this line, because the count above no longer says it.**
+    // A tool whose row is `ask`, `agent_review` or `agent_then_human` is
+    // offered to the model and decided one call at a time, so it is in the
+    // count and it will still stop and ask: see
+    // `chock_core.mcp.Session.dispatch`.
+    if (asking != 0) tty.detail(
+        "chock: {d} of them ask before each call, because this project's policy does not allow them outright\n",
+        .{asking},
+    );
 
     for (session.offers.items) |offer| {
         const reason = offer.refused orelse continue;
@@ -8171,7 +8234,7 @@ const PluginToolRunner = struct {
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *PluginToolRunner = @ptrCast(@alignCast(ptr));
 
-        const outcome = (try self.state.session.dispatch(gpa, io, call.tool, call.arguments)) orelse
+        const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
             return self.inner.dispatch(gpa, io, call);
 
         // `chock_core.Loop.runTool` owns exactly `call_id` and `output` and
@@ -8599,10 +8662,19 @@ fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
     if (session.isEmpty()) return;
 
     var offered: usize = 0;
+    var asking: usize = 0;
     for (session.offers.items) |offer| {
-        if (offer.refused == null) offered += 1;
+        if (offer.refused != null) continue;
+        offered += 1;
+        if (offer.decision != .allow) asking += 1;
     }
     tty.detail("chock: {d} plugin tools in this session\n", .{offered});
+    // The same line `reportMcpOffers` prints, for the same reason: see
+    // `chock_core.plugin.Session.dispatch`.
+    if (asking != 0) tty.detail(
+        "chock: {d} of them ask before each call, because this project's policy does not allow them outright\n",
+        .{asking},
+    );
 
     for (session.offers.items) |offer| {
         const reason = offer.refused orelse continue;
@@ -10418,6 +10490,24 @@ fn runSession(
     tool_runner.context.net = tool_network.seam();
     tool_runner.context.approval_wait_ns = &tool_network.approval_wait_ns;
 
+    // **What makes a tool a third party supplies answerable at all.** Both
+    // sessions read their policy once, before this function ran, and only a
+    // `deny` decided anything then. Every other answer is decided one call at
+    // a time from here on, through the same arbiter every other mid session
+    // question in this project goes through: see
+    // `chock_core.mcp.Session.dispatch`. A session left with no asker refuses
+    // every MCP and plugin tool call and says nobody could be asked.
+    mcp_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
+    plugin_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
+
+    // The handle each of those three needs, handed over once by `Loop.run`.
+    // See `GiveLockedToAll`.
+    var give_locked = GiveLockedToAll{
+        .network = &tool_network,
+        .mcp = &mcp_state.session,
+        .plugins = &plugin_state.session,
+    };
+
     // What carries the agent's own work back when it says it is finished.
     // **The same act `applyWork` performs at the end of the run**, through the
     // same `carryCommit`, so an agent that asks reaches exactly what an agent
@@ -10546,10 +10636,11 @@ fn runSession(
         .client = http.client(),
         .storage = started.storage,
         .tool_runner = plugin_aware.runner(),
-        // Hands `tool_network` the session's own locked handle once `run`
-        // has taken it, so a tool call's own `ask` can reach a person: see
-        // `ToolNetwork` and `chock_core.Loop.GiveLocked`.
-        .give_locked = tool_network.giveLocked(),
+        // Hands the session's own locked handle to the tool call network
+        // broker, the MCP session and the plugin session once `run` has taken
+        // it, so an `ask` any of the three reaches can reach a person: see
+        // `GiveLockedToAll` and `chock_core.Loop.GiveLocked`.
+        .give_locked = give_locked.giveLocked(),
         // The built-in list, plus whatever this project's MCP servers and
         // plugins declared and the policy allowed. Identical to
         // `started.tool_definitions` for a project that named neither: see
@@ -16025,6 +16116,11 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     var policy = AllowEverything{};
     try state.session.admit(&server, &.{.{ .name = "probe_tool" }}, policy.decider());
 
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(std.testing.io);
+    try log.arm(std.testing.io);
+    state.session.asker = log.asker();
+
     var inner = CountingToolRunner{};
     var mcp_aware = McpToolRunner{ .inner = inner.runner(), .state = &state };
 
@@ -16042,6 +16138,97 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     // The call id is the model's own, so the loop can pair the result with the
     // call that caused it.
     try std.testing.expectEqualStrings("call7", result.call_id);
+}
+
+test "one locked handle reaches both third party tool sessions, and a session that missed it runs nothing" {
+    // **The wiring that is easy to build and easy to leave half done.**
+    // `chock_core.Loop.Deps.give_locked` carries one handle and three parties
+    // need it, so the fan out is this file's. A session that keeps a null
+    // handle asks nobody and refuses every call, which is the safe direction
+    // and a silent loss of a supplier's tools if only one of the two is
+    // reached.
+    //
+    // Mutation check: drop either line of `giveLockedToSessions` and the
+    // matching half below stops running.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server_host = ProbeHost{ .text = "the server answered", .is_error = false };
+    var mcp_state = McpState.init(gpa);
+    defer mcp_state.deinit(io);
+    var server = chock_core.mcp.Server{ .name = "probe", .host = server_host.host() };
+    mcp_state.session.servers = @as(*[1]chock_core.mcp.Server, &server);
+
+    var plugin_probe = PluginProbeHost{ .text = "the plugin answered", .is_error = false };
+    var plugin_state = PluginState.init(gpa);
+    defer plugin_state.deinit(io);
+
+    var policy = AllowEverything{};
+    try mcp_state.session.admit(&server, &.{.{ .name = "server_tool" }}, policy.decider());
+    _ = try plugin_state.session.admit("hello", .{
+        .name = "written by the author",
+        .version = .{ .major = 1, .minor = 0, .patch = 0 },
+        .chock_version = .{ .min = .{ .major = 0, .minor = 1, .patch = 0 } },
+        .author = "somebody",
+        .tools = &.{.{ .name = "plugin_tool" }},
+    }, policy.decider());
+    var loaded = [_]chock_core.plugin.Loaded{.{ .name = "hello", .host = plugin_probe.host() }};
+    plugin_state.session.plugins = &loaded;
+
+    // An arbiter each, and no handle yet: the state every session is in
+    // between this file naming an arbiter and `Loop.run` taking the lock.
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    mcp_state.session.asker = .{ .arbiter = log.asker().arbiter };
+    plugin_state.session.asker = .{ .arbiter = log.asker().arbiter };
+
+    var inner = CountingToolRunner{};
+    var mcp_aware = McpToolRunner{ .inner = inner.runner(), .state = &mcp_state };
+    var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
+
+    for ([_][]const u8{ "server_tool", "plugin_tool" }) |name| {
+        const early = try plugin_aware.runner().dispatch(gpa, io, .{
+            .call_id = "call1",
+            .tool = name,
+            .arguments = "{}",
+        });
+        defer gpa.free(early.call_id);
+        defer gpa.free(early.output);
+        try std.testing.expect(early.is_error);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            early.output,
+            chock_core.arbiter.not_asked.outcome,
+        ) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server_host.calls);
+    try std.testing.expectEqual(@as(usize, 0), plugin_probe.calls);
+
+    // The handle arrives once, and both suppliers work.
+    giveLockedToSessions(&mcp_state.session, &plugin_state.session, &log.locked);
+
+    const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
+        .call_id = "call2",
+        .tool = "server_tool",
+        .arguments = "{}",
+    });
+    defer gpa.free(from_server.call_id);
+    defer gpa.free(from_server.output);
+    try std.testing.expectEqualStrings("the server answered", from_server.output);
+
+    const from_plugin = try plugin_aware.runner().dispatch(gpa, io, .{
+        .call_id = "call3",
+        .tool = "plugin_tool",
+        .arguments = "{}",
+    });
+    defer gpa.free(from_plugin.call_id);
+    defer gpa.free(from_plugin.output);
+    try std.testing.expectEqualStrings("the plugin answered", from_plugin.output);
+
+    try std.testing.expectEqual(@as(usize, 1), server_host.calls);
+    try std.testing.expectEqual(@as(usize, 1), plugin_probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
 test "the policy this wiring builds names the action, folds the chain, and refuses a child its parent lacks" {
@@ -16262,6 +16449,11 @@ test "a call to a plugin tool is answered here, with the guest's own words, and 
     var loaded = [_]chock_core.plugin.Loaded{.{ .name = "hello", .host = host.host() }};
     state.session.plugins = &loaded;
 
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(std.testing.io);
+    try log.arm(std.testing.io);
+    state.session.asker = log.asker();
+
     // The model is offered it, which is the half a dispatch cannot show: a tool
     // nobody is told about is never called.
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
@@ -16477,6 +16669,12 @@ test "a plugin tool cannot take a name an MCP server already declared" {
 
     // And the whole chain answers the way the list says: `shared` is the
     // server's, and the plugin's own tool is the plugin's.
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(std.testing.io);
+    try log.arm(std.testing.io);
+    mcp_state.session.asker = log.asker();
+    plugin_state.session.asker = log.asker();
+
     var inner = CountingToolRunner{};
     var mcp_aware = McpToolRunner{ .inner = inner.runner(), .state = &mcp_state };
     var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
@@ -16653,6 +16851,62 @@ const PluginProbeHost = struct {
 
 /// A policy that says yes, so the two runner tests measure the wiring and not
 /// the table. The table itself is measured by the two tests above it.
+/// A real session log, locked the way `Loop.run` locks one, beside an arbiter
+/// that permits every act.
+///
+/// **A session with no asker runs no MCP and no plugin tool at all**, which is
+/// the rule `chock_core.mcp.Session.dispatch` keeps: a tool a third party
+/// supplies is decided one call at a time, and a caller that named nobody to
+/// ask refuses. `GiveLockedToAll` is the production wiring. A test that
+/// measures the runner chain rather than the policy says so with this.
+const PermittingLog = struct {
+    var anchor: u8 = 0;
+
+    backing: chock_proto.storage.Memory,
+    store: chock_proto.storage.Storage = undefined,
+    locked: chock_core.arbiter.Locked = undefined,
+
+    fn init(gpa: std.mem.Allocator) !PermittingLog {
+        return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01RUNTEST") };
+    }
+
+    /// Separate from `init` because the handle points at the storage beside it,
+    /// and a struct returned by value moves.
+    fn arm(self: *PermittingLog, io: std.Io) !void {
+        self.store = self.backing.storage();
+        self.locked = try self.store.lock(io);
+    }
+
+    fn asker(self: *PermittingLog) chock_core.arbiter.Asker {
+        return .{
+            .arbiter = .{ .ptr = &anchor, .vtable = &vtable },
+            .locked = &self.locked,
+        };
+    }
+
+    const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *chock_core.arbiter.Locked,
+        ask: chock_core.arbiter.Ask,
+    ) chock_core.arbiter.Answer {
+        _ = ptr;
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        _ = ask;
+        return .{ .permitted = true, .outcome = "allowed_by_policy" };
+    }
+
+    fn deinit(self: *PermittingLog, io: std.Io) void {
+        self.locked.unlock(io) catch {};
+        self.store.close(io);
+    }
+};
+
 const AllowEverything = struct {
     fn decider(self: *AllowEverything) chock_core.mcp.Decider {
         return .{ .ptr = self, .vtable = &vtable };

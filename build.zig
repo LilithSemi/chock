@@ -1127,6 +1127,11 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "chock-core", .module = chock_core },
                 .{ .name = "chock-policy", .module = chock_policy },
+                // A tool call is decided by an arbiter now, and an arbiter
+                // writes its question through the session log's own locked
+                // handle: see `chock_core.mcp.Session.asker`. The test needs
+                // real storage to build one.
+                .{ .name = "chock-proto", .module = chock_proto },
                 .{ .name = "mcp_real_path", .module = mcp_real_path_options.createModule() },
             },
         }),
@@ -1744,6 +1749,11 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "chock-core", .module = chock_core },
                 .{ .name = "chock-plugin-core", .module = chock_plugin_core },
                 .{ .name = "chock-policy", .module = chock_policy },
+                // A tool call is decided by an arbiter now, and an arbiter
+                // writes its question through the session log's own locked
+                // handle: see `chock_core.plugin.Session.asker`. The test needs
+                // real storage to build one.
+                .{ .name = "chock-proto", .module = chock_proto },
                 // For the one test that starts a plugin host the way a session
                 // starts it: the mount tree, the Landlock rules and the
                 // lockdown are all sandbox values.
