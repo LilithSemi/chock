@@ -19,9 +19,10 @@ agree to uphold it.
   `chock-plugin-sdk` complete the set.
 - `src/` - the command line. One file for each command, with `main.zig` above
   them.
-- `test/` - the tests that need more than one process, by area: `auth`,
-  `broker`, `cli`, `container`, `core`, `pcsc`, `plugin`, `proto`, `redteam`,
-  `sandbox` and `workspace`.
+- `test/` - the tests that need more than one process, or more of the
+  repository than the library they test, by area: `auth`, `broker`, `cli`,
+  `container`, `core`, `docs`, `pcsc`, `plugin`, `proto`, `redteam`, `sandbox`
+  and `workspace`.
 - `docs/` - the documentation. Start at [docs/README.md](docs/README.md).
 
 ## The rules that hold the model together
@@ -113,8 +114,12 @@ No test catches this, because the tests all pass. When you add something, show
 where it is reached from.
 
 **Prose that expired.** A comment that was true when written and is false now.
-Nothing catches this either. When you change behaviour, read the comments around
-it and the documentation that describes it.
+`test/docs/claims.zig` catches the mechanical half of this in the
+documentation: a command, an option, a subcommand word, a repository path, a
+name or a count that the code has not got. It reads the truth out of the code
+and never out of a list of its own. It cannot read a sentence, so a comment and
+a claim that only prose carries are still yours to check. When you change
+behaviour, read the comments around it and the documentation that describes it.
 
 ## Before you submit
 

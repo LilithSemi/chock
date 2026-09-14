@@ -2,7 +2,7 @@
 
 - [sandbox.md](sandbox.md) - the layers a tool call runs inside, the throwaway
   workspace, the limits, and what the macOS sandbox holds and cannot.
-- [running.md](running.md) - `chock run`, the seventeen tools, the session log,
+- [running.md](running.md) - `chock run`, the eighteen tools, the session log,
   getting the work back out of the workspace, the exit codes, cost, the task
   list, and `chock doctor`.
 - [configuration.md](configuration.md) - `config.zon`, provider instances, how
@@ -28,5 +28,7 @@
   tree.
 - [daemon.md](daemon.md) - `chock daemon`, `chock serve`, and handing a session
   over with `chock detach`.
+- [threat-model.md](threat-model.md) - what the sandbox is built against, what
+  a person who approves an act is trusted with, and what is out of scope.
 - [status.md](status.md) - what works, what is not built yet, and the open
   items.

@@ -1502,6 +1502,38 @@ pub fn build(b: *std.Build) void {
     run_cli_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_cli_tests.step);
 
+    // Every claim in the documentation that a machine can check: see
+    // `test/docs/claims.zig`. It reads the pages off the disk and compares
+    // them against the command table, the exit codes, the tool list, the
+    // policy types and the source itself.
+    //
+    // **Where this repository is, because a test binary cannot know.** The
+    // tests read files that are not compiled into them, and `zig build` can be
+    // started from any directory, so the root is a build time constant. Same
+    // shape as `manifest_path_options` above.
+    const repo_root_options = b.addOptions();
+    repo_root_options.addOptionPath("repo_root", b.path("."));
+
+    const docs_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/docs/claims.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock_main", .module = chock_exe_module },
+                .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "chock-policy", .module = chock_policy },
+                .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "repo_root", .module = repo_root_options.createModule() },
+            },
+        }),
+    });
+    const run_docs_tests = b.addRunArtifact(docs_tests);
+    // They read this machine's own checkout, so a build for another machine
+    // has nothing to read.
+    run_docs_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_docs_tests.step);
+
     // test/broker/askpass.zig drives the askpass helper with the git on this
     // machine: GIT_ASKPASS points at the binary that was just built, and `git
     // credential fill` really asks it for a password. The unit tests beside

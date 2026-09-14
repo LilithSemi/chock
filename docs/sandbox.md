@@ -219,7 +219,7 @@ Work reaches your project only when the agent commits it in the workspace
 The mount set of a tool call is built per call, and the tools do not share one.
 The read only toolchain is this project's Nix dev shell closure, each store
 path at its own path, so the rest of the Nix store is not there. `/proc` is a
-fresh procfs, read only, with 22 entries masked. `/run/chock/tasks` is read
+fresh procfs, read only, with 20 entries masked. `/run/chock/tasks` is read
 only, so an agent cannot edit its own evidence.
 
 **The credential store is never mounted in.** It is a file in the data
