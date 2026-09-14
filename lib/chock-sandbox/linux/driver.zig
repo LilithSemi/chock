@@ -1095,7 +1095,17 @@ pub fn spawn(
     // descriptor would interleave with this process anyway. So A said it on
     // the middle pipe and this process, which does hold the log, counts it.
     // See `iface.SupervisorAudit`.
-    if (config.supervisor_audit) |audit| audit.record(middle_report.filter);
+    //
+    // **Every layer A puts on itself, and the fail mode table says which.** A
+    // layer A never applies has no fail mode for A, so it has no answer to
+    // count: see `iface.failModeFor`.
+    if (config.supervisor_audit) |audit| {
+        inline for (comptime std.enums.values(iface.LayerName)) |layer| {
+            if (comptime iface.failModeFor(.supervisor, layer) != null) {
+                audit.record(layer, middle_report.layers.get(layer));
+            }
+        }
+    }
 
     // The same route, for the same reason, carrying what the sandboxed program
     // asked the kernel for. A is the only process that can see it, and A holds
@@ -1350,14 +1360,32 @@ const record_bytes = 10;
 /// is 1.
 const tag_scratch_full: u8 = 0xD1;
 
-/// Whether A put a seccomp filter on itself. The value is 0 for a filter that
-/// went on, and otherwise a `SupervisorAudit.FilterFault`.
+/// Whether A put one layer on itself. The slot byte is the tag value of an
+/// `iface.LayerName`, and the value is 0 for a layer that went on and
+/// otherwise a `SupervisorAudit.Fault`.
 ///
 /// **Written whichever way it went**, so that "A said nothing" stays a third
 /// answer of its own rather than reading as success. A tool call a person
 /// cancelled kills A before it reaches `restrictMiddle` at all, and that call
 /// must not be counted as one whose supervisor was confined.
-const tag_middle_filter: u8 = 0xD2;
+///
+/// **One record per layer, and the slot is what tells them apart.** This tag
+/// used to carry the seccomp filter alone, so the two layers beside it reached
+/// a terminal and nothing else. `chock_proto.event.SandboxSupervisor` already
+/// carries a `layer` field for exactly this.
+const tag_middle_layer: u8 = 0xD2;
+
+/// How many `tag_middle_layer` records A can write, which is one for each
+/// layer it puts on itself. **Counted from the fail mode table** rather than
+/// spelled here, so a fourth layer given to the supervisor grows the read
+/// buffer with it instead of silently overflowing the margin.
+const middle_layer_count: usize = blk: {
+    var found: usize = 0;
+    for (std.enums.values(iface.LayerName)) |layer| {
+        if (iface.failModeFor(.supervisor, layer) != null) found += 1;
+    }
+    break :blk found;
+};
 
 /// Whether A held the notification descriptor for this call. The value is 1
 /// when it did and 0 when it did not.
@@ -1386,9 +1414,10 @@ const TrapState = enum {
 const MiddleReport = struct {
     /// True when a scratch area had no space left in it.
     scratch_full: bool = false,
-    /// What A said about its own seccomp filter. `.unsaid` when A never
+    /// What A said about each layer it puts on itself. `.unsaid` when A never
     /// reached `restrictMiddle`, or could not write.
-    filter: iface.SupervisorAudit.Filter = .unsaid,
+    layers: std.EnumArray(iface.LayerName, iface.SupervisorAudit.Outcome) =
+        .initFill(.unsaid),
     /// What A said about watching the sandboxed program's system calls.
     traps: TrapState = .unasked,
     /// The histogram A counted. All zero unless `traps` is `.observed`.
@@ -1415,11 +1444,15 @@ fn reportScratch(areas: *const ScratchAreas, middle_write_fd: i32) void {
     writeMiddleRecord(middle_write_fd, tag_scratch_full, 0, 1);
 }
 
-/// Say whether A could put a seccomp filter on itself, on the middle pipe.
-/// `fault` is null for a filter that went on.
-fn reportMiddleFilter(middle_write_fd: i32, fault: ?iface.SupervisorAudit.FilterFault) void {
+/// Say whether A could put one layer on itself, on the middle pipe. `fault` is
+/// null for a layer that went on.
+fn reportMiddleLayer(
+    middle_write_fd: i32,
+    layer: iface.LayerName,
+    fault: ?iface.SupervisorAudit.Fault,
+) void {
     const value: u8 = if (fault) |one| @intFromEnum(one) else 0;
-    writeMiddleRecord(middle_write_fd, tag_middle_filter, 0, value);
+    writeMiddleRecord(middle_write_fd, tag_middle_layer, @intFromEnum(layer), value);
 }
 
 /// Say what A saw of the sandboxed program's system calls, on the middle pipe.
@@ -1445,7 +1478,7 @@ fn reportTraps(middle_write_fd: i32, counts: ?*const notify.Counts) void {
 /// the log as one of the old ones. Before that error set was split, every
 /// failure arrived as `Rejected`, and a record that said so would have named
 /// the wrong repair.
-fn filterFaultFor(err: seccomp.InstallError) iface.SupervisorAudit.FilterFault {
+fn filterFaultFor(err: seccomp.InstallError) iface.SupervisorAudit.Fault {
     return switch (err) {
         error.NotSupported => .not_supported,
         error.NoNewPrivsRefused => .no_new_privs_refused,
@@ -1455,15 +1488,43 @@ fn filterFaultFor(err: seccomp.InstallError) iface.SupervisorAudit.FilterFault {
     };
 }
 
-/// Read the value byte of a `tag_middle_filter` record.
+/// Name the fault a failed Landlock call in A is recorded as. Exhaustive for
+/// the reason `filterFaultFor` gives.
 ///
-/// A value this build has no name for still reads as "no filter went on", with
-/// `unexpected` standing in for the name. A record only A writes cannot carry
-/// one, and reading it as success would be the one mistake this whole record
-/// exists to stop.
-fn filterFor(value: u8) iface.SupervisorAudit.Filter {
+/// **The four path faults cannot reach this.** A's ruleset holds no rule at
+/// all, so `allowPath` is never called and only `init` and `restrictSelf` can
+/// fail. They are named anyway, because an error set is not a promise about
+/// which caller uses which member.
+fn landlockFaultFor(err: landlock.RulesetError) iface.SupervisorAudit.Fault {
+    return switch (err) {
+        error.NotSupported => .not_supported,
+        error.Rejected,
+        error.PathNotFound,
+        error.AccessDenied,
+        error.NotADirectory,
+        error.PathTooLong,
+        => .rejected,
+        error.Unexpected => .unexpected,
+    };
+}
+
+/// Name the fault a failed `capabilities.dropAll` in A is recorded as.
+/// Exhaustive for the reason `filterFaultFor` gives.
+fn capabilitiesFaultFor(err: capabilities.Error) iface.SupervisorAudit.Fault {
+    return switch (err) {
+        error.Rejected => .rejected,
+    };
+}
+
+/// Read the value byte of a `tag_middle_layer` record.
+///
+/// A value this build has no name for still reads as "the layer did not go
+/// on", with `unexpected` standing in for the name. A record only A writes
+/// cannot carry one, and reading it as success would be the one mistake this
+/// whole record exists to stop.
+fn outcomeFor(value: u8) iface.SupervisorAudit.Outcome {
     if (value == 0) return .on;
-    const fault = std.enums.fromInt(iface.SupervisorAudit.FilterFault, value) orelse .unexpected;
+    const fault = std.enums.fromInt(iface.SupervisorAudit.Fault, value) orelse .unexpected;
     return .{ .off = fault };
 }
 
@@ -1471,12 +1532,13 @@ fn filterFor(value: u8) iface.SupervisorAudit.Filter {
 /// Every field keeps its default on end of file with no data, which is what a
 /// call whose A was killed before it could say anything leaves behind.
 fn readMiddleReport(middle_read_fd: i32) MiddleReport {
-    // Room for twice as many records as A can write: two of its own, one that
-    // says whether it watched the program, and one for each member of
-    // `seccomp.TrapCall` that the program used. A reader that stopped early
+    // Room for twice as many records as A can write: one for each layer it
+    // puts on itself, one for the scratch areas, one that says whether it
+    // watched the program, and one for each member of `seccomp.TrapCall` that
+    // the program used. A reader that stopped early
     // would leave bytes in a pipe nobody reads again, and the cost of the
     // margin is a few bytes of stack.
-    var buffer: [record_bytes * 2 * (3 + notify.call_count)]u8 = undefined;
+    var buffer: [record_bytes * 2 * (2 + middle_layer_count + notify.call_count)]u8 = undefined;
     var filled: usize = 0;
     while (filled < buffer.len) {
         const rc = linux.read(middle_read_fd, buffer[filled..].ptr, buffer.len - filled);
@@ -1496,7 +1558,12 @@ fn readMiddleReport(middle_read_fd: i32) MiddleReport {
         const value = std.mem.readInt(u64, buffer[at + 2 ..][0..8], .little);
         switch (buffer[at]) {
             tag_scratch_full => report.scratch_full = value != 0,
-            tag_middle_filter => report.filter = filterFor(@truncate(value)),
+            // A slot this build has no layer for is dropped, for the reason
+            // `tag_trap_count` below gives: an answer under the wrong layer's
+            // name is worse than one that is missing.
+            tag_middle_layer => if (std.enums.fromInt(iface.LayerName, slot)) |layer| {
+                report.layers.set(layer, outcomeFor(@truncate(value)));
+            },
             tag_traps_observed => report.traps = if (value != 0) .observed else .unobserved,
             // A slot this build has no member for is dropped. Counting it
             // against a member that exists would put a number under the wrong
@@ -2343,6 +2410,19 @@ fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_f
         dieNamespace(write_fd, config.stderr_fd, .namespace, err, diag);
 }
 
+/// Every layer `applyLayers` puts on the sandboxed program, in the order it
+/// puts them on. **The list the comptime check inside that function walks**,
+/// so a layer added there and not here is a layer nothing checks the fail mode
+/// of.
+const applied_by_b = [_]iface.LayerName{
+    .mount_tree,
+    .pivot_root,
+    .capabilities,
+    .landlock,
+    .session_keyring,
+    .seccomp,
+};
+
 /// Steps 2 to 6 of the order above, in B, the process that runs the caller's
 /// program. **The mount tree is built here and not in A**, because a procfs
 /// mount takes the pid namespace of whichever process makes it. See the
@@ -2356,6 +2436,28 @@ fn applyLayers(
     write_fd: i32,
     notify_fd: i32,
 ) void {
+    // **Every step below ends the process, and the fail mode table has to
+    // agree.** This function has no path that runs on without a layer, and it
+    // must not grow one: B is the caller's own program, and a tool call that
+    // ran with a layer quietly missing is the one state the whole design
+    // refuses. So the table is read here as a constraint rather than as a
+    // switch. An edit that gave one of these layers `open` for the sandboxed
+    // process stops this file compiling, which is the loudest a data field can
+    // be about code that would then be wrong.
+    //
+    // It is stated here and not derived into a branch on purpose: writing a
+    // runtime `open` arm for B would be adding a fail open path to the
+    // sandboxed process to make a field look load bearing. See
+    // `restrictMiddle`, which does derive, because it really has both.
+    comptime {
+        for (applied_by_b) |layer| {
+            if (iface.failModeFor(.sandboxed, layer) != .closed) @compileError(
+                "sandbox: applyLayers ends the process on every fault, so every layer it " ++
+                    "applies must fail closed",
+            );
+        }
+    }
+
     // One slot for both calls: `note` keeps the first fault, and a pivot can
     // only fail after a mount tree that did not, so the first is the one that
     // explains the rest.
@@ -2677,26 +2779,70 @@ fn restrictMiddle(abi: i32, insns: []const bpf.Insn, middle_write_fd: i32) void 
     // credential in its memory: best effort here still costs A nothing, for
     // the reason this whole function's own doc comment gives.
     var cap_diag: ?capabilities.Diagnostic = null;
-    capabilities.dropAll(&cap_diag) catch |err| printMiddleCapabilitiesFault(err, cap_diag);
+    if (capabilities.dropAll(&cap_diag)) |_| {
+        middleLayerWent(.capabilities, middle_write_fd, null);
+    } else |err| {
+        printMiddleCapabilitiesFault(err, cap_diag);
+        middleLayerWent(.capabilities, middle_write_fd, capabilitiesFaultFor(err));
+    }
 
     var diag: ?landlock.Diagnostic = null;
     if (landlock.Ruleset.init(abi, &diag)) |ruleset| {
         var owned = ruleset;
         defer owned.deinit();
-        owned.restrictSelf(&diag) catch |err| printMiddleFault(err, diag);
+        if (owned.restrictSelf(&diag)) |_| {
+            middleLayerWent(.landlock, middle_write_fd, null);
+        } else |err| {
+            printMiddleFault(err, diag);
+            middleLayerWent(.landlock, middle_write_fd, landlockFaultFor(err));
+        }
     } else |err| {
         printMiddleFault(err, diag);
+        middleLayerWent(.landlock, middle_write_fd, landlockFaultFor(err));
     }
 
     // **The line first and the record second**, so the behaviour a person sees
     // is the behaviour they always saw, and the record is added behind it.
-    // Written whichever way the install went: see `tag_middle_filter`.
-    seccomp.install(bpf.Prog.init(insns)) catch |err| {
+    // Written whichever way the install went: see `tag_middle_layer`.
+    if (seccomp.install(bpf.Prog.init(insns))) |_| {
+        middleLayerWent(.seccomp, middle_write_fd, null);
+    } else |err| {
         printMiddleFault(err, null);
-        reportMiddleFilter(middle_write_fd, filterFaultFor(err));
-        return;
-    };
-    reportMiddleFilter(middle_write_fd, null);
+        middleLayerWent(.seccomp, middle_write_fd, filterFaultFor(err));
+    }
+}
+
+/// What A does about a layer of its own that would not go on.
+///
+/// **The fail mode is read from `iface.failModeFor` and never from the shape
+/// of this file.** The whole point of that table is that a reader, a report
+/// and the log all learn the answer from one value instead of following a call
+/// graph. Reading it here is what stops the value from drifting away from the
+/// behaviour it names: change the table and this function compiles to
+/// something else.
+///
+/// **`comptime`, so there is no unreachable branch in A.** The switch is
+/// resolved when this file is compiled, so the arm that does not apply is
+/// never analysed and never emitted. A `.closed` entry would make A end the
+/// same way any other relay fault ends it.
+fn middleLayerWent(
+    comptime layer: iface.LayerName,
+    middle_write_fd: i32,
+    fault: ?iface.SupervisorAudit.Fault,
+) void {
+    const mode = comptime iface.failModeFor(.supervisor, layer) orelse @compileError(
+        "sandbox: the supervisor reports a layer the fail mode table says it never applies",
+    );
+    switch (comptime mode) {
+        // Counted and printed, and the process goes on. See `restrictMiddle`'s
+        // own doc comment for why ending A here would cost the caller the
+        // running program for nothing.
+        .open => reportMiddleLayer(middle_write_fd, layer, fault),
+        .closed => {
+            reportMiddleLayer(middle_write_fd, layer, fault);
+            if (fault != null) dieRelay(error.Unexpected);
+        },
+    }
 }
 
 /// Same as `printMiddleFault`, for the one call in `restrictMiddle` that is
@@ -3325,19 +3471,19 @@ fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     return buffer[0..len :0];
 }
 
-test "the middle pipe carries the scratch fact and the filter fact, and a reader tells them apart" {
+test "the middle pipe carries the scratch fact and a layer fact, and a reader tells them apart" {
     // **The record format itself, writer against reader.** Before this, the
     // pipe carried one unframed byte with one meaning, so a second fact could
     // not be added without a reader that could tell two records apart. Both
     // records go in here, in the order A writes them, and both come back.
     //
     // Mutation check: make `readMiddleReport` stop after the first record and
-    // the scratch fact is lost, because A writes the filter record first.
+    // the scratch fact is lost, because A writes the layer records first.
     var fds: [2]i32 = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
     defer _ = linux.close(fds[0]);
 
-    reportMiddleFilter(fds[1], .no_new_privs_refused);
+    reportMiddleLayer(fds[1], .seccomp, .no_new_privs_refused);
     writeMiddleRecord(fds[1], tag_scratch_full, 0, 1);
     // The reader stops at end of file, and only the writer's own close gives
     // it one.
@@ -3346,8 +3492,50 @@ test "the middle pipe carries the scratch fact and the filter fact, and a reader
     const report = readMiddleReport(fds[0]);
     try std.testing.expect(report.scratch_full);
     try std.testing.expectEqual(
-        iface.SupervisorAudit.Filter{ .off = .no_new_privs_refused },
-        report.filter,
+        iface.SupervisorAudit.Outcome{ .off = .no_new_privs_refused },
+        report.layers.get(.seccomp),
+    );
+    // **The slot is what tells one layer's answer from another's.** A reader
+    // that ignored it would read the seccomp record as the answer for every
+    // layer A puts on itself, which is how a refused Landlock ruleset comes to
+    // read as a filter that would not install.
+    //
+    // Mutation check: write slot 0 for every layer in `reportMiddleLayer` and
+    // this fails, because the capability record then lands on `.mount_tree`.
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Outcome.unsaid,
+        report.layers.get(.landlock),
+    );
+}
+
+test "each layer the supervisor puts on itself comes back under its own name" {
+    // The three records A really writes, together, read back apart. Before
+    // this the pipe carried the filter alone, so the capability drop and the
+    // Landlock ruleset reached a terminal and died with it.
+    //
+    // Mutation check: drop the slot byte from `reportMiddleLayer` and all
+    // three answers land on one layer, so two of the three expectations fail.
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[0]);
+
+    reportMiddleLayer(fds[1], .capabilities, .rejected);
+    reportMiddleLayer(fds[1], .landlock, .not_supported);
+    reportMiddleLayer(fds[1], .seccomp, null);
+    _ = linux.close(fds[1]);
+
+    const report = readMiddleReport(fds[0]);
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Outcome{ .off = .rejected },
+        report.layers.get(.capabilities),
+    );
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Outcome{ .off = .not_supported },
+        report.layers.get(.landlock),
+    );
+    try std.testing.expectEqual(
+        iface.SupervisorAudit.Outcome.on,
+        report.layers.get(.seccomp),
     );
 }
 
@@ -3359,7 +3547,7 @@ test "a supervisor that said nothing is not a supervisor that was confined" {
     // that passed, which is the shape of the vacuous test this project has
     // been caught by before.
     //
-    // Mutation check: give `MiddleReport.filter` a default of `.on` and this
+    // Mutation check: give `MiddleReport.layers` a default of `.on` and this
     // fails; `readMiddleReport` never writes the field for an empty pipe.
     var fds: [2]i32 = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
@@ -3368,7 +3556,12 @@ test "a supervisor that said nothing is not a supervisor that was confined" {
 
     const report = readMiddleReport(fds[0]);
     try std.testing.expect(!report.scratch_full);
-    try std.testing.expectEqual(iface.SupervisorAudit.Filter.unsaid, report.filter);
+    for (comptime std.enums.values(iface.LayerName)) |layer| {
+        try std.testing.expectEqual(
+            iface.SupervisorAudit.Outcome.unsaid,
+            report.layers.get(layer),
+        );
+    }
 }
 
 test "every way the filter can be refused reaches the reader as its own fault" {
@@ -3392,20 +3585,23 @@ test "every way the filter can be refused reaches the reader as its own fault" {
         error.Rejected,
         error.Unexpected,
     };
-    var seen: [errors.len]iface.SupervisorAudit.FilterFault = undefined;
+    var seen: [errors.len]iface.SupervisorAudit.Fault = undefined;
     for (errors, 0..) |err, index| {
-        reportMiddleFilter(fds[1], filterFaultFor(err));
+        reportMiddleLayer(fds[1], .seccomp, filterFaultFor(err));
         var record: [record_bytes]u8 = undefined;
         const rc = linux.read(fds[0], &record, record.len);
         try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
         try std.testing.expectEqual(@as(usize, record_bytes), rc);
-        try std.testing.expectEqual(tag_middle_filter, record[0]);
+        try std.testing.expectEqual(tag_middle_layer, record[0]);
 
-        // Byte 1 is the slot, which this record does not use, and the value
-        // starts at byte 2. See `record_bytes`.
-        try std.testing.expectEqual(@as(u8, 0), record[1]);
+        // Byte 1 is the slot, which names the layer, and the value starts at
+        // byte 2. See `record_bytes`.
+        try std.testing.expectEqual(
+            @as(u8, @intFromEnum(iface.LayerName.seccomp)),
+            record[1],
+        );
         const value = std.mem.readInt(u64, record[2..record_bytes], .little);
-        switch (filterFor(@truncate(value))) {
+        switch (outcomeFor(@truncate(value))) {
             .off => |fault| seen[index] = fault,
             // A filter that went on, or nothing said at all, for an install
             // that failed. Either one would make the whole record worthless.
@@ -3419,21 +3615,21 @@ test "every way the filter can be refused reaches the reader as its own fault" {
     }
 }
 
-test "a filter that went on is the only value byte that reads as confined" {
-    // The other half of the record's meaning. `reportMiddleFilter(fd, null)`
+test "a layer that went on is the only value byte that reads as confined" {
+    // The other half of the record's meaning. `reportMiddleLayer(fd, l, null)`
     // is what A writes when the install worked, and nothing else may read that
     // way, including a fault code from a build this one has never seen.
     //
-    // Mutation check: return `.on` for the unrecognised value in `filterFor`
+    // Mutation check: return `.on` for the unrecognised value in `outcomeFor`
     // and the last case here fails.
-    try std.testing.expectEqual(iface.SupervisorAudit.Filter.on, filterFor(0));
+    try std.testing.expectEqual(iface.SupervisorAudit.Outcome.on, outcomeFor(0));
     try std.testing.expectEqual(
-        iface.SupervisorAudit.Filter{ .off = .rejected },
-        filterFor(@intFromEnum(iface.SupervisorAudit.FilterFault.rejected)),
+        iface.SupervisorAudit.Outcome{ .off = .rejected },
+        outcomeFor(@intFromEnum(iface.SupervisorAudit.Fault.rejected)),
     );
     try std.testing.expectEqual(
-        iface.SupervisorAudit.Filter{ .off = .unexpected },
-        filterFor(200),
+        iface.SupervisorAudit.Outcome{ .off = .unexpected },
+        outcomeFor(200),
     );
 }
 

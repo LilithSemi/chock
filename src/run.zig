@@ -4398,27 +4398,26 @@ fn chosenLanding(
 /// missing, and `✓` beside a layer the driver gives is a claim about every call
 /// that ran, not a guess about one.
 ///
-/// **`unavailable` is a layer this machine could apply and this process was
-/// not permitted.** Nothing in `chock run` measures that for most layers
-/// today: the per call records that would hold it, `Sandbox.LimitsReport`
-/// and `Sandbox.LandlockReport`, are filled inside `chock_core.tools` and
-/// never carried back out. See `ui.Layer.State.unavailable`.
+/// **`witness` is what this process really asked the machine**, and it is the
+/// difference between a report and a claim. `witness.probed` names every
+/// guarantee something here observed one way or the other, and
+/// `witness.unavailable` names the ones that came back refused. A guarantee
+/// in `given` and not in `witness.probed` reads `ui.Layer.State.declared`: the
+/// build applies it and nothing here watched it go on.
 ///
-/// **Landlock is the one exception**, because `sandbox.landlock.probeAbi`
-/// changes nothing and needs no tool call to run: `src/doctor.zig` already
-/// reads it the same way, before this same session's first tool call, so a
-/// kernel that refuses Landlock right now reads `unavailable` in the header
-/// rather than `on`, and the session's first sandboxed call is not the first
-/// place that shows up. The caller passes what it measured in
-/// `unavailable`, a set naming every guarantee this run could not actually
-/// get even though `given` says the build carries it; this file does no
-/// measuring of its own.
+/// **That distinction is the whole reason this takes two sets.** A layer
+/// credited because the code that installs it compiled, or because the call
+/// that installs it returned no error, is a claim. The header draws before the
+/// first tool call, so at that moment an unprobed layer has nothing behind it
+/// at all, and a tick there would be the harness telling a person something it
+/// does not know. See `witnessLayers`, which does the measuring, and
+/// `ui.Layer.State` for what each answer prints.
 ///
 /// The result borrows only static strings, so a caller may keep it for as long
 /// as it likes.
 fn sandboxLayers(
     given: sandbox.Sandbox.Guarantees,
-    unavailable: sandbox.Sandbox.Guarantees,
+    witness: LayerWitness,
     network: sandbox.namespace.Network,
     workspace: []const u8,
 ) [layer_names.len]ui.Layer {
@@ -4444,10 +4443,12 @@ fn sandboxLayers(
         };
         const state: ui.Layer.State = if (!given.contains(named.guarantee))
             .unsupported
-        else if (unavailable.contains(named.guarantee))
+        else if (witness.unavailable.contains(named.guarantee))
             .unavailable
         else if (named.guarantee == .network_isolated and network == .host)
             .off
+        else if (!witness.probed.contains(named.guarantee))
+            .declared
         else
             .on;
         slot.* = .{ .name = named.name, .note = note, .state = state };
@@ -4455,21 +4456,107 @@ fn sandboxLayers(
     return built;
 }
 
-/// What `sandboxLayers`'s `unavailable` set should hold for this session,
-/// measured once, here, before the header is drawn.
+/// What this session could measure about its own sandbox layers, and what it
+/// could not.
 ///
-/// **Landlock only, and only when the driver under this build is the Linux
-/// one.** `sandbox.landlock.probeAbi` is the one guarantee this file can
-/// measure without a tool call: see `sandboxLayers`'s own doc comment for
-/// why. Darwin's `path_restricted` is Seatbelt, never Landlock, and a raw
-/// Landlock syscall asked of a kernel that is not Linux answers nothing true
-/// about that Seatbelt profile, so this asks nothing unless
-/// `builtin.target.os.tag` says the answer would mean something.
-fn measuredUnavailable(given: sandbox.Sandbox.Guarantees) sandbox.Sandbox.Guarantees {
-    var out = sandbox.Sandbox.Guarantees.initEmpty();
+/// **Two sets and not one, because "not probed" is a third answer.** A
+/// guarantee in `probed` is one this process really asked the machine about.
+/// A guarantee in `unavailable` came back refused, and `unavailable` is always
+/// a subset of `probed`: nothing may be called refused that was never asked.
+/// A guarantee in neither is a layer this build applies and nothing here
+/// watched. See `ui.Layer.State.declared`.
+const LayerWitness = struct {
+    probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
+    unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
+
+    /// Record one answer. `available` is what the machine said.
+    fn saw(self: *LayerWitness, guarantee: sandbox.Sandbox.Guarantee, available: bool) void {
+        self.probed.insert(guarantee);
+        if (!available) self.unavailable.insert(guarantee);
+    }
+};
+
+/// Measure what can be measured about this session's sandbox layers, once,
+/// here, before the header is drawn and before the first tool call.
+///
+/// **Only what this process can really observe, and nothing else.** A probe
+/// that changes nothing and a fork that asks the kernel the same question
+/// `spawn` will ask are observations. The absence of an error from code that
+/// has not run yet is not.
+///
+/// **Five of the six are answered and one is not**, and the header says
+/// which:
+///
+/// * `path_restricted` is `sandbox.landlock.probeAbi`, a system call that
+///   reads the ABI version and changes nothing. `src/doctor.zig` reads it the
+///   same way. It witnesses that this kernel has Landlock, and not that a
+///   ruleset restricted anything.
+/// * `signal_isolated`, `ipc_isolated` and `network_isolated` are
+///   `sandbox.namespace.probeAvailability`, which forks a child that calls
+///   `namespace.enter` with the same default options `spawn` uses, so the
+///   three namespaces are really made. Its third answer, `unknown`, is a probe
+///   that could not run, and it is recorded as neither.
+/// * `syscall_restricted` is `sandbox.seccomp.probeInstall`, which forks a
+///   child that installs this build's own filter and exits. The filter cannot
+///   be removed, so the question can only be asked in a child.
+/// * `workspace_mounted` is **not** measured. The namespace probe enters a
+///   mount namespace and it does not build a root or `pivot_root` into one,
+///   and claiming the workspace layer from it would be crediting a layer for
+///   a weaker measurement than the layer makes. It reads `declared`.
+///
+/// **Linux only.** Darwin's `path_restricted` is Seatbelt and never Landlock,
+/// and a raw Landlock system call asked of a kernel that is not Linux answers
+/// nothing true about that profile. The same holds for the other two probes,
+/// which name Linux mechanisms outright. On Darwin this measures nothing, so
+/// every layer Seatbelt gives reads `declared` rather than `on`: see
+/// `src/doctor.zig`'s own `measureSeatbelt`, which is where a Darwin session's
+/// layers really are measured.
+fn witnessLayers(
+    gpa: std.mem.Allocator,
+    given: sandbox.Sandbox.Guarantees,
+) LayerWitness {
+    var out = LayerWitness{};
     if (builtin.target.os.tag != .linux) return out;
-    if (!given.contains(.path_restricted)) return out;
-    if (sandbox.landlock.probeAbi()) |_| {} else |_| out.insert(.path_restricted);
+
+    if (given.contains(.path_restricted)) {
+        if (sandbox.landlock.probeAbi()) |_| {
+            out.saw(.path_restricted, true);
+        } else |_| {
+            out.saw(.path_restricted, false);
+        }
+    }
+
+    // One fork answers for all three namespaces, because `enter` makes them
+    // together. `unknown` is a probe that could not run, and it is left out of
+    // `probed` rather than counted as either answer.
+    const namespaces = sandbox.namespace.probeAvailability();
+    if (namespaces != .unknown) {
+        for ([_]sandbox.Sandbox.Guarantee{
+            .signal_isolated,
+            .ipc_isolated,
+            .network_isolated,
+        }) |guarantee| {
+            if (given.contains(guarantee)) out.saw(guarantee, namespaces.available());
+        }
+    }
+
+    if (given.contains(.syscall_restricted)) {
+        // Built here and not in the child: a fork may happen while another
+        // thread holds this allocator's lock. **No trap set**, for the reason
+        // `probeInstall` gives: a filter that asks for a user notification
+        // with no listener behind it makes the kernel answer every observed
+        // call with `ENOSYS`, and the child's own answer would be lost.
+        if (sandbox.seccomp.build(gpa, .{})) |insns| {
+            defer gpa.free(insns);
+            switch (sandbox.seccomp.probeInstall(sandbox.bpf.Prog.init(insns))) {
+                .ok => out.saw(.syscall_restricted, true),
+                .refused => out.saw(.syscall_restricted, false),
+                // Nothing was measured, so nothing is claimed either way.
+                .unknown => {},
+            }
+        } else |_| {}
+    }
+
     return out;
 }
 
@@ -5423,13 +5510,20 @@ fn logNetworkSummary(
     };
 }
 
-/// Write this session's one `sandbox.supervisor` event.
+/// Write this session's `sandbox.supervisor` events, one for each layer the
+/// supervisor puts on itself.
 ///
 /// **Always, and not only when something degraded.** A reader that finds no
 /// event cannot tell a session where every supervisor confined itself from a
 /// session written by a build that did not know the fact, and an audit that
 /// cannot tell those apart is not an audit. See
 /// `chock_proto.event.SandboxSupervisor`.
+///
+/// **One event per layer, and the fail mode table says which layers there
+/// are.** `SandboxSupervisor.layer` was given a field of its own for exactly
+/// this, so a second layer is a second event and never a second kind. Walking
+/// `sandbox.Sandbox.failModeFor` rather than a list here is what keeps the log
+/// and the driver naming the same three layers.
 ///
 /// Best effort, for the reason `logNetworkSummary` gives: `Loop.run` has
 /// already given the storage lock back by the time this runs, so this takes it
@@ -5441,19 +5535,21 @@ fn logSupervisorAudit(
     storage: chock_proto.storage.Storage,
     audit: *const sandbox.Sandbox.SupervisorAudit,
 ) void {
-    const ev = supervisorEvent(audit.counts());
-
     var locked = storage.lock(io) catch |err| {
         reportSupervisorRecord(err);
         return;
     };
     defer locked.unlock(io) catch {};
-    _ = locked.append(
-        gpa,
-        io,
-        ev,
-        std.Io.Timestamp.now(io, .real).toMilliseconds(),
-    ) catch |err| reportSupervisorRecord(err);
+    inline for (comptime std.enums.values(sandbox.Sandbox.LayerName)) |layer| {
+        if (comptime sandbox.Sandbox.failModeFor(.supervisor, layer)) |mode| {
+            _ = locked.append(
+                gpa,
+                io,
+                supervisorEvent(layer, mode, audit.counts(layer)),
+                std.Io.Timestamp.now(io, .real).toMilliseconds(),
+            ) catch |err| reportSupervisorRecord(err);
+        }
+    }
 }
 
 /// The one message a failed `logSupervisorAudit` writes.
@@ -5469,12 +5565,20 @@ fn reportSupervisorRecord(err: anyerror) void {
 /// The `sandbox.supervisor` event `logSupervisorAudit` writes. **Pure**, so
 /// its shape can be checked without touching storage: see the tests below.
 fn supervisorEvent(
+    layer: sandbox.Sandbox.LayerName,
+    fail_mode: sandbox.Sandbox.FailMode,
     counts: sandbox.Sandbox.SupervisorAudit.Counts,
 ) chock_proto.event.Event {
     return .{
         .sandbox_supervisor = .{
             .process = sandbox.Sandbox.SupervisorAudit.process_name,
-            .layer = sandbox.Sandbox.SupervisorAudit.layer_name,
+            .layer = layer.wireName(),
+            // **Written out and never left for a reader to infer.** The
+            // supervisor is the one process in this design that runs on
+            // without a layer, and a row that did not say so reads exactly
+            // like a row about the sandboxed program, where the same numbers
+            // would mean the call never ran.
+            .fail_mode = @tagName(fail_mode),
             .confined = counts.confined,
             .unconfined = counts.unconfined,
             .unreported = counts.unreported,
@@ -5637,7 +5741,7 @@ test "the supervisor event names the fault, and the audit question is one field"
     // Mutation check: write a bare "failed" for `reason` in `supervisorEvent`
     // and the `no_new_privs_refused` expectation fails, which is the whole
     // value of the split `seccomp.InstallError` carries.
-    const ev = supervisorEvent(.{
+    const ev = supervisorEvent(.seccomp, .open, .{
         .confined = 11,
         .unconfined = 2,
         .unreported = 1,
@@ -5650,6 +5754,92 @@ test "the supervisor event names the fault, and the audit question is one field"
     try std.testing.expectEqual(@as(u64, 2), ev.sandbox_supervisor.unconfined);
     try std.testing.expectEqual(@as(u64, 1), ev.sandbox_supervisor.unreported);
     try std.testing.expectEqualStrings("no_new_privs_refused", ev.sandbox_supervisor.reason);
+}
+
+test "the event says which way the layer fails, and the answer comes from the sandbox table" {
+    // **The fail mode is a value in the row and not a thing a reader works
+    // out.** Two rows can carry the same three counts and mean opposite
+    // things: a supervisor with `unconfined` above zero ran on without the
+    // layer, and the sandboxed program never could. Nothing in the row said
+    // which until this field.
+    //
+    // **Read from `failModeFor` and not spelled here**, so this test fails if
+    // the table and the log ever disagree rather than passing against a copy
+    // of the answer.
+    //
+    // Mutation check: write a constant `"open"` in `supervisorEvent` instead
+    // of the argument and the `closed` expectation below fails.
+    const table = sandbox.Sandbox.failModeFor(.supervisor, .seccomp).?;
+    try std.testing.expectEqual(sandbox.Sandbox.FailMode.open, table);
+    const open = supervisorEvent(.seccomp, table, .{
+        .confined = 1,
+        .unconfined = 0,
+        .unreported = 0,
+        .first_fault = null,
+    });
+    try std.testing.expectEqualStrings("open", open.sandbox_supervisor.fail_mode);
+
+    const closed = supervisorEvent(.seccomp, .closed, .{
+        .confined = 1,
+        .unconfined = 0,
+        .unreported = 0,
+        .first_fault = null,
+    });
+    try std.testing.expectEqualStrings("closed", closed.sandbox_supervisor.fail_mode);
+
+    // Every layer the sandboxed program wears fails closed, and the table is
+    // what says so. A build that changed one of them to `open` would be a
+    // build where a tool call can run with a layer missing.
+    for (comptime std.enums.values(sandbox.Sandbox.LayerName)) |layer| {
+        try std.testing.expectEqual(
+            @as(?sandbox.Sandbox.FailMode, .closed),
+            sandbox.Sandbox.failModeFor(.sandboxed, layer),
+        );
+    }
+}
+
+test "every layer the supervisor puts on itself gets a row of its own" {
+    // **The capability drop and the Landlock ruleset used to reach a terminal
+    // and nothing else.** Only the filter had a record, so a session log could
+    // not answer whether the process holding the credential kept its
+    // capabilities. `SandboxSupervisor.layer` exists so that a second layer is
+    // a second row of the same kind.
+    //
+    // Mutation check: write only the seccomp row in `logSupervisorAudit` and
+    // the count below is 1 instead of 3.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(gpa, "01SUPERVISORLAYERS00000000");
+    const storage = backing.storage();
+    defer storage.close(io);
+
+    var audit: sandbox.Sandbox.SupervisorAudit = .{};
+    audit.record(.capabilities, .on);
+    audit.record(.landlock, .{ .off = .rejected });
+    audit.record(.seccomp, .on);
+    logSupervisorAudit(gpa, io, storage, &audit);
+
+    var replay = try storage.replay(gpa, io, 0);
+    defer replay.deinit();
+    var rows: usize = 0;
+    var landlock_unconfined: u64 = 0;
+    var seccomp_unconfined: u64 = 1;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .sandbox_supervisor) continue;
+        rows += 1;
+        const said = parsed.value.event.sandbox_supervisor;
+        // Every row says how this process fails, whichever layer it names.
+        try std.testing.expectEqualStrings("open", said.fail_mode);
+        if (std.mem.eql(u8, said.layer, "landlock")) landlock_unconfined = said.unconfined;
+        if (std.mem.eql(u8, said.layer, "seccomp")) seccomp_unconfined = said.unconfined;
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows);
+    // **One layer's refusal is not another's.** A reader must be able to say
+    // which layer the credential holding process went without.
+    try std.testing.expectEqual(@as(u64, 1), landlock_unconfined);
+    try std.testing.expectEqual(@as(u64, 0), seccomp_unconfined);
 }
 
 test "a session where every supervisor confined itself still writes the event" {
@@ -5671,8 +5861,8 @@ test "a session where every supervisor confined itself still writes the event" {
     defer storage.close(io);
 
     var audit: sandbox.Sandbox.SupervisorAudit = .{};
-    audit.record(.on);
-    audit.record(.on);
+    audit.record(.seccomp, .on);
+    audit.record(.seccomp, .on);
     logSupervisorAudit(gpa, io, storage, &audit);
 
     var replay = try storage.replay(gpa, io, 0);
@@ -5681,6 +5871,7 @@ test "a session where every supervisor confined itself still writes the event" {
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         if (parsed.value.event != .sandbox_supervisor) continue;
+        if (!std.mem.eql(u8, parsed.value.event.sandbox_supervisor.layer, "seccomp")) continue;
         found = true;
         const said = parsed.value.event.sandbox_supervisor;
         try std.testing.expectEqual(@as(u64, 2), said.confined);
@@ -5706,8 +5897,8 @@ test "the supervisor's own degradation reaches the log, not only the terminal" {
     defer storage.close(io);
 
     var audit: sandbox.Sandbox.SupervisorAudit = .{};
-    audit.record(.on);
-    audit.record(.{ .off = .not_permitted });
+    audit.record(.seccomp, .on);
+    audit.record(.seccomp, .{ .off = .not_permitted });
     logSupervisorAudit(gpa, io, storage, &audit);
 
     var replay = try storage.replay(gpa, io, 0);
@@ -5716,6 +5907,7 @@ test "the supervisor's own degradation reaches the log, not only the terminal" {
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         if (parsed.value.event != .sandbox_supervisor) continue;
+        if (!std.mem.eql(u8, parsed.value.event.sandbox_supervisor.layer, "seccomp")) continue;
         found = true;
         const said = parsed.value.event.sandbox_supervisor;
         try std.testing.expectEqual(@as(u64, 1), said.confined);
@@ -10057,6 +10249,16 @@ fn runSession(
     // separate, because the transcript outlives the display.
     defer if (screen) |one| one.deinit();
 
+    // What this process could really observe about its own sandbox layers.
+    //
+    // **Before the display and not beside the header.** Two of the three
+    // probes fork, and a fork taken after `Ui.start` would be a fork of a
+    // process holding a terminal in raw mode. The child writes nothing but its
+    // own pipe and ends with `exit_group`, so it would be safe either way, and
+    // asking first costs nothing and removes the question. See
+    // `witnessLayers`.
+    const layer_witness = witnessLayers(gpa, sandbox.Sandbox.guarantees);
+
     if (options.display) |wanted| {
         screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err| open_failed: {
             // A terminal that will not give its size is a reason to print the
@@ -10076,7 +10278,7 @@ fn runSession(
     // `sandboxLayers` for where each one comes from.
     const layers = sandboxLayers(
         sandbox.Sandbox.guarantees,
-        measuredUnavailable(sandbox.Sandbox.guarantees),
+        layer_witness,
         started.sandbox_config.network,
         switch (started.workspace.kind) {
             .worktree => "worktree",
@@ -15461,7 +15663,8 @@ test "the header names every sandbox layer the driver gives, and says the word o
     // the second block below claims a sandbox layer that is not there, which is
     // the "never quiet" rule turned into a lie.
     const every = sandbox.Sandbox.Guarantees.initFull();
-    const on = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
+    const all_seen = LayerWitness{ .probed = every };
+    const on = sandboxLayers(every, all_seen, .none, "worktree");
     try std.testing.expectEqual(@as(usize, 6), on.len);
     for (on) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
     // The header and the layer states both write these two words.
@@ -15472,7 +15675,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
 
     // A driver that gives nothing, which is the Darwin driver today: every
     // layer says so, and none of them is quietly left on.
-    const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
+    const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), all_seen, .none, "worktree");
     for (none) |one| {
         try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         try std.testing.expect(one.state.word().len != 0);
@@ -15482,7 +15685,7 @@ test "the header names every sandbox layer the driver gives, and says the word o
     // one that says so, and it is the layer this asked about.
     var short = every;
     short.remove(.path_restricted);
-    const missing = sandboxLayers(short, sandbox.Sandbox.Guarantees.initEmpty(), .none, "worktree");
+    const missing = sandboxLayers(short, all_seen, .none, "worktree");
     for (missing) |one| {
         if (std.mem.eql(u8, one.name, "landlock")) {
             try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
@@ -15506,7 +15709,7 @@ test "a layer the driver gives but this run could not get reads unavailable, not
     var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
     landlock_only.insert(.path_restricted);
 
-    const blocked = sandboxLayers(every, landlock_only, .none, "worktree");
+    const blocked = sandboxLayers(every, .{ .probed = every, .unavailable = landlock_only }, .none, "worktree");
     for (blocked) |one| {
         if (std.mem.eql(u8, one.name, "landlock")) {
             try std.testing.expectEqual(ui.Layer.State.unavailable, one.state);
@@ -15520,12 +15723,118 @@ test "a layer the driver gives but this run could not get reads unavailable, not
     // only narrows a layer that was there to begin with.
     var short = every;
     short.remove(.path_restricted);
-    const never_had = sandboxLayers(short, landlock_only, .none, "worktree");
+    const never_had = sandboxLayers(short, .{ .probed = every, .unavailable = landlock_only }, .none, "worktree");
     for (never_had) |one| {
         if (std.mem.eql(u8, one.name, "landlock")) {
             try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         }
     }
+}
+
+test "a layer nothing measured reads unproven, and never the same as one that was probed" {
+    // **This is the whole point of the witness.** The header draws before the
+    // first tool call. Every layer used to read `on` there because the build's
+    // driver declares it, so the tick was a claim about code that had not run
+    // yet, not a report of anything observed. A reader cannot tell a measured
+    // layer from an unmeasured one when both print the same mark.
+    //
+    // Mutation check: drop the `witness.probed` test from `sandboxLayers` and
+    // the first block below reads `on` for all six, which is the old
+    // behaviour and the fault this change exists to remove.
+    const every = sandbox.Sandbox.Guarantees.initFull();
+
+    // Nothing probed at all: every layer the build gives is declared and none
+    // of them claims to have been seen.
+    const unseen = sandboxLayers(every, .{}, .none, "worktree");
+    for (unseen) |one| {
+        try std.testing.expectEqual(ui.Layer.State.declared, one.state);
+        // The word is what stops the difference resting on one glyph.
+        try std.testing.expectEqualStrings("UNPROVEN", one.state.word());
+    }
+    // And it is a different mark from both of the answers it sits between.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        ui.Layer.State.declared.glyph(),
+        ui.Layer.State.on.glyph(),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        ui.Layer.State.declared.glyph(),
+        ui.Layer.State.unavailable.glyph(),
+    ));
+
+    // One probed layer among five unprobed ones: only the probed one is
+    // credited, and the other five stay honest.
+    var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
+    landlock_only.insert(.path_restricted);
+    const one_seen = sandboxLayers(every, .{ .probed = landlock_only }, .none, "worktree");
+    for (one_seen) |one| {
+        if (std.mem.eql(u8, one.name, "landlock")) {
+            try std.testing.expectEqual(ui.Layer.State.on, one.state);
+        } else {
+            try std.testing.expectEqual(ui.Layer.State.declared, one.state);
+        }
+    }
+
+    // A layer that was probed and came back refused stays `unavailable`. That
+    // answer outranks this one, because it is the stronger fact: the machine
+    // was asked and it said no.
+    const refused = sandboxLayers(
+        every,
+        .{ .probed = landlock_only, .unavailable = landlock_only },
+        .none,
+        "worktree",
+    );
+    for (refused) |one| {
+        if (std.mem.eql(u8, one.name, "landlock")) {
+            try std.testing.expectEqual(ui.Layer.State.unavailable, one.state);
+        }
+    }
+}
+
+test "this machine really answers for the layers the witness claims to measure" {
+    // **A probe that never ran is the failure this whole change is about**, so
+    // this runs the real ones against the real machine rather than stating
+    // what they would say. Every test above builds the witness by hand, which
+    // is exactly the shape that lets a mechanism ship untested.
+    //
+    // **What is asserted is the shape and not the verdict.** A kernel that
+    // refuses Landlock is a real machine and this must not fail on it. What
+    // may never happen is a guarantee marked unavailable that was never
+    // probed, or a guarantee the driver does not give being answered for at
+    // all.
+    //
+    // Mutation check: insert into `unavailable` without inserting into
+    // `probed` in `LayerWitness.saw` and the subset check below fails.
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const given = sandbox.Sandbox.guarantees;
+    const seen = witnessLayers(std.testing.allocator, given);
+
+    var stray = seen.unavailable;
+    stray = stray.differenceWith(seen.probed);
+    try std.testing.expectEqual(@as(usize, 0), stray.count());
+
+    var uninvited = seen.probed;
+    uninvited = uninvited.differenceWith(given);
+    try std.testing.expectEqual(@as(usize, 0), uninvited.count());
+
+    // The four layers this process really can ask about are asked about. A
+    // machine that answers none of them has a probe that stopped running,
+    // which is the fault that has no other detector.
+    for ([_]sandbox.Sandbox.Guarantee{
+        .path_restricted,
+        .syscall_restricted,
+        .signal_isolated,
+        .ipc_isolated,
+        .network_isolated,
+    }) |guarantee| {
+        try std.testing.expect(seen.probed.contains(guarantee));
+    }
+
+    // **And the workspace layer is not claimed.** The namespace probe enters a
+    // mount namespace and builds no root, so crediting `workspace_mounted`
+    // from it would be the same overclaim in a new place.
+    try std.testing.expect(!seen.probed.contains(.workspace_mounted));
 }
 
 test "a session that gave the network layer up says so, and a filtered one does not" {
@@ -15539,11 +15848,12 @@ test "a session that gave the network layer up says so, and a filtered one does 
     // may reach one named host reads as a session with no network layer at all.
     const every = sandbox.Sandbox.Guarantees.initFull();
 
-    const filtered = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .filtered, "overlay");
+    const seen = LayerWitness{ .probed = every };
+    const filtered = sandboxLayers(every, seen, .filtered, "overlay");
     try std.testing.expectEqual(ui.Layer.State.on, filtered[0].state);
     try std.testing.expectEqualStrings("filtered", filtered[0].note);
 
-    const host = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), .host, "overlay");
+    const host = sandboxLayers(every, seen, .host, "overlay");
     try std.testing.expectEqual(ui.Layer.State.off, host[0].state);
     try std.testing.expectEqualStrings("host", host[0].note);
     try std.testing.expectEqualStrings("OFF", host[0].state.word());
@@ -15570,7 +15880,7 @@ test "the word beside the net layer is the name of the mode, for every mode ther
     // every other test of `sandboxLayers` still passes.
     const every = sandbox.Sandbox.Guarantees.initFull();
     for (std.enums.values(sandbox.namespace.Network)) |mode| {
-        const built = sandboxLayers(every, sandbox.Sandbox.Guarantees.initEmpty(), mode, "worktree");
+        const built = sandboxLayers(every, .{ .probed = every }, mode, "worktree");
         try std.testing.expectEqualStrings(@tagName(mode), built[0].note);
     }
 }

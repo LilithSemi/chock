@@ -816,6 +816,106 @@ pub fn installListening(prog: bpf.Prog) InstallError!i32 {
     return @intCast(rc);
 }
 
+/// What this machine answered when asked whether this process may install a
+/// filter at all.
+pub const InstallProbe = union(enum) {
+    /// A child of this process installed the filter. The layer is available.
+    ok,
+    /// A child of this process was refused, for this reason.
+    refused: InstallError,
+    /// The question could not be asked: the pipe, the fork, or the answer.
+    ///
+    /// **Never read as either of the other two.** A probe that could not run
+    /// says nothing about the machine, and reading it as `ok` is exactly the
+    /// claim this whole call exists to replace. `namespace.Availability` keeps
+    /// a third answer for the same reason.
+    unknown,
+};
+
+/// Ask the kernel whether this process may install `prog`, without installing
+/// it here.
+///
+/// **A child, because a filter can never be removed.** Installing one in this
+/// process would put it on the harness for the rest of its life, so the answer
+/// comes from a fork that installs and exits. `namespace.probeAvailability`
+/// forks for the same class of reason and this follows its shape, including
+/// the third answer for a question that could not be asked.
+///
+/// **The caller builds the instructions**, for two reasons. A fork may happen
+/// while another thread holds the allocator's lock, so the child must not
+/// allocate. And a caller that means to ask about its own session's filter can
+/// pass its own, rather than being answered about a filter nobody will run.
+///
+/// **This does not prove the session's own filter went on.** It proves this
+/// process may install one. `Sandbox.spawn` refuses rather than degrade, so a
+/// tool call that ran did have the filter; this is the answer a caller can get
+/// before the first tool call. See `src/run.zig`'s own `witnessLayers`.
+pub fn probeInstall(prog: bpf.Prog) InstallProbe {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return .unknown;
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return .unknown;
+    }
+
+    if (fork_rc == 0) {
+        _ = linux.close(fds[0]);
+        // Zero says the filter went on, and every other byte names a fault.
+        //
+        // **Written after the install, so the write runs under the filter.**
+        // A filter that refuses `write` therefore answers nothing, and the
+        // parent reads that as `unknown` rather than as either result. That is
+        // the safe direction, and it is also why a caller must not hand this a
+        // filter with a trap set: with no listener behind it the kernel
+        // answers every observed call with `ENOSYS`.
+        var answer: [1]u8 = .{0};
+        if (install(prog)) |_| {} else |err| answer[0] = installFaultCode(err);
+        _ = linux.write(fds[1], &answer, answer.len);
+        std.process.exit(0);
+    }
+
+    _ = linux.close(fds[1]);
+    var answer: [1]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < answer.len) {
+        const rc = linux.read(fds[0], answer[filled..].ptr, answer.len - filled);
+        const read_errno = linux.errno(rc);
+        if (read_errno == .INTR) continue;
+        if (read_errno != .SUCCESS or rc == 0) break;
+        filled += rc;
+    }
+    _ = linux.close(fds[0]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+
+    // A child that wrote nothing measured nothing. It must not read as either
+    // answer: see `InstallProbe.unknown`.
+    if (filled != answer.len) return .unknown;
+    return installProbeFor(answer[0]);
+}
+
+/// Read the answer byte a `probeInstall` child wrote.
+///
+/// **A byte this build has no fault for is `unknown` and never `ok`.** Only
+/// zero says the filter went on, so a record from a build that names a fault
+/// this one does not know still reads as a filter that did not go on.
+fn installProbeFor(answer: u8) InstallProbe {
+    if (answer == 0) return .ok;
+    return switch (answer) {
+        3 => .{ .refused = error.NotSupported },
+        4 => .{ .refused = error.Rejected },
+        5 => .{ .refused = error.NotPermitted },
+        6 => .{ .refused = error.NoNewPrivsRefused },
+        7 => .{ .refused = error.Unexpected },
+        else => .unknown,
+    };
+}
+
 /// The one body both installs share, so the flag is the only difference
 /// between them and the `no_new_privs` step cannot be lost from one of the two.
 fn setModeFilter(prog: bpf.Prog, flags: u32) InstallError!usize {
@@ -1463,6 +1563,37 @@ fn installFaultCode(err: InstallError) u8 {
 //   10    the state before the measurement was not the state the test needs.
 //   11    a `prctl` read failed, so the measurement is not available.
 //   12    the measurement did not give the answer the test needs.
+
+test "the install probe answers about the machine and never about a child that said nothing" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    // **A witness and not a claim.** Before this call, a caller that wanted to
+    // know whether a filter would install had two choices: install one and
+    // never be able to remove it, or assume. This asks in a child.
+    //
+    // Mutation check: return `.ok` for an unrecognised byte in
+    // `installProbeFor` and the last expectation below fails, which is the one
+    // that keeps "nobody answered" from reading as "the layer is on".
+    const allocator = std.testing.allocator;
+    const insns = try build(allocator, .{});
+    defer allocator.free(insns);
+
+    // A machine that runs this suite installs filters, so this is the real
+    // answer and not a shape check. A refusal here is a machine fact and it is
+    // reported rather than skipped: see `installFaultCode`'s own note on why a
+    // skip is the wrong answer to an install failure.
+    try std.testing.expectEqual(InstallProbe.ok, probeInstall(bpf.Prog.init(insns)));
+
+    // The three answers stay three. `unknown` is what a child that could not
+    // speak leaves behind, and reading it as `ok` is the exact mistake the
+    // whole call exists to replace.
+    try std.testing.expectEqual(InstallProbe.ok, installProbeFor(0));
+    try std.testing.expectEqual(
+        InstallProbe{ .refused = error.NotSupported },
+        installProbeFor(3),
+    );
+    try std.testing.expectEqual(InstallProbe.unknown, installProbeFor(200));
+}
 
 test "install turns on no_new_privs, and does not rely on a caller to do it" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;

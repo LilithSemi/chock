@@ -1411,6 +1411,18 @@ pub const SandboxSupervisor = struct {
     /// the same process is a second event of this kind rather than a second
     /// kind.
     layer: []const u8,
+    /// What became of this process when this layer would not go on: `open`
+    /// when it went on without the layer, `closed` when it ended instead.
+    ///
+    /// **Recorded and never inferred from the counts.** A reader that saw
+    /// `unconfined` above zero used to have to already know that the
+    /// supervisor is the one process allowed to run on without its layers,
+    /// and a reader that saw a zero could not tell a layer that never failed
+    /// from a layer whose failure ends the process before anything is counted.
+    /// This says which, in the row itself. See
+    /// `chock_sandbox.Sandbox.failModeFor`, which is the one table both this
+    /// and the driver read.
+    fail_mode: []const u8 = "",
     /// Calls whose supervisor said the layer went on.
     confined: u64 = 0,
     /// Calls whose supervisor said it did not. **This is the field an audit
@@ -2397,6 +2409,7 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
         .{ .sandbox_supervisor = .{
             .process = nl,
             .layer = nl,
+            .fail_mode = nl,
             .confined = 7,
             .unconfined = 1,
             .unreported = 2,

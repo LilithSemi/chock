@@ -1056,12 +1056,19 @@ test "the supervisor says whether it could filter itself, and the answer leaves 
     // counts it, which is what lets a session say afterwards whether the
     // credential holding process ran unfiltered.
     //
-    // This run is the ordinary machine, where the filter goes on, and it pins
+    // This run is the ordinary machine, where the layers go on, and it pins
     // the two halves that a unit test cannot: that the supervisor really
     // reaches the report, and that the report really crosses the pipe.
     //
-    // Mutation check: delete the `reportMiddleFilter` call in `restrictMiddle`
-    // and the run exits 5, "the supervisor said nothing".
+    // **All three layers, and not the filter alone.** The capability drop and
+    // the Landlock ruleset the supervisor puts on itself beside the filter
+    // used to be printed and never recorded, so nothing afterwards could say
+    // whether the credential holding process kept its capabilities. The probe
+    // reads one status per layer: see `spawn-supervisor-audit`.
+    //
+    // Mutation check: delete the `middleLayerWent` call from the capability
+    // arm of `restrictMiddle` and the run exits 10, "the supervisor said
+    // nothing about its capabilities". Delete the seccomp one and it exits 18.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-supervisor-audit", scratch.path());

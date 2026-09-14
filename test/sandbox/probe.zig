@@ -4579,17 +4579,30 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             else => return 4,
         }
 
-        const counts = audit.counts();
-        // **Nothing said is its own answer, and it is a failure here.** This
-        // machine builds sandboxes, so the supervisor reached the point where
-        // it confines itself, and a silent one means the record never left it.
-        if (counts.unreported != 0) return 5;
-        // The supervisor could not filter itself on a machine that gave it a
-        // whole sandbox. Real, and this is the case the record exists for, so
-        // it gets a status of its own rather than sharing one.
-        if (counts.unconfined != 0) return 6;
-        if (counts.confined != 1) return 7;
-        if (counts.first_fault != null) return 8;
+        // **Every layer the supervisor puts on itself, and not the filter
+        // alone.** The capability drop and the Landlock ruleset used to reach
+        // standard error and nothing else, so a session log could not say
+        // whether the credential holding process kept its capabilities.
+        //
+        // The status carries which layer as well as what went wrong, because a
+        // run that only said "a layer was not confined" would send a reader to
+        // read all three.
+        const watched = [_]sandbox.Sandbox.LayerName{ .capabilities, .landlock, .seccomp };
+        for (watched, 0..) |layer, index| {
+            const base_status: u8 = @intCast(10 + index * 4);
+            const counts = audit.counts(layer);
+            // **Nothing said is its own answer, and it is a failure here.**
+            // This machine builds sandboxes, so the supervisor reached the
+            // point where it confines itself, and a silent one means the
+            // record never left it.
+            if (counts.unreported != 0) return base_status;
+            // The supervisor could not put the layer on, on a machine that
+            // gave it a whole sandbox. Real, and this is the case the record
+            // exists for, so it gets a status of its own.
+            if (counts.unconfined != 0) return base_status + 1;
+            if (counts.confined != 1) return base_status + 2;
+            if (counts.first_fault != null) return base_status + 3;
+        }
         return 0;
     }
     if (std.mem.eql(u8, args[1], "spawn-syscall-audit-daemon")) {

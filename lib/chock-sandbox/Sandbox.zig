@@ -884,6 +884,110 @@ pub const LimitsReport = struct {
     }
 };
 
+/// Which process a layer is put on.
+///
+/// **A layer is not one fact, it is one fact for each process that wears it.**
+/// The same Landlock ruleset and the same seccomp filter go on the caller's
+/// own program and on the supervisor that waits for it, and the two answers to
+/// "what happens when it will not go on" are opposite. See `failModeFor`.
+pub const LayerProcess = enum {
+    /// The caller's own program, inside the sandbox. The Linux driver calls
+    /// it B.
+    sandboxed,
+    /// The process that waits for it and relays its outcome. It holds this
+    /// program's own memory, which on the `chock run` path includes the
+    /// provider credential. The Linux driver calls it A.
+    supervisor,
+
+    /// The name the session log uses for this process.
+    pub fn wireName(self: LayerProcess) []const u8 {
+        return switch (self) {
+            .sandboxed => "sandboxed",
+            .supervisor => "supervisor",
+        };
+    }
+};
+
+/// One layer a driver puts on a process, named for the mechanism that carries
+/// it.
+///
+/// **Not the same list as `Guarantee`.** A guarantee is what a caller is
+/// promised. This is what a driver installs, so it holds steps a caller never
+/// asked for by name: dropping the capability set is one, and joining a fresh
+/// session keyring is another.
+pub const LayerName = enum {
+    /// The bind mounts that make the new root.
+    mount_tree,
+    /// The `pivot_root` into it.
+    pivot_root,
+    /// Dropping every capability.
+    capabilities,
+    /// The Landlock ruleset.
+    landlock,
+    /// The fresh, anonymous session keyring.
+    session_keyring,
+    /// The seccomp filter.
+    seccomp,
+
+    /// The name the session log uses for this layer.
+    pub fn wireName(self: LayerName) []const u8 {
+        return switch (self) {
+            .mount_tree => "mount_tree",
+            .pivot_root => "pivot_root",
+            .capabilities => "capabilities",
+            .landlock => "landlock",
+            .session_keyring => "session_keyring",
+            .seccomp => "seccomp",
+        };
+    }
+};
+
+/// What becomes of a process that could not put one of its layers on.
+///
+/// **A value and never a shape of code.** Before this type, the answer was
+/// read out of the call graph: `applyLayers` calls `die`, `restrictMiddle`
+/// prints and returns, and a reader had to follow both to learn which. A value
+/// can be printed in a report, written to the log, and asserted against in a
+/// test, and the three readers then cannot disagree.
+pub const FailMode = enum {
+    /// The process ends. Nothing runs with the layer missing.
+    closed,
+    /// The process goes on without the layer, and says so. **Never silent**:
+    /// a recovery nobody can see is not a recovery.
+    open,
+};
+
+/// What happens to `process` when `layer` will not go on, or null when that
+/// process never puts that layer on at all.
+///
+/// **This table is the source and the code follows it.** `linux/driver.zig`
+/// reads it at compile time: `restrictMiddle` picks its fault handler from
+/// this answer, and `applyLayers` refuses to compile if this table ever says
+/// one of its layers may be skipped. So an edit here is an edit to the
+/// behaviour, and not to a description of it.
+///
+/// **The supervisor fails open on purpose, and that is the owner's decision.**
+/// Its program is already running by the time these three go on, and ending
+/// the supervisor ends that program. A layer that guards only the supervisor
+/// must not cost the caller the work. See `SupervisorAudit`, which is where
+/// the degradation is counted so that "open" does not mean "unrecorded".
+pub fn failModeFor(process: LayerProcess, layer: LayerName) ?FailMode {
+    return switch (process) {
+        // Every layer of the sandboxed program is fatal. There is no state in
+        // which the caller's program runs with one of them quietly missing,
+        // which is the claim the session header rests on.
+        .sandboxed => .closed,
+        .supervisor => switch (layer) {
+            .capabilities, .landlock, .seccomp => .open,
+            // The supervisor never builds a root, never pivots, and never
+            // touches the keyring. Null, and not a fail mode, because a fail
+            // mode for a layer nobody applies is an answer to a question
+            // nobody asked.
+            .mount_tree, .pivot_root, .session_keyring => null,
+        },
+    };
+}
+
 /// Whether the supervisor process could confine itself, counted over every
 /// `spawn` a caller attached this to.
 ///
@@ -912,110 +1016,122 @@ pub const SupervisorAudit = struct {
     /// The name the session log uses for the process these counts are about.
     /// Here, beside the counts, so the log and the driver cannot drift apart
     /// on what they call it.
-    pub const process_name = "supervisor";
-    /// The name the session log uses for the layer these counts are about.
-    /// One layer today: the Landlock ruleset the supervisor puts on itself
-    /// beside the filter has no error set that names a repair, so it is still
-    /// only printed. See `linux/driver.zig`'s own `restrictMiddle`.
-    pub const layer_name = "seccomp";
+    pub const process_name = LayerProcess.supervisor.wireName();
 
-    /// Supervisors that said the filter went on.
-    confined: std.atomic.Value(u64) = .init(0),
-    /// Supervisors that said it did not.
-    unconfined: std.atomic.Value(u64) = .init(0),
-    /// Calls where the supervisor said nothing at all.
+    /// One counter set for every layer, indexed by the layer's own name.
     ///
-    /// **Not the same fact as either count above, and not a zero.** A tool
-    /// call that a person cancelled, or that ran past its deadline, kills the
-    /// supervisor before it reaches the point where it confines itself, so
-    /// there is no answer to record and a count of zero would be a claim.
-    ///
-    /// A call that never built a sandbox at all is counted nowhere here. It
-    /// had no supervisor, so it has no answer, and `spawn` gives that caller a
-    /// setup error instead.
-    unreported: std.atomic.Value(u64) = .init(0),
-    /// Why the first unconfined supervisor went without the filter. Zero while
-    /// `unconfined` is zero. **The first and not the last**, because the first
-    /// is the one whose reason a reader can still match against the terminal
-    /// line that named it.
-    first_fault: std.atomic.Value(u8) = .init(0),
+    /// **Three of the six are ever written**, and `failModeFor` names which:
+    /// a layer the supervisor never puts on has no fail mode for the
+    /// supervisor, and its counters stay zero. A caller that writes these
+    /// down walks the same table rather than keeping a list of its own.
+    layers: std.EnumArray(LayerName, Counters) = .initFill(.{}),
 
-    /// Which way the supervisor's own filter install failed. One member for
-    /// each member of `linux/seccomp.zig`'s own `InstallError`, because the
-    /// repair differs for each: a refused `no_new_privs` flag, a missing
-    /// privilege, and a filter the kernel would not read are three different
-    /// faults. Before that error set was split, every one of them arrived as
-    /// `Rejected` and a record of it would have been worth nothing.
+    /// What one supervisor said about one of its own layers, counted over
+    /// every `spawn`.
+    pub const Counters = struct {
+        /// Supervisors that said the layer went on.
+        confined: std.atomic.Value(u64) = .init(0),
+        /// Supervisors that said it did not.
+        unconfined: std.atomic.Value(u64) = .init(0),
+        /// Calls where the supervisor said nothing at all.
+        ///
+        /// **Not the same fact as either count above, and not a zero.** A tool
+        /// call that a person cancelled, or that ran past its deadline, kills
+        /// the supervisor before it reaches the point where it confines
+        /// itself, so there is no answer to record and a count of zero would
+        /// be a claim.
+        ///
+        /// A call that never built a sandbox at all is counted nowhere here.
+        /// It had no supervisor, so it has no answer, and `spawn` gives that
+        /// caller a setup error instead.
+        unreported: std.atomic.Value(u64) = .init(0),
+        /// Why the first unconfined supervisor went without the layer. Zero
+        /// while `unconfined` is zero. **The first and not the last**, because
+        /// the first is the one whose reason a reader can still match against
+        /// the terminal line that named it.
+        first_fault: std.atomic.Value(u8) = .init(0),
+    };
+
+    /// Which way the supervisor's own install failed.
+    ///
+    /// **One set for all three layers, because the repairs are the same
+    /// sentences.** The seccomp members came first, one for each member of
+    /// `linux/seccomp.zig`'s own `InstallError`, because the repair differs
+    /// for each: a refused `no_new_privs` flag, a missing privilege, and a
+    /// filter the kernel would not read are three different faults. Landlock
+    /// and the capability set answer with a subset of the same five.
     ///
     /// The numbers are the wire form on the driver's own middle pipe, so zero
     /// is left free to mean "no fault named".
-    pub const FilterFault = enum(u8) {
-        /// This kernel has no `seccomp` system call at all.
+    pub const Fault = enum(u8) {
+        /// This kernel does not have the mechanism at all.
         ///
         /// **Recorded the same way as every other member, and that is
         /// deliberate.** It names a machine that cannot rather than a kernel
         /// that refused, and the repair is different, which is why it keeps a
         /// name of its own. The outcome an audit asks about is not different:
-        /// the process holding the credential ran with no filter on it either
+        /// the process holding the credential ran without the layer either
         /// way. A softer treatment would invite a reader to discount it, and
         /// "the machine cannot" is exactly the answer an audit must still
         /// count.
         ///
         /// It is also the member least likely to be true. The sandboxed
-        /// process installs the same filter from the same instructions, and
-        /// that install is fatal: see the Linux driver's own `applyLayers`. A
-        /// machine with no seccomp at all fails there first and the call never
+        /// process puts the same layer on from the same inputs, and that
+        /// install is fatal: see the Linux driver's own `applyLayers`. A
+        /// machine without the mechanism fails there first and the call never
         /// reaches a supervisor to report anything. So this member arriving
         /// means the kernel answered two processes differently, which is worth
         /// recording loudly rather than quietly.
         not_supported = 1,
-        /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the filter was never
+        /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the layer was never
         /// offered to the kernel.
         no_new_privs_refused = 2,
-        /// The kernel refused the filter because the process held neither
-        /// `no_new_privs` nor `CAP_SYS_ADMIN`.
+        /// The kernel refused because the process held neither `no_new_privs`
+        /// nor `CAP_SYS_ADMIN`.
         not_permitted = 3,
-        /// The kernel refused the filter itself.
+        /// The kernel refused the layer itself.
         rejected = 4,
         /// Anything else the kernel answered.
         unexpected = 5,
     };
 
-    /// What one supervisor said about its own filter.
-    pub const Filter = union(enum) {
-        /// The filter went on.
+    /// What one supervisor said about one layer.
+    pub const Outcome = union(enum) {
+        /// The layer went on.
         on,
         /// It did not, for this reason.
-        off: FilterFault,
-        /// The supervisor never said. See `unreported`.
+        off: Fault,
+        /// The supervisor never said. See `Counters.unreported`.
         unsaid,
     };
 
-    /// Count one call. Safe to call from any thread.
-    pub fn record(self: *SupervisorAudit, filter: Filter) void {
-        switch (filter) {
-            .on => _ = self.confined.fetchAdd(1, .monotonic),
-            .unsaid => _ = self.unreported.fetchAdd(1, .monotonic),
+    /// Count one call's answer about one layer. Safe to call from any thread.
+    pub fn record(self: *SupervisorAudit, layer: LayerName, outcome: Outcome) void {
+        const slot = self.layers.getPtr(layer);
+        switch (outcome) {
+            .on => _ = slot.confined.fetchAdd(1, .monotonic),
+            .unsaid => _ = slot.unreported.fetchAdd(1, .monotonic),
             .off => |fault| {
-                _ = self.unconfined.fetchAdd(1, .monotonic);
+                _ = slot.unconfined.fetchAdd(1, .monotonic);
                 // Keeps the first, so a second call with a different fault
                 // cannot overwrite the one a person already read on the
                 // terminal.
-                _ = self.first_fault.cmpxchgStrong(0, @intFromEnum(fault), .monotonic, .monotonic);
+                _ = slot.first_fault.cmpxchgStrong(0, @intFromEnum(fault), .monotonic, .monotonic);
             },
         }
     }
 
-    /// The counts as plain numbers, for a caller that is about to write them
-    /// down. Reads each field once, so two fields can disagree by one while a
-    /// call is in flight. Call it when the calls have stopped.
-    pub fn counts(self: *const SupervisorAudit) Counts {
-        const raw = self.first_fault.load(.monotonic);
+    /// One layer's counts as plain numbers, for a caller that is about to
+    /// write them down. Reads each field once, so two fields can disagree by
+    /// one while a call is in flight. Call it when the calls have stopped.
+    pub fn counts(self: *const SupervisorAudit, layer: LayerName) Counts {
+        const slot = self.layers.getPtrConst(layer);
+        const raw = slot.first_fault.load(.monotonic);
         return .{
-            .confined = self.confined.load(.monotonic),
-            .unconfined = self.unconfined.load(.monotonic),
-            .unreported = self.unreported.load(.monotonic),
-            .first_fault = std.enums.fromInt(FilterFault, raw),
+            .confined = slot.confined.load(.monotonic),
+            .unconfined = slot.unconfined.load(.monotonic),
+            .unreported = slot.unreported.load(.monotonic),
+            .first_fault = std.enums.fromInt(Fault, raw),
         };
     }
 
@@ -1026,7 +1142,7 @@ pub const SupervisorAudit = struct {
         unreported: u64,
         /// Null when `unconfined` is zero, and also when a fault code arrived
         /// that this build has no name for.
-        first_fault: ?FilterFault,
+        first_fault: ?Fault,
     };
 };
 
@@ -1560,22 +1676,40 @@ test "the audit counts each of the three answers apart, and keeps the first faul
     // fault every time, and the `not_supported` expectation below fails with
     // `rejected`.
     var audit: SupervisorAudit = .{};
-    try std.testing.expectEqual(@as(?SupervisorAudit.FilterFault, null), audit.counts().first_fault);
+    try std.testing.expectEqual(@as(?SupervisorAudit.Fault, null), audit.counts(.seccomp).first_fault);
 
-    audit.record(.on);
-    audit.record(.on);
-    audit.record(.unsaid);
-    audit.record(.{ .off = .not_supported });
-    audit.record(.{ .off = .rejected });
+    audit.record(.seccomp, .on);
+    audit.record(.seccomp, .on);
+    audit.record(.seccomp, .unsaid);
+    audit.record(.seccomp, .{ .off = .not_supported });
+    audit.record(.seccomp, .{ .off = .rejected });
 
-    const counts = audit.counts();
+    const counts = audit.counts(.seccomp);
     try std.testing.expectEqual(@as(u64, 2), counts.confined);
     try std.testing.expectEqual(@as(u64, 2), counts.unconfined);
     try std.testing.expectEqual(@as(u64, 1), counts.unreported);
     try std.testing.expectEqual(
-        @as(?SupervisorAudit.FilterFault, .not_supported),
+        @as(?SupervisorAudit.Fault, .not_supported),
         counts.first_fault,
     );
+
+    // **One layer's answer is that layer's alone.** Before the counters were
+    // split, every layer the supervisor put on itself shared one set, so a
+    // refused Landlock ruleset and a refused filter were the same number. A
+    // reader could then not tell which layer the credential holding process
+    // ran without, which is the only question the record is for.
+    //
+    // Mutation check: make `record` ignore its `layer` argument and count
+    // against `.seccomp` always, and every expectation below fails.
+    const paths = audit.counts(.landlock);
+    try std.testing.expectEqual(@as(u64, 0), paths.confined);
+    try std.testing.expectEqual(@as(u64, 0), paths.unconfined);
+    try std.testing.expectEqual(@as(u64, 0), paths.unreported);
+    try std.testing.expectEqual(@as(?SupervisorAudit.Fault, null), paths.first_fault);
+
+    audit.record(.landlock, .{ .off = .rejected });
+    try std.testing.expectEqual(@as(u64, 1), audit.counts(.landlock).unconfined);
+    try std.testing.expectEqual(@as(u64, 2), audit.counts(.seccomp).unconfined);
 }
 
 test "a fresh audit claims nothing, so an absent answer is never a confined one" {
@@ -1584,11 +1718,13 @@ test "a fresh audit claims nothing, so an absent answer is never a confined one"
     //
     // Mutation check: start `confined` at one and this fails.
     const audit: SupervisorAudit = .{};
-    const counts = audit.counts();
-    try std.testing.expectEqual(@as(u64, 0), counts.confined);
-    try std.testing.expectEqual(@as(u64, 0), counts.unconfined);
-    try std.testing.expectEqual(@as(u64, 0), counts.unreported);
-    try std.testing.expectEqual(@as(?SupervisorAudit.FilterFault, null), counts.first_fault);
+    for (std.enums.values(LayerName)) |layer| {
+        const counts = audit.counts(layer);
+        try std.testing.expectEqual(@as(u64, 0), counts.confined);
+        try std.testing.expectEqual(@as(u64, 0), counts.unconfined);
+        try std.testing.expectEqual(@as(u64, 0), counts.unreported);
+        try std.testing.expectEqual(@as(?SupervisorAudit.Fault, null), counts.first_fault);
+    }
 }
 
 test "the grant set is every mount target and every scratch area, and no denial" {
