@@ -65,6 +65,14 @@ pub const nftables = @import("chock-sandbox/linux/nftables.zig");
 /// **Nothing calls it yet.** It is the second piece of the router, and the
 /// wiring lands when the pieces exist.
 pub const netns = @import("chock-sandbox/linux/netns.zig");
+/// The userspace half of the network router: the TCP relay every outbound
+/// connection is redirected to, and the resolver beside it. Re-exported beside
+/// `nftables` and `netns` for the same reason. **The resolver is not a
+/// boundary**: it is what lets the boundary speak in names, and an address
+/// Chock never handed out is not in the allow set and dies at the kernel.
+/// **Nothing calls it yet.** It is the third piece of the router, and the
+/// wiring lands next.
+pub const router = @import("chock-sandbox/linux/router.zig");
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
