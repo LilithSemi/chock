@@ -320,16 +320,57 @@ test "the network namespace still applies over an image" {
 }
 
 test "the pid namespace still applies over an image" {
-    // The other half of the same statement. A program from an image is process
-    // 1 of its own namespace, and sees no other process on the machine.
+    // The other half of the same statement. A program from an image is in a pid
+    // namespace of its own, and sees no process of the machine.
+    //
+    // **The namespace itself is compared, and never a pid number.** This test
+    // read `[ "$$" = "1" ]` until 2026-09-14. That was true only because the
+    // sandboxed program happened to be the first process in the namespace. A
+    // keeper now holds process 1 and reaps orphans, so the program is process 2
+    // and the old assertion broke while the boundary it stood for was untouched.
+    // The sentence above it claimed two things at once, a pid number and an
+    // isolation property, and only the number stopped being true. This is the
+    // same fault the network test above records: an assertion whose failure has
+    // a second explanation proves nothing.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
 
+    var buffer: [64]u8 = undefined;
+    const length = try std.Io.Dir.readLinkAbsolute(std.testing.io, "/proc/self/ns/pid", &buffer);
+    const host_namespace = buffer[0..length];
+    try std.testing.expect(std.mem.startsWith(u8, host_namespace, "pid:["));
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "[ \"$(readlink /proc/self/ns/pid)\" = \"{s}\" ] && exit 9; exit 0",
+        .{host_namespace},
+    );
+    defer allocator.free(script);
+
+    try std.testing.expectEqual(
+        @as(u8, 0),
+        try runInside(&arranged, allocator, &.{ "/bin/busybox", "sh", "-c", script }),
+    );
+
+    // And the namespace it did get holds this sandbox and nothing of the
+    // machine's. A host runs hundreds of processes. This namespace holds the
+    // keeper, the program, and whatever the shell of this very check forks, so
+    // the upper bound is loose on purpose and still two orders of magnitude
+    // under a host. Counting is what catches a `/proc` that shows the machine's
+    // own table, which a namespace identifier alone reports as different and
+    // therefore as a pass.
+    //
+    // **The lower bound is what stops this passing on nothing.** A `/proc` that
+    // is not mounted at all makes `ls` fail and `grep -c` answer 0, and
+    // `[ 0 -le 16 ]` is true, so the upper bound alone would report isolation
+    // while measuring nothing. The keeper and the program are both always
+    // there, so a count under two is a broken check and not a clean sandbox.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
-            "/bin/busybox", "sh", "-c", "[ \"$$\" = \"1\" ] || exit 9",
+            "/bin/busybox", "sh", "-c",
+            "n=$(ls /proc | grep -c '^[0-9]'); [ \"$n\" -ge 2 ] || exit 10; [ \"$n\" -le 16 ] || exit 9",
         }),
     );
 
