@@ -51,6 +51,12 @@ pub const net_broker = @import("chock-sandbox/linux/netbroker.zig");
 /// `Cgroup.create` is the only way to learn the answer. Exporting it compiles
 /// cleanly for Darwin the same way `namespace` and `seccomp` already do.
 pub const cgroup = @import("chock-sandbox/linux/cgroup.zig");
+/// The nftables ruleset the network router installs in the sandbox's own
+/// network namespace, re-exported beside the modules above for the same
+/// reason: it is a mechanism a caller outside this library names directly.
+/// **Nothing calls it yet.** It is the kernel half of the router and the
+/// pieces that use it, the resolver and the relay, are not built.
+pub const nftables = @import("chock-sandbox/linux/nftables.zig");
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
