@@ -740,6 +740,159 @@ test "finding 4: git status, git add, and git commit still work inside the sandb
     try std.testing.expectEqualSlices(u8, project_head_before, project_head_after);
 }
 
+/// Take the project's own `user.name` and `user.email` away again, and
+/// confirm git now answers "there is no identity here".
+///
+/// `TestProject.init` has to state one to make its first commit, and a real
+/// project does not: a person's identity lives in their own `~/.gitconfig`,
+/// which the sandbox has no `HOME` to find and no mount to reach. This
+/// returns the project to that shape, which is the shape the fault was
+/// measured in.
+fn removeProjectIdentity(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    root_path: []const u8,
+) !void {
+    for ([_][]const u8{ "user.email", "user.name" }) |name| {
+        var output = try git.run(allocator, std.testing.io, env, root_path, &.{ "config", "--unset", name }, null);
+        defer output.deinit(allocator);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
+    }
+
+    // Confirmed, never assumed. Without this the test below could pass on a
+    // project that still states an identity, which measures nothing at all.
+    // `git.run` already forces `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to
+    // `/dev/null`, so this read sees the repository's own configuration and
+    // nothing else.
+    var read_back = try git.run(allocator, std.testing.io, env, root_path, &.{ "config", "user.name" }, null);
+    defer read_back.deinit(allocator);
+    const still_set = switch (read_back.term) {
+        .exited => |code| code == 0,
+        else => true,
+    };
+    if (still_set) return error.TheProjectStillStatesAnIdentity;
+}
+
+test "a bare git commit inside the sandbox succeeds on a project that states no identity, and the commit is Chock's own" {
+    // **This is the fault, reproduced and then fixed.** Measured in a real
+    // session: the agent ran `git commit -m ...`, git answered "Author
+    // identity unknown", and the agent worked around it by inventing an
+    // identity on the command line. A second session invented a different
+    // one. `git config` cannot make one either, because the whole of `.git`
+    // is mounted read only. And a commit in the workspace is the only way a
+    // session's work reaches the user at all, through `workspace.apply`.
+    //
+    // So: a project with no identity of its own, a real sandbox, `git add`
+    // and `git commit` with no `-c` flag anywhere, and then the commit read
+    // back on the host to see whose name is on it.
+    //
+    // Mutation check: take the four identity entries out of
+    // `Workspace.sandboxConfig` and the probe exits 5, because git refuses
+    // the commit. Change either value and the last comparison fails.
+    const allocator = std.testing.allocator;
+
+    const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse return error.SkipZigTest;
+    defer allocator.free(git_path);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try removeProjectIdentity(allocator, &project.env, project.root_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const wt = workspace.kind.worktree;
+
+    // The file the git-commit flow adds and commits.
+    var agent_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const agent_path = try std.fmt.bufPrintZ(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
+    try writeFile(std.testing.io, agent_path, "the agent wrote this inside the sandbox\n");
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    // Exit 5 is what the probe answers when a git step did not exit zero,
+    // which is what "Author identity unknown" looks like from out here.
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 0 },
+        try runProbe(allocator, &workspace, root_tmp, "git-commit", git_path),
+    );
+
+    const moved = (try wt.headMoved(allocator, std.testing.io, &project.env, null)) orelse
+        return error.TheSessionsOwnCommitWasNotVisible;
+    defer allocator.free(moved);
+
+    // Whose name is on it. The commit object is in the session's own scratch
+    // store, so that store comes in as an alternate for this one read.
+    var reading = try project.env.clone(allocator);
+    defer reading.deinit();
+    try reading.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", wt.object_store_source);
+    var shown = try git.run(allocator, std.testing.io, &reading, project.root_path, &.{
+        "show", "-s", "--format=%an%n%ae%n%cn%n%ce", moved,
+    }, null);
+    defer shown.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, shown.term);
+
+    // Author and committer both, because git takes the two from separate
+    // variables and falls back to the configuration for either one it is not
+    // given.
+    try std.testing.expectEqualStrings(
+        "Chock\nchock@lilithsemi.com\nChock\nchock@lilithsemi.com",
+        std.mem.trimEnd(u8, shown.stdout, "\n"),
+    );
+}
+
+test "the sandbox identity reaches no commit the user makes on the host" {
+    // The other side of the same wiring. The identity is four entries in one
+    // `Sandbox.Config`, handed to one sandboxed process, and it must be
+    // nothing else: not this process's own environment, and not something
+    // `chock-workspace/git.zig` forces on every call it makes. Either of
+    // those would put Chock's name on work a person did.
+    //
+    // Mutation check: add the four names to `git.zig`'s own `forced_env`, or
+    // set them with `setenv` anywhere in this library, and this fails.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    // A workspace is opened and its config built, so this test measures the
+    // state a session is actually in, not the state before one starts.
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+    const config = try workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
+    defer allocator.free(config.mounts);
+    defer allocator.free(config.rules);
+    defer allocator.free(config.env);
+
+    // An ordinary commit by the person, in their own project, on the host.
+    var host_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const host_path = try std.fmt.bufPrintZ(&host_buffer, "{s}/the-user-wrote-this.txt", .{project.root_path});
+    try writeFile(std.testing.io, host_path, "mine\n");
+    for ([_][]const []const u8{
+        &.{ "add", "the-user-wrote-this.txt" },
+        &.{ "commit", "-m", "the user's own commit" },
+    }) |argv| {
+        var output = try git.run(allocator, std.testing.io, &project.env, project.root_path, argv, null);
+        defer output.deinit(allocator);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
+    }
+
+    var shown = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{
+        "show", "-s", "--format=%an%n%ae%n%cn%n%ce", "HEAD",
+    }, null);
+    defer shown.deinit(allocator);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, shown.term);
+    try std.testing.expectEqualStrings(
+        "Test\ntest@example.com\nTest\ntest@example.com",
+        std.mem.trimEnd(u8, shown.stdout, "\n"),
+    );
+}
+
 test "the config.worktree redirect stays closed even when a project has extensions.worktreeConfig on but no config.worktree of its own yet" {
     // The reviewer's own reproduction of Finding 1: a project with
     // extensions.worktreeConfig already on, but with no config.worktree of

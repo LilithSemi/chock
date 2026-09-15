@@ -64,6 +64,13 @@
 //! own author exactly as `git rebase` does. It also needs no configuration to
 //! be present, so a project whose repository names no `user.name` still
 //! integrates.
+//!
+//! What that identity actually says is set one layer down, by
+//! `Workspace.identity_env`, which gives every commit made inside the sandbox
+//! the same name and the same address. **The two are separate acts and stay
+//! separate.** That one answers "who is making this commit", and this file
+//! answers "whose commit is being carried", which is why this file reads a
+//! date from the work and that one sets none.
 
 const std = @import("std");
 const chock_policy = @import("chock-policy");

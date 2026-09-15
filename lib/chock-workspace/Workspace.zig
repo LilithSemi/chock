@@ -61,6 +61,79 @@ pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || e
     ChockZonIsSymlink,
 };
 
+/// The name and the address every commit made inside the sandbox carries,
+/// as author and as committer both.
+///
+/// **A commit is the only way a session's work reaches the user.**
+/// `chock-broker`'s own `workspace.apply` takes what the agent committed in
+/// the worktree and puts it on a branch, so a `git commit` that refuses is a
+/// session whose work is lost. Without this, git refuses with "Author
+/// identity unknown": the sandbox has no `HOME`, so no global configuration
+/// is readable, and the whole of `.git` is mounted read only, so
+/// `git config user.name` cannot create one either. Measured in a real
+/// session, where the agent worked around it by inventing an identity of its
+/// own on the command line, and a second session invented a different one.
+///
+/// **Environment variables, never a configuration file**, for two reasons
+/// that each stand alone. They outrank every configuration file in git's own
+/// precedence, so they decide the identity whatever a repository's own
+/// `.git/config` says. And they need nothing writable, which is the actual
+/// fault above: a file would need a writable directory inside the sandbox to
+/// live in.
+///
+/// **No `GIT_AUTHOR_DATE` and no `GIT_COMMITTER_DATE`.** git reads the real
+/// clock when neither is set, which is what a commit's timestamp must be. The
+/// host side integration in `lib/chock-broker/integrate.zig` does set a date,
+/// and it answers a different question: it carries the identity of a commit
+/// that already exists onto a new one. Nothing here is that.
+///
+/// **The identity is fixed and no project can rename it.** See
+/// `identity_env`'s own doc comment.
+pub const identity_name = "Chock";
+/// The address half of `identity_name`.
+pub const identity_email = "chock@lilithsemi.com";
+
+/// The four entries `sandboxConfig` puts in front of every other
+/// environment variable, in `KEY=VALUE` form.
+///
+/// **Author and committer both.** git takes the two from separate variables
+/// and falls back to the configuration for either one it is not given, so
+/// naming only the author would leave the committer as the fault this exists
+/// to fix.
+///
+/// **No project may override this, on purpose, and `chock.zon` has no block
+/// for it.** An agent's commit has to be recognisable as an agent's commit by
+/// anybody reading the history later, and an identity a project could rename
+/// is an identity that says nothing. A person who wants different authorship
+/// on the work still has it: the commit reaches them through
+/// `workspace.apply`, on a branch of their own, where `git commit --amend
+/// --author` costs one command. That is the opposite trade from a
+/// configuration surface, which would make every repository's own history
+/// the place to look before trusting a name.
+///
+/// **`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are deliberately not here.**
+/// `lib/chock-workspace/git.zig` forces both to `/dev/null` on every call it
+/// makes, and the reason is a host side reason: Chock reads what git prints,
+/// so an alias, a colour setting, or a pager in a person's own `~/.gitconfig`
+/// would change the text Chock parses. Inside the sandbox nothing of Chock's
+/// parses git's output. The agent reads it. And no global or system
+/// configuration is reachable there in the first place: the sandbox has no
+/// `HOME`, and neither `/etc/gitconfig` nor a person's home directory is
+/// mounted. So the two variables would neutralize nothing that is not already
+/// absent, while taking away a gitconfig a dev shell or a container image may
+/// have put in the tree on purpose. The one thing a configuration file could
+/// still have decided, the identity, is decided above these lines instead,
+/// which is the whole point of using variables: they outrank a repository's
+/// own `.git/config` as well. The project's own `.git/config` is read only in
+/// the sandbox, but a repository the agent makes or clones for itself is not,
+/// and the identity has to hold in that one too.
+pub const identity_env = [_][]const u8{
+    "GIT_AUTHOR_NAME=" ++ identity_name,
+    "GIT_AUTHOR_EMAIL=" ++ identity_email,
+    "GIT_COMMITTER_NAME=" ++ identity_name,
+    "GIT_COMMITTER_EMAIL=" ++ identity_email,
+};
+
 /// Which backing a session got. `Workspace.open` decides. A caller never
 /// chooses by hand.
 ///
@@ -408,15 +481,16 @@ pub const Workspace = struct {
     /// `root` is the directory that becomes the root of the sandbox. The
     /// caller makes and owns it, the same as every `Sandbox.spawn` caller
     /// already does. The returned `Config`'s `cwd` is the project's own real
-    /// path, so a tool call starts where the agent's files are. `env` is
-    /// left empty for the overlay backing: this library knows nothing about
-    /// which variables a tool call needs beyond where its files are and what
-    /// may touch them. The worktree backing is the one exception:
-    /// `Worktree.gitEnv` names the two variables every git call needs to
-    /// work at all against a read only object store, so `env` carries those
-    /// two for that backing. A caller that also needs a Nix dev shell's own
-    /// environment, or a secret handle, still has to merge those in on top:
-    /// this function only ever adds what it alone knows how to build.
+    /// path, so a tool call starts where the agent's files are.
+    ///
+    /// `env` carries only what this library alone knows how to build, and
+    /// that is two groups. Both backings get `identity_env`, the name and the
+    /// address a commit made inside the sandbox is signed with, because a
+    /// project with no git repository of its own can still have the agent
+    /// make one. The worktree backing gets `Worktree.gitEnv` as well, the two
+    /// variables every git call needs to work at all against a read only
+    /// object store. A caller that also needs a Nix dev shell's own
+    /// environment, or a secret handle, still has to merge those in on top.
     ///
     /// The caller owns the returned `Config`'s `mounts`, `rules`, and `env`
     /// slices and frees each with `allocator.free`. Every string inside them
@@ -432,8 +506,13 @@ pub const Workspace = struct {
         errdefer mounts.deinit(allocator);
         var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
         errdefer rules.deinit(allocator);
-        var env: []const []const u8 = &.{};
-        errdefer if (env.len > 0) allocator.free(env);
+        // **The identity comes first and it comes for both backings.** A
+        // commit in the workspace is the only way a session's work reaches
+        // the user, and without these four git refuses to make one at all.
+        // See `identity_env`.
+        var env: std.ArrayList([]const u8) = .empty;
+        errdefer env.deinit(allocator);
+        try env.appendSlice(allocator, &identity_env);
 
         const cwd = self.sandboxRoot();
 
@@ -485,7 +564,9 @@ pub const Workspace = struct {
                 // writes into the scratch store and can still read every
                 // object that already exists. See Worktree.gitEnv's own doc
                 // comment for why this is a variable, never a file.
-                env = try wt.gitEnv(allocator);
+                const backing_env = try wt.gitEnv(allocator);
+                defer allocator.free(backing_env);
+                try env.appendSlice(allocator, backing_env);
             },
             .overlay => |ov| {
                 const backing_mounts = try ov.mounts(allocator);
@@ -536,7 +617,7 @@ pub const Workspace = struct {
             .mounts = try mounts.toOwnedSlice(allocator),
             .rules = try rules.toOwnedSlice(allocator),
             .cwd = cwd,
-            .env = env,
+            .env = try env.toOwnedSlice(allocator),
         };
     }
 
@@ -1188,8 +1269,9 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
     // The worktree kind's env carries the two variables that
     // let git work against a read only object store. This pins that
     // sandboxConfig actually wires Worktree.gitEnv in, not just that
-    // Worktree.gitEnv exists on its own.
-    try std.testing.expectEqual(@as(usize, 2), config.env.len);
+    // Worktree.gitEnv exists on its own. The four identity entries come
+    // with them: see the next test for what each one has to say.
+    try std.testing.expectEqual(identity_env.len + 2, config.env.len);
     var found_object_directory = false;
     var found_alternate = false;
     for (config.env) |entry| {
@@ -1198,6 +1280,64 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
     }
     try std.testing.expect(found_object_directory);
     try std.testing.expect(found_alternate);
+}
+
+test "both backings carry the git identity, author and committer, and neither carries a date" {
+    // **The one variable set is the difference between work delivered and
+    // work lost.** git refuses to commit with no identity, and a commit is
+    // the only way a session's work reaches the user. So this pins all four
+    // names and both values, for the worktree backing and for the overlay
+    // backing, and pins the two names that must stay absent.
+    //
+    // Mutation check: drop any one of the four appends in `identity_env`,
+    // or change either value, and this fails. Add a `GIT_AUTHOR_DATE` and
+    // the last loop fails.
+    const allocator = std.testing.allocator;
+
+    const wanted = [_][]const u8{
+        "GIT_AUTHOR_NAME=Chock",
+        "GIT_AUTHOR_EMAIL=chock@lilithsemi.com",
+        "GIT_COMMITTER_NAME=Chock",
+        "GIT_COMMITTER_EMAIL=chock@lilithsemi.com",
+    };
+
+    for ([_]bool{ true, false }) |as_git_repository| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var project = try TestProject.init(allocator, tmp);
+        defer project.deinit();
+        if (as_git_repository) try project.makeGitRepository();
+
+        var workspace = try Workspace.openWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
+        defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+        const config = try workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
+        defer allocator.free(config.mounts);
+        defer allocator.free(config.rules);
+        defer allocator.free(config.env);
+
+        for (wanted) |entry| {
+            const key = entry[0 .. std.mem.indexOfScalar(u8, entry, '=').? + 1];
+            // The entry with this name, so a wrong value is reported as the
+            // two strings side by side rather than as a bare false.
+            var found: ?[]const u8 = null;
+            for (config.env) |candidate| {
+                if (std.mem.startsWith(u8, candidate, key)) found = candidate;
+            }
+            try std.testing.expectEqualStrings(
+                entry,
+                found orelse return error.TheGitIdentityWasNotInTheSandboxEnvironment,
+            );
+        }
+
+        // **No date, ever.** git reads the real clock when neither of these
+        // is set, and a commit whose timestamp is not the time it was made
+        // is a commit nobody can order against the rest of the history.
+        for (config.env) |candidate| {
+            try std.testing.expect(!std.mem.startsWith(u8, candidate, "GIT_AUTHOR_DATE="));
+            try std.testing.expect(!std.mem.startsWith(u8, candidate, "GIT_COMMITTER_DATE="));
+        }
+    }
 }
 
 test "sandboxConfig for the overlay kind needs no namespace either, so an ordinary caller can call it directly" {
@@ -1235,8 +1375,9 @@ test "sandboxConfig for the overlay kind needs no namespace either, so an ordina
     try std.testing.expectEqualStrings(workspace.kind.overlay.project, config.cwd);
     // The overlay kind has no .git of its own to protect, so it gets none
     // of the worktree kind's git environment: a project with no git has no
-    // object store to work around.
-    try std.testing.expectEqual(@as(usize, 0), config.env.len);
+    // object store to work around. It still gets the identity, because an
+    // agent can make a repository of its own in a project that has none.
+    try std.testing.expectEqual(identity_env.len, config.env.len);
 
     // The first entry is the overlay descriptor itself, mounted at the
     // project's own real path, the way Worktree.mounts's own entry 0 is

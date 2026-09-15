@@ -1787,6 +1787,107 @@ test "run_command can git add and git commit through the scratch object store, a
     try std.testing.expectEqualStrings(refs_before, refs_after);
 }
 
+test "a bare git commit in a run_command tool call works with no identity in the project, and it is Chock's own" {
+    // **The tool call boundary, which is the one a model actually reaches.**
+    // `test/workspace/escape.zig` proves the same thing one layer down,
+    // against a `Sandbox.Config` driven by hand. This proves the variables
+    // survive the whole path a real session takes: `Workspace.sandboxConfig`
+    // builds them, `chock_core.tools.dispatch` carries them in `config.env`,
+    // and `run_command` hands them to the program the model named.
+    //
+    // The project states no identity of its own, the same shape a real
+    // project has: a person keeps theirs in `~/.gitconfig`, which the
+    // sandbox has no `HOME` to find and no mount to reach. So the only
+    // identity anywhere in this test is the one the sandbox supplies.
+    //
+    // Mutation check: take the four identity entries out of
+    // `Workspace.sandboxConfig` and the commit call reports a failure, the
+    // way a real session did, with "Author identity unknown" in its output.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try GitProject.init(allocator, tmp);
+    defer project.deinit();
+
+    // `GitProject.init` has to state an identity to make its first commit.
+    // Taking it away again is what makes the rest of this test measure
+    // something, and the read back below is what says it really went.
+    for ([_][]const u8{ "user.email", "user.name" }) |name| {
+        var unset = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "config", "--unset", name }, null);
+        defer unset.deinit(allocator);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, unset.term);
+    }
+    var read_back = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "config", "user.name" }, null);
+    defer read_back.deinit(allocator);
+    const still_set = switch (read_back.term) {
+        .exited => |code| code == 0,
+        else => true,
+    };
+    if (still_set) return error.TheProjectStillStatesAnIdentity;
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const wt = workspace.kind.worktree;
+    const new_file_path = try std.fs.path.join(allocator, &.{ wt.path, "agent-change.txt" });
+    defer allocator.free(new_file_path);
+    try writeFile(std.testing.io, new_file_path, "written by the agent\n");
+
+    var add_root_tmp = std.testing.tmpDir(.{});
+    defer add_root_tmp.cleanup();
+    var add_outcome = try runToolCall(
+        allocator,
+        &workspace,
+        add_root_tmp,
+        "run_command",
+        "{\"argv\":[\"git\",\"add\",\"agent-change.txt\"]}",
+    );
+    defer add_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), add_outcome.fault);
+    try std.testing.expect(!add_outcome.is_error);
+
+    // **No `-c` flag anywhere.** This is the exact command a real session ran
+    // and got "Author identity unknown" back from.
+    var commit_root_tmp = std.testing.tmpDir(.{});
+    defer commit_root_tmp.cleanup();
+    var commit_outcome = try runToolCall(
+        allocator,
+        &workspace,
+        commit_root_tmp,
+        "run_command",
+        "{\"argv\":[\"git\",\"commit\",\"-m\",\"agent commit\"]}",
+    );
+    defer commit_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), commit_outcome.fault);
+    if (commit_outcome.is_error) {
+        // The failure prints what git said, which names the cause.
+        try std.testing.expectEqualStrings("", commit_outcome.output);
+    }
+    try std.testing.expect(!commit_outcome.is_error);
+
+    // Whose name is on it, read by another tool call of its own, so the
+    // answer comes from git rather than from this test's arithmetic.
+    var log_root_tmp = std.testing.tmpDir(.{});
+    defer log_root_tmp.cleanup();
+    var log_outcome = try runToolCall(
+        allocator,
+        &workspace,
+        log_root_tmp,
+        "run_command",
+        "{\"argv\":[\"git\",\"show\",\"-s\",\"--format=author %an <%ae> committer %cn <%ce>\",\"HEAD\"]}",
+    );
+    defer log_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), log_outcome.fault);
+    try std.testing.expect(!log_outcome.is_error);
+    if (std.mem.indexOf(
+        u8,
+        log_outcome.output,
+        "author Chock <chock@lilithsemi.com> committer Chock <chock@lilithsemi.com>",
+    ) == null) {
+        try std.testing.expectEqualStrings("", log_outcome.output);
+    }
+}
+
 test "read_file on a binary file gives a description, and the session never sees the bytes" {
     // Found on a real run: an agent ran `cat` on a git object, which is zlib
     // compressed, and the provider answered 400 because the content part had
