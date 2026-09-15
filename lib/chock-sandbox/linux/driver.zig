@@ -24,6 +24,10 @@ const bpf = @import("bpf.zig");
 const rlimits = @import("rlimits.zig");
 const cgroup = @import("cgroup.zig");
 const netbroker = @import("netbroker.zig");
+const routerlink = @import("routerlink.zig");
+const router = @import("router.zig");
+const netns = @import("netns.zig");
+const nftables = @import("nftables.zig");
 const iface = @import("../Sandbox.zig");
 const Config = iface.Config;
 const SetupError = iface.SetupError;
@@ -60,6 +64,7 @@ const SetupStep = enum(u8) {
     cgroup_join,
     resource_limits,
     namespace,
+    network,
     scratch_mount,
     mount_tree,
     pivot,
@@ -112,7 +117,11 @@ const SetupFailureRecord = extern struct {
 /// to read it would need a root, a mount and a program, and it could only see
 /// the answer through a program's exit status. See `Options.block_connect` in
 /// `seccomp.zig` for what turning this on costs.
-fn seccompOptionsFor(base: seccomp.Options, network: namespace.Network) seccomp.Options {
+fn seccompOptionsFor(
+    base: seccomp.Options,
+    network: namespace.Network,
+    hands_host_descriptor: bool,
+) seccomp.Options {
     var options = base;
     options.block_connect = switch (network) {
         // Nothing is added for either of these. **`.none` gets exactly the
@@ -120,7 +129,23 @@ fn seccompOptionsFor(base: seccomp.Options, network: namespace.Network) seccomp.
         // ordinary tool call still works: that is the approval socket and the
         // git shim.
         .none, .host => false,
-        .filtered => true,
+        // **Keyed on the descriptor and not on the mode, and that is the whole
+        // rule.** The refusal exists for one reason: a connected descriptor
+        // made in the host's own network namespace really can be aimed
+        // somewhere else with `connect`, so a process that is handed one must
+        // not be able to make the call. `net_broker` hands one over.
+        // `net_router` never does: the descriptor the router receives stays in
+        // the router, which is a process of Chock's own that never runs the
+        // caller's program.
+        //
+        // **A routed call must be able to connect, or it has no network.** The
+        // whole point of the router is that an ordinary program that knows
+        // nothing about Chock calls `connect` and reaches a permitted host,
+        // with the kernel refusing everything else. Refusing the call here
+        // would leave that program exactly where it was before the router
+        // existed. See `iface.Config.net_router`, and `spawn`, which refuses a
+        // config that names both seams for this reason.
+        .filtered => hands_host_descriptor,
     };
     return options;
 }
@@ -135,16 +160,30 @@ test "the filter for a mode is the caller's own, and only a filtered call has co
     // comment on `block_connect`.
     //
     // Mutation check: answer `true` for `.none` and the first line below
-    // fails. Answer `false` for `.filtered` and the third fails.
-    try std.testing.expectEqual(false, seccompOptionsFor(.{}, .none).block_connect);
-    try std.testing.expectEqual(false, seccompOptionsFor(.{}, .host).block_connect);
-    try std.testing.expectEqual(true, seccompOptionsFor(.{}, .filtered).block_connect);
+    // fails. Answer `false` for a filtered call that hands a descriptor and
+    // the third fails.
+    try std.testing.expectEqual(false, seccompOptionsFor(.{}, .none, true).block_connect);
+    try std.testing.expectEqual(false, seccompOptionsFor(.{}, .host, true).block_connect);
+    try std.testing.expectEqual(true, seccompOptionsFor(.{}, .filtered, true).block_connect);
+
+    // **And a routed call keeps `connect`.** This is the line the whole router
+    // rests on: the sandboxed program reaches a permitted host by calling
+    // `connect` and letting the kernel's own ruleset judge the address. A
+    // filter that refused the call would leave that program with no network at
+    // all, and every escape test that says a permitted host is reachable would
+    // then be measuring the refusal instead.
+    //
+    // Mutation check: answer `true` for a routed filtered call and this line
+    // fails, together with every escape test that reaches a permitted host.
+    try std.testing.expectEqual(false, seccompOptionsFor(.{}, .filtered, false).block_connect);
 
     // A caller that turned the write and execute rule off keeps it off in
     // every mode. This function adds one thing and must take nothing.
     for (std.enums.values(namespace.Network)) |network| {
-        const relaxed = seccompOptionsFor(.{ .strict_wx = false }, network);
-        try std.testing.expectEqual(false, relaxed.strict_wx);
+        for ([_]bool{ false, true }) |hands| {
+            const relaxed = seccompOptionsFor(.{ .strict_wx = false }, network, hands);
+            try std.testing.expectEqual(false, relaxed.strict_wx);
+        }
     }
 
     // **And a caller cannot ask for `block_connect` on a mode that does not
@@ -152,7 +191,14 @@ test "the filter for a mode is the caller's own, and only a filtered call has co
     // named it would otherwise get a filter no test in this project covers.
     try std.testing.expectEqual(
         false,
-        seccompOptionsFor(.{ .block_connect = true }, .none).block_connect,
+        seccompOptionsFor(.{ .block_connect = true }, .none, true).block_connect,
+    );
+    // The same for a routed call, which is the other mode that now answers
+    // `false`: a caller must not be able to put the refusal back on and take
+    // the router's own network away.
+    try std.testing.expectEqual(
+        false,
+        seccompOptionsFor(.{ .block_connect = true }, .filtered, false).block_connect,
     );
 }
 
@@ -165,8 +211,8 @@ test "the filter the default config gets is the filter a caller with no options 
     // a later reader who makes `.filtered` the default fails here and reads
     // why in `namespace.Network`.
     //
-    // Mutation check: build the second filter with `.filtered` and the two
-    // differ by exactly the two instructions the connect rule adds.
+    // Mutation check: build the second filter with `.filtered` and `true` and
+    // the two differ by exactly the two instructions the connect rule adds.
     const allocator = std.testing.allocator;
 
     const plain = try seccomp.build(allocator, .{});
@@ -179,7 +225,7 @@ test "the filter the default config gets is the filter a caller with no options 
         .cwd = "/",
         .env = &.{},
     }).network;
-    const defaulted = try seccomp.build(allocator, seccompOptionsFor(.{}, default_network));
+    const defaulted = try seccomp.build(allocator, seccompOptionsFor(.{}, default_network, true));
     defer allocator.free(defaulted);
 
     try std.testing.expectEqualSlices(bpf.Insn, plain, defaulted);
@@ -328,9 +374,29 @@ pub fn spawn(
     // `.filtered` the default failed 69 tests, because every caller that names
     // no broker stops here.
     switch (config.network) {
-        .filtered => if (config.net_broker == null) return error.NetBrokerMissing,
-        .none, .host => if (config.net_broker != null) return error.NetBrokerNotFiltered,
+        .filtered => {
+            if (config.net_broker == null and config.net_router == null)
+                return error.NetBrokerMissing;
+            // **Both at once is refused rather than ranked.** The two want
+            // opposite things from one seccomp rule: the broker needs
+            // `connect` refused, because it hands a descriptor from the host's
+            // own network namespace across the boundary, and the router needs
+            // `connect` permitted, because a program reaching a permitted host
+            // is the whole mechanism. A driver that quietly picked one would
+            // give the other a sandbox that does not do what its field says.
+            // See `seccompOptionsFor`.
+            if (config.net_broker != null and config.net_router != null)
+                return error.NetRouterAndBroker;
+        },
+        .none, .host => {
+            if (config.net_broker != null) return error.NetBrokerNotFiltered;
+            if (config.net_router != null) return error.NetRouterNotFiltered;
+        },
     }
+
+    // Whether this call gets a network of its own with a ruleset on it. Read
+    // in A, in B and in the parent below, so the three cannot disagree.
+    const routed = config.net_router != null;
 
     // Read once, here, and used twice below: for the placement decision and
     // for the `RLIMIT_NPROC` decision the limits report carries. One read of
@@ -350,10 +416,16 @@ pub fn spawn(
     if (landlock_report) |report| report.* = .{ .abi = abi, .features = landlock.featuresFor(abi) };
 
     // **The one layer this driver decides for itself rather than taking from
-    // the caller.** A filtered process is handed a connected descriptor, and a
-    // connected descriptor really can be aimed somewhere else with `connect`,
-    // so `connect` is refused for exactly that case. See
+    // the caller.** A process the netbroker serves is handed a connected
+    // descriptor, and a connected descriptor really can be aimed somewhere
+    // else with `connect`, so `connect` is refused for exactly that case. See
     // `seccomp.Options.block_connect` for the measurement.
+    //
+    // **A routed call is the other case and keeps `connect`**, because the
+    // kernel's own ruleset is what judges the address and the program has to
+    // be able to make the call at all. `!routed` is what says so: see
+    // `seccompOptionsFor`, and the refusal above of a config that names both
+    // seams.
     //
     // **It only ever narrows, and both directions of that are already
     // measured.** Turning it off for a filtered call is caught by
@@ -376,7 +448,7 @@ pub fn spawn(
     //
     // All four read the errno rather than only the failure, which is what
     // makes them able to tell a narrowed filter from a closed network.
-    const seccomp_options = seccompOptionsFor(config.seccomp_options, config.network);
+    const seccomp_options = seccompOptionsFor(config.seccomp_options, config.network, !routed);
 
     // Built here, in the parent, before the fork. The filter depends only on
     // `config.seccomp_options` and `config.network`, never on anything the
@@ -419,6 +491,14 @@ pub fn spawn(
     else
         &[_]bpf.Insn{};
     defer if (recording) allocator.free(reader_insns);
+
+    // The fourth program, for N, the network router. **Built here for the
+    // reason the three above are**, and N is forked from A as R is.
+    const router_insns = if (routed)
+        seccomp.buildRouter(allocator) catch |err| return err
+    else
+        &[_]bpf.Insn{};
+    defer if (routed) allocator.free(router_insns);
 
     // The keeper is always present, so its filter is built before any fork.
     // The keeper holds process 1 in the pid namespace and reaps orphans.
@@ -532,7 +612,24 @@ pub fn spawn(
     // on the child's end in the last step before `execve`, so a sandbox that
     // failed to come up never hands a program a channel out.
     var broker_fds: [2]i32 = .{ -1, -1 };
-    if (config.network == .filtered) {
+    // The router's own pair, for a routed call and for no other. `[0]` stays
+    // in this process and `[1]` goes to A, which hands it to the router and
+    // keeps no copy. **Never placed on a descriptor number the caller's
+    // program can see**, unlike the broker's: the router is a process of
+    // Chock's own and the program it serves never learns it exists.
+    var router_fds: [2]i32 = .{ -1, -1 };
+    if (routed) {
+        router_fds = routerlink.makePair() catch {
+            _ = linux.close(read_fd);
+            _ = linux.close(write_fd);
+            _ = linux.close(middle_read_fd);
+            _ = linux.close(middle_write_fd);
+            return error.NetBrokerSocketFailed;
+        };
+    }
+    errdefer closeBrokerPair(&router_fds);
+
+    if (config.net_broker != null) {
         broker_fds = netbroker.makePair() catch {
             _ = linux.close(read_fd);
             _ = linux.close(write_fd);
@@ -574,6 +671,7 @@ pub fn spawn(
         _ = linux.close(middle_read_fd);
         _ = linux.close(middle_write_fd);
         closeBrokerPair(&broker_fds);
+        closeBrokerPair(&router_fds);
         // **A placement that was refused is named, and never retried without
         // the cgroup.** No process was created, so nothing ran outside the
         // caller's cgroup and nothing has to be cleaned up. The best effort
@@ -598,6 +696,11 @@ pub fn spawn(
         if (broker_fds[0] >= 0) {
             _ = linux.close(broker_fds[0]);
             broker_fds[0] = -1;
+        }
+        // The same rule again for the router's pair, and for the same reason.
+        if (router_fds[0] >= 0) {
+            _ = linux.close(router_fds[0]);
+            router_fds[0] = -1;
         }
 
         // Every failure from here to `execve` ends the process with a record on
@@ -632,7 +735,27 @@ pub fn spawn(
         // Point descriptor 0 at /dev/null before any layer goes on. See the
         // comment on `redirectStdinToDevNull` for why.
         redirectStdinToDevNull(write_fd, config.stderr_fd);
-        enterNamespaces(config, write_fd, middle_write_fd, broker_fds[1]);
+        // **One channel out, and never two.** `spawn` refuses a config that
+        // names both seams, so at most one of these is open: the broker's end,
+        // which B keeps and the caller's program is handed, or the router's,
+        // which A hands to N and nothing else ever holds.
+        enterNamespaces(config, write_fd, middle_write_fd, @max(broker_fds[1], router_fds[1]));
+
+        // **The network, here, before anything is forked into it.** A is in
+        // the network namespace `enterNamespaces` just took and holds
+        // `CAP_NET_ADMIN` in the user namespace that owns it, which is the one
+        // moment either call can be made at all. Nothing runs between this and
+        // the router's own fork below, so the sandbox never holds a network
+        // with no ruleset on it.
+        //
+        // **The capability is what the whole ruleset rests on.** Measured on
+        // 2026-09-14: with `CAP_NET_ADMIN` still held, a flush of this table
+        // succeeds and every rule below becomes advice. B drops every
+        // capability inside `applyLayers`, before it runs the caller's
+        // program, and N keeps this one and nothing else. See
+        // `capabilities.dropAll`, `runRouter`, and `nftables.Session.install`.
+        var table_session: nftables.Session = .{ .fd = -1 };
+        if (routed) table_session = buildNetwork(write_fd, config.stderr_fd);
 
         // The capped scratch areas, mounted here in A and not in B with the
         // rest of the mount tree. **A has to hold a descriptor on each one**,
@@ -737,6 +860,93 @@ pub fn spawn(
             keeper_ready[0] != 1)
         {
             die(write_fd, config.stderr_fd, .fork, error.Unexpected);
+        }
+
+        // **N, the network router, forked here and nowhere else.** It has to
+        // be a child of A for the reason R is: every child A makes after
+        // `unshare(CLONE_NEWPID)` is inside the pid namespace, and A is the
+        // only process that can reap it. It has to come **after** the keeper,
+        // so process 1 is already there to hold the namespace, and **before**
+        // B, because a program that connects before the relay is listening
+        // gets a reset from the kernel rather than a connection.
+        //
+        // **A waits for N to say it is up.** The kernel's redirect is
+        // installed already, so a connection made before N has bound the relay
+        // port is rewritten to a port nothing holds and answered
+        // `ECONNREFUSED` at once. That is a real failure a program would see,
+        // and the handshake is what removes the race rather than making it
+        // unlikely. The same shape the keeper's own readiness byte has.
+        var router_pid: linux.pid_t = -1;
+        var router_control_fd: i32 = -1;
+        if (routed) {
+            var router_ready_fds: [2]i32 = undefined;
+            const router_pair_rc = linux.socketpair(
+                linux.AF.UNIX,
+                linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+                0,
+                &router_ready_fds,
+            );
+            if (linux.errno(router_pair_rc) != .SUCCESS) {
+                dieErrno(
+                    write_fd,
+                    config.stderr_fd,
+                    .fork,
+                    "socketpair for the network router",
+                    linux.errno(router_pair_rc),
+                );
+            }
+
+            const router_fork_rc = linux.fork();
+            if (linux.errno(router_fork_rc) != .SUCCESS) {
+                die(write_fd, config.stderr_fd, .fork, error.Unexpected);
+            }
+            if (router_fork_rc == 0) {
+                _ = linux.close(router_ready_fds[0]);
+                _ = linux.close(keeper_fds[0]);
+                if (notify_fds[0] >= 0) _ = linux.close(notify_fds[0]);
+                if (notify_fds[1] >= 0) _ = linux.close(notify_fds[1]);
+                if (path_record) |record| unmapPathRecord(record);
+                runRouter(
+                    router_ready_fds[1],
+                    router_fds[1],
+                    table_session,
+                    middle_pidfd,
+                    router_insns,
+                    write_fd,
+                    config.stderr_fd,
+                );
+            }
+            router_pid = @intCast(router_fork_rc);
+
+            _ = linux.close(router_ready_fds[1]);
+            var router_ready: [1]u8 = undefined;
+            var router_read_rc = linux.read(router_ready_fds[0], &router_ready, router_ready.len);
+            while (linux.errno(router_read_rc) == .INTR) {
+                router_read_rc = linux.read(router_ready_fds[0], &router_ready, router_ready.len);
+            }
+            if (linux.errno(router_read_rc) != .SUCCESS or router_read_rc != router_ready.len or
+                router_ready[0] != 1)
+            {
+                die(write_fd, config.stderr_fd, .network, error.Unexpected);
+            }
+            // **A keeps its end, and that is what tells N to finish later.**
+            // The same socket carries the readiness byte one way and the end
+            // of the call the other: closing it is how A says the sandboxed
+            // program has gone, and it is what lets N carry the last bytes of
+            // a connection out before it dies. See `reapRouter`.
+            router_control_fd = router_ready_fds[0];
+
+            // **A gives up both of its own copies the moment N holds them.**
+            // The channel out is one: a copy here would keep the far end's
+            // read from ever reaching the end of the stream, so the parent's
+            // serve loop would not learn that the router has gone. The netlink
+            // socket is the other: A is about to fork B, and a descriptor A
+            // still holds is a descriptor B inherits, and that one writes the
+            // kernel's allow set.
+            _ = linux.close(router_fds[1]);
+            router_fds[1] = -1;
+            table_session.close();
+            table_session = .{ .fd = -1 };
         }
 
         const inner_fork_rc = linux.fork();
@@ -933,7 +1143,10 @@ pub fn spawn(
         // waits for B and relays B's outcome as its own, so the real parent's
         // single waitpid on A, further down in this function, still sees the
         // caller's program's real Term.
-        waitAndRelay(inner_pid, keeper_pid, keeper_fds[0], &areas, middle_write_fd, if (reader_pid >= 0) .{
+        waitAndRelay(inner_pid, keeper_pid, .{
+            .pid = router_pid,
+            .control_fd = router_control_fd,
+        }, keeper_fds[0], &areas, middle_write_fd, if (reader_pid >= 0) .{
             .pid = reader_pid,
             .record = path_record.?,
         } else null);
@@ -948,10 +1161,17 @@ pub fn spawn(
         _ = linux.close(broker_fds[1]);
         broker_fds[1] = -1;
     }
+    // The same rule again for the router's pair, whose child end belongs to A
+    // and then to N alone.
+    if (router_fds[1] >= 0) {
+        _ = linux.close(router_fds[1]);
+        router_fds[1] = -1;
+    }
     // Closed on the way out of every branch below, the same rule the two pipes
     // follow: a session runs thousands of calls, and a descriptor left open on
     // an error path ends with the harness unable to open a file.
     errdefer closeBrokerPair(&broker_fds);
+    errdefer closeBrokerPair(&router_fds);
 
     if (middle) |out| {
         // **Opened here, in the real parent, and before the pid is
@@ -1048,6 +1268,24 @@ pub fn spawn(
     // a connection are answered. **The blocking wait below cannot come first**:
     // it would leave nobody reading the pair for the whole call, and the
     // program inside would block on an answer that arrives after it has ended.
+    // **The router is served the same way and in the same place.** Exactly one
+    // of the two loops below ever runs, because `spawn` refuses a config that
+    // names both seams.
+    if (router_fds[0] >= 0) {
+        serveRouter(pid, router_fds[0], config.net_router.?) catch |err| {
+            closeBrokerPair(&router_fds);
+            _ = linux.close(middle_read_fd);
+            _ = linux.kill(pid, .KILL);
+            var reap_status: u32 = undefined;
+            var reap_rc = linux.waitpid(pid, &reap_status, 0);
+            while (linux.errno(reap_rc) == .INTR) {
+                reap_rc = linux.waitpid(pid, &reap_status, 0);
+            }
+            return err;
+        };
+        closeBrokerPair(&router_fds);
+    }
+
     if (broker_fds[0] >= 0) {
         serveBroker(pid, broker_fds[0], config.net_broker.?) catch |err| {
             closeBrokerPair(&broker_fds);
@@ -1274,6 +1512,59 @@ fn serveBroker(pid: linux.pid_t, broker_fd: i32, broker: iface.NetBroker) SpawnE
         }
         // The end of the stream on the pair, with nothing to read: every copy
         // of the child's end is closed, so nothing will ask again.
+        if (fds[0].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) return;
+        if (fds[1].revents != 0) return;
+    }
+}
+
+/// Answer the network router until the sandboxed call has ended. **This is
+/// the parent side**, and it is the mirror of `serveBroker` above: the same
+/// wait on the same two descriptors, and the same rule about which one is read
+/// first.
+///
+/// **The budget is larger than the broker's, and it is still a budget.** One
+/// request is one name a program resolved or one connection it made, and a
+/// program that installs a package really does make hundreds of both. What a
+/// budget bounds is the work a program inside the sandbox can spend on the
+/// far side by asking in a loop. Past it the pair closes, and the router then
+/// reads the end of the stream and refuses everything, which is the same
+/// answer a policy that permits nothing gives.
+fn serveRouter(pid: linux.pid_t, router_fd: i32, seam: iface.NetRouter) SpawnError!void {
+    // **Opened here, before anything reaps A**, for the reason `serveBroker`
+    // gives: this process is A's only reaper and has not run its `waitpid`
+    // yet, so A is still a task the kernel can resolve, alive or a zombie.
+    const watch_rc = linux.pidfd_open(pid, 0);
+    if (linux.errno(watch_rc) != .SUCCESS) return error.Unexpected;
+    const watch: i32 = @intCast(watch_rc);
+    defer _ = linux.close(watch);
+
+    var served: usize = 0;
+    while (served < routerlink.max_requests) {
+        var fds = [2]linux.pollfd{
+            .{ .fd = router_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = watch, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const ready = linux.poll(&fds, fds.len, -1);
+        switch (linux.errno(ready)) {
+            .SUCCESS => {},
+            // A signal reached this process while it waited. Nothing was lost,
+            // so look again rather than end a call over it.
+            .INTR => continue,
+            else => return,
+        }
+
+        // **The request is read first, and A's death second**, the same order
+        // and for the same reason `serveBroker` gives.
+        if (fds[0].revents & linux.POLL.IN != 0) {
+            switch (routerlink.serveOne(router_fd, seam)) {
+                .served => {
+                    served += 1;
+                    continue;
+                },
+                .nothing => continue,
+                .peer_gone => return,
+            }
+        }
         if (fds[0].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) return;
         if (fds[1].revents != 0) return;
     }
@@ -1746,6 +2037,11 @@ fn setupErrorFor(step: SetupStep) SetupError {
         .cgroup_join => error.CgroupJoinFailed,
         .resource_limits => error.ResourceLimitFailed,
         .namespace => error.NamespaceFailed,
+        // **Its own member, and not `NamespaceFailed`.** The network namespace
+        // was taken. What failed is the network built inside it, and the
+        // repair is a different one: a kernel module the host has to load.
+        // See `iface.SpawnError.NetRouterUnavailable`.
+        .network => error.NetRouterUnavailable,
         .scratch_mount => error.ScratchMountFailed,
         .mount_tree => error.MountTreeFailed,
         .pivot => error.PivotFailed,
@@ -2216,6 +2512,19 @@ fn dieErrno(
     std.process.exit(1);
 }
 
+/// Same as `dieErrno`, for a step whose errno came out of a `Diagnostic` and
+/// is already a plain number. **A number and not a `linux.E`**, because the
+/// diagnostics the network steps fill carry what the kernel answered, and an
+/// integer from outside is not an enum until something checks it.
+fn dieWithErrno(write_fd: i32, stderr_fd: i32, step: SetupStep, errno: i32) noreturn {
+    _ = stderr_fd;
+    // The record only. The caller printed the reason before it called this,
+    // which is what `printFault` is for on the two network paths: the errno
+    // alone does not say whether a module is missing or a capability is.
+    reportSetupFailure(write_fd, step, errno);
+    std.process.exit(1);
+}
+
 /// End the process for a fault on the relay path in `waitAndRelay`, after the
 /// setup pipe is already closed. There is no channel left to report this to
 /// spawn as a setup failure, and there must not be one: the caller's own
@@ -2260,6 +2569,8 @@ fn dieRelayErrno(comptime what: []const u8, err: linux.E) noreturn {
 fn waitAndRelay(
     pid: linux.pid_t,
     keeper_pid: linux.pid_t,
+    /// The network router. Both members are -1 for a call that has none.
+    network_router: RouterWatch,
     keeper_fd: i32,
     areas: *const ScratchAreas,
     middle_write_fd: i32,
@@ -2280,6 +2591,19 @@ fn waitAndRelay(
     // B is not process 1, so its exit does not wait for R to be reaped. R
     // watches B's pidfd and reports after this wait observes the same exit.
     if (reader) |watch| reapReader(watch, middle_write_fd);
+
+    // **N is ended here, and before the keeper below, and that order is a rule
+    // and not a preference.** A pid namespace cannot be torn down until every
+    // pid in it is **reaped**, not merely killed: process 1's own exit path
+    // waits for exactly that. N is a child of A, which is outside the
+    // namespace, so nothing inside it can ever reap N. A zombie left here
+    // would hold the keeper's exit forever and the whole session with it.
+    //
+    // **A kill and not a request.** N serves a loop with no way out of its
+    // own: it runs for as long as the sandbox does, and the sandbox has just
+    // ended. There is nothing for it to finish and nothing it could be waiting
+    // on, so the wait below cannot block on work in flight.
+    if (network_router.pid >= 0) reapRouter(network_router);
 
     // Closing this socket tells process 1 to leave. Its exit kills any process
     // that B left behind. Reap it last because its pid namespace cannot close
@@ -2316,6 +2640,292 @@ fn waitAndRelay(
     }
 
     std.process.exit(linux.W.EXITSTATUS(status));
+}
+
+/// End the network router and reap it. Called by A, from `waitAndRelay`, after
+/// the sandboxed program has been reaped and before process 1 is told to go.
+///
+/// **It cannot hang, and that is the whole reason it is a function.** `SIGKILL`
+/// cannot be caught, blocked or ignored, so N ends whatever it was doing, and
+/// A is N's parent and its only reaper, so the wait below has exactly one
+/// process to collect and no other waiter to race. The pid cannot be reused
+/// before the wait returns, because the kernel keeps a reaped-by-nobody child
+/// resolvable to its own parent.
+fn reapRouter(watch: RouterWatch) void {
+    // **The close comes first, and the kill is the fallback.** A program that
+    // wrote its last bytes and exited leaves those bytes in the router, on the
+    // way out, and a router killed at that instant drops them. Closing this
+    // socket is what tells N that the program has gone, so N carries what it
+    // holds and then leaves on its own. See `runRouter`.
+    if (watch.control_fd >= 0) _ = linux.close(watch.control_fd);
+
+    var status: u32 = undefined;
+    var rc: usize = 0;
+    var tries: usize = 0;
+    // **A fixed bound, the same shape `reapReader` has.** A router that will
+    // not leave must not hold the whole session, and a pid namespace cannot be
+    // torn down until every pid in it is reaped, so a wait with no bound here
+    // is a session that hangs.
+    while (tries < router_drain_tries) : (tries += 1) {
+        rc = linux.waitpid(watch.pid, &status, linux.W.NOHANG);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc != 0) return,
+            .INTR => continue,
+            else => break,
+        }
+        var pause: linux.timespec = .{ .sec = 0, .nsec = router_drain_step_ns };
+        _ = linux.nanosleep(&pause, null);
+    }
+
+    const kill_errno = linux.errno(linux.kill(watch.pid, .KILL));
+    switch (kill_errno) {
+        // `ESRCH` means N has already ended, which leaves a zombie to collect
+        // exactly as a kill does.
+        .SUCCESS, .SRCH => {},
+        else => dieRelayErrno("end the network router", kill_errno),
+    }
+    rc = linux.waitpid(watch.pid, &status, 0);
+    while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        dieRelayErrno("waitpid on the network router", linux.errno(rc));
+    }
+}
+
+/// What A holds about the network router while it waits for B.
+const RouterWatch = struct {
+    pid: linux.pid_t,
+    /// The socket N said it was ready on. **Closing it is how N is told the
+    /// call has ended.** -1 for a call with no router.
+    control_fd: i32,
+};
+
+/// How long A waits for the router to carry its last bytes and leave, as a
+/// number of one millisecond looks. Half a second, which is far above the two
+/// turns of a poll loop a drain really takes and far below anything a person
+/// would notice at the end of a tool call.
+const router_drain_tries: usize = 500;
+const router_drain_step_ns: isize = 1_000_000;
+
+/// Build the sandbox its own network and put the ruleset on it. Runs in A,
+/// inside the network namespace and while `CAP_NET_ADMIN` is still held.
+///
+/// The netlink socket the allow sets are written on comes back, because the
+/// router needs one and **it has to be opened here**: a netlink socket belongs
+/// to the network namespace of whichever process created it, and it has to be
+/// created before the capability is narrowed to N alone.
+///
+/// **A missing kernel module ends the call rather than weakening it.** Every
+/// one of `nf_tables`, `nf_nat`, `nft_chain_nat`, `nft_redir`, `nft_reject`,
+/// `nf_conntrack` and `dummy` may be a module, and **a process in a user
+/// namespace cannot make the kernel load one**. A sandbox that came up with a
+/// network and no ruleset on it would reach whatever the host can reach, so
+/// there is nothing to fall back to. See `iface.SpawnError.NetRouterUnavailable`.
+fn buildNetwork(write_fd: i32, stderr_fd: i32) nftables.Session {
+    var route_diag: ?netns.Diagnostic = null;
+    var route = netns.Session.open(&route_diag) catch |err|
+        dieNetwork(write_fd, stderr_fd, err, netnsErrno(route_diag));
+    _ = route.configure(&route_diag) catch |err|
+        dieNetwork(write_fd, stderr_fd, err, netnsErrno(route_diag));
+    // The rtnetlink socket has nothing left to say. The network it built is a
+    // property of the namespace and not of this descriptor.
+    route.close();
+
+    var table_diag: ?nftables.Diagnostic = null;
+    const table = nftables.Session.open(&table_diag) catch |err|
+        dieNetwork(write_fd, stderr_fd, err, nftablesErrno(table_diag));
+    table.install(&table_diag) catch |err|
+        dieNetwork(write_fd, stderr_fd, err, nftablesErrno(table_diag));
+    return table;
+}
+
+fn netnsErrno(diag: ?netns.Diagnostic) i32 {
+    return if (diag) |one| one.errno else 0;
+}
+
+fn nftablesErrno(diag: ?nftables.Diagnostic) i32 {
+    return if (diag) |one| one.errno else 0;
+}
+
+/// Report a network that would not come up, with the errno the kernel gave.
+///
+/// **A module that is missing gets a sentence and not only an error name.**
+/// It is the one fault here that a person can fix, and the fix is not obvious
+/// from the name: `KernelModuleMissing` means the host has to load a module,
+/// and no message anywhere else would say which. See `dieNoticeForDeny`, which
+/// is the same shape for the one fault a project author can fix.
+fn dieNetwork(write_fd: i32, stderr_fd: i32, err: anyerror, errno: i32) noreturn {
+    if (err == error.KernelModuleMissing) {
+        writeStderr(stderr_fd, missing_module_notice);
+    } else {
+        printFault(stderr_fd, err);
+    }
+    dieWithErrno(write_fd, stderr_fd, .network, errno);
+}
+
+/// What a person reads when the host has no nftables or no `dummy` device.
+///
+/// **A process in a user namespace cannot make the kernel load a module**, so
+/// there is nothing Chock can do about this from inside and nothing to fall
+/// back to: a sandbox with a network and no ruleset on it would reach whatever
+/// the host can reach. The modules are named because `modprobe` needs names.
+const missing_module_notice =
+    "sandbox: this host cannot give a sandbox its own filtered network.\n" ++
+    "sandbox: a kernel module it needs is not loaded, and a sandbox cannot load one.\n" ++
+    "sandbox: load these on the host and run again:\n" ++
+    "sandbox:   modprobe dummy nf_tables nf_nat nft_chain_nat nft_redir nft_reject nf_conntrack\n";
+
+/// N, the network router. Never returns.
+///
+/// **Confines itself before it serves anything**, and in this order: the two
+/// listeners come up while `CAP_NET_BIND_SERVICE` is still held, then every
+/// descriptor but the five it needs goes away, then every capability but
+/// `CAP_NET_ADMIN`, then a seccomp allowlist. Only after all of that does it
+/// say it is ready, so "ready" means "fully confined and listening" and never
+/// one without the other.
+///
+/// What it is permitted afterwards is `seccomp.router_calls` and nothing else:
+/// it cannot open a path, make a socket of any kind, run a program, or signal
+/// anything. Every descriptor it will ever hold is one it already has, plus
+/// the ones the kernel hands it through `accept4` and the far side hands it
+/// through `SCM_RIGHTS`.
+///
+/// **It keeps one capability, and only one.** `CAP_NET_ADMIN` in the sandbox's
+/// own user namespace is what lets it add an address to the kernel's allow
+/// set, which is the whole mechanism: a name the policy permitted becomes an
+/// address the kernel will carry, and nothing else ever becomes one. That
+/// namespace was made a moment earlier and owns nothing of the host's, and the
+/// filter above names no call the capability could otherwise be spent on: there
+/// is no `socket`, so there is no second netlink socket to open, and the one it
+/// holds was opened in A. See `capabilities.keepOnly`, and `runReader`, which
+/// is the same shape for `CAP_SYS_PTRACE`.
+///
+/// **A layer that will not go on ends this process rather than weakening it.**
+/// A router running with less than its full confinement is the one outcome
+/// that must not happen quietly: it holds a descriptor from the host's own
+/// network namespace and a capability the sandboxed program does not have.
+/// Ending it is safe for the session, because A is waiting for the readiness
+/// byte and reports a setup failure when it does not come.
+fn runRouter(
+    ready_fd: i32,
+    link_fd: i32,
+    table: nftables.Session,
+    middle_pidfd: i32,
+    insns: []const bpf.Insn,
+    write_fd: i32,
+    stderr_fd: i32,
+) noreturn {
+    // **Before anything else**, the same as the keeper. A that died between
+    // the fork above and this line would otherwise leave N running with a
+    // relay nobody reaps. See `armPdeathsig` for the race it closes.
+    armPdeathsig(write_fd, stderr_fd, middle_pidfd);
+
+    var client = routerlink.Client{ .fd = link_fd, .session = table };
+    var instance: router.Router = undefined;
+    var diag: ?router.Diagnostic = null;
+    // **The listeners come up first, and while the capability is still
+    // there.** The resolver binds port 53, which is privileged, so a process
+    // that had already narrowed its capabilities would be refused it. See
+    // `router.Error.PrivilegedPort`, which names exactly this mistake.
+    instance.open(.{ .policy = client.policy(), .host = client.host() }, &diag) catch |err| {
+        printFault(stderr_fd, err);
+        dieWithErrno(write_fd, stderr_fd, .network, if (diag) |one| one.errno else 0);
+    };
+
+    // Every descriptor but the five this loop uses. `closeInheritedFds`
+    // already ran in A, so what is left is A's own working set: the middle
+    // pipe, the caller's output descriptors, and the scratch areas.
+    keepOnlyTheseDescriptors(&.{
+        ready_fd,
+        link_fd,
+        table.fd,
+        instance.relay_fd,
+        instance.resolver_fd,
+    });
+
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.keepOnly(linux.CAP.NET_ADMIN, &cap_diag) catch linux.exit(1);
+    seccomp.install(bpf.Prog.init(insns)) catch linux.exit(1);
+
+    // **The last thing before the loop.** A is blocked on this byte and forks
+    // the caller's program only once it arrives, so nothing the program does
+    // can reach a relay that is not there.
+    //
+    // **`sendto` and not `write`**, because `write` is not on the router's
+    // allowlist and must not be put there: a router that can write to a
+    // descriptor is a router that can write to one the far side sent it.
+    const ready = [1]u8{1};
+    const said = linux.sendto(ready_fd, &ready, ready.len, linux.MSG.NOSIGNAL, null, 0);
+    if (linux.errno(said) != .SUCCESS or said != ready.len) linux.exit(1);
+
+    // **The same socket is the control channel from here on.** A keeps its own
+    // end open for as long as the sandboxed program runs and closes it once
+    // that program has been reaped. See `reapRouter`.
+    //
+    // **A finite wait, and not the `-1` `router.run` uses.** The router has to
+    // notice the close, and `Router.step` waits on the relay and the resolver
+    // and knows nothing about this descriptor. A wait of `-1` here would leave
+    // the router asleep until the next connection, which on a call that has
+    // just ended never comes, and A would then fall back to killing it and
+    // drop whatever it still held. The cost is one wakeup every
+    // `router_idle_step_ms`, which for a call that lasts seconds is nothing.
+    while (!peerHasGone(ready_fd)) {
+        // **A monotonic clock that counts suspended time, and never the wall
+        // clock.** Every deadline in the router is a span and not a date, so a
+        // clock an administrator or NTP can move would expire a name early or
+        // hold one late for no reason a reader could see. See `router.run`,
+        // which this loop replaces: that one needs a `std.Io`, and a `std.Io`
+        // needs calls this filter does not permit.
+        instance.step(monotonicMilliseconds(), router_idle_step_ms, null) catch linux.exit(1);
+    }
+
+    // **The last bytes, carried after the program that wrote them has gone.**
+    // A program that writes and exits leaves its bytes in this process, and a
+    // router that stopped the instant the program did would drop them. Every
+    // link is finished quickly here because the program is already gone, so
+    // every inside socket is closed and every direction ends. The bound is
+    // what makes this a drain and not a second loop with no way out.
+    var drained: usize = 0;
+    while (drained < router_drain_steps) : (drained += 1) {
+        instance.step(monotonicMilliseconds(), router_drain_step_ms, null) catch break;
+        if (instance.pendingBytes() == 0) break;
+    }
+    linux.exit(0);
+}
+
+/// How long the router sleeps in one turn of its loop when nothing is ready.
+const router_idle_step_ms: i32 = 20;
+
+/// How many turns the router may take to carry what it still holds once the
+/// call has ended, and how long each one may wait.
+///
+/// **Two turns is what a drain really takes**: one to read what the program
+/// wrote as its socket closes, and one to write it on. The bound is above that
+/// for a write the kernel would not take at once, and it is still a bound:
+/// `reapRouter` waits `router_drain_tries` milliseconds after this and then
+/// kills.
+const router_drain_steps: usize = 16;
+const router_drain_step_ms: i32 = 2;
+
+/// True when the peer of `fd` has closed its end.
+///
+/// **`POLLHUP` and not a read.** A read would take a byte the peer might have
+/// sent, and nothing is ever sent on this socket after the readiness byte, so
+/// a read that returned one would be a message this process cannot explain.
+fn peerHasGone(fd: i32) bool {
+    var watched = [1]linux.pollfd{.{ .fd = fd, .events = 0, .revents = 0 }};
+    const rc = linux.poll(&watched, watched.len, 0);
+    if (linux.errno(rc) != .SUCCESS) return false;
+    return watched[0].revents & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL) != 0;
+}
+
+/// The monotonic clock the router measures every lifetime on. `BOOTTIME`, so
+/// a machine that suspended does not leave a name alive past the moment the
+/// kernel forgot its address.
+fn monotonicMilliseconds() i64 {
+    var now: linux.timespec = undefined;
+    if (linux.errno(linux.clock_gettime(.BOOTTIME, &now)) != .SUCCESS) return 0;
+    return @as(i64, now.sec) * std.time.ms_per_s +
+        @divTrunc(@as(i64, now.nsec), std.time.ns_per_ms);
 }
 
 /// Process 1 of the sandbox pid namespace. It reaps orphans until A closes
@@ -2423,6 +3033,84 @@ const applied_by_b = [_]iface.LayerName{
     .seccomp,
 };
 
+/// What the sandbox's own resolver is, written where glibc looks for it.
+///
+/// **The address is the blackhole device's own**, which is the address
+/// `router.Options.resolver_address` binds by default. The two are one value
+/// and the `comptime` block below is what keeps them one: a resolver bound on
+/// an address nothing names would answer nobody, and the failure would read as
+/// "the network is down".
+///
+/// `timeout:1 attempts:2` because the resolver is a process one hop away in
+/// the same namespace. The default is five seconds, which is what a program
+/// would wait for each query if the router ever stopped answering.
+const resolv_conf =
+    "# Written by chock. The resolver is the sandbox's own.\n" ++
+    "nameserver 10.99.0.1\n" ++
+    "options timeout:1 attempts:2\n";
+
+comptime {
+    const bytes = netns.address4;
+    var rendered: [40]u8 = undefined;
+    const text = std.fmt.bufPrint(&rendered, "nameserver {d}.{d}.{d}.{d}\n", .{
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    }) catch @compileError("sandbox: the resolver address does not fit a resolv.conf line");
+    if (std.mem.indexOf(u8, resolv_conf, text) == null) @compileError(
+        "sandbox: resolv.conf must name the address the router binds. See netns.address4.",
+    );
+}
+
+/// The name service switch, and **it matters exactly as much as
+/// `resolv.conf`**.
+///
+/// Measured on this project's own machine on 2026-09-14. Its own file reads
+/// `hosts: mymachines mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns`,
+/// and `[NOTFOUND=return]` returns from the lookup **before it ever reaches
+/// `dns`**. A sandbox that wrote a perfect `resolv.conf` and left that file
+/// alone would have a resolver nobody asks anything.
+///
+/// `files dns` and nothing else: the sandbox's own `/etc/hosts` first, for
+/// loopback, and the router second. Every other database answers from files,
+/// because there is no directory service inside a sandbox to ask.
+const nsswitch_conf =
+    "# Written by chock. The sandbox asks its own resolver and nothing else.\n" ++
+    "hosts: files dns\n" ++
+    "passwd: files\n" ++
+    "group: files\n" ++
+    "shadow: files\n" ++
+    "services: files\n" ++
+    "protocols: files\n" ++
+    "networks: files\n";
+
+/// Loopback, so a program that reaches for `localhost` does not spend a query
+/// on it. The router would refuse it in any case: `localhost` is not a name a
+/// policy table names, and the address it would answer with is not one the
+/// guard chain carries.
+const hosts_file =
+    "127.0.0.1\tlocalhost\n" ++
+    "::1\tlocalhost ip6-localhost ip6-loopback\n";
+
+/// The three files the sandbox writes for itself and the two directories it
+/// hides, applied by `applyLayers` for a routed call.
+///
+/// **The two hidden paths are not optional and are easy to leave out.**
+/// Measured on 2026-09-14: `/run/nscd/socket` is an `AF_UNIX` socket, so a
+/// network namespace does not touch it. glibc asks nscd before it reads
+/// `resolv.conf` at all, nscd answers from the **host's** view of the network,
+/// and the sandbox's own resolver is never consulted. A first end to end run
+/// failed exactly that way with the ruleset loaded and the files correct.
+///
+/// Both spellings of the path are named, because `/var/run` is a symbolic link
+/// to `/run` on most machines and a real directory on some, and glibc has used
+/// each of the two over time.
+const resolver_substitutions = [_]namespace.Substitution{
+    .{ .text = .{ .target = "/etc/resolv.conf", .contents = resolv_conf } },
+    .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = nsswitch_conf } },
+    .{ .text = .{ .target = "/etc/hosts", .contents = hosts_file } },
+    .{ .hide = "/run/nscd" },
+    .{ .hide = "/var/run/nscd" },
+};
+
 /// Steps 2 to 6 of the order above, in B, the process that runs the caller's
 /// program. **The mount tree is built here and not in A**, because a procfs
 /// mount takes the pid namespace of whichever process makes it. See the
@@ -2464,6 +3152,22 @@ fn applyLayers(
     var diag: ?namespace.Diagnostic = null;
     namespace.buildRoot(allocator, config.root, config.mounts, &diag) catch |err|
         dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
+
+    // **The resolver files, after the whole mount tree and before the pivot.**
+    // After, so a bind the caller asked for cannot cover them and so a `/etc`
+    // that came from the host is already there to be covered. Before, because
+    // every path below is written relative to `config.root`, which stops being
+    // a path at all the moment this process pivots into it.
+    //
+    // **Only for a routed call**, and a call with no router makes none of
+    // these calls at all: a sandbox with no network of its own has no resolver
+    // to name, and rewriting a machine's `nsswitch.conf` for a program that
+    // cannot reach anything would be a change with no purpose.
+    if (config.net_router != null) {
+        namespace.substitute(allocator, config.root, &resolver_substitutions, &diag) catch |err|
+            dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
+    }
+
     namespace.pivotInto(allocator, config.root, &diag) catch |err|
         dieNamespace(write_fd, config.stderr_fd, .pivot, err, diag);
 
@@ -2734,14 +3438,32 @@ fn runReader(
 /// what is left here is A's own working set: the middle pipe, the caller's
 /// output descriptors, and the scratch areas.
 fn keepOnlyDescriptors(first: i32, second: i32) void {
-    const low = @min(first, second);
-    const high = @max(first, second);
+    keepOnlyTheseDescriptors(&.{ first, second });
+}
+
+/// The same, for a caller that has to keep more than two. **At most eight**,
+/// which is more than any process here holds: the router keeps five and the
+/// reader keeps two.
+///
+/// The list is sorted first and the gaps between its members are closed one
+/// range at a time, so the caller may pass its descriptors in whatever order
+/// it happens to hold them. A repeated number is harmless: the range between a
+/// number and itself is empty.
+fn keepOnlyTheseDescriptors(keep: []const i32) void {
+    std.debug.assert(keep.len > 0 and keep.len <= 8);
+    var sorted: [8]i32 = undefined;
+    @memcpy(sorted[0..keep.len], keep);
+    const held = sorted[0..keep.len];
+    std.mem.sort(i32, held, {}, std.sort.asc(i32));
+
     const all: u32 = std.math.maxInt(u32);
-    if (low > 0) _ = linux.syscall3(.close_range, 0, @intCast(low - 1), 0);
-    if (high > low + 1) {
-        _ = linux.syscall3(.close_range, @intCast(low + 1), @intCast(high - 1), 0);
+    if (held[0] > 0) _ = linux.syscall3(.close_range, 0, @intCast(held[0] - 1), 0);
+    for (held[1..], held[0 .. held.len - 1]) |high, low| {
+        if (high > low + 1) {
+            _ = linux.syscall3(.close_range, @intCast(low + 1), @intCast(high - 1), 0);
+        }
     }
-    _ = linux.syscall3(.close_range, @intCast(high + 1), all, 0);
+    _ = linux.syscall3(.close_range, @intCast(held[held.len - 1] + 1), all, 0);
 }
 
 /// What A holds while it waits for B: a Landlock ruleset with no rule in it,
@@ -3907,6 +4629,79 @@ test "a filtered config with nobody to ask is refused, and refused before anythi
                 .env = &.{},
                 .network = network,
                 .net_broker = broker,
+            },
+            &.{"/does-not-exist"},
+            &report,
+            null,
+        ));
+    }
+}
+
+test "a filtered config that names both seams is refused, and one that names a router outside filtered too" {
+    // **The two seams are two implementations of one mode and never both at
+    // once.** They want opposite things from one seccomp rule: the netbroker
+    // needs `connect` refused, because it hands a descriptor from the host's
+    // own network namespace across the boundary, and the router needs
+    // `connect` permitted, because a program reaching a permitted host is the
+    // whole mechanism. A driver that quietly picked one would give the other a
+    // sandbox that does not do what its field says. See `seccompOptionsFor`.
+    //
+    // The refusal comes before `probeAbi`, before any filter is built and
+    // before any fork, so this test needs no root, no mount and no program.
+    //
+    // Mutation check: drop either new arm of the switch in `spawn` and one of
+    // the calls below comes back with something other than the error it names.
+    var report: LandlockReport = undefined;
+
+    const Never = struct {
+        fn connect(_: *anyopaque, _: []const u8, _: u16) iface.NetBroker.Grant {
+            // Never reached: every call below refuses before it forks.
+            return .refused;
+        }
+        fn resolve(_: *anyopaque, _: []const u8, _: iface.NetRouter.Family) iface.NetRouter.Resolution {
+            return .refused;
+        }
+        fn open(_: *anyopaque, _: iface.NetRouter.Address, _: u16) iface.NetBroker.Grant {
+            return .refused;
+        }
+    };
+    var nothing: u8 = 0;
+    const broker = iface.NetBroker{ .ptr = &nothing, .vtable = &.{ .connect = Never.connect } };
+    const router_seam = iface.NetRouter{
+        .ptr = &nothing,
+        .vtable = &.{ .resolve = Never.resolve, .open = Never.open },
+    };
+
+    try std.testing.expectError(error.NetRouterAndBroker, spawn(
+        std.testing.allocator,
+        .{
+            .root = "/does-not-exist",
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            .network = .filtered,
+            .net_broker = broker,
+            .net_router = router_seam,
+        },
+        &.{"/does-not-exist"},
+        &report,
+        null,
+    ));
+
+    // And a router on a config that is not filtered, which has nothing to
+    // route: the same rule the netbroker has, for the same reason.
+    for ([_]namespace.Network{ .none, .host }) |network| {
+        try std.testing.expectError(error.NetRouterNotFiltered, spawn(
+            std.testing.allocator,
+            .{
+                .root = "/does-not-exist",
+                .mounts = &.{},
+                .rules = &.{},
+                .cwd = "/",
+                .env = &.{},
+                .network = network,
+                .net_router = router_seam,
             },
             &.{"/does-not-exist"},
             &report,

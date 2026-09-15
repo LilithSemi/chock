@@ -5367,7 +5367,7 @@ const SessionArbiter = struct {
 ///
 /// **`brokerFn` runs on every tool call, not on a smaller subset of them.**
 /// `lib/chock-core/tools.zig`'s own dispatch sets `config.net_broker =
-/// net.broker(call.tool, call.call_id)` for every call `context.net` is set
+/// net.router(call.tool, call.call_id)` for every call `context.net` is set
 /// for, with no narrower condition, the same "every ordinary tool call" shape
 /// `SessionArbiter.decideFn` answers through `gateToolCall`. So a full replay
 /// from event 0 on every call here is exactly the same quadratic
@@ -5431,9 +5431,9 @@ const ToolNetwork = struct {
         return .{ .ptr = self, .vtable = &seam_vtable };
     }
 
-    const seam_vtable = chock_core.tools.NetSeam.VTable{ .broker = brokerFn };
+    const seam_vtable = chock_core.tools.NetSeam.VTable{ .router = routerFn };
 
-    fn brokerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetBroker {
+    fn routerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         self.network.tool = tool;
         // **The real id, and not the empty one this used to send.** A
@@ -5450,7 +5450,7 @@ const ToolNetwork = struct {
         // on why a fold kept from `giveFn` alone misses a mid session
         // `restrict_self`.
         self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
-        return self.network.netBroker();
+        return self.network.netRouter();
     }
 
     /// Take the session's own locked handle and build everything that needed
@@ -8160,7 +8160,7 @@ fn startMcp(
         const net_action = chock_core.mcp.networkActionInto(&buffer, one.name).?;
         if (policy.answer(one.name, net_action) == .allow) {
             config.network = .filtered;
-            config.net_broker = state.networks[index].netBroker();
+            config.net_router = state.networks[index].netRouter();
             tty.detail(
                 "chock: the MCP server {s} may reach the hosts this project's net.connect rules name\n",
                 .{one.name},

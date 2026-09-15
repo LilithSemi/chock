@@ -54,28 +54,33 @@ pub const cgroup = @import("chock-sandbox/linux/cgroup.zig");
 /// The nftables ruleset the network router installs in the sandbox's own
 /// network namespace, re-exported beside the modules above for the same
 /// reason: it is a mechanism a caller outside this library names directly.
-/// **Nothing calls it yet.** It is the kernel half of the router and the
-/// pieces that use it, the resolver and the relay, are not built.
+/// **The driver installs it for every `.filtered` call.** It is the kernel
+/// half of the router, and the resolver and the relay sit beside it.
 pub const nftables = @import("chock-sandbox/linux/nftables.zig");
 /// The network the router gives a sandbox inside its own network namespace:
 /// loopback, one dummy device, an address, and a default route through it.
 /// Re-exported beside `nftables` for the same reason. **The dummy device is a
 /// blackhole and that is the whole design**: read that file's top comment
 /// before changing anything about the device it makes.
-/// **Nothing calls it yet.** It is the second piece of the router, and the
-/// wiring lands when the pieces exist.
+/// The driver builds it for every `.filtered` call.
 pub const netns = @import("chock-sandbox/linux/netns.zig");
 /// The userspace half of the network router: the TCP relay every outbound
 /// connection is redirected to, and the resolver beside it. Re-exported beside
 /// `nftables` and `netns` for the same reason. **The resolver is not a
 /// boundary**: it is what lets the boundary speak in names, and an address
 /// Chock never handed out is not in the allow set and dies at the kernel.
-/// **Nothing calls it yet.** It is the third piece of the router, and the
-/// wiring lands next.
+/// The driver wires it into every `.filtered` call: see `Config.net_router`.
 pub const router = @import("chock-sandbox/linux/router.zig");
+/// The one channel the router has out of the sandbox. A caller that
+/// implements `Sandbox.NetRouter` never names this file, the same way a
+/// caller that implements `NetBroker` never names `net_broker`: the driver
+/// serves the wire and calls the seam. Re-exported so a test can drive the
+/// exchange without a sandbox.
+pub const net_router = @import("chock-sandbox/linux/routerlink.zig");
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
+
 /// See `Sandbox.Middle`. Re-exported beside `spawn`, which fills one in, and
 /// beside the two calls a caller needs to use it at all: every caller of
 /// `spawn` that ever cancels a call holds one of these.
@@ -90,6 +95,10 @@ pub const SignalError = Sandbox.SignalError;
 /// caller that implements one never has to reach a file under `chock-sandbox/`
 /// by path.
 pub const NetBroker = Sandbox.NetBroker;
+/// See `Sandbox.NetRouter`, the other seam a `.filtered` call fills.
+/// Re-exported beside `NetBroker` for the same reason: `Config` names it, and
+/// `lib/chock-broker/network.zig` implements both.
+pub const NetRouter = Sandbox.NetRouter;
 /// See `Sandbox.copyStrings`. Re-exported beside `Config.copy`, which uses it,
 /// because a caller that copies a config for a process that outlives one tool
 /// call has an argv to copy beside it and must not grow a second spelling of

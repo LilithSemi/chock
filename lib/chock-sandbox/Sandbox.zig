@@ -34,6 +34,7 @@ const seccomp = @import("linux/seccomp.zig");
 const notify = @import("linux/notify.zig");
 const rlimits = @import("linux/rlimits.zig");
 const cgroup = @import("linux/cgroup.zig");
+const nftables = @import("linux/nftables.zig");
 const grants = @import("grants.zig");
 
 /// `landlock.zig`, `namespace.zig`, and `seccomp.zig` are Linux-only
@@ -320,6 +321,31 @@ pub const Config = struct {
     /// `limits_report` and the three descriptor fields, because it points at
     /// the caller's own storage.
     net_broker: ?NetBroker = null,
+    /// Who answers the network router when it has to turn a name into an
+    /// address, and an address into a connection.
+    ///
+    /// **This is the new implementation of `.filtered`, and `net_broker` above
+    /// is the old one.** A caller names exactly one of the two. With this one
+    /// the sandboxed program gets a real network in its own namespace and the
+    /// kernel refuses everything policy did not permit, so an ordinary program
+    /// that knows nothing about Chock reaches a permitted host. With
+    /// `net_broker` the program gets no network at all and one socket to ask
+    /// on, which only a program written for Chock can use.
+    ///
+    /// **Both at once is refused**, with `error.NetRouterAndBroker`. The two
+    /// cannot be on together: the broker hands a descriptor made in the host's
+    /// own network namespace across the boundary, and the seccomp rule that
+    /// stops that descriptor being aimed somewhere else is the same rule that
+    /// would stop the router's own program connecting at all. See
+    /// `seccomp.Options.block_connect`.
+    ///
+    /// The Darwin driver reads this field and applies nothing, the same as
+    /// every other field on this struct: it refuses before it reaches a layer
+    /// at all.
+    ///
+    /// **`Config.copy` carries this across as it is**, for the reason
+    /// `net_broker` gives.
+    net_router: ?NetRouter = null,
     /// Filled in with what the limits layer actually did, when a caller wants
     /// to know. Null is the ordinary case.
     ///
@@ -691,6 +717,87 @@ pub const NetBroker = struct {
 
     pub fn connect(self: NetBroker, host: []const u8, port: u16) Grant {
         return self.vtable.connect(self.ptr, host, port);
+    }
+};
+
+/// Who answers the network router, and the second seam this library has for a
+/// connection. See `Config.net_router`, and `linux/router.zig` for the
+/// resolver and the relay that reach it.
+///
+/// ## Two questions, because a name and an address are answered at different
+/// moments
+///
+/// `resolve` is asked while the sandboxed program is still looking a name up.
+/// Nothing has been connected and no port is known, so the answer is about the
+/// **name alone**: may this session reach this host at all. An address that
+/// comes back goes into the kernel's allow set, and an address the kernel does
+/// not hold is refused by the kernel before this library sees it.
+///
+/// `open` is asked once a connection has arrived at the relay. The router
+/// recovered the address the program really asked for, and the port with it,
+/// so this is the question the policy table was written for. **The address is
+/// the identity here and the name is not**: the router's own name table
+/// answers with the name an address was last handed out for, which two hosts
+/// on one content network share, so the implementation maps the address back
+/// to the name **it** handed out and never trusts one from inside.
+///
+/// ## Why the decision is not in here
+///
+/// The same reason `NetBroker` gives: a host policy is not the sandbox's to
+/// hold. This library bounds the shape of what crosses the boundary and then
+/// asks. See `lib/chock-broker/network.zig`, which is the real implementation
+/// of both seams.
+pub const NetRouter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    /// An address, in the two widths a name can answer with. The same spelling
+    /// `linux/nftables.zig` puts in the kernel's allow set, so an address does
+    /// not change type on its way from a policy answer to a kernel set.
+    pub const Address = nftables.Address;
+
+    /// Which width a query asked about.
+    pub const Family = @typeInfo(Address).@"union".tag_type.?;
+
+    /// What one `resolve` came back with.
+    pub const Resolution = union(enum) {
+        /// An address, which the router puts in the kernel's allow set and
+        /// then answers the query with.
+        granted: Address,
+        /// The policy refuses this name. The router answers `REFUSED` and adds
+        /// nothing to the allow set. **No reason crosses the boundary**, for
+        /// the reason `NetBroker.Grant.refused` gives.
+        refused,
+        /// The policy permits the name and there is no address of that width.
+        /// The router answers with no error and no answer, which is what a
+        /// resolver says when it holds nothing of that type. **Told apart from
+        /// a refusal on purpose**: a program that read one as the other would
+        /// stop asking for the other width.
+        unresolved,
+    };
+
+    pub const VTable = struct {
+        /// May this name be resolved, and to what. `host` is a name the
+        /// sandboxed program chose: the router has already bounded its length
+        /// and refused a byte that cannot be in a host name, and the
+        /// implementation checks it again against its own rules. `host`
+        /// borrows the router's own buffer and is not valid after this call
+        /// returns.
+        resolve: *const fn (ptr: *anyopaque, host: []const u8, want: Family) Resolution,
+        /// May the relay carry bytes to this address and port, and on what
+        /// descriptor. **The descriptor is made in the host's own network
+        /// namespace**, which is the one thing the router cannot do from where
+        /// it stands. The implementation gives up ownership, the same as
+        /// `NetBroker.connect`.
+        open: *const fn (ptr: *anyopaque, address: Address, port: u16) NetBroker.Grant,
+    };
+
+    pub fn resolve(self: NetRouter, host: []const u8, want: Family) Resolution {
+        return self.vtable.resolve(self.ptr, host, want);
+    }
+
+    pub fn open(self: NetRouter, address: Address, port: u16) NetBroker.Grant {
+        return self.vtable.open(self.ptr, address, port);
     }
 };
 
@@ -1438,6 +1545,12 @@ pub const Guarantees = std.EnumSet(Guarantee);
 /// it reaches anything resembling one of these steps.
 pub const SetupError = error{
     StdinRedirectFailed,
+    /// The sandbox could not be given a network of its own with a ruleset on
+    /// it. **A setup step and not a config fault**: the network namespace was
+    /// taken, and what the kernel refused is the device or the ruleset inside
+    /// it. See `SpawnError.NetRouterUnavailable`, which is the same member
+    /// read from the other side of the pipe.
+    NetRouterUnavailable,
     ProcessGroupFailed,
     /// The process could not be moved into the cgroup that carries its
     /// resource limits. Reported rather than ignored: a program that ran on
@@ -1498,9 +1611,13 @@ pub const SpawnError = error{
     /// every path stays where it is runs there: see `darwin/driver.zig`'s
     /// `Inexpressible` for the whole rule.
     NoMountNamespace,
-    /// `Config.network` is `.filtered` and `Config.net_broker` is null, so
-    /// there is nobody for the sandboxed process to ask. **Refused rather
-    /// than downgraded to `.none`**: see `Config.net_broker`.
+    /// `Config.network` is `.filtered` and both `Config.net_broker` and
+    /// `Config.net_router` are null, so there is nobody to ask. **Refused
+    /// rather than downgraded to `.none`**: see `Config.net_broker`.
+    ///
+    /// **Named for the broker although either field answers it.** It is the
+    /// answer a filtered config with nothing in it has always had, and a
+    /// caller that reads this name has filled in neither.
     NetBrokerMissing,
     /// `Config.net_broker` is set on a config whose `network` is not
     /// `.filtered`. There is no socket to serve, so the broker would never be
@@ -1509,6 +1626,13 @@ pub const SpawnError = error{
     NetBrokerNotFiltered,
     /// The socket pair that carries the requests could not be made.
     NetBrokerSocketFailed,
+    /// `Config.net_router` is set on a config whose `network` is not
+    /// `.filtered`. There is nothing to route, for the reason
+    /// `NetBrokerNotFiltered` gives.
+    NetRouterNotFiltered,
+    /// Both `Config.net_broker` and `Config.net_router` are set. The two
+    /// cannot be on together: see `Config.net_router`.
+    NetRouterAndBroker,
     /// `Config.containment` is `.supplied` and this build cannot put a child
     /// into a cgroup as the kernel creates it. On Linux that means a kernel
     /// older than `linux/cgroup.zig`'s own `clone_into_cgroup_since`. On
@@ -1852,7 +1976,46 @@ test "a copied config shares no memory with the original, scratch areas included
     // `spawn`**, so a field this function forgot would be a plain refusal and
     // never a silent isolation: see `Config.net_broker`.
     try std.testing.expectEqual(original.net_broker, copied.net_broker);
+
+    // `net_router` is the same case again, and it is checked with a seam that
+    // is really there rather than with the null every other field on this
+    // literal holds. Two nulls compare equal whether or not `copy` carries the
+    // field at all, so the check above proves less than it reads as.
+    //
+    // Mutation check: write `out.net_router = null;` in `copy` and this fails.
+    var stub: StubRouter = .{};
+    const routed = try (Config{
+        .root = "/",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_router = stub.netRouter(),
+    }).copy(arena);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &stub),
+        if (routed.net_router) |one| one.ptr else null,
+    );
 }
+
+/// A router seam that answers nothing. **For `Config.copy` alone**, which
+/// carries the pointer and never calls through it.
+const StubRouter = struct {
+    fn netRouter(self: *StubRouter) NetRouter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
+
+    fn resolveFn(_: *anyopaque, _: []const u8, _: NetRouter.Family) NetRouter.Resolution {
+        return .refused;
+    }
+
+    fn openFn(_: *anyopaque, _: NetRouter.Address, _: u16) NetBroker.Grant {
+        return .refused;
+    }
+};
 
 test "the linux driver and the darwin driver expose the same public shape" {
     // Guarded on `builtin.os.tag`, a comptime known value, so the branch

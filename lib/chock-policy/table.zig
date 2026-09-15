@@ -862,6 +862,59 @@ pub const Table = struct {
         return result;
     }
 
+    /// True when this table holds a rule that could permit **some** action
+    /// under `key.action`, which is read here as a **prefix** and not as an
+    /// action.
+    ///
+    /// ## What question this answers, and what it refuses to answer
+    ///
+    /// It is an **existence** question: did the author write anything at all
+    /// that reaches below this prefix. It says nothing about what the answer
+    /// to a real action would be, and no caller may treat a `true` here as a
+    /// permission. The decision for a real action is `evaluateChain`, which
+    /// folds the whole spawn chain and picks a winner by specificity. This
+    /// walks the rules one time and stops at the first one that could matter.
+    ///
+    /// ## The one caller, and why the question exists at all
+    ///
+    /// `lib/chock-broker/network.zig`'s resolver. A program inside a sandbox
+    /// looks a host name up **before** it opens anything, so at that moment
+    /// there is no port, and a `net.connect` action ends in one. Neither
+    /// reading of a full action fits:
+    ///
+    /// * `evaluateChain` on the bare prefix answers `ask` for a project whose
+    ///   only rule is `net.connect.com.anthropic.api.443`, because no rule
+    ///   names `net.connect.com.anthropic.api`. The host would never resolve,
+    ///   and the rule the author wrote could never be reached at all.
+    /// * `ceilingChain` on the bare prefix answers `allow` for a host nobody
+    ///   named, so every name in the world would resolve and the refusal would
+    ///   happen one step later, after the program had already been told the
+    ///   name exists.
+    ///
+    /// The resolver asks both: `ceilingChain` for "is this host forbidden
+    /// outright", and this for "did anybody write a rule that reaches it". A
+    /// name needs both answers before it resolves.
+    ///
+    /// ## A `deny` rule is not a rule that reaches
+    ///
+    /// A rule whose decision is `deny` is skipped. An author who wrote only
+    /// `net.connect.com.evil.*` set to `deny` wrote nothing that could permit
+    /// anything under it, and reading a refusal as "somebody named this host"
+    /// would turn a denial into the reason a name resolves.
+    ///
+    /// ## The chain is not folded here
+    ///
+    /// The key is the asking agent's own. A subagent whose parent is denied
+    /// still resolves the name and is then refused the connection by
+    /// `evaluateChain`, which does fold the chain. **That is the safe
+    /// direction for an existence question**: folding it here could only make
+    /// a name resolve that this reading already refuses, and the connection
+    /// itself is judged either way.
+    pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
+        return rulesReachBelow(self.policy.rules, key) or
+            rulesReachBelow(defaults.rules, key);
+    }
+
     /// The **ceiling** both layers put on `key`, folded over the whole spawn
     /// chain. `allow` when nothing names the key at all.
     ///
@@ -1040,6 +1093,51 @@ fn winnerFor(rules: []const Rule, key: Key) ?Rule {
         if (ruleBeats(rule, best)) winner = rule;
     }
     return winner;
+}
+
+/// True when any rule of `rules` could permit something under `key.action`.
+/// See `Table.permitsSomethingUnder`, which is the only reading of this.
+fn rulesReachBelow(rules: []const Rule, key: Key) bool {
+    std.debug.assert(key.action.len > 0);
+    for (rules) |rule| {
+        if (rule.decision == .deny) continue;
+        if (!patternMatches(rule.tool, key.tool)) continue;
+        if (!patternMatches(rule.model, key.model)) continue;
+        if (!patternMatches(rule.agent_kind, key.agent_kind)) continue;
+        if (!actionReachesBelow(rule.action, key.action)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// True when `pattern` names the prefix itself or names something under it.
+///
+/// Two ways, because a rule can sit on either side of the prefix:
+///
+/// * `net.connect.com.anthropic.*` **matches** the value
+///   `net.connect.com.anthropic.api`, so a class rule above the prefix reaches
+///   everything below it.
+/// * `net.connect.com.anthropic.api.443` **is under**
+///   `net.connect.com.anthropic.api`, so an exact rule for one port of a host
+///   reaches that host.
+///
+/// A rule with no action at all names every action, so it reaches everything.
+fn actionReachesBelow(pattern: ?[]const u8, prefix: []const u8) bool {
+    const text = pattern orelse return true;
+    if (patternMatches(text, prefix)) return true;
+    // `classPrefix` takes the `.*` off a class, so `net.connect.com.*` reads
+    // here as the name `net.connect.com`, which is the shape a rule under the
+    // prefix has once its class marker is gone.
+    //
+    // **Equal counts, and it is the case `patternMatches` above cannot
+    // answer.** `net.connect.com.anthropic.*` does not match the value
+    // `net.connect.com.anthropic`, because a class never matches its own
+    // prefix, and yet it does permit `net.connect.com.anthropic.443`. So the
+    // host `anthropic.com` is reached by that rule and the query for it has to
+    // say so.
+    const body = classPrefix(text) orelse text;
+    return std.mem.startsWith(u8, body, prefix) and
+        (body.len == prefix.len or body[prefix.len] == '.');
 }
 
 fn ruleMatches(rule: Rule, key: Key) bool {
@@ -1758,6 +1856,100 @@ test "a policy that names an action exactly beats one that names a class" {
     defer Table.destroy(gpa, table);
     try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(testKey("main", "git.branch.delete")));
     try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(testKey("main", "git.commit")));
+}
+
+test "a name the author never wrote a rule about reaches nothing, and one they wrote a port rule about does" {
+    // **The reading a resolver needs, and neither of the other two.** A host
+    // name is looked up before any connection exists, so there is no port and
+    // no full action to ask about. `evaluateChain` on the bare prefix answers
+    // `ask` for a project whose only rule names one port, and `ceilingChain`
+    // answers `allow` for a host nobody named at all. See
+    // `Table.permitsSomethingUnder`.
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .tool = "git", .action = "net.connect.com.anthropic.api.443", .decision = .allow },
+        \\            .{ .tool = "git", .action = "net.connect.com.evil.*", .decision = .deny },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const table = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, table);
+
+    // A rule **under** the prefix reaches it. This is the case that makes the
+    // whole query necessary: the author wrote a rule about one port of this
+    // host, and the name has to resolve for that rule to be reachable at all.
+    //
+    // Mutation check: delete the second half of `actionReachesBelow`, the one
+    // that reads a rule under the prefix, and this line fails.
+    try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic.api")));
+
+    // A host nobody named reaches nothing. **This is what stops every name in
+    // the world resolving**, which is what `ceilingChain` alone would do.
+    try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.test.evil.secret")));
+
+    // A `deny` rule is not a rule that reaches. An author who wrote only a
+    // refusal about a host wrote nothing that could permit anything under it.
+    //
+    // Mutation check: delete the `rule.decision == .deny` skip in
+    // `rulesReachBelow` and this line fails.
+    try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.com.evil.metadata")));
+
+    // The three parts of the key that are not the action still have to match.
+    // `testKey` names the tool `git`, and both rules above name it too, so a
+    // different tool reaches neither of them.
+    try std.testing.expect(!table.permitsSomethingUnder(.{
+        .agent_kind = "main",
+        .model = "test-model",
+        .tool = "fetch_url",
+        .action = "net.connect.com.anthropic.api",
+    }));
+}
+
+test "a class rule above a host reaches every host under it, and a rule about a different host does not" {
+    const gpa = std.testing.allocator;
+
+    const source: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.connect.com.anthropic.*", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const table = try Table.parse(gpa, source, null);
+    defer Table.destroy(gpa, table);
+
+    // The class matches the prefix itself, so every host under it resolves.
+    //
+    // Mutation check: delete the `patternMatches` half of `actionReachesBelow`
+    // and this line fails while the exact port rule of the test above still
+    // passes.
+    try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic.api")));
+    // **And the host the class is named after, which is the case a reader
+    // gets wrong.** `net.connect.com.anthropic.*` does not match the value
+    // `net.connect.com.anthropic`, because a class never matches its own
+    // prefix, and yet it plainly permits `net.connect.com.anthropic.443`. So
+    // `anthropic.com` itself has to resolve.
+    //
+    // Mutation check: read `actionReachesBelow`'s last comparison as
+    // `body.len > prefix.len` and this line fails while the one above it
+    // passes.
+    try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic")));
+
+    // **A name that only looks like it is under the class is not.** The labels
+    // run the other way round for exactly this reason: a request for
+    // `evil.com.anthropic.api` becomes `net.connect.api.anthropic.com.evil`,
+    // which this class does not reach.
+    try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.api.anthropic.com.evil")));
+
+    // And a host of a different company, which shares no label with the class.
+    try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropicx")));
 }
 
 test "a subagent's policy is the intersection of its parent's and its kind's" {

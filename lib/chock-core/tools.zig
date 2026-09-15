@@ -1503,7 +1503,7 @@ pub const Registry = struct {
         // for a call it starts in the background, below.
         if (context.net) |net| {
             config.network = .filtered;
-            config.net_broker = net.broker(call.tool, call.call_id);
+            config.net_router = net.router(call.tool, call.call_id);
         }
 
         // No `else`: a member added to `Tool` and forgotten here fails the
@@ -1697,7 +1697,7 @@ pub const NetSeam = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        broker: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetBroker,
+        router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter,
     };
 
     /// `call_id` is the `call_id` of the `tool.call` this broker is being
@@ -1708,8 +1708,8 @@ pub const NetSeam = struct {
     /// read by `test/redteam/logscan.zig`'s `Fold.toolFor` as no call at all,
     /// which downgrades a red team boundary to inconclusive rather than
     /// passing or failing it, so this is not a label the model reads.
-    pub fn broker(self: NetSeam, tool: []const u8, call_id: []const u8) sandbox.NetBroker {
-        return self.vtable.broker(self.ptr, tool, call_id);
+    pub fn router(self: NetSeam, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
+        return self.vtable.router(self.ptr, tool, call_id);
     }
 };
 
@@ -2386,7 +2386,13 @@ fn runCommand(
     // kept out of it rather than raced against it.
     if (in_background) {
         config.network = .none;
+        // **Both seams, and not only the one this session happens to use.**
+        // `spawn` refuses a seam on a config that is not filtered, so a field
+        // left behind here would turn a background call into a setup failure
+        // rather than into the `.none` sandbox this branch is about. See
+        // `Sandbox.SpawnError.NetRouterNotFiltered`.
         config.net_broker = null;
+        config.net_router = null;
     }
 
     // Every writable surface this call may carry, plus the read only one, each
@@ -7315,11 +7321,11 @@ test "a task list dispatched with no session around it is refused, and never rea
     try std.testing.expect(std.mem.indexOf(u8, result.output, "your answer") != null);
 }
 
-/// A `NetSeam` that records the tool name it was asked to build a broker
-/// for, and refuses whatever it is then asked to connect. Used to pin that
+/// A `NetSeam` that records the tool name it was asked to build a router
+/// for, and refuses whatever it is then asked about. Used to pin that
 /// `Registry.dispatchWith` reaches this seam once per call, with the tool
 /// that is really running, for a tool that never touches the network at
-/// all: the broker is offered whether or not anything ever asks it for one.
+/// all: the router is offered whether or not anything ever asks it anything.
 const TestNetSeam = struct {
     calls: usize = 0,
     last_tool: [64]u8 = undefined,
@@ -7331,9 +7337,9 @@ const TestNetSeam = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = NetSeam.VTable{ .broker = brokerFn };
+    const vtable = NetSeam.VTable{ .router = routerFn };
 
-    fn brokerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) sandbox.NetBroker {
+    fn routerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) sandbox.NetRouter {
         const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         self.last_tool_len = @min(name.len, self.last_tool.len);
@@ -7343,12 +7349,13 @@ const TestNetSeam = struct {
         return .{ .ptr = self, .vtable = &net_vtable };
     }
 
-    const net_vtable = sandbox.NetBroker.VTable{ .connect = connectFn };
+    const net_vtable = sandbox.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
 
-    fn connectFn(ptr: *anyopaque, host: []const u8, port: u16) sandbox.NetBroker.Grant {
-        _ = ptr;
-        _ = host;
-        _ = port;
+    fn resolveFn(_: *anyopaque, _: []const u8, _: sandbox.NetRouter.Family) sandbox.NetRouter.Resolution {
+        return .refused;
+    }
+
+    fn openFn(_: *anyopaque, _: sandbox.NetRouter.Address, _: u16) sandbox.NetBroker.Grant {
         return .refused;
     }
 
@@ -7361,11 +7368,11 @@ const TestNetSeam = struct {
     }
 };
 
-test "a tool call is given a network broker, named after the tool that is running" {
+test "a tool call is given a network router, named after the tool that is running" {
     // **This is the wiring `Context.net` exists for.** A tool call moves off
     // `Network.none` for every tool, not only `run_command`: this is what a
     // person approves when this session's own policy lets a call reach a
-    // host at all, so the broker has to be there before any tool's own
+    // host at all, so the router has to be there before any tool's own
     // handler runs, whether or not that handler ever tries to use it. See
     // `lib/chock-broker/network.zig`'s own top comment on what moved.
     const allocator = std.testing.allocator;
@@ -7406,7 +7413,7 @@ test "a tool call is given a network broker, named after the tool that is runnin
     // `lib/chock-broker/network.zig`'s `Network.tool_call_id` is what a
     // `net.connect` question is written with, and an empty id there is read
     // by `test/redteam/logscan.zig`'s `Fold.toolFor` as no call at all: see
-    // this file's own `NetSeam.broker` doc comment.
+    // this file's own `NetSeam.router` doc comment.
     try std.testing.expectEqualStrings("read1", seam.callId());
 }
 

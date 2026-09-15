@@ -836,6 +836,9 @@ pub const Diagnostic = struct {
         proc_entry_stat,
         deny_notice_file,
         deny_notice_write,
+        substitute_file,
+        substitute_write,
+        substitute_stat,
         deny_target_stat,
         deny_target_open,
         overlay_mount,
@@ -865,6 +868,9 @@ pub const Diagnostic = struct {
                 .proc_entry_stat => "statx on a proc entry",
                 .deny_notice_file => "open on the deny notice file",
                 .deny_notice_write => "the write of the deny notice",
+                .substitute_file => "open on a substituted file",
+                .substitute_write => "the write of a substituted file",
+                .substitute_stat => "statx on a substituted path",
                 .deny_target_stat => "statx on a denied path",
                 .deny_target_open => "open on a denied path",
                 .overlay_mount => "the overlay mount",
@@ -1478,6 +1484,245 @@ pub const masked_proc_entries: []const []const u8 = &.{
 /// The name of the empty file each mask is a bind mount of. It exists only
 /// while `maskProcEntries` runs, under the sandbox root, and the name is
 /// gone before anything runs inside the sandbox.
+/// A file the sandbox writes for itself, and a path it hides. **Applied after
+/// the whole mount tree is built and before `pivot_root`**, so a substitution
+/// is not covered by a bind the caller asked for and a hidden path stays
+/// hidden however the caller ordered its list.
+///
+/// ## Why the sandbox has to write these at all
+///
+/// A sandbox with a network of its own has a resolver of its own, and glibc
+/// only finds it through `/etc/resolv.conf`. **On a machine with Nix there is
+/// no `/etc` inside the sandbox at all**: `src/run.zig`'s own
+/// `hostToolchainPaths` binds `/nix/store` and nothing else, so there is
+/// nothing to write into and one has to be made. On a machine without Nix
+/// `/etc` is bound from the host, read only, and the file that is there names
+/// the host's own resolver. Either way the sandbox cannot use what it finds.
+///
+/// `/etc/nsswitch.conf` matters as much as `/etc/resolv.conf` and is easy to
+/// forget. Measured on this project's own machine, whose file reads
+/// `hosts: mymachines mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns`:
+/// `[NOTFOUND=return]` **returns before the lookup ever reaches `dns`**, so a
+/// correct `resolv.conf` is consulted by nobody. Chock writes its own
+/// `hosts: files dns`.
+///
+/// **And nscd has to be hidden or both files are decoration.** Measured on
+/// 2026-09-14: `/run/nscd/socket` is an `AF_UNIX` socket, so a network
+/// namespace does not touch it. glibc asks nscd first, nscd answers from the
+/// **host's** view of the network, and the sandbox's own resolver is never
+/// asked anything. A first end to end run failed exactly that way, with the
+/// ruleset loaded and `resolv.conf` written correctly.
+pub const Substitution = union(enum) {
+    /// `contents` are what is at `target` inside the root, whatever the host
+    /// has there.
+    text: Text,
+    /// Nothing usable is at `target` inside the root, whatever the host has
+    /// there. A path the sandbox does not hold already is left alone: there is
+    /// nothing to hide.
+    hide: []const u8,
+
+    pub const Text = struct {
+        /// An absolute path, read relative to the sandbox root.
+        target: []const u8,
+        contents: []const u8,
+    };
+};
+
+/// Where the bytes of a text substitution are staged before they are bound
+/// over a target that already exists.
+const substitute_source_name = ".chock-substitute";
+
+/// The empty directory a `hide` binds over a directory, and the empty file it
+/// binds over anything else.
+const substitute_empty_dir_name = ".chock-empty-dir";
+const substitute_empty_file_name = ".chock-empty-file";
+
+/// Apply every `Substitution` in `subs` under `root`.
+///
+/// **Two ways to place a file, and which one is used depends on the host.**
+/// A target that is not there yet is created and written, which is the Nix
+/// case where the sandbox has no `/etc`. A target that is already there is
+/// covered by a bind mount, which is the case where `/etc` came from the host
+/// read only and cannot be written at all. Both leave the same bytes at the
+/// same path, and the second is the only one that works on a read only mount.
+///
+/// **A project that substitutes nothing pays nothing**: the function returns
+/// before it makes any file, so a sandbox with an empty list makes exactly the
+/// calls it always made.
+pub fn substitute(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    subs: []const Substitution,
+    diag: ?*?Diagnostic,
+) MountError!void {
+    if (subs.len == 0) return;
+
+    for (subs) |one| {
+        switch (one) {
+            .text => |text| try placeText(allocator, root, text, diag),
+            .hide => |target| try hidePath(allocator, root, target, diag),
+        }
+    }
+}
+
+fn placeText(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    text: Substitution.Text,
+    diag: ?*?Diagnostic,
+) MountError!void {
+    const target = try std.fs.path.join(allocator, &.{ root, text.target });
+    defer allocator.free(target);
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+
+    // **A symbolic link at the leaf is refused and never followed.** `mount`
+    // resolves its target, so a bind over a link lands wherever the link
+    // points, and a link into a path this sandbox does not hold lands nowhere
+    // at all. Refusing is loud and fail closed: the call ends with a named
+    // error rather than running with a resolver file that is not the one this
+    // function wrote.
+    //
+    // **A known gap, and named here rather than left to be discovered.** On a
+    // machine with systemd and no Nix, `/etc` is bound from the host and
+    // `/etc/resolv.conf` there is a link into `/run/systemd/resolve`. Such a
+    // machine gets this refusal today. See `applyDenyMounts`, which refuses a
+    // link for a different reason and with the same error.
+    if (try pathIsSymlink(target_z.ptr, diag)) return error.BindTargetIsSymlink;
+
+    switch (try existingPathKind(target_z.ptr, .substitute_stat, diag)) {
+        // Nothing is there, so the file is made where it belongs and written
+        // in place. The parent directories are made too: a sandbox root with
+        // no `/etc` in it is the ordinary case on a machine with Nix.
+        .missing => {
+            try makePath(allocator, target, .file, diag);
+            try writeSubstitute(target_z.ptr, text.contents, diag);
+        },
+        // Something is there and it may well be on a read only mount, so the
+        // bytes are staged inside the root, where writing always works, and
+        // bound over the target. A mount needs no write permission on what it
+        // covers.
+        .file, .directory => {
+            const source = try std.fs.path.join(allocator, &.{ root, substitute_source_name });
+            defer allocator.free(source);
+            const source_z = try allocator.dupeZ(u8, source);
+            defer allocator.free(source_z);
+            try writeSubstitute(source_z.ptr, text.contents, diag);
+            // Runs whichever way this function leaves. A mount holds the file
+            // itself, so the substitution stays after the name is gone, and
+            // the sandbox root is left with nothing extra in it. The same
+            // trick `applyDenyMounts` and `maskProcEntries` use.
+            defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
+            // No `MS.REC`: one file, which has nothing under it.
+            try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
+        },
+    }
+}
+
+fn hidePath(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    path: []const u8,
+    diag: ?*?Diagnostic,
+) MountError!void {
+    const target = try std.fs.path.join(allocator, &.{ root, path });
+    defer allocator.free(target);
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+
+    const kind = try existingPathKind(target_z.ptr, .substitute_stat, diag);
+    // **Nothing to hide is the ordinary answer and not a fault.** A sandbox
+    // that binds only `/nix/store` has no `/run` at all, so the nscd socket is
+    // already unreachable. This call is what makes that true on a machine
+    // whose sandbox does hold one, and it must not refuse to start the others.
+    if (kind == .missing) return;
+
+    const name = if (kind == .directory) substitute_empty_dir_name else substitute_empty_file_name;
+    const source = try std.fs.path.join(allocator, &.{ root, name });
+    defer allocator.free(source);
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+
+    // A directory is covered by an empty directory and anything else by an
+    // empty file. The kernel refuses a bind whose source and target are not
+    // the same kind, so the two cases cannot share one source.
+    if (kind == .directory) {
+        try makeDir(source_z.ptr, diag);
+    } else {
+        try makeEmptyFile(source_z.ptr, diag);
+    }
+    defer _ = linux.unlinkat(
+        linux.AT.FDCWD,
+        source_z.ptr,
+        if (kind == .directory) linux.AT.REMOVEDIR else 0,
+    );
+
+    try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
+}
+
+/// True when `path` itself is a symbolic link. **`AT_SYMLINK_NOFOLLOW`**, so
+/// this answers about the name and not about whatever it leads to.
+fn pathIsSymlink(path: [*:0]const u8, diag: ?*?Diagnostic) MountError!bool {
+    var stat_buf: linux.Statx = undefined;
+    const rc = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        linux.AT.SYMLINK_NOFOLLOW,
+        .{ .TYPE = true },
+        &stat_buf,
+    );
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        .NOENT, .NOTDIR => return false,
+        .PERM, .ACCES => return error.NotPermitted,
+        else => |err| {
+            note(diag, .substitute_stat, err);
+            return error.Unexpected;
+        },
+    }
+    return (stat_buf.mode & linux.S.IFMT) == linux.S.IFLNK;
+}
+
+/// Make `path` hold exactly `contents`, whatever was there before it.
+///
+/// `makeFile` cannot serve here, for the reason `makeEmptyFile` gives: the
+/// content of a mount target does not matter, and the content of this one is
+/// the whole point.
+fn writeSubstitute(path: [*:0]const u8, contents: []const u8, diag: ?*?Diagnostic) MountError!void {
+    const fd_rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    switch (linux.errno(fd_rc)) {
+        .SUCCESS => {},
+        .PERM, .ACCES, .ROFS => return error.NotPermitted,
+        else => |err| {
+            note(diag, .substitute_file, err);
+            return error.Unexpected;
+        },
+    }
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    var written: usize = 0;
+    while (written < contents.len) {
+        const rc = linux.write(fd, contents.ptr + written, contents.len - written);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => |err| {
+                note(diag, .substitute_write, err);
+                return error.Unexpected;
+            },
+        }
+        // A write that takes nothing would otherwise spin here forever, and a
+        // file that holds part of a resolver configuration is worse than one
+        // that holds none: the sandbox would then ask the wrong resolver.
+        if (rc == 0) {
+            note(diag, .substitute_write, linux.E.IO);
+            return error.Unexpected;
+        }
+        written += rc;
+    }
+}
+
 const proc_mask_source_name = ".chock-proc-mask";
 
 /// Bind an empty file over each of `masked_proc_entries` inside the procfs at
@@ -1997,4 +2242,133 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
     // Best effort only. The mount point is already gone. Failing to remove the now
     // empty directory does not leave any path back to the host.
     _ = linux.rmdir("/.old_root");
+}
+
+test "a resolver file the sandbox does not hold is made where it belongs and written" {
+    // **The Nix case, which is the one this project's own machine takes.**
+    // `src/run.zig`'s `hostToolchainPaths` binds `/nix/store` and nothing
+    // else, so the sandbox has no `/etc` at all: there is nothing to replace
+    // and one has to be made, parent directories and all.
+    //
+    // No mount namespace is needed for this branch, because nothing is
+    // mounted: the file is created and written in place. The other branch,
+    // where the target is already there and is covered by a bind, is measured
+    // through a real spawn by `test/sandbox/escape.zig`'s own routed glibc
+    // test, which binds an `/etc` of the shape a machine without Nix gives.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    var diag: ?Diagnostic = null;
+    try substitute(gpa, root, &.{
+        .{ .text = .{ .target = "/etc/resolv.conf", .contents = "nameserver 10.99.0.1\n" } },
+    }, &diag);
+    try std.testing.expectEqual(@as(?Diagnostic, null), diag);
+
+    const written = try tmp.dir.readFileAlloc(std.testing.io, "etc/resolv.conf", gpa, .limited(4096));
+    defer gpa.free(written);
+    try std.testing.expectEqualStrings("nameserver 10.99.0.1\n", written);
+
+    // **And a second sandbox in the same root takes the other branch**, which
+    // is the one this test cannot drive: `config.root` is reused by every tool
+    // call of a session and nothing removes what a successful call left in it,
+    // so the file is already there next time and is covered by a bind mount.
+    // That branch needs a mount namespace, and it is measured through a real
+    // spawn by `test/sandbox/escape.zig`'s own routed glibc test. Asking for
+    // it here answers `error.NotPermitted` from the mount call, which is the
+    // fact that says the branch was really taken and not skipped.
+    try std.testing.expectError(error.NotPermitted, substitute(gpa, root, &.{
+        .{ .text = .{ .target = "/etc/resolv.conf", .contents = "nameserver 10.99.0.1\n" } },
+    }, null));
+}
+
+test "a path the sandbox does not hold is not hidden, and is not a fault either" {
+    // **Nothing to hide is the ordinary answer.** A sandbox that binds only a
+    // toolchain has no `/run` at all, so the nscd socket is already
+    // unreachable, and a `hide` that refused to start such a sandbox would
+    // refuse every sandbox this project builds on a machine with Nix.
+    //
+    // Mutation check: delete the `if (kind == .missing) return;` in `hidePath`
+    // and this answers `error.Unexpected` from the mount call instead.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    var diag: ?Diagnostic = null;
+    try substitute(gpa, root, &.{.{ .hide = "/run/nscd" }}, &diag);
+    try std.testing.expectEqual(@as(?Diagnostic, null), diag);
+}
+
+test "a substitution target that is a symbolic link is refused and never followed" {
+    // `mount` resolves its target, so a bind over a link lands wherever the
+    // link points, and a link into a path this sandbox does not hold lands
+    // nowhere at all. **Refused, loudly, rather than run with a resolver file
+    // that is not the one the sandbox wrote.**
+    //
+    // This is the case a machine with systemd and no Nix hits: `/etc` is bound
+    // from the host and `/etc/resolv.conf` there is a link into
+    // `/run/systemd/resolve`. It is a known gap, named here so it is a
+    // refusal a person can read rather than a silence.
+    //
+    // **Two links, because only one of them needs this check.** A link with
+    // nothing at the end of it reads as a missing path, so `makeFile`'s own
+    // `O_NOFOLLOW` refuses it with the same error by accident. A link that
+    // leads somewhere reads as a file, and without the check it would be bound
+    // over, which means bound over **whatever the link leads to**. The second
+    // is what this check is for and the first is what a reader would test by
+    // mistake.
+    //
+    // Mutation check, measured on 2026-09-15: delete the `pathIsSymlink` check
+    // in `placeText` and the dangling link still answers
+    // `error.BindTargetIsSymlink`, from `makeFile`, while the live one reaches
+    // the mount call and answers `error.NotPermitted` instead, because this
+    // test has no mount namespace. Only the second line below sees it.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    try tmp.dir.createDir(std.testing.io, "etc", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "../run/systemd/resolve/stub-resolv.conf", "etc/resolv.conf", .{});
+    try std.testing.expectError(error.BindTargetIsSymlink, substitute(gpa, root, &.{
+        .{ .text = .{ .target = "/etc/resolv.conf", .contents = "nameserver 10.99.0.1\n" } },
+    }, null));
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "etc/real", .data = "somebody else\n" });
+    try tmp.dir.symLink(std.testing.io, "real", "etc/nsswitch.conf", .{});
+    try std.testing.expectError(error.BindTargetIsSymlink, substitute(gpa, root, &.{
+        .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = "hosts: files dns\n" } },
+    }, null));
+    // **And what the link leads to is untouched.** Without the check this is
+    // the file the substitution would have landed on.
+    const beside = try tmp.dir.readFileAlloc(std.testing.io, "etc/real", gpa, .limited(4096));
+    defer gpa.free(beside);
+    try std.testing.expectEqualStrings("somebody else\n", beside);
+}
+
+test "a substitution that names nothing makes no call at all" {
+    // A sandbox with no router substitutes nothing, and must make exactly the
+    // calls it always made. The check is the absence of the staging file.
+    //
+    // **The early return this reads as is an equivalent mutation and this test
+    // knows it.** Measured on 2026-09-15: deleting `if (subs.len == 0) return;`
+    // changes nothing, because the loop below it walks an empty list. The
+    // return is there so a reader sees the rule stated rather than derived,
+    // the same way `applyDenyMounts` states it. What this test really pins is
+    // that no staging file is made for an empty list, which would stop being
+    // true the moment somebody moved the staging out of `placeText` and up to
+    // the top of `substitute`.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    try substitute(gpa, root, &.{}, null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, substitute_source_name, .{}));
 }

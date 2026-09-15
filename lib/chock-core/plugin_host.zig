@@ -600,6 +600,12 @@ pub fn lockdown(
 
     var out = config;
     out.network = .none;
+    // **And neither seam comes with it.** `spawn` refuses a seam on a config
+    // that is not filtered, so a field carried across from the caller's own
+    // config would turn every plugin host into a setup failure. See
+    // `Sandbox.SpawnError.NetRouterNotFiltered`.
+    out.net_broker = null;
+    out.net_router = null;
     out.rules = rules;
     return out;
 }

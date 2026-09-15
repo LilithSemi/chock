@@ -746,6 +746,96 @@ pub fn buildKeeper(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, keeper_calls);
 }
 
+/// Every call the network router may make, and the only ones it may make.
+///
+/// **An allowlist, and the same shape `reader_calls` has, for the same
+/// reason.** The router is the one process inside the sandbox that holds a
+/// descriptor made in the host's own network namespace and a capability the
+/// sandboxed program does not have, so what it may do has to be written down
+/// completely rather than left to a denylist.
+///
+/// **Everything that opens something happens before this filter goes on.**
+/// `driver.runRouter` binds the relay and the resolver, opens the netlink
+/// socket the allow sets are written on, and only then installs this. So there
+/// is no `socket`, no `bind`, no `listen`, no `openat` and no `connect` here
+/// at all: the router cannot make a new socket of any kind, and the one
+/// descriptor that leaves the namespace is the one the far side sends it.
+///
+/// What each one is for:
+///
+///   * `accept4` takes the connection the kernel redirected to the relay.
+///   * `getsockopt` reads `SO_ORIGINAL_DST`, which is the pre-nat address and
+///     the only thing that says where a redirected connection was going.
+///     `setsockopt` is **not** here: the router changes no socket option after
+///     its listeners are up.
+///   * `recvfrom` and `sendto` carry a query and its answer, a relayed write,
+///     and every message on the netlink socket. `recvmsg` and `sendmsg` carry
+///     the channel out, which is the one exchange with a descriptor in it.
+///   * `read` takes bytes off a relayed connection. `shutdown` carries a half
+///     close through, which is what lets a request finish.
+///   * `close` releases a link. `fcntl` makes an inherited descriptor
+///     non blocking, and nothing else: the router never asks for a descriptor
+///     it has to open.
+///   * `ppoll` and `poll` are the wait the whole loop is built on. Which of
+///     the two the standard library calls depends on the architecture.
+///   * `clock_gettime` reads the monotonic clock every expiry is measured on.
+///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
+///     process ends and how it comes back from a signal.
+///
+/// **No `write`, no `openat`, no `socket`, no `connect`, no `execve`, and no
+/// way to signal a process.** The router reads and writes only descriptors it
+/// already holds, and it reaches no path at all.
+pub const router_calls = blk: {
+    var list: []const linux.SYS = &.{
+        .accept4,
+        .getsockopt,
+        .recvfrom,
+        .sendto,
+        .recvmsg,
+        .sendmsg,
+        .read,
+        .shutdown,
+        .close,
+        .fcntl,
+        .ppoll,
+        .clock_gettime,
+        .exit_group,
+        .exit,
+        .rt_sigreturn,
+        .restart_syscall,
+    };
+    // `poll` exists on x86_64 and does not exist on aarch64, where the
+    // standard library calls `ppoll` instead. The same case `reader_calls`
+    // above names, and naming a member the table does not have would not build.
+    if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
+    break :blk list;
+};
+
+comptime {
+    // **The router must not be able to make a socket or reach a path.** It
+    // holds a descriptor from the host's own network namespace and
+    // `CAP_NET_ADMIN` in the sandbox's, and the only reason that is bounded is
+    // that it cannot open anything new. A call added to the list above without
+    // reading this comment stops the build.
+    for (router_calls) |call| {
+        const refused = switch (call) {
+            .socket, .socketpair, .connect, .bind, .listen, .openat, .execve, .kill, .ptrace => true,
+            else => false,
+        };
+        if (refused) @compileError(
+            "the network router may not open or reach anything new. See router_calls.",
+        );
+    }
+}
+
+/// The filter the network router runs under. **An allowlist**: every call not
+/// in `router_calls` kills the process.
+///
+/// The caller owns the memory.
+pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
+    return buildAllowlist(allocator, router_calls);
+}
+
 fn buildAllowlist(allocator: std.mem.Allocator, calls: []const linux.SYS) ![]bpf.Insn {
     var insns: std.ArrayList(bpf.Insn) = .empty;
     errdefer insns.deinit(allocator);
@@ -1894,4 +1984,91 @@ test "the keeper filter kills a call outside its allowlist" {
     if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
     try std.testing.expect(linux.W.IFSIGNALED(status));
     try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+}
+
+test "the router's filter permits the calls its loop makes and kills the rest" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    // **An allowlist is only an allowlist if the kernel enforces it.** The
+    // list itself is read by `linux/driver.zig`'s own `runRouter`. This drives
+    // the filter it builds, in a real process, against calls the router really
+    // makes and one it must never be able to make.
+    //
+    // **`socket` is the one that matters most.** The router keeps
+    // `CAP_NET_ADMIN` and holds a descriptor made in the host's own network
+    // namespace, and what bounds both of those is that it cannot open anything
+    // new. A router that could make a socket could make a second netlink
+    // socket and spend the capability on whatever it liked.
+    //
+    // Mutation check: put `.socket` in `router_calls` and the build stops, by
+    // the `comptime` block under that list. Make `buildRouter` end with
+    // `RET_ALLOW` and the child exits 13 rather than dying.
+    const allocator = std.testing.allocator;
+    const insns = try buildRouter(allocator);
+    defer allocator.free(insns);
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        // The wait the whole loop is built on. Zero descriptors and no
+        // timeout, which the kernel answers at once.
+        var none: [0]linux.pollfd = .{};
+        var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
+            std.process.exit(11);
+        }
+
+        // The clock every lifetime in the router is measured on.
+        var now: linux.timespec = undefined;
+        if (linux.errno(linux.clock_gettime(.BOOTTIME, &now)) != .SUCCESS) {
+            std.process.exit(12);
+        }
+
+        // A call nobody put on the list, and the one that would undo the
+        // reasoning above. The filter kills this process here, so the exit
+        // below is never reached.
+        _ = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
+        std.process.exit(13);
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+}
+
+test "the router may not open a path, run a program, or write to a descriptor" {
+    // **A list and not a filter**, so the reasoning is checked without a fork
+    // and on every target. The three calls named here are the ones that would
+    // each undo a different sentence of `runRouter`'s own doc comment: an open
+    // would give the router a path, an `execve` would give it a program, and a
+    // `write` would let it put bytes on a descriptor the far side sent it.
+    //
+    // `sendto` and `sendmsg` are on the list and `write` is not, which reads
+    // as an oddity until you see that the router's own readiness byte goes out
+    // with `sendto`: every descriptor it writes to is a socket, so the call
+    // that writes a file is one it has no use for.
+    const forbidden = [_]linux.SYS{ .openat, .execve, .write, .socket, .connect, .ptrace, .kill };
+    for (forbidden) |call| {
+        for (router_calls) |permitted| {
+            try std.testing.expect(call != permitted);
+        }
+    }
+
+    // And the calls the loop really makes are all there, so a list that lost
+    // one is caught here as well as by a router that dies in production.
+    const needed = [_]linux.SYS{ .accept4, .getsockopt, .recvfrom, .sendto, .recvmsg, .sendmsg, .read, .close };
+    for (needed) |call| {
+        var found = false;
+        for (router_calls) |permitted| {
+            if (call == permitted) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }

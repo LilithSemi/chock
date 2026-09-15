@@ -844,6 +844,28 @@ pub const Router = struct {
         self.resolver_fd = -1;
     }
 
+    /// How many bytes this router has read and not yet written on.
+    ///
+    /// **For a caller that has to know when there is nothing left to carry**,
+    /// which is the one question a shutdown asks. A program that wrote its
+    /// last bytes and exited leaves them here, in the buffer of a live link,
+    /// and a router that stopped at that instant would drop them. A caller
+    /// steps until this is zero and then leaves.
+    ///
+    /// **Bytes and not links.** A link stays live for as long as either peer
+    /// holds its end, and the peer outside the sandbox has no reason to let go
+    /// when the program inside it ends. Waiting for a link to close would
+    /// therefore wait for something that may never happen, and waiting for the
+    /// bytes waits for the only thing that can still be lost.
+    pub fn pendingBytes(self: *const Router) usize {
+        var total: usize = 0;
+        for (&self.links) |*link| {
+            if (!link.live) continue;
+            total += link.out_bound.pending() + link.in_bound.pending();
+        }
+        return total;
+    }
+
     /// Take the relay's listener away and leave everything else running.
     ///
     /// **This is what a dead relay looks like to the kernel**, and the only

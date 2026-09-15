@@ -417,19 +417,24 @@ fn grant(fd: i32, handle: i32) Outcome {
 /// `CMSG_ALIGN` from the kernel's own `linux/socket.h`, which rounds up to the
 /// width of a pointer. Written out here because Zig's standard library
 /// declares the structures and not the macros around them.
-fn cmsgAlign(len: usize) usize {
+///
+/// **Public for `routerlink.zig`**, along with the three constants and
+/// `firstReceivedFd` below it. The router's own channel passes a descriptor
+/// the same way this one does, and a second spelling of a control message
+/// header is a second thing to get wrong.
+pub fn cmsgAlign(len: usize) usize {
     const width: usize = @sizeOf(usize);
     return (len + width - 1) & ~(width - 1);
 }
 
 /// Where the payload of the one control message starts. `CMSG_DATA`.
-const cmsg_data_offset: usize = cmsgAlign(@sizeOf(linux.cmsghdr));
+pub const cmsg_data_offset: usize = cmsgAlign(@sizeOf(linux.cmsghdr));
 
 /// `CMSG_LEN` for one descriptor: the header, aligned, plus four bytes.
-const cmsg_len: usize = cmsg_data_offset + @sizeOf(i32);
+pub const cmsg_len: usize = cmsg_data_offset + @sizeOf(i32);
 
 /// `CMSG_SPACE` for one descriptor, which is what a buffer must hold.
-const control_bytes: usize = cmsg_data_offset + cmsgAlign(@sizeOf(i32));
+pub const control_bytes: usize = cmsg_data_offset + cmsgAlign(@sizeOf(i32));
 
 /// The first descriptor a received message carries, or null when it carries
 /// none.
@@ -437,7 +442,7 @@ const control_bytes: usize = cmsg_data_offset + cmsgAlign(@sizeOf(i32));
 /// **Every descriptor past the first is closed.** A far end that sent two is
 /// one this file does not understand, and keeping the extra ones would leak a
 /// descriptor per request into a process that has no idea it holds them.
-fn firstReceivedFd(message: *const linux.msghdr, control: []align(@alignOf(linux.cmsghdr)) const u8) ?i32 {
+pub fn firstReceivedFd(message: *const linux.msghdr, control: []align(@alignOf(linux.cmsghdr)) const u8) ?i32 {
     if (message.controllen < cmsg_len) return null;
     // The kernel says it had to drop control data. Whatever is in the buffer
     // is a fragment, so nothing in it may be read as a descriptor.

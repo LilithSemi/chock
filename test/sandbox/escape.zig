@@ -711,8 +711,40 @@ test "spawn applies every layer, and a spawned process cannot connect to a remot
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a filtered process still cannot open a connection of its own" {
-    // The first half of what `filtered` means. The process is handed a
+// **The two tests below pin the netbroker, which is the old implementation of
+// `.filtered`, and they are kept on purpose.**
+//
+// Each one reads a `connect` that answers `EPERM`. That is a **mechanism** and
+// not the property: what `.filtered` promises is "a network, and only what
+// policy permits", and refusing `connect` was one way of keeping it, not the
+// promise itself. The router keeps the same promise the other way round, by
+// letting the call through and having the kernel judge the address, so under
+// the router these two tests would measure the opposite of what they say.
+//
+// They still run, and they still measure something real, because a config that
+// fills `Config.net_broker` still gets exactly the sandbox it always got: the
+// descriptor on number three, and `connect` refused so that descriptor cannot
+// be aimed somewhere else. `seccompOptionsFor` keys the refusal on whether a
+// descriptor is handed inside rather than on the mode, which is what lets both
+// implementations be right at once.
+//
+// **Judged, one at a time:**
+//
+//  * "a filtered process still cannot open a connection of its own" pinned the
+//    mechanism. Its property, "a process may not reach a host the policy did
+//    not permit", now belongs to "an address that was never handed out is
+//    refused by the kernel", below, which is stronger: it refuses an address
+//    for a host the policy **does** permit.
+//  * "a filtered process can use the descriptor it is handed, and cannot aim
+//    it anywhere else" is about a descriptor the router never hands over, so
+//    it has no counterpart and no successor. It is a statement about the
+//    netbroker alone and it stays one.
+//
+// Neither expected value was flipped. When the netbroker is removed, both go
+// with it.
+
+test "a process the netbroker serves still cannot open a connection of its own" {
+    // The first half of what the **netbroker** means. The process is handed a
     // channel, and it must still have no way to make one.
     //
     // **The errno is the test, not the failure.** A filtered process is in the
@@ -721,16 +753,16 @@ test "a filtered process still cannot open a connection of its own" {
     // only for `EPERM`, which is the seccomp rule, and exit 5 for any other
     // errno.
     //
-    // Mutation check: delete `block_connect` from the driver's own
-    // `seccomp_options` and the connect answers `ENETUNREACH`, so the probe
-    // exits 5 and this fails.
+    // Mutation check: read `seccompOptionsFor`'s `hands_host_descriptor` as
+    // `false` and the connect answers `ENETUNREACH`, so the probe exits 5 and
+    // this fails.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-filtered-connect", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
-test "a filtered process can use the descriptor it is handed, and cannot aim it anywhere else" {
+test "a process the netbroker serves can use the descriptor it is handed, and cannot aim it anywhere else" {
     // The other half, and the one that needed a measurement to get right. A
     // granted descriptor is a real connected socket, made on the far side of
     // the boundary, so it belongs to **that** side's network namespace and the
@@ -740,7 +772,9 @@ test "a filtered process can use the descriptor it is handed, and cannot aim it 
     // connected TCP socket answers `EISCONN`, and a `connect` with `AF_UNSPEC`
     // followed by a `connect` elsewhere **both succeed**. So a granted
     // descriptor really can be aimed at another host, and refusing `connect`
-    // for a filtered process is what closes it.
+    // for a process that is handed one is what closes it. **The router hands
+    // none**, which is why it can leave `connect` alone: see
+    // `seccompOptionsFor`.
     //
     // Three facts, and the third is the one an exit code could not carry:
     //
@@ -751,11 +785,250 @@ test "a filtered process can use the descriptor it is handed, and cannot aim it 
     //  * the second listener, which the policy never permitted and the broker
     //    never dialled, has nothing in its backlog.
     //
-    // Mutation check: delete `block_connect` and the re-aim succeeds, the
-    // probe exits 1, and the second listener's backlog is no longer empty.
+    // Mutation check: read `seccompOptionsFor`'s `hands_host_descriptor` as
+    // `false` and the re-aim succeeds, the probe exits 1, and the second
+    // listener's backlog is no longer empty.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
     const term = try runProbeWithRoot("spawn-filtered-grant", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+// **The network router, which is what `.filtered` does for every real caller
+// of this project.** The tests below are the ones the three pieces of the
+// router could not have: each one
+// runs a real program inside a real sandbox, with the real kernel ruleset and
+// the real policy table, and measures what that program could and could not
+// reach.
+//
+// **The first one is what stops the rest being vacuous.** A sandbox where
+// nothing works refuses a hardcoded address, the metadata service and a
+// resolver of the program's own, and proves nothing at all by doing so. The
+// reach test is the positive fact those four are measured against.
+
+test "a program that knows nothing about chock resolves a permitted host and reaches it" {
+    // The claim the whole router exists for. The program asks the sandbox's
+    // own resolver over UDP, takes the address it is handed, calls `connect`,
+    // and writes a token. Nothing in it names Chock, there is no descriptor on
+    // number 3, and no part of it would work without the netns, the ruleset,
+    // the resolver and the relay all being right at once.
+    //
+    // The probe checks three separate things, because an exit code alone could
+    // be a relay answering its own connection:
+    //
+    //  * the token really arrived at a listener the far side dialled;
+    //  * the name was looked up exactly one time;
+    //  * the connection was dialled exactly one time, so the address the
+    //    program was given is the address that was reached and nothing
+    //    resolved the name again in between.
+    //
+    // Mutation check, measured on 2026-09-15: make `routerlink.Client.allowFn`
+    // return without calling `session.allow`, so the address the resolver
+    // hands out never reaches the kernel's allow set, and the probe exits 5
+    // with "a permitted host was not reachable: NotConnected". That is the one
+    // line the whole mechanism rests on: the answer is a permission only
+    // because the kernel was told about the address first.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-reach", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a name the policy refuses is refused by the resolver and never looked up" {
+    // The other half of the resolver, and the half that has to cost nothing.
+    // The program asks for a host under no class the table names. It gets
+    // `REFUSED`, no address enters the kernel's allow set, and **the far side
+    // never resolved the name**, which the probe reads off the transport's own
+    // lookup count.
+    //
+    // A DNS query is a message to whoever runs that zone, so a resolver that
+    // looked a name up and refused afterwards would hand a sandboxed program a
+    // channel out for any name it liked.
+    //
+    // Mutation check, both measured on 2026-09-15 and both make the probe exit
+    // 5 with "a refused name was resolved anyway":
+    //
+    //  * read `resolveName`'s condition as `ceiling != .allow` alone, dropping
+    //    `permitsSomethingUnder`, and the host resolves because no rule names
+    //    it and a ceiling nobody wrote is `allow`;
+    //  * put a `transport.lookup` above the policy read and the name is looked
+    //    up before anything judges it.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-refused-name", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "an address that was never handed out is refused by the kernel" {
+    // **The one sentence the design rests on.** The program writes the address
+    // of the permitted host straight into `connect` and never asks the
+    // resolver anything. The policy permits that host by name, so nothing in
+    // the policy refuses this: what refuses it is that the address is not in
+    // the kernel's allow set, because no policy answer ever put it there.
+    //
+    // This is what covers a hardcoded address, a program carrying its own
+    // resolver, and DNS over HTTPS, without anything in Chock knowing that any
+    // of the three exist.
+    //
+    // Mutation check, measured on 2026-09-15: widen the guard chain's
+    // conntrack state mask from `ESTABLISHED|RELATED` to include `NEW`, in
+    // `nftables.zig`'s install batch, and the chain accepts the packet before
+    // it ever reads the allow set. The probe then exits 1 with "an address
+    // that was never handed out was reachable".
+    //
+    // **A mutation that does not kill it, and is worth writing down.**
+    // Replacing the chain's `reject` with a counter, so the chain's own
+    // `policy drop` is what stops the packet, leaves this passing: a drop in
+    // the output hook answers the socket `EPERM` just as a reject does. The
+    // reject is there for the latency the prototype measured, 0.000s against a
+    // full connect timeout, and not for whether traffic is stopped.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-hardcoded", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a program that hardcodes the cloud metadata address reaches nothing" {
+    // `169.254.169.254` answers with the instance's own credentials on three
+    // of the large cloud providers, and a program that wants them writes the
+    // address rather than a name. **Nothing in the sandbox names this address
+    // at all**: it is refused because nothing resolved to it, which is the
+    // same reason every other unhanded address is refused.
+    //
+    // It gets its own test rather than sharing the one above because it is the
+    // case a reader will look for, and because `chock_broker.network`'s own
+    // `addressIsReachable` refuses it a second time on the far side: this
+    // measures that the kernel refuses it first, before anything is asked.
+    //
+    // Mutation check: the same conntrack widening the test above names, and
+    // measured the same day. The probe then exits 1 with "the metadata service
+    // was reachable".
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-metadata", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "glibc inside a routed sandbox is answered by the router and by nobody else" {
+    // **The only test here that runs a real resolver rather than a written
+    // one.** Every other routed test writes its own DNS query, which measures
+    // that the router answers and says nothing about whether a real program
+    // would ever ask it. A tool call runs glibc, and glibc looks for a
+    // resolver in three places a sandbox has to get right at once. Each of the
+    // three is a silent failure on its own.
+    //
+    // The probe binds three things the ordinary escape configuration has not
+    // got, so that all three places are real and not absent by luck:
+    //
+    //  * an `/etc` of the shape a machine **without** Nix gives, holding a
+    //    `nsswitch.conf` whose `hosts:` line never reaches `dns`. This is what
+    //    this machine's own `[NOTFOUND=return]` line amounts to once its short
+    //    circuit fires. Chock has to replace it with `hosts: files dns`, and
+    //    the target already exists, so this takes the bind mount branch of
+    //    `namespace.substitute` while a machine with Nix takes the other one.
+    //  * the host's own **nscd socket**, at `/var/run/nscd`, which is where
+    //    glibc 2.42 looks for it. Its socket is `AF_UNIX`, so a network
+    //    namespace does not touch it, and an unmasked nscd answers from the
+    //    host's own view of the network.
+    //  * a Landlock rule for `/etc`, without which glibc cannot open the files
+    //    Chock wrote and the lookup fails for a reason that is not the router.
+    //
+    // It requires three things together: the lookup succeeded, the address it
+    // answered with is the one the **far side** handed out, and the far side
+    // was asked exactly one time. An answer from anybody else fails at least
+    // one of the three.
+    //
+    // Mutation check, all three measured on 2026-09-15 against this probe:
+    //
+    //  * take `/etc/resolv.conf` out of `resolver_substitutions` and the
+    //    lookup finds nothing, so the probe exits 20;
+    //  * take `/etc/nsswitch.conf` out and the same, because the bound file
+    //    never reaches `dns`;
+    //  * take the two `hide` entries out and the lookup **succeeds** with a
+    //    real address of this machine's own, so the probe exits 21. That one
+    //    is the fault a first end to end run of the prototype hit, with the
+    //    ruleset loaded and `resolv.conf` written correctly.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-glibc", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a routed program cannot take away the ruleset that bounds it" {
+    // **The ruleset is worth nothing while something running under it can take
+    // it away.** Measured on 2026-09-14 in the prototype: with `CAP_NET_ADMIN`
+    // still held, a delete of the whole `chock` table **succeeds**, and every
+    // rule becomes advice. This asks the kernel to delete that table, over
+    // real nfnetlink, from inside the sandbox, and requires `EPERM`
+    // specifically. Any other errno would mean the batch was refused for its
+    // shape instead, which would make this pass without measuring the
+    // capability at all. Then it tries an address that was never handed out,
+    // so a refusal that came from a machine with no nftables cannot read as a
+    // pass either.
+    //
+    // ## What really removes the capability here, measured rather than assumed
+    //
+    // **`capabilities.dropAll` in `applyLayers` is not what stops this.**
+    // Measured on 2026-09-15, both ways round:
+    //
+    //  * reading that call as `capabilities.keepOnly(CAP_NET_ADMIN)` leaves
+    //    this test passing;
+    //  * deleting the call outright leaves this test passing too, while
+    //    `spawn-caps-drop` fails, as it should.
+    //
+    // The reason is `execve`. `namespace.writeIdMaps` maps the caller's own
+    // uid to itself, so the sandboxed program runs as an ordinary user inside
+    // the user namespace and not as root, and the kernel grants an ordinary
+    // user no capabilities across an `execve` of a file that carries none. The
+    // drop still matters, for the bounding set and for the window between it
+    // and the exec, and it is `spawn-caps-drop` that measures it.
+    //
+    // So this is a **design witness** for the program's half of the ordering,
+    // and the mutation that opens it is not a line in this project: it is
+    // running the sandboxed program as uid 0 inside the namespace. What the
+    // ordering still has to get right, and what is testable, is the other
+    // half: the ruleset is installed in A before B is forked, and the one
+    // process that keeps `CAP_NET_ADMIN` is the router, which
+    // `seccomp.router_calls` refuses an `execve` and a `socket`.
+    //
+    // Mutation check for the second half: widen the guard chain's conntrack
+    // state mask to include `NEW`, in `nftables.zig`'s install batch, and the
+    // address that was never handed out becomes reachable, so the probe exits
+    // 1. Measured on 2026-09-15.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-flush", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a program that carries its own resolver gets nowhere" {
+    // A UDP query to a public resolver, written by hand inside the sandbox.
+    // The address is not in the allow set, so the guard chain rejects the
+    // packet, and the program is left with no address for any name.
+    //
+    // **This is the case the resolver being a boundary would not cover.** The
+    // resolver is not a boundary: it is what lets the boundary speak in names.
+    // The boundary is the kernel's allow set, and a program that refuses to
+    // use the resolver simply has nothing in it.
+    //
+    // **The same program asks the sandbox's own resolver first, and is
+    // answered.** A sandbox where no UDP worked at all would refuse the second
+    // query and prove nothing by it, so the positive half is what makes the
+    // negative half mean something.
+    //
+    // **This test is a design witness and not a mutation sensitive one, and
+    // that is worth saying plainly.** What stops the query is that the
+    // namespace holds exactly one device and that device is a blackhole: see
+    // `netns.link_kind`. Measured on 2026-09-15: widening the guard chain's
+    // conntrack mask to include `NEW`, which kills the three tests above,
+    // leaves this one passing, because the packet is then accepted and goes to
+    // a device that delivers nothing. No one line change to this project's own
+    // code opens it. The moment anybody puts a veth in that namespace, this
+    // test goes on passing and the property is gone, so the blackhole is the
+    // thing to argue with and not this test.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-own-resolver", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 

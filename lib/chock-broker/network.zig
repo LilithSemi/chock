@@ -200,6 +200,7 @@ const event = chock_proto.event;
 
 const table = chock_policy.table;
 const NetBroker = chock_sandbox.NetBroker;
+const NetRouter = chock_sandbox.NetRouter;
 
 /// `chock_proto.storage.Locked` is not `pub`, so no file outside
 /// `chock-proto` can name it. This reaches the same type through the return
@@ -234,6 +235,28 @@ pub const max_action_bytes = action_prefix.len + 1 + max_host_bytes + 1 + 5;
 /// Allocates nothing: `NetBroker.connect` has no allocator and no error to
 /// give back, so every step of answering one request runs in a fixed buffer.
 pub fn actionInto(buffer: []u8, host: []const u8, port: u16) ?[]const u8 {
+    const written = hostActionInto(buffer, host) orelse return null;
+    const tail = std.fmt.bufPrint(buffer[written..], ".{d}", .{port}) catch return null;
+    return buffer[0 .. written + tail.len];
+}
+
+/// The action name for reaching `host` on **any** port, written into
+/// `buffer`. The same reversed labels `actionInto` writes, with nothing after
+/// them.
+///
+/// **This is the resolver's question and not the relay's.** A name is looked
+/// up before any connection exists, so there is no port to put in a key, and
+/// the kernel's allow set has no port in it either: it carries addresses, and
+/// the port is decided later, at the relay, where `actionInto` builds the full
+/// key. See `Network.resolveName` for the reading this is used with, which is
+/// a ceiling and not an act.
+pub fn classActionInto(buffer: []u8, host: []const u8) ?[]const u8 {
+    const written = hostActionInto(buffer, host) orelse return null;
+    return buffer[0..written];
+}
+
+/// The prefix and the reversed labels, and how many bytes that took.
+fn hostActionInto(buffer: []u8, host: []const u8) ?usize {
     if (buffer.len < max_action_bytes) return null;
     if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
 
@@ -258,8 +281,7 @@ pub fn actionInto(buffer: []u8, host: []const u8, port: u16) ?[]const u8 {
         end = if (start == 0) 0 else start - 1;
     }
 
-    const tail = std.fmt.bufPrint(buffer[written..], ".{d}", .{port}) catch return null;
-    return buffer[0 .. written + tail.len];
+    return written;
 }
 
 /// Where a name is resolved and a connection is opened. **The one seam in this
@@ -494,6 +516,11 @@ pub const Network = struct {
     /// id here is a hole in the evidence, not a saving of a byte.
     tool_call_id: []const u8 = "",
 
+    /// Every address this call handed out, and the name it was handed out
+    /// for. **Empty for a call the router does not serve**, which is every
+    /// call the netbroker serves instead.
+    handed_out: HandedOut = .{},
+
     /// How many connections were granted and how many were refused, so a
     /// caller can say what a call did without reading a log.
     granted: usize = 0,
@@ -518,9 +545,159 @@ pub const Network = struct {
         return self.answer(host, port);
     }
 
+    /// The other seam, for a call the network router serves. **The same
+    /// policy, the same table and the same counters**: a routed call and a
+    /// brokered one are the same decision reached through a different
+    /// mechanism, which is why this is one type with two faces and not two.
+    pub fn netRouter(self: *Network) NetRouter {
+        return .{ .ptr = self, .vtable = &router_vtable };
+    }
+
+    const router_vtable = NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
+
+    fn resolveFn(ptr: *anyopaque, host: []const u8, want: NetRouter.Family) NetRouter.Resolution {
+        const self: *Network = @ptrCast(@alignCast(ptr));
+        return self.resolveName(host, want);
+    }
+
+    fn openFn(ptr: *anyopaque, address: NetRouter.Address, port: u16) NetBroker.Grant {
+        const self: *Network = @ptrCast(@alignCast(ptr));
+        return self.openAddress(address, port);
+    }
+
+    /// Answer one name, for the resolver inside the sandbox. Its own function,
+    /// taking and giving ordinary values, so every test below drives the same
+    /// code the driver drives.
+    ///
+    /// ## The ceiling reading, and why it is not `evaluateChain`
+    ///
+    /// A query names a host and no port. `evaluateChain` answers `ask` for an
+    /// action nobody named, which is right for an **act**: a policy that
+    /// forgot a case must not become permission. It is wrong here. A project
+    /// whose only rule is `net.connect.com.anthropic.api.443` names no action
+    /// called `net.connect.com.anthropic.api`, so that reading would refuse
+    /// the query for a host the very next question permits, and a program
+    /// would never get as far as asking it.
+    ///
+    /// `ceilingChain` is the reading for a **resource** rather than an act:
+    /// `allow` when nothing names the key at all. That is exactly the question
+    /// a query is. `net.connect.*` set to `deny` still covers the host and
+    /// still refuses it here, which is the case that has to keep working.
+    /// `lib/chock-policy/table.zig` draws this distinction already and says so
+    /// on `ceilingChain` itself. This file is the third caller to use it.
+    ///
+    /// **An address handed out is not a connection granted.** It goes into the
+    /// kernel's allow set, which carries addresses and knows nothing about
+    /// ports, and the only way out of the sandbox is the relay. So a name this
+    /// permits is still put to `openAddress` below, with the port, under the
+    /// full `evaluateChain` reading, before one byte moves.
+    pub fn resolveName(self: *Network, host: []const u8, want: NetRouter.Family) NetRouter.Resolution {
+        var buffer: [max_action_bytes]u8 = undefined;
+        // **The name is not kept for this one**, for the reason `answer` gives:
+        // it failed the shape rule, so it holds bytes a host name cannot hold.
+        const action = classActionInto(&buffer, host) orelse {
+            _ = self.refuse(.{ .net_host_not_a_name = .{ .host = "", .port = 0 } });
+            return .refused;
+        };
+
+        const key = table.Key{
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = self.tool,
+            .action = action,
+        };
+
+        // **Two readings, and a name needs both.** The ceiling is "is this
+        // host forbidden outright", which is what a `net.connect.*` deny rule
+        // says. The existence question is "did anybody write a rule that
+        // reaches this host at all", which is what stops every name in the
+        // world resolving through a project that named none of them. See
+        // `Table.permitsSomethingUnder` for why neither reading alone is the
+        // question a query asks.
+        var fault: ?table.ChainFault = null;
+        const ceiling = chock_policy.ratchet.ceilingFor(self.self_policy, action)
+            .intersect(chock_policy.ratchet.ceilingFor(self.self_policy, action_prefix))
+            .intersect(self.table.ceilingChain(self.chain, key, &fault));
+        if (ceiling != .allow or !self.table.permitsSomethingUnder(key)) {
+            _ = self.refuse(.{ .net_host_not_permitted = .{
+                .host = self.copy(host),
+                .port = 0,
+                .decision = if (ceiling == .allow) .ask else ceiling,
+            } });
+            return .refused;
+        }
+
+        // **No port, because there is none yet.** `lookup` puts the port in
+        // the address it builds and nothing here reads it back.
+        const found = self.transport.lookup(self.io, host, 0) catch return .unresolved;
+
+        // **A width the query did not ask about is "nothing of that type" and
+        // never the other width.** glibc asks for both, one after the other,
+        // and uses whichever answers. Handing an IPv4 address back as an
+        // `AAAA` answer would put four bytes where sixteen belong.
+        const address: NetRouter.Address = switch (found) {
+            .ip4 => |ip4| if (want == .ipv4) .{ .ipv4 = ip4.bytes } else return .unresolved,
+            .ip6 => |ip6| if (want == .ipv6) .{ .ipv6 = ip6.bytes } else return .unresolved,
+        };
+
+        // The same check a brokered connection gets, at the same point in the
+        // same order: after the name resolved and before anything can reach
+        // the address. **Here it is stronger than it is there**, because the
+        // address never reaches the kernel's allow set at all, so a program
+        // cannot even open a connection to it.
+        if (!addressIsReachable(found)) {
+            _ = self.refuse(.{ .net_address_not_permitted = self.about(host, 0) });
+            return .refused;
+        }
+
+        self.handed_out.remember(address, host);
+        return .{ .granted = address };
+    }
+
+    /// Answer one connection, for the relay inside the sandbox.
+    ///
+    /// **The address is the identity and the name comes from this side.** The
+    /// router's own name table answers with the name an address was *last*
+    /// handed out for, which two hosts on one content network share, so it is
+    /// a narrowing and not an identity: see `chock_sandbox.router.NameTable`.
+    /// This function reads the name **it** resolved the address for, which is
+    /// exact, and it dials that same address rather than resolving the name
+    /// again. Resolving again would open the window a rebinding attack needs,
+    /// between the answer a program was given and the address it reaches.
+    pub fn openAddress(self: *Network, address: NetRouter.Address, port: u16) NetBroker.Grant {
+        // Copied onto the stack, because `answerWith` below writes to `self`
+        // and the name borrows a table that lives there.
+        var name: [max_host_bytes]u8 = undefined;
+        const found = self.handed_out.nameFor(address) orelse {
+            // **An address this call never handed out.** The kernel should
+            // have refused it long before the relay saw it, so this is either
+            // a name that expired out of the table or something that reached
+            // the relay another way. Either one is a refusal.
+            return self.refuse(.{ .net_address_not_permitted = .{ .host = "", .port = port } });
+        };
+        @memcpy(name[0..found.len], found);
+
+        return self.answerWith(name[0..found.len], port, addressWithPort(address, port));
+    }
+
     /// Answer one request. Its own function, taking and giving ordinary
     /// values, so every test below drives the same code the driver drives.
     pub fn answer(self: *Network, host: []const u8, port: u16) NetBroker.Grant {
+        return self.answerWith(host, port, null);
+    }
+
+    /// `answer`, with the address already in hand for a caller that has one.
+    ///
+    /// **`known` changes nothing about the decision and only about the
+    /// lookup.** `openAddress` above already holds the address, because it
+    /// handed that address out itself, and resolving the name a second time
+    /// would let the answer move between the two.
+    fn answerWith(
+        self: *Network,
+        host: []const u8,
+        port: u16,
+        known: ?Transport.Address,
+    ) NetBroker.Grant {
         // **The policy first, and the name second.** Nothing above this line
         // touches the network, and nothing below it runs for a host the table
         // does not permit: see this file's own top comment on DNS.
@@ -565,7 +742,7 @@ pub const Network = struct {
             // person is the one case that changed, and not the other two.
             if (decision == .ask) {
                 if (self.asker) |asker| {
-                    if (self.askPermits(asker, action, host, port)) return self.finishConnect(host, port);
+                    if (self.askPermits(asker, action, host, port)) return self.finishConnect(host, port, known);
                     return .refused;
                 }
             }
@@ -576,7 +753,7 @@ pub const Network = struct {
             } });
         }
 
-        return self.finishConnect(host, port);
+        return self.finishConnect(host, port, known);
     }
 
     /// Ask the broker about a connection this file's own table did not answer
@@ -704,9 +881,14 @@ pub const Network = struct {
     /// The name is resolved and the connection is opened, for a request this
     /// file has already decided may proceed, whether the table said `allow`
     /// on its own or the broker said yes on its behalf.
-    fn finishConnect(self: *Network, host: []const u8, port: u16) NetBroker.Grant {
-        const address = self.transport.lookup(self.io, host, port) catch
-            return self.refuse(.{ .net_host_not_resolved = self.about(host, port) });
+    fn finishConnect(
+        self: *Network,
+        host: []const u8,
+        port: u16,
+        known: ?Transport.Address,
+    ) NetBroker.Grant {
+        const address = known orelse (self.transport.lookup(self.io, host, port) catch
+            return self.refuse(.{ .net_host_not_resolved = self.about(host, port) }));
 
         if (!addressIsReachable(address))
             return self.refuse(.{ .net_address_not_permitted = self.about(host, port) });
@@ -745,6 +927,93 @@ pub const Network = struct {
         return self.gpa.dupe(u8, host) catch "";
     }
 };
+
+/// The same address with a port on it, for the dial `openAddress` asks for.
+fn addressWithPort(address: NetRouter.Address, port: u16) Transport.Address {
+    return switch (address) {
+        .ipv4 => |bytes| .{ .ip4 = .{ .bytes = bytes, .port = port } },
+        .ipv6 => |bytes| .{ .ip6 = .{ .bytes = bytes, .port = port } },
+    };
+}
+
+/// How many addresses one call remembers a name for.
+///
+/// **The same 64 the router's own name table holds**, and for the same reason:
+/// a program inside the sandbox drives how many names get resolved, so a
+/// growing table is a way to spend this process's memory from inside a
+/// sandbox. The two are not required to agree by anything but this comment,
+/// and they do not have to: the router's table narrows a destination to a
+/// likely name, and this one decides. A name that fell out of this one is a
+/// connection refused, which is the fail closed direction.
+pub const handed_out_capacity: usize = 64;
+
+/// Every address this call handed out, and the name it was handed out for.
+///
+/// **Fixed size and no allocation**, for the reason above. When it is full the
+/// oldest entry is taken, which is round robin and not least recently used: a
+/// clock would have to come from somewhere, and the only cost of getting the
+/// choice wrong is that a program re-resolves a name it had already looked up.
+///
+/// **An address that is already here keeps its slot and takes the new name.**
+/// That is what re-resolving a live name does, and it is what makes the answer
+/// the name most recently handed the address out for.
+const HandedOut = struct {
+    entries: [handed_out_capacity]Entry = @splat(.{}),
+    next: usize = 0,
+
+    const Entry = struct {
+        address: NetRouter.Address = .{ .ipv4 = .{ 0, 0, 0, 0 } },
+        host: [max_host_bytes]u8 = @splat(0),
+        host_len: usize = 0,
+        live: bool = false,
+    };
+
+    fn remember(self: *HandedOut, address: NetRouter.Address, host: []const u8) void {
+        // `hostBytesAreUsable` bounded this before the caller reached here, so
+        // a longer name is a mistake in this program rather than an input.
+        std.debug.assert(host.len > 0 and host.len <= max_host_bytes);
+
+        const slot = self.slotFor(address);
+        slot.address = address;
+        slot.host_len = host.len;
+        @memcpy(slot.host[0..host.len], host);
+        slot.live = true;
+    }
+
+    fn nameFor(self: *const HandedOut, address: NetRouter.Address) ?[]const u8 {
+        for (&self.entries) |*entry| {
+            if (!entry.live) continue;
+            if (!addressesEqual(entry.address, address)) continue;
+            return entry.host[0..entry.host_len];
+        }
+        return null;
+    }
+
+    fn slotFor(self: *HandedOut, address: NetRouter.Address) *Entry {
+        for (&self.entries) |*entry| {
+            if (entry.live and addressesEqual(entry.address, address)) return entry;
+        }
+        for (&self.entries) |*entry| {
+            if (!entry.live) return entry;
+        }
+        const taken = &self.entries[self.next];
+        self.next = (self.next + 1) % handed_out_capacity;
+        return taken;
+    }
+};
+
+fn addressesEqual(a: NetRouter.Address, b: NetRouter.Address) bool {
+    return switch (a) {
+        .ipv4 => |left| switch (b) {
+            .ipv4 => |right| std.mem.eql(u8, &left, &right),
+            .ipv6 => false,
+        },
+        .ipv6 => |left| switch (b) {
+            .ipv4 => false,
+            .ipv6 => |right| std.mem.eql(u8, &left, &right),
+        },
+    };
+}
 
 /// The real transport: the resolver of this machine, and a real socket.
 ///
@@ -1379,6 +1648,230 @@ test "a port is part of the key, so a rule about one port is not a rule about ev
 // `chock_proto.storage.Storage`, the same pieces `Broker.zig`'s own tests use,
 // so the question this file now asks is answered by the same code a live
 // session answers it with.
+
+// **The router's own two questions**, which reach the same table through the
+// other face of this type. Every test below drives `Network` directly, the
+// same way the netbroker tests above do, so the mechanism in
+// `lib/chock-sandbox/linux/routerlink.zig` is not between a test and the
+// decision it is about.
+
+test "a permitted host resolves, and the address is remembered for the connection that follows" {
+    // The whole routed path in one test: the name is judged, looked up, and
+    // the address that comes back is the one the relay later asks about. The
+    // second half is what stops the two halves drifting apart, because the
+    // relay knows an address and nothing else.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    const resolved = network.resolveName("api.anthropic.com", .ipv4);
+    try testing.expectEqual(@as(usize, 1), bench.fake.lookups);
+    switch (resolved) {
+        .granted => |address| try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, &address.ipv4),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // **The connection is dialled and the name is never looked up again.** A
+    // second lookup here would be a second answer, and the window between the
+    // address a program was given and the address it reaches is exactly what a
+    // rebinding attack needs.
+    //
+    // Mutation check: pass `null` instead of `known` from `openAddress` and
+    // the lookup count below is two.
+    const grant = network.openAddress(.{ .ipv4 = .{ 93, 184, 216, 34 } }, 443);
+    try testing.expect(grant == .granted);
+    try testing.expectEqual(@as(usize, 1), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 1), bench.fake.dials);
+    try testing.expectEqual(@as(usize, 1), network.granted);
+}
+
+test "a host the table names nothing about is refused, and is never looked up" {
+    // A DNS query is a message to whoever runs that zone, so a resolver that
+    // looked a name up and refused afterwards would hand a sandboxed program a
+    // channel out for any name it liked.
+    //
+    // Mutation check: move the policy read below the `transport.lookup` in
+    // `resolveName` and the lookup count below is one.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "secret.evil.test", .address = .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.resolveName("secret.evil.test", .ipv4) == .refused);
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+    try testing.expectEqual(@as(usize, 1), network.refused);
+}
+
+test "a host named by a rule about one port still resolves, and only that port connects" {
+    // **The case that decides which reading of the table a query gets.** The
+    // author wrote a rule about one port. `evaluateChain` on the bare host
+    // answers `ask`, because nothing names a host with no port on it, so a
+    // resolver that asked the act question would refuse the name and the rule
+    // could never be reached at all.
+    //
+    // Mutation check: read `permitsSomethingUnder` as `evaluateChain` in
+    // `resolveName` and the first line below fails.
+    const gpa = testing.allocator;
+    const one_port: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.connect.com.anthropic.api.443", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    var bench = try Bench.init(gpa, one_port, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.resolveName("api.anthropic.com", .ipv4) == .granted);
+
+    // And the port is still decided, at the relay, under the full reading.
+    // **The address resolving is not the connection being permitted.**
+    try testing.expect(network.openAddress(.{ .ipv4 = .{ 93, 184, 216, 34 } }, 443) == .granted);
+    try testing.expect(network.openAddress(.{ .ipv4 = .{ 93, 184, 216, 34 } }, 80) == .refused);
+}
+
+test "an address this call never handed out is refused, whatever the policy says about the host" {
+    // The relay sees an address and the kernel has already let it through, so
+    // this is the second reading of the same judgement and not a second
+    // opinion. An address with no name here is an address nothing resolved to,
+    // which no rule can be about.
+    //
+    // Mutation check: make `openAddress` fall back to some name when the table
+    // holds none and this stops being a refusal.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.openAddress(.{ .ipv4 = .{ 93, 184, 216, 34 } }, 443) == .refused);
+    try testing.expectEqual(@as(usize, 0), bench.fake.dials);
+}
+
+test "a query answers about the width it asked about and never about the other one" {
+    // glibc asks for `A` and `AAAA`, one after the other, and uses whichever
+    // answers. **An IPv4 address handed back as an `AAAA` answer would be four
+    // bytes where sixteen belong**, and the record would be unreadable.
+    //
+    // `unresolved` and not `refused`, because the name was permitted: a
+    // program told the name was refused would stop asking for the other width.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.resolveName("api.anthropic.com", .ipv6) == .unresolved);
+    try testing.expect(network.resolveName("api.anthropic.com", .ipv4) == .granted);
+}
+
+test "a permitted name that resolves onto this machine hands out no address at all" {
+    // Whoever runs a permitted zone decides what its names answer, so a rule
+    // about a host on the internet must not become a handle on the loopback
+    // interface or on the cloud metadata service beside it.
+    //
+    // **Stronger here than on the brokered path.** There the address is
+    // refused before a connection is dialled. Here it never reaches the
+    // kernel's allow set at all, so the sandboxed program cannot even open a
+    // connection to it.
+    //
+    // Mutation check: delete the `addressIsReachable` call in `resolveName`
+    // and the first line below becomes a grant.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } },
+        .{ .host = "meta.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 169, 254, 169, 254 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.resolveName("api.anthropic.com", .ipv4) == .refused);
+    try testing.expect(network.resolveName("meta.anthropic.com", .ipv4) == .refused);
+    // The names **were** looked up, because the policy permitted them. That is
+    // what says the address check is the thing that refused them.
+    try testing.expectEqual(@as(usize, 2), bench.fake.lookups);
+}
+
+test "a subagent resolves nothing its parent could not" {
+    // The one question the whole policy chain answers, asked of the resolver
+    // rather than of the relay. The ceiling folds the chain, so a kind that
+    // holds an allow of its own still gets nothing under a parent that is
+    // denied.
+    const gpa = testing.allocator;
+    const deny_parent: [:0]const u8 =
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .agent_kind = "main", .action = "net.connect.com.anthropic.*", .decision = .deny },
+        \\            .{ .agent_kind = "fetcher", .action = "net.connect.com.anthropic.*", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ;
+    const answers = [_]FakeTransport.Answer{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    };
+
+    // **The first run is what stops the second being vacuous.** A `fetcher`
+    // running as a root really does resolve the name.
+    var alone = try Bench.init(gpa, deny_parent, &answers);
+    defer alone.deinit();
+    try testing.expect(alone.ready(&.{"fetcher"}).resolveName("api.anthropic.com", .ipv4) == .granted);
+
+    var under_main = try Bench.init(gpa, deny_parent, &answers);
+    defer under_main.deinit();
+    const network = under_main.ready(&.{ "main", "fetcher" });
+    try testing.expect(network.resolveName("api.anthropic.com", .ipv4) == .refused);
+    try testing.expectEqual(@as(usize, 0), under_main.fake.lookups);
+}
+
+test "the router seam and the direct calls are the same code" {
+    // The driver never calls `resolveName` or `openAddress` by name: it holds
+    // a `NetRouter` and calls through the vtable. A test that only drove the
+    // two functions would leave the wiring between them and the seam untested,
+    // which is exactly how a mechanism ships with green tests and no caller.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{
+        .{ .host = "api.anthropic.com", .address = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 0 } } },
+    });
+    defer bench.deinit();
+    const seam = bench.ready(&.{"main"}).netRouter();
+
+    switch (seam.resolve("api.anthropic.com", .ipv4)) {
+        .granted => |address| try testing.expectEqualSlices(u8, &.{ 93, 184, 216, 34 }, &address.ipv4),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(seam.open(.{ .ipv4 = .{ 93, 184, 216, 34 } }, 443) == .granted);
+}
+
+test "a name that is not a name is refused before anything reads it" {
+    // The bytes come from a process that is assumed hostile. The mechanism
+    // bounds their shape as they cross the boundary, and this checks them
+    // again, for the reason the netbroker path gives: an implementation that
+    // trusted the mechanism would be handed a name with a `\0`, a `/`, or a
+    // space in it and would splice it into a policy key.
+    const gpa = testing.allocator;
+    var bench = try Bench.init(gpa, allow_anthropic, &.{});
+    defer bench.deinit();
+    const network = bench.ready(&.{"main"});
+
+    try testing.expect(network.resolveName("api anthropic com", .ipv4) == .refused);
+    try testing.expect(network.resolveName("", .ipv4) == .refused);
+    try testing.expect(network.resolveName("api.anthropic.com/../evil", .ipv4) == .refused);
+    try testing.expectEqual(@as(usize, 0), bench.fake.lookups);
+}
 
 const ask_anthropic: [:0]const u8 =
     \\.{

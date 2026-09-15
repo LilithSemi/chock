@@ -780,6 +780,448 @@ const filtered_public_address: chock_broker.network.Transport.Address =
 /// connection the broker opened.
 const filtered_token = "the-broker-opened-this";
 
+// ---------------------------------------------------------------------------
+// The network router.
+// ---------------------------------------------------------------------------
+
+/// What one routed spawn came back with.
+const RoutedRun = struct {
+    term: std.process.Child.Term,
+    lookups: usize,
+    dials: usize,
+    granted: usize,
+    refused: usize,
+};
+
+/// Run `/probe <op> <ports>` inside a real routed sandbox, with the real
+/// network broker answering the router.
+///
+/// **The same `Network` the netbroker path uses**, through its other face.
+/// That is the point: a routed call and a brokered one are one policy read
+/// reached two ways, so a test that drove a stand-in here would prove nothing
+/// about what ships. See `filteredEscape` above, which this mirrors.
+fn routedEscape(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    op: []const u8,
+    ports: []const u8,
+    source: [:0]const u8,
+    chain: []const []const u8,
+    resolves_to: chock_broker.network.Transport.Address,
+    dial_port: u16,
+) !RoutedRun {
+    const base = try baseEscapeConfig(arena);
+    const policy = try chock_policy.table.Table.parse(arena, source, null);
+
+    // A real, threadless `Io`, for the reason `filteredEscape` gives.
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+
+    var transport = ProbeTransport{ .resolves_to = resolves_to, .port = dial_port };
+    var network = chock_broker.network.Network{
+        .gpa = arena,
+        .io = io_impl.io(),
+        .table = policy,
+        .chain = chain,
+        .agent_kind = chain[chain.len - 1],
+        .model = "main",
+        .tool = "mcp",
+        .transport = transport.transport(),
+    };
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root,
+        .mounts = base.mounts,
+        .rules = base.rules,
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_router = network.netRouter(),
+    }, &.{ "/probe", op, ports }, null, null);
+
+    return .{
+        .term = term,
+        .lookups = transport.lookups,
+        .dials = transport.dials,
+        .granted = network.granted,
+        .refused = network.refused,
+    };
+}
+
+/// `A`, the only record type these probes ask for.
+const dns_type_a: u16 = 1;
+
+/// What one question to the sandbox's own resolver came back with.
+const Resolved = union(enum) {
+    /// An address, which is what a permitted name answers with.
+    address: [4]u8,
+    /// `REFUSED`, which is what a name the policy refuses answers with.
+    refused,
+    /// No error and no answer, which is what a permitted name with no address
+    /// of that type answers with.
+    empty,
+    /// Nothing came back before the deadline.
+    silent,
+    /// Something came back that this parser could not read, or an error code
+    /// that is neither of the two above.
+    unreadable,
+};
+
+/// Ask the sandbox's own resolver for `name`, over UDP, with raw syscalls.
+///
+/// **A resolver written here on purpose, and not `std.Io.net.HostName`.** This
+/// probe is statically linked, so a lookup through the standard library would
+/// exercise whatever resolver that library happens to carry. What is under
+/// test is the wire: the query the router parses and the answer it builds. A
+/// query this function writes by hand is the same query any resolver writes,
+/// and a failure here names the router rather than a library.
+fn askResolver(name: []const u8, kind: u16) Resolved {
+    var query: [512]u8 = undefined;
+    const length = buildDnsQuery(&query, 0x4321, name, kind) orelse return .unreadable;
+
+    const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(sock_rc) != .SUCCESS) return .silent;
+    const fd: i32 = @intCast(sock_rc);
+    defer _ = linux.close(fd);
+
+    // **A deadline, so a resolver that never answers is a result and not a
+    // hang.** Three seconds is far above one exchange inside one namespace,
+    // and far below the tool call deadline that would otherwise end the test.
+    const timeout = linux.timeval{ .sec = 3, .usec = 0 };
+    _ = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.RCVTIMEO,
+        @ptrCast(&timeout),
+        @sizeOf(linux.timeval),
+    );
+
+    const where = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = @bitCast(sandbox.netns.address4),
+    };
+    const sent = linux.sendto(
+        fd,
+        &query,
+        length,
+        0,
+        @ptrCast(&where),
+        @sizeOf(linux.sockaddr.in),
+    );
+    if (linux.errno(sent) != .SUCCESS or sent != length) return .silent;
+
+    var reply: [512]u8 = undefined;
+    const got = linux.recvfrom(fd, &reply, reply.len, 0, null, null);
+    if (linux.errno(got) != .SUCCESS) return .silent;
+    return readDnsReply(reply[0..got], 0x4321, kind);
+}
+
+/// Write one question into `out`, and answer how many bytes it took.
+fn buildDnsQuery(out: []u8, id: u16, name: []const u8, kind: u16) ?usize {
+    if (out.len < 12) return null;
+    std.mem.writeInt(u16, out[0..2], id, .big);
+    // Recursion desired, and nothing else. Every other flag is zero, which is
+    // an ordinary query of opcode zero.
+    std.mem.writeInt(u16, out[2..4], 0x0100, .big);
+    std.mem.writeInt(u16, out[4..6], 1, .big);
+    std.mem.writeInt(u16, out[6..8], 0, .big);
+    std.mem.writeInt(u16, out[8..10], 0, .big);
+    std.mem.writeInt(u16, out[10..12], 0, .big);
+
+    var at: usize = 12;
+    var start: usize = 0;
+    while (start <= name.len) {
+        const end = std.mem.indexOfScalarPos(u8, name, start, '.') orelse name.len;
+        const label = name[start..end];
+        if (label.len == 0 or label.len > 63) return null;
+        if (at + 1 + label.len > out.len) return null;
+        out[at] = @intCast(label.len);
+        at += 1;
+        @memcpy(out[at..][0..label.len], label);
+        at += label.len;
+        if (end == name.len) break;
+        start = end + 1;
+    }
+    if (at + 5 > out.len) return null;
+    out[at] = 0;
+    at += 1;
+    std.mem.writeInt(u16, out[at..][0..2], kind, .big);
+    at += 2;
+    std.mem.writeInt(u16, out[at..][0..2], 1, .big);
+    at += 2;
+    return at;
+}
+
+/// Read the first answer out of a reply, or say why there is none.
+fn readDnsReply(bytes: []const u8, id: u16, kind: u16) Resolved {
+    if (bytes.len < 12) return .unreadable;
+    if (std.mem.readInt(u16, bytes[0..2], .big) != id) return .unreadable;
+    const flags = std.mem.readInt(u16, bytes[2..4], .big);
+    if (flags & 0x8000 == 0) return .unreadable;
+    const rcode = flags & 0xf;
+    if (rcode == 5) return .refused;
+    if (rcode != 0) return .unreadable;
+
+    const answers = std.mem.readInt(u16, bytes[6..8], .big);
+    if (answers == 0) return .empty;
+
+    // Walk past the one question. The router echoes the question it was asked,
+    // so the name here is the name this probe wrote and carries no compression
+    // pointer.
+    var at: usize = 12;
+    while (at < bytes.len) {
+        const label = bytes[at];
+        if (label & 0xc0 != 0) return .unreadable;
+        at += 1;
+        if (label == 0) break;
+        at += label;
+    }
+    at += 4;
+    if (at + 12 > bytes.len) return .unreadable;
+
+    // The answer's own name, which is a compression pointer in every reply the
+    // router builds.
+    at += if (bytes[at] & 0xc0 != 0) 2 else return .unreadable;
+    const answer_kind = std.mem.readInt(u16, bytes[at..][0..2], .big);
+    at += 2;
+    // class, then ttl
+    at += 2 + 4;
+    const length = std.mem.readInt(u16, bytes[at..][0..2], .big);
+    at += 2;
+    if (answer_kind != kind or length != 4) return .unreadable;
+    if (at + 4 > bytes.len) return .unreadable;
+    return .{ .address = bytes[at..][0..4].* };
+}
+
+/// Open a connection to `bytes` on `port` from inside the sandbox, with raw
+/// syscalls and no resolver at all.
+fn connectToAddress(bytes: [4]u8, port: u16) !i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SetupFailed;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+
+    const where = linux.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(bytes),
+    };
+    if (linux.errno(linux.connect(fd, @ptrCast(&where), @sizeOf(linux.sockaddr.in))) != .SUCCESS)
+        return error.NotConnected;
+    return fd;
+}
+
+/// The nftables table the router installs, by name. Written out here rather
+/// than read from `chock_sandbox.nftables`, because this is the hostile side:
+/// a program that wanted the ruleset gone would know the name the same way
+/// anybody reading `nft list ruleset` does.
+const routed_table_name = "chock";
+
+/// Ask the kernel to delete the whole `chock` table, over nfnetlink, from
+/// inside the sandbox.
+///
+/// **This is the fault `chock-network-router-measured` records as the third
+/// one that reports success while doing nothing.** With `CAP_NET_ADMIN` still
+/// held, this batch **succeeds** and every rule the router installed becomes
+/// advice. The ordering that closes it is install, drop the capability, then
+/// exec, and the drop is `capabilities.dropAll` inside `applyLayers`.
+///
+/// Answers the errno the kernel gave for the delete, or null when the exchange
+/// itself could not happen.
+fn askToDeleteRuleset() ?linux.E {
+    const fd_rc = linux.socket(
+        linux.AF.NETLINK,
+        linux.SOCK.RAW | linux.SOCK.CLOEXEC,
+        linux.NETLINK.NETFILTER,
+    );
+    // A kernel with no nfnetlink at all cannot be asked, which is not a
+    // refusal and must not read as one.
+    if (linux.errno(fd_rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    const me = linux.sockaddr.nl{ .pid = 0, .groups = 0 };
+    if (linux.errno(linux.bind(fd, @ptrCast(&me), @sizeOf(linux.sockaddr.nl))) != .SUCCESS)
+        return null;
+
+    // `NFNL_SUBSYS_NFTABLES`, `NFT_MSG_DELTABLE`, `NFNL_MSG_BATCH_BEGIN` and
+    // `NFNL_MSG_BATCH_END`, and `NFPROTO_INET` for the table's own family.
+    // Every change to nftables is a batch, so a bare delete message would be
+    // refused for its shape before the kernel ever read a permission.
+    const subsys: u16 = 10;
+    const del_table: u16 = 2;
+    const batch_begin: u16 = 16;
+    const batch_end: u16 = 17;
+    const nfproto_inet: u8 = 1;
+    const nfta_table_name: u16 = 1;
+
+    var batch: [128]u8 = @splat(0);
+    var at: usize = 0;
+
+    at += writeNetlinkHeader(batch[at..], batch_begin, 0x001, 0, 0, subsys);
+    const delete_at = at;
+    at += writeNetlinkHeader(batch[at..], (subsys << 8) | del_table, 0x001 | 0x004, 1, nfproto_inet, 0);
+    at += writeNetlinkString(batch[at..], nfta_table_name, routed_table_name);
+    std.mem.writeInt(u32, batch[delete_at..][0..4], @intCast(at - delete_at), .little);
+    at += writeNetlinkHeader(batch[at..], batch_end, 0x001, 2, 0, subsys);
+
+    const sent = linux.sendto(fd, &batch, at, 0, null, 0);
+    if (linux.errno(sent) != .SUCCESS or sent != at) return null;
+
+    var reply: [1024]u8 = undefined;
+    const got = linux.recvfrom(fd, &reply, reply.len, 0, null, null);
+    if (linux.errno(got) != .SUCCESS) return null;
+
+    // **The first refusal, whichever message carries it.** Measured on
+    // 2026-09-15 inside a real routed sandbox: the kernel refuses the batch at
+    // `NFNL_MSG_BATCH_BEGIN`, with sequence zero, and never reads the delete
+    // at all. A reader that only looked for the acknowledgement of the delete
+    // itself would find none and report that the kernel could not be asked,
+    // which is how this function first read a refusal as an absence.
+    var acknowledged = false;
+    var offset: usize = 0;
+    while (offset + 16 <= got) {
+        const length = std.mem.readInt(u32, reply[offset..][0..4], .little);
+        if (length < 16 or offset + length > got) break;
+        const kind = std.mem.readInt(u16, reply[offset + 4 ..][0..2], .little);
+        // `NLMSG_ERROR` is 2, and it carries a negative errno, with zero
+        // meaning the change was taken.
+        if (kind == 2 and offset + 20 <= got) {
+            const code = std.mem.readInt(i32, reply[offset + 16 ..][0..4], .little);
+            if (code != 0) return @enumFromInt(if (code < 0) -code else code);
+            acknowledged = true;
+        }
+        offset += (length + 3) & ~@as(usize, 3);
+    }
+    if (acknowledged) return .SUCCESS;
+    return null;
+}
+
+/// One netlink message header and the nfgenmsg that follows it, written into
+/// `out`. Answers how many bytes it took. The length is filled in by the
+/// caller for a message that carries attributes.
+fn writeNetlinkHeader(
+    out: []u8,
+    kind: u16,
+    flags: u16,
+    sequence: u32,
+    family: u8,
+    res_id: u16,
+) usize {
+    @memset(out[0..20], 0);
+    std.mem.writeInt(u32, out[0..4], 20, .little);
+    std.mem.writeInt(u16, out[4..6], kind, .little);
+    std.mem.writeInt(u16, out[6..8], flags, .little);
+    std.mem.writeInt(u32, out[8..12], sequence, .little);
+    out[16] = family;
+    std.mem.writeInt(u16, out[18..20], res_id, .big);
+    return 20;
+}
+
+/// One netlink string attribute, null terminated the way nftables wants it.
+fn writeNetlinkString(out: []u8, kind: u16, text: []const u8) usize {
+    const payload = text.len + 1;
+    std.mem.writeInt(u16, out[0..2], @intCast(4 + payload), .little);
+    std.mem.writeInt(u16, out[2..4], kind, .little);
+    @memcpy(out[4..][0..text.len], text);
+    out[4 + text.len] = 0;
+    var total = 4 + payload;
+    while (total % 4 != 0) : (total += 1) out[total] = 0;
+    return total;
+}
+
+/// An `/etc` of the shape a machine **without** Nix gives a sandbox: the
+/// host's own files, bound in read only.
+///
+/// **Written by the probe rather than taken from the host.** The one file that
+/// matters is `nsswitch.conf`, and its content decides the result, so a test
+/// that read whatever this machine happens to hold would pass or fail for a
+/// reason nobody chose. The three below are this machine's own real contents
+/// as of 2026-09-15, which is what makes the simulation faithful.
+const HostileEtc = struct {
+    /// A `hosts:` line that never reaches `dns`.
+    ///
+    /// **This machine's own line is
+    /// `mymachines mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns`**,
+    /// measured on 2026-09-14, and `[NOTFOUND=return]` returns from the lookup
+    /// before it ever reaches `dns`. That line is not used here, because what
+    /// it does depends on which NSS modules the machine has: a module that is
+    /// not there answers UNAVAIL, the lookup carries on past it, and the file
+    /// then reaches `dns` after all. A sandbox that binds only a toolchain has
+    /// none of those modules, so the real line would make this test pass
+    /// whether or not the substitution happened.
+    ///
+    /// `files` alone is what that line **amounts to** once the short circuit
+    /// fires, and it is the same for every machine. A sandbox that leaves this
+    /// file alone has a resolver nothing asks, which is the fault under test.
+    const nsswitch =
+        "passwd:    files\n" ++
+        "group:     files\n" ++
+        "hosts:     files\n" ++
+        "services:  files\n" ++
+        "protocols: files\n";
+
+    /// A resolver that is not the sandbox's own. `192.0.2.1` is the
+    /// documentation range of RFC 5737 and answers nobody, so a lookup that
+    /// used this file would time out rather than reach anything real.
+    const resolv = "nameserver 192.0.2.1\noptions timeout:1 attempts:1\n";
+
+    const hosts = "127.0.0.1\tlocalhost\n";
+
+    /// Write the three files into a directory beside the sandbox root, and
+    /// answer its path. **Beside the root and never inside it**, because
+    /// everything inside the root is removed between calls.
+    fn build(arena: std.mem.Allocator, beside: []const u8) ![]const u8 {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}-host-etc", .{beside}, 0);
+        switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, path.ptr, 0o755))) {
+            .SUCCESS, .EXIST => {},
+            else => return error.SetupFailed,
+        }
+        try write(arena, path, "nsswitch.conf", nsswitch);
+        try write(arena, path, "resolv.conf", resolv);
+        try write(arena, path, "hosts", hosts);
+        return path;
+    }
+
+    fn write(
+        arena: std.mem.Allocator,
+        directory: []const u8,
+        name: []const u8,
+        bytes: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
+        const fd_rc = linux.open(
+            path.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            0o644,
+        );
+        if (linux.errno(fd_rc) != .SUCCESS) return error.SetupFailed;
+        const fd: i32 = @intCast(fd_rc);
+        defer _ = linux.close(fd);
+        const wrote = linux.write(fd, bytes.ptr, bytes.len);
+        if (linux.errno(wrote) != .SUCCESS or wrote != bytes.len) return error.SetupFailed;
+    }
+};
+
+/// The directory the name service cache daemon puts its socket in, on the
+/// host.
+const nscd_directory_z: [:0]const u8 = "/run/nscd";
+
+/// Where glibc looks for that socket, which is **not** where the host keeps
+/// it. Read out of `libc.so.6` on this machine on 2026-09-15: glibc 2.42
+/// spells `_PATH_NSCDSOCKET` as `/var/run/nscd/socket`, and `/var/run` is a
+/// symbolic link to `/run` on the host and does not exist at all inside a
+/// sandbox that binds only a toolchain.
+///
+/// **Bound into the routed glibc probe at this path on purpose.** Left out,
+/// the socket is simply absent inside the sandbox, the masking is true by
+/// accident, and no mutation of it could be seen. Bound in, an unmasked nscd
+/// answers from the host's own view of the network.
+const nscd_target = "/var/run/nscd";
+
+/// The port every routed probe connects on. The policy permits the host on
+/// any port, because the ports these probes really use are chosen by the
+/// kernel at run time and no rule could name them.
+const routed_port: u16 = 443;
+
 /// The two ports a filtered child is given, as `"<granted>,<other>"`.
 fn filteredPorts(arena: std.mem.Allocator, granted: u16, other: u16) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d},{d}", .{ granted, other });
@@ -1567,6 +2009,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // sockets, parses its own policy, and spawns a real sandbox with a
         // real broker answering it. See `filteredEscape`.
         std.mem.startsWith(u8, args[1], "spawn-filtered-") or
+        std.mem.startsWith(u8, args[1], "spawn-routed-") or
         // The three resource limit runs, each in a bounded and an unbounded
         // form. They belong here for the reason every other "spawn-" operation
         // does: each one forks and lets sandbox.spawn build the whole sandbox
@@ -1629,6 +2072,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // reach. Both are ephemeral, so no rule and no constant could name
         // them and the operation that spawned this one has to pass them down.
         std.mem.startsWith(u8, args[1], "spawned-filtered-") or
+        // The same, for a routed child. It reaches a permitted host through
+        // the resolver and never learns the ports, so it takes the argument
+        // and reads none of it: one shape for every child a filtered spawn
+        // starts, rather than two the caller has to keep apart.
+        std.mem.startsWith(u8, args[1], "routed-") or
         std.mem.eql(u8, args[1], "session-keyring-fresh");
 
     // A needs_scratch_root operation reads its scratch root off the command line,
@@ -4053,6 +4501,266 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         return reportChildTerm(term);
     }
 
+    if (std.mem.eql(u8, args[1], "spawn-routed-glibc")) {
+        // **The only test that proves a real program finds the router.** Every
+        // other routed probe writes its own DNS query, which measures that the
+        // router answers and says nothing about whether anything would ever
+        // ask it. glibc is what a tool call really runs, and it looks for a
+        // resolver in three places this sandbox has to get right at once:
+        // `/etc/resolv.conf`, which does not exist on a machine that binds
+        // only `/nix/store`; `/etc/nsswitch.conf`, whose own
+        // `[NOTFOUND=return]` on this machine returns before the lookup ever
+        // reaches `dns`; and the nscd socket, which is `AF_UNIX` and which a
+        // network namespace does not touch at all.
+        //
+        // **The host's own nscd is bound in on purpose.** Without it the
+        // socket is simply absent inside the sandbox, so the masking would be
+        // true by accident and no mutation of it could be seen. With it bound,
+        // an unmasked nscd answers from the host's view of the network, and
+        // the address it gives is not the one the far side hands out.
+        const base = try baseEscapeConfig(arena);
+        const listener = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(listener.fd);
+
+        var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 3);
+        mounts.appendSliceAssumeCapacity(base.mounts);
+        mounts.appendAssumeCapacity(.{ .bind = .{
+            .source = try absolutePath(arena, dynamic_probe_path),
+            .target = "/dynamic",
+            .read_only = true,
+        } });
+        // **An `/etc` of the shape a machine without Nix gives**, so the
+        // substitution has a file to replace rather than a gap to fill. The
+        // two branches are different code: a target that is not there is
+        // created and written, and a target that is there is covered by a bind
+        // mount, which is the only one that works on a read only mount. This
+        // probe takes the second, and the machine this runs on takes the
+        // first, so both are measured.
+        mounts.appendAssumeCapacity(.{ .bind = .{
+            .source = try HostileEtc.build(arena, root_arg),
+            .target = "/etc",
+            .read_only = true,
+        } });
+
+        if (pathExists(nscd_directory_z)) {
+            // **Not read only.** Connecting to a unix socket needs write
+            // permission on the socket itself, so a read only bind would leave
+            // nscd unreachable for a reason that has nothing to do with the
+            // masking, and the masking would then be untestable.
+            mounts.appendAssumeCapacity(.{ .bind = .{
+                .source = nscd_directory_z,
+                .target = nscd_target,
+                .read_only = false,
+            } });
+        }
+
+        var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 3);
+        rules.appendSliceAssumeCapacity(base.rules);
+        // A file and not a directory, so `read_only_file`: the kernel refuses
+        // a directory right over a file.
+        rules.appendAssumeCapacity(.{
+            .path = "/dynamic",
+            .access = sandbox.landlock.AccessFs.read_only_file,
+        });
+        // **The resolver files the sandbox wrote for itself.** They are inside
+        // the root, made before the pivot, so by the time Landlock runs they
+        // are ordinary paths of this sandbox. Without this rule glibc cannot
+        // open them and the whole lookup fails for a reason that has nothing
+        // to do with the router.
+        rules.appendAssumeCapacity(.{
+            .path = "/etc",
+            .access = sandbox.landlock.AccessFs.read_only,
+        });
+        if (pathExists(nscd_directory_z)) {
+            rules.appendAssumeCapacity(.{
+                .path = nscd_target,
+                .access = sandbox.landlock.AccessFs.read_write,
+            });
+        }
+
+        const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
+        var io_impl: std.Io.Threaded = .init_single_threaded;
+        var transport = ProbeTransport{
+            .resolves_to = filtered_public_address,
+            .port = listener.port,
+        };
+        var network = chock_broker.network.Network{
+            .gpa = arena,
+            .io = io_impl.io(),
+            .table = policy,
+            .chain = &.{"main"},
+            .agent_kind = "main",
+            .model = "main",
+            .tool = "mcp",
+            .transport = transport.transport(),
+        };
+
+        const term = try sandbox.spawn(arena, .{
+            .root = root_arg,
+            .mounts = mounts.items,
+            .rules = rules.items,
+            .cwd = "/",
+            .env = &.{},
+            .network = .filtered,
+            .net_router = network.netRouter(),
+        }, &.{ "/dynamic", "resolve", filtered_host, "93.184.216.34" }, null, null);
+
+        if (term != .exited or term.exited != 0) return reportChildTerm(term);
+
+        // **One lookup on the far side, and the address glibc got is the one
+        // the far side handed out.** Zero lookups with a successful resolve is
+        // exactly what an unmasked nscd looks like: the program was answered
+        // by somebody else and the router was never asked anything.
+        if (transport.lookups != 1) {
+            std.debug.print(
+                "glibc resolved a name and the far side was asked {d} times\n",
+                .{transport.lookups},
+            );
+            return 5;
+        }
+        return 0;
+    }
+    if (std.mem.startsWith(u8, args[1], "spawn-routed-")) {
+        // One listener, which is where a granted connection really lands. The
+        // router never learns of it: the far side dials it, and the sandboxed
+        // program only ever sees the address the resolver handed out.
+        const granted = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(granted.fd);
+        const ports = try filteredPorts(arena, granted.port, granted.port);
+
+        if (std.mem.eql(u8, args[1], "spawn-routed-reach")) {
+            const run = try routedEscape(
+                arena,
+                root_arg,
+                "routed-reach",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            if (run.term != .exited or run.term.exited != 0) return reportChildTerm(run.term);
+
+            // **The bytes are the proof, and the exit code is not.** A child
+            // that reported success and reached nothing would be a relay that
+            // answered its own connection, so what the listener really holds
+            // is read here rather than believed.
+            var buffer: [64]u8 = undefined;
+            const carried = granted.readFirst(&buffer) orelse {
+                std.debug.print("a permitted host was reported reached and nothing arrived\n", .{});
+                return 5;
+            };
+            if (!std.mem.eql(u8, carried, filtered_token)) {
+                std.debug.print("the connection carried the wrong bytes\n", .{});
+                return 5;
+            }
+            // One name resolved and one connection dialled, and neither one
+            // twice. **Two dials would mean the name was resolved again
+            // between the answer and the connection**, which is the window a
+            // rebinding attack needs.
+            if (run.lookups != 1 or run.dials != 1 or run.granted != 1) {
+                std.debug.print(
+                    "a routed call did {d} lookups, {d} dials and {d} grants\n",
+                    .{ run.lookups, run.dials, run.granted },
+                );
+                return 5;
+            }
+            return 0;
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-routed-refused-name")) {
+            const run = try routedEscape(
+                arena,
+                root_arg,
+                "routed-refused-name",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // **The refused name was never resolved.** A resolver that looked
+            // a name up and refused afterwards would hand a sandboxed program
+            // a message to whoever runs that zone, for any name it liked.
+            if (run.lookups != 0 or run.dials != 0) {
+                std.debug.print("a refused name was resolved anyway\n", .{});
+                return 5;
+            }
+            if (granted.hasPending()) {
+                std.debug.print("a refused name reached the listener\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-routed-own-resolver")) {
+            const run = try routedEscape(
+                arena,
+                root_arg,
+                "routed-own-resolver",
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // **One lookup, which is the positive half.** The child asks the
+            // sandbox's own resolver first and is answered, so a sandbox where
+            // no UDP worked at all cannot read as a pass. Nothing is dialled,
+            // because the child opens no connection at all.
+            if (run.lookups != 1 or run.dials != 0) {
+                std.debug.print(
+                    "a child with its own resolver did {d} lookups and {d} dials\n",
+                    .{ run.lookups, run.dials },
+                );
+                return 5;
+            }
+            if (granted.hasPending()) {
+                std.debug.print("a child with its own resolver reached the listener\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        if (std.mem.eql(u8, args[1], "spawn-routed-hardcoded") or
+            std.mem.eql(u8, args[1], "spawn-routed-metadata") or
+            std.mem.eql(u8, args[1], "spawn-routed-flush"))
+        {
+            const op = args[1]["spawn-".len..];
+            const run = try routedEscape(
+                arena,
+                root_arg,
+                op,
+                ports,
+                filtered_policy,
+                &.{"main"},
+                filtered_public_address,
+                granted.port,
+            );
+            // Nothing was asked of the far side at all: the child never
+            // resolved anything, so the kernel is the only thing that can
+            // have refused it.
+            if (run.lookups != 0 or run.dials != 0) {
+                std.debug.print("a child that resolved nothing still used the seam\n", .{});
+                return 5;
+            }
+            if (granted.hasPending()) {
+                std.debug.print("a child that resolved nothing reached the listener\n", .{});
+                return 5;
+            }
+            return reportChildTerm(run.term);
+        }
+
+        std.debug.print("unknown routed operation: {s}\n", .{args[1]});
+        return 2;
+    }
+
     if (std.mem.startsWith(u8, args[1], "spawn-filtered-")) {
         const granted = listenLoopback() catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
@@ -5687,6 +6395,173 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         defer removeShmSegment(shmid);
         const rc = linux.syscall3(.shmat, shmid, 0, 0);
         return if (linux.errno(rc) == .SUCCESS) 0 else 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Inside a routed sandbox. Each of these runs as the sandboxed program,
+    // with no netbroker descriptor and no knowledge that a router exists: it
+    // resolves and connects the way any program does.
+    // -----------------------------------------------------------------------
+
+    if (std.mem.eql(u8, args[1], "routed-reach")) {
+        // **The whole path, in one program.** Ask the sandbox's own resolver,
+        // take the address it gives, and connect to it. Nothing here knows
+        // about Chock: this is what npm and curl do.
+        switch (askResolver(filtered_host, dns_type_a)) {
+            .address => |bytes| {
+                const fd = connectToAddress(bytes, routed_port) catch |err| {
+                    std.debug.print("a permitted host was not reachable: {s}\n", .{@errorName(err)});
+                    return 5;
+                };
+                defer _ = linux.close(fd);
+                const wrote = linux.write(fd, filtered_token, filtered_token.len);
+                if (linux.errno(wrote) != .SUCCESS or wrote != filtered_token.len) {
+                    std.debug.print("the connection carried nothing\n", .{});
+                    return 5;
+                }
+                return 0;
+            },
+            else => |other| {
+                std.debug.print("a permitted host did not resolve: {s}\n", .{@tagName(other)});
+                return 5;
+            },
+        }
+    }
+    if (std.mem.eql(u8, args[1], "routed-flush")) {
+        // **The capability ordering, measured from inside.** The ruleset is
+        // only worth anything while nothing that runs under it can take it
+        // away. This asks the kernel to delete the whole table and requires a
+        // refusal.
+        //
+        // The errno is the test and not the failure. `EPERM` is the capability
+        // being gone, which is what `applyLayers` does before it execs this
+        // program. Any other answer means the batch was refused for its shape
+        // instead, which would make this pass for the wrong reason.
+        const answer = askToDeleteRuleset() orelse {
+            std.debug.print("the kernel could not be asked about the ruleset at all\n", .{});
+            return 3;
+        };
+        if (answer == .SUCCESS) {
+            std.debug.print("the sandboxed program deleted the ruleset\n", .{});
+            return 1;
+        }
+        if (answer != .PERM) {
+            std.debug.print("deleting the ruleset was refused with {t}\n", .{answer});
+            return 5;
+        }
+        // **And the ruleset still stops what it stopped before.** A refusal on
+        // its own would also be what a machine with no table at all answers,
+        // so the address that was never handed out is tried again here.
+        const fd = connectToAddress(.{ 93, 184, 216, 34 }, routed_port) catch return 0;
+        _ = linux.close(fd);
+        std.debug.print("an unhanded address was reachable after the refused delete\n", .{});
+        return 1;
+    }
+    if (std.mem.eql(u8, args[1], "routed-refused-name")) {
+        // A name the policy does not cover. **`REFUSED` and not an empty
+        // answer**, so a program is told the name was refused rather than
+        // being left to read it as a host that does not exist.
+        switch (askResolver(filtered_refused_host, dns_type_a)) {
+            .refused => return 0,
+            else => |other| {
+                std.debug.print("a refused host answered {s}\n", .{@tagName(other)});
+                return 1;
+            },
+        }
+    }
+    if (std.mem.eql(u8, args[1], "routed-hardcoded")) {
+        // An address nobody handed out, written straight into `connect`. The
+        // policy permits the host this address really belongs to, and the
+        // resolver was never asked, so **only the kernel can be what refuses
+        // this**.
+        const bytes = [4]u8{ 93, 184, 216, 34 };
+        const fd = connectToAddress(bytes, routed_port) catch return 0;
+        _ = linux.close(fd);
+        std.debug.print("an address that was never handed out was reachable\n", .{});
+        return 1;
+    }
+    if (std.mem.eql(u8, args[1], "routed-metadata")) {
+        // The cloud metadata address, which answers with the machine's own
+        // credentials on three of the large providers. Nothing resolves to it
+        // here, so it is refused for the reason every unhanded address is.
+        const fd = connectToAddress(.{ 169, 254, 169, 254 }, 80) catch return 0;
+        _ = linux.close(fd);
+        std.debug.print("the metadata service was reachable\n", .{});
+        return 1;
+    }
+    if (std.mem.eql(u8, args[1], "routed-own-resolver")) {
+        // A program that carries its own resolver and asks somebody else.
+        // **Nothing here enumerates that case**: the query is a UDP packet to
+        // an address that is not in the kernel's allow set, and it dies there
+        // like any other.
+        //
+        // **The sandbox's own resolver is asked first, and that is what stops
+        // this being vacuous.** A sandbox where no UDP worked at all would
+        // refuse the query below and prove nothing by it. This same program,
+        // with the same socket calls, is answered when it asks the address the
+        // resolver is on.
+        switch (askResolver(filtered_host, dns_type_a)) {
+            .address => {},
+            else => |other| {
+                std.debug.print("the sandbox's own resolver answered {s}\n", .{@tagName(other)});
+                return 5;
+            },
+        }
+        const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+        if (linux.errno(sock_rc) != .SUCCESS) return 3;
+        const fd: i32 = @intCast(sock_rc);
+        defer _ = linux.close(fd);
+
+        const timeout = linux.timeval{ .sec = 2, .usec = 0 };
+        _ = linux.setsockopt(
+            fd,
+            linux.SOL.SOCKET,
+            linux.SO.RCVTIMEO,
+            @ptrCast(&timeout),
+            @sizeOf(linux.timeval),
+        );
+
+        var query: [512]u8 = undefined;
+        const length = buildDnsQuery(&query, 0x1111, filtered_host, dns_type_a) orelse return 3;
+        const where = linux.sockaddr.in{
+            .port = std.mem.nativeToBig(u16, 53),
+            .addr = @bitCast([4]u8{ 8, 8, 8, 8 }),
+        };
+        const sent = linux.sendto(
+            fd,
+            &query,
+            length,
+            0,
+            @ptrCast(&where),
+            @sizeOf(linux.sockaddr.in),
+        );
+        // **The send itself is what fails, and the errno is the test.**
+        // Measured on 2026-09-15 inside a real routed sandbox: the guard chain
+        // answers this with `EPERM` on the socket, because the chain **rejects**
+        // rather than drops. A chain that dropped would take the packet, send
+        // it to a device that delivers nothing, and leave the program waiting
+        // out its own timeout, which is the shape the prototype measured at a
+        // full SYN timeout against 0.000s for a reject.
+        //
+        // So a send that succeeds is a chain that stopped rejecting, and it is
+        // reported as a failure even though the query still goes unanswered.
+        if (linux.errno(sent) != .PERM) {
+            std.debug.print(
+                "a query to a resolver of the program's own was answered {t}\n",
+                .{linux.errno(sent)},
+            );
+            return 1;
+        }
+
+        // And nothing comes back, which is the fact the errno alone does not
+        // carry: the packet reached nobody.
+        var reply: [512]u8 = undefined;
+        const got = linux.recvfrom(fd, &reply, reply.len, 0, null, null);
+        if (linux.errno(got) == .SUCCESS) {
+            std.debug.print("a resolver of the program's own was answered\n", .{});
+            return 1;
+        }
+        return 0;
     }
 
     std.debug.print("unknown operation: {s}\n", .{args[1]});
