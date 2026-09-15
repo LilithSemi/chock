@@ -17,6 +17,13 @@
 //! `test/workspace/escape.zig` proves it on a running system rather than
 //! taking it on trust.
 //!
+//! An organisation can put a ceiling over that cap, in the org policy bundle
+//! `lib/chock-policy/org.zig` reads. `underCeiling` folds the two, and it is a
+//! minimum: a project may hold itself to less than its organisation allows and
+//! may never take more. **A project above the ceiling is refused and not
+//! quietly lowered**, and that decision is argued in full beside that
+//! function.
+//!
 //! This reader is lenient about the rest of the file and strict inside its
 //! own block, the same split `lib/chock-policy/table.zig` makes and for the
 //! same reason: another milestone owns the other blocks, and a misspelled
@@ -82,6 +89,17 @@ pub const LoadError = ParseError || error{
     ReadFailed,
 };
 
+/// What can go wrong when a budget is folded under an org policy bundle's
+/// ceiling. See `underCeiling`, which argues why both of these refuse the
+/// session instead of quietly lowering the number.
+pub const CeilingError = error{
+    /// The budget is above the ceiling the org policy bundle sets.
+    AboveOrgCeiling,
+    /// The budget and the ceiling name two different currencies, so no
+    /// comparison of the two numbers means anything.
+    CurrencyDiffersFromCeiling,
+};
+
 /// What went wrong while the budget block was read, and the facts the error
 /// alone throws away.
 ///
@@ -103,6 +121,29 @@ pub const Diagnostic = union(enum) {
     file_too_large: usize,
     /// The file exists and the read failed. The fault is the filesystem's.
     read_failed: anyerror,
+    /// The budget is above the ceiling an org policy bundle sets. Both
+    /// numbers are here, because a refusal that named one of them would make
+    /// the reader open two files to learn the other.
+    above_org_ceiling: Ceilinged,
+    /// The budget and the ceiling are written in two different currencies.
+    currency_differs_from_ceiling: Currencies,
+
+    /// A budget that is above its ceiling, and the ceiling it is above. Both
+    /// amounts are in `currency`, because `underCeiling` refuses a pair in two
+    /// currencies before it compares two numbers.
+    pub const Ceilinged = struct {
+        asked: f64,
+        ceiling: f64,
+        currency: []const u8,
+    };
+
+    /// The two currencies that do not match. **Borrowed, not owned**: the
+    /// caller of `underCeiling` holds both the budget and the ceiling, and
+    /// both outlive the diagnostic.
+    pub const Currencies = struct {
+        asked: []const u8,
+        ceiling: []const u8,
+    };
 
     /// Release what the diagnostic owns. Safe on every variant, so a caller
     /// can call it without asking which one it holds.
@@ -139,6 +180,20 @@ pub const Diagnostic = union(enum) {
             .read_failed => |err| try writer.print(
                 "{s}: the file could not be read: {t}",
                 .{ file_name, err },
+            ),
+            .above_org_ceiling => |pair| try writer.print(
+                "a budget of {d} {s} is above the org policy bundle's ceiling of {d} {s}. " ++
+                    "The budget comes from the budget block of {s}, or from the parent of a " ++
+                    "subagent, and neither may pass the ceiling. Lower the budget, or ask " ++
+                    "whoever issued the bundle for a higher ceiling.",
+                .{ pair.asked, pair.currency, pair.ceiling, pair.currency, file_name },
+            ),
+            .currency_differs_from_ceiling => |pair| try writer.print(
+                "the budget is in {s} and the org policy bundle's ceiling is in {s}. Two amounts " ++
+                    "in two currencies cannot be compared, and an exchange rate invented here " ++
+                    "would be a cap nobody wrote. Write the budget in {s}, or ask whoever issued " ++
+                    "the bundle for a ceiling in {s}.",
+                .{ pair.asked, pair.ceiling, pair.ceiling, pair.asked },
             ),
         }
     }
@@ -231,6 +286,79 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
 /// Release a `Budget` that `parse` or `load` returned.
 pub fn free(gpa: std.mem.Allocator, budget: Budget) void {
     gpa.free(budget.currency);
+}
+
+/// This session's budget, under the ceiling an org policy bundle sets.
+///
+/// **A bound and not a rule.** `lib/chock-policy/table.zig` answers "may this
+/// happen" and takes the intersection of every layer. A ceiling answers "how
+/// much", and the fold for a number is the minimum: a project below the
+/// ceiling keeps its own number, because a project is free to hold itself to
+/// less than its organisation allows.
+///
+/// ## The branch above the ceiling refuses, and does not lower the number
+///
+/// The minimum of the two would be the ceiling, and taking it silently is the
+/// one thing this must not do. A project that wrote `max_cost = 50` and got 5
+/// believes it has a budget it does not have. Nothing tells it otherwise, and
+/// the fault arrives much later, as a session that stops in the middle of the
+/// work with no stated cause, on the one turn the difference bites. That is
+/// the exact shape `Loop.refuseForBudget` was written to remove: a cap that
+/// bites has to name itself before the money is gone. A refusal here is read
+/// by a person, once, at the start, beside the two numbers that disagree, and
+/// the fix is one line of `chock.zon`.
+///
+/// A refusal also keeps the two questions apart. "This project may spend 5"
+/// and "this project asked for 50 and may not have it" are different facts,
+/// and a clamp writes both of them as the first one.
+///
+/// ## Two currencies refuse as well
+///
+/// A ceiling of 5 USD says nothing at all about a budget of 900 JPY, so the
+/// comparison cannot be made and an exchange rate invented here would be a cap
+/// nobody wrote. Allowing the pair would also be the whole ceiling gone: a
+/// project that may name its own currency may name one its organisation did
+/// not, and then no number binds it. `src/run.zig`'s own `budgetUnderOrg`
+/// meets the same pair one layer down, between a project and the parent of a
+/// subagent, and answers it differently: there the narrower authority is the
+/// parent that divided the money, so there is always an answer that cannot
+/// widen. Here there is not.
+///
+/// Neither number can be a NaN. `parse` refuses one in `chock.zon` and
+/// `chock_policy.org.validate` refuses one in a bundle, both when the file is
+/// read, so the comparison below is over two finite numbers.
+///
+/// A null ceiling is an installation with no bundle, or a bundle that names no
+/// budget, and it changes nothing. A null budget under a ceiling takes the
+/// ceiling: an organisation that capped its projects capped the ones that
+/// wrote no cap of their own as well.
+///
+/// The answer borrows its `currency` from whichever of the two it took, so
+/// both must outlive it. Nothing here allocates.
+pub fn underCeiling(
+    asked: ?Budget,
+    ceiling: ?Budget,
+    diag: ?*?Diagnostic,
+) CeilingError!?Budget {
+    const cap = ceiling orelse return asked;
+    const want = asked orelse return cap;
+
+    if (!std.mem.eql(u8, want.currency, cap.currency)) {
+        _ = note(diag, .{ .currency_differs_from_ceiling = .{
+            .asked = want.currency,
+            .ceiling = cap.currency,
+        } });
+        return error.CurrencyDiffersFromCeiling;
+    }
+    if (want.max_cost > cap.max_cost) {
+        _ = note(diag, .{ .above_org_ceiling = .{
+            .asked = want.max_cost,
+            .ceiling = cap.max_cost,
+            .currency = cap.currency,
+        } });
+        return error.AboveOrgCeiling;
+    }
+    return want;
 }
 
 /// Read `chock.zon` from `project_root` and take its budget. Null when the
@@ -392,9 +520,11 @@ test "no two faults of this module read the same" {
         .{ .max_cost_not_positive = 0 },
         .{ .file_too_large = max_file_bytes },
         .{ .read_failed = error.AccessDenied },
+        .{ .above_org_ceiling = .{ .asked = 50, .ceiling = 5, .currency = "USD" } },
+        .{ .currency_differs_from_ceiling = .{ .asked = "JPY", .ceiling = "USD" } },
     };
-    var buffers: [4][256]u8 = undefined;
-    var lines: [4][]const u8 = undefined;
+    var buffers: [6][512]u8 = undefined;
+    var lines: [6][]const u8 = undefined;
     for (cases, 0..) |case, i| {
         lines[i] = try std.fmt.bufPrint(&buffers[i], "{f}", .{&case});
         try testing.expect(lines[i].len > 0);
@@ -402,4 +532,92 @@ test "no two faults of this module read the same" {
     for (lines, 0..) |line, i| {
         for (lines[i + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, line, other));
     }
+}
+
+test "a project under the org ceiling keeps its own budget" {
+    // The minimum of the two, and the project is the smaller one. Nothing is
+    // rewritten: the currency string that comes back is the project's own.
+    const project = Budget{ .max_cost = 2.5, .currency = "USD" };
+    const ceiling = Budget{ .max_cost = 5.0, .currency = "USD" };
+    const folded = (try underCeiling(project, ceiling, null)).?;
+    try testing.expectApproxEqAbs(@as(f64, 2.5), folded.max_cost, 1e-12);
+    try testing.expectEqualStrings("USD", folded.currency);
+
+    // The boundary. A project that asks for exactly the ceiling is at the
+    // ceiling and not above it, so it runs.
+    const at_the_line = (try underCeiling(
+        .{ .max_cost = 5.0, .currency = "USD" },
+        ceiling,
+        null,
+    )).?;
+    try testing.expectApproxEqAbs(@as(f64, 5.0), at_the_line.max_cost, 1e-12);
+}
+
+test "a project above the org ceiling is refused, and the refusal names both numbers" {
+    // The decision this module argues beside `underCeiling`: a clamp here
+    // would leave the project believing it has 50.
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(testing.allocator);
+    try testing.expectError(error.AboveOrgCeiling, underCeiling(
+        .{ .max_cost = 50.0, .currency = "USD" },
+        .{ .max_cost = 5.0, .currency = "USD" },
+        &diag,
+    ));
+    try testing.expectApproxEqAbs(@as(f64, 50.0), diag.?.above_org_ceiling.asked, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 5.0), diag.?.above_org_ceiling.ceiling, 1e-12);
+
+    var buffer: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
+    // Both numbers are in the sentence a person reads, so nobody has to open
+    // two files to learn which one is which.
+    try testing.expect(std.mem.indexOf(u8, line, "50 USD") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "5 USD") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "chock.zon") != null);
+}
+
+test "an org bundle with no ceiling leaves a project's own budget alone" {
+    const project = Budget{ .max_cost = 900.0, .currency = "JPY" };
+    const folded = (try underCeiling(project, null, null)).?;
+    try testing.expectApproxEqAbs(@as(f64, 900.0), folded.max_cost, 1e-12);
+    try testing.expectEqualStrings("JPY", folded.currency);
+
+    // Neither side named a number, so there is no cap at all. This is every
+    // installation that predates org ceilings.
+    try testing.expectEqual(@as(?Budget, null), try underCeiling(null, null, null));
+}
+
+test "a project with no budget of its own takes the org ceiling" {
+    // An organisation that capped its projects capped the ones that wrote no
+    // cap as well, or the ceiling would bind only the projects that already
+    // agreed to be bound.
+    const folded = (try underCeiling(null, .{ .max_cost = 5.0, .currency = "USD" }, null)).?;
+    try testing.expectApproxEqAbs(@as(f64, 5.0), folded.max_cost, 1e-12);
+    try testing.expectEqualStrings("USD", folded.currency);
+}
+
+test "a budget and a ceiling in two currencies refuse rather than compare" {
+    // 900 is a smaller number than no ceiling at all and a larger one than 5,
+    // and neither fact means anything across two currencies. Both orders
+    // refuse, so the answer does not depend on which number happens to be
+    // bigger.
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(testing.allocator);
+    try testing.expectError(error.CurrencyDiffersFromCeiling, underCeiling(
+        .{ .max_cost = 900.0, .currency = "JPY" },
+        .{ .max_cost = 5.0, .currency = "USD" },
+        &diag,
+    ));
+    try testing.expectEqualStrings("JPY", diag.?.currency_differs_from_ceiling.asked);
+    try testing.expectEqualStrings("USD", diag.?.currency_differs_from_ceiling.ceiling);
+
+    try testing.expectError(error.CurrencyDiffersFromCeiling, underCeiling(
+        .{ .max_cost = 1.0, .currency = "JPY" },
+        .{ .max_cost = 5.0, .currency = "USD" },
+        null,
+    ));
+
+    var buffer: [512]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
+    try testing.expect(std.mem.indexOf(u8, line, "JPY") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "USD") != null);
 }

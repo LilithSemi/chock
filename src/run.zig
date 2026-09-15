@@ -1172,6 +1172,16 @@ fn reportOrgBundle(bundle: *const chock_policy.org.Bundle, now_ms: i64) void {
         });
     }
 
+    // **A ceiling is said out loud, whoever the bundle names.** A person who
+    // is held to a number has to be able to see the number, and the one line
+    // that reports the subject is printed only for a bundle that named one.
+    if (orgBudgetCeiling(bundle)) |ceiling| {
+        tty.print(.plain, "chock: org policy budget ceiling {d} {s}\n", .{
+            ceiling.max_cost,
+            ceiling.currency,
+        });
+    }
+
     const stale_ms = bundle.expiredForMs(now_ms) orelse return;
     const days = daysIn(stale_ms);
     tty.print(
@@ -1829,6 +1839,10 @@ fn start(
     // it is the user's to hear about now rather than on the turn it would have
     // bitten. The same file is kept beyond the agent's reach, which is what
     // makes this a control the model cannot raise for itself.
+    //
+    // The number the file asks for is not always the number the session gets:
+    // `budgetUnderOrg` folds it under the ceiling the org policy bundle sets,
+    // and refuses the session when the file asks for more than that.
     var budget_diag: ?chock_cost.budget.Diagnostic = null;
     defer if (budget_diag) |*d| d.deinit(arena);
     const from_file = chock_cost.budget.load(arena, io, project_root, &budget_diag) catch |err| {
@@ -1842,7 +1856,7 @@ fn start(
         }
         return error.Reported;
     };
-    const budget = budgetFor(from_file, options);
+    const budget = try budgetUnderOrg(arena, from_file, options, org_bundle);
     const billing = chock_cost.prices.billingFor(instance.base_url);
     warnUnmeasurableBudget(budget, billing, instance.name, model);
 
@@ -2679,32 +2693,119 @@ fn approvalEndpoint(
     return endpoint;
 }
 
+/// The ceiling this installation's org policy bundle sets, as a `Budget` the
+/// cost library can fold.
+///
+/// **This is the seam between two libraries that do not know each other.**
+/// `lib/chock-policy` imports no other chock library, so it writes the ceiling
+/// out in its own `org.BudgetCeiling`; `lib/chock-cost` owns the budget type
+/// and the one default currency. This command already joins the two libraries
+/// for the audit sinks, and it joins them here the same way, in one named
+/// function a test can hold both halves against.
+///
+/// A currency the bundle left out is `USD`, exactly as it is for a project
+/// that left it out of `chock.zon`. **The same default on both sides**, or an
+/// organisation that wrote a plain number would be refusing every project that
+/// wrote a plain number.
+fn orgBudgetCeiling(
+    org_bundle: ?*const chock_policy.org.Bundle,
+) ?chock_cost.budget.Budget {
+    const bundle = org_bundle orelse return null;
+    const ceiling = bundle.budget orelse return null;
+    return .{
+        .max_cost = ceiling.max_cost,
+        .currency = if (ceiling.currency.len != 0)
+            ceiling.currency
+        else
+            chock_cost.budget.default_currency,
+    };
+}
+
 /// What this session may spend: the cap in `chock.zon`, the slice a parent
-/// gave it, or the smaller of the two.
+/// gave it, and the ceiling the org policy bundle sets, folded in that order.
 ///
 /// **A slice can only ever narrow.** A parent divides what it has left and
 /// hands a piece to each child, through `chock_core.subagent.budgetSlice`, and
 /// the project's own cap still binds every session of that project. Taking the
 /// smaller of the two means neither a parent nor a project file can be worked
-/// around by the other.
+/// around by the other. A currency the parent did not name is the project's
+/// own, and a parent that named one wins: the parent is what divided the
+/// number.
 ///
-/// A currency the parent did not name is the project's own, and a parent that
-/// named one wins: the parent is what divided the number.
-fn budgetFor(from_file: ?chock_cost.budget.Budget, options: Options) ?chock_cost.budget.Budget {
-    const slice = options.max_cost orelse return from_file;
-    const currency = if (options.currency.len != 0)
-        options.currency
-    else if (from_file) |file| file.currency else chock_cost.budget.default_currency;
+/// **The ceiling is folded last, over every other source.** A budget reaches a
+/// session from `chock.zon` or from the slice a parent handed a subagent, and
+/// the ceiling has to bind both: an organisation that capped a project did not
+/// cap only the projects that read their cap out of a file. Folding last means
+/// there is one place the answer is checked, and no source that can be added
+/// later without passing through it.
+///
+/// **A session above the ceiling is refused here and not lowered.** The whole
+/// argument is beside `chock_cost.budget.underCeiling`. The one line of it:
+/// lowering the number quietly leaves a project believing it has money it does
+/// not have, and it finds out as a session that stops in the middle of the
+/// work with nothing said about why.
+///
+/// **One function and not two, so `start` has nothing else to call.** The two
+/// halves were separate while the ceiling did not exist, and a `start` that
+/// took the slice and skipped the ceiling would have passed every test of the
+/// fold itself: see `lib/chock-core/constitution.zig`, on mechanisms in this
+/// project that shipped with green tests and no caller at all. There is now
+/// one answer to "what may this session spend", and it is this.
+fn budgetUnderOrg(
+    gpa: std.mem.Allocator,
+    from_file: ?chock_cost.budget.Budget,
+    options: Options,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) StartError!?chock_cost.budget.Budget {
+    const asked: ?chock_cost.budget.Budget = asked: {
+        const slice = options.max_cost orelse break :asked from_file;
+        const currency = if (options.currency.len != 0)
+            options.currency
+        else if (from_file) |file| file.currency else chock_cost.budget.default_currency;
 
-    const file_cap = from_file orelse return .{ .max_cost = slice, .currency = currency };
-    // Two caps in two currencies cannot be compared at all, and inventing a
-    // rate would be worse than not enforcing. The narrower answer is the
-    // parent's own, because a parent that hands out a slice has already
-    // decided the tree's total.
-    if (!std.mem.eql(u8, file_cap.currency, currency)) {
-        return .{ .max_cost = slice, .currency = currency };
-    }
-    return .{ .max_cost = @min(file_cap.max_cost, slice), .currency = currency };
+        const file_cap = from_file orelse break :asked .{
+            .max_cost = slice,
+            .currency = currency,
+        };
+        // Two caps in two currencies cannot be compared at all, and inventing
+        // a rate would be worse than not enforcing. The narrower answer is the
+        // parent's own, because a parent that hands out a slice has already
+        // decided the tree's total. The org ceiling below refuses this pair
+        // rather than taking a side, because there it is the ceiling that the
+        // other currency would walk around.
+        if (!std.mem.eql(u8, file_cap.currency, currency)) {
+            break :asked .{ .max_cost = slice, .currency = currency };
+        }
+        break :asked .{
+            .max_cost = @min(file_cap.max_cost, slice),
+            .currency = currency,
+        };
+    };
+
+    var diag: ?chock_cost.budget.Diagnostic = null;
+    // Neither of the two variants this call can raise owns memory: both hold
+    // numbers and strings borrowed from the two budgets, which outlive this
+    // function. `deinit` is still called all the same, because a caller that
+    // asks which variant it holds before releasing it is a caller that breaks
+    // the day a variant that does own memory is added.
+    defer if (diag) |*d| d.deinit(gpa);
+    return chock_cost.budget.underCeiling(
+        asked,
+        orgBudgetCeiling(org_bundle),
+        &diag,
+    ) catch {
+        if (diag) |*d| {
+            tty.print(.err, "chock run: {f}\n", .{d});
+        } else {
+            tty.print(
+                .err,
+                "chock run: the budget is above the ceiling this installation's org policy " ++
+                    "bundle sets.\n",
+                .{},
+            );
+        }
+        return error.Reported;
+    };
 }
 
 /// Every parent of this session, root first. Empty for a session a person
@@ -12925,37 +13026,181 @@ test "the flags a parent writes are the flags this parser reads" {
     try testing.expectEqualStrings("", said.out());
 }
 
+test "a budget ceiling is said out loud, whether or not the bundle names a subject" {
+    // A person held to a number has to see the number. The line that reports
+    // the subject is printed only for a bundle that named one, so a ceiling
+    // that rode on that line would be silent for every anonymous bundle.
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const anonymous = try chock_policy.org.parse(arena, ".{ .budget = .{ .max_cost = 5.0 } }", null);
+    reportOrgBundle(anonymous, 0);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "budget ceiling 5 USD") != null);
+
+    // And a bundle that sets none says nothing about one.
+    said.clear();
+    const no_ceiling = try chock_policy.org.parse(arena, ".{ .rules = .{} }", null);
+    reportOrgBundle(no_ceiling, 0);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "budget ceiling") == null);
+}
+
+test "an org budget ceiling binds this session, and a project above it is refused out loud" {
+    const gpa = testing.allocator;
+
+    // The layer above the project. It is a field of the bundle and not a rule,
+    // and the fold is a minimum: see `chock_policy.org.BudgetCeiling`.
+    const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
+
+    // A project below the ceiling keeps its own number. Narrowing is free.
+    const modest = chock_cost.budget.Budget{ .max_cost = 2.5, .currency = "USD" };
+    const kept = (try budgetUnderOrg(gpa, modest, .{}, &capped)).?;
+    try testing.expectEqual(@as(f64, 2.5), kept.max_cost);
+    try testing.expectEqualStrings("USD", kept.currency);
+
+    // A project above it is refused, and both numbers are in what the person
+    // reads. **Not clamped to 5**: a session that ran at 5 while `chock.zon`
+    // said 50 would stop in the middle of the work with nothing said about
+    // why, which is the failure this whole refusal exists to remove.
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    const greedy = chock_cost.budget.Budget{ .max_cost = 50.0, .currency = "USD" };
+    try testing.expectError(error.Reported, budgetUnderOrg(gpa, greedy, .{}, &capped));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "50 USD") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "5 USD") != null);
+    try testing.expectEqualStrings("", said.out());
+}
+
+test "an org bundle with no ceiling leaves a project alone, and one with a ceiling caps a project that wrote none" {
+    const gpa = testing.allocator;
+
+    // Every bundle written before this field. A rule only bundle sets no
+    // ceiling at all, so the project's own cap is the only cap there is.
+    const rules_only: chock_policy.org.Bundle = .{};
+    const own = chock_cost.budget.Budget{ .max_cost = 50.0, .currency = "USD" };
+    const untouched = (try budgetUnderOrg(gpa, own, .{}, &rules_only)).?;
+    try testing.expectEqual(@as(f64, 50.0), untouched.max_cost);
+
+    // An installation with no bundle at all reads the same way.
+    const no_bundle = (try budgetUnderOrg(gpa, own, .{}, null)).?;
+    try testing.expectEqual(@as(f64, 50.0), no_bundle.max_cost);
+
+    // A project that wrote no cap gets the organisation's. A ceiling that
+    // bound only the projects which had already agreed to be bound would bind
+    // nothing.
+    const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
+    const from_org = (try budgetUnderOrg(gpa, null, .{}, &capped)).?;
+    try testing.expectEqual(@as(f64, 5.0), from_org.max_cost);
+    try testing.expectEqualStrings("USD", from_org.currency);
+
+    // And a project with no cap under no ceiling still has no cap.
+    try testing.expectEqual(
+        @as(?chock_cost.budget.Budget, null),
+        try budgetUnderOrg(gpa, null, .{}, &rules_only),
+    );
+}
+
+test "the org ceiling is folded after the parent slice, so no source of a budget goes around it" {
+    const gpa = testing.allocator;
+    const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
+
+    // A slice narrows below the ceiling, which is every subagent of a project
+    // that is itself under the ceiling.
+    const sliced = (try budgetUnderOrg(gpa, .{ .max_cost = 5.0, .currency = "USD" }, .{
+        .max_cost = 1.25,
+    }, &capped)).?;
+    try testing.expectEqual(@as(f64, 1.25), sliced.max_cost);
+
+    // A slice in another currency is where `budgetFor` alone would let a
+    // session past the ceiling: it takes the parent's currency and the
+    // parent's number, and 900 JPY says nothing about 5 USD. The fold runs
+    // over the answer and not over the file, so the pair is refused here.
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    try testing.expectError(error.Reported, budgetUnderOrg(gpa, null, .{
+        .max_cost = 900.0,
+        .currency = "JPY",
+    }, &capped));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "JPY") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "USD") != null);
+}
+
+test "a ceiling that names no currency is USD, the same default a project gets" {
+    // Both sides default the same way, or an organisation that wrote a plain
+    // number would refuse every project that wrote a plain number.
+    const plain: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0 } };
+    const ceiling = orgBudgetCeiling(&plain).?;
+    try testing.expectEqual(@as(f64, 5.0), ceiling.max_cost);
+    try testing.expectEqualStrings(chock_cost.budget.default_currency, ceiling.currency);
+
+    // A bundle that names one keeps it.
+    const yen: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 900.0, .currency = "JPY" } };
+    try testing.expectEqualStrings("JPY", orgBudgetCeiling(&yen).?.currency);
+
+    // No bundle, and a bundle with no ceiling, are the same answer.
+    try testing.expectEqual(@as(?chock_cost.budget.Budget, null), orgBudgetCeiling(null));
+    const rules_only: chock_policy.org.Bundle = .{};
+    try testing.expectEqual(@as(?chock_cost.budget.Budget, null), orgBudgetCeiling(&rules_only));
+}
+
 test "a budget slice narrows what chock.zon allows and can never widen it" {
     // Both controls hold. A parent divides what it has left, and the project's
     // own cap still binds every session of that project, so neither one can be
     // worked around by the other.
+    //
+    // **Driven through `budgetUnderOrg` with no bundle**, because that is the
+    // one function that answers what a session may spend. An installation with
+    // no org policy bundle sets no ceiling, so what comes back here is the
+    // slice fold on its own.
+    const gpa = testing.allocator;
     const file_cap = chock_cost.budget.Budget{ .max_cost = 5.0, .currency = "USD" };
 
     // No slice at all: the project's cap, unchanged.
-    try testing.expectEqual(@as(f64, 5.0), budgetFor(file_cap, .{}).?.max_cost);
+    try testing.expectEqual(@as(f64, 5.0), (try budgetUnderOrg(gpa, file_cap, .{}, null)).?.max_cost);
 
     // A slice below the cap wins, because it is the narrower of the two.
-    try testing.expectEqual(@as(f64, 1.25), budgetFor(file_cap, .{ .max_cost = 1.25 }).?.max_cost);
+    try testing.expectEqual(
+        @as(f64, 1.25),
+        (try budgetUnderOrg(gpa, file_cap, .{ .max_cost = 1.25 }, null)).?.max_cost,
+    );
 
     // **A slice above the cap does not widen it.** A parent that asked for
     // more than the project allows gets the project's number.
-    try testing.expectEqual(@as(f64, 5.0), budgetFor(file_cap, .{ .max_cost = 500.0 }).?.max_cost);
+    try testing.expectEqual(
+        @as(f64, 5.0),
+        (try budgetUnderOrg(gpa, file_cap, .{ .max_cost = 500.0 }, null)).?.max_cost,
+    );
 
     // A project with no cap of its own still runs the child under its slice,
     // which is what bounds a tree whose project set no total.
-    try testing.expectEqual(@as(f64, 1.25), budgetFor(null, .{ .max_cost = 1.25 }).?.max_cost);
-    try testing.expectEqualStrings("USD", budgetFor(null, .{ .max_cost = 1.25 }).?.currency);
+    const sliced = (try budgetUnderOrg(gpa, null, .{ .max_cost = 1.25 }, null)).?;
+    try testing.expectEqual(@as(f64, 1.25), sliced.max_cost);
+    try testing.expectEqualStrings("USD", sliced.currency);
 
     // Two caps in two currencies cannot be compared, and inventing a rate
     // would be worse than not enforcing. The parent's own number is the answer,
     // because a parent that handed out a slice already decided the total.
-    const in_yen = budgetFor(file_cap, .{ .max_cost = 900.0, .currency = "JPY" }).?;
+    const in_yen = (try budgetUnderOrg(gpa, file_cap, .{
+        .max_cost = 900.0,
+        .currency = "JPY",
+    }, null)).?;
     try testing.expectEqual(@as(f64, 900.0), in_yen.max_cost);
     try testing.expectEqualStrings("JPY", in_yen.currency);
 
     // And a session nobody gave a slice keeps whatever the file said, cap or
     // no cap.
-    try testing.expectEqual(@as(?chock_cost.budget.Budget, null), budgetFor(null, .{}));
+    try testing.expectEqual(
+        @as(?chock_cost.budget.Budget, null),
+        try budgetUnderOrg(gpa, null, .{}, null),
+    );
 }
 
 /// A value each option in `value_options` accepts, for the test above.

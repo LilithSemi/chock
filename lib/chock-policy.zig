@@ -20,9 +20,11 @@
 //! `lib/chock-policy/org.zig` holds the layer above the project: the policy an
 //! organisation gives an installation, which `chock.zon` may only narrow. It
 //! is the same rule again, one level up, and `table.Table.org` is where it
-//! joins the same intersection. It also holds the one thing in this library
-//! that is not a rule: the audit sinks every session of an installation writes,
-//! which a project may add to and can never take from.
+//! joins the same intersection. It also holds the two things in this library
+//! that are not rules: the audit sinks every session of an installation writes,
+//! which a project may add to and can never take from, and the budget ceiling,
+//! which a project may go under and can never go over. Neither is a row,
+//! because a rule answers "may this happen" and neither of these does.
 //!
 //! `lib/chock-policy/access.zig` holds the two action names that say which
 //! providers and which models a session may use. They are rows on the table

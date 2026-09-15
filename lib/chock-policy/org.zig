@@ -74,6 +74,25 @@
 //! outcome this file exists to prevent. A hub that adds a field which changes
 //! what is permitted raises the version.
 //!
+//! ## A budget ceiling, which is a bound and not a rule
+//!
+//! An organisation caps what a project may spend, and a project may not raise
+//! that cap. The rule is the one above, one more time: narrowing is free and
+//! widening is not. The arithmetic is different, though, and that difference
+//! is the whole of the design.
+//!
+//! **A rule answers "may this happen" and a bound answers "how much".** The
+//! table folds its layers as an intersection of decisions; a ceiling folds as
+//! a **minimum** of two numbers. So `budget` is a field of a `Bundle` and
+//! never a `table.Rule`, for the same reason a required sink is a field: the
+//! arithmetic a rule uses is the wrong arithmetic for this question.
+//!
+//! **A project above the ceiling is refused, and never quietly lowered.**
+//! `chock_cost.budget.underCeiling` takes the minimum and argues that decision
+//! in full. The short of it: a project that got a smaller number than it wrote
+//! believes it has money it does not have, and finds out as a session that
+//! stops in the middle of the work with no stated cause.
+//!
 //! ## A required sink, which is a control and not an option
 //!
 //! Log export is `lib/chock-proto/ship.zig`, and until this field it was
@@ -236,6 +255,31 @@ pub const RequiredSink = struct {
     };
 };
 
+/// The most every session of this installation may spend, whatever `chock.zon`
+/// asks for.
+///
+/// **A bound and not a rule, so it is a field and not a `table.Rule`.** The
+/// table answers "may this happen" and folds its layers as an intersection of
+/// decisions. This answers "how much", and the fold for a number is a minimum:
+/// `chock_cost.budget.underCeiling` takes it, and that function argues in full
+/// why a project above the ceiling is refused instead of quietly lowered.
+///
+/// The same shape as `chock_cost.budget.Budget`, written out again here
+/// because **this library imports no other chock library**, which is the rule
+/// `lib/chock-policy.zig` states. `src/run.zig` joins the two, the same way it
+/// already joins `RequiredSink.Kind` to the shipper's own kinds.
+pub const BudgetCeiling = struct {
+    /// The ceiling, in `currency`. Above zero and finite, and `validate`
+    /// refuses a bundle whose number is neither.
+    max_cost: f64,
+    /// ISO 4217. **Empty when the bundle named none**, and the one default
+    /// lives in `chock_cost.budget.default_currency` rather than being spelled
+    /// a second time here. An empty string is also what `subject` and `issuer`
+    /// hold for a field the file left out, so the free path of
+    /// `std.zon.parse` sees the same thing it already sees.
+    currency: []const u8 = "",
+};
+
 /// What a bundle file holds.
 ///
 /// **`rules` is the whole of the policy, and there are no `agents`.** A
@@ -275,6 +319,13 @@ pub const Bundle = struct {
     /// file's own top comment. A project adds a sink of its own and can drop
     /// none of these.
     sinks: []const RequiredSink = &.{},
+    /// The most a session of this installation may spend. Null for a bundle
+    /// that sets no ceiling, which is every bundle that predates this field,
+    /// and then a project's own `budget` block is the only cap there is.
+    ///
+    /// **A field and not a rule, and a minimum and not an intersection**: see
+    /// `BudgetCeiling`.
+    budget: ?BudgetCeiling = null,
     /// The version of the bundle format. See `max_version`.
     version: u32 = 1,
 
@@ -323,6 +374,11 @@ pub const ParseError = error{
     /// A required sink names a path this reader will not take: an empty one, a
     /// relative one, or one longer than `max_sink_path_bytes`.
     InvalidSinkPath,
+    /// The budget ceiling's `max_cost` is zero, negative, or not a number. The
+    /// same rule `chock_cost.budget` keeps for a project's own cap: a ceiling
+    /// of zero would refuse the first turn of every session in the
+    /// installation, and a negative one has no meaning at all.
+    InvalidBudgetCeiling,
 };
 
 /// What can go wrong while reading a bundle from a path.
@@ -374,6 +430,9 @@ pub const Diagnostic = union(enum) {
     /// A required sink names a path longer than `max_sink_path_bytes`. The
     /// number is which sink, counted from one.
     sink_path_too_long: usize,
+    /// The budget ceiling names a `max_cost` that is not a number above zero.
+    /// The value is what the file said.
+    budget_max_cost_not_positive: f64,
 
     pub const NameTooLong = struct {
         field: []const u8,
@@ -442,6 +501,12 @@ pub const Diagnostic = union(enum) {
             .sink_path_too_long => |which| try writer.print(
                 "audit sink {d} of the org policy bundle names a path longer than {d} bytes.",
                 .{ which, max_sink_path_bytes },
+            ),
+            .budget_max_cost_not_positive => |value| try writer.print(
+                "the org policy bundle's budget ceiling must be a number above zero, and this " ++
+                    "one is {d}. A ceiling of zero stops every session in this installation on " ++
+                    "its first turn, which is not a cap anybody writes on purpose.",
+                .{value},
             ),
         }
     }
@@ -589,6 +654,17 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         if (!std.fs.path.isAbsolute(sink.path)) {
             _ = note(diag, .{ .sink_path_relative = which });
             return error.InvalidSinkPath;
+        }
+    }
+
+    // The same test `chock_cost.budget.parse` makes on a project's own cap,
+    // and it is made here for the same reason: a number that cannot bound
+    // anything is heard when the file is read, and not on the turn it would
+    // have stopped the work.
+    if (bundle.budget) |ceiling| {
+        if (!(ceiling.max_cost > 0) or !std.math.isFinite(ceiling.max_cost)) {
+            _ = note(diag, .{ .budget_max_cost_not_positive = ceiling.max_cost });
+            return error.InvalidBudgetCeiling;
         }
     }
 }
@@ -1021,6 +1097,7 @@ test "no two faults of this module read the same" {
         .{ .sink_path_empty = 1 },
         .{ .sink_path_relative = 1 },
         .{ .sink_path_too_long = 1 },
+        .{ .budget_max_cost_not_positive = 0 },
     };
 
     var rendered: [faults.len][]u8 = undefined;
@@ -1048,5 +1125,61 @@ test "a caller that wants no diagnostic allocates nothing extra for one" {
     try testing.expectError(
         error.VersionTooNew,
         parse(testing.allocator, ".{ .version = 99, .rules = .{} }", null),
+    );
+}
+
+test "a bundle sets a budget ceiling, and one that names none sets no ceiling" {
+    const gpa = testing.allocator;
+
+    const source = try bundleSource(gpa,
+        \\ .subject = "ross@example.org",
+        \\ .budget = .{ .max_cost = 5.0, .currency = "USD" },
+    );
+    defer gpa.free(source);
+
+    const bundle = try parse(gpa, source, null);
+    defer destroy(gpa, bundle);
+    try testing.expectApproxEqAbs(@as(f64, 5.0), bundle.budget.?.max_cost, 1e-12);
+    try testing.expectEqualStrings("USD", bundle.budget.?.currency);
+
+    // The ordinary bundle, which is every bundle written before this field
+    // existed. Null is no ceiling at all, and a project's own cap is then the
+    // only cap there is.
+    const no_ceiling = try parse(gpa, ".{ .rules = .{} }", null);
+    defer destroy(gpa, no_ceiling);
+    try testing.expectEqual(@as(?BudgetCeiling, null), no_ceiling.budget);
+}
+
+test "a budget ceiling that names no currency leaves the field empty for the folder to fill" {
+    // The one default lives in `chock_cost.budget.default_currency`, and this
+    // library imports no other chock library, so an empty string travels and
+    // `src/run.zig` puts the default on it.
+    const gpa = testing.allocator;
+    const bundle = try parse(gpa, ".{ .budget = .{ .max_cost = 5.0 } }", null);
+    defer destroy(gpa, bundle);
+    try testing.expectEqualStrings("", bundle.budget.?.currency);
+}
+
+test "a budget ceiling of zero or below is refused when the bundle is read" {
+    // Read time and not run time, the same rule `chock_cost.budget.parse`
+    // keeps: a ceiling of zero stops every session of the installation on its
+    // first turn, and nobody writes that on purpose.
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidBudgetCeiling,
+        parse(gpa, ".{ .budget = .{ .max_cost = 0.0 } }", &diag),
+    );
+    try testing.expectApproxEqAbs(
+        @as(f64, 0.0),
+        diag.?.budget_max_cost_not_positive,
+        1e-12,
+    );
+
+    try testing.expectError(
+        error.InvalidBudgetCeiling,
+        parse(gpa, ".{ .budget = .{ .max_cost = -1.0 } }", null),
     );
 }

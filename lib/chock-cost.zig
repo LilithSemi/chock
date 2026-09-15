@@ -18,7 +18,11 @@
 //!   of `chock.zon`, which is already beyond the agent's reach: the
 //!   workspace binds the project's own copy back over that path
 //!   read only, so **the model cannot raise its own budget**, and
-//!   `test/workspace/escape.zig` proves it on a running system.
+//!   `test/workspace/escape.zig` proves it on a running system. It also holds
+//!   `underCeiling`, which folds that cap under the ceiling an organisation
+//!   sets in the bundle `lib/chock-policy/org.zig` reads: the fold is a
+//!   minimum, and **a project above the ceiling is refused and never quietly
+//!   lowered**.
 //!
 //! This library imports `chock-proto` for the `Cost` and `Usage` types the
 //! log already carries, and nothing else. It reads a file and does
