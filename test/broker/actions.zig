@@ -334,6 +334,9 @@ test "the broker runs the action, and the agent never holds the capability" {
         .scratch_object_store = wt.object_store_source,
         .ref = "refs/heads/main",
         .new_id = agent_commit,
+        // No landing: this test is about the objects and the ref, the part of
+        // an apply that happens whatever the mode is.
+        .wanted = .{ .none = .nobody_answered },
     }, null);
     try testing.expect(apply.objects.len >= 3);
 
@@ -586,6 +589,9 @@ test "an agent that asks for an apply the table allows carries its commit into t
             .scratch_object_store = wt.object_store_source,
             .ref = ref,
             .new_id = agent_commit,
+            // No landing: this test is about what an agent gains by asking, and
+            // the answer is the ref and never a branch of the user's.
+            .wanted = .{ .none = .nobody_answered },
         }, null);
         var waits: usize = 0;
         const refused = try askTheTable(
@@ -614,6 +620,9 @@ test "an agent that asks for an apply the table allows carries its commit into t
             .scratch_object_store = wt.object_store_source,
             .ref = ref,
             .new_id = agent_commit,
+            // No landing: this test is about what an agent gains by asking, and
+            // the answer is the ref and never a branch of the user's.
+            .wanted = .{ .none = .nobody_answered },
         }, null);
         // The description is what a person reads, and it has to say what would
         // be applied or the approval is theatre. The commit is named and the
@@ -806,18 +815,18 @@ const Carried = struct {
         }));
     }
 
-    /// Describe an apply of this session's commit, in `landing`.
+    /// Describe an apply of this session's commit, in `wanted`.
     fn describing(
         self: *const Carried,
         arena: std.mem.Allocator,
-        landing: Landing,
+        wanted: chock_broker.integrate.Wanted,
     ) !actions.WorkspaceApply {
         return actions.WorkspaceApply.describing(arena, testing.io, .{ .env = &self.project.env }, .{
             .repository = self.project.root_path,
             .scratch_object_store = self.tree().object_store_source,
             .ref = apply_ref,
             .new_id = self.commit,
-            .landing = landing,
+            .wanted = wanted,
         }, null);
     }
 
@@ -877,10 +886,20 @@ fn applying(gpa: std.mem.Allocator, carried: *const Carried, apply: actions.Work
     );
 }
 
-test "a project that says nothing parks the work and moves no branch" {
-    // **The default, proved against real git.** This is what every session did
-    // before modes existed, and the whole feature is only safe if a project
-    // that has never heard of it behaves exactly as it did.
+test "a project that says nothing merges the work onto its branch, and says so before it is asked" {
+    // **The default, proved against real git, and read out of the one place it
+    // lives.** No mode is written here: the landing comes from
+    // `chock_policy.apply.Settings{}`, so this test follows the default rather
+    // than restating it, and it fails if the default ever stops naming a
+    // landing at all.
+    //
+    // The project owner approved six applies that parked and read every one as
+    // a merge. The approval is the consent, so a project that has never heard
+    // of this block now gets the act the prompt describes.
+    //
+    // Mutation check: write `.mode = .rebase` in `Settings` and the parent
+    // count below fails; take the branch off the move arm of `Action.summary`
+    // and the summary check fails.
     const gpa = testing.allocator;
     const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
     defer gpa.free(git_path);
@@ -889,29 +908,99 @@ test "a project that says nothing parks the work and moves no branch" {
     defer tmp.cleanup();
     var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
     defer carried.deinit(gpa);
+    // The user has committed since the session started, so the branch has
+    // really moved on and a merge is a merge rather than a fast forward.
+    try carried.commitOnMain(gpa, "user.txt", "the user wrote this\n");
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    // `describing` with no `landing` at all: the field has a default, and the
-    // default is what a caller that has not heard of modes gets.
-    const apply = try actions.WorkspaceApply.describing(
-        arena_state.allocator(),
-        testing.io,
-        .{ .env = &carried.project.env },
-        .{
-            .repository = carried.project.root_path,
-            .scratch_object_store = carried.tree().object_store_source,
-            .ref = apply_ref,
-            .new_id = carried.commit,
-        },
-        null,
+    // The whole chain a project with no `chock.zon` walks: the `Settings`
+    // default, which no policy row bounds, settled into a landing.
+    const settings = chock_policy.apply.Settings{};
+    try testing.expectEqual(
+        @as(?chock_policy.apply.Mode, settings.mode),
+        chock_policy.apply.boundBy(settings.mode, .allow),
     );
+    const landing = settings.mode.settled() orelse return error.TheDefaultAsksAQuestion;
+
+    const apply = try carried.describing(arena_state.allocator(), .{ .land = landing });
+    try testing.expect(apply.integration == .move);
+    try testing.expectEqualStrings("refs/heads/main", apply.integration.move.branch);
+
+    // **And the person is told before they answer.** The one line every client
+    // shows names the branch and the landing.
+    const said = try (actions.Action{ .workspace_apply = apply }).summary(gpa);
+    defer gpa.free(said);
+    try testing.expect(std.mem.indexOf(u8, said, "merge it into refs/heads/main") != null);
+
+    var attempt = try applying(gpa, &carried, apply);
+    try testing.expect(attempt == .done);
+    defer attempt.done.result.deinit(gpa);
+    const outcome = attempt.done.result.workspace_apply.integration;
+    try testing.expect(outcome == .moved);
+    try testing.expectEqualStrings("refs/heads/main", outcome.moved.branch);
+
+    // The branch really moved, and the history keeps both sides, which is what
+    // makes `merge` the conservative one of the three that move a branch.
+    const parents = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+        "rev-list", "--parents", "-n", "1", "HEAD",
+    });
+    defer gpa.free(parents);
+    var fields = std.mem.tokenizeScalar(u8, parents, ' ');
+    _ = fields.next();
+    var parent_count: usize = 0;
+    while (fields.next()) |_| parent_count += 1;
+    try testing.expectEqual(@as(usize, 2), parent_count);
+
+    // And the work is at the ref too, which is the thing a person can always
+    // fall back on, in every mode.
+    const at_ref = try gitOk(gpa, &carried.project.env, carried.project.root_path, &.{
+        "rev-parse", apply_ref,
+    });
+    defer gpa.free(at_ref);
+    try testing.expectEqualStrings(carried.commit, at_ref);
+}
+
+test "a policy that refuses the row parks the work, and the repository is untouched" {
+    // **`deny` on `workspace.integrate` is the one decision that bounds the
+    // landing**, and the default becoming `merge` must not weaken it. An
+    // organisation writes that rule once, `chock_policy.apply.boundBy` answers
+    // null, and `src/run.zig` turns null into the `Wanted` this describes with.
+    //
+    // Mutation check: let `boundBy` answer the mode for `deny` as well and the
+    // branch below moves.
+    const gpa = testing.allocator;
+    const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
+    defer gpa.free(git_path);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var carried = try Carried.init(gpa, tmp, carried_file, "the session wrote this\n");
+    defer carried.deinit(gpa);
+    try carried.commitOnMain(gpa, "user.txt", "the user wrote this\n");
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // The project asks for the default, and the row above it says no.
+    const bounded = chock_policy.apply.boundBy((chock_policy.apply.Settings{}).mode, .deny);
+    try testing.expectEqual(@as(?chock_policy.apply.Mode, null), bounded);
+
+    const apply = try carried.describing(arena_state.allocator(), .{ .none = .policy_refused });
     try testing.expect(apply.integration == .park);
     try testing.expectEqual(
-        chock_broker.integrate.Reason.not_asked_for,
+        chock_broker.integrate.Reason.policy_refused,
         apply.integration.park.why,
     );
+    // No landing is named, because none was ever settled on.
+    try testing.expectEqual(@as(?Landing, null), apply.integration.park.wanted);
+
+    // And the one line says that no branch moves, and why.
+    const said = try (actions.Action{ .workspace_apply = apply }).summary(gpa);
+    defer gpa.free(said);
+    try testing.expect(std.mem.indexOf(u8, said, "No branch of yours moves") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "workspace.integrate") != null);
 
     const before = try carried.snapshot(gpa);
     defer gpa.free(before);
@@ -957,7 +1046,7 @@ test "merge, rebase and squash each land the work on the branch the way they say
 
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const apply = try carried.describing(arena_state.allocator(), landing);
+        const apply = try carried.describing(arena_state.allocator(), .{ .land = landing });
 
         // The plan says which branch moves and where to, before anybody is
         // asked, and the commit it moves to is one of the objects the person
@@ -1021,7 +1110,6 @@ test "merge, rebase and squash each land the work on the branch the way they say
             .merge => try testing.expectEqual(@as(usize, 2), parent_count),
             // A rebase and a squash both leave a straight line.
             .rebase, .squash => try testing.expectEqual(@as(usize, 1), parent_count),
-            .ref => unreachable,
         }
 
         // The work is at the ref as well, in every mode. That is the thing a
@@ -1058,13 +1146,13 @@ test "a dirty working tree parks the work, and the repository is untouched" {
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const apply = try carried.describing(arena_state.allocator(), .merge);
+    const apply = try carried.describing(arena_state.allocator(), .{ .land = .merge });
 
     // **Known before anybody is asked**, and the prompt says so. A person is
     // never asked to approve a merge that was already known not to happen.
     try testing.expect(apply.integration == .park);
     try testing.expectEqual(chock_broker.integrate.Reason.dirty_tree, apply.integration.park.why);
-    try testing.expectEqual(Landing.merge, apply.integration.park.wanted);
+    try testing.expectEqual(@as(?Landing, .merge), apply.integration.park.wanted);
 
     var attempt = try applying(gpa, &carried, apply);
     try testing.expect(attempt == .done);
@@ -1111,7 +1199,7 @@ test "an integration that would conflict leaves the repository exactly as it was
 
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
-        const apply = try carried.describing(arena_state.allocator(), landing);
+        const apply = try carried.describing(arena_state.allocator(), .{ .land = landing });
         try testing.expect(apply.integration == .park);
         try testing.expectEqual(
             chock_broker.integrate.Reason.would_conflict,
@@ -1169,7 +1257,7 @@ test "a detached head and an unfinished merge each park the work" {
             "checkout", "--quiet", "--detach", "HEAD",
         }));
 
-        const apply = try carried.describing(arena_state.allocator(), .merge);
+        const apply = try carried.describing(arena_state.allocator(), .{ .land = .merge });
         try testing.expectEqual(
             chock_broker.integrate.Reason.detached_head,
             apply.integration.park.why,
@@ -1190,7 +1278,7 @@ test "a detached head and an unfinished merge each park the work" {
         defer gpa.free(path);
         try writeFileAbsolute(testing.io, path, "0000000000000000000000000000000000000000\n");
 
-        const apply = try carried.describing(arena_state.allocator(), .rebase);
+        const apply = try carried.describing(arena_state.allocator(), .{ .land = .rebase });
         try testing.expectEqual(
             chock_broker.integrate.Reason.unfinished_operation,
             apply.integration.park.why,
@@ -1199,8 +1287,10 @@ test "a detached head and an unfinished merge each park the work" {
 }
 
 test "the question a person is asked is different in every mode and names the mode" {
-    // **The property the modes are only safe with.** The same "y" at the same
-    // prompt now does four different things, so the prompt has to say which.
+    // **The property the modes are only safe with**, and the property that
+    // makes `merge` safe as the default: the same "y" at the same prompt does
+    // four different things, so the prompt has to say which, before it is
+    // answered.
     const gpa = testing.allocator;
     const git_path = (try findGitOnPath(gpa, testing.io)) orelse return error.SkipZigTest;
     defer gpa.free(git_path);
@@ -1214,10 +1304,18 @@ test "the question a person is asked is different in every mode and names the mo
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    var seen: [4][]u8 = undefined;
-    var seen_detail: [4][]u8 = undefined;
-    for (std.enums.values(Landing), 0..) |landing, index| {
-        const apply = try carried.describing(arena_state.allocator(), landing);
+    // The three landings, and the one case that names none: a policy row that
+    // refused it. Four prompts, and no two of them read alike.
+    const wanted = [_]chock_broker.integrate.Wanted{
+        .{ .land = .merge },
+        .{ .land = .rebase },
+        .{ .land = .squash },
+        .{ .none = .policy_refused },
+    };
+    var seen: [wanted.len][]u8 = undefined;
+    var seen_detail: [wanted.len][]u8 = undefined;
+    for (wanted, 0..) |one, index| {
+        const apply = try carried.describing(arena_state.allocator(), one);
         const action = actions.Action{ .workspace_apply = apply };
         seen[index] = try action.summary(gpa);
         seen_detail[index] = try action.detail(gpa);
@@ -1225,13 +1323,21 @@ test "the question a person is asked is different in every mode and names the mo
         // Every prompt says what happens to the branch, in words, in both the
         // one line and the whole of it.
         try testing.expect(std.mem.indexOf(u8, seen_detail[index], "your branch") != null);
-        if (landing == .ref) {
-            try testing.expect(std.mem.indexOf(u8, seen_detail[index], "no branch of yours moves") != null);
-        } else {
-            // The mode is named, and so is the branch it moves.
+        if (one.landing()) |landing| {
+            // The landing is named, and so is the branch it moves.
             try testing.expect(std.mem.indexOf(u8, seen[index], landing.wireName()) != null);
             try testing.expect(std.mem.indexOf(u8, seen[index], "refs/heads/main") != null);
             try testing.expect(std.mem.indexOf(u8, seen_detail[index], "moves it") != null);
+        } else {
+            // And a park says so, and says why, rather than leaving the branch
+            // out of the sentence.
+            try testing.expect(
+                std.mem.indexOf(u8, seen[index], "No branch of yours moves") != null,
+            );
+            try testing.expect(
+                std.mem.indexOf(u8, seen_detail[index], "no branch of yours moves") != null,
+            );
+            try testing.expect(std.mem.indexOf(u8, seen[index], "workspace.integrate") != null);
         }
     }
     defer for (seen) |one| gpa.free(one);

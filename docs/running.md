@@ -141,11 +141,12 @@ Work reaches your project only when the agent commits it in the workspace
 **and** the policy in your `chock.zon` permits the apply. It lands on
 `refs/chock/<session id>`, so `git log` reads it and `git merge` takes it.
 
-**No branch of yours moves unless you asked for that**, in the `apply` block of
-`chock.zon`. A project can say `merge`, `rebase` or `squash` there and have the
-work carried onto the branch it has checked out, or `ask` to be asked each time.
-The approval prompt names the mode it is about to use, and Chock refuses the
-integration rather than leave your repository in the middle of one. See
+**An approved apply merges the work into the branch you have checked out**, and
+the prompt names that branch and that merge before you answer. A project can say
+`rebase` or `squash` in the `apply` block of `chock.zon` instead, or `ask` to be
+asked each time. Chock refuses the integration rather than leave your repository
+in the middle of one, and the work is at the ref either way. An organisation
+that wants no branch touched writes one policy row. See
 [approvals.md](approvals.md).
 
 **A session that does not end cleanly keeps its workspace**, and prints where

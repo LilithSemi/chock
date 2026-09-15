@@ -175,19 +175,21 @@ places a session that gave it up says so.
 
 `workspace.integrate` is the second row of that shape, and it is read the other
 way round from `sandbox.jit`. A project says in its `chock.zon` how an approved
-apply should land, with `.apply = .{ .mode = .merge }` and the four modes
-[approvals.md](approvals.md) lists. This row says whether that mode may be
-anything but `ref`, which is the mode that moves no branch of yours.
+apply should land, with `.apply = .{ .mode = .rebase }` and the four modes
+[approvals.md](approvals.md) lists. This row says whether an approved apply may
+move a branch of yours at all. There is no mode that means "move nothing", so
+this row and a `n` at the prompt are the two ways to say it.
 
 ```zon
 .{ .action = "workspace.integrate", .decision = .deny }
 ```
 
 **A row nobody wrote answers `allow` here**, unlike every action above, because
-this is a question about a capability and not about an act: a project that wrote
-`merge` and an installation whose organisation has never heard of the row gets
-`merge`. That is the same reading `provider.<instance>` gets, and it is what
-keeps a permission model from breaking every configuration the day it ships. One
+this is a question about a capability and not about an act: a project on an
+installation whose organisation has never heard of the row gets the mode it
+configured, and the default `merge` where it configured none. That is the same
+reading `provider.<instance>` gets, and it is what keeps a permission model from
+breaking every configuration the day it ships. One
 `deny` in an organisation's bundle closes the road for every project under it,
 and the same fold means a subagent moves no branch its parent could not.
 

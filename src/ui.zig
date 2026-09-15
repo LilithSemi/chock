@@ -7952,15 +7952,20 @@ test "an apply that moved no branch still draws a row, and says the branch staye
     defer h.close();
 
     const watching = h.screen.observer();
-    watching.onEvent(1, .{ .workspace_integrate = .{
-        .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
-        .mode = "ref",
-        .decision = "allow",
-        .branch = "",
-        .branch_from = "",
-        .branch_to = "",
-        .parked = "not_asked_for",
-    } });
+    watching.onEvent(1, .{
+        .workspace_integrate = .{
+            .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
+            // No landing was ever settled on, so the row names none and the reason
+            // is the whole of why. The default is `merge` now, so a park is a
+            // refusal or a fault, and this row is what says which.
+            .mode = "",
+            .decision = "deny",
+            .branch = "",
+            .branch_from = "",
+            .branch_to = "",
+            .parked = "policy_refused",
+        },
+    });
 
     try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
     const row = h.screen.lines.items[0];
@@ -7971,7 +7976,7 @@ test "an apply that moved no branch still draws a row, and says the branch staye
     }
     // The reason the log recorded, and where the work is, so the row answers
     // "why" and "what now" as well as "did it move".
-    try testing.expect(std.mem.indexOf(u8, row.text, "not_asked_for") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "policy_refused") != null);
     try testing.expect(std.mem.indexOf(u8, row.text, "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA") != null);
 
     // And a branch that really moved still draws the row it always drew, which

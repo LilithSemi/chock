@@ -366,9 +366,13 @@ pub const WorkspaceApply = struct {
     /// The diff from `old_id` to `new_id`. This is what the user reads.
     diff: []const u8,
     /// What this apply does to the branch the user has checked out, worked out
-    /// before anybody is asked. **`.park` for every project that says nothing**,
-    /// which is the behaviour every session had before modes existed.
-    integration: integrate.Plan = .{ .park = .{ .wanted = .ref, .why = .not_asked_for } },
+    /// before anybody is asked.
+    ///
+    /// **No default, on purpose.** A default here would be a second place the
+    /// answer to "where does approved work land" is written, and the one place
+    /// is `chock_policy.apply.Settings`. A caller that has not decided yet has
+    /// nothing honest to put, so it has to decide.
+    integration: integrate.Plan,
 
     /// Build one of these by reading the two stores and the repository, so
     /// the object list, the old id, and the diff are what is really there.
@@ -383,9 +387,11 @@ pub const WorkspaceApply = struct {
             ref: []const u8,
             new_id: []const u8,
             /// What the project's mode asked for, after the policy row
-            /// bounded it. **The default is today's behaviour**, so a caller
-            /// that says nothing parks the work and moves no branch.
-            landing: chock_policy.apply.Landing = .ref,
+            /// bounded it and after a person answered an `ask`. **No default**,
+            /// for the reason `integration` above gives: the one place the
+            /// landing is decided is `chock_policy.apply`, and a caller that
+            /// says nothing has said nothing rather than said "park it".
+            wanted: integrate.Wanted,
         },
         diag: ?*?Diagnostic,
     ) DescribeError!WorkspaceApply {
@@ -411,7 +417,7 @@ pub const WorkspaceApply = struct {
             .repository = params.repository,
             .scratch_object_store = params.scratch_object_store,
             .project_object_store = project_object_store,
-            .landing = params.landing,
+            .wanted = params.wanted,
             .ref = params.ref,
             .new_id = params.new_id,
         }, diag);
@@ -699,21 +705,22 @@ pub const Action = union(Kind) {
                         m.branch,
                     },
                 ),
-                .park => |p| if (p.why == .not_asked_for) std.fmt.allocPrint(
+                .park => |p| if (p.wanted == null) std.fmt.allocPrint(
                     gpa,
                     "land {d} {s} of the session in {s}, and set {s} to {s}. " ++
-                        "No branch of yours moves",
+                        "No branch of yours moves, because {s}",
                     .{
                         a.objects.len,
                         plural(a.objects.len, "object", "objects"),
                         a.repository,
                         a.ref,
                         shortId(a.new_id),
+                        p.why.sentence(),
                     },
                 ) else std.fmt.allocPrint(
                     gpa,
                     "land {d} {s} of the session in {s}, and set {s} to {s}. " ++
-                        "No branch of yours moves: the {s} this project asks for does not " ++
+                        "No branch of yours moves: the {s} this apply would take does not " ++
                         "happen, because {s}",
                     .{
                         a.objects.len,
@@ -721,7 +728,7 @@ pub const Action = union(Kind) {
                         a.repository,
                         a.ref,
                         shortId(a.new_id),
-                        p.wanted.wireName(),
+                        p.wanted.?.wireName(),
                         p.why.sentence(),
                     },
                 ),
@@ -871,19 +878,19 @@ fn branchText(gpa: std.mem.Allocator, a: WorkspaceApply) std.mem.Allocator.Error
             m.to,
             m.landing.promise(),
         }),
-        .park => |p| if (p.why == .not_asked_for) std.fmt.allocPrint(gpa,
+        .park => |p| if (p.wanted == null) std.fmt.allocPrint(gpa,
             \\
             \\your branch: no branch of yours moves
-            \\  {s}
+            \\  why: {s}
             \\  read the work with `git log {s}`, and take it with `git merge {s}`
             \\
         , .{ p.why.sentence(), a.ref, a.ref }) else std.fmt.allocPrint(gpa,
             \\
             \\your branch: no branch of yours moves
-            \\  this project asks for {s}, and it does not happen, because {s}
+            \\  this apply would take the {s}, and it does not happen, because {s}
             \\  the work still lands at {s}, and you take it with `git merge {s}`
             \\
-        , .{ p.wanted.wireName(), p.why.sentence(), a.ref, a.ref }),
+        , .{ p.wanted.?.wireName(), p.why.sentence(), a.ref, a.ref }),
     };
 }
 
@@ -2276,6 +2283,9 @@ test "an approved workspace.apply moves the objects and updates the ref" {
         .scratch_object_store = session.worktree.object_store_source,
         .ref = "refs/heads/main",
         .new_id = new_id,
+        // No landing: these tests are about the objects and the ref, which is
+        // the part of an apply that happens whatever the mode is.
+        .wanted = .{ .none = .nobody_answered },
     }, null);
 
     // The description named real work: a commit of one new file writes at
@@ -2344,6 +2354,9 @@ test "a refused workspace.apply leaves the user's repository byte for byte uncha
         .scratch_object_store = session.worktree.object_store_source,
         .ref = "refs/heads/main",
         .new_id = new_id,
+        // No landing: these tests are about the objects and the ref, which is
+        // the part of an apply that happens whatever the mode is.
+        .wanted = .{ .none = .nobody_answered },
     }, null);
     // The act really had something to do. A description of nothing would
     // leave the repository unchanged whatever the broker did.
@@ -2410,6 +2423,7 @@ test "a workspace.apply nobody can answer expires at once, and the repository is
         // The ref `src/run.zig` builds: never a branch of the user.
         .ref = "refs/chock/01SESSION",
         .new_id = new_id,
+        .wanted = .{ .none = .nobody_answered },
     }, null);
     try testing.expect(apply.objects.len >= 3);
     // A ref that does not exist yet, which git is told the act must find
@@ -2470,6 +2484,7 @@ test "a workspace.apply the project's own policy allows lands with nobody at the
         .scratch_object_store = session.worktree.object_store_source,
         .ref = "refs/chock/01SESSION",
         .new_id = new_id,
+        .wanted = .{ .none = .nobody_answered },
     }, null);
 
     var backing = try chock_proto.storage.Memory.init(gpa, "01BROKER");
@@ -2637,6 +2652,7 @@ test "an action names its effect, and the effect is a diff and not a command" {
                     "4444444444444444444444444444444444444444",
                 },
                 .diff = diff,
+                .integration = .{ .park = .{ .wanted = null, .why = .nobody_answered } },
             } },
             .name = "workspace.apply",
             .effect = &.{
@@ -2694,12 +2710,16 @@ test "an action names its effect, and the effect is a diff and not a command" {
 
 test "the one line of an apply that parks says that no branch of yours moves" {
     // **The fault this closes, reported by the project owner on 2026-09-08.**
-    // He approved an apply six times in a project whose mode was the default
-    // `ref`, and believed each time that Chock had merged for him. The log is
-    // right: six parks. The summary he read named the ref and never the branch,
-    // and the sentence that would have told him is in the detail, behind a
-    // `show` he never opened. The summary is what a person reads, so the
-    // summary has to carry it.
+    // He approved an apply six times in a project whose mode was the old
+    // default, which parked, and believed each time that Chock had merged for
+    // him. The log is right: six parks. The summary he read named the ref and
+    // never the branch, and the sentence that would have told him is in the
+    // detail, behind a `show` he never opened. The summary is what a person
+    // reads, so the summary has to carry it.
+    //
+    // The default is `merge` now, so the first case below is a park nobody can
+    // configure any more: the policy row refused it. The line still has to say
+    // so.
     //
     // Mutation check: take the phrase off either park arm of `summary` and the
     // half below it fails.
@@ -2714,19 +2734,24 @@ test "the one line of an apply that parks says that no branch of yours moves" {
         .new_id = "2222222222222222222222222222222222222222",
         .objects = &.{"2222222222222222222222222222222222222222"},
         .diff = "",
+        // Every case below writes its own. This one is never read.
+        .integration = .{ .park = .{ .wanted = null, .why = .nobody_answered } },
     };
 
-    // The ordinary case, and the one the owner met: the project asked for
-    // nothing, so nothing was ever going to move.
+    // No landing at all, because the policy row refused one. The old member
+    // that said "this project asked for nothing" is gone with the mode of the
+    // same name, so this arm now has a reason worth reading and it says it.
     {
         var apply = base;
-        apply.integration = .{ .park = .{ .wanted = .ref, .why = .not_asked_for } };
+        apply.integration = .{ .park = .{ .wanted = null, .why = .policy_refused } };
         const said = try (Action{ .workspace_apply = apply }).summary(gpa);
         defer gpa.free(said);
         if (std.mem.indexOf(u8, said, "No branch of yours moves") == null) {
             try testing.expectEqualStrings("a summary that names the branch", said);
             return error.SummaryDoesNotSayTheBranchStays;
         }
+        // And why, which the arm this replaces never said at all.
+        try testing.expect(std.mem.indexOf(u8, said, "workspace.integrate") != null);
         // Still one line: a client lists it in one row.
         try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, said, '\n'));
     }

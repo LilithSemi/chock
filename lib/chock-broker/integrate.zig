@@ -3,8 +3,11 @@
 //!
 //! `lib/chock-broker/actions.zig` owns `workspace.apply`: the objects move into
 //! the project and `refs/chock/<session>` moves to the session's commit. That
-//! much happens in every mode and it moves no branch of the user's. This file
-//! is the part after it, and only for `merge`, `rebase` and `squash`.
+//! much happens on every apply, whatever the mode, and it moves no branch of
+//! the user's. This file is the part after it. **It is why no mode means "park
+//! it": the ref is written either way, so a mode that stopped there would only
+//! be saying "do not integrate", which the policy row and the person answering
+//! the approval already say.**
 //!
 //! ## The one rule: the project is never left in the middle of anything
 //!
@@ -43,9 +46,9 @@
 //! between reading the question and answering it. `moving` reads the same facts
 //! again and parks the work when any of them has changed. **Parking is narrower
 //! than what was approved and never wider**: the work still lands at the ref,
-//! which is what the mode `ref` does and what every session did before these
-//! modes existed, and no branch moves. The log records which of the two
-//! happened, so the narrowing is never silent.
+//! which every apply does before this file is reached at all, and no branch
+//! moves. The log records which of the two happened, so the narrowing is never
+//! silent.
 //!
 //! ## Who the commit says it is
 //!
@@ -70,8 +73,9 @@ const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const git = chock_workspace.git;
 
-/// The four shapes one apply can take, named by `chock_policy.apply`. `ref` is
-/// here too, and it is the one that moves no branch.
+/// The three shapes one apply can take, named by `chock_policy.apply`. Every
+/// one of them moves a branch: "no branch moves" is a `Wanted.none` and a
+/// `Reason` beside it, and never a landing.
 pub const Landing = chock_policy.apply.Landing;
 
 /// The names git gives the files it leaves in the git directory while an
@@ -95,9 +99,18 @@ const unfinished_markers = [_][]const u8{
 /// member is what the log records. `sentence` is what a person reads, and the
 /// two cannot drift apart because each has one switch over the whole enum.
 pub const Reason = enum {
-    /// The project asked for `ref`, so no branch was ever going to move. **The
-    /// one member that is the ordinary case** and not a refusal.
-    not_asked_for,
+    /// The `workspace.integrate` row of the policy table answers `deny`, so no
+    /// approval of this session may move a branch. `chock_policy.apply.boundBy`
+    /// is where that is read, and null is what it leaves.
+    policy_refused,
+    /// The project asks at the moment of the apply, and nobody named a landing:
+    /// there was no terminal, nobody answered in time, or what was typed is not
+    /// a landing. **The narrow answer**, and the one a session with nobody
+    /// watching always gets.
+    nobody_answered,
+    /// The apply itself was not approved, so nothing happened at all and no
+    /// branch could move.
+    apply_refused,
     /// The branch already reaches the session's commit, so there is nothing to
     /// carry onto it.
     already_there,
@@ -126,7 +139,9 @@ pub const Reason = enum {
     /// The word the log records.
     pub fn wireName(self: Reason) []const u8 {
         return switch (self) {
-            .not_asked_for => "not_asked_for",
+            .policy_refused => "policy_refused",
+            .nobody_answered => "nobody_answered",
+            .apply_refused => "apply_refused",
             .already_there => "already_there",
             .dirty_tree => "dirty_tree",
             .detached_head => "detached_head",
@@ -144,7 +159,10 @@ pub const Reason = enum {
     /// Chock does about it.
     pub fn sentence(self: Reason) []const u8 {
         return switch (self) {
-            .not_asked_for => "this project asks for the work to wait at the ref",
+            .policy_refused => "the policy answers deny for workspace.integrate, so no approval " ++
+                "of this session moves a branch",
+            .nobody_answered => "this project asks how the work should land, and nobody answered",
+            .apply_refused => "the apply itself was not approved",
             .already_there => "the branch already reaches this commit",
             .dirty_tree => "the working tree holds changes that are not committed",
             .detached_head => "no branch is checked out there",
@@ -177,13 +195,37 @@ pub const Move = struct {
     to: []const u8,
 };
 
-/// No branch moves. **Both halves**: what the project asked for, and why it is
-/// not happening. A reader who is told only the reason cannot tell a project
-/// that wanted a merge from one that never asked for anything.
+/// No branch moves. **Both halves**: what the landing was going to be, and why
+/// it is not happening. A reader who is told only the reason cannot tell a
+/// merge that the working tree refused from one nobody ever settled on.
 pub const Parked = struct {
-    /// What the project's mode asked for. `ref` when it asked for nothing.
-    wanted: Landing,
+    /// The landing this apply was going to take. **Null when none was ever
+    /// settled on**, which is what the policy row refusing and nobody
+    /// answering both leave. `why` says which.
+    wanted: ?Landing,
     why: Reason,
+};
+
+/// What an apply may do to the checked out branch, worked out on the host
+/// before anything is described.
+///
+/// **A landing, or nothing and the reason for nothing.** `Landing` holds only
+/// landings that move a branch, so "move nothing" cannot be one of its members,
+/// and a caller that carries it as a bare optional would throw away why. See
+/// `chock_policy.apply.Landing`.
+pub const Wanted = union(enum) {
+    /// Carry the work onto the checked out branch, in this shape.
+    land: Landing,
+    /// Move no branch, for a reason that is not about the repository at all.
+    none: Reason,
+
+    /// The landing, or null when there is none.
+    pub fn landing(self: Wanted) ?Landing {
+        return switch (self) {
+            .land => |it| it,
+            .none => null,
+        };
+    }
 };
 
 /// What an apply is going to do to the branch, worked out before anybody is
@@ -202,8 +244,9 @@ pub const Plan = union(enum) {
         };
     }
 
-    /// What the project asked for, whether or not it is happening.
-    pub fn wanted(self: Plan) Landing {
+    /// The landing, whether or not it is happening. Null when none was ever
+    /// settled on.
+    pub fn wanted(self: Plan) ?Landing {
         return switch (self) {
             .move => |m| m.landing,
             .park => |it| it.wanted,
@@ -268,8 +311,10 @@ pub fn planning(
         scratch_object_store: []const u8,
         /// Absolute host path of the project's own object store.
         project_object_store: []const u8,
-        /// What the mode asked for, after the policy row bounded it.
-        landing: Landing,
+        /// What the mode asked for, after the policy row bounded it and after
+        /// a person answered an `ask`. `.none` carries the reason there is no
+        /// landing, and this call hands it straight back as the park.
+        wanted: Wanted,
         /// The ref the work is parked at, which the commit message names.
         ref: []const u8,
         /// The session's commit. It lives in the scratch store.
@@ -277,10 +322,13 @@ pub fn planning(
     },
     diag: ?*?Diagnostic,
 ) Error!Plan {
-    if (!params.landing.movesABranch()) return .{ .park = .{
-        .wanted = params.landing,
-        .why = .not_asked_for,
-    } };
+    // **No landing answers before anything is opened**, so a session the policy
+    // refused and a session nobody answered each cost one switch and no git
+    // call at all.
+    const landing = switch (params.wanted) {
+        .land => |it| it,
+        .none => |why| return .{ .park = .{ .wanted = null, .why = why } },
+    };
 
     // Reading the session's commit from the project needs the scratch store as
     // an alternate. Writing the result needs the scratch store as the primary,
@@ -296,21 +344,19 @@ pub fn planning(
 
     const standing = try standingOf(arena, io, env, params.repository, diag);
     const ready = switch (standing) {
-        .park => |why| return .{ .park = .{ .wanted = params.landing, .why = why } },
+        .park => |why| return .{ .park = .{ .wanted = landing, .why = why } },
         .ready => |it| it,
     };
 
     // Nothing to carry. Read through the alternate, because the session's
     // commit is still only in the scratch store.
     if (try isAncestor(arena, io, &reading, params.repository, params.new_id, ready.at))
-        return .{ .park = .{ .wanted = params.landing, .why = .already_there } };
+        return .{ .park = .{ .wanted = landing, .why = .already_there } };
 
-    const built = switch (params.landing) {
-        // `movesABranch` already answered for this one.
-        .ref => unreachable,
+    const built = switch (landing) {
         .merge, .squash => try mergeOrSquash(arena, io, &writing, .{
             .repository = params.repository,
-            .landing = params.landing,
+            .landing = landing,
             .branch = ready.branch,
             .at = ready.at,
             .ref = params.ref,
@@ -324,9 +370,9 @@ pub fn planning(
     };
 
     return switch (built) {
-        .refused => |why| .{ .park = .{ .wanted = params.landing, .why = why } },
+        .refused => |why| .{ .park = .{ .wanted = landing, .why = why } },
         .commit => |id| .{ .move = .{
-            .landing = params.landing,
+            .landing = landing,
             .branch = ready.branch,
             .at = ready.at,
             .to = id,
@@ -743,23 +789,38 @@ fn ok(
 
 const testing = std.testing;
 
-test "every reason says something a person can read, and only one of them is ordinary" {
+test "every reason says something a person can read, and none of them is silence" {
+    // **Every park now says why.** The member that used to mean "this project
+    // asked for nothing" is gone with `apply.Mode.ref`, so a park is a fault in
+    // the repository, a refusal by the policy, a refusal by the person, or
+    // nobody answering, and each of the four has a sentence of its own.
+    //
+    // Mutation check: give any member an empty sentence and this fails.
     for (std.enums.values(Reason)) |reason| {
         try testing.expect(reason.wireName().len > 0);
         try testing.expect(reason.sentence().len > 0);
         // The wire name is a name and never a sentence: it goes in a log field
         // that a reader matches on.
         try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, reason.wireName(), ' '));
+        // And no member says the work was never asked about, because there is
+        // no longer a way to ask for nothing.
+        try testing.expect(!std.mem.eql(u8, "not_asked_for", reason.wireName()));
     }
-    try testing.expectEqualStrings("not_asked_for", Reason.not_asked_for.wireName());
+    try testing.expectEqualStrings("policy_refused", Reason.policy_refused.wireName());
 }
 
 test "a plan that moves nothing names why, and one that moves says nothing about why" {
     const parked: Plan = .{ .park = .{ .wanted = .merge, .why = .dirty_tree } };
     try testing.expectEqual(Reason.dirty_tree, parked.parked().?.why);
-    // **What the project asked for survives the refusal.** A reader told only
-    // "dirty tree" cannot tell this from a project that wanted nothing.
-    try testing.expectEqual(Landing.merge, parked.wanted());
+    // **What the landing was going to be survives the refusal.** A reader told
+    // only "dirty tree" cannot tell this from a park nobody chose a landing for.
+    try testing.expectEqual(@as(?Landing, .merge), parked.wanted());
+
+    // And a park with no landing at all says so, rather than naming one that
+    // was never settled on.
+    const never: Plan = .{ .park = .{ .wanted = null, .why = .policy_refused } };
+    try testing.expectEqual(@as(?Landing, null), never.wanted());
+    try testing.expectEqual(Reason.policy_refused, never.parked().?.why);
 
     const moving_plan: Plan = .{ .move = .{
         .landing = .merge,
@@ -768,27 +829,39 @@ test "a plan that moves nothing names why, and one that moves says nothing about
         .to = "b" ** 40,
     } };
     try testing.expectEqual(@as(?Parked, null), moving_plan.parked());
-    try testing.expectEqual(Landing.merge, moving_plan.wanted());
+    try testing.expectEqual(@as(?Landing, .merge), moving_plan.wanted());
 }
 
-test "the ref landing never plans a move at all" {
-    // Read through the real entry point, with no repository behind it: `ref`
-    // answers before it opens anything, which is what makes the default free.
+test "no landing plans no move, and hands back the reason it was given" {
+    // Read through the real entry point, with no repository behind it at all:
+    // `.none` answers before anything is opened, which is what makes a refused
+    // session cost nothing and is why the paths below are never looked at.
+    //
+    // Mutation check: make the `.none` arm fall through to `standingOf` and
+    // this fails trying to run git in /nowhere/at/all.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var env = try std.testing.environ.createMap(testing.allocator);
     defer env.deinit();
 
-    const plan = try planning(arena_state.allocator(), testing.io, &env, .{
-        .repository = "/nowhere/at/all",
-        .scratch_object_store = "/nowhere/at/all",
-        .project_object_store = "/nowhere/at/all",
-        .landing = .ref,
-        .ref = "refs/chock/01S",
-        .new_id = "c" ** 40,
-    }, null);
-    try testing.expectEqual(Reason.not_asked_for, plan.parked().?.why);
-    try testing.expectEqual(Landing.ref, plan.wanted());
+    for ([_]Reason{ .policy_refused, .nobody_answered }) |why| {
+        const plan = try planning(arena_state.allocator(), testing.io, &env, .{
+            .repository = "/nowhere/at/all",
+            .scratch_object_store = "/nowhere/at/all",
+            .project_object_store = "/nowhere/at/all",
+            .wanted = .{ .none = why },
+            .ref = "refs/chock/01S",
+            .new_id = "c" ** 40,
+        }, null);
+        try testing.expectEqual(why, plan.parked().?.why);
+        // **And no landing is named**, because none was ever settled on.
+        try testing.expectEqual(@as(?Landing, null), plan.wanted());
+    }
+}
+
+test "a wanted landing is a landing, and nothing wanted is null" {
+    try testing.expectEqual(@as(?Landing, .rebase), (Wanted{ .land = .rebase }).landing());
+    try testing.expectEqual(@as(?Landing, null), (Wanted{ .none = .apply_refused }).landing());
 }
 
 test "an outcome that moved holds the whole of what moved" {
@@ -801,5 +874,5 @@ test "an outcome that moved holds the whole of what moved" {
     } };
     defer outcome.deinit(gpa);
     try testing.expectEqualStrings("refs/heads/main", outcome.moved.branch);
-    try testing.expect(outcome.moved.landing.movesABranch());
+    try testing.expectEqual(Landing.rebase, outcome.moved.landing);
 }

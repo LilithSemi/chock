@@ -8,11 +8,24 @@
 //! }
 //! ```
 //!
-//! Five modes. `ref` parks the work at `refs/chock/<session>` and moves no
-//! branch of the user's, which is what every session did before this block
-//! existed. `merge`, `rebase` and `squash` park the work at the same ref and
-//! then carry it into the checked out branch. `ask` puts the choice to the
-//! person at the moment of the apply.
+//! Four modes, and `merge` is the default. `merge`, `rebase` and `squash` each
+//! park the work at `refs/chock/<session>` and then carry it into the checked
+//! out branch. `ask` puts the choice to the person at the moment of the apply.
+//!
+//! ## There is no mode that means "move nothing"
+//!
+//! The ref is written on every apply, before any branch is touched:
+//! `chock_broker.actions.performWorkspaceApply` runs `update-ref` first and
+//! calls `lib/chock-broker/integrate.zig` afterwards. So `refs/chock/<session>`
+//! is there whatever the mode is, and a mode that stopped after the step that
+//! always happens would say only "do not integrate".
+//!
+//! **"Do not integrate" is a whether question, and it already has two
+//! answers.** A person says `n` to the `workspace.apply` approval, and an
+//! organisation writes `deny` on the `workspace.integrate` row. Writing the
+//! same judgement a third time, as a mode, let a person approve an apply and
+//! get less than the prompt had offered. So a mode says only **how** the work
+//! lands, and `Landing` holds nothing but landings that move a branch.
 //!
 //! ## Why the mode is in `chock.zon` and the permission is on the table
 //!
@@ -38,16 +51,17 @@
 //! already folds an org bundle over a project and a parent over a child.
 //!
 //! So the two halves compose. `chock.zon` names the mode, `integrate_action`
-//! decides whether that mode may be anything but `ref`, and `boundBy` is the
-//! one place the two meet.
+//! decides whether an approved apply may move a branch at all, and `boundBy`
+//! is the one place the two meet. `boundBy` answers null for `deny`, which is
+//! "no landing at all", and a caller that reads null parks the work.
 //!
 //! ## Read as a ceiling, so a project that said nothing is unchanged
 //!
 //! `Table.ceilingChain` is the verb, not `Table.evaluateChain`, the same
 //! reading `lib/chock-policy/access.zig` takes for a provider and a model. A
 //! row nobody wrote answers `allow`, which is no ceiling at all, so a project
-//! that writes `.mode = .merge` and an installation whose organisation has
-//! never heard of this row gets `merge`. An organisation that wants the road
+//! that writes nothing at all, on an installation whose organisation has never
+//! heard of this row, gets `merge`. An organisation that wants the road
 //! closed writes one rule:
 //!
 //! ```zon
@@ -73,9 +87,9 @@
 //! `agent_review` and `agent_then_human` here say **that integration is
 //! permitted and somebody has to say yes first**, and the somebody is whoever
 //! the apply request already asks. None of the three says where the work
-//! lands. Reading them as `ref` took the mode away before the apply was even
-//! described, so the person answered a prompt that could no longer carry the
-//! work. `deny` is the one decision that removes the capability, so `deny` is
+//! lands. Reading them as "no landing" took the mode away before the apply was
+//! even described, so the person answered a prompt that could no longer carry
+//! the work. `deny` is the one decision that removes the capability, so `deny` is
 //! the one decision that parks the work at the ref.
 //!
 //! **A rule that names nothing reaches this row.** `workspace.integrate` is
@@ -91,7 +105,7 @@
 //!
 //! ## The mode is never a widening of the approval
 //!
-//! `Mode.ask` and the four settled modes all end in the same place: one
+//! `Mode.ask` and the three settled modes all end in the same place: one
 //! `workspace.apply` request, described in the mode that is really configured,
 //! put to the policy table and, where the table says `ask`, to a person. **The
 //! prompt names the mode.** `chock_broker.actions.WorkspaceApply` carries the
@@ -136,11 +150,12 @@ pub const namespace = "workspace";
 
 /// What a project asks for.
 pub const Mode = enum {
-    /// The work is parked at `refs/chock/<session>` and no branch moves. **The
+    /// Park the work, then merge it into the checked out branch. **The
     /// default**, and what every project that has never heard of this block
     /// gets.
-    ref,
-    /// Park the work, then merge it into the checked out branch.
+    ///
+    /// **The conservative one of the three that move a branch**: a merge keeps
+    /// both histories, and a rebase and a squash each rewrite one.
     merge,
     /// Park the work, then replay its commits on top of the checked out
     /// branch.
@@ -154,7 +169,6 @@ pub const Mode = enum {
     /// The word a log line, a `chock doctor` row and an approval prompt carry.
     pub fn wireName(self: Mode) []const u8 {
         return switch (self) {
-            .ref => "ref",
             .merge => "merge",
             .rebase => "rebase",
             .squash => "squash",
@@ -170,7 +184,6 @@ pub const Mode = enum {
     /// wonder what `ask` does in a git call.
     pub fn settled(self: Mode) ?Landing {
         return switch (self) {
-            .ref => .ref,
             .merge => .merge,
             .rebase => .rebase,
             .squash => .squash,
@@ -178,48 +191,37 @@ pub const Mode = enum {
         };
     }
 
-    /// Whether this mode can end with a branch of the user's in a new place.
-    /// True for `ask`, because the person may answer with one that does.
-    pub fn mayMoveABranch(self: Mode) bool {
-        return switch (self) {
-            .ref => false,
-            .merge, .rebase, .squash, .ask => true,
-        };
-    }
-
-    /// The mode a person typed, or null for a word this does not know.
+    /// The landing a person typed, or null for a word this does not know.
     /// **`ask` is not one of them**: a person is answering the question, not
-    /// asking it again.
+    /// asking it again. **Null moves no branch**, so a person who typed
+    /// something this does not know keeps their branch where it is.
     pub fn fromAnswer(said: []const u8) ?Landing {
         const trimmed = std.mem.trim(u8, said, " \t\r\n");
-        inline for (.{ Landing.ref, Landing.merge, Landing.rebase, Landing.squash }) |landing| {
+        inline for (.{ Landing.merge, Landing.rebase, Landing.squash }) |landing| {
             if (std.ascii.eqlIgnoreCase(trimmed, landing.wireName())) return landing;
         }
         return null;
     }
 };
 
-/// What one apply really does. `ask` is not here: see `Mode.settled`.
+/// What one apply really does to a branch. `ask` is not here: see
+/// `Mode.settled`.
+///
+/// **Every member moves a branch of the user's.** "No branch moves" is not a
+/// landing, so it is not a member: a caller that has no landing holds null, and
+/// why it holds null is a `chock_broker.integrate.Reason` beside it. That keeps
+/// "which shape" and "whether at all" in two types, instead of one type with a
+/// hole in it.
 pub const Landing = enum {
-    ref,
     merge,
     rebase,
     squash,
 
     pub fn wireName(self: Landing) []const u8 {
         return switch (self) {
-            .ref => "ref",
             .merge => "merge",
             .rebase => "rebase",
             .squash => "squash",
-        };
-    }
-
-    /// Whether this landing moves a branch of the user's.
-    pub fn movesABranch(self: Landing) bool {
-        return switch (self) {
-            .ref => false,
-            .merge, .rebase, .squash => true,
         };
     }
 
@@ -228,7 +230,6 @@ pub const Landing = enum {
     /// is deciding whether to let that happen.
     pub fn promise(self: Landing) []const u8 {
         return switch (self) {
-            .ref => "no branch of yours moves. The work waits at the ref until you merge it",
             .merge => "your checked out branch is merged with this work, and your working tree " ++
                 "is updated to the result",
             .rebase => "this work is replayed on top of your checked out branch, that branch is " ++
@@ -240,11 +241,20 @@ pub const Landing = enum {
 };
 
 /// What the `apply` block holds. A project that writes no block gets this.
+///
+/// **`merge` and not a park.** A person who is asked "may I apply this work"
+/// and answers yes has agreed to the act the prompt described, and the prompt
+/// names the landing and the branch before they answer:
+/// `chock_broker.actions.Action.summary` puts "and merge it into
+/// refs/heads/main" on the one line every client shows. Being asked and saying
+/// yes must do the act, and not a smaller act the person then finishes by hand.
 pub const Settings = struct {
-    mode: Mode = .ref,
+    mode: Mode = .merge,
 };
 
 /// The mode `chock.zon` asked for, bounded by what the policy row permits.
+/// **Null is "no landing at all"**, which is what `deny` leaves, and a caller
+/// that reads null parks the work at the ref and moves no branch.
 ///
 /// **This bounds the permission and never the landing.** `decision` is the
 /// answer for `integrate_action`, which says "may an approval move my branch
@@ -253,13 +263,18 @@ pub const Settings = struct {
 /// that parks the work at the ref. `ask`, `agent_review` and
 /// `agent_then_human` say that integration is permitted once somebody says
 /// yes, and the only place anybody is asked is the `workspace.apply` approval,
-/// which this row does not answer. A mode bound to `ref` by one of those three
-/// would take the merge away before the apply was described. See this file's
-/// own top comment.
-pub fn boundBy(mode: Mode, decision: table.Decision) Mode {
+/// which this row does not answer. A mode bound to nothing by one of those
+/// three would take the merge away before the apply was described. See this
+/// file's own top comment.
+///
+/// **An optional and not a member of `Mode`.** A `Mode.ref` that meant "do not
+/// integrate" would write the same judgement the row already holds a second
+/// time, and a project could then ask for it, which is the whole reason it no
+/// longer exists.
+pub fn boundBy(mode: Mode, decision: table.Decision) ?Mode {
     return switch (decision) {
         .allow, .ask, .agent_review, .agent_then_human => mode,
-        .deny => .ref,
+        .deny => null,
     };
 }
 
@@ -399,7 +414,11 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     };
     defer std.zon.parse.free(gpa, wire);
 
-    return .{ .mode = wire.mode orelse .ref };
+    // **The default is written once**, in `Settings`, so a block that names no
+    // mode and a file with no block at all cannot answer differently.
+    var settings: Settings = .{};
+    if (wire.mode) |mode| settings.mode = mode;
+    return settings;
 }
 
 /// Read `chock.zon` from `project_root` and take its settings. A project with
@@ -464,10 +483,21 @@ fn findApplyNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zo
 
 const testing = std.testing;
 
-test "a project that writes nothing parks the work at the ref" {
+test "a project that writes nothing merges the work into the branch" {
     // **The default this block must have.** Three files with no `apply` block
-    // between them, and every one of them behaves the way every session did
-    // before the block existed.
+    // between them, and every one of them lands the work where the approval
+    // prompt says it will.
+    //
+    // The project owner met the old default four times: he was asked "may I
+    // apply this work", answered yes, and the work stopped at the ref while no
+    // branch moved. Six approvals in one session, six parks. The approval is
+    // the consent, and the prompt names the branch and the landing before he
+    // answers, so yes has to do the act it described.
+    //
+    // Mutation check: put `mode: Mode = .rebase` in `Settings` and this fails
+    // on the first source. The last case is why `parse` reads the default out
+    // of `Settings` rather than writing a word of its own: a second spelling
+    // could answer differently for a block that names no mode.
     const gpa = testing.allocator;
     for ([_][:0]const u8{
         ".{}",
@@ -475,14 +505,38 @@ test "a project that writes nothing parks the work at the ref" {
         ".{ .budget = .{ .max_cost = 5.0, .currency = \"USD\" } }",
     }) |source| {
         const settings = try parse(gpa, source, null);
-        try testing.expectEqual(Mode.ref, settings.mode);
-        try testing.expect(!settings.mode.mayMoveABranch());
+        try testing.expectEqual(Mode.merge, settings.mode);
+        try testing.expect(settings.mode.settled() != null);
     }
+
+    // And a block that names no mode answers the same as no block at all,
+    // because both read the one default `Settings` holds.
+    const empty_block = try parse(gpa, ".{ .apply = .{} }", null);
+    try testing.expectEqual(Mode.merge, empty_block.mode);
+}
+
+test "no mode means move nothing, so a project cannot ask for one" {
+    // **`ref` is gone on purpose.** "Do not integrate" is a whether question,
+    // and it is answered by a person saying `n` to the apply and by `deny` on
+    // the `workspace.integrate` row. A mode of the same name wrote the
+    // judgement a third time, and let an approved apply do less than the prompt
+    // had offered.
+    //
+    // Mutation check: add a `ref` member back to either enum and this fails.
+    for (std.enums.values(Mode)) |mode| {
+        try testing.expect(!std.mem.eql(u8, "ref", mode.wireName()));
+    }
+    for (std.enums.values(Landing)) |landing| {
+        try testing.expect(!std.mem.eql(u8, "ref", landing.wireName()));
+    }
+    // So every landing any apply can take moves a branch, which is what makes
+    // null the one answer that moves none.
+    try testing.expectEqual(@as(usize, 3), std.enums.values(Landing).len);
 }
 
 test "each mode is read back by name" {
     const gpa = testing.allocator;
-    inline for (.{ "ref", "merge", "rebase", "squash", "ask" }) |name| {
+    inline for (.{ "merge", "rebase", "squash", "ask" }) |name| {
         const source = ".{ .apply = .{ .mode = ." ++ name ++ " } }";
         const settings = try parse(gpa, source, null);
         try testing.expectEqualStrings(name, settings.mode.wireName());
@@ -491,8 +545,8 @@ test "each mode is read back by name" {
 
 test "a misspelled field is refused and is never read as the default" {
     // The whole reason this reader is strict inside its own block: a project
-    // that meant `merge` and typed `mdoe` must hear about it, not silently get
-    // `ref`, and a project that meant `ref` must not silently get `merge`.
+    // that meant `squash` and typed `mdoe` must hear about it, and not silently
+    // get the default.
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -525,11 +579,11 @@ test "a decision that permits integration keeps the mode, and deny is the one th
     const permitting = [_]table.Decision{ .allow, .ask, .agent_review, .agent_then_human };
     for (permitting) |decision| {
         for (std.enums.values(Mode)) |mode| {
-            try testing.expectEqual(mode, boundBy(mode, decision));
+            try testing.expectEqual(@as(?Mode, mode), boundBy(mode, decision));
         }
     }
     for (std.enums.values(Mode)) |mode| {
-        try testing.expectEqual(Mode.ref, boundBy(mode, .deny));
+        try testing.expectEqual(@as(?Mode, null), boundBy(mode, .deny));
     }
 
     // **The two lists together are the whole enum**, so a member added to
@@ -599,9 +653,11 @@ test "three shapes of rule reach this row differently, and none of them takes th
         // **The whole product.** Whichever of the two answers the row gave,
         // the project still gets the merge it configured, so the yes a person
         // gives at the apply prompt carries the work.
-        const bounded = boundBy(settings.mode, decision);
+        const bounded = boundBy(settings.mode, decision) orelse {
+            try testing.expectEqualStrings("a mode", "no landing at all");
+            return error.TheRowTookTheModeAway;
+        };
         try testing.expectEqual(Mode.merge, bounded);
-        try testing.expect(bounded.mayMoveABranch());
         try testing.expectEqualStrings("merge", bounded.settled().?.wireName());
     }
 }
@@ -620,7 +676,7 @@ test "a project that says nothing about the row keeps the mode it configured" {
         .action = integrate_action,
     }, null);
     try testing.expectEqual(table.Decision.allow, decision);
-    try testing.expectEqual(Mode.merge, boundBy(.merge, decision));
+    try testing.expectEqual(@as(?Mode, .merge), boundBy(.merge, decision));
 }
 
 test "one org rule closes the road for every project under it" {
@@ -645,7 +701,9 @@ test "one org rule closes the road for every project under it" {
         .tool = "request_action",
         .action = integrate_action,
     }, null);
-    try testing.expectEqual(Mode.ref, boundBy(settings.mode, decision));
+    // **Null is the whole of what `deny` leaves**: no landing, so no branch of
+    // anybody's moves under this bundle whatever the project writes.
+    try testing.expectEqual(@as(?Mode, null), boundBy(settings.mode, decision));
 }
 
 test "a subagent moves no branch its parent could not" {
@@ -666,7 +724,7 @@ test "a subagent moves no branch its parent could not" {
         .tool = "request_action",
         .action = integrate_action,
     }, null);
-    try testing.expectEqual(Mode.ref, boundBy(.merge, child));
+    try testing.expectEqual(@as(?Mode, null), boundBy(.merge, child));
 }
 
 test "the class name covers the row" {
@@ -691,17 +749,22 @@ test "a settled mode is a landing, and ask is not" {
 test "an answer names a landing and never the question" {
     try testing.expectEqual(Landing.merge, Mode.fromAnswer("merge").?);
     try testing.expectEqual(Landing.rebase, Mode.fromAnswer("  REBASE \n").?);
-    try testing.expectEqual(Landing.ref, Mode.fromAnswer("ref").?);
     try testing.expectEqual(Landing.squash, Mode.fromAnswer("Squash").?);
     // A person answering the question cannot answer it with the question.
     try testing.expectEqual(@as(?Landing, null), Mode.fromAnswer("ask"));
+    // And `ref` is not a landing any more, so a person who types it is a person
+    // who named no landing, which moves no branch.
+    try testing.expectEqual(@as(?Landing, null), Mode.fromAnswer("ref"));
     try testing.expectEqual(@as(?Landing, null), Mode.fromAnswer(""));
     try testing.expectEqual(@as(?Landing, null), Mode.fromAnswer("y"));
 }
 
-test "every landing promises something a person can act on, and only ref promises nothing moves" {
+test "every landing promises something a person can act on" {
+    // The promise is read into the approval prompt, so a landing with nothing
+    // to say would be a landing a person approves without being told what it
+    // does to their branch.
     for (std.enums.values(Landing)) |landing| {
         try testing.expect(landing.promise().len > 0);
-        try testing.expectEqual(landing != .ref, landing.movesABranch());
+        try testing.expect(std.mem.indexOf(u8, landing.promise(), "branch") != null);
     }
 }

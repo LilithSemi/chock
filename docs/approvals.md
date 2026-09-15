@@ -39,7 +39,8 @@ chock: this needs your approval before it can happen.
 
   action   workspace.apply
   asked by main
-  summary  move 4 objects and set refs/chock/01K2...
+  summary  land 4 objects of the session in /home/you/site, set
+           refs/chock/01K2... to a1b2c3d, and merge it into refs/heads/main
   reason   the session made a commit, and the workspace it is in is about to
            be removed
 
@@ -64,36 +65,44 @@ refusal, and keeps the workspace.
 
 ### Where the work lands, and how to change it
 
-By default the work stops at `refs/chock/<session>`. **No branch of yours
-moves**, and you take the work with `git merge refs/chock/...` when you want it.
+**By default an approved apply merges the work into the branch you have checked
+out**, and your working tree is updated to the result. The work is parked at
+`refs/chock/<session>` first, always, so the ref is there whatever else happens
+and `git merge refs/chock/...` is always available to you.
 
-A project that would rather not run that merge by hand says so in `chock.zon`:
+A project that wants another shape says so in `chock.zon`:
 
 ```zon
 .{
-    .apply = .{ .mode = .merge },
+    .apply = .{ .mode = .rebase },
 }
 ```
 
-Four modes and one question:
+Three modes and one question:
 
 | mode | what an approved apply does |
 | --- | --- |
-| `ref` | the default. Parks the work at the ref. No branch of yours moves. |
-| `merge` | parks the work, then merges it into the branch you have checked out. |
+| `merge` | the default. Parks the work, then merges it into the branch you have checked out. |
 | `rebase` | parks the work, then replays it on top of the branch you have checked out. |
 | `squash` | parks the work, then puts all of it on that branch as one commit. |
-| `ask` | Chock asks you which of the four, at the moment of the apply. |
+| `ask` | Chock asks you which of the three, at the moment of the apply. |
+
+**There is no mode that means "move nothing".** You already have two ways to say
+that, and both are better than a setting: answer `n` to the apply, or write
+`.{ .action = "workspace.integrate", .decision = .deny }` on the policy table.
+A mode of that name let you approve an apply and get less than the prompt had
+offered, which is how one session produced six approvals and six parks.
 
 **The prompt says which one you are approving.** The `summary` line names the
-mode and the branch, and the detail has a paragraph of its own about your
+landing and the branch, and the detail has a paragraph of its own about your
 branch: which branch, where it is, where it moves to, and what happens to your
-working tree. A `ref` apply says in the same place that no branch of yours
-moves. The four questions do not read alike, because the same `y` no longer
-means the same thing.
+working tree. An apply that moves no branch says so in the same place, and says
+why. The questions do not read alike, because the same `y` does not mean the
+same thing.
 
 Every mode parks the work at the ref first, so the ref is there whatever else
-happened.
+happened. That is why `merge` is safe as the default: nothing is ever lost, and
+the fallback is one `git reset --hard` away.
 
 **Chock never leaves your repository in the middle of a merge.** The merge, the
 rebase and the squash are all built inside the session's own object store, with
@@ -115,14 +124,15 @@ and in the log:
 - your branch moved between the question and your answer.
 
 **A refusal never loses the work and never refuses the apply.** The objects and
-the ref land exactly as they do in `ref` mode, which is the behaviour you
-already have a `git merge` for. Chock checks the same facts again immediately
-before it moves your branch, so a working tree you dirtied while reading the
-question parks the work rather than integrating into it.
+the ref land exactly as they always do, which is the behaviour you already have
+a `git merge` for. Chock checks the same facts again immediately before it moves
+your branch, so a working tree you dirtied while reading the question parks the
+work rather than integrating into it.
 
 `ask` needs somebody at the keyboard. A subagent, a session the daemon started,
 a `chock run` behind a pipe and a session with the full screen interface up all
-have nobody to ask, and all of them keep the work at the ref.
+have nobody to ask, and all of them keep the work at the ref. So does an answer
+that is not one of the three words.
 
 `chock run` prints what happened either way, and says how to put your branch
 back:

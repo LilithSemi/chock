@@ -111,9 +111,12 @@ is a complete `chock.zon` with every block a first project needs:
 `.subagents` also takes `.max_depth`. Both default to 6. See
 [subagents.md](subagents.md).
 
-`.apply.mode` says how an approved apply lands. It defaults to `ref`, which
-parks the work at `refs/chock/<session>` and moves no branch of yours. See
-[approvals.md](approvals.md).
+`.apply.mode` says how an approved apply lands. **It defaults to `merge`**,
+which parks the work at `refs/chock/<session>` and then merges it into the
+branch you have checked out. The approval prompt names the branch and the
+landing before you answer, so the `y` you give is a `y` to that act. There is no
+mode that means "move nothing": say `n` to the apply, or write the policy row
+below. See [approvals.md](approvals.md).
 
 **A rule goes under `.policy.rules`, and never directly under `.policy`.**
 `.policy` is a struct with named fields, so a rule written beside `.agents` is
@@ -129,12 +132,13 @@ can forbid it and a project cannot take that back. See
 [sandbox.md](sandbox.md).
 
 `workspace.integrate` is the other. `.apply.mode` above is the project's own
-taste, and this row is what says whether that taste may be anything but `ref`.
-An organisation that wants "never touch my branch automatically" writes
+taste, and this row is what says whether an approved apply may move a branch at
+all. An organisation that wants "never touch my branch automatically" writes
 `.{ .action = "workspace.integrate", .decision = .deny }` once, in its bundle,
 and no project under it can move a branch whatever `.apply.mode` says. A row
-nobody wrote permits the mode, so a project that configures `merge` on an
-installation with no bundle gets `merge`. See [approvals.md](approvals.md).
+nobody wrote permits the mode, so a project on an installation with no bundle
+gets the mode it configured, and the default `merge` where it configured none.
+See [approvals.md](approvals.md).
 
 - [policy.md](policy.md) for the policy table and the denied paths.
 - [subagents.md](subagents.md) for the subagent limits.

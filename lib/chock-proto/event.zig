@@ -1319,8 +1319,10 @@ pub const WorkspaceIntegrate = struct {
     ref: []const u8,
     /// What this apply really did to the branch, by the name
     /// `chock_policy.apply.Landing` gives it: the landing that moved the branch,
-    /// or, where none moved, the landing that was wanted. `ref` for a project
-    /// that configured nothing.
+    /// or, where none moved, the landing that was wanted. **Empty when no
+    /// landing was ever settled on**, which the policy row refusing and nobody
+    /// answering both leave. A row from a build before 2026-09-14 can carry
+    /// `ref`, which was a landing then and means the work waited at the ref.
     ///
     /// **The outcome and not the plan.** This used to carry the mode
     /// `chock.zon` configured, which could be the word `ask`, so a session
@@ -1332,7 +1334,8 @@ pub const WorkspaceIntegrate = struct {
     /// The policy answer for `workspace.integrate`, by the name
     /// `chock_policy.table.Decision` gives it. `deny` is the one answer that
     /// takes the capability away, so it is the one answer under which `mode`
-    /// can only be `ref`. See `chock_policy.apply.boundBy`.
+    /// is always empty and `parked` always reads `policy_refused`. See
+    /// `chock_policy.apply.boundBy`.
     decision: []const u8,
     /// The branch that moved. **Empty when no branch moved**, which is the
     /// one field a reader looking for "did somebody's branch move" reads.

@@ -3981,20 +3981,22 @@ fn hardeningDecision(
 /// decided it. Both halves, because the log records the reason as well as the
 /// outcome, exactly as `Hardening` does.
 const ApplyMode = struct {
-    /// What the project asked for, after the row above it bounded it.
-    mode: chock_policy.apply.Mode = .ref,
+    /// What the project asked for, after the row above it bounded it. **Null
+    /// when the row answers `deny`**, which is "no landing at all", and every
+    /// apply of the session then parks the work at its ref.
+    mode: ?chock_policy.apply.Mode = .merge,
     /// The answer the `workspace.integrate` row gave.
     decision: chock_policy.table.Decision = .allow,
     /// What `chock.zon` asked for, before the row bounded it. **The half a
-    /// person has to be told about**: a project that wrote `merge` and gets
-    /// `ref` is the one case where the session does something other than what
+    /// person has to be told about**: a project that wrote `merge` and gets no
+    /// landing is the one case where the session does something other than what
     /// the file says, and `mode` alone cannot show it. See `bounded_mode_fmt`.
-    asked_for: chock_policy.apply.Mode = .ref,
+    asked_for: chock_policy.apply.Mode = .merge,
 };
 
-/// The line a person reads when the `workspace.integrate` row takes away the
-/// mode `chock.zon` asked for. It takes the mode the file named, the answer the
-/// row gave, and the name of the row.
+/// The line a person reads when the `workspace.integrate` row takes the landing
+/// away. It takes the landing the session would have taken, the answer the row
+/// gave, and the name of the row.
 ///
 /// **One text, said in two places.** `applyModeFor` prints it before the
 /// session starts, which is the whole of it for a run with no display, and
@@ -4002,11 +4004,16 @@ const ApplyMode = struct {
 /// a full screen display opens its alternate screen over everything printed
 /// before it and this line was never read. Two spellings of one fact drift
 /// apart.
-const bounded_mode_fmt = "this project asks for the mode {s} in chock.zon, and the policy " ++
-    "answers {t} for {s}, so the session's work waits at its ref and no branch of yours moves.";
+///
+/// **It does not say the file asks for it.** The mode is `merge` for a project
+/// with no `chock.zon` at all, so a line naming the file would be a claim about
+/// a file that may not be there.
+const bounded_mode_fmt = "this session's work would land as {s}, and the policy answers {t} " ++
+    "for {s}, so the work waits at its ref and no branch of yours moves.";
 
 /// Whether this session's approved applies may move a branch of the user's,
-/// and which shape they take when they do.
+/// and which shape they take when they do. **A null `mode` is "they may
+/// not"**, which is what `deny` on the row leaves.
 ///
 /// **Two files and one answer.** `chock.zon` names the mode, because the shape
 /// a project wants its work in is the project's own taste; the
@@ -4069,8 +4076,9 @@ fn applyModeFor(
     const bounded = chock_policy.apply.boundBy(settings.mode, decision);
     // **Said out loud, and not only written to the log.** A person whose
     // project asked for a merge and will not get one has to be able to see
-    // that before the session runs, not at the end of it.
-    if (bounded != settings.mode) tty.print(.warn, "chock: " ++ bounded_mode_fmt ++ "\n", .{
+    // that before the session runs, not at the end of it. `deny` is the one
+    // answer that takes the landing away, so null is the whole of the case.
+    if (bounded == null) tty.print(.warn, "chock: " ++ bounded_mode_fmt ++ "\n", .{
         settings.mode.wireName(),
         decision,
         chock_policy.apply.integrate_action,
@@ -4339,27 +4347,26 @@ fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Er
 /// **Each one is a `Mode.fromAnswer` word.** A person who chooses by number and
 /// a person who types the word reach the same answer, because
 /// `chock_core.ask.chosen` turns the number into the word before this reads it.
-const landing_options = [_][]const u8{ "ref", "merge", "rebase", "squash" };
+const landing_options = [_][]const u8{ "merge", "rebase", "squash" };
 
 /// What the display asks. `landing_question` below is the console's own wording,
 /// which can afford more rows than a region has.
 const landing_text =
     "How should this session's work land? " ++
-    "ref leaves it at the ref, and no branch of yours moves. " ++
-    "merge, rebase and squash carry it onto the branch you have checked out. " ++
-    "Anything else keeps the work at the ref.";
+    "merge, rebase and squash each carry it onto the branch you have checked out. " ++
+    "Anything else keeps the work at the ref, and no branch of yours moves.";
 
 const landing_question =
     \\
     \\chock: this project asks you how the session's work should land.
     \\
-    \\  ref     leave it at the ref. No branch of yours moves, and you merge it yourself.
     \\  merge   merge it into the branch you have checked out.
     \\  rebase  replay it on top of the branch you have checked out.
     \\  squash  put all of it on the branch you have checked out, as one commit.
     \\
-    \\Anything else keeps the work at the ref. You are asked to approve the apply after this.
-    \\Which? [ref/merge/rebase/squash] 
+    \\Anything else keeps the work at the ref, and no branch of yours moves.
+    \\You are asked to approve the apply after this.
+    \\Which? [merge/rebase/squash] 
 ;
 
 /// Which shape this apply takes, for a project whose mode is `ask`.
@@ -4370,14 +4377,13 @@ const landing_question =
 /// prompt that describes the act, which is the property the whole approval flow
 /// rests on.
 ///
-/// **Nobody to ask means `ref`.** A subagent, a session the daemon started and
-/// a `chock run` whose standard input is a pipe all have nobody at the keyboard,
-/// and so does a session with the full screen display up, which owns the
-/// terminal and cannot have a second reader on it. Each of those keeps the work
-/// at the ref, which is the narrow answer and the one every session had before
-/// modes existed. `chock_core.ask` refuses the same three the same way and for
-/// the same reason.
-/// The landing one answer names, and `ref` for every answer that names none.
+/// **Nobody to ask means no landing.** A subagent, a session the daemon started
+/// and a `chock run` whose standard input is a pipe all have nobody at the
+/// keyboard, and so does a session with the full screen display up, which owns
+/// the terminal and cannot have a second reader on it. Each of those keeps the
+/// work at the ref, which is the narrow answer. `chock_core.ask` refuses the
+/// same three the same way and for the same reason.
+/// The landing one answer names, and null for every answer that names none.
 ///
 /// **Its own function so it can be driven without a display.** The region a
 /// person answers in cannot be built in a test here, so the part that can be
@@ -4386,20 +4392,27 @@ const landing_question =
 /// **Only a landing word moves a branch.** A person who typed something else,
 /// who pressed Enter, who was never there, or who ran out of time all get the
 /// answer that moves nothing. That is the same rule the console path keeps.
-fn landingFor(answer: chock_core.ask.Answer) chock_policy.apply.Landing {
+fn landingFor(answer: chock_core.ask.Answer) ?chock_policy.apply.Landing {
     return switch (answer) {
-        .answered => |said| chock_policy.apply.Mode.fromAnswer(said) orelse .ref,
-        .declined, .nobody, .timed_out, .stopped => .ref,
+        .answered => |said| chock_policy.apply.Mode.fromAnswer(said),
+        .declined, .nobody, .timed_out, .stopped => null,
     };
 }
 
+/// What this apply may do to the branch: a landing, or nothing and why.
+///
+/// **Null `mode` is the policy row's `deny`**, read once when the session
+/// started, and it is the one answer that takes the capability away. Every
+/// other way out of this function with no landing is nobody answering, which is
+/// the narrow answer and moves no branch either.
 fn chosenLanding(
     gpa: std.mem.Allocator,
     io: std.Io,
-    mode: chock_policy.apply.Mode,
+    mode: ?chock_policy.apply.Mode,
     screen: ?*ui.Ui,
-) chock_policy.apply.Landing {
-    if (mode.settled()) |landing| return landing;
+) chock_broker.integrate.Wanted {
+    const asked = mode orelse return .{ .none = .policy_refused };
+    if (asked.settled()) |landing| return .{ .land = landing };
     // **A display has a region for a question, so the question goes there.**
     // `Ui.showQuestion` carries the options and the countdown, and it is the
     // region a person is already reached through while a screen is up. A bare
@@ -4410,11 +4423,12 @@ fn chosenLanding(
         const answer = display.ask(gpa, io, .{
             .text = landing_text,
             .options = &landing_options,
-        }) catch return .ref;
+        }) catch return .{ .none = .nobody_answered };
         defer if (answer == .answered) gpa.free(answer.answered);
-        return landingFor(answer);
+        if (landingFor(answer)) |landing| return .{ .land = landing };
+        return .{ .none = .nobody_answered };
     }
-    if (!approval.hasTerminal(io)) return .ref;
+    if (!approval.hasTerminal(io)) return .{ .none = .nobody_answered };
 
     const stdin = approval.Stdin{};
     const console = stdin.console();
@@ -4428,10 +4442,11 @@ fn chosenLanding(
         // one that moves nothing.
         .idle, .ended, .canceled => {
             console.write(io, "\n");
-            return .ref;
+            return .{ .none = .nobody_answered };
         },
     };
-    return chock_policy.apply.Mode.fromAnswer(said) orelse .ref;
+    if (chock_policy.apply.Mode.fromAnswer(said)) |landing| return .{ .land = landing };
+    return .{ .none = .nobody_answered };
 }
 
 /// Every sandbox layer of this session, in the order the header names them.
@@ -6675,19 +6690,21 @@ const SessionHandback = struct {
                     .{ done.objects, ref, tree.project_root, m.landing.wireName(), m.branch, m.to },
                 ) },
                 .park => |p| parked: {
-                    // **The clause is built first**, because a project that
-                    // asks for nothing gets no clause at all: telling a model
-                    // on every apply of every project that nothing moved
-                    // "because this project asks for the work to wait at the
-                    // ref" is noise in the one place it is deciding what to say
-                    // to a person.
-                    const note = if (p.why == .not_asked_for)
-                        try gpa.dupe(u8, "")
+                    // **The clause is built first**, because a park with no
+                    // landing has no landing to name. Every park says why
+                    // either way: there is no longer a way to ask for nothing,
+                    // so no park is the ordinary case.
+                    const note = if (p.wanted) |it|
+                        try std.fmt.allocPrint(
+                            gpa,
+                            " The {s} this apply would have taken did not happen, because {s}.",
+                            .{ it.wireName(), p.why.sentence() },
+                        )
                     else
                         try std.fmt.allocPrint(
                             gpa,
-                            " The {s} this project asks for did not happen, because {s}.",
-                            .{ p.wanted.wireName(), p.why.sentence() },
+                            " No branch moved, because {s}.",
+                            .{p.why.sentence()},
                         );
                     defer gpa.free(note);
                     break :parked .{ .carried = true, .output = try std.fmt.allocPrint(
@@ -6898,27 +6915,26 @@ fn applyWork(
                     .{ m.branch, shortId(m.from), shortId(m.to), m.landing.wireName(), m.from },
                 ),
                 .park => |p| {
-                    // **Every park says that no branch moved, the ordinary one
-                    // included.** This sentence used to be inside the `if`
-                    // below, so the common case, a project that asks for `ref`,
-                    // printed the object count and then a `git merge` command
-                    // and nothing else. The command is one for the person to
-                    // run, and a reader took it for a report of what Chock had
-                    // already done. `Action.summary` says the same words on the
-                    // same occasion, so the two read alike.
+                    // **Every park says that no branch moved, and every park
+                    // says why.** The sentence used to be inside the `if`
+                    // below, so the common case, a project that asked for
+                    // nothing, printed the object count and then a `git merge`
+                    // command and nothing else. The command is one for the
+                    // person to run, and a reader took it for a report of what
+                    // Chock had already done. `Action.summary` says the same
+                    // words on the same occasion, so the two read alike.
                     //
-                    // Mutation check: put this arm back inside
-                    // `if (p.why != .not_asked_for)` and the ordinary park says
-                    // nothing about a branch again.
-                    if (p.why == .not_asked_for) tty.print(
-                        .plain,
-                        "chock run: no branch of yours moved: {s}.\n",
-                        .{p.why.sentence()},
-                    ) else tty.print(
+                    // Mutation check: drop either arm and a park stops saying
+                    // what happened to the branch.
+                    if (p.wanted) |it| tty.print(
                         .warn,
-                        "chock run: the {s} this project asks for did not happen, because {s}. " ++
-                            "No branch of yours moved.\n",
-                        .{ p.wanted.wireName(), p.why.sentence() },
+                        "chock run: the {s} this apply would have taken did not happen, " ++
+                            "because {s}. No branch of yours moved.\n",
+                        .{ it.wireName(), p.why.sentence() },
+                    ) else tty.print(
+                        .plain,
+                        "chock run: no branch of yours moved, because {s}.\n",
+                        .{p.why.sentence()},
                     );
                     tty.print(
                         .plain,
@@ -7047,13 +7063,13 @@ fn carryCommit(
     defer if (describe_diag) |*d| d.deinit(arena);
     // **Answered before the act is described**, so the description a person
     // reads names the shape they picked. See `chosenLanding`.
-    const landing = chosenLanding(gpa, io, started.apply_mode.mode, params.screen);
+    const wanted = chosenLanding(gpa, io, started.apply_mode.mode, params.screen);
     const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
         .repository = params.tree.project_root,
         .scratch_object_store = params.tree.object_store_source,
         .ref = params.ref,
         .new_id = params.new_id,
-        .landing = landing,
+        .wanted = wanted,
     }, &describe_diag) catch |err| {
         if (describe_diag) |*fault| {
             tty.print(
@@ -7088,7 +7104,7 @@ fn carryCommit(
     // person's attention on a change that is already made.
     if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
         recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
-            .park = .{ .wanted = landing, .why = .already_there },
+            .park = .{ .wanted = wanted.landing(), .why = .already_there },
         });
         return .already_there;
     }
@@ -7220,7 +7236,7 @@ fn carryCommit(
             // only when something happened is missing exactly where a reader
             // needs it.
             recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
-                .park = .{ .wanted = landing, .why = .not_asked_for },
+                .park = .{ .wanted = wanted.landing(), .why = .apply_refused },
             });
             return .{ .refused = outcome };
         },
@@ -7279,7 +7295,10 @@ fn recordIntegration(
             // `Landing` has no `ask` member, so neither has this row.
             .mode = switch (outcome) {
                 .moved => |m| m.landing.wireName(),
-                .park => |p| p.wanted.wireName(),
+                // **Empty for a park that never settled on a landing**, which
+                // the policy row refusing and nobody answering both leave.
+                // Naming one here would be a claim about an act nobody chose.
+                .park => |p| if (p.wanted) |it| it.wireName() else "",
             },
             .decision = @tagName(apply_mode.decision),
             .branch = if (moved) |m| m.branch else "",
@@ -10490,7 +10509,7 @@ fn runSession(
         // `applyModeFor` prints it in phase 1, which runs before `Ui.start`, so
         // the alternate screen opened straight over the one line that says why
         // no branch of the person's will move. See `bounded_mode_fmt`.
-        if (started.apply_mode.asked_for != started.apply_mode.mode) one.note(
+        if (started.apply_mode.mode == null) one.note(
             bounded_mode_fmt,
             .{
                 started.apply_mode.asked_for.wireName(),
@@ -13642,16 +13661,16 @@ test "an agent that has made no commit is answered before anything is put to any
 test "every ending of an apply writes down what it did to the branch" {
     // **A session has to be distinguishable afterwards by what happened to
     // somebody's branch.** A record written only when a branch moved is missing
-    // exactly where a reader needs it: they cannot tell a project that never
-    // asked from one whose merge was refused, or from a Chock too old to have
-    // modes at all.
+    // exactly where a reader needs it: they cannot tell a session the policy
+    // refused from one whose merge was refused by the working tree, or from a
+    // Chock too old to have modes at all.
     //
     // A structural check, for the reason `own_source` gives: the end to end
     // route needs a workspace, a policy table and a model, which this suite has
     // none of. Mutation check: delete any one of the three calls and this fails
     // with `CallIsGone`.
-    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n            .park = .{ .wanted = landing, .why = .already_there },");
-    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n                .park = .{ .wanted = landing, .why = .not_asked_for },");
+    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n            .park = .{ .wanted = wanted.landing(), .why = .already_there },");
+    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n                .park = .{ .wanted = wanted.landing(), .why = .apply_refused },");
     _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
 
     // And the record is written before the answer goes back, so a crash between
@@ -13710,9 +13729,10 @@ test "the log records the landing that happened, and not the mode the project co
     recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/two", .{
         .park = .{ .wanted = .merge, .why = .dirty_tree },
     });
-    // And a project that asked for nothing still reads `ref`.
-    recordIntegration(gpa, io, &locked, .{}, "refs/chock/three", .{
-        .park = .{ .wanted = .ref, .why = .not_asked_for },
+    // And a session the policy refused a landing names no landing at all,
+    // rather than a word for an act nobody chose.
+    recordIntegration(gpa, io, &locked, .{ .mode = null, .decision = .deny }, "refs/chock/three", .{
+        .park = .{ .wanted = null, .why = .policy_refused },
     });
     try locked.unlock(io);
 
@@ -13727,11 +13747,13 @@ test "the log records the landing that happened, and not the mode the project co
         @as(usize, 2),
         std.mem.count(u8, text, "\"mode\":\"merge\""),
     );
-    try std.testing.expect(std.mem.indexOf(u8, text, "\"mode\":\"ref\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"mode\":\"\"") != null);
     // The policy answer is still beside it, so a reader can still tell a
     // project that asked from an installation that permitted.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"dirty_tree\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"policy_refused\"") != null);
 }
 
 test "the line about a mode the policy took away is said again once the display is up" {
@@ -13749,11 +13771,11 @@ test "the line about a mode the policy took away is said again once the display 
     // and the comparison fails, which is the fault itself, written the other
     // way round.
     const printed = try callAt(
-        "\n    if (bounded != settings.mode) tty.print(.warn, \"chock: \" ++ bounded_mode_fmt",
+        "\n    if (bounded == null) tty.print(.warn, \"chock: \" ++ bounded_mode_fmt",
     );
     const opened = try callAt("\n        screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err|");
     const said_again = try callAt(
-        "\n        if (started.apply_mode.asked_for != started.apply_mode.mode) one.note(",
+        "\n        if (started.apply_mode.mode == null) one.note(",
     );
 
     try std.testing.expect(opened < said_again);
@@ -14557,11 +14579,18 @@ test "the write and execute rule is on unless this project's policy says allow" 
     try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, child.rule);
 }
 
-test "the mode comes from chock.zon and the table above it, and a project that says nothing parks" {
-    // **Two files and one answer.** The project names the shape, the
-    // `workspace.integrate` row says whether the shape may be anything but
-    // `ref`, and a project that has never heard of either is exactly as it was
-    // before an apply could move a branch at all.
+test "the mode comes from chock.zon and the table above it, and nothing configured merges" {
+    // **Two files and one answer.** The project names the shape, and the
+    // `workspace.integrate` row says whether an approved apply may move a
+    // branch at all.
+    //
+    // **The whole chain for a project with no `chock.zon`**, measured end to
+    // end in the first case below: no file, so `apply.load` answers the
+    // `Settings` default, which is `merge`; no rule names the row, so
+    // `ceilingChain` answers `allow`; `boundBy(.merge, .allow)` is `merge`; and
+    // `chosenLanding` settles `merge` without asking anybody. The person is
+    // then shown a summary that names the branch and the merge before they
+    // answer.
     //
     // Mutation check: let `boundBy` answer `mode` for `deny` as well and the
     // third case below lets an installation whose organisation said no move a
@@ -14588,11 +14617,19 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
     defer chock_policy.table.Table.destroy(arena, empty);
 
-    // No `chock.zon` at all: the work waits at the ref, and nothing is said,
-    // because nothing was taken away.
+    // No `chock.zon` at all: the work merges into the branch, and nothing is
+    // said, because nothing was taken away.
     const silent = try applyModeFor(arena, io, root, empty, &.{}, "main", "a-model");
-    try std.testing.expectEqual(chock_policy.apply.Mode.ref, silent.mode);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Mode, .merge), silent.mode);
+    try std.testing.expectEqual(chock_policy.table.Decision.allow, silent.decision);
     try std.testing.expectEqualStrings("", said.err());
+
+    // And the landing that mode settles on, with no display and no question
+    // put to anybody, because a settled mode needs nobody.
+    try std.testing.expectEqual(
+        chock_broker.integrate.Wanted{ .land = .merge },
+        chosenLanding(gpa, io, silent.mode, null),
+    );
 
     // A project that asked for a merge, in the file that is kept beyond the
     // agent's reach, and an installation whose organisation has never heard of
@@ -14603,7 +14640,7 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     file.close(io);
 
     const asked = try applyModeFor(arena, io, root, empty, &.{}, "main", "a-model");
-    try std.testing.expectEqual(chock_policy.apply.Mode.merge, asked.mode);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Mode, .merge), asked.mode);
     try std.testing.expectEqual(chock_policy.table.Decision.allow, asked.decision);
     try std.testing.expectEqualStrings("", said.err());
 
@@ -14617,14 +14654,24 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     defer chock_policy.table.Table.destroy(arena, under_org);
 
     const refused = try applyModeFor(arena, io, root, under_org, &.{}, "main", "a-model");
-    try std.testing.expectEqual(chock_policy.apply.Mode.ref, refused.mode);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Mode, null), refused.mode);
     try std.testing.expectEqual(chock_policy.table.Decision.deny, refused.decision);
+    // **And the apply that follows parks, and says the policy is why.** `deny`
+    // is the one decision that bounds the landing, and it still does.
+    try std.testing.expectEqual(
+        chock_broker.integrate.Wanted{ .none = .policy_refused },
+        chosenLanding(gpa, io, refused.mode, null),
+    );
     // **And what the file asked for is kept beside what it got.** That is the
     // half the line a person reads names, and `mode` alone cannot show it.
     try std.testing.expectEqual(chock_policy.apply.Mode.merge, refused.asked_for);
     // **And the person hears about it before the session runs**, rather than at
-    // the end of it when nothing was integrated.
+    // the end of it when nothing was integrated. The line names the landing and
+    // the row, and never the file, because a project with no `chock.zon` at all
+    // reaches this same line through the default.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "workspace.integrate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "merge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") == null);
 
     // And a subagent moves no branch its parent could not.
     said.clear();
@@ -14636,22 +14683,26 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     defer chock_policy.table.Table.destroy(arena, child_only);
     const chain = [_]chock_proto.event.SpawnLink{.{ .agent_kind = "main", .reason = "review it" }};
     const child = try applyModeFor(arena, io, root, child_only, &chain, "reviewer", "a-model");
-    try std.testing.expectEqual(chock_policy.apply.Mode.ref, child.mode);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Mode, null), child.mode);
+    try std.testing.expectEqual(
+        chock_broker.integrate.Wanted{ .none = .policy_refused },
+        chosenLanding(gpa, io, child.mode, null),
+    );
 }
 
 test "only a landing word moves a branch, whichever way the answer arrived" {
     // The display and the console read one answer the same way, so a person who
     // chose in the region and a person who typed at a prompt reach the same
-    // landing. Mutation check: make any arm below answer something other than
-    // `.ref` and the half under it fails.
+    // landing. Mutation check: make any arm below answer a landing and the half
+    // under it fails.
     const gpa = std.testing.allocator;
 
-    for ([_][]const u8{ "ref", "merge", "rebase", "squash" }) |word| {
+    for ([_][]const u8{ "merge", "rebase", "squash" }) |word| {
         const said = try gpa.dupe(u8, word);
         defer gpa.free(said);
         try std.testing.expectEqualStrings(
             word,
-            landingFor(.{ .answered = said }).wireName(),
+            landingFor(.{ .answered = said }).?.wireName(),
         );
     }
 
@@ -14665,32 +14716,49 @@ test "only a landing word moves a branch, whichever way the answer arrived" {
     // at all, moves nothing.
     const nonsense = try gpa.dupe(u8, "yes please");
     defer gpa.free(nonsense);
-    try std.testing.expectEqual(chock_policy.apply.Landing.ref, landingFor(.{ .answered = nonsense }));
+    const Landing = chock_policy.apply.Landing;
+    try std.testing.expectEqual(@as(?Landing, null), landingFor(.{ .answered = nonsense }));
     for ([_]chock_core.ask.Answer{ .declined, .nobody, .timed_out, .stopped }) |none| {
-        try std.testing.expectEqual(chock_policy.apply.Landing.ref, landingFor(none));
+        try std.testing.expectEqual(@as(?Landing, null), landingFor(none));
+    }
+    // **`ref` is not a word here any more.** It used to be the answer that
+    // moved nothing, and now nothing is that answer: a person who wants no
+    // branch moved says `n` to the apply itself.
+    const old_word = try gpa.dupe(u8, "ref");
+    defer gpa.free(old_word);
+    try std.testing.expectEqual(@as(?Landing, null), landingFor(.{ .answered = old_word }));
+    for (landing_options) |option| {
+        try std.testing.expect(!std.mem.eql(u8, "ref", option));
     }
 }
 
 test "a session with nobody at the keyboard never lands the work on a branch by itself" {
     // `ask` puts the choice to a person, and a subagent, a daemon session and a
-    // `chock run` behind a pipe all have nobody to put it to. The narrow answer
-    // is the one every session had before modes existed.
+    // `chock run` behind a pipe all have nobody to put it to. **The narrow
+    // answer is not negotiable**, and it survives the default becoming `merge`
+    // because a settled mode and an unanswered question are two different
+    // routes through this function.
     //
-    // Mutation check: answer `merge` when there is no terminal and a session
+    // Mutation check: answer a landing when there is no terminal and a session
     // nobody is watching starts moving branches on its own.
     const io = std.testing.io;
     // The test binary's own standard input is the build runner's, and it is not
     // a terminal, so this is the real reader answering for the real case.
-    try std.testing.expectEqual(
-        chock_policy.apply.Landing.ref,
-        chosenLanding(std.testing.allocator, io, .ask, null),
-    );
+    const nobody = chosenLanding(std.testing.allocator, io, .ask, null);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Landing, null), nobody.landing());
+    try std.testing.expectEqual(chock_broker.integrate.Reason.nobody_answered, nobody.none);
+
+    // And a session the policy refused one moves no branch either, without
+    // asking anybody anything.
+    const refused = chosenLanding(std.testing.allocator, io, null, null);
+    try std.testing.expectEqual(@as(?chock_policy.apply.Landing, null), refused.landing());
+    try std.testing.expectEqual(chock_broker.integrate.Reason.policy_refused, refused.none);
 
     // A settled mode needs nobody and is answered without a question.
-    for ([_]chock_policy.apply.Mode{ .ref, .merge, .rebase, .squash }) |mode| {
+    for ([_]chock_policy.apply.Mode{ .merge, .rebase, .squash }) |mode| {
         try std.testing.expectEqualStrings(
             mode.wireName(),
-            chosenLanding(std.testing.allocator, io, mode, null).wireName(),
+            chosenLanding(std.testing.allocator, io, mode, null).landing().?.wireName(),
         );
     }
 }
