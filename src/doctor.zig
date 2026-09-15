@@ -475,12 +475,6 @@ pub fn wordFor(row: Row) []const u8 {
         // A row that is on and blocks is not a state this file builds: a first
         // run cannot fail on a layer that went on.
         .on => unreachable,
-        // **This command produces none of these today, and it still needs a
-        // word.** Every row here is measured, which is what the whole file is
-        // for, so a layer nobody measured has no row. A row that ever did
-        // arrive this way must say that nothing was measured rather than read
-        // as a refusal. See `ui.Layer.State.declared`.
-        .declared => "UNPROVEN",
         // The header's own two words for a machine and never for a verdict.
         // `OFF` is a layer that was given up and `NONE` is a machine with
         // nothing to configure, and neither was ever read as a refusal.
@@ -3010,7 +3004,7 @@ test "a layer this machine has is still reported absent when the measurement say
 }
 
 test "a layer the machine has and this process may not use is BLOCKED, not NONE" {
-    // The state `src/ui.zig` declared and nothing produced. `unsupported`
+    // The state `src/ui.zig` names and the header rarely draws. `unsupported`
     // says there is nothing to configure; `unavailable` says an administrator
     // can change something. A report that spelled the two the same way would
     // have a person looking for a kernel fault that is not there.

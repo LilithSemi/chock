@@ -4458,20 +4458,14 @@ fn chosenLanding(
 /// missing, and `✓` beside a layer the driver gives is a claim about every call
 /// that ran, not a guess about one.
 ///
-/// **`witness` is what this process really asked the machine**, and it is the
-/// difference between a report and a claim. `witness.probed` names every
-/// guarantee something here observed one way or the other, and
-/// `witness.unavailable` names the ones that came back refused. A guarantee
-/// in `given` and not in `witness.probed` reads `ui.Layer.State.declared`: the
-/// build applies it and nothing here watched it go on.
-///
-/// **That distinction is the whole reason this takes two sets.** A layer
-/// credited because the code that installs it compiled, or because the call
-/// that installs it returned no error, is a claim. The header draws before the
-/// first tool call, so at that moment an unprobed layer has nothing behind it
-/// at all, and a tick there would be the harness telling a person something it
-/// does not know. See `witnessLayers`, which does the measuring, and
-/// `ui.Layer.State` for what each answer prints.
+/// **`witness` is the one thing this machine can answer differently**, and it
+/// only ever takes a layer away. `witness.unavailable` names the guarantees a
+/// probe here asked about and got refused, such as a kernel with no Landlock
+/// or one that will not take this build's filter. Those are measured facts
+/// about this machine, so they outrank the tick. A guarantee nothing probed is
+/// **not** a third answer: see the paragraph above, which is why. See
+/// `witnessLayers` for what is really asked, and `ui.Layer.State` for what
+/// each answer prints.
 ///
 /// The result borrows only static strings, so a caller may keep it for as long
 /// as it likes.
@@ -4481,6 +4475,11 @@ fn sandboxLayers(
     network: sandbox.namespace.Network,
     workspace: []const u8,
 ) [layer_names.len]ui.Layer {
+    // Nothing may be called refused that was never asked. A caller that broke
+    // this would draw a cross on a layer no probe ever ran against, which is
+    // the fault this file removed, pointing the other way.
+    std.debug.assert(witness.unavailable.subsetOf(witness.probed));
+
     var built: [layer_names.len]ui.Layer = undefined;
     for (layer_names, &built) |named, *slot| {
         const note: []const u8 = switch (named.guarantee) {
@@ -4507,8 +4506,6 @@ fn sandboxLayers(
             .unavailable
         else if (named.guarantee == .network_isolated and network == .host)
             .off
-        else if (!witness.probed.contains(named.guarantee))
-            .declared
         else
             .on;
         slot.* = .{ .name = named.name, .note = note, .state = state };
@@ -4516,15 +4513,16 @@ fn sandboxLayers(
     return built;
 }
 
-/// What this session could measure about its own sandbox layers, and what it
-/// could not.
+/// What this machine refused, out of what this session asked it.
 ///
-/// **Two sets and not one, because "not probed" is a third answer.** A
-/// guarantee in `probed` is one this process really asked the machine about.
-/// A guarantee in `unavailable` came back refused, and `unavailable` is always
-/// a subset of `probed`: nothing may be called refused that was never asked.
-/// A guarantee in neither is a layer this build applies and nothing here
-/// watched. See `ui.Layer.State.declared`.
+/// **Two sets and not one, so that a refusal can be told from a question
+/// nobody asked.** A guarantee in `probed` is one this process really asked
+/// the machine about. A guarantee in `unavailable` came back refused, and
+/// `unavailable` is always a subset of `probed`: nothing may be called refused
+/// that was never asked, and `sandboxLayers` asserts it.
+///
+/// **A guarantee in neither changes nothing.** The driver applies it and dies
+/// if it cannot, so it reads on: see `ui.Layer.State.on`.
 const LayerWitness = struct {
     probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
     unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
@@ -4544,8 +4542,12 @@ const LayerWitness = struct {
 /// `spawn` will ask are observations. The absence of an error from code that
 /// has not run yet is not.
 ///
-/// **Five of the six are answered and one is not**, and the header says
-/// which:
+/// **What a probe is for now: the two questions a machine can answer
+/// differently.** A layer this build applies is enforced or the call dies, so
+/// a probe cannot make its tick any truer. What a probe can find is a machine
+/// that will refuse the layer outright, and the header draws that as
+/// `BLOCKED`. Five of the six are asked, because one fork answers for three
+/// namespaces at no extra cost, and the sixth cannot be asked at all:
 ///
 /// * `path_restricted` is `sandbox.landlock.probeAbi`, a system call that
 ///   reads the ABI version and changes nothing. `src/doctor.zig` reads it the
@@ -4559,18 +4561,21 @@ const LayerWitness = struct {
 /// * `syscall_restricted` is `sandbox.seccomp.probeInstall`, which forks a
 ///   child that installs this build's own filter and exits. The filter cannot
 ///   be removed, so the question can only be asked in a child.
-/// * `workspace_mounted` is **not** measured. The namespace probe enters a
-///   mount namespace and it does not build a root or `pivot_root` into one,
-///   and claiming the workspace layer from it would be crediting a layer for
-///   a weaker measurement than the layer makes. It reads `declared`.
+/// * `workspace_mounted` is **not** measured, and it does not need to be. The
+///   namespace probe enters a mount namespace and it builds no root and
+///   `pivot_root`s into none, so crediting the workspace layer from it would
+///   be the same overclaim in a new place. `buildRoot` and `pivotInto` both
+///   die, so the layer is enforced or the call never runs.
 ///
-/// **Linux only.** Darwin's `path_restricted` is Seatbelt and never Landlock,
-/// and a raw Landlock system call asked of a kernel that is not Linux answers
-/// nothing true about that profile. The same holds for the other two probes,
-/// which name Linux mechanisms outright. On Darwin this measures nothing, so
-/// every layer Seatbelt gives reads `declared` rather than `on`: see
-/// `src/doctor.zig`'s own `measureSeatbelt`, which is where a Darwin session's
-/// layers really are measured.
+/// **Linux only, and that costs Darwin nothing.** Darwin's `path_restricted`
+/// is Seatbelt and never Landlock, and a raw Landlock system call asked of a
+/// kernel that is not Linux answers nothing true about that profile. The same
+/// holds for the other two probes, which name Linux mechanisms outright. So on
+/// Darwin this measures nothing and every guarantee that driver gives reads
+/// on, because `darwin/driver.zig` dies when Seatbelt refuses the profile, and
+/// the two it does not give read `NONE`. `src/doctor.zig`'s own
+/// `measureSeatbelt` spawns a real confined child against probe files on disk,
+/// which is a report's work and not a header's.
 fn witnessLayers(
     gpa: std.mem.Allocator,
     given: sandbox.Sandbox.Guarantees,
@@ -16057,54 +16062,26 @@ test "a layer the driver gives but this run could not get reads unavailable, not
     }
 }
 
-test "a layer nothing measured reads unproven, and never the same as one that was probed" {
-    // **This is the whole point of the witness.** The header draws before the
-    // first tool call. Every layer used to read `on` there because the build's
-    // driver declares it, so the tick was a claim about code that had not run
-    // yet, not a report of anything observed. A reader cannot tell a measured
-    // layer from an unmeasured one when both print the same mark.
+test "a layer nothing probed still reads on, because the driver dies rather than run without it" {
+    // **A layer whose failure is fatal needs no pre-flight probe to earn its
+    // tick.** Every step of `applyLayers` in `lib/chock-sandbox/linux/driver.zig`
+    // ends in `die`: the mount tree, the pivot, the capabilities, Landlock, the
+    // session keyring and the filter. `enterNamespaces` dies as well. Darwin's
+    // own driver dies when Seatbelt refuses the profile. So there is no path
+    // where a layer quietly fails to apply and the tool call still runs, and a
+    // tick means "this is enforced, or the call dies".
     //
-    // Mutation check: drop the `witness.probed` test from `sandboxLayers` and
-    // the first block below reads `on` for all six, which is the old
-    // behaviour and the fault this change exists to remove.
+    // Mutation check: answer a state of its own for a layer nothing probed and
+    // the first block below reads that state for all six.
     const every = sandbox.Sandbox.Guarantees.initFull();
+    const unprobed = sandboxLayers(every, .{}, .none, "worktree");
+    for (unprobed) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
 
-    // Nothing probed at all: every layer the build gives is declared and none
-    // of them claims to have been seen.
-    const unseen = sandboxLayers(every, .{}, .none, "worktree");
-    for (unseen) |one| {
-        try std.testing.expectEqual(ui.Layer.State.declared, one.state);
-        // The word is what stops the difference resting on one glyph.
-        try std.testing.expectEqualStrings("UNPROVEN", one.state.word());
-    }
-    // And it is a different mark from both of the answers it sits between.
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        ui.Layer.State.declared.glyph(),
-        ui.Layer.State.on.glyph(),
-    ));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        ui.Layer.State.declared.glyph(),
-        ui.Layer.State.unavailable.glyph(),
-    ));
-
-    // One probed layer among five unprobed ones: only the probed one is
-    // credited, and the other five stay honest.
+    // A probe that came back refused still outranks the tick. That is a
+    // measured answer about this machine, and it is what the two probes are
+    // kept for.
     var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
     landlock_only.insert(.path_restricted);
-    const one_seen = sandboxLayers(every, .{ .probed = landlock_only }, .none, "worktree");
-    for (one_seen) |one| {
-        if (std.mem.eql(u8, one.name, "landlock")) {
-            try std.testing.expectEqual(ui.Layer.State.on, one.state);
-        } else {
-            try std.testing.expectEqual(ui.Layer.State.declared, one.state);
-        }
-    }
-
-    // A layer that was probed and came back refused stays `unavailable`. That
-    // answer outranks this one, because it is the stronger fact: the machine
-    // was asked and it said no.
     const refused = sandboxLayers(
         every,
         .{ .probed = landlock_only, .unavailable = landlock_only },
@@ -16114,6 +16091,62 @@ test "a layer nothing measured reads unproven, and never the same as one that wa
     for (refused) |one| {
         if (std.mem.eql(u8, one.name, "landlock")) {
             try std.testing.expectEqual(ui.Layer.State.unavailable, one.state);
+        } else {
+            try std.testing.expectEqual(ui.Layer.State.on, one.state);
+        }
+    }
+}
+
+test "the header of a normal linux session is six ticks and no other mark" {
+    // **The literal row a person reads.** Nothing here probes anything, which
+    // is what a Darwin session and a Linux session with an unrunnable probe
+    // both look like, and the row is still six ticks because every one of the
+    // six is fatal to fail.
+    //
+    // Mutation check: answer a state of its own for a layer nothing probed and
+    // this row grows a mark that is neither a tick nor a cross.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const layers = sandboxLayers(sandbox.Sandbox.Guarantees.initFull(), .{}, .none, "worktree");
+    var said: std.ArrayList(u8) = .empty;
+    for (layers) |one| {
+        if (said.items.len != 0) try said.appendSlice(arena, "  ");
+        try said.appendSlice(arena, try ui.layerText(arena, one, false));
+    }
+    try std.testing.expectEqualStrings(
+        "\u{2713} net none  \u{2713} fs worktree  \u{2713} pid  " ++
+            "\u{2713} ipc  \u{2713} seccomp  \u{2713} landlock",
+        said.items,
+    );
+}
+
+test "a layer this platform never applies is drawn as missing and never as on" {
+    // **Darwin measures nothing here and it must still read true.** Its driver
+    // declares four guarantees, which are the network, the signals, the IPC and
+    // the paths, and it declares neither a system call filter nor a mounted
+    // workspace. `witnessLayers` names Linux mechanisms, so on Darwin it
+    // returns an empty witness. The four the profile applies read on, because
+    // `darwin/driver.zig` dies when Seatbelt refuses the profile, and the two
+    // it never applies read `NONE`.
+    //
+    // Mutation check: read a guarantee the driver does not give as on and the
+    // two `NONE` rows below claim a layer this platform has never had.
+    const darwin = sandbox.Sandbox.Guarantees.initMany(&.{
+        .network_isolated,
+        .signal_isolated,
+        .ipc_isolated,
+        .path_restricted,
+    });
+    const built = sandboxLayers(darwin, .{}, .none, "worktree");
+    for (built) |one| {
+        const never = std.mem.eql(u8, one.name, "fs") or std.mem.eql(u8, one.name, "seccomp");
+        if (never) {
+            try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
+            try std.testing.expectEqualStrings("NONE", one.state.word());
+        } else {
+            try std.testing.expectEqual(ui.Layer.State.on, one.state);
         }
     }
 }

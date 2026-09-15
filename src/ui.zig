@@ -1584,56 +1584,44 @@ pub const Layer = struct {
     /// What became of one layer.
     ///
     /// **The names are the project's own**, from `chock_sandbox`'s cgroup
-    /// support record: `ok`, `off`, `unsupported`, `unavailable`. Two of the
-    /// four can be answered today and the other two are named here so that the
-    /// answer has somewhere to land when it exists: see this file's own
-    /// `Layer.State.unavailable`.
+    /// support record: `ok`, `off`, `unsupported`, `unavailable`.
+    ///
+    /// **Every state is either a tick or a cross, and there is no third
+    /// answer.** A row that said "this was not measured" is a confession and
+    /// not a status: a person can act on none of it, and beside a layer that
+    /// holds it reads as a warning. See `Layer.State.on` for what makes the
+    /// two answers enough.
     pub const State = enum {
-        /// The layer is on, **and something in this process observed it**. A
-        /// probe answered, a system call came back the right way, or a value
-        /// was read and checked. See `run.witnessLayers` for what each one is.
+        /// The layer will be enforced on every tool call of this session.
+        ///
+        /// **Because the driver dies rather than run a call without it.**
+        /// Every step of `applyLayers` in `lib/chock-sandbox/linux/driver.zig`
+        /// ends in `die`, and `darwin/driver.zig` dies when Seatbelt refuses
+        /// the profile. So there is no path where a layer quietly fails to
+        /// apply and the tool call still runs, and this tick is a claim about
+        /// every call that runs rather than a guess about the first one.
         on,
-        /// This build's driver applies the layer and **nothing here observed
-        /// it**.
-        ///
-        /// **A weaker claim than `on`, and it must not print the same.** A
-        /// capability credited because the code that installs it compiled, or
-        /// because the call that installs it returned no error, is a claim and
-        /// not a measurement. The session header draws before the first tool
-        /// call, so a layer with no probe of its own has nothing behind it yet
-        /// at that moment, whatever the first tool call goes on to prove.
-        ///
-        /// **Not a fault.** A layer reading this is very probably on, and the
-        /// report says only that this process did not watch it go on.
-        /// `chock doctor` measures every row it prints, so it produces none of
-        /// these today.
-        declared,
         /// The layer could be on and this session gave it up. The one case
         /// today is a network config of `.host`, which is allowed only for an
         /// act a user approved.
         off,
         /// This build's sandbox driver does not give this layer at all. On
-        /// Darwin this is the layers Seatbelt has no answer for, and not the
-        /// whole set: the paths, the network, the signals and the IPC are
-        /// measured there and read `on` when the profile applied. A build with
-        /// no driver at all is `LayerFamily.none`, never this.
+        /// Darwin this is the system call filter and the mounted workspace,
+        /// and not the whole set: that driver gives the paths, the network,
+        /// the signals and the IPC, and those four read `on`. A build with no
+        /// driver at all is `LayerFamily.none`, never this.
         unsupported,
-        /// The machine could give this layer and this process was not
-        /// permitted. **Nothing produces this yet**, because no per layer
-        /// record of a real `Sandbox.spawn` reaches this process: see
-        /// `run.sandboxLayers`, which says what does reach it and why the
-        /// remaining states are still honest.
+        /// The machine could give this layer and **it refused this process**.
+        /// A probe asked and got a no: a kernel with no Landlock, or one that
+        /// will not take this build's filter. See `run.witnessLayers` for the
+        /// two questions that are really asked, which are the only two a
+        /// machine can answer differently.
         unavailable,
 
         /// The first signal: a glyph, which survives a terminal with no colour.
         pub fn glyph(self: State) []const u8 {
             return switch (self) {
                 .on => "\u{2713}",
-                // **Neither mark.** A tick is a claim this state does not
-                // carry and a cross is a fault it is not. A reader who sees a
-                // question mark asks what was measured, which is the right
-                // question.
-                .declared => "?",
                 .off, .unsupported, .unavailable => "\u{2717}",
             };
         }
@@ -1644,10 +1632,6 @@ pub const Layer = struct {
         pub fn word(self: State) []const u8 {
             return switch (self) {
                 .on => "",
-                // **A word, because a glyph alone would rest the difference
-                // between a measured layer and an unmeasured one on one
-                // character.** That is the same rule `OFF` follows.
-                .declared => "UNPROVEN",
                 .off => "OFF",
                 // A different word from `OFF`, because they are different
                 // facts: one is a layer this session gave up and the other is a
@@ -1928,13 +1912,10 @@ pub fn headerPieces(
         taken += room.measure.widthOf(whole);
         try layers.append(arena, .{
             .text = whole,
-            // **Three tones, because there are three kinds of answer.** A
-            // layer nobody measured is not a fault, so painting it the colour
-            // of one would teach a reader to ignore that colour. It takes the
-            // muted tone the context facts have: see `Layer.State.declared`.
+            // **Two tones, because a layer is either enforced or it is not.**
+            // See `Layer.State`, which says why there is no third answer.
             .tone = switch (one.state) {
                 .on => .on,
-                .declared => .context,
                 .off, .unsupported, .unavailable => .off,
             },
         });
@@ -8340,44 +8321,26 @@ test "a layer that is not on says so in a word as well as in a glyph and a colou
     try testing.expectEqualStrings("", Layer.State.on.word());
 }
 
-test "a layer nobody measured is told apart from one that was, by glyph and by word" {
-    // **A capability credited because it compiled is not a capability.** The
-    // session header draws before the first tool call, so a layer with no
-    // probe behind it has been observed by nothing at that moment. It must not
-    // draw the mark a measured layer draws, and it must not draw the mark a
-    // refused one draws either: it is neither a claim nor a fault.
+test "every layer state is a tick or a cross, because a layer is either enforced or it is not" {
+    // **There is no third answer.** Every step of `applyLayers` in the Linux
+    // driver ends in `die`, and Darwin's driver dies too when Seatbelt refuses
+    // the profile. So a layer this build applies is enforced, or the tool call
+    // never runs. A state that said "nobody measured this" was a confession
+    // and not a status: a reader could act on none of it, and on the workspace
+    // layer, which works, it read as a warning about a layer that holds.
     //
-    // Mutation check: give `.declared` the same glyph as `.on` and the first
-    // expectation fails. Give it an empty word and the third fails, which is
-    // the case where the whole difference would rest on one character.
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try testing.expectEqualStrings("? seccomp UNPROVEN", try layerText(
-        arena,
-        .{ .name = "seccomp", .state = .declared },
-        false,
-    ));
-
-    // No two states share a glyph and a word together, so no two of them read
-    // the same on a screen with no colour.
+    // Mutation check: give any state a mark of its own, such as `?`, and the
+    // first loop below fails on it. Give a second state the tick and the count
+    // below fails, which is a tick that means two different things.
+    const tick = "\u{2713}";
+    const cross = "\u{2717}";
+    var ticks: usize = 0;
     for (std.enums.values(Layer.State)) |state| {
-        if (state == .declared) continue;
-        const same_glyph = std.mem.eql(u8, state.glyph(), Layer.State.declared.glyph());
-        const same_word = std.mem.eql(u8, state.word(), Layer.State.declared.word());
-        try testing.expect(!(same_glyph and same_word));
+        const is_tick = std.mem.eql(u8, state.glyph(), tick);
+        try testing.expect(is_tick or std.mem.eql(u8, state.glyph(), cross));
+        if (is_tick) ticks += 1;
     }
-    try testing.expect(Layer.State.declared.word().len != 0);
-
-    // **It keeps its name at every width**, the same rule a layer that is not
-    // on follows: a bare glyph would leave the fact a person is there for
-    // resting on one character.
-    try testing.expectEqualStrings("? seccomp UNPROVEN", try layerText(
-        arena,
-        .{ .name = "seccomp", .state = .declared },
-        true,
-    ));
+    try testing.expectEqual(@as(usize, 1), ticks);
 }
 
 test "under 60 columns a layer that is on sheds its name and one that is not keeps it" {
