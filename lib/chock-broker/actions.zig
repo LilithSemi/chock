@@ -678,6 +678,13 @@ pub const Action = union(Kind) {
             // arms and not one with a mode appended: a person who reads only
             // the summary must be able to tell a merge from a park, because
             // the answer to both is the same "y".
+            //
+            // **And a park says so in words, not by leaving the branch out.**
+            // The project owner approved six parks reading a line that named
+            // only the ref, and believed each one had merged for him. The
+            // sentence that would have told him was in the detail, behind a
+            // `show` he never opened. `detail` still carries the whole of it;
+            // this carries the half nobody may miss.
             .workspace_apply => |a| switch (a.integration) {
                 .move => |m| std.fmt.allocPrint(
                     gpa,
@@ -694,7 +701,8 @@ pub const Action = union(Kind) {
                 ),
                 .park => |p| if (p.why == .not_asked_for) std.fmt.allocPrint(
                     gpa,
-                    "land {d} {s} of the session in {s}, and set {s} to {s}",
+                    "land {d} {s} of the session in {s}, and set {s} to {s}. " ++
+                        "No branch of yours moves",
                     .{
                         a.objects.len,
                         plural(a.objects.len, "object", "objects"),
@@ -705,7 +713,8 @@ pub const Action = union(Kind) {
                 ) else std.fmt.allocPrint(
                     gpa,
                     "land {d} {s} of the session in {s}, and set {s} to {s}. " ++
-                        "The {s} this project asks for does not happen, because {s}",
+                        "No branch of yours moves: the {s} this project asks for does not " ++
+                        "happen, because {s}",
                     .{
                         a.objects.len,
                         plural(a.objects.len, "object", "objects"),
@@ -2680,6 +2689,80 @@ test "an action names its effect, and the effect is a diff and not a command" {
             try testing.expectEqualStrings("a detail that names no command", detail);
             return error.DetailNamesACommand;
         }
+    }
+}
+
+test "the one line of an apply that parks says that no branch of yours moves" {
+    // **The fault this closes, reported by the project owner on 2026-09-08.**
+    // He approved an apply six times in a project whose mode was the default
+    // `ref`, and believed each time that Chock had merged for him. The log is
+    // right: six parks. The summary he read named the ref and never the branch,
+    // and the sentence that would have told him is in the detail, behind a
+    // `show` he never opened. The summary is what a person reads, so the
+    // summary has to carry it.
+    //
+    // Mutation check: take the phrase off either park arm of `summary` and the
+    // half below it fails.
+    const gpa = testing.allocator;
+
+    const base = WorkspaceApply{
+        .repository = "/home/ross/project",
+        .scratch_object_store = "/tmp/sess1.objects",
+        .project_object_store = "/home/ross/project/.git/objects",
+        .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
+        .old_id = "",
+        .new_id = "2222222222222222222222222222222222222222",
+        .objects = &.{"2222222222222222222222222222222222222222"},
+        .diff = "",
+    };
+
+    // The ordinary case, and the one the owner met: the project asked for
+    // nothing, so nothing was ever going to move.
+    {
+        var apply = base;
+        apply.integration = .{ .park = .{ .wanted = .ref, .why = .not_asked_for } };
+        const said = try (Action{ .workspace_apply = apply }).summary(gpa);
+        defer gpa.free(said);
+        if (std.mem.indexOf(u8, said, "No branch of yours moves") == null) {
+            try testing.expectEqualStrings("a summary that names the branch", said);
+            return error.SummaryDoesNotSayTheBranchStays;
+        }
+        // Still one line: a client lists it in one row.
+        try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, said, '\n'));
+    }
+
+    // The project asked for a merge and cannot have one. The refusal was
+    // already named; what was missing is the branch.
+    {
+        var apply = base;
+        apply.integration = .{ .park = .{ .wanted = .merge, .why = .dirty_tree } };
+        const said = try (Action{ .workspace_apply = apply }).summary(gpa);
+        defer gpa.free(said);
+        if (std.mem.indexOf(u8, said, "No branch of yours moves") == null) {
+            try testing.expectEqualStrings("a summary that names the branch", said);
+            return error.SummaryDoesNotSayTheBranchStays;
+        }
+        // Both halves are still there: what was asked for, and why it is not
+        // happening. See `integrate.Parked`.
+        try testing.expect(std.mem.indexOf(u8, said, "merge") != null);
+        try testing.expect(std.mem.indexOf(u8, said, "not committed") != null);
+        try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, said, '\n'));
+    }
+
+    // And the arm that really moves a branch does not borrow the phrase, or
+    // the one row would say the opposite of what it does.
+    {
+        var apply = base;
+        apply.integration = .{ .move = .{
+            .landing = .merge,
+            .branch = "refs/heads/main",
+            .at = "1111111111111111111111111111111111111111",
+            .to = "3333333333333333333333333333333333333333",
+        } };
+        const said = try (Action{ .workspace_apply = apply }).summary(gpa);
+        defer gpa.free(said);
+        try testing.expect(std.mem.indexOf(u8, said, "No branch of yours moves") == null);
+        try testing.expect(std.mem.indexOf(u8, said, "refs/heads/main") != null);
     }
 }
 

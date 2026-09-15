@@ -1305,11 +1305,9 @@ pub const WriteExecuteRule = union(enum) {
 /// sandbox, written for the same reason.
 ///
 /// **The reason and not only the outcome.** `mode` and `decision` together say
-/// why this apply was allowed to move a branch at all, so a reader can tell a
-/// project that asked for a merge from an installation whose organisation
-/// permitted one, and can tell a project that asked for nothing from one whose
-/// merge was refused. `parked` says why a branch that was going to move did
-/// not.
+/// what this apply did and whether it was permitted to do it at all, so a
+/// reader can tell a project that asked for nothing from one whose merge was
+/// refused. `parked` says why a branch that was going to move did not.
 ///
 /// **Written once per apply**, whichever way it went, including the applies
 /// where no branch was ever going to move. A fact recorded only when it is
@@ -1319,12 +1317,22 @@ pub const WorkspaceIntegrate = struct {
     /// The ref the work is parked at. Set in every mode, because every mode
     /// parks the work there first.
     ref: []const u8,
-    /// The mode this project configured, after the policy row bounded it, by
-    /// the name `chock_policy.apply.Mode` gives it. `ref` for a project that
-    /// configured nothing.
+    /// What this apply really did to the branch, by the name
+    /// `chock_policy.apply.Landing` gives it: the landing that moved the branch,
+    /// or, where none moved, the landing that was wanted. `ref` for a project
+    /// that configured nothing.
+    ///
+    /// **The outcome and not the plan.** This used to carry the mode
+    /// `chock.zon` configured, which could be the word `ask`, so a session
+    /// where a person chose merge and the branch really merged recorded `ask`.
+    /// `Landing` has no `ask` member, so no row written since carries one, and
+    /// a reader of a row from an older build has to read `ask` as "the project
+    /// put the choice to the person" rather than as a landing.
     mode: []const u8,
     /// The policy answer for `workspace.integrate`, by the name
-    /// `chock_policy.table.Decision` gives it. Only `allow` keeps `mode`.
+    /// `chock_policy.table.Decision` gives it. `deny` is the one answer that
+    /// takes the capability away, so it is the one answer under which `mode`
+    /// can only be `ref`. See `chock_policy.apply.boundBy`.
     decision: []const u8,
     /// The branch that moved. **Empty when no branch moved**, which is the
     /// one field a reader looking for "did somebody's branch move" reads.

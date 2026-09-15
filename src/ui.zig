@@ -4862,6 +4862,18 @@ pub const Ui = struct {
         self.primed = message;
     }
 
+    /// Put one row into the transcript, in Chock's own voice, from outside the
+    /// observer.
+    ///
+    /// **What a line printed before the display opened needs.** The display
+    /// puts its alternate screen over everything standard error carried before
+    /// it, so a warning the start up wrote is under that screen the moment the
+    /// first frame is drawn and nobody reads it. The caller says it again
+    /// through this, once the display is up.
+    pub fn note(self: *Ui, comptime fmt: []const u8, args: anytype) void {
+        self.sayFmt(.chock, fmt, args);
+    }
+
     /// Give the display back and put the transcript where a terminal user
     /// expects to find it.
     ///
@@ -5027,22 +5039,28 @@ pub const Ui = struct {
                     one.ceiling.wireName(),
                 });
             },
+            // **Both endings draw, because both answer the same question.**
+            // This drew only when a branch had moved, so the screen after a
+            // person answered `y` to a park was blank, and the one thing they
+            // wanted to know, "did my branch move", had no answer anywhere they
+            // could see. The project owner read six parks as merges that way.
+            // The park row names the reason the log recorded and where the work
+            // waits, so it says why as well as what.
+            .workspace_integrate => |landed| if (landed.branch.len != 0) self.sayFmt(
+                .chock,
+                "your branch {s} moved to {s}, because this project asks for {s}",
+                .{ landed.branch, landed.branch_to, landed.mode },
+            ) else self.sayFmt(
+                .chock,
+                "no branch of yours moved, and the reason recorded is {s}. The work is at {s}",
+                .{ landed.parked, landed.ref },
+            ),
             // **Only when it is not the ordinary sandbox.** A row on every
             // replay of every session saying that the write and execute rule
             // was on would be noise in the one region a person is reading, and
             // the whole record is in the log either way. A session that gave
             // the rule up is the one a reader has to see, and `chock doctor`
             // says the same fact before a session starts.
-            // **Only when a branch of theirs moved.** A row on every replay of
-            // every session saying that nothing happened to the branch would be
-            // noise in the one region a person is reading, and the whole record
-            // is in the log either way. A session that moved somebody's branch
-            // is the one a reader has to see.
-            .workspace_integrate => |landed| if (landed.branch.len != 0) self.sayFmt(
-                .chock,
-                "your branch {s} moved to {s}, because this project asks for {s}",
-                .{ landed.branch, landed.branch_to, landed.mode },
-            ),
             .sandbox_open => |opened| switch (opened.write_execute) {
                 .strict => {},
                 .relaxed, .unknown => self.sayFmt(
@@ -7936,6 +7954,59 @@ test "one row of the transcript is written per newline, whoever said it" {
     try testing.expectEqualStrings("the model was saying", h.screen.lines.items[4].text);
     try testing.expectEqual(Voice.chock, h.screen.lines.items[5].voice);
     try testing.expectEqualStrings("session ended, finished", h.screen.lines.items[5].text);
+}
+
+test "an apply that moved no branch still draws a row, and says the branch stayed" {
+    // **The screen after `y` used to be blank.** `workspace.integrate` is
+    // written on every apply, whichever way it went, and this arm drew a row
+    // only when a branch had moved. So the one question a person has after
+    // approving an apply, "did my branch move", had no answer anywhere they
+    // could see. The project owner met it six times in a row and reported a
+    // correct park as a broken merge.
+    //
+    // Mutation check: take the park arm off `.workspace_integrate` and the row
+    // count below is 0.
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    const watching = h.screen.observer();
+    watching.onEvent(1, .{ .workspace_integrate = .{
+        .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
+        .mode = "ref",
+        .decision = "allow",
+        .branch = "",
+        .branch_from = "",
+        .branch_to = "",
+        .parked = "not_asked_for",
+    } });
+
+    try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
+    const row = h.screen.lines.items[0];
+    try testing.expectEqual(Voice.chock, row.voice);
+    if (std.mem.indexOf(u8, row.text, "no branch of yours moved") == null) {
+        try testing.expectEqualStrings("a row saying the branch did not move", row.text);
+        return error.AParkDrawsNoAnswer;
+    }
+    // The reason the log recorded, and where the work is, so the row answers
+    // "why" and "what now" as well as "did it move".
+    try testing.expect(std.mem.indexOf(u8, row.text, "not_asked_for") != null);
+    try testing.expect(std.mem.indexOf(u8, row.text, "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA") != null);
+
+    // And a branch that really moved still draws the row it always drew, which
+    // is the half a reader must be able to tell from the one above.
+    watching.onEvent(2, .{ .workspace_integrate = .{
+        .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
+        .mode = "merge",
+        .decision = "allow",
+        .branch = "refs/heads/main",
+        .branch_from = "1111111",
+        .branch_to = "2222222",
+        .parked = "",
+    } });
+    try testing.expectEqual(@as(usize, 2), h.screen.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.screen.lines.items[1].text, "moved to 2222222") != null);
+    try testing.expect(std.mem.indexOf(u8, h.screen.lines.items[1].text, "no branch of yours") == null);
 }
 
 test "the rows shown are the newest ones, in the order they were said" {

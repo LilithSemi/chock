@@ -3985,7 +3985,25 @@ const ApplyMode = struct {
     mode: chock_policy.apply.Mode = .ref,
     /// The answer the `workspace.integrate` row gave.
     decision: chock_policy.table.Decision = .allow,
+    /// What `chock.zon` asked for, before the row bounded it. **The half a
+    /// person has to be told about**: a project that wrote `merge` and gets
+    /// `ref` is the one case where the session does something other than what
+    /// the file says, and `mode` alone cannot show it. See `bounded_mode_fmt`.
+    asked_for: chock_policy.apply.Mode = .ref,
 };
+
+/// The line a person reads when the `workspace.integrate` row takes away the
+/// mode `chock.zon` asked for. It takes the mode the file named, the answer the
+/// row gave, and the name of the row.
+///
+/// **One text, said in two places.** `applyModeFor` prints it before the
+/// session starts, which is the whole of it for a run with no display, and
+/// `runSession` says it again in the transcript once the display is up, because
+/// a full screen display opens its alternate screen over everything printed
+/// before it and this line was never read. Two spellings of one fact drift
+/// apart.
+const bounded_mode_fmt = "this project asks for the mode {s} in chock.zon, and the policy " ++
+    "answers {t} for {s}, so the session's work waits at its ref and no branch of yours moves.";
 
 /// Whether this session's approved applies may move a branch of the user's,
 /// and which shape they take when they do.
@@ -4052,13 +4070,12 @@ fn applyModeFor(
     // **Said out loud, and not only written to the log.** A person whose
     // project asked for a merge and will not get one has to be able to see
     // that before the session runs, not at the end of it.
-    if (bounded != settings.mode) tty.print(
-        .warn,
-        "chock: this project asks for the mode {s} in chock.zon, and the policy answers {t} for " ++
-            "{s}, so the session's work waits at its ref and no branch of yours moves.\n",
-        .{ settings.mode.wireName(), decision, chock_policy.apply.integrate_action },
-    );
-    return .{ .mode = bounded, .decision = decision };
+    if (bounded != settings.mode) tty.print(.warn, "chock: " ++ bounded_mode_fmt ++ "\n", .{
+        settings.mode.wireName(),
+        decision,
+        chock_policy.apply.integrate_action,
+    });
+    return .{ .mode = bounded, .decision = decision, .asked_for = settings.mode };
 }
 
 fn provisioningFor(
@@ -6876,7 +6893,23 @@ fn applyWork(
                     .{ m.branch, shortId(m.from), shortId(m.to), m.landing.wireName(), m.from },
                 ),
                 .park => |p| {
-                    if (p.why != .not_asked_for) tty.print(
+                    // **Every park says that no branch moved, the ordinary one
+                    // included.** This sentence used to be inside the `if`
+                    // below, so the common case, a project that asks for `ref`,
+                    // printed the object count and then a `git merge` command
+                    // and nothing else. The command is one for the person to
+                    // run, and a reader took it for a report of what Chock had
+                    // already done. `Action.summary` says the same words on the
+                    // same occasion, so the two read alike.
+                    //
+                    // Mutation check: put this arm back inside
+                    // `if (p.why != .not_asked_for)` and the ordinary park says
+                    // nothing about a branch again.
+                    if (p.why == .not_asked_for) tty.print(
+                        .plain,
+                        "chock run: no branch of yours moved: {s}.\n",
+                        .{p.why.sentence()},
+                    ) else tty.print(
                         .warn,
                         "chock run: the {s} this project asks for did not happen, because {s}. " ++
                             "No branch of yours moved.\n",
@@ -7049,7 +7082,7 @@ fn carryCommit(
     // now; asking again when the plan moves nothing either would spend a
     // person's attention on a change that is already made.
     if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
-        recordIntegration(gpa, io, params.locked, started, params.ref, .{
+        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
             .park = .{ .wanted = landing, .why = .already_there },
         });
         return .already_there;
@@ -7181,14 +7214,14 @@ fn carryCommit(
             // this session whichever way the apply went, and a record written
             // only when something happened is missing exactly where a reader
             // needs it.
-            recordIntegration(gpa, io, params.locked, started, params.ref, .{
+            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
                 .park = .{ .wanted = landing, .why = .not_asked_for },
             });
             return .{ .refused = outcome };
         },
         .done => |*done| {
             const carried = done.result.workspace_apply;
-            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);
+            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);
             // **The two strings this does not need are freed, and the one it
             // does is handed on.** `Result.deinit` would free all three, and a
             // copy of the third could fail for want of memory at the one moment
@@ -7223,7 +7256,7 @@ fn recordIntegration(
     gpa: std.mem.Allocator,
     io: std.Io,
     locked: *ApprovalLock,
-    started: *Started,
+    apply_mode: ApplyMode,
     ref: []const u8,
     outcome: chock_broker.integrate.Outcome,
 ) void {
@@ -7231,18 +7264,28 @@ fn recordIntegration(
         .moved => |m| m,
         .park => null,
     };
-    _ = locked.append(gpa, io, .{ .workspace_integrate = .{
-        .ref = ref,
-        .mode = started.apply_mode.mode.wireName(),
-        .decision = @tagName(started.apply_mode.decision),
-        .branch = if (moved) |m| m.branch else "",
-        .branch_from = if (moved) |m| m.from else "",
-        .branch_to = if (moved) |m| m.to else "",
-        .parked = switch (outcome) {
-            .moved => "",
-            .park => |p| p.why.wireName(),
+    _ = locked.append(gpa, io, .{
+        .workspace_integrate = .{
+            .ref = ref,
+            // **The outcome and not the plan**, the rule
+            // `chock_broker.actions.Result` states for the field this reads. A plan
+            // that said `merge` can still end at `park`, and the configured mode
+            // can be `ask`, which is a question and not a landing any apply takes.
+            // `Landing` has no `ask` member, so neither has this row.
+            .mode = switch (outcome) {
+                .moved => |m| m.landing.wireName(),
+                .park => |p| p.wanted.wireName(),
+            },
+            .decision = @tagName(apply_mode.decision),
+            .branch = if (moved) |m| m.branch else "",
+            .branch_from = if (moved) |m| m.from else "",
+            .branch_to = if (moved) |m| m.to else "",
+            .parked = switch (outcome) {
+                .moved => "",
+                .park => |p| p.why.wireName(),
+            },
         },
-    } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
+    }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| {
         tty.print(
             .warn,
             "chock run: what this apply did to your branch could not be written to the log: {s}\n",
@@ -10438,6 +10481,18 @@ fn runSession(
         // transcript under it, and the loop below then asks for a message. The
         // other order shows an empty header over a full transcript.
         replayInto(gpa, io, started.storage, one);
+        // **Said again, because the first saying is under this screen.**
+        // `applyModeFor` prints it in phase 1, which runs before `Ui.start`, so
+        // the alternate screen opened straight over the one line that says why
+        // no branch of the person's will move. See `bounded_mode_fmt`.
+        if (started.apply_mode.asked_for != started.apply_mode.mode) one.note(
+            bounded_mode_fmt,
+            .{
+                started.apply_mode.asked_for.wireName(),
+                started.apply_mode.decision,
+                chock_policy.apply.integrate_action,
+            },
+        );
         // A message already on standard input is the first turn's, so a piped
         // run and a typed one take one path through the loop below.
         if (options.display.?.first_message.len != 0) one.prime(options.display.?.first_message);
@@ -13590,15 +13645,116 @@ test "every ending of an apply writes down what it did to the branch" {
     // route needs a workspace, a policy table and a model, which this suite has
     // none of. Mutation check: delete any one of the three calls and this fails
     // with `CallIsGone`.
-    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started, params.ref, .{\n            .park = .{ .wanted = landing, .why = .already_there },");
-    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, .{\n                .park = .{ .wanted = landing, .why = .not_asked_for },");
-    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);");
+    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n            .park = .{ .wanted = landing, .why = .already_there },");
+    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n                .park = .{ .wanted = landing, .why = .not_asked_for },");
+    _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
 
     // And the record is written before the answer goes back, so a crash between
     // the two leaves the fact on disk rather than only in a return value.
-    const recorded = try callAt("\n            recordIntegration(gpa, io, params.locked, started, params.ref, carried.integration);");
+    const recorded = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
     const answered = try callAt("\n            return .{ .landed = .{\n                .objects = carried.objects_moved,");
     try testing.expect(recorded < answered);
+}
+
+test "the log records the landing that happened, and not the mode the project configured" {
+    // **The outcome and not the plan**, the rule `chock_broker.actions.Result`
+    // already states about its own `integration` field. This row did not keep
+    // it: it wrote the mode `chock.zon` configured, which can be the word `ask`.
+    // A project configured `.ask`, where the person chose merge and the branch
+    // really merged, wrote "because this project asks for ask", and `ask` is a
+    // question, not a landing any apply can take.
+    //
+    // Mutation check: write `apply_mode.mode.wireName()` here again and the
+    // first two expectations below read `ask`.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buffer[0..try tmp.dir.realPath(io, &buffer)];
+    const id = "01JQ" ++ "E" ** 22;
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, id }, 0);
+
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+
+    // A project that put the choice to the person, which is the configuration
+    // the measured example had.
+    const asked_the_person = ApplyMode{ .mode = .ask, .decision = .allow, .asked_for = .ask };
+
+    var locked = try store.lock(io);
+    // The person chose merge and the branch really merged.
+    var branch = "refs/heads/main".*;
+    var from = "1111111111111111111111111111111111111111".*;
+    var to = "2222222222222222222222222222222222222222".*;
+    recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/one", .{ .moved = .{
+        .landing = .merge,
+        .branch = &branch,
+        .from = &from,
+        .to = &to,
+    } });
+    // The person chose merge and the working tree would not take it, so the
+    // work waited at the ref. `wanted` is the honest answer for a park.
+    recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/two", .{
+        .park = .{ .wanted = .merge, .why = .dirty_tree },
+    });
+    // And a project that asked for nothing still reads `ref`.
+    recordIntegration(gpa, io, &locked, .{}, "refs/chock/three", .{
+        .park = .{ .wanted = .ref, .why = .not_asked_for },
+    });
+    try locked.unlock(io);
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(1 << 20));
+    // **The word a landing can never be.** `chock_policy.apply.Landing` has no
+    // `ask` member, so a row carrying one was written from the plan.
+    if (std.mem.indexOf(u8, text, "\"mode\":\"ask\"") != null) {
+        try std.testing.expectEqualStrings("no row saying the mode was ask", text);
+        return error.TheRowRecordsThePlan;
+    }
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, text, "\"mode\":\"merge\""),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"mode\":\"ref\"") != null);
+    // The policy answer is still beside it, so a reader can still tell a
+    // project that asked from an installation that permitted.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"dirty_tree\"") != null);
+}
+
+test "the line about a mode the policy took away is said again once the display is up" {
+    // **It was printed where nothing could read it.** `applyModeFor` runs in
+    // `start`, which is before `Ui.start`, so the display's alternate screen
+    // opened straight over the one line that says why no branch of the person's
+    // will move. The line is kept where it is, because a session with no
+    // display has no other way to hear it, and it is said again in the
+    // transcript once there is a screen to say it on.
+    //
+    // A structural check, for the reason `own_source` gives: the end to end
+    // route needs a terminal on three descriptors, which this suite has none
+    // of. Mutation check: delete either call and this fails with `CallIsGone`;
+    // move the block that opens the display below the block that says the line
+    // and the comparison fails, which is the fault itself, written the other
+    // way round.
+    const printed = try callAt(
+        "\n    if (bounded != settings.mode) tty.print(.warn, \"chock: \" ++ bounded_mode_fmt",
+    );
+    const opened = try callAt("\n        screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err|");
+    const said_again = try callAt(
+        "\n        if (started.apply_mode.asked_for != started.apply_mode.mode) one.note(",
+    );
+
+    try std.testing.expect(opened < said_again);
+    // And the plain path still has its own line, for a run with no display at
+    // all.
+    try std.testing.expect(printed != said_again);
 }
 
 test "the display is told what the session is, then filled from the log, then asked for a message" {
@@ -14402,8 +14558,9 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     // `ref`, and a project that has never heard of either is exactly as it was
     // before an apply could move a branch at all.
     //
-    // Mutation check: read `boundBy` as permitting `ask` and the third case
-    // below lets an installation whose organisation said no move a branch.
+    // Mutation check: let `boundBy` answer `mode` for `deny` as well and the
+    // third case below lets an installation whose organisation said no move a
+    // branch, while the fourth lets a subagent move one its parent could not.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -14457,6 +14614,9 @@ test "the mode comes from chock.zon and the table above it, and a project that s
     const refused = try applyModeFor(arena, io, root, under_org, &.{}, "main", "a-model");
     try std.testing.expectEqual(chock_policy.apply.Mode.ref, refused.mode);
     try std.testing.expectEqual(chock_policy.table.Decision.deny, refused.decision);
+    // **And what the file asked for is kept beside what it got.** That is the
+    // half the line a person reads names, and `mode` alone cannot show it.
+    try std.testing.expectEqual(chock_policy.apply.Mode.merge, refused.asked_for);
     // **And the person hears about it before the session runs**, rather than at
     // the end of it when nothing was integrated.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "workspace.integrate") != null);
