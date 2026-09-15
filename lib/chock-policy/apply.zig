@@ -57,13 +57,37 @@
 //! and no project under that bundle can move a branch, because
 //! `ceilingChain` folds the bundle in as one more term of a minimum.
 //!
-//! **`ask` cannot mean "ask" for this row.** The row is a capability of the
-//! whole session, read once when the session starts, and the mode it bounds
-//! has to be known before an apply is described, because the description is
-//! what a person reads. There is no second question to put here that is not
-//! already the approval itself. `boundBy` therefore reads only `allow` as
-//! permission, which is the same reading `hardening.writeExecuteFor` and
-//! `access.refusalNeeded` take.
+//! **The row decides whether, and the mode decides where.** They are two
+//! answers and `boundBy` must not let one silently give the other. The row is
+//! a capability of the whole session, read once when the session starts, and
+//! the mode it bounds has to be settled before an apply is described, because
+//! the description is what a person reads and it names the act. So `ask`
+//! cannot mean "ask which mode" here: there is nobody at the keyboard at the
+//! moment the row is read, and the question it would put is already the
+//! `workspace.apply` approval.
+//!
+//! That is an argument about the question and not about the answer. This row
+//! is a capability and it carries no question of its own. The one question an
+//! apply ever puts is the `workspace.apply` approval, and that request is
+//! answered by the `workspace.apply` row and not by this one. So `ask`,
+//! `agent_review` and `agent_then_human` here say **that integration is
+//! permitted and somebody has to say yes first**, and the somebody is whoever
+//! the apply request already asks. None of the three says where the work
+//! lands. Reading them as `ref` took the mode away before the apply was even
+//! described, so the person answered a prompt that could no longer carry the
+//! work. `deny` is the one decision that removes the capability, so `deny` is
+//! the one decision that parks the work at the ref.
+//!
+//! **A rule that names nothing reaches this row.** `workspace.integrate` is
+//! matched by a catch all `.{ .decision = .ask }` and by `workspace.*` as well
+//! as by its own name, so before this change a project that wrote one broad
+//! rule about anything lost `.apply.mode` without ever naming an apply. A rule
+//! that names `workspace.apply` alone never reached this row and never did.
+//!
+//! **So `deny` is the only ceiling this row puts on a landing.** An
+//! organisation that writes `ask` here binds nothing about where the work
+//! goes, and there is no rule today that caps a project at `merge` while
+//! leaving `rebase` closed.
 //!
 //! ## The mode is never a widening of the approval
 //!
@@ -222,13 +246,20 @@ pub const Settings = struct {
 
 /// The mode `chock.zon` asked for, bounded by what the policy row permits.
 ///
-/// **Only `allow` keeps the mode.** See this file's own top comment: there is
-/// nobody to ask at the moment this is decided, so `ask` holds the work at the
-/// ref exactly as `deny` does.
+/// **This bounds the permission and never the landing.** `decision` is the
+/// answer for `integrate_action`, which says "may an approval move my branch
+/// at all", and `mode` says "where does the work go when it does". `deny` is
+/// the one decision that takes the capability away, so it is the one decision
+/// that parks the work at the ref. `ask`, `agent_review` and
+/// `agent_then_human` say that integration is permitted once somebody says
+/// yes, and the only place anybody is asked is the `workspace.apply` approval,
+/// which this row does not answer. A mode bound to `ref` by one of those three
+/// would take the merge away before the apply was described. See this file's
+/// own top comment.
 pub fn boundBy(mode: Mode, decision: table.Decision) Mode {
     return switch (decision) {
-        .allow => mode,
-        .ask, .deny, .agent_review, .agent_then_human => .ref,
+        .allow, .ask, .agent_review, .agent_then_human => mode,
+        .deny => .ref,
     };
 }
 
@@ -483,14 +514,95 @@ test "a mode nobody defined is refused" {
     try testing.expect(diag != null);
 }
 
-test "only allow keeps the mode, and every other decision parks the work" {
-    // The whole product, so a member added to `Decision` cannot quietly join
-    // the permitting side: this walks the enum itself rather than a list.
-    for (std.enums.values(table.Decision)) |decision| {
+test "a decision that permits integration keeps the mode, and deny is the one that parks the work" {
+    // **The `workspace.integrate` row decides whether an apply may move a
+    // branch, and `.apply.mode` decides where the work lands.** `ask`,
+    // `agent_review` and `agent_then_human` each permit integration once
+    // somebody says yes, and none of them names a landing, so a mode bound to
+    // `ref` by one of them would take the merge away before anybody was asked.
+    // Only `deny` takes the capability away, and that is the rule an
+    // organisation writes.
+    const permitting = [_]table.Decision{ .allow, .ask, .agent_review, .agent_then_human };
+    for (permitting) |decision| {
         for (std.enums.values(Mode)) |mode| {
-            const expected: Mode = if (decision == .allow) mode else .ref;
-            try testing.expectEqual(expected, boundBy(mode, decision));
+            try testing.expectEqual(mode, boundBy(mode, decision));
         }
+    }
+    for (std.enums.values(Mode)) |mode| {
+        try testing.expectEqual(Mode.ref, boundBy(mode, .deny));
+    }
+
+    // **The two lists together are the whole enum**, so a member added to
+    // `Decision` cannot quietly join the permitting side. A later author has
+    // to say here which side the new member belongs on.
+    var named: usize = 0;
+    for (std.enums.values(table.Decision)) |decision| {
+        if (decision == .deny) {
+            named += 1;
+            continue;
+        }
+        for (permitting) |one| {
+            if (one == decision) named += 1;
+        }
+    }
+    try testing.expectEqual(std.enums.values(table.Decision).len, named);
+}
+
+test "three shapes of rule reach this row differently, and none of them takes the mode away" {
+    // **The regression test for the bug this file had**, and for the three
+    // shapes that were measured against the real reader.
+    //
+    // `ask` on this row used to bind the mode to `ref`, so a project that
+    // wrote `merge` got nothing, and the rule that did it did not have to name
+    // an apply at all: a catch all and `workspace.*` both reach
+    // `workspace.integrate`, while a rule that names `workspace.apply` alone
+    // never reaches it. Those three cases are pinned apart here so nobody
+    // re-derives the wrong story about which row feeds this function.
+    const gpa = testing.allocator;
+    const cases = [_]struct {
+        rule: []const u8,
+        reaches_the_row: bool,
+    }{
+        // A rule that names nothing at all. It matches every key, this one
+        // included.
+        .{ .rule = ".{ .decision = .ask }", .reaches_the_row = true },
+        // The class rule. `workspace.*` covers `workspace.integrate`.
+        .{ .rule = ".{ .action = \"workspace.*\", .decision = .ask }", .reaches_the_row = true },
+        // **The apply row is a different row.** It answers the approval
+        // request, and it is not what bounds the mode.
+        .{ .rule = ".{ .action = \"workspace.apply\", .decision = .ask }", .reaches_the_row = false },
+    };
+
+    for (cases) |case| {
+        const source = try std.fmt.allocPrintSentinel(
+            gpa,
+            ".{{ .apply = .{{ .mode = .merge }}, .policy = .{{ .rules = .{{ {s} }} }} }}",
+            .{case.rule},
+            0,
+        );
+        defer gpa.free(source);
+
+        const settings = try parse(gpa, source, null);
+        try testing.expectEqual(Mode.merge, settings.mode);
+
+        const parsed = try table.Table.parse(gpa, source, null);
+        defer table.Table.destroy(gpa, parsed);
+        const decision = parsed.ceilingChain(&.{"main"}, .{
+            .agent_kind = "main",
+            .model = "a-model",
+            .tool = "request_action",
+            .action = integrate_action,
+        }, null);
+        const expected: table.Decision = if (case.reaches_the_row) .ask else .allow;
+        try testing.expectEqual(expected, decision);
+
+        // **The whole product.** Whichever of the two answers the row gave,
+        // the project still gets the merge it configured, so the yes a person
+        // gives at the apply prompt carries the work.
+        const bounded = boundBy(settings.mode, decision);
+        try testing.expectEqual(Mode.merge, bounded);
+        try testing.expect(bounded.mayMoveABranch());
+        try testing.expectEqualStrings("merge", bounded.settled().?.wireName());
     }
 }
 

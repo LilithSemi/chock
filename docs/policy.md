@@ -191,10 +191,23 @@ keeps a permission model from breaking every configuration the day it ships. One
 `deny` in an organisation's bundle closes the road for every project under it,
 and the same fold means a subagent moves no branch its parent could not.
 
-Only `allow` keeps the mode. The answer is read once, when the session starts,
-before an apply is described, because the description is what a person reads and
-it has to say what the apply does. So `ask` here holds the work at the ref
-exactly as `deny` does.
+**This row decides whether, and `.apply.mode` decides where.** `deny` is the one
+decision that takes the capability away, so it is the one decision that parks the
+work at the ref. `ask`, `agent_review` and `agent_then_human` each say that
+integration is permitted once somebody says yes, and none of them names a
+landing, so they keep the mode the project configured. The one question an apply
+puts is the `workspace.apply` approval, which is a different row.
+
+The answer is read once, when the session starts, before an apply is described,
+because the description is what a person reads and it has to say what the apply
+does. So the mode is settled before the prompt exists, and a yes at that prompt
+carries the work in the mode the prompt named.
+
+**A rule that names nothing reaches this row.** A catch all
+`.{ .decision = .ask }` and a `workspace.*` rule both match
+`workspace.integrate`, while a rule that names `workspace.apply` alone does not.
+Until this was corrected, one broad rule about anything silently took away
+`.apply.mode` without ever naming an apply.
 
 ## Files the agent may not read
 
