@@ -344,20 +344,23 @@ const changes_state: []const []const u8 = &.{
 
 /// Subcommands that have to reach another host to do anything at all.
 ///
-/// **Every one of these fails inside the sandbox whatever anybody answers**,
-/// because the network namespace holds no route out and the answer to a
-/// question here only ever means "run it inside the sandbox": see this file's
-/// own top comment on what "yes" means. So this list is not a second opinion
-/// about risk. It is the set of subcommands for which running the real git can
-/// only produce a confusing failure, and for which the useful answer is a
-/// sentence saying so.
+/// **This list used to say that every one of them fails inside the sandbox
+/// whatever anybody answers. That stopped being true.** The sandbox had no
+/// route out of its network namespace, so running the real git could only give
+/// a confusing failure. A sandbox now reaches whatever host this project's
+/// `net.connect` rules name, through the router. So the reason this list still
+/// exists is a different one, and a smaller one: **an act that leaves the
+/// sandbox is performed on the host, out of a payload that names the effect,
+/// and no caller builds such a payload for a git subcommand yet.** See
+/// `hostReachingRefusal`, which says exactly that and no longer blames the
+/// network.
 ///
-/// **Measured, and this is what it looked like.** A session ran `git fetch`.
-/// The real git forked `ssh`, `ssh` was not in the sandbox, and the model read
-/// `cannot run ssh: No such file or directory`, which names a missing program
-/// and not a missing network. It then spent turns looking for a proxy that was
-/// never going to exist. Nothing was breached: the namespace refused, and
-/// would have refused whatever `ssh` did. What was missing was the answer.
+/// **Measured, and this is what the old failure looked like.** A session ran
+/// `git fetch`. The real git forked `ssh`, `ssh` was not in the sandbox, and
+/// the model read `cannot run ssh: No such file or directory`, which names a
+/// missing program and not a missing network. It then spent turns looking for
+/// a proxy that was never going to exist. Nothing was breached. What was
+/// missing was the answer, and a wrong answer would have cost the same turns.
 ///
 /// Short, and every entry is unambiguous. `remote` and `submodule` reach a
 /// host in some spellings and not in others, so they are absent: a subcommand
@@ -378,24 +381,40 @@ pub fn needsNetwork(subcommand: []const u8) bool {
     return isOneOf(subcommand, needs_network);
 }
 
-/// What the agent is told when it ran a git subcommand that has to reach
-/// another host. Owned by the caller.
+/// What the agent is told when a subcommand that reaches another host was
+/// permitted and still did not run. Owned by the caller.
+///
+/// **This is the text a person's yes now leads to**, which is why it says what
+/// is missing and never that the answer was no. The caller asks first: see
+/// `src/run.zig`'s own `GitToolRunner`.
+///
+/// **The reason in it was wrong from 2026-09-15 until this was rewritten, and
+/// a wrong reason is worse than a terse one.** It said the sandbox has no
+/// network and that there is no proxy to find. Both were true before the
+/// router, and both stopped being true with it: a sandbox reaches whatever
+/// host the project's `net.connect` rules name. A model told the network is
+/// absent goes looking for a network, which is not the problem. What is
+/// missing is a caller: an act that leaves the sandbox is performed on the
+/// host out of a payload that names the effect, and nothing builds one of
+/// those for a git subcommand yet.
 ///
 /// **Named alternatives, because that is what makes a model adapt.** The
 /// refusal of a shell name in `lib/chock-core/tools.zig` was measured to do
 /// this: a model told plainly that there is no shell, and told what to send
 /// instead, sent the right thing on the next turn. A message that only said
 /// "refused" would leave the model with the same question it started with.
-pub fn networkRefusal(gpa: std.mem.Allocator, subcommand: []const u8) std.mem.Allocator.Error![]u8 {
+pub fn hostReachingRefusal(gpa: std.mem.Allocator, subcommand: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(
         gpa,
-        "git {s} was not run: the sandbox has no network, so no git subcommand can reach " ++
-            "another host from here. This is not a missing program and there is no proxy to " ++
-            "find. Work with what is already in the workspace: the project's own history is " ++
-            "here, so git log, git show, git diff and git status all work. Commit your work " ++
-            "in the workspace as usual, and the user is asked at the end of the session " ++
-            "whether to carry that commit into their own repository. Nothing you run here " ++
-            "reaches a remote.",
+        "git {s} was not run, and this is not a refusal: the part of it that reaches another " ++
+            "host is not built yet. Chock performs an act that leaves the sandbox on the host " ++
+            "itself, out of a payload that names the effect, and no caller builds one of those " ++
+            "for a git subcommand today. This is not a missing program, and it is not the " ++
+            "sandbox's network, so there is nothing here to configure and no proxy to find. " ++
+            "Work with what is already in the workspace: the project's own history is here, so " ++
+            "git log, git show, git diff and git status all work. Commit your work in the " ++
+            "workspace as usual, and the user is asked at the end of the session whether to " ++
+            "carry that commit into their own repository.",
         .{subcommand},
     );
 }
@@ -484,7 +503,7 @@ pub fn decide(
 }
 
 /// One line, for the list a client shows.
-fn summaryOf(gpa: std.mem.Allocator, ask: Ask) std.mem.Allocator.Error![]u8 {
+pub fn summaryOf(gpa: std.mem.Allocator, ask: Ask) std.mem.Allocator.Error![]u8 {
     if (ask.subcommand.len == 0) return gpa.dupe(u8, "the agent ran git with an option this shim does not read");
     return std.fmt.allocPrint(gpa, "the agent ran the git subcommand {s}", .{ask.subcommand});
 }
@@ -497,14 +516,15 @@ fn summaryOf(gpa: std.mem.Allocator, ask: Ask) std.mem.Allocator.Error![]u8 {
 /// own line, and it is the same for every answer this file can give: the
 /// subcommand runs inside the sandbox. The vector is below it as the fact the
 /// user is being told about, which is what the agent tried to do.
-fn detailOf(gpa: std.mem.Allocator, ask: Ask, argv: []const []const u8) std.mem.Allocator.Error![]u8 {
+pub fn detailOf(gpa: std.mem.Allocator, ask: Ask, argv: []const []const u8) std.mem.Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
     try out.appendSlice(gpa,
         \\what happens if you say yes:
         \\  the subcommand runs inside the sandbox, and nothing else changes.
-        \\  the sandbox has no network and does not hold your own repository.
+        \\  the sandbox does not hold your own repository, and it reaches only
+        \\  the hosts this project's net.connect rules name.
         \\
         \\why you are being asked:
         \\
@@ -745,22 +765,37 @@ test "every subcommand that has to reach another host is one classify already st
     }
 }
 
-test "the answer for a network subcommand names what does work, and never sends the agent looking for a proxy" {
-    // The measured failure: `cannot run ssh: No such file or directory` names
-    // a missing program, so the model went hunting for a proxy. The
-    // replacement has to say the network is the thing that is absent, and it
-    // has to name what the agent can do instead, the way the shell refusal
-    // does.
+test "the answer for a host reaching subcommand blames the missing caller, and never the network" {
+    // **The reason is the part of a refusal that gets acted on**, so a wrong
+    // one costs the same turns the measured failure cost: `cannot run ssh: No
+    // such file or directory` named a missing program, and the model went
+    // hunting for a proxy. This text said "the sandbox has no network" and
+    // "there is no proxy to find" until 2026-09-15, which was true before the
+    // router and false after it. A model told the network is absent looks for
+    // a network. What is absent is a caller.
+    //
+    // Mutation check: put either of the two old sentences back and the two
+    // `indexOf ... == null` expectations below fail.
     const gpa = testing.allocator;
 
-    const text = try networkRefusal(gpa, "fetch");
+    const text = try hostReachingRefusal(gpa, "fetch");
     defer gpa.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "git fetch") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "no network") != null);
-    // The two wrong turns, said plainly so neither is taken.
-    try testing.expect(std.mem.indexOf(u8, text, "no proxy") != null);
+    // The true reason: an act that leaves the sandbox has nobody to perform it.
+    try testing.expect(std.mem.indexOf(u8, text, "not built yet") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "no caller") != null);
+    // **And it is not read as a no.** A person may well have said yes, and an
+    // agent told it was refused argues with the person instead of working.
+    try testing.expect(std.mem.indexOf(u8, text, "not a refusal") != null);
+    // The three wrong turns, said plainly so none of them is taken.
     try testing.expect(std.mem.indexOf(u8, text, "not a missing program") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "no proxy to find") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "not the sandbox's network") != null);
+    // And the two claims that became false with the router are gone outright,
+    // rather than softened somewhere else in the same paragraph.
+    try testing.expect(std.mem.indexOf(u8, text, "has no network") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "reaches a remote") == null);
     // What does work instead.
     try testing.expect(std.mem.indexOf(u8, text, "git log") != null);
     try testing.expect(std.mem.indexOf(u8, text, "Commit your work") != null);
@@ -930,7 +965,16 @@ test "the shim tells the user what saying yes does, and never offers to do the a
     defer run.deinit(gpa);
 
     try testing.expect(std.mem.indexOf(u8, run.detail, "the subcommand runs inside the sandbox") != null);
-    try testing.expect(std.mem.indexOf(u8, run.detail, "the sandbox has no network") != null);
+    // **What the sandbox bounds this to, and it is read by a person.** This
+    // line said the sandbox has no network until 2026-09-15, which the router
+    // made false: a sandbox reaches the hosts `net.connect` names. A statement
+    // a person weighs an approval on must be one they can act on.
+    //
+    // Mutation check: put "the sandbox has no network" back and the second
+    // expectation below fails.
+    try testing.expect(std.mem.indexOf(u8, run.detail, "does not hold your own repository") != null);
+    try testing.expect(std.mem.indexOf(u8, run.detail, "net.connect rules name") != null);
+    try testing.expect(std.mem.indexOf(u8, run.detail, "has no network") == null);
     // **Never the name of a tool that would refuse this.** `request_action`
     // exists and takes one act, `workspace.apply`; a push is not that act and
     // is refused by name there. A message telling the agent to call it costs

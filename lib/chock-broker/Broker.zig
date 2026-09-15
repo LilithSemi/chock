@@ -1611,6 +1611,7 @@ const ask_every_action: [:0]const u8 =
     \\    .policy = .{
     \\        .rules = .{
     \\            .{ .action = "git.push", .decision = .ask },
+    \\            .{ .action = "git.commit", .decision = .ask },
     \\        },
     \\    },
     \\}
@@ -1836,6 +1837,15 @@ test "a request that expires is a refusal, and says expired rather than refused"
 
 test "an answer to a different request does not answer this one" {
     // Two requests can be open at once. An answer names its request.
+    //
+    // **Both action names are in the table above, and `git.commit` had to be
+    // added there.** This test used to name only `git.push` and let
+    // `git.commit` fall through to a shipped default that did not exist, which
+    // answered `ask` the way any unnamed key does. `lib/chock-policy/defaults.zig`
+    // ships `.allow` for `git.commit` since the git shim's approval half was
+    // wired, so the inner request stopped waiting for anybody and this test
+    // crashed on an id nothing had filled in. A test about answers must name
+    // the decision it wants rather than borrow one.
     //
     // The first request is open when the second one starts, because the
     // second one is asked from inside the first one's own wait, which is

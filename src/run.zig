@@ -5571,6 +5571,10 @@ const GiveLockedToAll = struct {
     network: *ToolNetwork,
     mcp: *chock_core.mcp.Session,
     plugins: *chock_core.plugin.Session,
+    /// The git shim's own runner. **Fourth party to the same handle**, since
+    /// 2026-09-15: a git subcommand the shim classifies is decided one call at
+    /// a time, mid turn, through the same arbiter. See `GitToolRunner`.
+    git: *GitToolRunner,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
         return .{ .ptr = self, .vtable = &vtable };
@@ -5581,24 +5585,26 @@ const GiveLockedToAll = struct {
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
-        giveLockedToSessions(self.mcp, self.plugins, locked);
+        giveLockedToAskers(self.mcp, self.plugins, self.git, locked);
     }
 };
 
-/// Hand the handle to both third party tool sessions.
+/// Hand the handle to the three askers that are not the network broker.
 ///
 /// **A free function, so a test can drive the fan out without a `ToolNetwork`,
-/// which needs a whole started session behind it.** Both sessions have to be
-/// reached from the one seam: a session that keeps a null handle asks nobody
-/// and runs none of its tools, so a half wired fan out is a supplier of tools
-/// that quietly stops working.
-fn giveLockedToSessions(
+/// which needs a whole started session behind it.** All three have to be
+/// reached from the one seam: one that keeps a null handle asks nobody and
+/// refuses everything it gates, so a half wired fan out is a supplier of tools
+/// that quietly stops working, and a git shim that refuses `git add`.
+fn giveLockedToAskers(
     mcp_session: *chock_core.mcp.Session,
     plugin_session: *chock_core.plugin.Session,
+    git_runner: *GitToolRunner,
     locked: *chock_core.arbiter.Locked,
 ) void {
     mcp_session.giveLocked(locked);
     plugin_session.giveLocked(locked);
+    git_runner.giveLocked(locked);
 }
 
 /// Write one `network.summary` event, when there is one to write. Best
@@ -7531,27 +7537,79 @@ fn warnUnmeasurableBudget(
 /// as one. The capability layers are what stop an attack, and they stop the
 /// same things whether this runner is in the way or not.
 ///
-/// **Only the subcommands that reach another host are answered here, and the
-/// approval half of the shim is not wired.** Two reasons, and neither is a
-/// plan to leave it:
+/// ## The approval half is wired, and this is where it happens
 ///
-/// * `ToolRunner.dispatch` is handed no lock on the session log, and
-///   `Broker.request` needs one to append the `approval.request` and read the
-///   answer back. `Loop.run` holds that lock for the whole session: see
-///   `applyWork`, which takes it again only after `run` has returned.
-/// * Nobody can answer a question `chock run` asks while that lock is held, so
-///   an approval here would be a refusal. That would refuse `git commit`, and a
-///   commit in the workspace is the only way a session's work reaches the user
-///   at all, through the `workspace.apply` `applyWork` asks about at the end.
+/// **This comment used to say the opposite, at length, and every claim in it
+/// is now false.** It said the approval half could not be wired because
+/// `ToolRunner.dispatch` is handed no lock on the session log, because nobody
+/// could answer a question asked while `Loop.run` holds that lock, and because
+/// a subcommand reaching a host fails inside the sandbox whatever anybody
+/// answers. A stale comment arguing for the old behaviour is how a fix gets
+/// reverted, so here is what is true instead:
 ///
-/// A subcommand that reaches a host has neither problem: it fails inside the
-/// sandbox whatever anybody answers, so there is nothing to ask about and
-/// only something to say. See `chock_broker.git_shim.needs_network`.
+/// * `chock_core.arbiter.Asker` carries an arbiter and the loop's own locked
+///   handle, and `chock_core.Loop.GiveLocked` hands that handle over once,
+///   right after `Loop.run` takes it. `GiveLockedToAll` is what fills it in
+///   here. So a question asked from inside a tool call is written through the
+///   handle the loop already holds, and nothing opens the log a second time.
+/// * A question asked mid turn does reach a person. `Approvers` gives the
+///   broker the display when bare `chock` brought one up, and the approval
+///   socket otherwise, so `chock approve` answers from another process. This
+///   is the same seam `chock_core.mcp.Session.dispatch` and
+///   `chock_core.plugin.Session.dispatch` already ask on for every call, and
+///   **there is deliberately no second way to ask** built here.
+/// * A subcommand that reaches a host no longer fails for want of a network.
+///   The sandbox reaches whatever host this project's `net.connect` rules
+///   name. See `chock_broker.git_shim.hostReachingRefusal`, which now blames
+///   the thing that is actually missing.
+///
+/// ## What a yes gets, and the one thing it does not
+///
+/// A yes runs the real git **inside the sandbox**, which is the only act this
+/// runner can carry out and the whole of what
+/// `lib/chock-broker/git_shim.zig`'s own top comment promises a user.
+///
+/// **A subcommand that reaches another host is asked about and still does not
+/// run, even approved.** An act that leaves the sandbox is performed on the
+/// host out of a payload that names the effect, and nothing builds such a
+/// payload for a git subcommand yet: the shim reads an argument vector, and an
+/// argument vector holds no object id, no lease and no remote URL, so the shim
+/// must not invent one. `git push` in particular needs the credential half
+/// too, which is `src/askpass.zig` and `lib/chock-broker/askpass.zig` waiting
+/// on a caller that opens an `askpass.Endpoint`. Until that lands, an approved
+/// host-reaching subcommand is told what is missing rather than told no: see
+/// `hostReachingRefusal`, and `docs/status.md`.
+///
+/// ## A project with no `chock.zon` gains no prompt
+///
+/// `lib/chock-policy/defaults.zig` ships `.allow` for every git action name
+/// the shim can build for a subcommand that changes only the session's own
+/// workspace, `git.commit` among them. That is not a softening of this runner:
+/// it is what keeps the promise `docs/status.md` already makes, and it is a
+/// shipped default, so a project's own `chock.zon` overrides any of it with
+/// one line.
 const GitToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
+    /// Who decides, and the log handle the question and the answer travel
+    /// through.
+    ///
+    /// **Null refuses every subcommand the shim classifies, and says nobody
+    /// could be asked.** That is the same direction
+    /// `chock_core.mcp.Session.asker` takes, and for the same reason: a wiring
+    /// this file forgot is then a loud failure and never a silent grant. See
+    /// `chock_core.arbiter.Asker.decide`.
+    asker: ?chock_core.arbiter.Asker = null,
 
     fn runner(self: *GitToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Take the session's own locked handle. **Called by `GiveLockedToAll`,
+    /// which is what `chock_core.Loop.GiveLocked` reaches**, once, before the
+    /// first turn. A runner whose `asker` was never named has nothing to fill
+    /// in and still refuses.
+    fn giveLocked(self: *GitToolRunner, locked: *chock_core.arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
     }
 
     const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
@@ -7563,7 +7621,7 @@ const GitToolRunner = struct {
         call: chock_proto.event.ToolCall,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *GitToolRunner = @ptrCast(@alignCast(ptr));
-        if (try gitRefusal(gpa, call)) |output| {
+        if (try self.gitAnswer(gpa, io, call)) |output| {
             // The same shape an ordinary refused tool call already has: an
             // `is_error` result the model reads and answers, never an error
             // that ends the session. See `chock_core.Loop.runTool`.
@@ -7576,38 +7634,90 @@ const GitToolRunner = struct {
         }
         return self.inner.dispatch(gpa, io, call);
     }
+
+    /// What the agent is told instead of running `call`, or null when this call
+    /// reaches the real git. Owned by the caller.
+    ///
+    /// A call this cannot read at all reads as "not a git call": the argument
+    /// vector is `run_command`'s own to check, and `chock_core.tools` already
+    /// says what is wrong with one it cannot parse. Two readers of the same
+    /// arguments giving two different complaints is worse than one.
+    ///
+    /// **Nothing is asked about a read only subcommand.** `classify` answers
+    /// `run_the_real_git` for those and this returns before it reaches the
+    /// seam, so `git status` and `git log` cost a session exactly what they
+    /// cost before the approval half existed.
+    fn gitAnswer(
+        self: *GitToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!?[]u8 {
+        if (!std.mem.eql(u8, call.tool, "run_command")) return null;
+
+        const Args = struct { argv: []const []const u8 };
+        const parsed = std.json.parseFromSlice(Args, gpa, call.arguments, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        defer parsed.deinit();
+
+        const argv = parsed.value.argv;
+        if (argv.len == 0) return null;
+        // `argv[0]` is a bare program name resolved on the PATH, and
+        // `chock_core.tools` refuses any spelling with a slash in it before
+        // this runner is reached, so there is one spelling of git to match
+        // here.
+        if (!std.mem.eql(u8, argv[0], "git")) return null;
+
+        const ask = switch (chock_broker.git_shim.classify(argv)) {
+            .run_the_real_git => return null,
+            .ask => |a| a,
+        };
+
+        // **Every string a question carries comes out of the shim.** The
+        // action name is the key `lib/chock-policy` matches and the log
+        // records, and the two texts are the ones `git_shim.decide` already
+        // builds for the broker's own route to the same question. One wording
+        // and not two, so the two routes cannot drift apart on what a person
+        // is shown.
+        const action = try ask.actionName(gpa);
+        defer gpa.free(action);
+        const summary = try chock_broker.git_shim.summaryOf(gpa, ask);
+        defer gpa.free(summary);
+        const detail = try chock_broker.git_shim.detailOf(gpa, ask, argv);
+        defer gpa.free(detail);
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, gpa, io, .{
+            .action = action,
+            .summary = summary,
+            .detail = detail,
+            // A `run_command` call carries no reason of its own:
+            // `event.ToolCall` has no field for one. The same empty reason
+            // `chock_core.mcp.Session.askAbout` sends, rather than a sentence
+            // this file would have to invent on the model's behalf.
+            .reason = "",
+            // **The tool the agent called, which is part of the policy key.**
+            // `run_command`, and never the subcommand: the subcommand is
+            // already the action.
+            .tool = call.tool,
+            .tool_call_id = call.call_id,
+        });
+
+        // **One refusal sentence, written in one place.**
+        // `chock_core.arbiter.refusalText` is the same text the loop and both
+        // third party tool sessions give, so a git subcommand refused here
+        // reads exactly like any other refused act.
+        if (!answer.permitted) return try chock_core.arbiter.refusalText(gpa, action, answer);
+
+        // Approved, and still not run. See this struct's own top comment: the
+        // act that reaches the host is not built, and the honest answer names
+        // what is missing rather than implying the yes was a no.
+        if (chock_broker.git_shim.needsNetwork(ask.subcommand)) {
+            return try chock_broker.git_shim.hostReachingRefusal(gpa, ask.subcommand);
+        }
+        return null;
+    }
 };
-
-/// What the agent is told instead of running `call`, or null when this call
-/// reaches the real git the way it always did. Owned by the caller.
-///
-/// A call this cannot read at all reads as "not a git call": the argument
-/// vector is `run_command`'s own to check, and `chock_core.tools` already says
-/// what is wrong with one it cannot parse. Two readers of the same arguments
-/// giving two different complaints is worse than one.
-fn gitRefusal(gpa: std.mem.Allocator, call: chock_proto.event.ToolCall) std.mem.Allocator.Error!?[]u8 {
-    if (!std.mem.eql(u8, call.tool, "run_command")) return null;
-
-    const Args = struct { argv: []const []const u8 };
-    const parsed = std.json.parseFromSlice(Args, gpa, call.arguments, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-
-    const argv = parsed.value.argv;
-    if (argv.len == 0) return null;
-    // `argv[0]` is a bare program name resolved on the PATH, and
-    // `chock_core.tools` refuses any spelling with a slash in it before this
-    // runner is reached, so there is one spelling of git to match here.
-    if (!std.mem.eql(u8, argv[0], "git")) return null;
-
-    const ask = switch (chock_broker.git_shim.classify(argv)) {
-        .run_the_real_git => return null,
-        .ask => |a| a,
-    };
-    if (!chock_broker.git_shim.needsNetwork(ask.subcommand)) return null;
-    return try chock_broker.git_shim.networkRefusal(gpa, ask.subcommand);
-}
 
 /// A `ToolRunner` that asks the language server about a file the agent just
 /// wrote, and appends what it said to that call's own result. Everything else
@@ -10622,12 +10732,21 @@ fn runSession(
     mcp_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
     plugin_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
 
-    // The handle each of those three needs, handed over once by `Loop.run`.
+    // **And the git shim, through the very same arbiter.** `git_aware` was
+    // built above, before this file had one to name, so the field is set on it
+    // here the way both sessions above are: see `GitToolRunner`, which holds
+    // why the approval half of the shim could not be wired before the seam
+    // existed and what is true now. A runner left with no arbiter refuses
+    // every subcommand the shim classifies, `git add` included.
+    git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
+
+    // The handle each of those four needs, handed over once by `Loop.run`.
     // See `GiveLockedToAll`.
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
         .mcp = &mcp_state.session,
         .plugins = &plugin_state.session,
+        .git = &git_aware,
     };
 
     // What carries the agent's own work back when it says it is finished.
@@ -13168,90 +13287,386 @@ const CountingToolRunner = struct {
     }
 };
 
-test "a git subcommand that has to reach another host is answered, and never reaches the real git" {
+/// An `Arbiter` that answers one way for everything and counts what it was
+/// asked. **The count is what most of the git shim tests below actually
+/// measure**: which subcommands reach a person at all is the whole of what
+/// wiring the approval half changed.
+const CountingArbiter = struct {
+    permitted: bool,
+    asks: usize = 0,
+
+    /// **Copied out, and never borrowed.** Every string in a
+    /// `chock_core.arbiter.Ask` belongs to the caller for the length of the
+    /// `decide` call and no longer: `GitToolRunner.gitAnswer` frees the action
+    /// name and both texts on the way out. A field that kept one of those
+    /// slices read freed memory the moment a test looked at it, which is how
+    /// this was written the first time and what it segfaulted on.
+    action: Kept(64) = .{},
+    tool: Kept(64) = .{},
+    detail: Kept(512) = .{},
+
+    fn Kept(comptime size: usize) type {
+        return struct {
+            bytes: [size]u8 = undefined,
+            len: usize = 0,
+
+            fn set(self: *@This(), text: []const u8) void {
+                self.len = @min(text.len, size);
+                @memcpy(self.bytes[0..self.len], text[0..self.len]);
+            }
+
+            fn read(self: *const @This()) []const u8 {
+                return self.bytes[0..self.len];
+            }
+        };
+    }
+
+    fn asker(self: *CountingArbiter, locked: *chock_core.arbiter.Locked) chock_core.arbiter.Asker {
+        return .{ .arbiter = .{ .ptr = self, .vtable = &vtable }, .locked = locked };
+    }
+
+    const vtable = chock_core.arbiter.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        locked: *chock_core.arbiter.Locked,
+        ask: chock_core.arbiter.Ask,
+    ) chock_core.arbiter.Answer {
+        _ = gpa;
+        _ = io;
+        _ = locked;
+        const self: *CountingArbiter = @ptrCast(@alignCast(ptr));
+        self.asks += 1;
+        self.action.set(ask.action);
+        self.tool.set(ask.tool);
+        self.detail.set(ask.detail);
+        return .{
+            .permitted = self.permitted,
+            .outcome = if (self.permitted) "allowed_by_policy" else "refused_by_user",
+        };
+    }
+};
+
+/// One git command line through a `GitToolRunner` whose arbiter answers
+/// `permitted` every time. The caller frees both fields of the result.
+fn driveGitRunner(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arbitrator: *CountingArbiter,
+    inner: *CountingToolRunner,
+    arguments: []const u8,
+) !chock_proto.event.ToolResult {
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var shim = GitToolRunner{ .inner = inner.runner(), .asker = arbitrator.asker(&log.locked) };
+    return shim.runner().dispatch(gpa, io, .{
+        .call_id = "call1",
+        .tool = "run_command",
+        .arguments = arguments,
+    });
+}
+
+test "a subcommand the shim classifies reaches a person, and is refused when nobody can answer" {
+    // **The fault this closes.** `GitToolRunner` used to read the verdict and
+    // throw away everything that was not a subcommand needing a host, so a
+    // `git rebase` or a `git -c core.pager=sh log` went straight to the real
+    // git and nobody was ever told. The seam `6850dbb` built is what carries
+    // the question now, and a session that can reach nobody refuses rather
+    // than running.
+    //
+    // Mutation check: return `null` instead of `refusalText` in `gitAnswer`.
+    // The call then reaches the real git, and the first expectation below
+    // fails with "expected 0, found 1".
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        // A subcommand the shim knows changes state, with no shipped default.
+        "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
+        // A verb on neither of the shim's lists.
+        "{\"argv\":[\"git\",\"frobnicate\"]}",
+        // An option this shim does not read, which stops it reading the
+        // subcommand at all. `-c` is the one that makes git run a program.
+        "{\"argv\":[\"git\",\"-c\",\"core.pager=sh -c id\",\"log\"]}",
+    }) |arguments| {
+        var inner = CountingToolRunner{};
+        // **Nobody to ask**: the `Asker` itself is absent, which is the state
+        // a session whose wiring this file forgot is in.
+        var shim = GitToolRunner{ .inner = inner.runner() };
+
+        const result = try shim.runner().dispatch(gpa, io, .{
+            .call_id = "call1",
+            .tool = "run_command",
+            .arguments = arguments,
+        });
+        defer gpa.free(result.call_id);
+        defer gpa.free(result.output);
+
+        try testing.expectEqual(@as(usize, 0), inner.calls);
+        try testing.expect(result.is_error);
+        // "nobody was there", and never "somebody said no": see
+        // `chock_core.arbiter.not_asked`.
+        try testing.expect(std.mem.indexOf(
+            u8,
+            result.output,
+            chock_core.arbiter.not_asked.outcome,
+        ) != null);
+    }
+}
+
+test "the question a git subcommand asks names the act, the tool that ran it, and the effect" {
+    // The four parts of the policy key a reader of the log rebuilds. The
+    // action is the act's own name, which for a push is the same `git.push`
+    // `lib/chock-broker/actions.zig` performs, and the tool is `run_command`
+    // and never the subcommand: the subcommand is already the action.
+    //
+    // Mutation check: send `ask.subcommand` as `.tool` and the third
+    // expectation fails.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arbitrator = CountingArbiter{ .permitted = false };
+    var inner = CountingToolRunner{};
+    const result = try driveGitRunner(
+        gpa,
+        io,
+        &arbitrator,
+        &inner,
+        "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expectEqual(@as(usize, 1), arbitrator.asks);
+    try testing.expectEqualStrings("git.push", arbitrator.action.read());
+    try testing.expectEqualStrings("run_command", arbitrator.tool.read());
+    // The effect first, out of the shim's own text and not a second wording
+    // written here: see `chock_broker.git_shim.detailOf`.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        arbitrator.detail.read(),
+        "the subcommand runs inside the sandbox",
+    ) != null);
+    // And the refusal the agent reads names the act, not the tool.
+    try testing.expect(std.mem.indexOf(u8, result.output, "git.push") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "refused_by_user") != null);
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+}
+
+test "a subcommand that reaches another host is asked about, and an approved one still does not run" {
     // The measured session: `git fetch` reached the real git, the real git
     // forked `ssh`, and the model read `cannot run ssh: No such file or
-    // directory`, then spent turns looking for a proxy. Nothing was breached,
-    // and nothing about the sandbox changes here. What changes is that the
-    // agent is told the truth in one turn.
+    // directory`, then spent turns looking for a proxy. What changed twice
+    // since: it is a real question now instead of a silent discard, and the
+    // answer no longer blames a network the sandbox has.
+    //
+    // **A yes does not make it run.** An act that leaves the sandbox is
+    // performed on the host out of a payload that names the effect, and
+    // nothing builds one for a git subcommand yet. The agent is told what is
+    // missing rather than told no.
+    //
+    // Mutation check: drop the `needsNetwork` branch from `gitAnswer` and
+    // `inner.calls` below reaches one.
     const gpa = testing.allocator;
+    const io = testing.io;
 
     for ([_][]const u8{
         "{\"argv\":[\"git\",\"fetch\",\"origin\"]}",
         "{\"argv\":[\"git\",\"pull\"]}",
         "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
         "{\"argv\":[\"git\",\"clone\",\"https://example.invalid/x.git\"]}",
-        "{\"argv\":[\"git\",\"ls-remote\",\"origin\"]}",
         // An option before the subcommand is read the same way, so a fetch
         // does not get through by being spelled with one.
         "{\"argv\":[\"git\",\"-C\",\"sub\",\"fetch\"]}",
     }) |arguments| {
+        var arbitrator = CountingArbiter{ .permitted = true };
         var inner = CountingToolRunner{};
-        var shim = GitToolRunner{ .inner = inner.runner() };
-
-        const result = try shim.runner().dispatch(gpa, testing.io, .{
-            .call_id = "call1",
-            .tool = "run_command",
-            .arguments = arguments,
-        });
+        const result = try driveGitRunner(gpa, io, &arbitrator, &inner, arguments);
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
-        // Answered here, so the real git never forked ssh at all.
+        // Asked, and then still not run.
+        try testing.expectEqual(@as(usize, 1), arbitrator.asks);
         try testing.expectEqual(@as(usize, 0), inner.calls);
         try testing.expect(result.is_error);
-        try testing.expect(std.mem.indexOf(u8, result.output, "no network") != null);
-        try testing.expect(std.mem.indexOf(u8, result.output, "no proxy") != null);
+        try testing.expect(std.mem.indexOf(u8, result.output, "not built yet") != null);
+        // **Not read as a no, and never blaming the network.** A person may
+        // well have said yes, and the router gave the sandbox one.
+        try testing.expect(std.mem.indexOf(u8, result.output, "not a refusal") != null);
+        try testing.expect(std.mem.indexOf(u8, result.output, "has no network") == null);
     }
 }
 
-test "every other command still reaches the runner behind the shim, git included" {
-    // The other half, and the one that matters more: this runner sits in
-    // front of every tool call a session makes. A shim that quietly refused
-    // more than it says would break the session's own work, and `git commit`
-    // in particular is how that work reaches the user at all: see
-    // `GitToolRunner` and `applyWork`.
+test "a read only subcommand reaches the real git and asks nobody at all" {
+    // **The cheap path, and the one a session spends most of its git calls
+    // on.** `classify` answers `run_the_real_git` for these, so `gitAnswer`
+    // returns before it reaches the seam: no question is written, nobody is
+    // interrupted, and the call costs exactly what it cost before the approval
+    // half existed.
+    //
+    // Mutation check: ask before the `run_the_real_git` arm and `asks` below
+    // is no longer zero.
     const gpa = testing.allocator;
+    const io = testing.io;
 
     for ([_][]const u8{
         "{\"argv\":[\"git\",\"status\",\"--short\"]}",
         "{\"argv\":[\"git\",\"log\",\"--oneline\"]}",
-        "{\"argv\":[\"git\",\"add\",\"-A\"]}",
-        "{\"argv\":[\"git\",\"commit\",\"-m\",\"the work\"]}",
-        "{\"argv\":[\"git\",\"checkout\",\"-b\",\"topic\"]}",
+        "{\"argv\":[\"git\",\"diff\"]}",
+        "{\"argv\":[\"git\",\"--version\"]}",
         "{\"argv\":[\"zig\",\"build\",\"test\"]}",
         // A vector this runner cannot read is `run_command`'s own complaint to
-        // make, not this one's: see `gitRefusal`.
+        // make, not this one's: see `GitToolRunner.gitAnswer`.
         "{\"argv\":[]}",
         "not json at all",
     }) |arguments| {
+        var arbitrator = CountingArbiter{ .permitted = false };
         var inner = CountingToolRunner{};
-        var shim = GitToolRunner{ .inner = inner.runner() };
-
-        const result = try shim.runner().dispatch(gpa, testing.io, .{
-            .call_id = "call1",
-            .tool = "run_command",
-            .arguments = arguments,
-        });
+        const result = try driveGitRunner(gpa, io, &arbitrator, &inner, arguments);
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
+        try testing.expectEqual(@as(usize, 0), arbitrator.asks);
         try testing.expectEqual(@as(usize, 1), inner.calls);
         try testing.expect(!result.is_error);
     }
 
     // And a tool that is not `run_command` is not read as a git command line
     // whatever its arguments hold.
+    var arbitrator = CountingArbiter{ .permitted = false };
     var inner = CountingToolRunner{};
-    var shim = GitToolRunner{ .inner = inner.runner() };
-    const result = try shim.runner().dispatch(gpa, testing.io, .{
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    var shim = GitToolRunner{ .inner = inner.runner(), .asker = arbitrator.asker(&log.locked) };
+    const result = try shim.runner().dispatch(gpa, io, .{
         .call_id = "call1",
         .tool = "write_file",
         .arguments = "{\"path\":\"x\",\"content\":\"{\\\"argv\\\":[\\\"git\\\",\\\"fetch\\\"]}\"}",
     });
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
+    try testing.expectEqual(@as(usize, 0), arbitrator.asks);
     try testing.expectEqual(@as(usize, 1), inner.calls);
+}
+
+test "an approved workspace subcommand reaches the real git, git commit included" {
+    // The other half, and the one that matters more: this runner sits in
+    // front of every tool call a session makes. A shim that quietly refused
+    // more than it says would break the session's own work, and `git commit`
+    // in particular is how that work reaches the user at all: see
+    // `GitToolRunner` and `applyWork`.
+    //
+    // Mutation check: drop the `!` from `if (!answer.permitted)` in
+    // `gitAnswer`, so a yes refuses. `inner.calls` below stops reaching one.
+    // Written as an inversion and not as an unconditional refusal, because an
+    // unconditional one does not compile: the `needsNetwork` branch after it
+    // becomes unreachable code.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    for ([_][]const u8{
+        "{\"argv\":[\"git\",\"add\",\"-A\"]}",
+        "{\"argv\":[\"git\",\"commit\",\"-m\",\"the work\"]}",
+        "{\"argv\":[\"git\",\"checkout\",\"-b\",\"topic\"]}",
+        "{\"argv\":[\"git\",\"branch\",\"-D\",\"topic\"]}",
+    }) |arguments| {
+        var arbitrator = CountingArbiter{ .permitted = true };
+        var inner = CountingToolRunner{};
+        const result = try driveGitRunner(gpa, io, &arbitrator, &inner, arguments);
+        defer gpa.free(result.call_id);
+        defer gpa.free(result.output);
+
+        try testing.expectEqual(@as(usize, 1), arbitrator.asks);
+        try testing.expectEqual(@as(usize, 1), inner.calls);
+        try testing.expect(!result.is_error);
+    }
+}
+
+test "a project with no chock.zon answers allow for git commit and ask for a push" {
+    // **The promise `docs/status.md` makes, measured on the table itself.**
+    // Wiring the shim's approval half turned every subcommand it classifies
+    // into a key this table is asked about, and a key nobody named answers
+    // `ask`. Without the `git.*` block in `lib/chock-policy/defaults.zig` an
+    // ordinary session would stop at its first `git add`, and a piped one,
+    // which can ask nobody, would be refused outright.
+    //
+    // Mutation check: delete the `git.commit` line from
+    // `chock_policy.defaults.rules` and the first loop below answers `ask`.
+    const gpa = testing.allocator;
+
+    // An empty project file, which is the project this test is about.
+    const empty: [:0]const u8 = ".{}";
+    const policy = try chock_policy.table.Table.parse(gpa, empty, null);
+    defer chock_policy.table.Table.destroy(gpa, policy);
+
+    const key = struct {
+        fn of(action: []const u8) chock_policy.table.Key {
+            return .{
+                .agent_kind = "main",
+                .model = "test-model",
+                .tool = "run_command",
+                .action = action,
+            };
+        }
+    };
+
+    // Everything the shim can classify that changes only this session's own
+    // workspace. No prompt, exactly as before the approval half was wired.
+    for ([_][]const u8{
+        "git.add",
+        "git.commit",
+        "git.checkout",
+        "git.branch",
+        "git.branch.delete",
+        "git.merge",
+        "git.rebase",
+        "git.reset",
+        "git.stash",
+        "git.worktree",
+    }) |action| {
+        try testing.expectEqual(
+            chock_policy.table.Decision.allow,
+            policy.evaluateKindAlone(key.of(action)),
+        );
+    }
+
+    // And everything that reaches another host, plus the two names the shim
+    // builds when it could not read the command at all. Each of these is a
+    // key nobody named, which is `ask`.
+    for ([_][]const u8{
+        "git.push",
+        "git.clone",
+        "git.fetch",
+        "git.pull",
+        chock_broker.git_shim.unreadable_action,
+        "git.frobnicate",
+    }) |action| {
+        try testing.expectEqual(
+            chock_policy.table.Decision.ask,
+            policy.evaluateKindAlone(key.of(action)),
+        );
+    }
+
+    // **And no write gained a prompt.** The two tool calls a session writes
+    // with are still allowed, and `file.write`, which is the broker's own act
+    // at a path outside the workspace, still asks.
+    try testing.expectEqual(
+        chock_policy.table.Decision.allow,
+        policy.evaluateKindAlone(key.of("call.write_file")),
+    );
+    try testing.expectEqual(
+        chock_policy.table.Decision.allow,
+        policy.evaluateKindAlone(key.of("call.edit_file")),
+    );
+    try testing.expectEqual(
+        chock_policy.table.Decision.ask,
+        policy.evaluateKindAlone(key.of("file.write")),
+    );
 }
 
 // `lib/chock-core/lsp.zig` holds the ranking, the bound and the say-once rule,
@@ -16476,16 +16891,16 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     try std.testing.expectEqualStrings("call7", result.call_id);
 }
 
-test "one locked handle reaches both third party tool sessions, and a session that missed it runs nothing" {
+test "one locked handle reaches all three askers, and one that missed it runs nothing" {
     // **The wiring that is easy to build and easy to leave half done.**
-    // `chock_core.Loop.Deps.give_locked` carries one handle and three parties
-    // need it, so the fan out is this file's. A session that keeps a null
-    // handle asks nobody and refuses every call, which is the safe direction
-    // and a silent loss of a supplier's tools if only one of the two is
-    // reached.
+    // `chock_core.Loop.Deps.give_locked` carries one handle and four parties
+    // need it, so the fan out is this file's. One that keeps a null handle
+    // asks nobody and refuses every call it gates, which is the safe direction
+    // and a silent loss of a supplier's tools, or of `git add`, if only some
+    // of them are reached.
     //
-    // Mutation check: drop either line of `giveLockedToSessions` and the
-    // matching half below stops running.
+    // Mutation check: drop any one line of `giveLockedToAskers` and the
+    // matching third below stops running.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -16520,7 +16935,8 @@ test "one locked handle reaches both third party tool sessions, and a session th
     plugin_state.session.asker = .{ .arbiter = log.asker().arbiter };
 
     var inner = CountingToolRunner{};
-    var mcp_aware = McpToolRunner{ .inner = inner.runner(), .state = &mcp_state };
+    var git_aware = GitToolRunner{ .inner = inner.runner(), .asker = .{ .arbiter = log.asker().arbiter } };
+    var mcp_aware = McpToolRunner{ .inner = git_aware.runner(), .state = &mcp_state };
     var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
 
     for ([_][]const u8{ "server_tool", "plugin_tool" }) |name| {
@@ -16538,11 +16954,31 @@ test "one locked handle reaches both third party tool sessions, and a session th
             chock_core.arbiter.not_asked.outcome,
         ) != null);
     }
+    // **And the git shim is the third of them.** `git add` changes only the
+    // session's own workspace and `lib/chock-policy/defaults.zig` allows it,
+    // but a runner whose handle has not arrived has nowhere to write the
+    // question, so it refuses and says nobody was asked rather than running.
+    {
+        const early = try plugin_aware.runner().dispatch(gpa, io, .{
+            .call_id = "call1",
+            .tool = "run_command",
+            .arguments = "{\"argv\":[\"git\",\"add\",\"-A\"]}",
+        });
+        defer gpa.free(early.call_id);
+        defer gpa.free(early.output);
+        try std.testing.expect(early.is_error);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            early.output,
+            chock_core.arbiter.not_asked.outcome,
+        ) != null);
+    }
     try std.testing.expectEqual(@as(usize, 0), server_host.calls);
     try std.testing.expectEqual(@as(usize, 0), plugin_probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), inner.calls);
 
-    // The handle arrives once, and both suppliers work.
-    giveLockedToSessions(&mcp_state.session, &plugin_state.session, &log.locked);
+    // The handle arrives once, and all three work.
+    giveLockedToAskers(&mcp_state.session, &plugin_state.session, &git_aware, &log.locked);
 
     const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
         .call_id = "call2",
@@ -16562,9 +16998,19 @@ test "one locked handle reaches both third party tool sessions, and a session th
     defer gpa.free(from_plugin.output);
     try std.testing.expectEqualStrings("the plugin answered", from_plugin.output);
 
+    const from_git = try plugin_aware.runner().dispatch(gpa, io, .{
+        .call_id = "call4",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"git\",\"add\",\"-A\"]}",
+    });
+    defer gpa.free(from_git.call_id);
+    defer gpa.free(from_git.output);
+    try std.testing.expect(!from_git.is_error);
+    try std.testing.expectEqualStrings("the real git ran", from_git.output);
+
     try std.testing.expectEqual(@as(usize, 1), server_host.calls);
     try std.testing.expectEqual(@as(usize, 1), plugin_probe.calls);
-    try std.testing.expectEqual(@as(usize, 0), inner.calls);
+    try std.testing.expectEqual(@as(usize, 1), inner.calls);
 }
 
 test "the policy this wiring builds names the action, folds the chain, and refuses a child its parent lacks" {

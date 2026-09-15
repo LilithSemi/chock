@@ -412,7 +412,7 @@ pub const Refusal = enum {
     nobody_answered,
 
     /// One line, for the person reading `git`'s standard error. **Each one
-    /// names what to do instead**, which is the rule `git_shim.networkRefusal`
+    /// names what to do instead**, which is the rule `git_shim.hostReachingRefusal`
     /// keeps: a message that only says no leaves the reader with the question
     /// they started with.
     pub fn text(self: Refusal) []const u8 {
@@ -1253,7 +1253,7 @@ test "a prompt over a real socket is answered, and one for another host is not" 
 }
 
 test "every refusal names what to do instead, and none of them is a bare no" {
-    // The rule `git_shim.networkRefusal` keeps, measured: a model, and a
+    // The rule `git_shim.hostReachingRefusal` keeps, measured: a model, and a
     // person, told plainly what is wrong and what works instead act on it,
     // and a message that only says no leaves them with the question they
     // started with.

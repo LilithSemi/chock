@@ -136,15 +136,18 @@ tenth.
   finished can ask for its commit to be carried into the user's repository,
   and the policy table, or a person, answers. Every other action name is
   refused by name, before anybody is asked. An agent still cannot ask about
-  `git.commit`, `git.push`, `git.branch.delete`, `net.fetch` as an act,
-  `nix.build` or `file.write`: the table can answer those rows and nothing
-  in a session asks them. Three callers reach the broker today. Two are the
-  harness itself: `chock run` asks for `workspace.apply` after the loop has
-  ended, and the session arbiter asks for `policy.widen` while it runs. The
-  third is the agent, through `request_action`, for that one act. The git
-  shim is still the one thing that stops a subcommand, and only one that
-  would reach another host: `git commit` runs the real git inside the
-  sandbox with no question asked.
+  `net.fetch` as an act, `nix.build` or `file.write`: the table can answer
+  those rows and nothing in a session asks them. Four callers reach the broker
+  today. Two are the harness itself: `chock run` asks for `workspace.apply`
+  after the loop has ended, and the session arbiter asks for `policy.widen`
+  while it runs. The third is the agent, through `request_action`, for that
+  one act. The fourth is the git shim, which asks about every subcommand it
+  classifies, so `git.commit`, `git.push` and `git.branch.delete` are rows a
+  session really does ask. `git commit` still runs with no prompt on a project
+  that wrote no `chock.zon`, because Chock ships `allow` for every git action
+  name that changes only the session's own workspace. A subcommand that
+  reaches another host is asked about and still does not run, even approved:
+  the act that leaves the sandbox has no caller yet.
 
 - **A handover cannot carry a background command or a background subagent, so a
   session running one refuses.** Both live in the process that started them, and
@@ -247,12 +250,25 @@ tenth.
   attempts spanning about a minute, honouring `Retry-After` when the provider
   sends one. A broken stream is a different fault: the turn half happened, and
   sending it again is a larger change than the wait was.
-- **Nothing starts `git` with the password helper yet.** `chock askpass` is
-  built: git or ssh asks over a socket, the broker answers from the policy
-  table, and the credential never enters the sandbox. What is missing is the
-  caller. `actions.performGitPush` blocks in `child.wait`, so a real push needs
-  a caller that spawns git and polls the endpoint while it runs. The shape is
-  proved by a test that does exactly that against real `git`.
+- **Nothing starts `git` with the password helper yet, so `git push` is asked
+  about and still does not run.** `chock askpass` is built: git or ssh asks
+  over a socket, the broker answers from the policy table, and the credential
+  never enters the sandbox. Two things are missing, and neither is small.
+  The first is the caller: `actions.performGitPush` blocks in `child.wait`, so
+  a real push needs a caller that spawns git and polls the endpoint while it
+  runs. The shape is proved by a test that does exactly that against real
+  `git`. The second is where a git password comes from at all: nothing fills a
+  `chock_broker.askpass.Grants`, and there is no way to put a credential in
+  one. Until both land, a person's yes to a `git.push` leads to a sentence
+  saying what is missing, rather than to a push.
+
+  **The socket is not the answer to mounting it into the sandbox, either.**
+  A helper reachable from a tool call would let the agent ask for a password
+  for any host `secret.password.*` permits, as often as it likes, with no git
+  involved. That is a credential oracle and a different capability from "git
+  asked for the credential it needs". A push leaves the sandbox, so it belongs
+  with the other acts that leave it, performed on the host out of a payload
+  that names the effect.
 
 ## Known open items
 

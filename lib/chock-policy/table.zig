@@ -3220,12 +3220,17 @@ test "the read time check counts the shipped defaults, and refuses what the file
     try std.testing.expectEqual(@as(u64, 64), walk.longest_name);
 
     // 74 names in the model list and in the tool list (73 distinct plus the
-    // "matches nothing" marker), and 87 names in the action list: the same
-    // 74, plus one entry for each of the 13 patterns `defaults.zig` ships,
-    // because `representatives` now folds those in too, so the action space
-    // this check walks matches the one `evaluateRules` actually reads. The
-    // product is cubed for the one declared link, and read against the
-    // file's 73 rules plus the 13 rules `defaults.zig` ships, twice per key.
+    // "matches nothing" marker), and 74 plus one entry for each rule
+    // `defaults.zig` ships in the action list, because `representatives` now
+    // folds those in too, so the action space this check walks matches the one
+    // `evaluateRules` actually reads. The product is cubed for the one
+    // declared link, and read against the file's 73 rules plus the rules
+    // `defaults.zig` ships, twice per key.
+    //
+    // **Written against `defaults.rules.len` and never against a number.**
+    // That list grew from 13 rules to 50 on 2026-09-15, when the git shim's
+    // approval half was wired and every git action name it can build for a
+    // workspace-only subcommand was shipped as a default.
     const keys: u64 = 74 * 74 * (74 + @as(u64, defaults.rules.len));
     const rules_per_key: u64 = walk.rules + @as(u64, defaults.rules.len);
     try std.testing.expectEqual(keys * rules_per_key * 2, walk.reads);
@@ -3237,12 +3242,23 @@ test "the corrected budget still reads a table under it and still refuses one cl
     // must not turn it into a check that refuses every table or none.
     // Folding the shipped defaults into the action list as well as the rule
     // count moves the ceiling down further, from 72 rules to 69: 69 rules of
-    // three distinct 64 byte names under one declared parent link is the
-    // largest file of this shape the corrected budget still reads, inside it
-    // by a small margin.
+    // three distinct 64 byte names under one declared parent link was the
+    // largest file of this shape the corrected budget still read.
+    //
+    // **The ceiling moved again, to 54, and it moved for a reason worth
+    // naming.** `defaults.zig` shipped 13 rules and now ships 50: wiring the
+    // git shim's approval half made every git subcommand the shim classifies a
+    // key this table is asked about, and the shipped `.allow` rules are what
+    // keep a project with no `chock.zon` from being prompted for `git add`.
+    // Every one of those rules is counted twice per key by the budget above
+    // and adds one name to the action list, so a project's own file has less
+    // room than it did. **It is the pathological shape that lost the room**:
+    // 54 rules of three distinct 64 byte names each, under a declared parent
+    // link. A real `chock.zon` holds a handful of short rules and is nowhere
+    // near this.
     const gpa = std.testing.allocator;
 
-    const admitted = try wideSource(gpa, 69, 64);
+    const admitted = try wideSource(gpa, 54, 64);
     defer gpa.free(admitted);
     const table = try Table.parse(gpa, admitted, null);
     defer Table.destroy(gpa, table);
@@ -3257,9 +3273,9 @@ test "the corrected budget still reads a table under it and still refuses one cl
         .action = name,
     }));
 
-    // One rule more, 70, is refused. The same shape crosses the budget at
+    // One rule more, 55, is refused. The same shape crosses the budget at
     // exactly one rule above what is admitted.
-    const one_more = try wideSource(gpa, 70, 64);
+    const one_more = try wideSource(gpa, 55, 64);
     defer gpa.free(one_more);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, one_more, null));
 

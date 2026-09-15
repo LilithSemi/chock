@@ -81,6 +81,39 @@
 //! * `update_plan`, `ask_user` and `set_title` grant no capability and need no
 //!   key at all.
 //!
+//! ## The git shim asks too, and its names are here for one reason
+//!
+//! `lib/chock-broker/git_shim.zig` reads a `run_command` call that runs `git`
+//! and answers `run_the_real_git` or `ask`. Until 2026-09-15 the `ask` half
+//! reached nobody: `src/run.zig` threw away every verdict that was not a
+//! subcommand needing a host. It reaches the arbiter now, which means a
+//! subcommand the shim classifies is a key this table is asked about, and a
+//! key nobody named answers `ask`.
+//!
+//! **So a `git.*` rule here buys exactly one thing: a project with no
+//! `chock.zon` keeps running `git add` and `git commit` with no prompt.**
+//! That is the same promise `call.write_file` and `call.edit_file` above are
+//! here for, read for a different tool. Without these lines, wiring the shim
+//! would have made every ordinary session stop at its first `git add`, and a
+//! piped session, which can ask nobody, would have been refused outright.
+//!
+//! **The split is whether the subcommand reaches another host, and nothing
+//! else.** `git_shim.needs_network` is where that judgement already lives, and
+//! it is not copied here: the four names on it that this file could have
+//! written simply are not written, so there is one list and not two. A
+//! subcommand that only changes the session's own workspace is allowed,
+//! because the workspace is a scratch worktree the project never sees and the
+//! user is asked about `workspace.apply` at the end of the session either way.
+//! A subcommand that reaches a host is not, because that act leaves the
+//! sandbox and Chock asks about every act that leaves it.
+//!
+//! **Two names the shim builds hold no rule, and both are the safe default.**
+//! `git.unknown` is what an option this shim cannot read answers, which stops
+//! it reading the subcommand at all, and a verb on neither of the shim's own
+//! lists answers `git.<verb>`, which no line below names. Both are a git
+//! command Chock could not read, and a command nobody can read is not safe for
+//! being unreadable: that is the reading `exec.unparsed` below already gets.
+//!
 //! ## What is deliberately absent
 //!
 //! `net.connect.*` and `net.fetch.*` hold no rule here, on purpose. Chock
@@ -90,6 +123,20 @@
 //! the same at first glance and mean something worse: it would be one more
 //! line for the next author to wonder whether narrowing it is enough, when
 //! today the true answer is that no rule exists at all.
+//!
+//! `git.push`, `git.clone`, `git.fetch` and `git.pull` join them, for the
+//! same reason and one more of their own: each one reaches another host, and
+//! a host reach is decided at `net.connect.*`, which holds no rule here
+//! either. `git.unknown` joins them as well: see the section above.
+//!
+//! `file.write` joins them, and it is worth saying why it is not read as a
+//! contradiction of `call.write_file` above. The two are different acts with
+//! similar names. `call.write_file` is a tool call, which writes inside the
+//! sandbox and reaches only the session's own workspace, so it is allowed.
+//! `file.write` is `lib/chock-broker/actions.zig`'s act, which the broker
+//! performs **on the host**, at a path outside the workspace. An unnamed key
+//! answers `ask`, which is the right answer for the second one, and writing a
+//! rule here would be writing one for the wrong one.
 //!
 //! `exec.unparsed` joins them, and it did not always. `lib/chock-core/tools.zig`
 //! answers `exec.unparsed` for a path it refuses to resolve, most often a `..`
@@ -122,8 +169,14 @@
 const table = @import("table.zig");
 
 /// One rule for every action `gateToolCall` actually asks the table about
-/// for an ordinary tool call, so an empty or absent `chock.zon` still runs
-/// them without a prompt.
+/// for an ordinary tool call, plus the git shim's own names, so an empty or
+/// absent `chock.zon` still runs them without a prompt.
+///
+/// **The `git.*` block at the end is not a `gateToolCall` key.** It is asked
+/// by `src/run.zig`'s `GitToolRunner`, out of what
+/// `lib/chock-broker/git_shim.zig` read from one `run_command` argument
+/// vector. See this file's own top comment, "The git shim asks too", for why
+/// the block stops at the subcommands that reach no other host.
 ///
 /// `run_command` needs three rules, one for each class `actionInto` can
 /// build a path into, because `.tool = "run_command"` alone would be exactly
@@ -161,6 +214,60 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
+
+    // **The git shim's own names.** See this file's own top comment, "The git
+    // shim asks too". Every one of these changes the session's own scratch
+    // workspace and nothing outside it, so a project that wrote no `chock.zon`
+    // runs them with no prompt, exactly as it did before the shim's `ask` half
+    // was wired. `git.push`, `git.clone`, `git.fetch`, `git.pull` and
+    // `git.unknown` are deliberately not here.
+    .{ .action = "git.add", .decision = .allow },
+    .{ .action = "git.am", .decision = .allow },
+    .{ .action = "git.apply", .decision = .allow },
+    .{ .action = "git.bisect", .decision = .allow },
+    .{ .action = "git.branch", .decision = .allow },
+    // `git branch -d` is the one spelling that names an act of its own, so it
+    // is its own key. It still deletes a branch in the session's own object
+    // store and never in the user's repository.
+    .{ .action = "git.branch.delete", .decision = .allow },
+    .{ .action = "git.checkout", .decision = .allow },
+    .{ .action = "git.cherry-pick", .decision = .allow },
+    .{ .action = "git.clean", .decision = .allow },
+    // **The one that must not prompt.** A commit in the workspace is how a
+    // session's work reaches the user at all, through the `workspace.apply`
+    // the user is asked about at the end of the run.
+    .{ .action = "git.commit", .decision = .allow },
+    .{ .action = "git.config", .decision = .allow },
+    .{ .action = "git.filter-branch", .decision = .allow },
+    .{ .action = "git.fsck", .decision = .allow },
+    .{ .action = "git.gc", .decision = .allow },
+    .{ .action = "git.hash-object", .decision = .allow },
+    .{ .action = "git.init", .decision = .allow },
+    .{ .action = "git.merge", .decision = .allow },
+    .{ .action = "git.mv", .decision = .allow },
+    .{ .action = "git.notes", .decision = .allow },
+    .{ .action = "git.prune", .decision = .allow },
+    .{ .action = "git.rebase", .decision = .allow },
+    .{ .action = "git.reflog", .decision = .allow },
+    // `git remote` and `git submodule` reach a host in some spellings and not
+    // in others, which is why `git_shim.needs_network` leaves both off. They
+    // are allowed here for the same reason every other line is, and the reach
+    // itself is still decided at `net.connect.*`, which holds no rule at all.
+    .{ .action = "git.remote", .decision = .allow },
+    .{ .action = "git.repack", .decision = .allow },
+    .{ .action = "git.replace", .decision = .allow },
+    .{ .action = "git.reset", .decision = .allow },
+    .{ .action = "git.restore", .decision = .allow },
+    .{ .action = "git.revert", .decision = .allow },
+    .{ .action = "git.rm", .decision = .allow },
+    .{ .action = "git.stash", .decision = .allow },
+    .{ .action = "git.submodule", .decision = .allow },
+    .{ .action = "git.switch", .decision = .allow },
+    .{ .action = "git.symbolic-ref", .decision = .allow },
+    .{ .action = "git.tag", .decision = .allow },
+    .{ .action = "git.update-index", .decision = .allow },
+    .{ .action = "git.update-ref", .decision = .allow },
+    .{ .action = "git.worktree", .decision = .allow },
 };
 
 const std = @import("std");

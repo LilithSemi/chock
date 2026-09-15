@@ -113,12 +113,25 @@ the boundary. An agent that wants to avoid the shim has several ways and none
 of them is difficult, so nothing in Chock is built as though the shim were a
 control.
 
-**Only part of the shim is wired in this release.** A subcommand that has to
-reach another host, such as `git push`, is refused with a sentence that says
-why. Every other subcommand, `git commit` included, runs the real git inside
-the sandbox, and no approval request is sent. So `git.commit`, `git.push` and
-`git.branch.delete` are rows the table can answer, and nothing in a session
-asks them yet. The same is true of `file.write`.
+**The shim's approval half is wired.** Every subcommand it classifies is asked
+about while the loop runs, through the same arbiter an MCP tool call and a
+plugin tool call already go through. A read only subcommand asks nobody and
+runs the real git, so `git status`, `git log` and `git diff` cost what they
+always did. So `git.commit`, `git.push` and `git.branch.delete` are rows a
+session really asks, and a subcommand the shim does not know asks under its own
+name, such as `git.frobnicate`. An option the shim cannot read stops it reading
+the subcommand at all, and that asks as `git.unknown`.
+
+Chock ships `allow` for every git action name that changes only the session's
+own workspace, `git.commit` among them, so a project with no `chock.zon` gains
+no new prompt. It ships none for `git.push`, `git.clone`, `git.fetch`,
+`git.pull` or `git.unknown`, so each of those asks.
+
+**A subcommand that reaches another host is asked about and still does not run,
+even when a person says yes.** An act that leaves the sandbox is performed on
+the host, out of a payload that names the effect, and nothing builds such a
+payload for a git subcommand yet. The agent is told what is missing rather than
+told no. `file.write` is still a row nothing in a session asks.
 
 `net.fetch` is `fetch_url`'s action, and the host is part of the name, with
 the labels reversed: `docs.ziglang.org` becomes `net.fetch.org.ziglang.docs`.
