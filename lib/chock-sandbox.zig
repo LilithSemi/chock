@@ -57,6 +57,14 @@ pub const cgroup = @import("chock-sandbox/linux/cgroup.zig");
 /// **Nothing calls it yet.** It is the kernel half of the router and the
 /// pieces that use it, the resolver and the relay, are not built.
 pub const nftables = @import("chock-sandbox/linux/nftables.zig");
+/// The network the router gives a sandbox inside its own network namespace:
+/// loopback, one dummy device, an address, and a default route through it.
+/// Re-exported beside `nftables` for the same reason. **The dummy device is a
+/// blackhole and that is the whole design**: read that file's top comment
+/// before changing anything about the device it makes.
+/// **Nothing calls it yet.** It is the second piece of the router, and the
+/// wiring lands when the pieces exist.
+pub const netns = @import("chock-sandbox/linux/netns.zig");
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
