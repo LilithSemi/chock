@@ -1261,7 +1261,7 @@ fn recordFailure(record: *Measurement, diag: ?Diagnostic) void {
 /// Answers null when this machine will not give a namespace at all, which the
 /// caller must report as a skip. **A machine that cannot build a sandbox
 /// measured nothing here, and that is not a pass.**
-fn measure() ?Measurement {
+fn measure() error{ChildCrashed}!?Measurement {
     if (builtin.os.tag != .linux) return null;
     if (!namespace.probeAvailability().available()) return null;
 
@@ -1302,6 +1302,16 @@ fn measure() ?Measurement {
     var status: u32 = 0;
     _ = linux.waitpid(@intCast(child), &status, 0);
 
+    // **A crashed child and a machine with no namespace write the same short
+    // pipe.** They are told apart by the exit status and by nothing else. This
+    // file's own tests would otherwise turn an assertion that fired inside the
+    // child into a SKIP, and the suite would stay green with the test never
+    // having run. Measured in `netns.zig` while it was built, which carries the
+    // same harness and found this first.
+    //
+    // The child leaves by `exit(0)` on both paths it plans to take, so any
+    // other status is a crash, a signal, or a panic.
+    if (status != 0) return error.ChildCrashed;
     if (filled != bytes.len) return null;
     return record;
 }
@@ -1413,7 +1423,7 @@ test "a set element carries its timeout in attribute 4 and never in 6" {
 }
 
 test "install reads back the ruleset it wrote" {
-    const record = measure() orelse return error.SkipZigTest;
+    const record = try measure() orelse return error.SkipZigTest;
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.failed_step);
 
@@ -1440,7 +1450,7 @@ test "install reads back the ruleset it wrote" {
 }
 
 test "the two chains keep the priorities the ordering depends on" {
-    const record = measure() orelse return error.SkipZigTest;
+    const record = try measure() orelse return error.SkipZigTest;
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.failed_step);
 
@@ -1460,7 +1470,7 @@ test "the two chains keep the priorities the ordering depends on" {
 }
 
 test "allow stores a timeout the kernel gives back as a timeout" {
-    const record = measure() orelse return error.SkipZigTest;
+    const record = try measure() orelse return error.SkipZigTest;
     if (measuredNothing(record)) return error.SkipZigTest;
     try testing.expectEqual(Measurement.no_failure, record.failed_step);
 
