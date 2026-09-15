@@ -183,6 +183,52 @@ pub const ToolchainState = union(enum) {
     none,
 };
 
+/// What a routed sandbox would find at the three files it writes for itself.
+///
+/// **A host property and not a namespace probe, and it is the one that saves
+/// the most confusion.** A sandbox with a network of its own has a resolver of
+/// its own, and glibc only finds it through `/etc/resolv.conf`, so
+/// `namespace.substitute` puts that file and two more inside the sandbox.
+/// **It refuses a target that is a symbolic link rather than following one**: a
+/// bind over a link lands wherever the link points, which the sandbox does not
+/// hold. On a machine with systemd and no Nix, `/etc` is bound from the host
+/// and `/etc/resolv.conf` there is a link into `/run/systemd/resolve`, so that
+/// machine can start no routed sandbox at all, and the only way to learn it
+/// today is to try.
+///
+/// See `measureResolverFiles` for how each answer is reached, and
+/// `Sandbox.resolver_substitutions` for the list this reads.
+pub const ResolverFiles = union(enum) {
+    /// Nothing read this host. **Never printed on a real run**: the row is
+    /// only built for a driver that routes, and the answer is measured before
+    /// `rowsFor` is called.
+    not_read,
+    /// A routed sandbox holds no host `/etc`, so it makes all three files
+    /// itself. Every machine with a Nix store, and every project with a dev
+    /// shell.
+    made_inside,
+    /// A routed sandbox binds this host's own `/etc`, and every target there
+    /// is a regular file. A bind mount covers one whatever it holds and needs
+    /// no write permission on it, so this works.
+    covered,
+    /// A routed sandbox binds this host's own `/etc` and this target there is
+    /// a symbolic link. **No routed sandbox starts on this machine.** The text
+    /// is the target, which is `/etc/resolv.conf` on a systemd machine.
+    linked: []const u8,
+    /// A routed sandbox binds this host's own `/etc` and this target is not
+    /// there at all. `substitute` then makes the file where it belongs, which
+    /// is inside a mount that is read only, and `writeSubstitute` answers
+    /// `EROFS`. **No routed sandbox starts on this machine either**, and it is
+    /// the same fault as the one above pointing the other way.
+    missing: []const u8,
+    /// The `/etc` a routed sandbox holds comes from this project's container
+    /// image, so this host's own says nothing about it. The text names the
+    /// image. **Nothing here unpacked one to read it**, and the row says so:
+    /// the same shape `vantageNote` uses for a cgroup answer that is about a
+    /// view and not about the machine.
+    from_image: []const u8,
+};
+
 /// One audit sink this installation's org policy bundle requires, and whether
 /// this machine can reach it. See `reachSink`.
 pub const SinkProbe = struct {
@@ -272,6 +318,18 @@ pub const Measured = struct {
     pid_namespace: Probe = .{ .absent = driver_gives_nothing },
     ipc_namespace: Probe = .{ .absent = driver_gives_nothing },
     network_namespace: Probe = .{ .absent = driver_gives_nothing },
+    /// Whether this kernel built the sandbox's own network when this command
+    /// asked it to. **Measured by calling `netns.Session.configure` for real**
+    /// in a network namespace of its own, the same call a routed tool call
+    /// makes: see `probeNetwork`.
+    router_network: Probe = .{ .absent = layer_not_measured },
+    /// Whether this kernel took the ruleset that filters that network.
+    /// **Measured by calling `nftables.Session.install` for real**, in the same
+    /// child and on the network the row above built.
+    router_filter: Probe = .{ .absent = layer_not_measured },
+    /// What a routed sandbox would find at the three files it writes for
+    /// itself. See `ResolverFiles`.
+    resolver_files: ResolverFiles = .not_read,
     landlock: Probe = .{ .absent = driver_gives_nothing },
     /// The Landlock ABI version the kernel answered, or null when it has
     /// none. Shown beside the row, because a kernel with Landlock and an old
@@ -571,6 +629,32 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
             .blocks = true,
         });
 
+        // **The three rows the network router needs, and they sit here**, right
+        // under the namespace they are built inside, so a person reads the
+        // whole network answer in one place.
+        //
+        // **Gated on the driver's own guarantee and never on the platform**,
+        // the rule the whole file keeps. A driver that gives a tool call no
+        // network of its own builds no router, so it gets no row at all rather
+        // than three rows about a mechanism it never reaches.
+        if (m.driver.contains(.network_isolated)) {
+            try rows.append(arena, try routerRow(
+                arena,
+                "router network",
+                m.router_network,
+                "the sandbox has a network of its own: loopback, one blackhole device, an address, and a default route through it",
+                router_network_fix,
+            ));
+            try rows.append(arena, try routerRow(
+                arena,
+                "router filter",
+                m.router_filter,
+                "the kernel itself filters that network, so a connection reaches only an address a policy let out",
+                router_filter_fix,
+            ));
+            try rows.append(arena, try resolverFilesRow(arena, m.resolver_files));
+        }
+
         try rows.append(arena, .{
             .name = "landlock",
             .state = m.landlock.state(),
@@ -708,6 +792,159 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
 
     return rows.toOwnedSlice(arena);
 }
+
+/// One of the two rows that say whether this kernel can give a tool call the
+/// network a routed call gets. See `probeNetwork`, which measures both by
+/// making the real calls in a namespace of its own.
+///
+/// **Both rows block, and the rule is the same one every other row follows:**
+/// `Row.blocks` is true when a first run fails because of this row, as
+/// measured. Every foreground tool call of a `chock run` session takes
+/// `Network.filtered`, whatever this project's policy says, because
+/// `src/run.zig` gives the tool runner a network seam on every session and
+/// `chock_core.tools` moves the call to `.filtered` wherever that seam is set.
+/// So a kernel that answers no here refuses the first tool call and every one
+/// after it. `.none` and `.host` use no router, and neither is reachable from
+/// the command line: a background `run_command`, a language server and an
+/// unnamed MCP server get `.none`, and none of those is a session.
+fn routerRow(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    probe: Probe,
+    why: []const u8,
+    absent_fix: []const u8,
+) std.mem.Allocator.Error!Row {
+    return .{
+        .name = name,
+        .state = probe.state(),
+        .means = if (probe == .ok)
+            ""
+        else
+            try std.fmt.allocPrint(arena, "no foreground tool call can start: {s}", .{probe.why()}),
+        .why = why,
+        .fix = switch (probe) {
+            .ok => "",
+            .absent => absent_fix,
+            .refused => router_refusal_fix,
+        },
+        .blocks = true,
+    };
+}
+
+/// What to do about a kernel with no `dummy` link kind. **The module is named,
+/// because `modprobe` needs a name and no other message on this machine says
+/// which one.** Read from `Sandbox.network_modules`, so this file states no
+/// second copy of the list.
+const router_network_fix = "Load it on the host and run again: modprobe " ++ sandbox.Sandbox.network_modules ++
+    ". A sandbox cannot make the kernel load a module, and every foreground tool call takes a " ++
+    "filtered network, so no tool call runs until this is loaded.";
+
+/// What to do about a kernel that has no nftables. The list is
+/// `Sandbox.filter_modules`, for the reason above.
+const router_filter_fix = "Load them on the host and run again: modprobe " ++ sandbox.Sandbox.filter_modules ++
+    ". A sandbox with a network and no ruleset on it would reach whatever the host can reach, " ++
+    "so Chock refuses to start rather than run without the filter.";
+
+/// What to do about a kernel that has the mechanism and refused this process.
+///
+/// **There is nothing on the machine to change, and saying so is the answer.**
+/// A routed call builds its network inside a network namespace it made a
+/// moment earlier, where it is root and holds `CAP_NET_ADMIN`. A refusal there
+/// is this program sending something the kernel does not accept.
+const router_refusal_fix = "The sandbox builds this inside a network namespace of its own, where it holds " ++
+    "CAP_NET_ADMIN, so a refusal here is a fault in Chock and not a setting on this machine. " ++
+    "It is worth reporting.";
+
+/// Whether this host lets a routed sandbox write the three files it needs.
+///
+/// **The one row here that is a question about the host and not about a
+/// namespace**, and the one that blocks the most machines. See `ResolverFiles`.
+fn resolverFilesRow(
+    arena: std.mem.Allocator,
+    files: ResolverFiles,
+) std.mem.Allocator.Error!Row {
+    const why = "the sandbox writes its own resolv.conf, nsswitch.conf and hosts, so a program in it " ++
+        "asks the sandbox's own resolver and no other";
+    return switch (files) {
+        .not_read => .{
+            .name = resolver_files_name,
+            .state = .unsupported,
+            .means = layer_not_measured,
+        },
+        .made_inside => .{
+            .name = resolver_files_name,
+            .state = .on,
+            .means = "",
+            .why = why,
+        },
+        .covered => .{
+            .name = resolver_files_name,
+            .state = .on,
+            .means = "this host's own /etc is bound into the sandbox, and each file is covered by a bind mount",
+            .why = why,
+        },
+        // **`unavailable` and not `unsupported`.** The machine has everything
+        // it needs and one file on it is the wrong kind of thing, which a
+        // person can change. `NONE` would read as nothing to configure.
+        .linked => |target| .{
+            .name = resolver_files_name,
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "no foreground tool call can start: {s} on this host is a symbolic link, and Chock " ++
+                    "refuses such a target rather than following it",
+                .{target},
+            ),
+            .why = why,
+            .fix = "A bind over a link lands where the link points, which the sandbox does not hold. " ++
+                resolver_files_fix ++ " The other answer is to make that path a regular file on the host.",
+            .blocks = true,
+        },
+        // The same fault pointing the other way. The directory is bound from
+        // the host and it is read only, so a file that is not already there
+        // cannot be made there.
+        .missing => |target| .{
+            .name = resolver_files_name,
+            .state = .unavailable,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "no foreground tool call can start: {s} is not on this host, and the directory it " ++
+                    "belongs in is bound into the sandbox read only, so Chock cannot make it there",
+                .{target},
+            ),
+            .why = why,
+            .fix = resolver_files_fix ++ " The other answer is to make that file on the host, with " ++
+                "whatever content: Chock binds its own over it.",
+            .blocks = true,
+        },
+        // **On, and the sentence says which /etc the answer is about.** What
+        // was measured is that this host's own /etc is not what a routed
+        // sandbox holds here. What the image holds was not read, because
+        // nothing unpacked one. The same shape `vantageNote` gives a cgroup
+        // answer that is true of a view and not of the machine.
+        .from_image => |reference| .{
+            .name = resolver_files_name,
+            .state = .on,
+            .means = try std.fmt.allocPrint(
+                arena,
+                "the /etc a routed sandbox holds comes from the image {s}, so this host's own says " ++
+                    "nothing about it, and nothing here unpacked one to read it",
+                .{reference},
+            ),
+            .why = why,
+        },
+    };
+}
+
+/// The one answer that works for either fault, and the one this project can
+/// really state: both toolchains put a sandbox together out of paths that hold
+/// no `/etc`, so neither reads this host's own at all.
+const resolver_files_fix = "Give this project a flake.nix dev shell or a chock.zon container image, " ++
+    "and the sandbox holds no host /etc at all.";
+
+/// The name of the row `resolverFilesRow` writes. Named once, because a test
+/// reads it and that function writes it.
+pub const resolver_files_name = "resolver files";
 
 /// The name of the row that says whether a whole tool call can run on a
 /// Seatbelt build. Named once, because a test reads it and `rowsFor` writes it.
@@ -1568,6 +1805,98 @@ fn measureHost(
     m.required_sinks = measureRequiredSinks(arena, io, env);
 
     m.write_execute = measureHardening(arena, io, env, project_root, defaultModel(arena, io, env));
+
+    // **After the toolchain, because the answer depends on it**, and only for
+    // a driver that routes: a driver that gives a tool call no network of its
+    // own writes no resolver files and gets no row. See `ResolverFiles`.
+    if (m.driver.contains(.network_isolated)) {
+        m.resolver_files = measureResolverFiles(io, m.toolchain, "");
+    }
+}
+
+/// Whether this host lets a routed sandbox write the three files it needs.
+///
+/// **Two questions, and both are needed.** The first is which `/etc` a routed
+/// sandbox would hold, which the toolchain decides: a Nix closure and a dev
+/// shell hold none, so the files are made inside and nothing on the host is
+/// touched. The second is whether a target this host really does bind in is a
+/// symbolic link, which `namespace.substitute` refuses rather than follows.
+///
+/// **The `hide` entries are left out on purpose.** `namespace.hidePath` binds
+/// over whatever it finds and follows a link to do it, so only a `text` target
+/// can be refused for being one.
+///
+/// `host_root` is empty for the real host. A test states a tree of its own
+/// there, so the one answer that stops a machine can be measured on a machine
+/// that does not have it. Every path below is read under that prefix, the Nix
+/// store included, so a stated tree is a whole host and never half of one.
+fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []const u8) ResolverFiles {
+    switch (toolchain) {
+        .image => |reference| return .{ .from_image = reference },
+        // A dev shell is a Nix closure and holds no `/etc`. The other two name
+        // a session that does not start at all, and the toolchain row already
+        // says so: there is no mount set to read.
+        .dev_shell, .image_unusable, .none => return .made_inside,
+        .host => {},
+    }
+
+    // The one rule `run.hostToolchainPaths` states in full: a machine with a
+    // Nix store mounts that and nothing else, so its sandbox holds no host
+    // `/etc`. Read from that list, so a report and a session cannot disagree.
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (under(&buffer, host_root, run.host_toolchain_candidates[0])) |store| {
+        if (pathIsDirectory(io, store)) return .made_inside;
+    }
+
+    var covered: usize = 0;
+    for (sandbox.Sandbox.resolver_substitutions) |one| {
+        const target = switch (one) {
+            .text => |text| text.target,
+            .hide => continue,
+        };
+
+        // **The directory decides which of the two ways this file is placed.**
+        // A directory the host has is one `hostToolchainPaths` binds, read
+        // only, so the file has to be there already and gets a bind mount over
+        // it. A directory the host has not is one the sandbox makes in its own
+        // writable root, and the file is written there. See `placeText`, which
+        // has exactly these two paths.
+        const parent = std.fs.path.dirname(target) orelse continue;
+        const parent_path = under(&buffer, host_root, parent) orelse continue;
+        if (!pathIsDirectory(io, parent_path)) continue;
+
+        const path = under(&buffer, host_root, target) orelse continue;
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .{ .missing = target },
+            // A path this process cannot read says nothing about what a
+            // sandbox finds there, and a report that called that a fault would
+            // refuse to start on a machine that works.
+            else => continue,
+        };
+        if (stat.kind == .sym_link) return .{ .linked = target };
+        covered += 1;
+    }
+
+    // Not one of the three sits in a directory this host binds, so a routed
+    // sandbox makes all of them itself.
+    if (covered == 0) return .made_inside;
+    return .covered;
+}
+
+/// True when `path` is a directory, or a link that leads to one. The same
+/// question `src/run.zig`'s own `pathIsDirectory` asks, and the same answer for
+/// a path this process may not read: a source it cannot stat is a source the
+/// sandbox cannot bind either.
+fn pathIsDirectory(io: std.Io, path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .directory;
+}
+
+/// `root ++ path` in `buffer`, or null when it does not fit. Null for a path
+/// too long to name is the same answer as a path that is not there: neither
+/// can be read, and neither refuses a routed sandbox.
+fn under(buffer: []u8, root: []const u8, path: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ root, path }) catch null;
 }
 
 /// Whether a session of this project would run with the write and execute rule
@@ -2041,6 +2370,12 @@ const Step = enum(u8) {
     tmpfs = 2,
     overlayfs = 3,
     seccomp = 4,
+    /// `netns.Session.configure`, for real. The detail byte is the `netns.Step`
+    /// the kernel refused.
+    router_network = 5,
+    /// `nftables.Session.install`, for real, on the network the step above
+    /// built. The detail byte is the `nftables.Step` the kernel refused.
+    router_filter = 6,
 };
 
 /// What one step answered.
@@ -2056,8 +2391,16 @@ const Answer = enum(u8) {
     refused_id_map = 3,
 };
 
-/// One record on the pipe: which step, and what it answered.
-const record_bytes = 2;
+/// One record on the pipe: which step, what it answered, and one byte of
+/// detail.
+///
+/// **The third byte carries which call inside a step the kernel refused**, as
+/// that step's own `Step` ordinal. Both router steps need it: `netns` and
+/// `nftables` each answer `KernelModuleMissing` for several calls, and which
+/// call it was is the difference between a `modprobe` line a person can run
+/// and a row that only says it did not work. Every other step writes a zero
+/// there and nothing reads it.
+const record_bytes = 3;
 
 /// What a probe child is asked to do. **Every field narrows**, so a plan that
 /// asks for less can never measure more than the machine gave.
@@ -2070,6 +2413,11 @@ const Plan = struct {
     filesystems: bool,
     /// Install the seccomp filter. Last, because it cannot be removed.
     seccomp: bool,
+    /// Build the sandbox's own network and put the ruleset on it. **Only ever
+    /// true for a plan whose `network` takes a namespace**, because the calls
+    /// below make a device and a ruleset, and made outside a network namespace
+    /// they are a device and a ruleset on the machine a person is using.
+    router: bool,
 };
 
 /// What one child reported, one slot per step, null for a step it never
@@ -2079,6 +2427,24 @@ const ChildReport = struct {
     tmpfs: ?Answer = null,
     overlayfs: ?Answer = null,
     seccomp: ?Answer = null,
+    router_network: ?Answer = null,
+    /// Which `netns.Step` the kernel refused, as its own ordinal. Meaningless
+    /// for an answer of `ok` and for a step that was never reached.
+    router_network_step: u8 = 0,
+    router_filter: ?Answer = null,
+    /// Which `nftables.Step` the kernel refused, as its own ordinal.
+    router_filter_step: u8 = 0,
+    /// True when the child left by anything but `exit(0)`.
+    ///
+    /// **A crash is not a measurement, and the tests below are where that has
+    /// to be loud.** Every path the child takes ends in `std.process.exit(0)`,
+    /// so any other status is a signal, a panic or an abort, and a slot left
+    /// null by one of those reads exactly like a machine that answered no. A
+    /// test that took the second for the first would turn a broken probe into
+    /// a green suite: measured while building `linux/netns.zig`, where an
+    /// assertion inside the child turned four failures into four skips. Both
+    /// that file and `linux/nftables.zig` carry the same fix.
+    crashed: bool = false,
 };
 
 /// The size the tmpfs probe asks for. Small: this asks whether a capped area
@@ -2205,10 +2571,15 @@ fn measureLayers(
         .mount = true,
         .filesystems = probe_root != null,
         .seccomp = filter != null,
+        // `Network.none` takes a network namespace, the same one `.filtered`
+        // takes: see `namespace.Network`. So this child holds one of its own
+        // and nothing it builds reaches the machine.
+        .router = true,
     }, probe_root, filter);
 
     applySeccomp(m, whole, filter);
     applyFilesystems(m, whole, probe_root);
+    applyRouter(arena, m, whole);
 
     if (whole.namespaces == .ok) {
         m.user_namespace = .ok;
@@ -2435,6 +2806,10 @@ fn narrowNamespaces(
         .filesystems = false,
         // Already measured by the whole plan when it got that far.
         .seccomp = whole.seccomp == null and filter != null,
+        // **Never here.** This plan keeps the host's own network namespace, so
+        // a device and a ruleset made in it would be made on the machine a
+        // person is using. See `Plan.router`.
+        .router = false,
     }, null, filter);
     applySeccomp(m, bare, filter);
 
@@ -2460,6 +2835,7 @@ fn narrowNamespaces(
         .mount = true,
         .filesystems = false,
         .seccomp = false,
+        .router = false,
     }, null, null);
     if (with_mount.namespaces == Answer.ok) {
         m.mount_namespace = .ok;
@@ -2496,6 +2872,82 @@ fn applyFilesystems(m: *Measured, report: ChildReport, probe_root: ?[]const u8) 
     } else {
         m.overlayfs = .{ .refused = "the mount namespace it needs was refused" };
     }
+}
+
+/// What the child said about the sandbox's own network and the filter on it.
+///
+/// **A step the child never reached is said as one it never reached, and never
+/// as a kernel that answered no.** The same rule `applyFilesystems` keeps: a
+/// null slot is silence, and nothing here turns silence into a measurement.
+fn applyRouter(arena: std.mem.Allocator, m: *Measured, report: ChildReport) void {
+    const network = report.router_network orelse {
+        m.router_network = .{ .refused = router_not_reached };
+        m.router_filter = .{ .refused = router_not_reached };
+        return;
+    };
+    m.router_network = routerProbe(
+        arena,
+        network,
+        routerStepName(sandbox.netns.Step, report.router_network_step),
+    );
+
+    const filter = report.router_filter orelse {
+        m.router_filter = .{ .refused = "the network it filters did not come up, so this was never reached" };
+        return;
+    };
+    m.router_filter = routerProbe(
+        arena,
+        filter,
+        routerStepName(sandbox.nftables.Step, report.router_filter_step),
+    );
+}
+
+/// The reason both router rows carry when the namespaces they are built inside
+/// never came up. **Not a measurement of the network**, and the rows above it
+/// already say what really failed.
+const router_not_reached = "the sandbox's own namespaces did not come up, so nothing asked the kernel for a network";
+
+/// What a router step answered, with the call the kernel refused named where
+/// the child could name it.
+///
+/// **Naming the call is the whole worth of the row.** `nf_tables`, `nf_nat`,
+/// `nft_chain_nat`, `nft_redir`, `nft_reject` and `nf_conntrack` are six
+/// modules and one refusal, and a row that only said "it did not work" would
+/// leave a person reading kernel configuration. See `nftables.Step`, whose own
+/// comment says the same thing.
+fn routerProbe(arena: std.mem.Allocator, answer: Answer, step: ?[]const u8) Probe {
+    return switch (answer) {
+        .ok => .ok,
+        .absent => .{ .absent = if (step) |named| std.fmt.allocPrint(
+            arena,
+            "the {s} step needs a kernel module that is not loaded, and a sandbox cannot make " ++
+                "the kernel load one",
+            .{named},
+        ) catch router_absent_text else router_absent_text },
+        // `refused_id_map` names the user namespace and no router step can
+        // carry it, so it reads as the plain refusal it would be.
+        .refused, .refused_id_map => .{ .refused = if (step) |named| std.fmt.allocPrint(
+            arena,
+            "the kernel refused the {s} step",
+            .{named},
+        ) catch router_refused_text else router_refused_text },
+    };
+}
+
+/// What a router row says when the child could not name the call. Both are the
+/// same sentence with the step left out.
+const router_absent_text = "a kernel module it needs is not loaded, and a sandbox cannot make the kernel load one";
+const router_refused_text = "the kernel refused it";
+
+/// The name of the call a router step reported, or null when it named none.
+///
+/// **Read with `fromInt` and never with `@enumFromInt`.** The byte came over a
+/// pipe from another process, and a byte that names no step is dropped rather
+/// than turned into an invalid tag. See `record_bytes` for the one added.
+fn routerStepName(comptime Named: type, byte: u8) ?[]const u8 {
+    if (byte == 0) return null;
+    const step = std.enums.fromInt(Named, byte - 1) orelse return null;
+    return @tagName(step);
 }
 
 /// One answer, as a probe. `refused_text` is what a refusal says; an absence
@@ -2664,7 +3116,7 @@ fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) Ch
     }
 
     _ = linux.close(fds[1]);
-    const report = readReport(fds[0]);
+    var report = readReport(fds[0]);
     _ = linux.close(fds[0]);
 
     var status: u32 = undefined;
@@ -2673,6 +3125,9 @@ fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) Ch
 
     // A child that died before it wrote anything measured nothing, and a slot
     // left null is exactly that. Nothing here turns silence into an answer.
+    // **How it died is carried, and never folded into the slots**: see
+    // `ChildReport.crashed`.
+    report.crashed = status != 0;
     return report;
 }
 
@@ -2704,6 +3159,14 @@ fn readReport(read_fd: i32) ChildReport {
             .tmpfs => report.tmpfs = answer,
             .overlayfs => report.overlayfs = answer,
             .seccomp => report.seccomp = answer,
+            .router_network => {
+                report.router_network = answer;
+                report.router_network_step = buffer[index + 2];
+            },
+            .router_filter => {
+                report.router_filter = answer;
+                report.router_filter_step = buffer[index + 2];
+            },
         }
     }
     return report;
@@ -2742,6 +3205,11 @@ fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sand
         return;
     }
 
+    // **Before the mounts, so a mount fault cannot hide a network fault.**
+    // Neither touches the other, and the order a routed `spawn` really uses
+    // puts the network first as well.
+    if (plan.router) probeNetwork(write_fd);
+
     if (plan.filesystems and plan.mount) {
         if (probe_root) |root| {
             probeMounts(write_fd, root);
@@ -2749,6 +3217,82 @@ fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sand
     }
 
     if (plan.seccomp) sayFilter(write_fd, filter);
+}
+
+/// Build the sandbox's own network and put the ruleset on it, for real, in the
+/// network namespace this child already holds.
+///
+/// **The real calls and never a version number.** `Session.configure` and
+/// `Session.install` are the two a routed tool call makes, in the order it
+/// makes them, so a kernel that answers yes here is a kernel that answers yes
+/// to a session. See `linux/driver.zig`'s own `buildNetwork`, which is the
+/// same two calls with the same order and the same reasoning.
+///
+/// **Nothing here reaches the host.** The device, the addresses, the routes
+/// and the ruleset all belong to a network namespace this child made and the
+/// kernel frees when it leaves.
+fn probeNetwork(write_fd: i32) void {
+    var route_diag: ?sandbox.netns.Diagnostic = null;
+    var route = sandbox.netns.Session.open(&route_diag) catch |err| {
+        sayDetail(write_fd, .router_network, networkAnswer(err), netnsStepByte(route_diag));
+        return;
+    };
+    defer route.close();
+    _ = route.configure(&route_diag) catch |err| {
+        sayDetail(write_fd, .router_network, networkAnswer(err), netnsStepByte(route_diag));
+        return;
+    };
+    say(write_fd, .router_network, .ok);
+
+    var table_diag: ?sandbox.nftables.Diagnostic = null;
+    const table = sandbox.nftables.Session.open(&table_diag) catch |err| {
+        sayDetail(write_fd, .router_filter, filterAnswer(err), nftablesStepByte(table_diag));
+        return;
+    };
+    defer table.close();
+    table.install(&table_diag) catch |err| {
+        sayDetail(write_fd, .router_filter, filterAnswer(err), nftablesStepByte(table_diag));
+        return;
+    };
+    say(write_fd, .router_filter, .ok);
+}
+
+/// A refusal of the network, as one of the three answers this file has.
+///
+/// **`KernelModuleMissing` is the one that is about the machine.** A process in
+/// a user namespace cannot make the kernel load a module, so a host with no
+/// `dummy` link kind really does not have the mechanism. Every other member is
+/// this process being refused something the kernel does have.
+fn networkAnswer(err: sandbox.netns.Error) Answer {
+    return switch (err) {
+        error.KernelModuleMissing => .absent,
+        error.NotPermitted, error.Refused, error.ExchangeFailed => .refused,
+    };
+}
+
+/// The same reading for the ruleset. See `networkAnswer`.
+fn filterAnswer(err: sandbox.nftables.Error) Answer {
+    return switch (err) {
+        error.KernelModuleMissing => .absent,
+        error.NotPermitted, error.Refused, error.ExchangeFailed => .refused,
+    };
+}
+
+/// Which call the kernel refused, as one byte.
+///
+/// **One more than the ordinal, and zero means no diagnostic.** The first
+/// member of both step enums is `open_socket` and its ordinal is zero, so a
+/// plain ordinal could not be told from a library that filled nothing in, and
+/// the row would name the wrong call on the one host that hits it.
+/// `routerStepName` is the only reader.
+fn netnsStepByte(diag: ?sandbox.netns.Diagnostic) u8 {
+    const one = diag orelse return 0;
+    return @intFromEnum(one.step) + 1;
+}
+
+fn nftablesStepByte(diag: ?sandbox.nftables.Diagnostic) u8 {
+    const one = diag orelse return 0;
+    return @intFromEnum(one.step) + 1;
 }
 
 fn probeMounts(write_fd: i32, root: []const u8) void {
@@ -2843,7 +3387,13 @@ fn sayFilter(write_fd: i32, filter: ?[]sandbox.bpf.Insn) void {
 /// Write one record. A failed write is dropped: the parent reads a slot that
 /// stayed null, which is "this step was never reported" and is the truth.
 fn say(write_fd: i32, step: Step, answer: Answer) void {
-    const record = [record_bytes]u8{ @intFromEnum(step), @intFromEnum(answer) };
+    sayDetail(write_fd, step, answer, 0);
+}
+
+/// Write one record with the third byte filled. **Only the two router steps
+/// use it**, and only they read it back: see `record_bytes`.
+fn sayDetail(write_fd: i32, step: Step, answer: Answer, detail: u8) void {
+    const record = [record_bytes]u8{ @intFromEnum(step), @intFromEnum(answer), detail };
     _ = linux.write(write_fd, &record, record.len);
 }
 
@@ -2937,6 +3487,11 @@ fn healthy() Measured {
         .pid_namespace = .ok,
         .ipc_namespace = .ok,
         .network_namespace = .ok,
+        .router_network = .ok,
+        .router_filter = .ok,
+        // A machine with a Nix store, which is the machine these tests run on
+        // and the one every other field above states.
+        .resolver_files = .made_inside,
         .landlock = .ok,
         .landlock_abi = 6,
         .seccomp = .ok,
@@ -3457,6 +4012,14 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
         "pid namespace",
         "ipc namespace",
         "net namespace",
+        // Every foreground tool call of a session takes `Network.filtered`,
+        // so a kernel that cannot build or filter that network refuses the
+        // first tool call and every one after it. See `routerRow`.
+        "router network",
+        "router filter",
+        // `namespace.substitute` answers `BindTargetIsSymlink` and
+        // `applyLayers` ends the call, so a routed sandbox does not start.
+        resolver_files_name,
         "landlock",
         "seccomp",
         "pidfd",
@@ -3673,6 +4236,9 @@ fn broken() Measured {
     m.pid_namespace = refused;
     m.ipc_namespace = refused;
     m.network_namespace = refused;
+    m.router_network = .{ .absent = "the dummy_create step needs a kernel module that is not loaded" };
+    m.router_filter = .{ .absent = "the batch_begin step needs a kernel module that is not loaded" };
+    m.resolver_files = .{ .linked = "/etc/resolv.conf" };
     m.landlock = .{ .absent = "the kernel answered that it has no Landlock" };
     m.landlock_abi = null;
     m.seccomp = refused;
@@ -3722,6 +4288,19 @@ test "every row that stops a first run is one Sandbox.spawn or chock run really 
         "pid namespace",
         "ipc namespace",
         "net namespace",
+        // **Every foreground tool call of a session takes `Network.filtered`.**
+        // `src/run.zig` gives its tool runner a network seam on every session,
+        // with no flag and no policy question, and `chock_core.tools` moves a
+        // call to `.filtered` wherever that seam is set. So a kernel that
+        // cannot build that network, or cannot filter it, refuses the first
+        // tool call and every one after it, and `Sandbox.spawn` answers
+        // `SpawnError.NetRouterUnavailable`.
+        "router network",
+        "router filter",
+        // `namespace.substitute` answers `BindTargetIsSymlink` for a target
+        // that is a link, and `applyLayers` ends the call on it, so no routed
+        // sandbox starts at all.
+        resolver_files_name,
         "landlock",
         "seccomp",
         "pidfd",
@@ -4133,6 +4712,513 @@ test "the probe answers map to the three states and never invent a fourth" {
     try testing.expectEqual(ui.Layer.State.unavailable, whyFor(.refused, "x").state());
     try testing.expectEqualStrings("x", whyFor(.refused, "x").why());
     try testing.expectEqualStrings("", whyFor(.ok, "x").why());
+}
+
+test "the router rows are built by really building a network and really filtering it" {
+    // **The measurement, and not a version number.** `measureLayers` forks a
+    // child and does the real thing for every other layer, and these two are no
+    // different: the child calls `netns.Session.configure` and then
+    // `nftables.Session.install`, which are the two calls a routed tool call
+    // makes, in the order it makes them. A row built any other way would say
+    // yes on a host that has never loaded nftables.
+    //
+    // Mutation check: write `if (false) probeNetwork(write_fd);` in `runProbes`
+    // and the first expectation below fails, because the child then says
+    // nothing about either step.
+    switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
+        // A build with no namespace driver has no network to build and no row
+        // for one. Nothing here to measure.
+        .none, .seatbelt => return error.SkipZigTest,
+        .namespaces => {},
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const report = runChild(.{
+        .network = .none,
+        .mount = true,
+        .filesystems = false,
+        .seccomp = false,
+        .router = true,
+    }, null, null);
+
+    // **A child that crashed is a failure and never a skip.** A crash writes a
+    // short pipe, which is byte for byte what a machine with no namespace
+    // writes, and the two are told apart by the exit status and nothing else.
+    // See `ChildReport.crashed`.
+    try testing.expect(!report.crashed);
+
+    // A machine that gives no namespace at all measured nothing here, and that
+    // is not a pass. Every other answer below is a real one.
+    if (report.namespaces != Answer.ok) return error.SkipZigTest;
+
+    const network = report.router_network orelse return error.TestUnexpectedResult;
+    if (network != Answer.ok) {
+        // A host with no `dummy` link kind is a real host and this test must
+        // not fail on it. What it must still do is name the call, because that
+        // is the whole worth of the row.
+        try testing.expect(routerStepName(sandbox.netns.Step, report.router_network_step) != null);
+        return;
+    }
+
+    const filter = report.router_filter orelse return error.TestUnexpectedResult;
+    if (filter != Answer.ok) {
+        try testing.expect(routerStepName(sandbox.nftables.Step, report.router_filter_step) != null);
+        return;
+    }
+
+    // This machine built both, so the rows say so.
+    var m = healthy();
+    m.router_network = .{ .absent = "stated, and overwritten by the measurement below" };
+    m.router_filter = .{ .absent = "stated, and overwritten by the measurement below" };
+    applyRouter(arena, &m, report);
+    const rows = try rowsFor(arena, m);
+    try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "router network").?.state);
+    try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "router filter").?.state);
+}
+
+test "a plan that asks for no network builds none, so nothing is ever made on the machine a person is using" {
+    // **The field is load bearing and this is what proves it.** A device and a
+    // ruleset made outside a network namespace are a device and a ruleset on
+    // the host. `narrowNamespaces` runs its children with `Network.host`, which
+    // keeps the host's own namespace, so `Plan.router` has to be off there and
+    // on for the whole plan.
+    //
+    // Mutation check: ignore `plan.router` in `runProbes` and call
+    // `probeNetwork` always. The first expectation below then reads `refused`
+    // rather than null, because a process that is root in a user namespace of
+    // its own is not `ns_capable` over the host's own network namespace and
+    // the kernel answers `EPERM` at the very first message. **That refusal is
+    // what this test rests on and it is not what makes the field necessary**:
+    // a caller who gave such a child `CAP_NET_ADMIN` over the host would make
+    // a `chock0` device on the machine a person is using.
+    switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
+        .none, .seatbelt => return error.SkipZigTest,
+        .namespaces => {},
+    }
+
+    const quiet = runChild(.{
+        .network = .host,
+        .mount = false,
+        .filesystems = false,
+        .seccomp = false,
+        .router = false,
+    }, null, null);
+    try testing.expect(!quiet.crashed);
+    try testing.expectEqual(@as(?Answer, null), quiet.router_network);
+    try testing.expectEqual(@as(?Answer, null), quiet.router_filter);
+
+    const asked = runChild(.{
+        .network = .none,
+        .mount = true,
+        .filesystems = false,
+        .seccomp = false,
+        .router = true,
+    }, null, null);
+    try testing.expect(!asked.crashed);
+    if (asked.namespaces != Answer.ok) return error.SkipZigTest;
+    try testing.expect(asked.router_network != null);
+}
+
+test "a kernel that has no module names the call and the modprobe line, and one that refused does not" {
+    // The two are different facts and need different words. A missing module
+    // is the host's, and a person fixes it with one command. A refusal inside
+    // a namespace this process is root in is a fault in Chock, and telling a
+    // person to load a module for that is an hour wasted.
+    //
+    // Mutation check: answer `.refused` for `error.KernelModuleMissing` in
+    // `networkAnswer` or in `filterAnswer` and the first pair of expectations
+    // below fails, which is the row telling a person to report a bug when what
+    // they have to do is load a module.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // **The one error name that is about the machine.** A process in a user
+    // namespace cannot make the kernel load a module, so a host with none
+    // really does not have the mechanism. Every other member of both error
+    // sets is this process being refused something the kernel does have.
+    try testing.expectEqual(Answer.absent, networkAnswer(error.KernelModuleMissing));
+    try testing.expectEqual(Answer.absent, filterAnswer(error.KernelModuleMissing));
+    for ([_]sandbox.netns.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
+        try testing.expectEqual(Answer.refused, networkAnswer(err));
+    }
+    for ([_]sandbox.nftables.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
+        try testing.expectEqual(Answer.refused, filterAnswer(err));
+    }
+
+    var m = healthy();
+    applyRouter(arena, &m, .{
+        .namespaces = .ok,
+        .router_network = .ok,
+        .router_filter = .absent,
+        .router_filter_step = @intFromEnum(sandbox.nftables.Step.relay_rule) + 1,
+    });
+    const rows = try rowsFor(arena, m);
+
+    const filter = rowNamed(rows, "router filter").?;
+    try testing.expectEqual(ui.Layer.State.unsupported, filter.state);
+    // A row that stops a first run says `BLOCKED`, whatever its state is.
+    try testing.expectEqualStrings("BLOCKED", wordFor(filter));
+    try testing.expect(filter.blocks);
+    // The call the kernel refused, by name.
+    try testing.expect(std.mem.indexOf(u8, filter.means, "relay_rule") != null);
+    // And the command a person runs, with every module in it.
+    try testing.expect(std.mem.indexOf(u8, filter.fix, "modprobe") != null);
+    try testing.expect(std.mem.indexOf(u8, filter.fix, sandbox.Sandbox.filter_modules) != null);
+    for ([_][]const u8{
+        "nf_tables",
+        "nf_nat",
+        "nft_chain_nat",
+        "nft_redir",
+        "nft_reject",
+        "nf_conntrack",
+    }) |module| {
+        try testing.expect(std.mem.indexOf(u8, filter.fix, module) != null);
+    }
+    // The network above it came up, so its row is still on and says nothing.
+    try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "router network").?.state);
+
+    // The `dummy` module is the one the network row names, and it is the only
+    // one on that line: a person told to load six modules for a missing link
+    // kind learns nothing about which of them mattered.
+    var no_dummy = healthy();
+    applyRouter(arena, &no_dummy, .{
+        .namespaces = .ok,
+        .router_network = .absent,
+        .router_network_step = @intFromEnum(sandbox.netns.Step.dummy_create) + 1,
+    });
+    const dummy_rows = try rowsFor(arena, no_dummy);
+    const network = rowNamed(dummy_rows, "router network").?;
+    try testing.expect(std.mem.indexOf(u8, network.means, "dummy_create") != null);
+    try testing.expect(std.mem.indexOf(u8, network.fix, "modprobe dummy") != null);
+    try testing.expect(std.mem.indexOf(u8, network.fix, "nft_redir") == null);
+    // And the ruleset was never reached, so it is not reported as a kernel
+    // that answered no to anything.
+    const never = rowNamed(dummy_rows, "router filter").?;
+    try testing.expect(std.mem.indexOf(u8, never.means, "did not come up") != null);
+    try testing.expect(std.mem.indexOf(u8, never.fix, "modprobe") == null);
+
+    // A refusal names the call and tells nobody to load anything.
+    var refused = healthy();
+    applyRouter(arena, &refused, .{
+        .namespaces = .ok,
+        .router_network = .refused,
+        .router_network_step = @intFromEnum(sandbox.netns.Step.route4_add) + 1,
+    });
+    const refused_rows = try rowsFor(arena, refused);
+    const row = rowNamed(refused_rows, "router network").?;
+    try testing.expectEqual(ui.Layer.State.unavailable, row.state);
+    try testing.expect(std.mem.indexOf(u8, row.means, "route4_add") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "modprobe") == null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "worth reporting") != null);
+}
+
+test "a child that never reached the network says so, and is never read as a kernel that answered no" {
+    // Silence is not an answer. A child whose namespaces did not come up never
+    // asked the kernel anything about a network, and a row that called that a
+    // refused network would send a person after a fault that is not there.
+    //
+    // Mutation check: read a null `router_network` as `Answer.refused` and the
+    // sentence below stops naming the namespaces.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = healthy();
+    applyRouter(arena, &m, .{});
+    try testing.expectEqualStrings(router_not_reached, m.router_network.why());
+    try testing.expectEqualStrings(router_not_reached, m.router_filter.why());
+    try testing.expect(std.mem.indexOf(u8, router_not_reached, "namespaces") != null);
+
+    // A step byte the child never filled in names no call, and the row then
+    // says the same sentence without one rather than naming the first member
+    // of the enum. `open_socket` is that member and its ordinal is zero.
+    try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 0));
+    try testing.expectEqualStrings(
+        "open_socket",
+        routerStepName(sandbox.netns.Step, @intFromEnum(sandbox.netns.Step.open_socket) + 1).?,
+    );
+    try testing.expectEqualStrings(
+        "open_socket",
+        routerStepName(sandbox.nftables.Step, @intFromEnum(sandbox.nftables.Step.open_socket) + 1).?,
+    );
+    // A byte that names no step is dropped, the same as every other byte that
+    // came over the pipe.
+    try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 250));
+
+    var unnamed = healthy();
+    applyRouter(arena, &unnamed, .{ .namespaces = .ok, .router_network = .absent });
+    try testing.expectEqualStrings(router_absent_text, unnamed.router_network.why());
+}
+
+test "a host whose resolv.conf is a link cannot start a routed sandbox, and the row says which file" {
+    // **The blocker most Linux machines outside NixOS have.** `/etc` is bound
+    // from the host, `/etc/resolv.conf` there is a link into
+    // `/run/systemd/resolve`, and `namespace.substitute` refuses a link rather
+    // than following it. Today the only way to learn that is to start a session
+    // and watch the first tool call die.
+    //
+    // Mutation check: follow the link in `measureResolverFiles` by dropping
+    // `.follow_symlinks = false`, and this machine answers `covered`, which is
+    // the report saying yes to a host that cannot run a tool call.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+
+    // **A host with no `/etc` of its own is not a blocked host**, and this is
+    // the half that is easy to lose. The sandbox binds no such directory, so
+    // it makes one in its own writable root and writes the three files there.
+    //
+    // Mutation check: drop the parent directory test in `measureResolverFiles`
+    // and this reads `missing`, which puts a BLOCKED row on a machine where a
+    // session works.
+    try testing.expectEqual(
+        ResolverFiles.made_inside,
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+
+    // A host with no Nix store, an `/etc` of its own, and a resolver file that
+    // is a link. That is a systemd machine.
+    try tmp.dir.createDir(testing.io, "etc", .default_dir);
+    try tmp.dir.symLink(
+        testing.io,
+        "../run/systemd/resolve/stub-resolv.conf",
+        "etc/resolv.conf",
+        .{},
+    );
+    try testing.expectEqual(
+        ResolverFiles{ .linked = "/etc/resolv.conf" },
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+
+    const rows = try rowsFor(arena, linkedHost());
+    const row = rowNamed(rows, resolver_files_name).?;
+    try testing.expectEqual(ui.Layer.State.unavailable, row.state);
+    try testing.expect(row.blocks);
+    try testing.expectEqualStrings("BLOCKED", wordFor(row));
+    // The file, by name. A row that only said "a substitution target" would
+    // leave a person reading this project's source to find out which one.
+    try testing.expect(std.mem.indexOf(u8, row.means, "/etc/resolv.conf") != null);
+    try testing.expect(std.mem.indexOf(u8, row.means, "symbolic link") != null);
+    // And the two ways out, both of which are true: either of the two
+    // toolchains puts no host `/etc` in the sandbox at all.
+    try testing.expect(std.mem.indexOf(u8, row.fix, "dev shell") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "container image") != null);
+    try testing.expect(std.mem.indexOf(u8, row.fix, "regular file") != null);
+
+    // **The same fault pointing the other way, and it is easy to miss.** The
+    // host's `/etc` is bound read only, so a file that is not already there
+    // cannot be made there either: `writeSubstitute` answers `EROFS`, which it
+    // reads as `NotPermitted`, and the call ends. A report that only looked
+    // for a link would say yes to this machine.
+    //
+    // Mutation check: count a target that is not there as one that is covered,
+    // and this expectation reads `covered`.
+    try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
+    try testing.expectEqual(
+        ResolverFiles{ .missing = "/etc/resolv.conf" },
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+
+    var absent = healthy();
+    absent.resolver_files = .{ .missing = "/etc/resolv.conf" };
+    const absent_row = rowNamed(try rowsFor(arena, absent), resolver_files_name).?;
+    try testing.expect(absent_row.blocks);
+    try testing.expectEqualStrings("BLOCKED", wordFor(absent_row));
+    try testing.expect(std.mem.indexOf(u8, absent_row.means, "/etc/resolv.conf") != null);
+    try testing.expect(std.mem.indexOf(u8, absent_row.means, "read only") != null);
+
+    // All three there as regular files, which is what every ordinary machine
+    // with an `/etc` has. Each one is covered by a bind mount and works.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/resolv.conf", .data = "nameserver 1.1.1.1\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/nsswitch.conf", .data = "hosts: files\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/hosts", .data = "127.0.0.1 localhost\n" });
+    try testing.expectEqual(
+        ResolverFiles.covered,
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+
+    // And the same machine with a Nix store mounts that and nothing else, so
+    // the link is never touched: the sandbox has no `/etc` to put it in. The
+    // link is still there, which is what makes this the interesting half.
+    try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
+    try tmp.dir.symLink(testing.io, "../run/systemd/resolve/stub-resolv.conf", "etc/resolv.conf", .{});
+    try tmp.dir.createDir(testing.io, "nix", .default_dir);
+    try tmp.dir.createDir(testing.io, "nix/store", .default_dir);
+    try testing.expectEqual(
+        ResolverFiles.made_inside,
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+}
+
+test "a toolchain that puts no host /etc in the sandbox is never blocked by the host's own" {
+    // A dev shell is a Nix closure and holds no `/etc`, so the three files are
+    // made inside the sandbox whatever this host has. A report that read the
+    // host anyway would refuse to start on a machine where a session works.
+    //
+    // Mutation check: measure the host for a `dev_shell` toolchain too, and
+    // this fails on the machine every systemd user has.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+    try tmp.dir.createDir(testing.io, "etc", .default_dir);
+    try tmp.dir.symLink(testing.io, "../run/systemd/resolve/stub-resolv.conf", "etc/resolv.conf", .{});
+
+    try testing.expectEqual(
+        ResolverFiles.made_inside,
+        measureResolverFiles(testing.io, .dev_shell, root),
+    );
+    // A session that does not start at all has no mount set to reason about,
+    // and the toolchain row is what says so.
+    try testing.expectEqual(
+        ResolverFiles.made_inside,
+        measureResolverFiles(testing.io, .none, root),
+    );
+
+    // An image brings its own `/etc`, so this host's says nothing about it and
+    // the row says exactly that rather than answering for a tree nobody read.
+    const measured = measureResolverFiles(testing.io, .{ .image = "docker.io/library/alpine:3.20" }, root);
+    try testing.expectEqualStrings("docker.io/library/alpine:3.20", measured.from_image);
+
+    var m = healthy();
+    m.resolver_files = measured;
+    const rows = try rowsFor(arena, m);
+    const row = rowNamed(rows, resolver_files_name).?;
+    // On, because what was measured is that this host does not stop it, and
+    // the sentence names the tree the rest of the answer is about. The same
+    // shape `vantageNote` gives a cgroup answer measured from inside a
+    // namespace.
+    try testing.expectEqual(ui.Layer.State.on, row.state);
+    try testing.expect(!row.blocks);
+    try testing.expect(std.mem.indexOf(u8, row.means, "alpine:3.20") != null);
+    try testing.expect(std.mem.indexOf(u8, row.means, "nothing here unpacked one") != null);
+}
+
+test "a build whose driver isolates no network gets none of the three router rows" {
+    // **Read from the driver and never from the platform**, the rule the whole
+    // file keeps. A driver that gives a tool call no network of its own builds
+    // no router, so three rows about one would name mechanisms that build never
+    // reaches.
+    //
+    // Mutation check: drop the `network_isolated` guard in `rowsFor` and the
+    // three rows come back on a driver that has no router at all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var m = healthy();
+    try testing.expect(rowNamed(try rowsFor(arena, m), "router network") != null);
+
+    m.driver.remove(.network_isolated);
+    const rows = try rowsFor(arena, m);
+    for ([_][]const u8{ "router network", "router filter", resolver_files_name }) |name| {
+        try testing.expectEqual(@as(?Row, null), rowNamed(rows, name));
+    }
+    // And the rest of the column is untouched, so this removed three rows and
+    // not a family.
+    try testing.expect(rowNamed(rows, "landlock") != null);
+    try testing.expect(rowNamed(rows, "net namespace") != null);
+}
+
+/// A machine whose `/etc/resolv.conf` is a link, and healthy in every other
+/// way. The machine most people outside NixOS are on.
+fn linkedHost() Measured {
+    var m = healthy();
+    m.toolchain = .{ .host = 9 };
+    m.resolver_files = .{ .linked = "/etc/resolv.conf" };
+    return m;
+}
+
+test "a machine that cannot route says so in its exit code, because every tool call takes a filtered network" {
+    // **The decision, written where somebody changing it will meet it.**
+    // `Row.blocks` means a first run fails because of this row, and it is what
+    // the exit code is built from. `src/run.zig` gives its tool runner a
+    // network seam on every session, with no flag and no policy question, and
+    // `chock_core.tools` moves every foreground call to `Network.filtered`
+    // wherever that seam is set. So a host that cannot build or filter that
+    // network refuses the first tool call and every one after it, and there is
+    // no lesser mode to fall back to: `.none` and `.host` are for a background
+    // command, a language server and an MCP server nobody let out.
+    //
+    // Mutation check: set `.blocks = false` on either router row and this
+    // machine exits 0, which tells a script a broken box is ready.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var no_modules = healthy();
+    applyRouter(arena, &no_modules, .{
+        .namespaces = .ok,
+        .router_network = .ok,
+        .router_filter = .absent,
+        .router_filter_step = @intFromEnum(sandbox.nftables.Step.batch_begin) + 1,
+    });
+    const rows = try rowsFor(arena, no_modules);
+    try testing.expectEqual(Verdict.blocked, verdictFor(rows));
+    try testing.expectEqual(@as(u8, 2), exitFor(verdictFor(rows)).code());
+    try testing.expectEqual(@as(usize, 1), countBlocking(rows));
+
+    // The same for a host whose resolver file is a link, which is a different
+    // fault with the same consequence.
+    const linked_rows = try rowsFor(arena, linkedHost());
+    try testing.expectEqual(Verdict.blocked, verdictFor(linked_rows));
+    try testing.expectEqual(@as(u8, 2), exitFor(verdictFor(linked_rows)).code());
+
+    // And a machine that really can route exits 0, so this is a gate and not a
+    // refusal to start anywhere.
+    try testing.expectEqual(Verdict.ready, verdictFor(try rowsFor(arena, healthy())));
+    try testing.expectEqual(@as(u8, 0), exitFor(.ready).code());
+}
+
+test "the three router rows are sandbox layers and are printed under that heading" {
+    // They are layers of the same sandbox every row above them is about, and a
+    // person reading the column reads the whole network answer in one place:
+    // the namespace, the network in it, the filter on that network, and the
+    // files that make a program use it.
+    //
+    // Mutation check: add either name to `isFirstRunRow` and the rows move
+    // under the wrong heading, which this fails on.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const rows = try rowsFor(arena, healthy());
+    for ([_][]const u8{ "router network", "router filter", resolver_files_name }) |name| {
+        try testing.expect(!isFirstRunRow(rowNamed(rows, name).?));
+    }
+
+    // And they sit with the namespace they are built inside, between it and
+    // the paths layer, rather than at the end of the column.
+    var seen: usize = 0;
+    var net_namespace: usize = 0;
+    var landlock: usize = 0;
+    var first_router: usize = 0;
+    for (rows, 0..) |row, index| {
+        if (std.mem.eql(u8, row.name, "net namespace")) net_namespace = index;
+        if (std.mem.eql(u8, row.name, "landlock")) landlock = index;
+        if (std.mem.eql(u8, row.name, "router network")) {
+            first_router = index;
+            seen += 1;
+        }
+        if (std.mem.eql(u8, row.name, "router filter")) seen += 1;
+        if (std.mem.eql(u8, row.name, resolver_files_name)) seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqual(net_namespace + 1, first_router);
+    try testing.expectEqual(first_router + 3, landlock);
 }
 
 test "a record from the probe pipe with a byte that names no step is dropped" {

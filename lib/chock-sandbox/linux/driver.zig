@@ -2772,7 +2772,20 @@ const missing_module_notice =
     "sandbox: this host cannot give a sandbox its own filtered network.\n" ++
     "sandbox: a kernel module it needs is not loaded, and a sandbox cannot load one.\n" ++
     "sandbox: load these on the host and run again:\n" ++
-    "sandbox:   modprobe dummy nf_tables nf_nat nft_chain_nat nft_redir nft_reject nf_conntrack\n";
+    "sandbox:   modprobe " ++ network_modules ++ " " ++ filter_modules ++ "\n";
+
+/// The module `netns.Session.configure` needs, which is the `dummy` link kind
+/// and nothing else. See `netns.link_kind`.
+///
+/// **One list, read by the notice above and by `src/doctor.zig`.** That command
+/// asks this question before a session starts, and a second copy of a
+/// `modprobe` line is a second thing to keep true.
+pub const network_modules = "dummy";
+
+/// The modules `nftables.Session.install` needs. See that file's own top
+/// comment for why each one is a module on most kernels, and `network_modules`
+/// above for why the list is stated once.
+pub const filter_modules = "nf_tables nf_nat nft_chain_nat nft_redir nft_reject nf_conntrack";
 
 /// N, the network router. Never returns.
 ///
@@ -3103,7 +3116,12 @@ const hosts_file =
 /// Both spellings of the path are named, because `/var/run` is a symbolic link
 /// to `/run` on most machines and a real directory on some, and glibc has used
 /// each of the two over time.
-const resolver_substitutions = [_]namespace.Substitution{
+///
+/// **Public because `src/doctor.zig` reads the same list**, and asks this host
+/// whether a `text` target there is a symbolic link before a session starts.
+/// `substitute` refuses such a target rather than following it, so a machine
+/// that has one can start no routed sandbox at all.
+pub const resolver_substitutions = [_]namespace.Substitution{
     .{ .text = .{ .target = "/etc/resolv.conf", .contents = resolv_conf } },
     .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = nsswitch_conf } },
     .{ .text = .{ .target = "/etc/hosts", .contents = hosts_file } },

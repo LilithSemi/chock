@@ -1739,6 +1739,35 @@ const driver = switch (builtin.os.tag) {
 /// Which guarantees this build's driver actually gives. See `Guarantee`.
 pub const guarantees: Guarantees = driver.guarantees;
 
+/// The kernel modules this build's driver needs on the host to give a sandbox
+/// a network of its own, and the ones it needs to filter that network. Named
+/// apart, because the two are two rows of `chock doctor` and two `modprobe`
+/// lines.
+///
+/// **Empty on a driver with no router**, which is every driver but the Linux
+/// one. A row built from these is a row that build never has.
+///
+/// The switch is on a comptime known value, so only the arm this build takes
+/// is analysed. The same rule `driver` above is selected by.
+pub const network_modules: []const u8 = switch (builtin.os.tag) {
+    .linux => driver.network_modules,
+    else => "",
+};
+pub const filter_modules: []const u8 = switch (builtin.os.tag) {
+    .linux => driver.filter_modules,
+    else => "",
+};
+
+/// The files a routed call writes inside the sandbox for itself, and the paths
+/// it hides. **One list, and `chock doctor` reads it** to ask whether this host
+/// would let them be written at all: `namespace.substitute` refuses a `text`
+/// target that is a symbolic link rather than following it. Empty on a driver
+/// with no router.
+pub const resolver_substitutions: []const namespace.Substitution = switch (builtin.os.tag) {
+    .linux => &driver.resolver_substitutions,
+    else => &.{},
+};
+
 /// Start a program in the sandbox and wait for it. See whichever driver
 /// `builtin.os.tag` selects, `linux/driver.zig` or `darwin/driver.zig`, for
 /// the real contract: this function only ever forwards to it and carries no
