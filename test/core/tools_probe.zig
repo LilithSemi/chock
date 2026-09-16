@@ -96,12 +96,19 @@
 //!
 //! Standard output, on success (exit 0), is one header line:
 //!
-//!   is_error=<0 or 1> truncated=<0 or 1> len=<decimal>
+//!   is_error=<0 or 1> truncated=<0 or 1> len=<decimal> note_len=<decimal>
+//!     media_len=<decimal> image_bytes=<decimal> hash_len=<decimal>
+//!     data_len=<decimal>
 //!
-//! followed by exactly `len` raw bytes: `ToolResult.output`, unmodified,
-//! which may itself hold newlines. `test/core/tools.zig` reads the header
-//! line first and then exactly `len` bytes, never splits on a newline
-//! inside the body.
+//! followed by exactly that many raw bytes, in that order: `ToolResult.output`,
+//! then `ToolResult.note`, then the three strings of `ToolResult.image`, which
+//! are all empty for every call that read no picture. Every one of them may
+//! itself hold newlines, so `test/core/tools.zig` reads the header line first
+//! and then exactly the counted bytes, and never splits on a newline inside
+//! the body.
+//!
+//! `image_bytes` is the size of the picture before base64, which is the one
+//! number of `ImageRef` that is not a length of what follows.
 //!
 //! Exit codes:
 //!   0 - dispatch returned a result, printed above. is_error in the header
@@ -365,15 +372,34 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 /// `Loop.runTool` keeps out of what the model ever reads, so it is the one
 /// field this wire format did not have to carry before now.
 fn printResult(result: chock_core.tools.ToolResult) void {
-    var header_buffer: [160]u8 = undefined;
+    const image = result.image orelse chock_core.tools.ImageRef{
+        .media_type = "",
+        .byte_count = 0,
+        .content_hash = "",
+        .data = "",
+    };
+    var header_buffer: [256]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buffer,
-        "is_error={d} truncated={d} len={d} note_len={d}\n",
-        .{ @intFromBool(result.is_error), @intFromBool(result.truncated), result.output.len, result.note.len },
+        "is_error={d} truncated={d} len={d} note_len={d} " ++
+            "media_len={d} image_bytes={d} hash_len={d} data_len={d}\n",
+        .{
+            @intFromBool(result.is_error),
+            @intFromBool(result.truncated),
+            result.output.len,
+            result.note.len,
+            image.media_type.len,
+            image.byte_count,
+            image.content_hash.len,
+            image.data.len,
+        },
     ) catch unreachable;
     writeAll(header);
     writeAll(result.output);
     writeAll(result.note);
+    writeAll(image.media_type);
+    writeAll(image.content_hash);
+    writeAll(image.data);
 }
 
 fn writeAll(bytes: []const u8) void {

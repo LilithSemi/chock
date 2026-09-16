@@ -997,6 +997,11 @@ fn dupeContentParts(
                 .output = try allocator.dupe(u8, tool_result.output),
                 .is_error = tool_result.is_error,
             } },
+            .image => |image| .{ .image = .{
+                .call_id = try allocator.dupe(u8, image.call_id),
+                .media_type = try allocator.dupe(u8, image.media_type),
+                .data = try allocator.dupe(u8, image.data),
+            } },
             .unknown => |unknown| .{ .unknown = .{
                 .name = try allocator.dupe(u8, unknown.name),
                 .raw = .null,

@@ -12,6 +12,17 @@ Every command works.
 brings up a full screen interface, and it prints the usage page when nothing
 can be drawn.
 
+`read_image` reads a picture out of the workspace and gives it to the model as
+an image. It is offered only where both halves of the gate say yes: every
+adapter can encode an image, so the answer turns on the provider instance's
+own `.capabilities = .{ .images = true }`, and a session without it never
+hears the name. The kind is read from the content and never from the name of
+the file, four kinds are carried and every other kind is refused by name, and
+a picture over 3 MiB is refused with nothing sent. **The session log holds the
+description of an image and never a second copy of the bytes**: the `message`
+event carries them, because the context is folded from `message` events, and
+the `tool.result` event carries the media type, the size and a hash.
+
 ## The red team harness
 
 **The red team harness is built, and two models have been thrown at it.**
@@ -177,11 +188,6 @@ tenth.
   actually showed the model. That needs a record of what each read returned,
   and the tool runner is a fresh process per call, so the record belongs at the
   loop's tool seam.
-- **No tool reads an image.** `read_image` needs an image content part in the
-  neutral message type and a different encoding per adapter, so it waits for
-  a pass of its own. The gate that will hold it back until then is built:
-  a tool is offered only when the adapter can express it and the provider
-  instance does it.
 - **macOS runs a real session, and two limits there are permanent.** Seatbelt
   holds the paths, the network including unix sockets, the signals and shared
   memory. A whole session has run on the Darwin box on 2026-08-25: `read_file`,

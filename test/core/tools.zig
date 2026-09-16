@@ -268,10 +268,20 @@ const ProbeOutcome = struct {
     /// afterward gets and the model never does. Empty for every test that
     /// never touches a path that sets one.
     note: []u8,
+    /// `chock_core.tools.ToolResult.image`, flattened: three empty strings
+    /// and a zero for every call that read no picture, which is every call
+    /// but a `read_image` that succeeded.
+    media_type: []u8,
+    image_bytes: u64,
+    content_hash: []u8,
+    image_data: []u8,
 
     fn deinit(self: *ProbeOutcome, allocator: std.mem.Allocator) void {
         allocator.free(self.output);
         allocator.free(self.note);
+        allocator.free(self.media_type);
+        allocator.free(self.content_hash);
+        allocator.free(self.image_data);
         self.* = undefined;
     }
 };
@@ -495,6 +505,10 @@ fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term,
             .truncated = false,
             .output = try allocator.dupe(u8, &.{}),
             .note = try allocator.dupe(u8, &.{}),
+            .media_type = try allocator.dupe(u8, &.{}),
+            .image_bytes = 0,
+            .content_hash = try allocator.dupe(u8, &.{}),
+            .image_data = try allocator.dupe(u8, &.{}),
         };
     }
 
@@ -514,16 +528,259 @@ fn parseProbeOutcome(allocator: std.mem.Allocator, term: std.process.Child.Term,
     if (!std.mem.startsWith(u8, note_len_field, "note_len=")) return error.BadProbeOutput;
     const note_len = try std.fmt.parseInt(usize, note_len_field["note_len=".len..], 10);
 
+    const media_len = try countField(&fields, "media_len=");
+    const image_bytes = try countField(&fields, "image_bytes=");
+    const hash_len = try countField(&fields, "hash_len=");
+    const data_len = try countField(&fields, "data_len=");
+
     const body = stdout[newline_idx + 1 ..];
-    if (body.len != len + note_len) return error.BadProbeOutput;
+    if (body.len != len + note_len + media_len + hash_len + data_len) return error.BadProbeOutput;
+
+    var at: usize = 0;
+    const output = body[at..][0..len];
+    at += len;
+    const note = body[at..][0..note_len];
+    at += note_len;
+    const media_type = body[at..][0..media_len];
+    at += media_len;
+    const content_hash = body[at..][0..hash_len];
+    at += hash_len;
+    const image_data = body[at..][0..data_len];
 
     return .{
         .fault = null,
         .is_error = is_error,
         .truncated = truncated,
-        .output = try allocator.dupe(u8, body[0..len]),
-        .note = try allocator.dupe(u8, body[len..]),
+        .output = try allocator.dupe(u8, output),
+        .note = try allocator.dupe(u8, note),
+        .media_type = try allocator.dupe(u8, media_type),
+        .image_bytes = image_bytes,
+        .content_hash = try allocator.dupe(u8, content_hash),
+        .image_data = try allocator.dupe(u8, image_data),
     };
+}
+
+/// The next header field, which must be `name` followed by a decimal. See
+/// `test/core/tools_probe.zig`'s own top comment for the header shape.
+fn countField(fields: *std.mem.TokenIterator(u8, .scalar), name: []const u8) !u64 {
+    const field = fields.next() orelse return error.BadProbeOutput;
+    if (!std.mem.startsWith(u8, field, name)) return error.BadProbeOutput;
+    return std.fmt.parseInt(u64, field[name.len..], 10);
+}
+
+/// A real 1x1 PNG: the signature, an IHDR, an IDAT holding one red pixel and
+/// an IEND, each with its own CRC. **A real file, not a signature with
+/// rubbish after it**, so what these tests measure is what a screenshot would
+/// do. The same bytes `lib/chock-core/tools.zig`'s own unit tests use.
+const png_1x1 = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+    0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
+test "read_image carries a real image out of the workspace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const ov = workspace.kind.overlay;
+    const shot_path = try std.fs.path.join(allocator, &.{ ov.project, "shot.png" });
+    defer allocator.free(shot_path);
+    try writeFile(std.testing.io, shot_path, &png_1x1);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    var outcome = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"shot.png\"}");
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(!outcome.is_error);
+
+    // The media type came from the bytes, and the size is the real one.
+    try std.testing.expectEqualStrings("image/png", outcome.media_type);
+    try std.testing.expectEqual(@as(u64, png_1x1.len), outcome.image_bytes);
+
+    // **The picture itself, decoded back, byte for byte.** Checking only that
+    // the field is non-empty would pass for a base64 of the wrong file.
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(outcome.image_data);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try decoder.decode(decoded, outcome.image_data);
+    try std.testing.expectEqualSlices(u8, &png_1x1, decoded);
+
+    // The text the model reads names the file and the kind, and holds none of
+    // the bytes: see `chock_proto.event.ImageRef`.
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "shot.png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "image/png") != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, outcome.image_data) == null);
+    try std.testing.expectEqualStrings(outcome.content_hash, outcome.content_hash);
+}
+
+test "read_image cannot read a path outside the workspace" {
+    // The boundary question, asked of the tool that carries the most out of a
+    // call. A real path on the host, so a refusal means the boundary held and
+    // not that the file was missing: see "read_file cannot read a path
+    // outside the workspace" above for the whole argument.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    // A real image, outside the project, in a directory the host can reach.
+    const outside_path = try std.fs.path.join(allocator, &.{ project.scratch_path, "secret.png" });
+    defer allocator.free(outside_path);
+    try writeFile(std.testing.io, outside_path, &png_1x1);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    const arguments = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\"}}", .{outside_path});
+    defer allocator.free(arguments);
+
+    var outcome = try runToolCall(allocator, &workspace, root_tmp, "read_image", arguments);
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "outside it") != null);
+    // Nothing was carried: not the bytes, and not the media type either.
+    try std.testing.expectEqualStrings("", outcome.image_data);
+    try std.testing.expectEqualStrings("", outcome.media_type);
+
+    // And a relative path that climbs out is the same refusal, so the check
+    // is on where the path lands and not on how it is spelled.
+    var climbed = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"../secret.png\"}");
+    defer climbed.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), climbed.fault);
+    try std.testing.expect(climbed.is_error);
+    try std.testing.expectEqualStrings("", climbed.image_data);
+}
+
+test "read_image refuses a file that is not an image, whatever the file is called" {
+    // **The name is not evidence.** Both files below are called like pictures
+    // and neither one is, and the refusal has to say so rather than sending
+    // the provider bytes it will answer 400 to.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const ov = workspace.kind.overlay;
+    const fake_path = try std.fs.path.join(allocator, &.{ ov.project, "screenshot.png" });
+    defer allocator.free(fake_path);
+    try writeFile(std.testing.io, fake_path, "#!/bin/sh\necho not a picture\n");
+
+    // A real image of a kind neither wire carries, also misnamed, so the two
+    // refusals cannot be confused with each other.
+    var bmp = [_]u8{0} ** 64;
+    @memcpy(bmp[0..2], "BM");
+    std.mem.writeInt(u32, bmp[2..6], bmp.len, .little);
+    const bmp_path = try std.fs.path.join(allocator, &.{ ov.project, "chart.jpeg" });
+    defer allocator.free(bmp_path);
+    try writeFile(std.testing.io, bmp_path, &bmp);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    var text_outcome = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"screenshot.png\"}");
+    defer text_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), text_outcome.fault);
+    try std.testing.expect(text_outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, text_outcome.output, "is not an image") != null);
+    try std.testing.expectEqualStrings("", text_outcome.image_data);
+
+    // The unsupported kind is refused **by name**, so the model can convert
+    // from it rather than guess what was wrong.
+    var bmp_outcome = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"chart.jpeg\"}");
+    defer bmp_outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), bmp_outcome.fault);
+    try std.testing.expect(bmp_outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, bmp_outcome.output, "image/bmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bmp_outcome.output, "image/png") != null);
+    try std.testing.expectEqualStrings("", bmp_outcome.image_data);
+}
+
+test "read_image refuses a picture larger than the bound, and names the bound" {
+    // An image is attacker influenced input: the model picks the path, and a
+    // huge file is paid for in the log and in every later turn of the
+    // session. Nothing is sent, and the refusal says the number to aim below.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    // A real PNG signature, then enough bytes to cross the bound by one. It
+    // is refused for its size and never for its kind, which is what makes the
+    // signature worth putting at the front.
+    const size = chock_core.tools.max_image_bytes + 1;
+    const big = try allocator.alloc(u8, size);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    @memcpy(big[0..png_1x1.len], &png_1x1);
+
+    const ov = workspace.kind.overlay;
+    const big_path = try std.fs.path.join(allocator, &.{ ov.project, "huge.png" });
+    defer allocator.free(big_path);
+    try writeFile(std.testing.io, big_path, big);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    var outcome = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"huge.png\"}");
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(outcome.is_error);
+
+    // The bound itself, in the words the model reads, taken from the constant
+    // so a bound that moves moves this assertion with it.
+    var bound_buffer: [24]u8 = undefined;
+    const bound_text = try std.fmt.bufPrint(&bound_buffer, "{d}", .{chock_core.tools.max_image_bytes});
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, bound_text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "huge.png") != null);
+
+    // **Nothing was sent**, which is the half a refusal that only said the
+    // right words would not prove.
+    try std.testing.expectEqualStrings("", outcome.image_data);
+    try std.testing.expectEqual(@as(u64, 0), outcome.image_bytes);
+
+    // And the same file one byte smaller is carried, so the bound is a bound
+    // and not a rule that refuses every large picture.
+    const at_bound_path = try std.fs.path.join(allocator, &.{ ov.project, "just-fits.png" });
+    defer allocator.free(at_bound_path);
+    try writeFile(std.testing.io, at_bound_path, big[0 .. size - 1]);
+
+    var fits = try runToolCall(allocator, &workspace, root_tmp, "read_image", "{\"path\":\"just-fits.png\"}");
+    defer fits.deinit(allocator);
+    try std.testing.expectEqual(@as(?u8, null), fits.fault);
+    try std.testing.expect(!fits.is_error);
+    try std.testing.expectEqual(@as(u64, chock_core.tools.max_image_bytes), fits.image_bytes);
 }
 
 test "run_command runs in the workspace and returns what the program wrote" {

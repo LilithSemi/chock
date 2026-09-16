@@ -2442,6 +2442,14 @@ fn runTool(
     // **Only when there is one**, because the empty default is a constant and
     // not an allocation. See `event.ToolResult.note`.
     defer if (dispatched.note.len != 0) allocator.free(dispatched.note);
+    // Only `read_image` ever sets this, and only when it succeeded. Every
+    // field of it is owned, `media_type` included, so the ownership rule is
+    // the same for all three and a reader has one thing to remember.
+    defer if (dispatched.image) |image| {
+        allocator.free(image.media_type);
+        allocator.free(image.content_hash);
+        allocator.free(image.data);
+    };
 
     // **The one place output that is not text is stood in for.** See
     // `tools.outputForModel`: bytes that are not valid UTF-8 serialize as a
@@ -2477,14 +2485,39 @@ fn runTool(
     // it.** Only these three fields become a content part, so Chock's own
     // sentence to the person never reaches the model. See
     // `event.ToolResult.note`.
-    const feedback = [_]event.ContentPart{.{ .tool_result = .{
+    // Two at most, on the stack: the result, and the picture when there is
+    // one. `parts` is how many of them this call filled in.
+    var feedback: [2]event.ContentPart = undefined;
+    var parts: usize = 1;
+    feedback[0] = .{ .tool_result = .{
         .call_id = result.call_id,
         .output = result.output,
         .is_error = result.is_error,
-    } }};
+    } };
+
+    // **The picture, and the one copy of it the log keeps.** The
+    // `tool.result` event above holds the description of the image and none
+    // of its bytes, because the fold that builds the context reads `message`
+    // events and nothing else: see `chock_proto.event.ImageRef`. So the bytes
+    // have to be here, and putting them here as well as there would put two
+    // copies of every picture in the log.
+    //
+    // **After the tool result and never before it.** The Anthropic wire
+    // refuses a `tool_result` block that comes after anything else in the
+    // same turn, and `chock_provider.anthropic.toWireMessages` reorders on
+    // that rule, so this order is what both wires already expect.
+    if (result.image) |image| {
+        feedback[parts] = .{ .image = .{
+            .call_id = result.call_id,
+            .media_type = image.media_type,
+            .data = image.data,
+        } };
+        parts += 1;
+    }
+
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .message = .{
         .role = .tool,
-        .content = &feedback,
+        .content = feedback[0..parts],
     } });
 }
 
@@ -4208,6 +4241,9 @@ const FakeToolRunner = struct {
     storage_to_check: ?chock_proto.storage.Storage = null,
     saw_call_in_log: bool = false,
     calls: usize = 0,
+    /// The picture this runner answers with, or null for every test that
+    /// wants a plain text result. See `event.ImageRef`.
+    image: ?event.ImageRef = null,
 
     fn dispatch(
         ptr: *anyopaque,
@@ -4228,6 +4264,14 @@ const FakeToolRunner = struct {
             // Owned by the same allocator the output is, and empty when there
             // is none: the loop frees it only when it holds something.
             .note = if (self.note.len == 0) "" else try allocator.dupe(u8, self.note),
+            // Every field owned by the same allocator, which is the rule
+            // `runTool` frees it under: see its own `defer`.
+            .image = if (self.image) |image| .{
+                .media_type = try allocator.dupe(u8, image.media_type),
+                .byte_count = image.byte_count,
+                .content_hash = try allocator.dupe(u8, image.content_hash),
+                .data = try allocator.dupe(u8, image.data),
+            } else null,
         };
     }
 
@@ -4663,6 +4707,11 @@ fn expectMessagesEqual(a: chock_proto.state.OwnedMessage, b: chock_proto.state.O
                 try testing.expectEqualStrings(at.call_id, bp.tool_result.call_id);
                 try testing.expectEqualStrings(at.output, bp.tool_result.output);
                 try testing.expectEqual(at.is_error, bp.tool_result.is_error);
+            },
+            .image => |at| {
+                try testing.expectEqualStrings(at.call_id, bp.image.call_id);
+                try testing.expectEqualStrings(at.media_type, bp.image.media_type);
+                try testing.expectEqualStrings(at.data, bp.image.data);
             },
             .reasoning, .unknown => {},
         }
@@ -6714,6 +6763,82 @@ test "a cap in one currency and turns billed in another is not enforced" {
     // The turn went out: 99 EUR against a 5 USD cap is not 99 > 5, it is two
     // numbers that cannot be compared.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
+}
+
+test "an image answer puts the bytes in the message event and the description in the tool result" {
+    // The decision, measured end to end: one copy of a picture in the log,
+    // and it is the copy the context is folded from.
+    //
+    // **Mutation check:** drop the `.image` branch that appends the second
+    // content part in `runTool`. The message event then holds one part, the
+    // request holds no image, and the first three assertions fail.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
+    const store = backing.storage();
+    defer store.close(io);
+
+    const data = "iVBORw0KGgoAAAANSUhEUg==";
+    var fake_client = FakeClient{
+        .turns = &.{
+            .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "call1", .name = "read_image", .arguments = "{}" } }} },
+            .{ .deltas = &.{.{ .text = "a red square" }} },
+        },
+        .record_requests = true,
+    };
+    var fake_tools = FakeToolRunner{
+        .output = "[chock: image/png, 69 bytes, image_hash 0123456789abcdef] shot.png",
+        .image = .{
+            .media_type = "image/png",
+            .byte_count = 69,
+            .content_hash = "0123456789abcdef",
+            .data = data,
+        },
+    };
+
+    try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
+    defer if (fake_client.last_request_json) |json| allocator.free(json);
+
+    try testing.expectEqual(@as(usize, 2), fake_client.calls);
+
+    // The picture reached the provider, in the request the second turn made.
+    const json = fake_client.last_request_json.?;
+    try testing.expect(std.mem.indexOf(u8, json, data) != null);
+
+    // And in the log: the message event carries the bytes, and it is the only
+    // event that does.
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var image_parts: usize = 0;
+    var results_with_bytes: usize = 0;
+    var described: usize = 0;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        switch (parsed.value.event) {
+            .message => |m| for (m.content) |part| {
+                if (part != .image) continue;
+                image_parts += 1;
+                try testing.expectEqualStrings("call1", part.image.call_id);
+                try testing.expectEqualStrings("image/png", part.image.media_type);
+                try testing.expectEqualStrings(data, part.image.data);
+            },
+            .tool_result => |r| {
+                if (std.mem.indexOf(u8, replay.line(), data) != null) results_with_bytes += 1;
+                const image = r.image orelse continue;
+                described += 1;
+                try testing.expectEqualStrings("image/png", image.media_type);
+                try testing.expectEqual(@as(u64, 69), image.byte_count);
+                try testing.expectEqualStrings("0123456789abcdef", image.content_hash);
+                // The bytes are not here, and that is the whole point.
+                try testing.expectEqualStrings("", image.data);
+            },
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), image_parts);
+    try testing.expectEqual(@as(usize, 1), described);
+    try testing.expectEqual(@as(usize, 0), results_with_bytes);
 }
 
 test "a tool that answers with bytes that are not UTF-8 leaves a JSON string in the request, never an array" {

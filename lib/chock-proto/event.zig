@@ -535,6 +535,43 @@ pub const ToolResultPart = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// An image a tool read, carried to the model as an image and never as text.
+///
+/// **A separate content part, and not a field of `ToolResultPart`.** The two
+/// wires Chock talks put a tool's image in two different places, and neither
+/// place is inside the tool result block. The Anthropic wire takes an `image`
+/// block in the same `user` message that holds the tool result. The OpenAI
+/// wire has no image at all in a `tool` role message, so the image goes in
+/// the `user` message that follows it. One neutral part that each adapter
+/// puts where its own wire wants it is the only shape both can express, and
+/// a field inside the tool result would have had to be moved out again by
+/// both adapters.
+///
+/// `call_id` pairs the image with the `tool_result` part that describes it,
+/// so a reader of the log can say which call produced which picture.
+pub const ImagePart = struct {
+    call_id: []const u8,
+    /// The IANA media type of the bytes, for example "image/png". **Decided
+    /// from the content of the file and never from the name of it**: see
+    /// `chock_core.tools.sniffImage`.
+    media_type: []const u8,
+    /// Base64 of the image bytes, padded, with no line breaks.
+    ///
+    /// **Base64 and not the raw bytes, for the reason
+    /// `chock_core.tools.outputForModel` already writes down one field away**:
+    /// `std.json.Stringify`, given a `[]const u8` that is not valid UTF-8,
+    /// writes an array of integers rather than a string, which changes the
+    /// shape of the part on the wire and which a replay of the same log
+    /// cannot read back. Image bytes are never valid UTF-8 by design, so this
+    /// is not a rare case but the only case. Both wires want base64 anyway.
+    data: []const u8,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A content part this reader does not recognize, for example a citation
 /// block a provider adds after this reader was built. `name` is the field
 /// name seen on the wire, and `raw` is its value, kept verbatim so nothing
@@ -554,6 +591,7 @@ pub const ContentPart = union(enum) {
     reasoning: Reasoning,
     tool_use: ToolUse,
     tool_result: ToolResultPart,
+    image: ImagePart,
     unknown: UnknownPart,
 
     pub fn jsonStringify(self: ContentPart, jw: *std.json.Stringify) std.json.Stringify.Error!void {
@@ -594,6 +632,8 @@ pub const ContentPart = union(enum) {
             result = .{ .tool_use = try std.json.innerParse(ToolUse, allocator, source, options) };
         } else if (std.mem.eql(u8, field_name, "tool_result")) {
             result = .{ .tool_result = try std.json.innerParse(ToolResultPart, allocator, source, options) };
+        } else if (std.mem.eql(u8, field_name, "image")) {
+            result = .{ .image = try std.json.innerParse(ImagePart, allocator, source, options) };
         } else {
             // A content part from a future provider adapter. Keep the name
             // and the raw JSON, so the part survives a replay through this
@@ -641,6 +681,79 @@ pub const ToolCall = struct {
 };
 
 /// A tool call finished.
+/// What a tool call read, when what it read was an image. The description of
+/// a picture, never the picture.
+///
+/// ## The log holds one copy of an image, and this is not it
+///
+/// An image reaches the model through two events, and only one of them has to
+/// carry the bytes.
+///
+/// * The `message` event is the copy that has to hold them. `chock-proto`'s
+///   own fold, in `lib/chock-proto/state.zig`, builds the context out of
+///   `message` events and out of nothing else, and the context is what every
+///   later turn of the session sends to the provider again. A `message` event
+///   that held a reference instead of the bytes would need the fold to open a
+///   file to resolve it, and the fold is a pure function of the log. A log
+///   that cannot rebuild its own context is a log `chockd` cannot re-serve.
+/// * The `tool_result` event is this one, and it is read by a person and by a
+///   replay, never by a model. So it carries what a person needs to say what
+///   was read, and it carries no bytes at all.
+///
+/// **Two copies was the alternative and it was refused.** The bound on one
+/// image is `chock_core.tools.max_image_bytes`, and base64 adds a third on
+/// top of that, so a second copy would put about 4 MiB in the log for every
+/// picture the agent looked at. This project has already fixed one fault of
+/// exactly that shape, where 200 network connections cost 159 KiB of log.
+///
+/// `data` is the field that makes that true, and it is the one field
+/// `jsonStringify` below leaves out.
+pub const ImageRef = struct {
+    /// The IANA media type the content was found to be. See
+    /// `chock_core.tools.sniffImage`.
+    media_type: []const u8,
+    /// How many bytes the image is, before base64.
+    byte_count: u64,
+    /// `chock_core.tools.contentHash` of the image bytes, so two reads of the
+    /// same picture are recognisable as the same picture.
+    content_hash: []const u8,
+    /// Base64 of the image bytes, padded, with no line breaks.
+    ///
+    /// **This field never reaches the log.** `jsonStringify` below writes
+    /// every other field and skips this one, for the reason the type's own
+    /// doc comment gives. It exists so that the tool runner can hand the
+    /// bytes to `chock_core.Loop.runTool`, which is what builds the
+    /// `ImagePart` that does go in the log. A value parsed back from a log is
+    /// therefore always empty, and that is correct: a replay reads the bytes
+    /// from the `message` event.
+    data: []const u8 = "",
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+
+    /// Every field except `data`, then whatever a newer writer added. The
+    /// order matches `ForwardCompatible.jsonStringify`, which is what a
+    /// reader of both encodings expects.
+    pub fn jsonStringify(self: ImageRef, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("media_type");
+        try jw.write(self.media_type);
+        try jw.objectField("byte_count");
+        try jw.write(self.byte_count);
+        try jw.objectField("content_hash");
+        try jw.write(self.content_hash);
+        for (self.extra.members) |member| {
+            try jw.objectField(member.name);
+            try jw.write(member.value);
+        }
+        try jw.endObject();
+    }
+
+    /// The ordinary forward compatible parse. `data` has a default, so a
+    /// record written by `jsonStringify` above reads back with an empty one.
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const ToolResult = struct {
     call_id: []const u8,
     /// Redacted before this event is built. See the doc comment on Envelope.
@@ -670,6 +783,10 @@ pub const ToolResult = struct {
     /// travel together and cannot drift apart, and so a replay of the log
     /// shows the person what the person was shown at the time.
     note: []const u8 = "",
+    /// The image this call read, or null for every call that read none, which
+    /// is every call but a `read_image` that succeeded. **The description and
+    /// not the picture**: see `ImageRef`.
+    image: ?ImageRef = null,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());
@@ -2084,6 +2201,95 @@ test "a path record survives a round trip, caveat and overflow count included" {
     // A call that recorded nothing carries no path record at all, and that
     // reads back as null rather than as a set of zeros.
     try std.testing.expectEqual(@as(?UnverifiedPaths, null), said.calls[1].unverified_paths);
+}
+
+test "the log holds the description of an image and never the bytes of one" {
+    // The decision `ImageRef` was built for, pinned. A `tool.result` event is
+    // read by a person and by a replay, and the copy the model reads lives in
+    // the `message` event, so a second copy here would double what every
+    // picture costs the log.
+    //
+    // **Mutation check:** give `ImageRef` the ordinary
+    // `ForwardCompatible.jsonStringify`, which writes every field. The base64
+    // then appears in this line and the test fails on the first assertion.
+    const allocator = std.testing.allocator;
+
+    const result = ToolResult{
+        .call_id = "call1",
+        .output = "[chock: image/png, 69 bytes, image_hash 0123456789abcdef] shot.png",
+        .is_error = false,
+        .truncated = false,
+        .image = .{
+            .media_type = "image/png",
+            .byte_count = 69,
+            .content_hash = "0123456789abcdef",
+            .data = "iVBORw0KGgoAAAANSUhEUg==",
+        },
+    };
+
+    const text = try std.json.Stringify.valueAlloc(allocator, result, .{});
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "iVBORw0KGgoAAAANSUhEUg==") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"data\"") == null);
+
+    // And everything a person reading the log needs is still there.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"byte_count\":69") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"content_hash\":\"0123456789abcdef\"") != null);
+
+    // Read back, the reference is whole and `data` is empty, which is the
+    // honest answer: the bytes were never written here.
+    const parsed = try std.json.parseFromSlice(ToolResult, allocator, text, .{});
+    defer parsed.deinit();
+    const back = parsed.value.image.?;
+    try std.testing.expectEqualStrings("image/png", back.media_type);
+    try std.testing.expectEqual(@as(u64, 69), back.byte_count);
+    try std.testing.expectEqualStrings("0123456789abcdef", back.content_hash);
+    try std.testing.expectEqualStrings("", back.data);
+
+    // A result that read no picture writes a null and gains nothing.
+    const plain = ToolResult{
+        .call_id = "call2",
+        .output = "ok",
+        .is_error = false,
+        .truncated = false,
+    };
+    const plain_text = try std.json.Stringify.valueAlloc(allocator, plain, .{});
+    defer allocator.free(plain_text);
+    try std.testing.expect(std.mem.indexOf(u8, plain_text, "\"image\":null") != null);
+}
+
+test "an image content part survives a round trip byte for byte" {
+    // This is the copy the model reads and the copy a replay rebuilds the
+    // context from, so it is the one that has to carry the bytes whole.
+    const allocator = std.testing.allocator;
+
+    const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1Pe";
+    const content = [_]ContentPart{
+        .{ .tool_result = .{ .call_id = "call1", .output = "read it", .is_error = false } },
+        .{ .image = .{ .call_id = "call1", .media_type = "image/png", .data = data } },
+    };
+    const envelope = Envelope{
+        .id = 7,
+        .session = "01S",
+        .time_ms = 9,
+        .event = .{ .message = .{ .role = .tool, .content = &content } },
+    };
+
+    const text = try std.json.Stringify.valueAlloc(allocator, envelope, .{});
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"image\":{") != null);
+
+    const parsed = try std.json.parseFromSlice(Envelope, allocator, text, .{});
+    defer parsed.deinit();
+
+    const back = parsed.value.event.message.content;
+    try std.testing.expectEqual(@as(usize, 2), back.len);
+    try std.testing.expectEqualStrings("call1", back[0].tool_result.call_id);
+    try std.testing.expectEqualStrings("call1", back[1].image.call_id);
+    try std.testing.expectEqualStrings("image/png", back[1].image.media_type);
+    try std.testing.expectEqualStrings(data, back[1].image.data);
 }
 
 test "a reasoning block's signature survives a round trip byte for byte" {

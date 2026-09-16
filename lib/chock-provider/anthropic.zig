@@ -113,6 +113,7 @@ pub const WireBlock = union(enum) {
     thinking: Thinking,
     tool_use: ToolUse,
     tool_result: ToolResult,
+    image: Image,
     /// A block type this reader has no case for, kept whole so it can be
     /// written back out unchanged. Mirrors `message.ContentPart.unknown`.
     unknown: Unknown,
@@ -143,6 +144,21 @@ pub const WireBlock = union(enum) {
         is_error: bool,
     };
 
+    /// An image, always base64 on this wire. **It is a block of its own and
+    /// never a field of a `tool_result` block**: a tool's picture rides in
+    /// the same `user` message as the result that describes it, after the
+    /// result blocks, which is where `toWireMessages` puts it. See
+    /// `chock_proto.event.ImagePart`.
+    ///
+    /// The wire nests both fields under `source`, and the source `type` is
+    /// always "base64" here. This adapter never sends a URL source: the
+    /// bytes are read out of the workspace, so there is no URL to send, and
+    /// a URL would ask the provider to fetch something Chock never saw.
+    pub const Image = struct {
+        media_type: []const u8,
+        data: []const u8,
+    };
+
     pub const Unknown = struct {
         /// The `type` this reader did not recognize.
         name: []const u8,
@@ -169,6 +185,14 @@ pub const WireBlock = union(enum) {
                 .tool_use_id = block.tool_use_id,
                 .content = block.content,
                 .is_error = block.is_error,
+            }),
+            .image => |block| try jw.write(.{
+                .type = "image",
+                .source = .{
+                    .type = "base64",
+                    .media_type = block.media_type,
+                    .data = block.data,
+                },
             }),
             // The raw value already carries its own `type`, because it is the
             // block exactly as it arrived. Writing it verbatim is what makes
@@ -220,6 +244,17 @@ pub const WireBlock = union(enum) {
                 .tool_use_id = stringField(object, "tool_use_id"),
                 .content = toolResultText(object.get("content")),
                 .is_error = is_error == .bool and is_error.bool,
+            } };
+        }
+        if (std.mem.eql(u8, kind.string, "image")) {
+            const source = object.get("source") orelse return unknownBlock(allocator, kind.string, value);
+            // A URL source has no `data`, so it reads back with an empty one
+            // rather than as an image this reader could carry. Keeping the
+            // whole block instead would need a second shape nothing writes.
+            if (source != .object) return unknownBlock(allocator, kind.string, value);
+            return .{ .image = .{
+                .media_type = stringField(source.object, "media_type"),
+                .data = stringField(source.object, "data"),
             } };
         }
         return unknownBlock(allocator, kind.string, value);
@@ -351,6 +386,14 @@ fn toWireMessages(
                 .tool_use_id = tool_result.call_id,
                 .content = tool_result.output,
                 .is_error = tool_result.is_error,
+            } }),
+            // Into `own` and not into `results`, so it lands after every
+            // `tool_result` block of the same turn: this wire refuses a
+            // result block that comes after anything else, and the tail of
+            // this function is what puts the results first.
+            .image => |image| try own.append(arena, .{ .image = .{
+                .media_type = image.media_type,
+                .data = image.data,
             } }),
             .unknown => |unknown| try own.append(arena, .{ .unknown = .{
                 .name = unknown.name,
@@ -534,6 +577,11 @@ pub fn toContent(
                 .call_id = tool_use.id,
                 .tool = tool_use.name,
                 .arguments = try std.json.Stringify.valueAlloc(allocator, tool_use.input, .{}),
+            } }),
+            .image => |image| try parts.append(allocator, .{ .image = .{
+                .call_id = "",
+                .media_type = image.media_type,
+                .data = image.data,
             } }),
             .tool_result => |tool_result| try parts.append(allocator, .{ .tool_result = .{
                 .call_id = tool_result.tool_use_id,
@@ -1086,6 +1134,90 @@ test "two turns that both carry a tool result keep their own turns" {
     // result.
     try testing.expectEqual(@as(usize, 2), wire_messages[0].object.get("content").?.array.items.len);
     try testing.expectEqual(@as(usize, 1), wire_messages[1].object.get("content").?.array.items.len);
+}
+
+test "a tool's image rides after its result, in the same user turn" {
+    // What `image_results` means on this wire. The picture is a block of its
+    // own, never a field of the result block, and the result comes first: a
+    // `tool_result` block after anything else in the same turn is refused by
+    // the provider.
+    //
+    // **Mutation check:** put the image into `results` instead of `own` in
+    // `toWireMessages`. The order flips and the second assertion fails.
+    const allocator = testing.allocator;
+    const data = "iVBORw0KGgoAAAANSUhEUg==";
+    const content = [_]message.ContentPart{
+        .{ .tool_result = .{ .call_id = "toolu_1", .output = "read it", .is_error = false } },
+        .{ .image = .{ .call_id = "toolu_1", .media_type = "image/png", .data = data } },
+    };
+    const messages = [_]message.Message{.{ .role = .tool, .content = &content }};
+
+    const body = try buildRequest(allocator, .{ .model = "claude-opus-5", .system = "s", .messages = &messages });
+    defer allocator.free(body);
+    const parsed = try parseBody(allocator, body);
+    defer parsed.deinit();
+
+    const wire_messages = parsed.value.object.get("messages").?.array.items;
+    try testing.expectEqual(@as(usize, 1), wire_messages.len);
+    // There is no `tool` role on this wire: the whole turn is a user turn.
+    try testing.expectEqualStrings("user", wire_messages[0].object.get("role").?.string);
+
+    const blocks = wire_messages[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), blocks.len);
+    try testing.expectEqualStrings("tool_result", blocks[0].object.get("type").?.string);
+    try testing.expectEqualStrings("image", blocks[1].object.get("type").?.string);
+
+    const source = blocks[1].object.get("source").?.object;
+    try testing.expectEqualStrings("base64", source.get("type").?.string);
+    try testing.expectEqualStrings("image/png", source.get("media_type").?.string);
+    try testing.expectEqualStrings(data, source.get("data").?.string);
+
+    // **And the order is imposed here, not merely copied from the neutral
+    // message.** A foreign history can hold the picture first, and this wire
+    // still refuses a `tool_result` block that comes after anything else, so
+    // the result has to be moved back in front of it. Chock's own loop always
+    // builds the pair the other way round, which is why a test that only used
+    // that order would pass whether this reordering worked or not.
+    const reversed = [_]message.ContentPart{
+        .{ .image = .{ .call_id = "toolu_1", .media_type = "image/png", .data = data } },
+        .{ .tool_result = .{ .call_id = "toolu_1", .output = "read it", .is_error = false } },
+    };
+    const reversed_messages = [_]message.Message{.{ .role = .tool, .content = &reversed }};
+    const reversed_body = try buildRequest(allocator, .{
+        .model = "claude-opus-5",
+        .system = "s",
+        .messages = &reversed_messages,
+    });
+    defer allocator.free(reversed_body);
+    const reversed_parsed = try parseBody(allocator, reversed_body);
+    defer reversed_parsed.deinit();
+
+    const reversed_blocks = reversed_parsed.value.object.get("messages").?.array
+        .items[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), reversed_blocks.len);
+    try testing.expectEqualStrings("tool_result", reversed_blocks[0].object.get("type").?.string);
+    try testing.expectEqualStrings("image", reversed_blocks[1].object.get("type").?.string);
+}
+
+test "an image block read off this wire keeps its media type and its bytes" {
+    // A history some other client wrote, replayed through this reader. The
+    // block has to survive as an image and not fall into `unknown`, or a
+    // replay would send a picture the model can no longer see.
+    const allocator = testing.allocator;
+    const body =
+        \\{"role":"user","content":[{"type":"image","source":
+        \\{"type":"base64","media_type":"image/webp","data":"UklGRg=="}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(WireMessage, allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const parts = try toContent(allocator, parsed.value.content);
+    defer allocator.free(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("image/webp", parts[0].image.media_type);
+    try testing.expectEqualStrings("UklGRg==", parts[0].image.data);
 }
 
 test "max_tokens is always on the wire, because this provider requires it" {

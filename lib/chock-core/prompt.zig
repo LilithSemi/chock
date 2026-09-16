@@ -388,34 +388,47 @@ test "the prompt names every tool the session offers, and the two lists are one 
 
 test "the prompt never names a tool this build does not offer" {
     // The tripwire for the gate. `read_image` is the tool the gate was
-    // designed for and this milestone deliberately does not build: no adapter
-    // can carry an image result, because the neutral content part for one does
-    // not exist. If somebody adds the tool and skips the gate, the name appears
-    // in the prompt and this fails.
+    // designed for, and the gate is what decides whether the name is in the
+    // prompt at all. A provider instance that says nothing about images must
+    // never see the name: a model told about a tool it cannot use spends one
+    // turn calling it and one turn reading the failure.
+    //
+    // **Both directions, in one test.** The old version of this only checked
+    // that the name was absent, and it passed for the wrong reason: no adapter
+    // could carry an image then, so the name was absent whatever the gate
+    // did. Checking that a session which passes both gates DOES get the name
+    // is what makes the absent case mean something.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const not_offered = [_][]const u8{"read_image"};
-
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
-        const support = core_tools.Support{
-            .adapter = @enumFromInt(field.value),
-            // Even an instance that claims the capability: the adapter gate
-            // still refuses, and a prompt that named it anyway would be the
-            // fault this test exists for.
-            .provider = .{ .images = true },
-        };
-        const definitions = try core_tools.Registry.definitions(arena, support);
-        const text = try build(arena, .{}, definitions, .{});
+        const adapter: chock_provider.Client.Adapter = @enumFromInt(field.value);
 
-        for (not_offered) |name| {
-            for (definitions) |definition| {
-                try std.testing.expect(!std.mem.eql(u8, definition.name, name));
-            }
-            try std.testing.expect(std.mem.indexOf(u8, text, name) == null);
+        // The provider half says nothing, which is a no. Every adapter can
+        // carry an image, so this is the gate that holds, and it must hold on
+        // its own.
+        const silent = try core_tools.Registry.definitions(arena, .{ .adapter = adapter });
+        const silent_text = try build(arena, .{}, silent, .{});
+        for (silent) |definition| {
+            try std.testing.expect(!std.mem.eql(u8, definition.name, "read_image"));
         }
+        try std.testing.expect(std.mem.indexOf(u8, silent_text, "read_image") == null);
+
+        // And the same session with an instance that takes an image is told
+        // the name.
+        const seeing = try core_tools.Registry.definitions(arena, .{
+            .adapter = adapter,
+            .provider = .{ .images = true },
+        });
+        const seeing_text = try build(arena, .{}, seeing, .{});
+        var named = false;
+        for (seeing) |definition| {
+            if (std.mem.eql(u8, definition.name, "read_image")) named = true;
+        }
+        try std.testing.expect(named);
+        try std.testing.expect(std.mem.indexOf(u8, seeing_text, "read_image") != null);
     }
 }
 

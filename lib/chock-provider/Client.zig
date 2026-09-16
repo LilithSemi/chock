@@ -81,18 +81,18 @@ pub const Adapter = enum {
         return switch (self) {
             .openai_compatible => switch (capability) {
                 .tool_calls => true,
-                // `openai.zig` builds its content parts from
-                // `message.ContentPart`, which has no image part, so there
-                // is no image for this adapter to encode.
-                .image_results => false,
+                // `openai.zig` sends the picture as a `user` turn of its own,
+                // after the `tool` message that answers the call, because a
+                // message with role "tool" on this wire carries text and
+                // nothing else. See its own `toWireMessages`.
+                .image_results => true,
             },
             .anthropic => switch (capability) {
                 .tool_calls => true,
-                // The Anthropic wire does have an image content block, and
-                // the neutral type still has no image part to fill it from.
-                // The gap is in `chock-proto`, not here, so this stays false
-                // until that part exists.
-                .image_results => false,
+                // `anthropic.zig` sends an `image` block in the same `user`
+                // turn as the `tool_result` block, after it. See
+                // `WireBlock.Image`.
+                .image_results => true,
             },
         };
     }
@@ -1755,7 +1755,7 @@ pub fn freeUsage(allocator: std.mem.Allocator, usage: message.Usage) void {
 /// ever holds `.text`, `.reasoning`, and `.tool_use` parts, because those
 /// are the only parts a model's own streamed reply can carry.
 ///
-/// A `.tool_result` or `.unknown` part reaching here means this was handed a
+/// A `.tool_result`, `.image` or `.unknown` part reaching here means this was handed a
 /// message `Collector.toMessage` never built, a caller's own bug: this
 /// panics rather than reaching `unreachable`, so a caller that makes this
 /// mistake gets a clear, safe crash naming exactly what went wrong in every
@@ -1773,7 +1773,7 @@ pub fn freeAssembledMessage(allocator: std.mem.Allocator, msg: message.Message) 
                 allocator.free(tool_use.tool);
                 allocator.free(tool_use.arguments);
             },
-            .tool_result, .unknown => std.debug.panic(
+            .tool_result, .image, .unknown => std.debug.panic(
                 "freeAssembledMessage received a .{s} content part; sendAndAssemble never builds one",
                 .{@tagName(part)},
             ),

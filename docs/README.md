@@ -2,7 +2,7 @@
 
 - [sandbox.md](sandbox.md) - the layers a tool call runs inside, the throwaway
   workspace, the limits, and what the macOS sandbox holds and cannot.
-- [running.md](running.md) - `chock run`, the eighteen tools, the session log,
+- [running.md](running.md) - `chock run`, the nineteen tools, the session log,
   getting the work back out of the workspace, the exit codes, cost, the task
   list, and `chock doctor`.
 - [configuration.md](configuration.md) - `config.zon`, provider instances, how

@@ -74,6 +74,23 @@ pub const WireTextPart = struct {
     text: []const u8,
 };
 
+/// One entry of a `content` array that carries an image rather than text.
+///
+/// **This wire has no image source but a URL**, so the bytes travel as a
+/// `data:` URL, which is what every OpenAI compatible server documents for an
+/// image the caller holds rather than one on the web. `dataUrl` below builds
+/// the string. Chock never sends an `http` URL here: the bytes were read out
+/// of the workspace, so there is no URL to send, and sending one would ask
+/// the provider to fetch something Chock never saw.
+pub const WireImagePart = struct {
+    type: []const u8 = "image_url",
+    image_url: Url,
+
+    pub const Url = struct {
+        url: []const u8,
+    };
+};
+
 /// A message's `content` field. An OpenAI compatible server accepts either a
 /// plain string or an array of typed parts, and some servers send the array
 /// shape back in a response. Both directions go through this type so a
@@ -81,11 +98,16 @@ pub const WireTextPart = struct {
 pub const WireContent = union(enum) {
     text: []const u8,
     parts: []const WireTextPart,
+    /// **Written and never read.** A response never carries an image, so
+    /// `jsonParse` below has no case that produces this: it is the shape a
+    /// request uses to send one. See `toWireMessages`.
+    images: []const WireImagePart,
 
     pub fn jsonStringify(self: WireContent, jw: *std.json.Stringify) std.json.Stringify.Error!void {
         switch (self) {
             .text => |text| try jw.write(text),
             .parts => |parts| try jw.write(parts),
+            .images => |parts| try jw.write(parts),
         }
     }
 
@@ -255,6 +277,7 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
     var tool_calls: std.ArrayList(WireToolCall) = .empty;
     var unknown_parts: std.ArrayList(WireUnknownPart) = .empty;
     var tool_messages: std.ArrayList(WireMessage) = .empty;
+    var images: std.ArrayList(WireImagePart) = .empty;
 
     for (msg.content) |part| {
         switch (part) {
@@ -273,6 +296,9 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
                 .tool_call_id = tool_result.call_id,
                 .is_error = tool_result.is_error,
             }),
+            .image => |image| try images.append(allocator, .{ .image_url = .{
+                .url = try dataUrl(allocator, image.media_type, image.data),
+            } }),
             .unknown => |unknown_part| try unknown_parts.append(allocator, .{
                 .name = unknown_part.name,
                 .raw = unknown_part.raw,
@@ -331,7 +357,33 @@ fn toWireMessages(allocator: std.mem.Allocator, msg: message.Message) BuildError
     // compatible history looks like for a tool's answer.
     try result.appendSlice(allocator, tool_messages.items);
 
+    // **A turn of its own, after the tool messages, and always with role
+    // "user".** A message with role "tool" on this wire carries text and
+    // nothing else, so an image from a tool cannot ride in the message that
+    // answers the call: the server refuses the whole request. The picture
+    // therefore follows the answer as a plain user turn, which is the one
+    // shape this wire has for it. Two user turns in a row are accepted here,
+    // unlike on the Anthropic wire, so this needs no joining rule.
+    if (images.items.len != 0) {
+        try result.append(allocator, .{
+            .role = "user",
+            .content = .{ .images = images.items },
+        });
+    }
+
     return result.toOwnedSlice(allocator);
+}
+
+/// `data:<media_type>;base64,<data>`, the only image source this wire takes
+/// for bytes the caller holds. `data` is already base64: see
+/// `chock_proto.event.ImagePart.data`, which says why the neutral part
+/// carries it that way rather than raw.
+fn dataUrl(
+    allocator: std.mem.Allocator,
+    media_type: []const u8,
+    data: []const u8,
+) BuildError![]const u8 {
+    return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ media_type, data });
 }
 
 /// Build the JSON body for a chat completion request. The key never enters
@@ -421,6 +473,10 @@ fn toolOutputText(allocator: std.mem.Allocator, content: ?WireContent) std.mem.A
     const wire_content = content orelse return "";
     return switch (wire_content) {
         .text => |text| text,
+        // A picture is not the text of a tool's answer. Chock never builds a
+        // "tool" message holding one, and a server that sent one back has
+        // said nothing this field can hold.
+        .images => "",
         .parts => |parts| blk: {
             var out: std.ArrayList(u8) = .empty;
             for (parts, 0..) |part, i| {
@@ -484,6 +540,11 @@ pub fn toMessage(allocator: std.mem.Allocator, wire: WireMessage) std.mem.Alloca
             .parts => |wire_parts| for (wire_parts) |part| {
                 if (part.text.len != 0) try parts.append(allocator, .{ .text = part.text });
             },
+            // `jsonParse` never produces this variant, so a response cannot
+            // arrive holding one: see `WireContent.images`. The case is here
+            // because the union is exhaustive, and it drops nothing a parse
+            // could have built.
+            .images => {},
         }
     }
 
@@ -933,6 +994,42 @@ test "a system role message still reaches the wire when the request carries no s
     try std.testing.expectEqual(@as(usize, 1), parsed.value.messages.len);
     try std.testing.expectEqualStrings("system", parsed.value.messages[0].role);
     try std.testing.expectEqualStrings("only system source", parsed.value.messages[0].content.?.text);
+}
+
+test "a tool's image follows the tool message as a user turn holding a data URL" {
+    // What `image_results` means on this wire, and it is not what it means on
+    // the Anthropic one. A message with role "tool" here carries text and
+    // nothing else, so the picture cannot ride in the message that answers the
+    // call: it is a user turn of its own, after it.
+    //
+    // **Mutation check:** put the image part into the primary message instead.
+    // The role of the message holding it becomes "tool" and the fourth
+    // assertion fails.
+    const allocator = std.testing.allocator;
+    const data = "iVBORw0KGgoAAAANSUhEUg==";
+    const content = [_]message.ContentPart{
+        .{ .tool_result = .{ .call_id = "call_1", .output = "read it", .is_error = false } },
+        .{ .image = .{ .call_id = "call_1", .media_type = "image/png", .data = data } },
+    };
+    const messages = [_]message.Message{.{ .role = .tool, .content = &content }};
+
+    const body = try buildRequest(allocator, .{ .model = "m", .system = "", .messages = &messages });
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const wire_messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), wire_messages.len);
+
+    try std.testing.expectEqualStrings("tool", wire_messages[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("read it", wire_messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", wire_messages[1].object.get("role").?.string);
+
+    const parts = wire_messages[1].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("image_url", parts[0].object.get("type").?.string);
+    const url = parts[0].object.get("image_url").?.object.get("url").?.string;
+    try std.testing.expectEqualStrings("data:image/png;base64," ++ data, url);
 }
 
 test "a response whose content is an array of text parts degrades to the text instead of failing to parse" {

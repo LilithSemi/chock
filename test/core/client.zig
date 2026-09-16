@@ -1586,7 +1586,7 @@ test "a refused Anthropic reply carries the category and the explanation through
     }
 }
 
-test "every adapter carries a tool call, and no adapter carries an image result yet" {
+test "every adapter carries a tool call, and every adapter carries an image result" {
     // `Adapter.carries` is what stops a tool being offered on a wire that
     // cannot express it at all. A tool the
     // model cannot use costs one turn calling it and one turn reading the
@@ -1598,10 +1598,11 @@ test "every adapter carries a tool call, and no adapter carries an image result 
         // An agent with no tool call has nothing to do at all, so this must
         // hold for every wire Chock speaks.
         try std.testing.expect(adapter.carries(.tool_calls));
-        // `message.ContentPart` has no image part, so neither adapter has
-        // anything to encode. This flips to true for one adapter at a time,
-        // once that part exists and that adapter learns to write it.
-        try std.testing.expect(!adapter.carries(.image_results));
+        // Both adapters encode an image now, each in the place its own wire
+        // has for one: an `image` block after the `tool_result` block on the
+        // Anthropic wire, and a `user` turn after the `tool` message on the
+        // OpenAI compatible one. See `chock_proto.event.ImagePart`.
+        try std.testing.expect(adapter.carries(.image_results));
     }
 }
 
@@ -1613,7 +1614,7 @@ test "carries is readable at comptime, which is what makes it a property of the 
     comptime {
         const Adapter = provider.Client.Adapter;
         if (!Adapter.openai_compatible.carries(.tool_calls)) unreachable;
-        if (Adapter.anthropic.carries(.image_results)) unreachable;
+        if (!Adapter.anthropic.carries(.image_results)) unreachable;
     }
 }
 

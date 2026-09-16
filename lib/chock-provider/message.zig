@@ -73,12 +73,13 @@ pub const Capability = enum {
     /// talks to is expected to: a provider that does not would leave the
     /// agent with nothing to do at all.
     tool_calls,
-    /// A tool result can carry an image rather than text. **No adapter
-    /// carries this today**: `ContentPart` has text, reasoning, a tool call
-    /// and a tool result, and no image part, so there is nothing for an
-    /// adapter to encode. The member exists so the gate that will hold
-    /// `read_image` back is built and tested before the tool is, rather than
-    /// after.
+    /// A tool result can carry an image rather than text. **Every adapter
+    /// carries this**, each in the place its own wire has for one: an `image`
+    /// block after the `tool_result` block on the Anthropic wire, and a
+    /// `user` turn holding a `data:` URL after the `tool` message on the
+    /// OpenAI compatible one. So the answer for `read_image` turns entirely
+    /// on the second gate, which is what the provider instance says about
+    /// itself. See `ContentPart.image`.
     image_results,
 };
 

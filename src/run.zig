@@ -11682,7 +11682,10 @@ const Printer = struct {
                         wrote_anything = true;
                     },
                     .reasoning => {},
-                    .tool_use, .tool_result, .unknown => {},
+                    // An image is the tool's answer and not the assistant's
+                    // words, the same as `.tool_result` beside it. A terminal
+                    // cannot draw it either.
+                    .tool_use, .tool_result, .image, .unknown => {},
                 };
                 if (wrote_anything) self.write("\n");
             },

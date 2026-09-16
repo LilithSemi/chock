@@ -163,6 +163,12 @@ pub const ToolCall = chock_proto.event.ToolCall;
 /// caller owns both and frees them with `allocator.free`.
 pub const ToolResult = chock_proto.event.ToolResult;
 
+/// What a tool result says about an image it read. See
+/// `lib/chock-proto/event.zig`: the description of a picture, never the
+/// picture, which is what keeps the session log from holding two copies of
+/// every image the agent looks at.
+pub const ImageRef = chock_proto.event.ImageRef;
+
 /// A tool result is kept under this many bytes. The model context stays small
 /// on purpose. Chosen small enough that an ordinary command's output almost
 /// never hits it, and small enough that hitting it costs little context even
@@ -387,6 +393,158 @@ pub fn outputForModel(
     return note;
 }
 
+/// The largest image `read_image` carries, before base64.
+///
+/// **An image is attacker influenced input.** The model chooses the path, and
+/// every byte it chooses is paid for three times: once in the session log, once
+/// in the context window on this turn, and once again on every later turn of
+/// the session, because the context is sent whole each time. A bound is
+/// therefore not a convenience, it is what stops one call from spending a
+/// session.
+///
+/// **Where 3 MiB comes from.** Base64 adds a third, so 3 MiB of image is
+/// 4 MiB on the wire, which sits under the 5 MB an Anthropic request takes for
+/// one image. The OpenAI compatible wire allows more, and the smaller of the
+/// two is the honest bound for a tool that is offered on both. It is also far
+/// above a screenshot of a whole 4K display saved as PNG, which is the case
+/// the tool exists for.
+///
+/// **Not `max_file_bytes`.** That bound asks what `edit_file` may rewrite
+/// without losing the tail of a file, and it is about the disk. This one asks
+/// what a provider takes and what a context window can hold, and it is about
+/// the wire.
+pub const max_image_bytes: usize = 3 * 1024 * 1024;
+
+/// `max_image_bytes` as text, for `Tool.description` and for the refusal, both
+/// of which are built at comptime and cannot call a formatter.
+const max_image_bytes_text = std.fmt.comptimePrint("{d}", .{max_image_bytes});
+
+/// An image kind both provider wires carry. **The intersection and never the
+/// union**: a kind one provider takes and the other refuses would make the
+/// same call succeed or fail depending on which model the session runs, which
+/// is exactly the confusion `Support` exists to stop.
+pub const ImageKind = enum {
+    png,
+    jpeg,
+    gif,
+    webp,
+
+    /// The IANA media type both wires name this kind by.
+    pub fn mediaType(self: ImageKind) []const u8 {
+        return switch (self) {
+            .png => "image/png",
+            .jpeg => "image/jpeg",
+            .gif => "image/gif",
+            .webp => "image/webp",
+        };
+    }
+};
+
+/// Every carried media type, joined, for `Tool.description` and for a
+/// refusal. Built from the enum, so a kind that is added cannot be missing
+/// from either.
+const carried_image_types_text = blk: {
+    var text: []const u8 = "";
+    for (@typeInfo(ImageKind).@"enum".fields, 0..) |field, i| {
+        const kind: ImageKind = @enumFromInt(field.value);
+        if (i != 0) text = text ++ ", ";
+        text = text ++ kind.mediaType();
+    }
+    break :blk text;
+};
+
+/// What the bytes of a file say the file is.
+pub const Sniffed = union(enum) {
+    /// A kind both wires carry.
+    carried: ImageKind,
+    /// A real image, of a kind that is not carried. The media type, so the
+    /// refusal can name it and the model can convert the file rather than
+    /// guess why it was refused.
+    other_image: []const u8,
+    /// Nothing this recognises as a picture at all.
+    not_an_image,
+};
+
+/// What `bytes` is, read from the content of the file.
+///
+/// ## The name of a file is not evidence and is never read here
+///
+/// This function is not given the path, so it cannot consult the extension
+/// even by accident. That is deliberate and it is the whole point.
+///
+/// * **A name is chosen by whoever wrote the file.** A tool call names a path
+///   the model picked, and a workspace holds files a previous call wrote, so
+///   the name is as much attacker influenced input as the content is. `.png`
+///   on a file of shell script is one rename.
+/// * **The provider reads the bytes, not the name.** A media type taken from
+///   an extension is a claim about a file, and a claim that does not match the
+///   content is a request the provider answers 400 to, which ends the session.
+///   Reading the content is the only way the media type Chock sends is the
+///   media type the provider finds.
+/// * **A correct name proves nothing extra.** A file whose content is a real
+///   PNG is a real PNG whatever it is called, and that is what this returns.
+///
+/// ## What each signature is
+///
+/// Each one is the fixed bytes at the front of the format, and every check is
+/// length guarded, so a file shorter than its own signature is
+/// `not_an_image` rather than a read past the end.
+///
+/// BMP is the one refusal that needs more than a marker: `BM` is two bytes and
+/// two bytes match by accident. The stored file size at offset 2 has to equal
+/// the length of what was read as well, so a text file beginning "BM" is
+/// `not_an_image` and not a misnamed bitmap.
+pub fn sniffImage(bytes: []const u8) Sniffed {
+    if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return .{ .carried = .png };
+    if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return .{ .carried = .jpeg };
+    if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) {
+        return .{ .carried = .gif };
+    }
+    // RIFF, then four bytes of length, then the form type. A RIFF container
+    // that is not WEBP is a WAV or an AVI, which is not a picture.
+    if (bytes.len >= 12 and std.mem.startsWith(u8, bytes, "RIFF") and
+        std.mem.eql(u8, bytes[8..12], "WEBP"))
+    {
+        return .{ .carried = .webp };
+    }
+
+    // A real picture of a kind one or both wires refuse. Named, so the model
+    // is told what to convert from rather than being told "not an image"
+    // about a file that plainly is one.
+    if (bytes.len >= 14 and std.mem.startsWith(u8, bytes, "BM")) {
+        const stored = std.mem.readInt(u32, bytes[2..6], .little);
+        if (stored == bytes.len) return .{ .other_image = "image/bmp" };
+    }
+    if (std.mem.startsWith(u8, bytes, "II\x2a\x00") or std.mem.startsWith(u8, bytes, "MM\x00\x2a")) {
+        return .{ .other_image = "image/tiff" };
+    }
+    if (std.mem.startsWith(u8, bytes, "\x00\x00\x01\x00")) return .{ .other_image = "image/vnd.microsoft.icon" };
+    // ISO base media: four bytes of box length, then "ftyp", then the brand.
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[4..8], "ftyp")) {
+        const brand = bytes[8..12];
+        if (std.mem.eql(u8, brand, "avif") or std.mem.eql(u8, brand, "avis")) {
+            return .{ .other_image = "image/avif" };
+        }
+        if (std.mem.eql(u8, brand, "heic") or std.mem.eql(u8, brand, "heix") or
+            std.mem.eql(u8, brand, "mif1"))
+        {
+            return .{ .other_image = "image/heic" };
+        }
+    }
+    // SVG is text, so the marker can be preceded by whitespace and by an XML
+    // declaration. Only the front of the file is looked at, so a document that
+    // merely mentions "<svg" far down is not one.
+    const head = bytes[0..@min(bytes.len, 512)];
+    const trimmed = std.mem.trimStart(u8, head, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "<svg") or
+        (std.mem.startsWith(u8, trimmed, "<?xml") and std.mem.indexOf(u8, trimmed, "<svg") != null))
+    {
+        return .{ .other_image = "image/svg+xml" };
+    }
+
+    return .not_an_image;
+}
+
 /// How large `spawnCapturing` tries to grow the pipe it reads a sandboxed
 /// program's output from, before it runs the program. `spawnCapturing`
 /// reads the pipe while the program runs, so this is no longer what keeps a
@@ -517,6 +675,7 @@ pub const Error = sandbox.Sandbox.SpawnError;
 /// and does nothing, or one that runs and is never offered.
 pub const Tool = enum {
     read_file,
+    read_image,
     list_directory,
     glob,
     grep,
@@ -539,6 +698,11 @@ pub const Tool = enum {
     /// instance before anybody may offer it. See `Support`.
     pub fn needs(self: Tool) Capability {
         return switch (self) {
+            // The one member of the enum that needs anything else. Both gates
+            // have to pass before this name is offered: the adapter must have
+            // a shape for an image, and the provider instance must say it
+            // takes one. See `Support`.
+            .read_image => .image_results,
             .read_file,
             .list_directory,
             .glob,
@@ -585,6 +749,11 @@ pub const Tool = enum {
             // `Support.provisioning`.
             .provide_tool => support.provisioning,
             .read_file,
+            // Both of its gates were already read at the top of this
+            // function, by `support.offers(self.needs())`. Nothing else holds
+            // it back: a session whose provider takes an image has the tool,
+            // and a session whose provider does not never hears the name.
+            .read_image,
             .list_directory,
             .glob,
             .grep,
@@ -1000,6 +1169,7 @@ pub const Tool = enum {
         return switch (self) {
             .run_command => runCommandActionInto(buffer, argv0, project_root),
             .read_file,
+            .read_image,
             .list_directory,
             .glob,
             .grep,
@@ -1042,6 +1212,7 @@ pub const Tool = enum {
         return switch (self) {
             .write_file, .edit_file => true,
             .read_file,
+            .read_image,
             .list_directory,
             .glob,
             .grep,
@@ -1090,6 +1261,7 @@ pub const Tool = enum {
         return switch (self) {
             .write_file, .edit_file, .run_command => true,
             .read_file,
+            .read_image,
             .list_directory,
             .glob,
             .grep,
@@ -1156,6 +1328,14 @@ pub const Tool = enum {
                 "result begins with the file_hash of what you were given: pass it to edit_file " ++
                 "so an edit against a file that changed in the meantime is refused instead of " ++
                 "applied.",
+            .read_image => "Look at an image inside the sandboxed workspace: a screenshot, a " ++
+                "diagram, a rendered chart, a mockup. The picture comes back beside the " ++
+                "result, so read it there rather than calling again. The path is resolved " ++
+                "against the project root, and a path outside the workspace is refused. " ++
+                "The kinds carried are " ++ carried_image_types_text ++ ", and any other " ++
+                "kind is refused by name. **What the file holds is what decides**, never " ++
+                "what it is called, so a .png that is really a text file is refused. At " ++
+                "most " ++ max_image_bytes_text ++ " bytes.",
             .list_directory => "List one directory inside the sandboxed workspace. A name that " ++
                 "ends with \"/\" is a directory. Hidden entries are listed too. At most " ++
                 max_directory_entries_text ++ " entries come back, and the result says how many " ++
@@ -1303,6 +1483,7 @@ pub const Tool = enum {
     pub fn Args(comptime self: Tool) type {
         return switch (self) {
             .read_file => ReadFileArgs,
+            .read_image => ReadImageArgs,
             .list_directory => ListDirectoryArgs,
             .glob => GlobArgs,
             .grep => GrepArgs,
@@ -1512,6 +1693,7 @@ pub const Registry = struct {
         // nothing.
         return switch (tool) {
             .read_file => readFile(allocator, io, env, config, call, timeout_ns),
+            .read_image => readImage(allocator, io, env, config, call, timeout_ns),
             .list_directory => listDirectory(allocator, io, env, config, call, timeout_ns),
             .glob => globFiles(allocator, io, env, config, call, timeout_ns),
             .grep => grepFiles(allocator, io, env, config, call, timeout_ns),
@@ -1966,6 +2148,14 @@ const ReadFileArgs = struct {
 
     pub const docs = .{
         .path = "The path to read, relative to the project root.",
+    };
+};
+
+const ReadImageArgs = struct {
+    path: []const u8,
+
+    pub const docs = .{
+        .path = "The path of the image to look at, relative to the project root.",
     };
 };
 
@@ -2922,6 +3112,130 @@ fn readFile(
         .output = try out.toOwnedSlice(allocator),
         .is_error = false,
         .truncated = captured.truncated,
+    };
+}
+
+/// Read one image out of the workspace and give it to the model as a picture.
+///
+/// **The same route `readFile` takes, and the same boundary.** The bytes come
+/// back through `cat` inside the sandbox, so the path the model gave is
+/// resolved by the kernel inside the mount tree and nothing else can be
+/// reached. `leavesProject` is read first, for the reason its own doc gives:
+/// the mount is the boundary, and this is what stops a whole turn being spent
+/// finding that out.
+///
+/// Four refusals, and each one names what it refused:
+///
+/// * a path outside the project,
+/// * a path the project denied,
+/// * content that is not a picture, or is a picture of a kind neither wire
+///   carries,
+/// * more than `max_image_bytes`.
+fn readImage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    workspace_config: sandbox.Config,
+    call: ToolCall,
+    timeout_ns: u64,
+) Error!ToolResult {
+    const parsed = std.json.parseFromSlice(ReadImageArgs, allocator, call.arguments, .{
+        .ignore_unknown_fields = true,
+    }) catch return parseFailure(allocator, call, .read_image);
+    defer parsed.deinit();
+
+    const path = parsed.value.path;
+    if (leavesProject(path, workspace_config.cwd)) {
+        return toolErrorResult(allocator, call, try std.fmt.allocPrint(
+            allocator,
+            "read_image reads a file inside the project, and \"{s}\" is outside it. Give a " ++
+                "path inside the project.",
+            .{path},
+        ));
+    }
+    // Before the sandbox is started, the same as `readFile`: see
+    // `deniedPathResult`.
+    if (deniedMountFor(workspace_config, path)) |denied| {
+        return deniedPathResult(allocator, call, denied);
+    }
+
+    // `--` so a path that begins with a dash is a path and never an option of
+    // `cat`'s. `keep_bytes` is the bound itself, so a larger file comes back
+    // marked truncated and is refused below rather than being sent in part: a
+    // picture cut in half is not a smaller picture, it is a broken file.
+    const argv = [_][]const u8{ "cat", "--", path };
+    const captured = (try fixedProgram(allocator, io, env, workspace_config, .{
+        .argv = &argv,
+        .keep_bytes = max_image_bytes,
+        .timeout_ns = timeout_ns,
+    })) orelse return notFoundResult(allocator, call, "cat");
+
+    // The file is not there, is a directory, or could not be read. `cat` has
+    // already said which, and there is nothing to describe. `buildToolResult`
+    // takes the captured bytes, so the `defer` that frees them is after this
+    // line and not before it, exactly as in `readFile`.
+    if (!isSuccess(captured, null)) return buildToolResult(allocator, call, captured);
+    defer allocator.free(captured.output);
+
+    if (captured.truncated) {
+        return toolErrorResult(allocator, call, try std.fmt.allocPrint(
+            allocator,
+            "{s} is larger than " ++ max_image_bytes_text ++ " bytes, which is the most " ++
+                "read_image carries. Nothing was sent. Make a smaller copy of it, or crop " ++
+                "the part you need, and read that.",
+            .{path},
+        ));
+    }
+
+    const kind = switch (sniffImage(captured.output)) {
+        .carried => |kind| kind,
+        .other_image => |media_type| return toolErrorResult(allocator, call, try std.fmt.allocPrint(
+            allocator,
+            "{s} is {s}, and read_image carries only " ++ carried_image_types_text ++ ". " ++
+                "Convert it to one of those and read the converted file.",
+            .{ path, media_type },
+        )),
+        .not_an_image => return toolErrorResult(allocator, call, try std.fmt.allocPrint(
+            allocator,
+            "{s} is not an image. The content of the file is what decides this, never the " ++
+                "name of it, so a file named like a picture that does not hold one is " ++
+                "refused here. Use read_file if it holds text.",
+            .{path},
+        )),
+    };
+
+    // Base64, because that is what both wires take and because raw image bytes
+    // are never valid UTF-8: see `chock_proto.event.ImagePart.data`.
+    const encoder = std.base64.standard.Encoder;
+    const data = try allocator.alloc(u8, encoder.calcSize(captured.output.len));
+    errdefer allocator.free(data);
+    _ = encoder.encode(data, captured.output);
+
+    const hash = contentHash(captured.output);
+    const media_type = kind.mediaType();
+
+    // **The bytes are not in this sentence, and the sentence is what the log
+    // keeps.** See `chock_proto.event.ImageRef`.
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "[chock: {s}, {d} bytes, image_hash {s}] {s}\n" ++
+            "The picture is beside this result, as an image. Look at it there rather than " ++
+            "reading the file again.",
+        .{ media_type, captured.output.len, hash, path },
+    );
+    errdefer allocator.free(text);
+
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = text,
+        .is_error = false,
+        .truncated = false,
+        .image = .{
+            .media_type = try allocator.dupe(u8, media_type),
+            .byte_count = captured.output.len,
+            .content_hash = try allocator.dupe(u8, &hash),
+            .data = data,
+        },
     };
 }
 
@@ -6575,11 +6889,13 @@ test "glob and grep both refuse a path outside the project, before any program r
 const plain_support = Support{ .adapter = .openai_compatible };
 
 /// A `Support` for a session that has everything this build can give: the
-/// same wire, plus a knowledgebase directory and a way to resolve a program
-/// with Nix. Used where a test needs the whole tool list rather than the list
-/// a session with no memory and no Nix gets.
+/// same wire, plus a provider that takes an image, a knowledgebase directory
+/// and a way to resolve a program with Nix. Used where a test needs the whole
+/// tool list rather than the list a session with no memory, no Nix and a
+/// provider that says nothing about images gets.
 const full_support = Support{
     .adapter = .openai_compatible,
+    .provider = .{ .images = true },
     .memory = true,
     .provisioning = true,
 };
@@ -6605,15 +6921,15 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
 
-    // The eighteen a session with everything gets, by name, so a tool that
+    // The nineteen a session with everything gets, by name, so a tool that
     // quietly loses its entry is a test failure and not a smaller list
     // nobody notices.
     const expected = [_][]const u8{
-        "read_file",    "list_directory", "glob",        "grep",
-        "write_file",   "edit_file",      "run_command", "read_guidance",
-        "read_memory",  "write_memory",   "spawn_agent", "update_plan",
-        "provide_tool", "restrict_self",  "fetch_url",   "ask_user",
-        "set_title",    "request_action",
+        "read_file",     "read_image",   "list_directory", "glob",
+        "grep",          "write_file",   "edit_file",      "run_command",
+        "read_guidance", "read_memory",  "write_memory",   "spawn_agent",
+        "update_plan",   "provide_tool", "restrict_self",  "fetch_url",
+        "ask_user",      "set_title",    "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -6691,12 +7007,13 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     try std.testing.expectEqual(Role.worker, (Context{}).role);
 }
 
-test "a session with no knowledgebase and no Nix is offered neither memory tool nor provide_tool" {
+test "a session with no knowledgebase, no Nix and no vision is offered none of those four tools" {
     // A tool the model cannot use is worse than a tool that is missing: it
     // costs one turn to call and one to read the failure, and a small model
     // may never recover from the confusion. So a caller that could not make
-    // the directory and cannot reach Nix offers eleven tools, not fourteen
-    // with three that always fail.
+    // the directory, cannot reach Nix, and talks to a provider that says
+    // nothing about images offers fifteen tools, not nineteen with four that
+    // always fail.
     //
     // `spawn_agent` is the one tool this reasoning does not reach, because
     // whether it works changes while the session runs: see `Tool.offeredBy`.
@@ -6706,11 +7023,14 @@ test "a session with no knowledgebase and no Nix is offered neither memory tool 
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 3, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 4, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
+        // The fourth, and the only one of the four whose gate is the wire and
+        // the provider rather than something the caller built. See `Support`.
+        try std.testing.expect(!std.mem.eql(u8, def.name, "read_image"));
     }
 
     // And the three gates are separate: a session that can provision and has
@@ -6866,12 +7186,11 @@ test "a status the model misspells is not a status, and never reaches the log as
     }
 }
 
-test "both gates must pass before a tool is offered, and an image result passes neither yet" {
-    // `image_results` is the member the gate exists for: no adapter can encode
-    // one, because the neutral content part does not exist, so an instance that
-    // claims vision still does not get a tool that needs it. A gate that only
-    // asked the provider would answer differently here, and that is the mistake
-    // this pins.
+test "both gates must pass before a tool is offered, and a silent provider fails the second" {
+    // `image_results` is the member the gate exists for. Every adapter can now
+    // encode one, so the adapter gate passes for all of them, and the answer
+    // still turns entirely on what the instance says about itself. The default
+    // `ProviderCapabilities` says nothing, and saying nothing is a no.
     const claims_vision = ProviderCapabilities{ .images = true };
 
     inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
@@ -6879,10 +7198,149 @@ test "both gates must pass before a tool is offered, and an image result passes 
 
         try std.testing.expect(Support.offers(.{ .adapter = adapter }, .tool_calls));
         try std.testing.expect(!Support.offers(.{ .adapter = adapter }, .image_results));
-        try std.testing.expect(!Support.offers(
+        try std.testing.expect(Support.offers(
             .{ .adapter = adapter, .provider = claims_vision },
             .image_results,
         ));
+    }
+}
+
+/// A real 1x1 PNG, made by hand and checked by a decoder: the signature, an
+/// IHDR, an IDAT holding one red pixel, and an IEND, each with its own CRC.
+/// **A real file and not a signature with rubbish after it**, so a test that
+/// reads it is measuring what a screenshot would do.
+const png_1x1 = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+    0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+};
+
+test "every carried kind is recognised from its own first bytes" {
+    try std.testing.expectEqual(ImageKind.png, sniffImage(&png_1x1).carried);
+
+    // The shortest true prefix of each format, so the check is the signature
+    // and never something further in.
+    try std.testing.expectEqual(ImageKind.jpeg, sniffImage("\xff\xd8\xff\xe0 anything").carried);
+    try std.testing.expectEqual(ImageKind.gif, sniffImage("GIF87a....").carried);
+    try std.testing.expectEqual(ImageKind.gif, sniffImage("GIF89a....").carried);
+    try std.testing.expectEqual(ImageKind.webp, sniffImage("RIFF\x24\x00\x00\x00WEBPVP8 ").carried);
+
+    // And every kind has a media type both wires name, read from the enum so
+    // a kind added without one fails here.
+    inline for (@typeInfo(ImageKind).@"enum".fields) |field| {
+        const kind: ImageKind = @enumFromInt(field.value);
+        try std.testing.expect(std.mem.startsWith(u8, kind.mediaType(), "image/"));
+    }
+}
+
+test "the name of a file is never evidence: a text file called like a picture is not one" {
+    // **The mutation this exists for**: make `sniffImage` take the path and
+    // answer from the extension. Every line below then reports a picture.
+    // `sniffImage` is not given the path at all, which is what makes that
+    // mutation a change to the signature and not a quiet one.
+    //
+    // Each of these is a real file somebody could put in a workspace and call
+    // `screenshot.png`.
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("#!/bin/sh\nrm -rf /\n"));
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("const std = @import(\"std\");\n"));
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage(""));
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("PNG"));
+    // A file that begins with the two letters BMP starts with, and is not a
+    // bitmap: the stored size does not match the length. Two letters match by
+    // accident, which is why the size is checked as well.
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("BM is short for bitmap"));
+    // A RIFF container that is not WEBP.
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("RIFF\x24\x00\x00\x00WAVEfmt "));
+    // The first byte of the PNG signature is wrong, and everything after it
+    // is right. A check that read fewer bytes would call this a PNG.
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage("\x88PNG\r\n\x1a\nrest"));
+}
+
+test "a real image of a kind neither wire carries is refused by its own name" {
+    // Not "not an image", which would send the model looking for a fault in a
+    // file that is exactly what it looks like. The media type is what the
+    // refusal needs, so the model can convert from it.
+    var bmp = [_]u8{0} ** 20;
+    @memcpy(bmp[0..2], "BM");
+    std.mem.writeInt(u32, bmp[2..6], bmp.len, .little);
+    try std.testing.expectEqualStrings("image/bmp", sniffImage(&bmp).other_image);
+
+    try std.testing.expectEqualStrings("image/tiff", sniffImage("II\x2a\x00rest of it").other_image);
+    try std.testing.expectEqualStrings("image/tiff", sniffImage("MM\x00\x2arest of it").other_image);
+    try std.testing.expectEqualStrings(
+        "image/vnd.microsoft.icon",
+        sniffImage("\x00\x00\x01\x00\x01\x00").other_image,
+    );
+    try std.testing.expectEqualStrings(
+        "image/avif",
+        sniffImage("\x00\x00\x00\x20ftypavifmore").other_image,
+    );
+    try std.testing.expectEqualStrings(
+        "image/heic",
+        sniffImage("\x00\x00\x00\x20ftypheicmore").other_image,
+    );
+    try std.testing.expectEqualStrings(
+        "image/svg+xml",
+        sniffImage("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>").other_image,
+    );
+    try std.testing.expectEqualStrings(
+        "image/svg+xml",
+        sniffImage("  \n<?xml version=\"1.0\"?>\n<svg></svg>").other_image,
+    );
+
+    // A document that only mentions the marker far down is not one: only the
+    // front of the file is read.
+    const mentions = "// this file explains how to draw an <svg> element\n" ++ ("x" ** 600) ++ "<svg>";
+    try std.testing.expectEqual(Sniffed.not_an_image, sniffImage(mentions));
+}
+
+test "the tool is offered only where both halves of the gate say yes" {
+    // The property the whole `Support` mechanism exists for, read off the one
+    // tool that needs anything. Four cases, and only one of them offers it.
+    try std.testing.expectEqual(Capability.image_results, Tool.read_image.needs());
+
+    inline for (@typeInfo(chock_provider.Client.Adapter).@"enum".fields) |field| {
+        const adapter: chock_provider.Client.Adapter = @enumFromInt(field.value);
+
+        // The provider instance says nothing, which is a no.
+        try std.testing.expect(!Tool.read_image.offeredBy(.{ .adapter = adapter }));
+        // It says yes, and the adapter can carry one, so the tool is offered.
+        try std.testing.expect(Tool.read_image.offeredBy(.{
+            .adapter = adapter,
+            .provider = .{ .images = true },
+        }));
+        // And an arbitrator holds no tool at all, whatever both halves say:
+        // the role is read before either gate. See `Role`.
+        try std.testing.expect(!Tool.read_image.offeredBy(.{
+            .adapter = adapter,
+            .provider = .{ .images = true },
+            .role = .arbitrator,
+        }));
+    }
+}
+
+test "the bound read_image carries sits under what one provider request takes" {
+    // Base64 adds a third, and an Anthropic request takes 5 MB for one image.
+    // A bound that let a larger picture through would build a request the
+    // provider refuses, which ends the session, and the refusal would arrive
+    // from the provider rather than from the tool that could name the file.
+    const encoded = std.base64.standard.Encoder.calcSize(max_image_bytes);
+    try std.testing.expect(encoded < 5_000_000);
+
+    // And the tool says the number, so a model that is refused knows what to
+    // aim below without guessing.
+    try std.testing.expect(std.mem.indexOf(u8, Tool.read_image.description(), max_image_bytes_text) != null);
+
+    // Every carried media type is named in the description too, so a refusal
+    // that names a kind can be acted on.
+    inline for (@typeInfo(ImageKind).@"enum".fields) |field| {
+        const kind: ImageKind = @enumFromInt(field.value);
+        try std.testing.expect(
+            std.mem.indexOf(u8, Tool.read_image.description(), kind.mediaType()) != null,
+        );
     }
 }
 

@@ -226,6 +226,10 @@ fn entryBytes(entry: state.ContextEntry) usize {
                 .reasoning => |reasoning| reasoning.text.len,
                 .tool_use => |use| use.tool.len + use.arguments.len,
                 .tool_result => |result| result.output.len,
+                // The base64, which is what the request really carries. An
+                // image counted as nothing would let a span of pictures sit
+                // inside a byte budget that has no room for them.
+                .image => |image| image.data.len,
                 .unknown => 0,
             };
             break :bytes total;
@@ -275,6 +279,16 @@ pub fn transcript(allocator: std.mem.Allocator, entries: []const state.ContextEn
                         const word = if (result.is_error) "a tool failed" else "a tool answered";
                         try out.print(allocator, "[{s}]\n", .{word});
                         try appendCut(allocator, &out, result.output, policy.part_max_bytes);
+                    },
+                    // A summary is text, so the picture cannot survive the
+                    // fold whatever is written here. What it says instead is
+                    // that a picture was there and what it was of, which is
+                    // the one fact a later turn can act on: it can read the
+                    // file again.
+                    .image => |image| {
+                        try out.print(allocator, "[an image, {s}, which is no longer shown]\n", .{
+                            image.media_type,
+                        });
                     },
                     // Reasoning is left out on purpose: it is the model's own
                     // working, it is the largest part of a turn on a

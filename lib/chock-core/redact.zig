@@ -311,6 +311,11 @@ fn parts(
                 copy.output = try text(arena, policy, result.output);
                 break :blk .{ .tool_result = copy };
             },
+            // Bytes of a picture, base64, and never words. There is no
+            // credential to find in them, and running the text pass over
+            // base64 would match a heuristic by accident and corrupt the
+            // image without telling anybody. Kept exactly as read.
+            .image => part,
             // A part shape this build does not know, kept verbatim through a
             // replay of an older or newer log. Its strings came from the same
             // wire every other part came from, so they get the same

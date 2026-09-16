@@ -100,11 +100,13 @@ pub const Kind = enum {
 /// heard of is refused by the strict parse of a provider entry, the same way
 /// a typo in `.token` is. See `parse`.
 pub const Capabilities = struct {
-    /// The instance can take an image in a request. Nothing offers a tool
-    /// that needs this yet: `chock_provider.message.ContentPart` has no image
-    /// part, so no adapter carries one either, and the first gate refuses
-    /// before this one is ever read. The field is here so the record exists
-    /// and is tested before the tool that needs it is built.
+    /// The instance can take an image in a request. **This is the second of
+    /// the two gates `read_image` passes**, and it is the one that decides:
+    /// every adapter can encode an image, so what is written here is what
+    /// says whether the session is offered the tool at all. False, the
+    /// default, means the model never hears the name, which is the right
+    /// answer for a model that cannot see. See
+    /// `chock_core.tools.Support.offers`.
     images: bool = false,
 };
 

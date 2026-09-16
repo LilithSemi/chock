@@ -36,12 +36,21 @@ copies your uncommitted work into the workspace as well.
 
 ## The tools
 
-The agent has eighteen tools, and every one that touches the machine goes
+The agent has nineteen tools, and every one that touches the machine goes
 through that sandbox: `read_file`, `list_directory`, `glob`, `grep`,
 `write_file`, `edit_file`, `run_command`, `read_memory` and `write_memory`.
 Only `run_command` takes a command. The rest name a path, a pattern, or the
 text to write, because a person can review a change and cannot review a shell
 line.
+
+`read_image` reads a picture out of the workspace, a screenshot, a diagram, a
+rendered chart, and gives it to the model as an image. **It is the one tool
+that is not always offered.** A model that cannot read a picture never hears
+the name, so it cannot spend a turn calling it: the wire format must have a
+shape for an image, and the provider instance must say it takes one, which is
+the `.capabilities = .{ .images = true }` block of that instance in your
+configuration. The kind of file is read from the content and never from the
+name, so a text file called `plot.png` is refused. At most 3145728 bytes.
 
 `read_guidance` reads a document compiled into Chock, so it reaches nothing on
 the machine at all. `ask_user` puts one question to the person who started the

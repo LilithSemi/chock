@@ -202,6 +202,11 @@ const table = @import("table.zig");
 /// safe direction to fail in, and not a silent `allow`.
 pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_file", .decision = .allow },
+    // Reading a picture out of the workspace is a read, the same class as
+    // `call.read_file` above it. What holds it back is not this table but
+    // `Support`: a session whose provider cannot take an image is never
+    // offered the tool, so this row is never reached there.
+    .{ .action = "call.read_image", .decision = .allow },
     .{ .action = "call.list_directory", .decision = .allow },
     .{ .action = "call.glob", .decision = .allow },
     .{ .action = "call.grep", .decision = .allow },
@@ -300,6 +305,7 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
 
     const call_actions = [_][]const u8{
         "call.read_file",
+        "call.read_image",
         "call.list_directory",
         "call.glob",
         "call.grep",
