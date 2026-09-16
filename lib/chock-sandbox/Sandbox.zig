@@ -320,6 +320,15 @@ pub const Config = struct {
     /// **`Config.copy` carries this across as it is**, the same as
     /// `limits_report` and the three descriptor fields, because it points at
     /// the caller's own storage.
+    ///
+    /// **No Chock command sets this today.** Every tool call and every shell
+    /// command goes through `net_router` below. The only callers that give
+    /// this field a value are the tests of this library and
+    /// `test/sandbox/probe.zig`. The field and the exchange behind it stay
+    /// because they answer a question the router does not: a program written
+    /// for Chock asks by name and is handed a descriptor, with no network in
+    /// its namespace at all. Read this as a capability with no producer yet,
+    /// and not as a path a session takes. See `linux/netbroker.zig`.
     net_broker: ?NetBroker = null,
     /// Who answers the network router when it has to turn a name into an
     /// address, and an address into a connection.

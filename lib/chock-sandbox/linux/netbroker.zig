@@ -13,6 +13,22 @@
 //! where the policy is, and the sandboxed process never holds an address it
 //! chose.
 //!
+//! ## What uses this file today, and what does not
+//!
+//! **The exchange has no producer in Chock.** `Config.net_broker` is set only
+//! by the tests of this library and by `test/sandbox/probe.zig`. Every tool
+//! call and every shell command uses `Config.net_router` instead, which gives
+//! the program a real network in its own namespace. See `routerlink.zig`,
+//! whose own top comment says why the two are different channels and why this
+//! one is left as it is.
+//!
+//! **Parts of this file are load bearing anyway.** `hostBytesAreUsable` and
+//! `max_host_bytes` are what `chock-broker/network.zig`, `fetch.zig` and
+//! `askpass.zig` bound a host name with, `chock-core/mcp.zig` names the same
+//! rule, and `routerlink.zig` uses the `SCM_RIGHTS` helpers at the end of this
+//! file. **Do not delete this file as dead code.** The exchange is unused; the
+//! bounds and the helpers are not.
+//!
 //! ## The child gets a descriptor, never a name
 //!
 //! Two rules follow from that, and each one is a test:
