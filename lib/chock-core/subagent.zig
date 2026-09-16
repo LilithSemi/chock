@@ -430,6 +430,20 @@ pub fn readReport(
                 .{kept},
             ),
         },
+        // **Not `refused`, and this is the whole point of the member.** The
+        // child waited out every retry it was allowed and still could not get
+        // through. Nothing it did was wrong and its work was never judged, so a
+        // parent told `refused` would give up on work that asking again later
+        // would have finished. See `event.AgentOutcome.rate_limited`.
+        .rate_limited => return .{
+            .outcome = .rate_limited,
+            .result = try std.fmt.allocPrint(
+                allocator,
+                "the subagent was rate limited by the model backend and gave up after waiting: " ++
+                    "{s}. Asking again later is expected to work. What it had said by then: {s}",
+                .{ end_detail.items, kept },
+            ),
+        },
         else => return .{
             .outcome = .refused,
             .result = try std.fmt.allocPrint(
@@ -1181,6 +1195,8 @@ test "each way a child session can end is its own outcome, and the answer comes 
         .{ .reason = .errored, .want = .refused },
         .{ .reason = .canceled_by_user, .want = .refused },
         .{ .reason = .turn_limit, .want = .refused },
+        // **The one this file got wrong.** See the test below.
+        .{ .reason = .rate_limited, .want = .rate_limited },
     };
 
     for (cases) |one| {
@@ -1583,4 +1599,45 @@ test "a record the table could not keep reaches the caller, and no longer only a
     // Taken once. A caller that reads it a second time is told nothing,
     // rather than the same loss over again.
     try testing.expectEqual(@as(?Diagnostic, null), table.takeLost());
+}
+
+
+test "a rate limited child is not reported as a refused one" {
+    // **The bug this member exists for, measured in a real session.** A
+    // subagent spawned in parallel with three others was rate limited, spent
+    // every retry its loop allows, and ended. The parent was told `refused`,
+    // whose own documentation says the child "was stopped, it faulted, it
+    // reached a turn limit, or its answer was not the shape the parent asked
+    // for". None of those happened. The backend was busy.
+    //
+    // A parent that reads `refused` gives up on work that asking again later
+    // would have finished, and the only thing that said otherwise was a
+    // sentence in `result` that a model had to interpret. That is exactly the
+    // failure `event.SessionEndReason` carries a member for every other time:
+    // a reason of its own, never a sentence a reader has to match on.
+    //
+    // Mutation check: take the `.rate_limited` arm out of `readReport` and the
+    // `else` arm answers `.refused`, which fails the first expectation here.
+    const gpa = testing.allocator;
+
+    var log = try ChildLog.init(gpa, "01CHILDRL");
+    defer log.deinit(gpa);
+    try log.say(gpa, "I had found three call sites so far");
+    try log.append(gpa, .{ .session_end = .{
+        .reason = .rate_limited,
+        .detail = "gave up after 6 attempts: status 429 (rate_limited)",
+    } });
+
+    const report = try log.report(gpa, .prose);
+    defer freeReport(gpa, report);
+
+    try testing.expectEqual(event.AgentOutcome.rate_limited, report.outcome);
+    try testing.expect(report.outcome != .refused);
+
+    // The parent is told it is worth asking again, and what the child had
+    // already done is still carried back so the work is not started from
+    // nothing.
+    try testing.expect(std.mem.indexOf(u8, report.result, "rate limited") != null);
+    try testing.expect(std.mem.indexOf(u8, report.result, "again later") != null);
+    try testing.expect(std.mem.indexOf(u8, report.result, "three call sites") != null);
 }

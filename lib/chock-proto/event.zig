@@ -415,6 +415,27 @@ pub const SessionEndReason = union(enum) {
     /// does not retry, change model, reset the context, or reword what the
     /// provider said.
     refused_by_model,
+    /// The model backend rate limited this credential, and the session spent
+    /// every retry `chock_provider.retry.Policy` allows without getting
+    /// through. **The session waited first**: this is what the far end of about
+    /// a minute of backoff looks like, and not a request that was refused once.
+    ///
+    /// **Not `errored`.** Nothing faulted. The connection was good and the
+    /// credential was accepted; the provider asked for a queue and the queue
+    /// was longer than the wait. The advice is the opposite of a fault's: the
+    /// same request, sent later, is expected to work.
+    ///
+    /// **A reason of its own because a parent acts on it.** A subagent that
+    /// ends here is reported to its parent as
+    /// `AgentOutcome.rate_limited` rather than as `refused`, so a parent can
+    /// tell "the backend was busy" from "this agent failed" without reading
+    /// `detail`. Folding it into `errored` is what made a rate limited
+    /// subagent look like a broken one, and the parent then had no way to know
+    /// that asking again later was the right move.
+    ///
+    /// `detail` carries how many attempts were made and what the provider last
+    /// said. See `chock_core.Loop.givingUpDetail`.
+    rate_limited,
     unknown: []const u8,
 
     pub const wireName = WireString(SessionEndReason).wireName;
@@ -1119,6 +1140,18 @@ pub const AgentOutcome = union(enum) {
     /// or it died before it could say why. A parent is told that plainly here
     /// rather than left to read a truncated log as a finished one.
     died,
+    /// The child was rate limited by the model backend and spent every retry
+    /// it was allowed without getting through. **Not `refused`**, for the same
+    /// reason `budget` is not: nothing the child did was wrong and its work was
+    /// never judged. The backend was busy, and the same request later is
+    /// expected to work.
+    ///
+    /// **This is the member a parent needs to decide anything.** A parent told
+    /// `refused` reads "it was stopped, it faulted, it reached a turn limit, or
+    /// its answer was the wrong shape", none of which happened, so it either
+    /// gives up on work that would have succeeded or guesses from prose. See
+    /// `SessionEndReason.rate_limited`.
+    rate_limited,
     unknown: []const u8,
 
     pub const wireName = WireString(AgentOutcome).wireName;

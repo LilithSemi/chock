@@ -1502,7 +1502,7 @@ fn sendWithRetry(
                     held = false;
                     freeReply(allocator, answer);
                     _ = try appendAndApply(allocator, io, locked, session, deps, .{
-                        .session_end = .{ .reason = .errored, .detail = detail },
+                        .session_end = .{ .reason = endReasonFor(class), .detail = detail },
                     });
                     return null;
                 },
@@ -1573,6 +1573,27 @@ fn givingUpDetail(
         // own: the caller answers it. A message here would be a message
         // nobody reads.
         .not_retryable => unreachable,
+    };
+}
+
+/// How a session ends when the retry has nothing left to try.
+///
+/// **A rate limit is not a fault, and this is the one place that distinction
+/// can still be made.** By the time the retry gives up, the class of the
+/// failure is the only thing that separates "the backend was busy for longer
+/// than we waited" from "something broke". Writing `errored` for both threw
+/// that away, and a parent reading its subagent's log could then not tell a
+/// busy backend from a broken agent: see
+/// `chock_proto.event.SessionEndReason.rate_limited`.
+///
+/// `context_overflow` and `permanent` answer `not_retryable` and never reach
+/// the caller of this function. They are named here because the switch is
+/// exhaustive, which is what makes a class added later a compile error rather
+/// than a silent `errored`.
+fn endReasonFor(class: chock_provider.failure.Class) chock_proto.event.SessionEndReason {
+    return switch (class) {
+        .rate_limited => .rate_limited,
+        .transient, .permanent, .context_overflow => .errored,
     };
 }
 
@@ -7585,7 +7606,7 @@ test "a rate limit ends the session and never compacts, however much its body sa
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
     try testing.expect(try firstCompaction(allocator, io, store) == null);
     try testing.expectEqual(
-        event.SessionEndReason.errored,
+        event.SessionEndReason.rate_limited,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
     );
 }
@@ -7723,7 +7744,7 @@ test "the attempts run out, and the session says how many were made and what the
     try testing.expect(sleeper.waits.items[1] > sleeper.waits.items[0]);
 
     try testing.expectEqual(
-        event.SessionEndReason.errored,
+        event.SessionEndReason.rate_limited,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
     );
     const detail = try endDetailOf(allocator, io, store);

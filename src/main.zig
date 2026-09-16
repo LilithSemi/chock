@@ -181,6 +181,21 @@ pub const Exit = enum(u8) {
     /// neither on its own. See
     /// `chock_proto.event.SessionEndReason.refused_by_model`.
     model_refused = 11,
+    /// The model backend rate limited this credential, and the session spent
+    /// every retry it was allowed without getting through. **The session
+    /// waited first**, about a minute of backoff by default, so this is the far
+    /// end of a queue and not a single refused request.
+    ///
+    /// Not `faulted`: nothing broke, and this is the one code where asking
+    /// again later is exactly the right move. A script that reads a fault as a
+    /// reason to stop should read this as a reason to wait. Not
+    /// `empty_response`, which is the backend answering with nothing: here it
+    /// did not answer at all.
+    ///
+    /// See `chock_proto.event.SessionEndReason.rate_limited`, and
+    /// `chock_proto.event.AgentOutcome.rate_limited`, which is how a parent
+    /// session is told the same thing about a subagent.
+    rate_limited = 12,
 
     pub fn code(self: Exit) u8 {
         return @intFromEnum(self);
@@ -218,6 +233,9 @@ pub fn exitFor(reason: chock_proto.event.SessionEndReason) Exit {
         // `errored`, because a refusal is an answer and not a fault.** See
         // `Exit.model_refused`.
         .refused_by_model => .model_refused,
+        // **Never `faulted`.** The backend was busy and the session waited out
+        // every retry it was allowed. See `Exit.rate_limited`.
+        .rate_limited => .rate_limited,
         // A reason a newer Chock wrote and this one does not know. Never
         // `finished`: an absent answer is never a permissive answer, which is
         // the same rule a policy keeps.
@@ -801,6 +819,7 @@ test "every session end reason has an exit code, so a new one cannot be forgotte
         .handed_over,
         .empty_response,
         .refused_by_model,
+        .rate_limited,
         .{ .unknown = "" },
     };
     try testing.expectEqual(
@@ -823,7 +842,7 @@ test "no two exit codes are the same, so a script can tell every outcome apart" 
         codes[count] = value.code();
         count += 1;
     }
-    try testing.expectEqual(@as(usize, 12), count);
+    try testing.expectEqual(@as(usize, 13), count);
 }
 
 test {

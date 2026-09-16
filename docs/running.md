@@ -201,6 +201,7 @@ chock workspace adopt 01K2...       # take the work out of one kept overlay
 | 9 | a required audit sink still held none of the tail of the log |
 | 10 | the model backend answered a turn with nothing, so there is no answer |
 | 11 | the model backend refused the request, and said why |
+| 12 | the model backend rate limited this credential, and every retry was spent |
 
 A session that changed files and never committed them exits `2`, and says so:
 only a commit is carried back. **A refusal is not a crash and must not look
@@ -212,6 +213,18 @@ person, or an approval nobody answered, refusing one act, and nothing broke.
 Asking again gets the same answer, so Chock stops and never retries, changes
 model, or resets the context on its own. The session log holds the provider's
 own category and explanation, when it sent them.
+
+`12` is the opposite advice, and it is the one code where asking again is
+right. The session was rate limited, and it **already waited**: the retry
+policy spends about a minute of backoff before it gives up, so `12` is the far
+end of that queue and not a single refused request. Nothing broke, so it is not
+`2`.
+
+A subagent that ends this way reaches its parent as the outcome
+`rate_limited`, not as `refused`. That distinction is the whole point: a parent
+told `refused` reads that the child failed, and gives up on work that the same
+request a few minutes later would have finished. Spawning several subagents at
+once is what usually causes this, because they share one credential's limit.
 
 ## What a session cost
 
