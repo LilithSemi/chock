@@ -39,15 +39,22 @@
 //! here grants nothing the sandbox does not already allow, and that is the
 //! rule read from the other side: the agent never gets the privilege.
 //!
-//! An act that has to leave the sandbox, a push to a real remote or a commit
-//! into the user's own repository, cannot be done by saying yes here at all.
-//! The design is that the agent calls `request_action` with an
+//! **A push is now the exception, and it is carried out.** Saying yes to a
+//! `git push` runs the real git inside the sandbox, which reaches the remote
+//! through the network router and is given its credential over a socket for
+//! that one call: see `askpass.zig` and `agentproxy.zig`, and `src/run.zig`'s
+//! own `GitToolRunner.armPush`, which is what opens and closes it. The act
+//! still happens inside the sandbox, so the rule above is unchanged: an
+//! approval grants nothing the sandbox does not already allow.
+//!
+//! An act that has to leave the sandbox, a commit into the user's own
+//! repository or a branch delete there, still cannot be done by saying yes
+//! here at all. The design is that the agent calls `request_action` with an
 //! `actions.Action`, and the broker does it outside the sandbox, out of a
 //! payload that names the effect. **That tool takes one act, `workspace.apply`,
-//! and no act this file meets is that one.** A push, a commit into the user's
-//! repository and a branch delete are all refused by name there. So `Ask.kind`
-//! names which act it would be, and `Ask.advice` tells the agent the effect
-//! cannot be had in this build, and does not name a tool call that would work.
+//! and no act this file meets is that one.** So `Ask.kind` names which act it
+//! would be, and `Ask.advice` tells the agent the effect cannot be had in this
+//! build, and does not name a tool call that would work.
 //!
 //! **The shim cannot build that payload for the agent, and must not try.** The
 //! user approves the effect and never a shell line. An `actions.Action` holds a

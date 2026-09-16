@@ -127,11 +127,18 @@ own workspace, `git.commit` among them, so a project with no `chock.zon` gains
 no new prompt. It ships none for `git.push`, `git.clone`, `git.fetch`,
 `git.pull` or `git.unknown`, so each of those asks.
 
-**A subcommand that reaches another host is asked about and still does not run,
-even when a person says yes.** An act that leaves the sandbox is performed on
-the host, out of a payload that names the effect, and nothing builds such a
-payload for a git subcommand yet. The agent is told what is missing rather than
-told no. `file.write` is still a row nothing in a session asks.
+**An approved `git push` runs.** It is the one subcommand that reaches another
+host and is carried out: the real git runs inside the sandbox, reaches the
+remote through the network router, and gets its credential over a socket for
+that one call. An `https` remote prompts a person for a password, an `ssh`
+remote arms the agent proxy, and both are closed again when the call ends. See
+[credentials.md](credentials.md).
+
+**Every other subcommand that reaches another host is asked about and still
+does not run, even when a person says yes.** `git clone`, `git fetch` and
+`git pull` have no act that carries the effect out, so the agent is told what
+is missing rather than told no. `file.write` is still a row nothing in a
+session asks.
 
 `net.fetch` is `fetch_url`'s action, and the host is part of the name, with
 the labels reversed: `docs.ziglang.org` becomes `net.fetch.org.ziglang.docs`.

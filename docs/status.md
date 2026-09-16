@@ -274,25 +274,30 @@ tenth.
   attempts spanning about a minute, honouring `Retry-After` when the provider
   sends one. A broken stream is a different fault: the turn half happened, and
   sending it again is a larger change than the wait was.
-- **Nothing starts `git` with the password helper yet, so `git push` is asked
-  about and still does not run.** `chock askpass` is built: git or ssh asks
-  over a socket, the broker answers from the policy table, and the credential
-  never enters the sandbox. Two things are missing, and neither is small.
-  The first is the caller: `actions.performGitPush` blocks in `child.wait`, so
-  a real push needs a caller that spawns git and polls the endpoint while it
-  runs. The shape is proved by a test that does exactly that against real
-  `git`. The second is where a git password comes from at all: nothing fills a
-  `chock_broker.askpass.Grants`, and there is no way to put a credential in
-  one. Until both land, a person's yes to a `git.push` leads to a sentence
-  saying what is missing, rather than to a push.
+- **An approved `git push` runs.** The real git runs inside the sandbox,
+  reaches the remote through the network router, and is given its credential
+  over a socket for that one call: git runs `chock askpass`, which carries the
+  prompt to the broker and carries one answer back. Which credential is chosen by the remote's
+  own scheme, read on the host at approval time: an `https` remote prompts a
+  person for a password, an `ssh` remote arms the agent proxy, and a remote
+  that cannot be read refuses the push rather than guessing. Both are closed
+  again when the call ends, so the capability lasts as long as the act and no
+  longer. Every other subcommand that reaches another host is still asked
+  about and still does not run.
 
-  **The socket is not the answer to mounting it into the sandbox, either.**
-  A helper reachable from a tool call would let the agent ask for a password
-  for any host `secret.password.*` permits, as often as it likes, with no git
-  involved. That is a credential oracle and a different capability from "git
-  asked for the credential it needs". A push leaves the sandbox, so it belongs
-  with the other acts that leave it, performed on the host out of a payload
-  that names the effect.
+  **A password is prompted live and never stored.** There is no credential
+  store entry for one, no configuration field, and nothing written to disk.
+  The value is held for one tool call, covered by the redaction funnel for
+  exactly as long as it exists, and overwritten when the call ends. **A
+  private key is never copied**: an ssh agent signs and never hands a key out,
+  so the sandbox gets "can sign with this key" and not the key.
+
+  **The agent cannot use the socket as a credential oracle.** A helper
+  reachable from any tool call would let the agent ask for a password for any
+  host `secret.password.*` permits, as often as it likes, with no git
+  involved. Live prompting is what removes that: nothing can be had without a
+  person seeing a prompt, so the worst an agent can do is make noise, which is
+  visible and refusable.
 
 ## Known open items
 
