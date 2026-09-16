@@ -6500,12 +6500,17 @@ test "cancelRunningTool signals nothing at all when no tool call is running" {
     // The child below is an ordinary process of this same group, and it is
     // the whole assertion: a group that had been signalled ends it, so the
     // status it really exits with is the proof that nothing was.
-    var child = std.process.spawn(std.testing.io, .{
+    // **A spawn that fails is a failure and not a skip.** What these two tests
+    // pin is that a cancel with no call running cannot reach the caller's own
+    // process group, which holds the terminal. A skip here would report that
+    // claim as untested, and a machine with no `sleep` is a broken machine and
+    // not an unsupported one. Same rule as the probe child in `32658cc`.
+    var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ "sleep", "1" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch return error.SkipZigTest;
+    });
 
     // No call is running, which is the state a session is in between two tool
     // calls, and the state `chock run` spends most of a slow turn in. Every
@@ -6552,12 +6557,17 @@ test "a cancel through a slot whose call has ended reaches nobody" {
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 
-    var child = std.process.spawn(std.testing.io, .{
+    // **A spawn that fails is a failure and not a skip.** What these two tests
+    // pin is that a cancel with no call running cannot reach the caller's own
+    // process group, which holds the terminal. A skip here would report that
+    // claim as untested, and a machine with no `sleep` is a broken machine and
+    // not an unsupported one. Same rule as the probe child in `32658cc`.
+    var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ "sleep", "1" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch return error.SkipZigTest;
+    });
 
     // A handle on a process that then ends and is reaped. `std.process.spawn`
     // gives this test a child it can name, and `wait` below is the reap.
@@ -6584,12 +6594,12 @@ test "a cancel through a slot whose call has ended reaches nobody" {
 
     // Nothing in this process died from it either. A `cancelRunningTool` that
     // fell back to a group signal would have reached this test runner.
-    var still_here = std.process.spawn(std.testing.io, .{
+    var still_here = try std.process.spawn(std.testing.io, .{
         .argv = &.{"true"},
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
-    }) catch return error.SkipZigTest;
+    });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try still_here.wait(std.testing.io));
 }
 
