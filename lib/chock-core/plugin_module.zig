@@ -1088,7 +1088,7 @@ test "a module built to the shape a plugin has reads back the record it carries"
     defer read_module.deinit();
 
     try testing.expect(sample_record.eql(read_module.record()));
-    try testing.expectEqual(@as(u32, 1), read_module.abi_word);
+    try testing.expectEqual(@as(u32, @intFromEnum(core.AbiVersion.current)), read_module.abi_word);
     try testing.expectEqual(@as(u32, 0), read_module.init_function);
 }
 
@@ -1097,7 +1097,7 @@ test "a symbol that is an imported global is refused rather than guessed at" {
     // one thing this reader never does. A reader that read the defined globals
     // by the raw export index would read the wrong global here and hand a host
     // whatever bytes lay at that address.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .imported_globals = 1,
@@ -1122,7 +1122,7 @@ test "the import section shifts the global index space this reader reads" {
     // the very same module with the export indices moved up by the import
     // count must read correctly. A reader that ignored imports would pass the
     // test above by accident and fail this one.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .imported_globals = 2,
@@ -1145,7 +1145,7 @@ test "a global whose initialiser is not a constant is refused" {
     // `global.get` is the other form a linker emits. Its value is not in the
     // file, so there is nothing to read without running the module, and a
     // reader that took zero for it would answer with the wrong address.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, null },
@@ -1166,7 +1166,7 @@ test "a global whose initialiser is not a constant is refused" {
 }
 
 test "a symbol pointing at an address no data segment covers is refused" {
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         // The metadata global points a kilobyte past the end of the segment.
@@ -1189,7 +1189,7 @@ test "a passive data segment is in no memory, so a symbol into one is refused" {
     // A passive segment is copied into memory by a running module. Reading one
     // as though it were already there would be this reader deciding what the
     // module would have done, which is the one thing it must not do.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1210,7 +1210,7 @@ test "two data segments over one address are refused rather than resolved" {
     // the bytes a host reads and the bytes an engine would put in memory would
     // then be decided by a rule this reader has to copy exactly, and a plugin
     // has no reason to ask for it.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1239,7 +1239,7 @@ test "a blob split across two touching segments still reads" {
     // are ordinary linker output, so a blob that starts in one and ends in the
     // next must read: a reader that demanded one segment would break the first
     // time a linker split a section.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const cut = data.len / 2;
     const module = try buildModule(.{
@@ -1265,7 +1265,7 @@ test "a blob split across two touching segments still reads" {
 test "a hole between two segments is not read as zeros" {
     // A byte no segment covers is a byte a running module would read as zero,
     // and a zero this reader invented is a value the module never wrote.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const cut = data.len / 2;
     const module = try buildModule(.{
@@ -1288,7 +1288,7 @@ test "a hole between two segments is not read as zeros" {
 test "a module with no chock_plugin_magic is not a Chock plugin" {
     // The symbol name is the magic. Its absence is the whole answer, and it is
     // a different answer from a plugin built for another Chock.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1313,7 +1313,7 @@ test "a module with no chock_plugin_magic is not a Chock plugin" {
 test "a plugin with no chock_plugin_init is refused at load and not at call" {
     // A plugin whose tool bodies can never be bound is a plugin that half
     // works, which is the failure the collision rule is written against too.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1331,7 +1331,7 @@ test "a plugin with no chock_plugin_init is refused at load and not at call" {
 }
 
 test "a symbol exported as the wrong kind of thing is refused by name" {
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },
@@ -1360,7 +1360,7 @@ test "a module that exports one name twice is refused" {
     // Two exports of one name would ask this reader to choose which of them a
     // host reads, and a module that could choose that could show one thing to
     // a reader and hand another to an engine.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4, 0 },
@@ -1394,10 +1394,16 @@ test "the ABI in the magic symbol and the ABI in the blob must agree" {
     try testing.expectError(error.AbiDisagrees, read(testing.allocator, module, &refusal));
     const text = try sentence(refusal.?);
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings(
-        "the module says it is plugin ABI 9 and its metadata says ABI 1",
-        text,
+    // The number the blob states comes from the enum and not from a literal,
+    // so a later ABI keeps this measuring the disagreement rather than the
+    // version it was written in.
+    const want = try std.fmt.allocPrint(
+        testing.allocator,
+        "the module says it is plugin ABI 9 and its metadata says ABI {d}",
+        .{@intFromEnum(core.AbiVersion.current)},
     );
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, text);
 }
 
 test "a file that is not wasm is refused before a section is walked" {
@@ -1441,7 +1447,7 @@ test "a wasm binary format this reader does not know is refused by number" {
 }
 
 test "a section that runs past the end of the file is refused" {
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try sampleModule(data);
     defer testing.allocator.free(module);
@@ -1493,7 +1499,7 @@ test "the memory a module declares costs this reader nothing" {
     // A module states how many pages it wants and that number is free to be
     // enormous. Nothing here is allocated from it, and the only bytes this
     // reader holds are the ones the file really carries.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         // Four gibibytes, the most a wasm32 module can name.
@@ -1517,7 +1523,7 @@ test "a blob that states a length above the bound is refused before it is alloca
     // The length is the first number in a blob that a reader could act on, and
     // it comes from a file somebody else wrote. `core.Prefix.read` bounds it,
     // and this pins that the bound is read before the allocation is made.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     std.mem.writeInt(u32, data[4 + core.Prefix.total_len_offset ..][0..4], std.math.maxInt(u32), .little);
 
@@ -1534,7 +1540,7 @@ test "a blob that states more bytes than the module carries is refused" {
     // and past the end of the data the module really holds. A reader that
     // filled the rest with zeros would hand a host a record the plugin never
     // wrote.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const stated = @as(u32, @intCast(data.len - 4)) + 64;
     std.mem.writeInt(u32, data[4 + core.Prefix.total_len_offset ..][0..4], stated, .little);
@@ -1552,7 +1558,7 @@ test "a symbol holding a negative address is refused rather than cast" {
     // reader that cast one to the other would turn a small negative number
     // into an enormous address, which is a different question from the one the
     // module asked.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ -4, sample_address + 4 },
@@ -1575,7 +1581,7 @@ test "a passive segment is not read as though it sat at address zero" {
     // a passive segment at zero would get away with it: the symbols point at
     // address zero as well, so only a reader that leaves a passive segment out
     // of memory altogether refuses this.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ 0, 4 },
@@ -1613,7 +1619,7 @@ test "chock_plugin_init exported as anything but a function is refused" {
     // The host calls this symbol and nothing else. A module that exported a
     // global under the name would have the host calling whatever function
     // index that global's value happened to be.
-    const data = try sampleData(1);
+    const data = try sampleData(@intFromEnum(core.AbiVersion.current));
     defer testing.allocator.free(data);
     const module = try buildModule(.{
         .globals = &.{ sample_address, sample_address + 4 },

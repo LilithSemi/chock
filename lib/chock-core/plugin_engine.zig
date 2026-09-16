@@ -307,6 +307,13 @@ pub const Runner = struct {
     bound: u32 = 0,
     /// Whether the guest has been instantiated and initialised.
     ready: bool = false,
+    /// What each tool takes, in the tool's own order, read out of the module's
+    /// metadata by `load`.
+    ///
+    /// **Borrowed from the module the caller read**, which the caller keeps
+    /// alive for as long as this runner. A copy here would be a second record
+    /// to keep in step with the one the host already has.
+    tools: []const core.ToolDescriptor = &.{},
     /// Why the last `error.EngineRefused` was answered.
     ///
     /// **The latest and not the first**, which is the opposite of
@@ -332,7 +339,7 @@ pub const Runner = struct {
         self: *Runner,
         gpa: std.mem.Allocator,
         module: []const u8,
-        declared_tools: usize,
+        declared: []const core.ToolDescriptor,
         wanted: []const Import,
         capabilities: []const []const u8,
         refused: ?*?Refused,
@@ -361,9 +368,10 @@ pub const Runner = struct {
 
         const bound = self.engine.call0(core.init_symbol) catch |err|
             return self.refuse(.init_call, err);
-        if (bound != declared_tools) return error.ToolCountDisagrees;
+        if (bound != declared.len) return error.ToolCountDisagrees;
 
         self.bound = bound;
+        self.tools = declared;
         self.ready = true;
     }
 
@@ -371,7 +379,19 @@ pub const Runner = struct {
     /// own memory, so a caller copies it before the next call.
     ///
     /// `index` is the tool's position in the metadata's own tool list.
-    pub fn call(self: *Runner, index: u32, arguments: []const u8) Error!plugin.Outcome {
+    /// `arguments` is the JSON the model wrote.
+    ///
+    /// **The parse is here and never in the guest.** This is the last hop
+    /// before guest code, and it is the last place that has both the model's
+    /// text and the schema the tool declared. See
+    /// `lib/chock-plugin-core/args.zig` for the measurement that decided it.
+    /// `gpa` holds the record until this call returns.
+    pub fn call(
+        self: *Runner,
+        gpa: std.mem.Allocator,
+        index: u32,
+        arguments: []const u8,
+    ) Error!plugin.Outcome {
         // See `load`: a `refusal` from an earlier call must never be read as
         // the reason for this one.
         self.refusal = null;
@@ -379,7 +399,9 @@ pub const Runner = struct {
         if (!self.ready) return self.refuse(.before_instantiation, null);
         if (index >= self.bound) return self.refuse(.tool_index, null);
 
-        const written = try self.writeArguments(arguments);
+        const record = try self.recordFor(gpa, index, arguments);
+        defer gpa.free(record);
+        const written = try self.writeArguments(record);
 
         const address = self.engine.call3(
             core.call_symbol,
@@ -412,12 +434,50 @@ pub const Runner = struct {
         return error.EngineRefused;
     }
 
-    /// Where the argument text went in the guest's memory, and how much of it.
+    /// The record for one call, built from the model's text and the tool's own
+    /// schema. The caller owns it and frees it with `gpa.free`.
+    ///
+    /// **A tool that takes nothing gets no bytes at all**, without the text
+    /// being parsed, so the ordinary plugin pays nothing for this.
+    ///
+    /// The host that started this process already checked the arguments against
+    /// the same schema, so a refusal here means the two disagree. It is still
+    /// answered rather than asserted, because the two are separate programs.
+    fn recordFor(
+        self: *Runner,
+        gpa: std.mem.Allocator,
+        index: u32,
+        arguments: []const u8,
+    ) Error![]u8 {
+        const properties = if (index < self.tools.len) self.tools[index].parameters else &.{};
+        if (properties.len == 0) return gpa.alloc(u8, 0);
+
+        const trimmed = std.mem.trim(u8, arguments, " \t\r\n");
+        const text = if (trimmed.len == 0) "{}" else trimmed;
+
+        var parsed: std.json.Parsed(std.json.Value) = std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            text,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.refuse(.arguments_call, error.ArgumentsUnreadable),
+        };
+        defer parsed.deinit();
+
+        return core.args.encodeAlloc(gpa, properties, parsed.value) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.refuse(.arguments_call, err),
+        };
+    }
+
+    /// Where the argument record went in the guest's memory, and how much of it.
     const Written = struct { address: u32, length: u32 };
 
-    /// Put the argument text where the guest said it may go.
+    /// Put the argument record where the guest said it may go.
     ///
-    /// Nothing is written for an empty text, so a tool called with no argument
+    /// Nothing is written for an empty record, so a tool that takes nothing
     /// never reaches into guest memory at all.
     fn writeArguments(self: *Runner, arguments: []const u8) Error!Written {
         if (arguments.len == 0) return .{ .address = 0, .length = 0 };
@@ -496,6 +556,25 @@ pub fn unionOfCapabilities(
 // allowed to be the only test of anything.
 
 const testing = std.testing;
+
+/// One tool, for a test that only needs a count. Every test here measures the
+/// gate and the call ABI, not what a tool takes, so the tool takes nothing.
+const one_tool: [1]core.ToolDescriptor = .{.{ .name = "hello" }};
+
+/// What a model writes for `typed_tool`.
+const who = "{\"who\":\"Ross\"}";
+
+/// One tool that takes a string, for the tests that measure the argument
+/// record. `plugins/hello.zig` declares the same shape.
+const typed_tool: [1]core.ToolDescriptor = .{.{
+    .name = "greet",
+    .parameters = &.{.{
+        .name = "who",
+        .description = "Who to greet.",
+        .required = true,
+        .shape = .{ .kind = .string },
+    }},
+}};
 
 /// An engine that runs nothing and answers what a test tells it to. It exists
 /// for the cases a real module cannot be made to show: an engine that refuses,
@@ -602,11 +681,11 @@ test "a module that imports nothing runs, and the engine is handed no address" {
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
 
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
     try testing.expect(fake.instantiated);
     try testing.expectEqual(@as(usize, 0), fake.supplied);
 
-    const outcome = try runner.call(0, "");
+    const outcome = try runner.call(testing.allocator, 0, "");
     try testing.expectEqualStrings("Hello, world!", outcome.text);
     try testing.expect(!outcome.is_error);
 }
@@ -627,7 +706,7 @@ test "a module that imports anything is refused before it is instantiated" {
     var refused: ?Refused = null;
     try testing.expectError(
         error.ImportNotDeclared,
-        runner.load(testing.allocator, "module", 1, fake.wanted, &.{"fs.read"}, &refused),
+        runner.load(testing.allocator, "module", &one_tool, fake.wanted, &.{"fs.read"}, &refused),
     );
     // Nothing of the guest ran, which is the property that matters: the engine
     // was never told to build anything.
@@ -660,7 +739,7 @@ test "a guest whose bound count disagrees with its metadata is refused" {
     var runner: Runner = .{ .engine = fake.engine() };
     try testing.expectError(
         error.ToolCountDisagrees,
-        runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+        runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null),
     );
     try testing.expect(!runner.ready);
 }
@@ -675,12 +754,12 @@ test "an answer pointing past the guest's own memory is refused rather than read
     var guest: [1024]u8 = @splat(0);
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
 
     // A text that starts inside the memory and ends outside it.
     std.mem.writeInt(u32, guest[16 + core.call.Answer.text_ptr_offset ..][0..4], 1000, .little);
     std.mem.writeInt(u32, guest[16 + core.call.Answer.text_len_offset ..][0..4], 500, .little);
-    try testing.expectError(error.GuestMisbehaved, runner.call(0, ""));
+    try testing.expectError(error.GuestMisbehaved, runner.call(testing.allocator, 0, ""));
 }
 
 test "a tool index no guest bound is refused without reaching the engine" {
@@ -690,10 +769,10 @@ test "a tool index no guest bound is refused without reaching the engine" {
     stageAnswer(&guest, 16, .success, "unreachable");
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
 
-    try testing.expectError(error.EngineRefused, runner.call(1, ""));
-    try testing.expectError(error.EngineRefused, runner.call(99, ""));
+    try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 1, ""));
+    try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 99, ""));
 }
 
 test "a runner that never loaded refuses every call" {
@@ -705,10 +784,10 @@ test "a runner that never loaded refuses every call" {
 
     try testing.expectError(
         error.EngineRefused,
-        runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+        runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null),
     );
     try testing.expect(!runner.ready);
-    try testing.expectError(error.EngineRefused, runner.call(0, ""));
+    try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 0, ""));
 }
 
 test "every refusal names the call it came out of" {
@@ -727,14 +806,14 @@ test "every refusal names the call it came out of" {
         var runner: Runner = .{ .engine = fake.engine() };
         try testing.expectError(
             error.EngineRefused,
-            runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+            runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null),
         );
         try testing.expectEqual(Diagnostic.Call.instantiate, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
 
         // The same runner, still not ready, refuses a call for a different
         // reason, and says so.
-        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 0, ""));
         try testing.expectEqual(Diagnostic.Call.before_instantiation, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
     }
@@ -744,7 +823,7 @@ test "every refusal names the call it came out of" {
         var runner: Runner = .{ .engine = fake.engine() };
         try testing.expectError(
             error.EngineRefused,
-            runner.load(testing.allocator, "module", 1, &.{}, &.{}, null),
+            runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null),
         );
         try testing.expectEqual(Diagnostic.Call.init_call, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
@@ -754,8 +833,8 @@ test "every refusal names the call it came out of" {
         stageAnswer(&guest, 16, .success, "unreachable");
         var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
         var runner: Runner = .{ .engine = fake.engine() };
-        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
-        try testing.expectError(error.EngineRefused, runner.call(1, ""));
+        try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 1, ""));
         try testing.expectEqual(Diagnostic.Call.tool_index, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
     }
@@ -768,8 +847,8 @@ test "every refusal names the call it came out of" {
             .refusing_symbol = arguments_symbol,
         };
         var runner: Runner = .{ .engine = fake.engine() };
-        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
-        try testing.expectError(error.EngineRefused, runner.call(0, "{\"a\":1}"));
+        try runner.load(testing.allocator, "module", &typed_tool, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 0, who));
         try testing.expectEqual(Diagnostic.Call.arguments_call, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
     }
@@ -781,8 +860,8 @@ test "every refusal names the call it came out of" {
             .refusing_symbol = core.call_symbol,
         };
         var runner: Runner = .{ .engine = fake.engine() };
-        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
-        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 0, ""));
         try testing.expectEqual(Diagnostic.Call.tool_call, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, error.Refused), runner.refusal.?.cause);
     }
@@ -792,8 +871,8 @@ test "every refusal names the call it came out of" {
         // and it is what `FakeEngine` answers by default.
         var fake: FakeEngine = .{ .guest = &guest, .answer_at = core.call.no_answer };
         var runner: Runner = .{ .engine = fake.engine() };
-        try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
-        try testing.expectError(error.EngineRefused, runner.call(0, ""));
+        try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
+        try testing.expectError(error.EngineRefused, runner.call(testing.allocator, 0, ""));
         try testing.expectEqual(Diagnostic.Call.empty_answer, runner.refusal.?.call);
         try testing.expectEqual(@as(?anyerror, null), runner.refusal.?.cause);
     }
@@ -841,9 +920,9 @@ test "arguments the guest has no room for are refused, and never written anyway"
     var guest: [1024]u8 = @splat(0);
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16, .arguments_at = 0 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &typed_tool, &.{}, &.{}, null);
 
-    try testing.expectError(error.ArgumentsTooLong, runner.call(0, "{\"a\":1}"));
+    try testing.expectError(error.ArgumentsTooLong, runner.call(testing.allocator, 0, who));
     // Nothing was written: the first bytes of the guest's memory are still the
     // answer record this test staged and not the arguments.
     try testing.expectEqual(@as(u8, 0), guest[0]);
@@ -858,23 +937,84 @@ test "an argument address the guest answered is checked before anything is writt
     var guest: [1024]u8 = @splat(0);
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16, .arguments_at = 1020 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &typed_tool, &.{}, &.{}, null);
 
-    try testing.expectError(error.GuestMisbehaved, runner.call(0, "{\"a\":1}"));
+    try testing.expectError(error.GuestMisbehaved, runner.call(testing.allocator, 0, who));
 }
 
-test "arguments that fit really reach the guest's memory" {
+test "the model's arguments reach the guest as the record its schema names" {
     // The other side of the two tests above: the ordinary path has to work, or
-    // `Context.arguments` is a field a tool body can never read.
+    // a tool body is never handed anything at all.
+    //
+    // **And what lands is the record and not the model's own text.** The bytes
+    // below are a present byte, a length of four, and the four letters, which
+    // is what `chock_plugin_core.args` writes for one required string. A host
+    // that passed the JSON through would put a brace at offset 512.
+    //
+    // Mutation check: write `arguments` instead of the record and this fails on
+    // the first byte.
     var guest: [1024]u8 = @splat(0);
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16, .arguments_at = 512 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &typed_tool, &.{}, &.{}, null);
 
     stageAnswer(&guest, 16, .success, "done");
-    const outcome = try runner.call(0, "{\"a\":1}");
+    const outcome = try runner.call(testing.allocator, 0, who);
     try testing.expectEqualStrings("done", outcome.text);
-    try testing.expectEqualStrings("{\"a\":1}", guest[512..][0..7]);
+    try testing.expectEqualSlices(u8, &.{ 1, 4, 0, 0, 0 }, guest[512..][0..5]);
+    try testing.expectEqualStrings("Ross", guest[517..][0..4]);
+}
+
+test "a tool that takes nothing is handed no bytes at all" {
+    // The ordinary plugin. It must reach into the guest's memory for nothing,
+    // which is what it did before a tool could take an argument.
+    //
+    // Mutation check: write a record for a tool with no property and the guest
+    // memory below stops being untouched.
+    var guest: [1024]u8 = @splat(0);
+    var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16, .arguments_at = 512 };
+    var runner: Runner = .{ .engine = fake.engine() };
+    try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
+
+    stageAnswer(&guest, 16, .success, "done");
+    const outcome = try runner.call(testing.allocator, 0, who);
+    try testing.expectEqualStrings("done", outcome.text);
+    try testing.expectEqualSlices(u8, &(.{0} ** 16), guest[512..][0..16]);
+
+    // **And its arguments are never read at all**, so a tool that takes
+    // nothing is not refused over text nobody was going to look at. This is
+    // what the early answer in `recordFor` is for.
+    const anyway = try runner.call(testing.allocator, 0, "not json");
+    try testing.expectEqualStrings("done", anyway.text);
+    try testing.expect(!anyway.is_error);
+}
+
+test "arguments that do not match the schema are refused before the guest runs" {
+    // The harness checked them already, so this is the second line. It is here
+    // because the two are separate programs: a harness that skipped the check
+    // must not be able to hand a guest a number where a string belongs.
+    var guest: [1024]u8 = @splat(0);
+    var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16, .arguments_at = 512 };
+    var runner: Runner = .{ .engine = fake.engine() };
+    try runner.load(testing.allocator, "module", &typed_tool, &.{}, &.{}, null);
+
+    try testing.expectError(
+        error.EngineRefused,
+        runner.call(testing.allocator, 0, "{\"who\":7}"),
+    );
+    try testing.expectEqual(Diagnostic.Call.arguments_call, runner.refusal.?.call);
+    try testing.expectEqual(@as(?anyerror, error.TypeMismatch), runner.refusal.?.cause);
+
+    // And text that is not JSON at all, which is the other way a call arrives
+    // wrong.
+    try testing.expectError(
+        error.EngineRefused,
+        runner.call(testing.allocator, 0, "not json"),
+    );
+    try testing.expectEqual(
+        @as(?anyerror, error.ArgumentsUnreadable),
+        runner.refusal.?.cause,
+    );
 }
 
 test "a tool that failed is a result and not a fault of this host" {
@@ -885,9 +1025,9 @@ test "a tool that failed is a result and not a fault of this host" {
     stageAnswer(&guest, 16, .failure, "no such file");
     var fake: FakeEngine = .{ .guest = &guest, .answer_at = 16 };
     var runner: Runner = .{ .engine = fake.engine() };
-    try runner.load(testing.allocator, "module", 1, &.{}, &.{}, null);
+    try runner.load(testing.allocator, "module", &one_tool, &.{}, &.{}, null);
 
-    const outcome = try runner.call(0, "");
+    const outcome = try runner.call(testing.allocator, 0, "");
     try testing.expect(outcome.is_error);
     try testing.expectEqualStrings("no such file", outcome.text);
 }

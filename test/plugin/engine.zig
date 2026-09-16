@@ -252,6 +252,82 @@ test "a plugin tool call really runs guest code and answers what the guest said"
     try testing.expect(!outcome.is_error);
 }
 
+test "a typed argument reaches the real guest as a value of the tool's own type" {
+    // **The acceptance test of argument schemas, end to end.** The schema was
+    // built from `GreetTool` while the plugin compiled, travelled in the
+    // metadata blob, was read by a host with no engine, checked against what
+    // the model wrote, written as a record, and read back into a field of the
+    // tool's own struct. The body answers `args.who`, so the name below can
+    // only have come through all of it.
+    //
+    // Mutation check: hand the guest the model's JSON instead of the record
+    // and the answer becomes a refusal. Drop a field from the schema on the
+    // way out and the record no longer matches the struct, which is the same
+    // refusal.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var host = try Host.start(gpa, io, wasm_path, &.{});
+    defer host.stop(io);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var protocol = plugin_host.Protocol{ .gpa = gpa };
+    defer protocol.deinit();
+
+    const outcome = try protocol.call(
+        arena_state.allocator(),
+        io,
+        &host.channel,
+        generousDeadline(io),
+        1,
+        "{\"who\":\"Ross\"}",
+    );
+    try testing.expectEqualStrings("Ross", outcome.text);
+    try testing.expect(!outcome.is_error);
+
+    // And the optional field really is optional on the way in, and really
+    // reaches the body when it is set.
+    const shouted = try protocol.call(
+        arena_state.allocator(),
+        io,
+        &host.channel,
+        generousDeadline(io),
+        1,
+        "{\"who\":\"Ross\",\"loudly\":true}",
+    );
+    try testing.expectEqualStrings("HELLO!", shouted.text);
+}
+
+test "the real plugin says what its tools take, read with no engine at all" {
+    // Discovery still costs no guest execution. The schema is in the same
+    // record as the tool's name, so a host learns what a tool takes at the
+    // moment it learns the tool exists, and before it has decided to load the
+    // plugin at all.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        wasm_path,
+        gpa,
+        .limited(plugin_module.max_module_bytes),
+    );
+    defer gpa.free(bytes);
+
+    var read = try plugin_module.read(gpa, bytes, null);
+    defer read.deinit();
+
+    const greet = read.record().tools[1];
+    try testing.expectEqualStrings("greet", greet.name);
+    try testing.expectEqual(@as(usize, 2), greet.parameters.len);
+    try testing.expectEqualStrings("who", greet.parameters[0].name);
+    try testing.expect(greet.parameters[0].required);
+    try testing.expectEqual(core.Kind.string, greet.parameters[0].shape.kind);
+    try testing.expect(!greet.parameters[1].required);
+    try testing.expectEqual(core.Kind.boolean, greet.parameters[1].shape.kind);
+}
+
 test "the same process answers a second call, and is not restarted between them" {
     // A plugin host outlives one tool call: that is the whole reason it is a
     // helper and not a process per call. A second call must reach the guest
@@ -355,7 +431,7 @@ test "a module that imports anything is stopped before it runs, and named" {
     // not, this test would be measuring a broken file and not the gate.
     var read = try plugin_module.read(gpa, spliced, null);
     defer read.deinit();
-    try testing.expectEqual(@as(usize, 1), read.record().tools.len);
+    try testing.expectEqual(@as(usize, 2), read.record().tools.len);
 
     const path = try writeTemporary(gpa, spliced);
     defer gpa.free(path);

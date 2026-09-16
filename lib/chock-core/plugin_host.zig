@@ -533,7 +533,7 @@ fn runOne(
         .is_error = true,
     };
 
-    const outcome = live.call(request.index, request.arguments) catch |err| return .{
+    const outcome = live.call(arena, request.index, request.arguments) catch |err| return .{
         // **The refusal's own sentence where there is one.**
         // `error.EngineRefused` is answered from seven places in
         // `plugin_engine.Runner`, and the name alone names none of them.

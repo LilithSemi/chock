@@ -97,6 +97,21 @@ pub const max_capabilities_per_tool = 16;
 /// segments, such as `fs.read` or `net.connect.com.github.api.443`.
 pub const max_capability_bytes = 128;
 
+/// The largest argument schema this host carries for one tool.
+///
+/// **The same number, from the same place, for the same reason.**
+/// `mcp.max_schema_bytes` bounds the schema an MCP server states, which is the
+/// same hazard one supplier away: a schema a third party wrote, going into
+/// every request of the session. Eight kibibytes is far above any real one.
+///
+/// **A tool above it is refused and never carried with an empty schema.** An
+/// MCP tool whose schema is too large keeps its name and loses its schema,
+/// because the server is still the only thing that can run it. A plugin tool
+/// has an argument type behind the schema, so an empty schema would tell the
+/// model the tool takes nothing while the plugin still needs a field, which is
+/// a wrong answer rather than a thin one.
+pub const max_schema_bytes = mcp.max_schema_bytes;
+
 /// The locale this host reads a description in.
 ///
 /// Chock translates nothing itself, so a plugin that carries no description in
@@ -247,6 +262,12 @@ pub const Refusal = enum {
     /// own action leaves it offered and decided one call at a time: see
     /// `Session.dispatch`.
     policy,
+    /// Its argument schema holds a field name this host will not put in front
+    /// of the model, or it nests deeper than this host reads.
+    schema_unusable,
+    /// Its argument schema is larger than this host carries. See
+    /// `max_schema_bytes`.
+    schema_too_large,
     /// This project's policy does not answer `allow` for one of the
     /// capabilities the tool declares.
     ///
@@ -265,6 +286,8 @@ pub const Refusal = enum {
             .name_unusable => "its name holds bytes a tool name cannot hold",
             .already_declared => "another tool of this session already holds that name",
             .capability_unusable => "it declares a capability that is not an action name",
+            .schema_unusable => "its argument schema holds a field this host cannot describe",
+            .schema_too_large => "its argument schema is larger than this host carries",
             .policy => "this project's policy denies it",
             .capability_policy => "this project's policy does not allow a capability it declares",
         };
@@ -582,6 +605,17 @@ pub const Session = struct {
             // anything longer.
             const description = try lsp.flattenMessage(keep, describe(tool.description));
 
+            // **The schema, bounded, and a bound that fires refuses the tool.**
+            // Everything in it was written by somebody else, it goes into every
+            // request of the session, and the model writes its arguments
+            // against it, so a schema this host cannot carry whole is a schema
+            // it must not carry at all: see `max_schema_bytes`.
+            var schema_refusal: ?Refusal = null;
+            const parameters = if (refusal != null)
+                try emptyObject(keep)
+            else
+                try schemaInto(keep, tool.parameters, &schema_refusal) orelse try emptyObject(keep);
+
             try self.offers.append(gpa, .{
                 .plugin = name,
                 .name = kept_name,
@@ -596,11 +630,11 @@ pub const Session = struct {
                 // somebody asked into a tool nobody was ever offered and
                 // nobody was ever asked about. They are decided one call at a
                 // time now: see `dispatch`.
-                .refused = refusal orelse priced,
+                .refused = refusal orelse schema_refusal orelse priced,
                 .definition = .{
                     .name = kept_name,
                     .description = description,
-                    .parameters = try emptyObject(keep),
+                    .parameters = parameters,
                 },
             });
         }
@@ -709,18 +743,31 @@ pub const Session = struct {
             .is_error = true,
         };
 
-        // **After the cheap local checks, and before anything reaches the
-        // host.** A question spent on a call that could not have run either
-        // way costs a person's attention for nothing, the rule
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+
+        // **The arguments are checked against the very object the model was
+        // shown, and before anybody is asked about the call.** A call whose
+        // arguments do not match could not have run either way, so asking a
+        // person about it spends their attention for nothing: the rule
         // `chock_broker.Broker.reviewed` already keeps for a review it knows
-        // cannot finish. Nothing above this line reaches the plugin.
+        // cannot finish. The model reads the complaint and writes the call
+        // again.
+        if (try argumentComplaint(
+            arena_state.allocator(),
+            offer.definition.parameters,
+            call.arguments,
+        )) |complaint| return .{
+            .text = try std.fmt.allocPrint(gpa, "{s}: {s}", .{ name, complaint }),
+            .is_error = true,
+        };
+
+        // **After the cheap local checks, and before anything reaches the
+        // host.** Nothing above this line reaches the plugin.
         if (try self.refusalFrom(gpa, io, offer, call.call_id)) |text| return .{
             .text = text,
             .is_error = true,
         };
-
-        var arena_state: std.heap.ArenaAllocator = .init(gpa);
-        defer arena_state.deinit();
 
         const answer = loaded.host.call(
             arena_state.allocator(),
@@ -875,13 +922,233 @@ fn describe(fields: []const core.LocaleField) []const u8 {
     return "";
 }
 
+/// What is wrong with the arguments the model wrote, measured against the
+/// schema this host advertised for the tool, or null when nothing is.
+///
+/// **The host checks, and the plugin is not the gate.** A plugin is third party
+/// code: a tool body that is handed a field it did not ask for, or that is
+/// missing one it did, is a tool body deciding what to do about a mistake
+/// nobody here wrote. Checking here means the plugin only ever runs on
+/// arguments that match what it said it takes.
+///
+/// **A field the schema does not name is left alone.** A model that adds a word
+/// to a call it otherwise got right is told nothing, because the guest's own
+/// decoder ignores what it does not know, and refusing the whole call over it
+/// would cost a turn for nothing.
+///
+/// The text is borrowed from `arena`.
+fn argumentComplaint(
+    arena: std.mem.Allocator,
+    schema: std.json.Value,
+    text: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    // A call with nothing in it is a call with no field set, which is what an
+    // empty object says. Every provider writes one or the other.
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const source = if (trimmed.len == 0) "{}" else trimmed;
+
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, source, .{}) catch
+        return "the arguments are not JSON";
+
+    return try objectComplaint(arena, schema, parsed, "");
+}
+
+/// One object measured against one object schema. `where` names the field this
+/// object came from, so a complaint about a nested record says which one.
+fn objectComplaint(
+    arena: std.mem.Allocator,
+    schema: std.json.Value,
+    value: std.json.Value,
+    where: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    if (value != .object) {
+        return try std.fmt.allocPrint(arena, "{s}must be a JSON object", .{whose(where)});
+    }
+    if (schema != .object) return null;
+
+    if (schema.object.get("required")) |required| {
+        if (required == .array) {
+            for (required.array.items) |one| {
+                if (one != .string) continue;
+                if (value.object.get(one.string) == null) {
+                    return try std.fmt.allocPrint(
+                        arena,
+                        "{s}leaves out the field \"{s}\", which this tool needs",
+                        .{ whose(where), one.string },
+                    );
+                }
+            }
+        }
+    }
+
+    const properties = schema.object.get("properties") orelse return null;
+    if (properties != .object) return null;
+
+    var walk = value.object.iterator();
+    while (walk.next()) |entry| {
+        const declared = properties.object.get(entry.key_ptr.*) orelse continue;
+        if (try valueComplaint(arena, declared, entry.value_ptr.*, entry.key_ptr.*)) |complaint| {
+            return complaint;
+        }
+    }
+    return null;
+}
+
+/// One value measured against one value's schema.
+fn valueComplaint(
+    arena: std.mem.Allocator,
+    schema: std.json.Value,
+    value: std.json.Value,
+    where: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    if (schema != .object) return null;
+    const declared = schema.object.get("type") orelse return null;
+    if (declared != .string) return null;
+
+    // **A null is a field left out and not a field of the wrong type.** Every
+    // provider writes one for an argument the model chose not to set, and a
+    // required field that arrived as null was already caught above.
+    if (value == .null) return null;
+
+    const kind = core.Kind.fromJsonName(declared.string) orelse return null;
+    switch (kind) {
+        .object => return try objectComplaint(arena, schema, value, where),
+        .array => {
+            if (value != .array) return try wrongType(arena, where, "an array");
+            const items = schema.object.get("items") orelse return null;
+            for (value.array.items) |one| {
+                if (try valueComplaint(arena, items, one, where)) |complaint| return complaint;
+            }
+            return null;
+        },
+        .string => if (value != .string) return try wrongType(arena, where, "a string"),
+        .boolean => if (value != .bool) return try wrongType(arena, where, "true or false"),
+        .integer => if (value != .integer) return try wrongType(arena, where, "a whole number"),
+        .number => if (value != .integer and value != .float) {
+            return try wrongType(arena, where, "a number");
+        },
+    }
+    return null;
+}
+
+fn wrongType(
+    arena: std.mem.Allocator,
+    where: []const u8,
+    wanted: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(arena, "the field \"{s}\" must be {s}", .{ where, wanted });
+}
+
+/// How a complaint names what it is about. The arguments as a whole have no
+/// field name, so they are named by what they are.
+fn whose(where: []const u8) []const u8 {
+    return if (where.len == 0) "the arguments " else "that field ";
+}
+
+/// One tool's argument schema, in `keep`, ready to go in front of the model.
+///
+/// Answers null and fills `refusal` when a bound this host keeps says no. Every
+/// one of them is about text somebody else wrote:
+///
+/// * **A field name has to be a name.** The same rule a tool name is held to,
+///   reused whole: letters, digits, hyphen and underscore, up to
+///   `max_name_bytes`. The model writes this name back as a JSON key, and a
+///   key holding a quote, a newline, or a byte that is not UTF-8 is a request
+///   the provider answers 400 to.
+/// * **A field description is flattened and cut**, by `lsp.flattenMessage`,
+///   exactly like the tool description above it. Same hazard, same answer:
+///   third party text going into the model's context.
+/// * **The whole thing is measured after it is rendered**, against
+///   `max_schema_bytes`. A schema above it refuses the tool.
+///
+/// The nesting is bounded twice. `core.wire` refuses a blob that nests past
+/// `core.max_schema_depth` before it allocates anything for it, and this walk
+/// checks again, because a caller may build a record by hand rather than read
+/// one out of a file.
+fn schemaInto(
+    keep: std.mem.Allocator,
+    properties: []const core.Property,
+    refusal: *?Refusal,
+) std.mem.Allocator.Error!?std.json.Value {
+    const copied = try copyProperties(keep, properties, 0, refusal) orelse return null;
+    const value = try core.schema.jsonValue(copied, keep);
+
+    // Rendered and measured, and not guessed at from the parts. What costs
+    // context is the text the provider is sent, so that is the thing to bound.
+    const text = std.json.Stringify.valueAlloc(keep, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    if (text.len > max_schema_bytes) {
+        refusal.* = .schema_too_large;
+        return null;
+    }
+    return value;
+}
+
+/// Every property, copied into `keep`, with the bounds above applied. Null with
+/// `refusal` filled when one of them says no.
+///
+/// The depth is checked by `copyShape` and not here. Every road into this
+/// function has already passed through that one at the same depth, so a check
+/// here would never fire.
+fn copyProperties(
+    keep: std.mem.Allocator,
+    properties: []const core.Property,
+    depth: u32,
+    refusal: *?Refusal,
+) std.mem.Allocator.Error!?[]const core.Property {
+    if (properties.len > core.max_properties) {
+        refusal.* = .schema_unusable;
+        return null;
+    }
+
+    const out = try keep.alloc(core.Property, properties.len);
+    for (out, properties) |*slot, property| {
+        if (!nameIsUsable(property.name)) {
+            refusal.* = .schema_unusable;
+            return null;
+        }
+        slot.* = .{
+            .name = try keep.dupe(u8, property.name),
+            .description = try lsp.flattenMessage(keep, property.description),
+            .required = property.required,
+            .shape = try copyShape(keep, property.shape, depth + 1, refusal) orelse return null,
+        };
+    }
+    return out;
+}
+
+fn copyShape(
+    keep: std.mem.Allocator,
+    shape: core.Shape,
+    depth: u32,
+    refusal: *?Refusal,
+) std.mem.Allocator.Error!?core.Shape {
+    if (depth > core.max_schema_depth) {
+        refusal.* = .schema_unusable;
+        return null;
+    }
+    switch (shape.kind) {
+        .array => {
+            const item = shape.items orelse return core.Shape{ .kind = .array };
+            const copied = try keep.create(core.Shape);
+            copied.* = try copyShape(keep, item.*, depth + 1, refusal) orelse return null;
+            return core.Shape{ .kind = .array, .items = copied };
+        },
+        .object => return core.Shape{
+            .kind = .object,
+            .properties = try copyProperties(keep, shape.properties, depth, refusal) orelse return null,
+        },
+        else => return core.Shape{ .kind = shape.kind },
+    }
+}
+
 /// The JSON object with no fields in it.
 ///
-/// A plugin tool takes no arguments this host knows how to describe yet: the
-/// argument type lives in the guest's own Zig and nothing lowers it into a
-/// schema. **Built and never written as `.{}`**, which Zig makes a tuple and
-/// `std.json.Stringify` writes as `[]`: the fault a real language server found
-/// in this project once already.
+/// What a tool that takes nothing advertises, and what a refused tool carries
+/// so that an `Offer` always holds a definition. **Built and never written as
+/// `.{}`**, which Zig makes a tuple and `std.json.Stringify` writes as `[]`:
+/// the fault a real language server found in this project once already.
 fn emptyObject(keep: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, keep, "{}", .{}) catch
         error.OutOfMemory;
@@ -1265,6 +1532,163 @@ fn oneTool(name: []const u8, capabilities: []const []const u8) Plugin {
         .description = &.{.{ .locale = "en", .value = "does a thing" }},
         .capabilities = capabilities,
     }} };
+}
+
+/// One plugin whose one tool takes the fields given.
+fn typedTool(name: []const u8, parameters: []const core.Property) Plugin {
+    return .{ .tools = .{.{
+        .name = name,
+        .description = &.{.{ .locale = "en", .value = "does a thing" }},
+        .parameters = parameters,
+    }} };
+}
+
+/// A required string and an optional flag, which is the ordinary shape.
+const greet_fields: []const core.Property = &.{
+    .{ .name = "who", .description = "Who to greet.", .required = true, .shape = .{ .kind = .string } },
+    .{ .name = "loudly", .description = "True to shout.", .required = false, .shape = .{ .kind = .boolean } },
+};
+
+test "a tool's argument schema is what the model is offered" {
+    // **The acceptance test of the host half.** What the plugin said it takes
+    // is what goes into the request, in the shape a provider classifies. A
+    // host that still advertised an empty object would leave the model sending
+    // a tool nothing while the tool needs a name.
+    var session: Session = .init(testing.allocator);
+    defer session.deinit();
+    var policy: FakeDecider = .{};
+
+    var declared = typedTool("greet", greet_fields);
+    _ = try session.admit("hello", declared.record(), policy.decider());
+
+    const text = try std.json.Stringify.valueAlloc(
+        testing.allocator,
+        session.find("greet").?.definition.parameters,
+        .{},
+    );
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(
+        "{\"type\":\"object\",\"properties\":{\"who\":{\"type\":\"string\"," ++
+            "\"description\":\"Who to greet.\"},\"loudly\":{\"type\":\"boolean\"," ++
+            "\"description\":\"True to shout.\"}},\"required\":[\"who\"]}",
+        text,
+    );
+}
+
+test "a field name this host will not show the model refuses the tool" {
+    // The name goes into the request as a JSON key and comes back as one. A
+    // key holding a quote, a newline, or a byte that is not UTF-8 is a request
+    // the provider answers 400 to, which ends the session.
+    //
+    // Mutation check: drop the `nameIsUsable` call and the tool is offered
+    // with the name below in it.
+    for ([_][]const u8{ "who\"s", "who\n", "", "a." ++ "b", "x" ** (max_name_bytes + 1) }) |bad| {
+        var session: Session = .init(testing.allocator);
+        defer session.deinit();
+        var policy: FakeDecider = .{};
+
+        var declared = typedTool("greet", &.{.{
+            .name = bad,
+            .description = "A field.",
+            .required = true,
+            .shape = .{ .kind = .string },
+        }});
+        _ = try session.admit("hello", declared.record(), policy.decider());
+        try testing.expectEqual(Refusal.schema_unusable, session.find("greet").?.refused.?);
+    }
+}
+
+test "a schema larger than this host carries refuses the tool, and does not thin it" {
+    // Every byte of a schema is paid for on every turn of the session, and the
+    // text is written by somebody else. A tool above the bound is left out
+    // whole: an empty schema would tell the model the tool takes nothing while
+    // the plugin still needs a field, which is a wrong answer and not a thin
+    // one.
+    //
+    // Mutation check: advertise `emptyObject` for an oversized schema instead
+    // of refusing, and the tool below is offered.
+    // The largest schema the other bounds still allow: every field named to
+    // the length a name may be, and described to the length a description
+    // survives at. That is what decides the number in `max_schema_bytes`, and
+    // a tool at it must be refused rather than carried on every turn.
+    var fields: [core.max_properties]core.Property = undefined;
+    var names: [core.max_properties][max_name_bytes]u8 = undefined;
+    for (&fields, &names, 0..) |*field, *name, index| {
+        @memset(name, 'f');
+        _ = std.fmt.bufPrint(name[name.len - 3 ..], "{d:0>3}", .{index}) catch unreachable;
+        field.* = .{
+            .name = name,
+            .description = "x" ** 400,
+            .required = true,
+            .shape = .{ .kind = .string },
+        };
+    }
+
+    var session: Session = .init(testing.allocator);
+    defer session.deinit();
+    var policy: FakeDecider = .{};
+
+    var declared = typedTool("greet", &fields);
+    _ = try session.admit("hello", declared.record(), policy.decider());
+    try testing.expectEqual(Refusal.schema_too_large, session.find("greet").?.refused.?);
+
+    var offered: std.ArrayList(tools.Definition) = .empty;
+    defer offered.deinit(testing.allocator);
+    try session.appendDefinitions(testing.allocator, &offered);
+    try testing.expectEqual(@as(usize, 0), offered.items.len);
+}
+
+test "a field description is flattened and cut like every other third party sentence" {
+    // Same hazard, same answer: a newline breaks the shape of what the model
+    // reads, and the length is paid for on every turn.
+    var session: Session = .init(testing.allocator);
+    defer session.deinit();
+    var policy: FakeDecider = .{};
+
+    const long = "a\nb" ++ "x" ** (lsp.max_message_bytes * 4);
+    var declared = typedTool("greet", &.{.{
+        .name = "who",
+        .description = long,
+        .required = true,
+        .shape = .{ .kind = .string },
+    }});
+    _ = try session.admit("hello", declared.record(), policy.decider());
+
+    const shown = session.find("greet").?.definition.parameters
+        .object.get("properties").?.object.get("who").?.object.get("description").?.string;
+    try testing.expect(shown.len < long.len);
+    // The newline became one space rather than being dropped, so two words do
+    // not run together.
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, shown, '\n'));
+    try testing.expectEqualStrings("a b", shown[0..3]);
+    // And the cut is marked, so nothing reads a half sentence as a whole one.
+    try testing.expect(std.mem.endsWith(u8, shown, "longer than this]"));
+}
+
+test "a schema that nests past what this host walks refuses the tool" {
+    // The blob reader already refuses this, and a record built by hand does
+    // not go through the blob reader. Two checks, because there are two roads
+    // in.
+    // Each slot points at the one before it, so the nesting is real and the
+    // walk is finite.
+    var holder: [core.max_schema_depth + 2]core.Shape = undefined;
+    holder[0] = .{ .kind = .string };
+    for (holder[1..], 0..) |*slot, before| {
+        slot.* = .{ .kind = .array, .items = &holder[before] };
+    }
+
+    var session: Session = .init(testing.allocator);
+    defer session.deinit();
+    var policy: FakeDecider = .{};
+
+    var declared = typedTool("greet", &.{.{
+        .name = "deep",
+        .description = "A field.",
+        .required = false,
+        .shape = holder[holder.len - 1],
+    }});
+    _ = try session.admit("hello", declared.record(), policy.decider());
+    try testing.expectEqual(Refusal.schema_unusable, session.find("greet").?.refused.?);
 }
 
 test "a plugin tool lands on the policy table under a dotted action" {
@@ -1657,10 +2081,11 @@ test "a tool whose row asks is in the definitions the model reads" {
     try testing.expectEqualStrings("greet", offered.items[0].name);
 }
 
-test "an offered tool's parameters are a JSON object and not an array" {
+test "a tool that takes nothing advertises an object and not an array" {
     // `.{}` in Zig is a tuple, and `std.json.Stringify` writes a tuple as
     // `[]`. A provider that read `[]` where a schema belongs is the fault a
-    // real language server found in this project once already.
+    // real language server found in this project once already. A tool that
+    // takes nothing says so in full rather than by saying nothing.
     var session: Session = .init(testing.allocator);
     defer session.deinit();
     var policy: FakeDecider = .{};
@@ -1672,7 +2097,7 @@ test "an offered tool's parameters are a JSON object and not an array" {
         .{},
     );
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings("{}", text);
+    try testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{},\"required\":[]}", text);
 }
 
 test "a description longer than the prompt carries is cut" {
@@ -2062,6 +2487,101 @@ test "a plugin tool whose row asks is asked about on every call, and a refusal n
         try testing.expectEqualStrings("hello", ran.text);
         try testing.expectEqual(@as(usize, 1), bench.fake.calls);
     }
+}
+
+test "arguments that do not match the schema never reach the plugin, and nobody is asked" {
+    // **The host is the gate, and the plugin is not.** A tool body handed a
+    // field it did not ask for, or missing one it did, is third party code
+    // deciding what to do about a mistake nobody here wrote. And the check
+    // comes before the question: asking a person about a call that could not
+    // have run either way spends their attention for nothing.
+    //
+    // Mutation check: drop the `argumentComplaint` call from `dispatch` and
+    // both counts below stop being zero.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    var policy: FakeDecider = .{ .answer = .allow };
+
+    var declared = typedTool("greet", greet_fields);
+    _ = try bench.session.admit("hello", declared.record(), policy.decider());
+    try bench.arm(testing.io, "hello");
+    try testing.expectEqual(@as(?Refusal, null), bench.session.find("greet").?.refused);
+
+    const cases = [_]struct { arguments: []const u8, says: []const u8 }{
+        .{ .arguments = "{}", .says = "leaves out the field \"who\"" },
+        .{ .arguments = "{\"loudly\":true}", .says = "leaves out the field \"who\"" },
+        .{ .arguments = "{\"who\":7}", .says = "the field \"who\" must be a string" },
+        .{ .arguments = "{\"who\":\"a\",\"loudly\":\"yes\"}", .says = "the field \"loudly\" must be true or false" },
+        .{ .arguments = "[]", .says = "the arguments must be a JSON object" },
+        .{ .arguments = "not json", .says = "the arguments are not JSON" },
+    };
+    for (cases) |one| {
+        const answer = (try bench.session.dispatch(gpa, testing.io, callOf("greet", one.arguments))).?;
+        defer gpa.free(answer.text);
+        try testing.expect(answer.is_error);
+        try testing.expect(std.mem.indexOf(u8, answer.text, one.says) != null);
+        // The name of the tool is in it, because the model reads this beside
+        // the answers of every other call it made.
+        try testing.expect(std.mem.startsWith(u8, answer.text, "greet: "));
+    }
+    try testing.expectEqual(@as(usize, 0), bench.fake.calls);
+    try testing.expectEqual(@as(usize, 0), bench.judge.asks);
+
+    // And arguments that do match really run, so the refusals above are the
+    // answer and not the path.
+    const ran = (try bench.session.dispatch(
+        gpa,
+        testing.io,
+        callOf("greet", "{\"who\":\"Ross\"}"),
+    )).?;
+    defer gpa.free(ran.text);
+    try testing.expect(!ran.is_error);
+    try testing.expectEqual(@as(usize, 1), bench.fake.calls);
+}
+
+test "a field the schema does not name is left alone, and a null is a field left out" {
+    // A model that adds a word to a call it otherwise got right should not
+    // have the whole call refused for it, and every provider writes a null for
+    // an argument the model chose not to set.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    var policy: FakeDecider = .{ .answer = .allow };
+
+    var declared = typedTool("greet", greet_fields);
+    _ = try bench.session.admit("hello", declared.record(), policy.decider());
+    try bench.arm(testing.io, "hello");
+
+    for ([_][]const u8{
+        "{\"who\":\"Ross\",\"extra\":1}",
+        "{\"who\":\"Ross\",\"loudly\":null}",
+    }) |arguments| {
+        const answer = (try bench.session.dispatch(gpa, testing.io, callOf("greet", arguments))).?;
+        defer gpa.free(answer.text);
+        try testing.expect(!answer.is_error);
+    }
+    try testing.expectEqual(@as(usize, 2), bench.fake.calls);
+}
+
+test "a tool that takes nothing is called exactly as it was before schemas" {
+    // The ordinary plugin. An empty object, no arguments at all, and blank
+    // text all have to run, or every plugin that exists today stops working.
+    const gpa = testing.allocator;
+    var bench = Bench.init(gpa);
+    defer bench.deinit();
+    var policy: FakeDecider = .{ .answer = .allow };
+
+    _ = try bench.session.admit("hello", oneTool("greet", &.{}).record(), policy.decider());
+    try bench.arm(testing.io, "hello");
+
+    for ([_][]const u8{ "{}", "", "   ", "{\"stray\":1}" }) |arguments| {
+        const answer = (try bench.session.dispatch(gpa, testing.io, callOf("greet", arguments))).?;
+        defer gpa.free(answer.text);
+        try testing.expect(!answer.is_error);
+        try testing.expectEqualStrings("hello", answer.text);
+    }
+    try testing.expectEqual(@as(usize, 4), bench.fake.calls);
 }
 
 test "a plugin tool the table allowed raises a question for its own action and for each capability it declared" {

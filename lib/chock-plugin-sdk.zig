@@ -6,14 +6,37 @@
 //! ```zig
 //! const chock_plugin_sdk = @import("chock-plugin-sdk");
 //!
-//! const HelloTool = struct {
-//!     pub fn run(ctx: chock_plugin_sdk.tools.Context, args: HelloTool) chock_plugin_sdk.tools.Result {
-//!         return ctx.successResult("Hello, world!");
+//! const GreetTool = struct {
+//!     who: []const u8,
+//!     loudly: ?bool = null,
+//!
+//!     pub const docs = .{
+//!         .who = "The name to greet.",
+//!         .loudly = "True to shout the greeting.",
+//!     };
+//!
+//!     pub fn run(ctx: chock_plugin_sdk.tools.Context, args: GreetTool) chock_plugin_sdk.tools.Result {
+//!         return ctx.successResult(args.who);
 //!     }
 //! };
 //!
 //! pub const chock_plugin_metadata: chock_plugin_sdk.Metadata = .{ ... };
 //! ```
+//!
+//! ## A tool says what it takes, in its own type
+//!
+//! The struct's fields are the tool's arguments, and `docs` is one sentence per
+//! field. The SDK reads both while the plugin compiles, turns them into a JSON
+//! schema, and puts that schema in the metadata beside the tool's name. The
+//! host advertises it to the model, checks what the model wrote against it, and
+//! hands the body a value of the struct. **A field the mapping has no JSON type
+//! for fails the build**, naming the tool, the field, and the type, because a
+//! field that was quietly dropped would leave the model reading a schema the
+//! plugin does not mean. See `lib/chock-plugin-core/schema.zig`.
+//!
+//! A tool that takes nothing declares a struct with no field and needs no
+//! `docs`. It costs nothing: the generated thunk decides at compile time, so
+//! such a plugin carries no reader at all.
 //!
 //! This SDK is a compiler and not a header. It reads that declaration while
 //! the plugin compiles, lowers it to the data only form in

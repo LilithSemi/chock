@@ -137,10 +137,17 @@ pub fn main(
 
     var runner: plugin_engine.Runner = .{ .engine = engine_state.engine() };
 
+    // **The module's own record outlives `load`, and it has to.** The runner
+    // borrows the tool list out of it to know what each tool takes, which is
+    // what it builds an argument record from on every call. See
+    // `plugin_engine.Runner.recordFor`.
+    var module: ?plugin_module.Module = null;
+    defer if (module) |one| one.deinit();
+
     // **Every failure below becomes a sentence and not an exit.** A host
     // process that exited would be read by the harness as a crash, which says
     // something different and worse than "this plugin would not load".
-    const load_failure = load(gpa, arena, io, module_path, capabilities, &runner) catch |err|
+    const load_failure = load(gpa, arena, io, module_path, capabilities, &runner, &module) catch |err|
         try std.fmt.allocPrint(arena, "the plugin would not load: {t}", .{err});
 
     const input: std.Io.File = .{
@@ -179,6 +186,10 @@ fn load(
     module_path: []const u8,
     capabilities: []const []const u8,
     runner: *plugin_engine.Runner,
+    /// Where the read module is left when it loaded. The caller owns it and
+    /// keeps it for as long as the runner, which borrows the tool list out of
+    /// it. Untouched when this answers a failure.
+    kept: *?plugin_module.Module,
 ) !?[]const u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
@@ -195,13 +206,17 @@ fn load(
     // made before it decided to start this process, and it is made again here
     // because this process must not take the tool count from the wire.
     var module_refusal: ?plugin_module.Refusal = null;
-    var read = plugin_module.read(gpa, bytes, &module_refusal) catch {
+    const read = plugin_module.read(gpa, bytes, &module_refusal) catch {
         if (module_refusal) |detail| {
             return try std.fmt.allocPrint(arena, "{f}", .{detail});
         }
         return try arena.dupe(u8, "the plugin's module could not be read");
     };
-    defer read.deinit();
+    // **Handed over the moment it is read, and never after.** Every way out of
+    // this function below is a sentence and not an error, so an `errdefer`
+    // would fire on none of them and the record would leak. The caller frees
+    // it whatever this answers.
+    kept.* = read;
 
     const wanted = plugin_module.readImports(gpa, bytes, null) catch
         return try arena.dupe(u8, "the plugin's imports could not be read");
@@ -214,7 +229,7 @@ fn load(
     runner.load(
         gpa,
         bytes,
-        read.record().tools.len,
+        kept.*.?.record().tools,
         gated,
         capabilities,
         &refused,

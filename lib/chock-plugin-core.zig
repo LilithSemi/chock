@@ -28,7 +28,15 @@
 //! prefix never moves.
 
 pub const metadata = @import("chock-plugin-core/metadata.zig");
+/// What a tool's arguments look like, as data, and the one mapping from a Zig
+/// argument struct onto it. Both a built-in tool and a plugin tool are
+/// described through this, so the model reads one spelling of one idea.
+pub const schema = @import("chock-plugin-core/schema.zig");
 pub const wire = @import("chock-plugin-core/wire.zig");
+/// One call's arguments, as bytes, in the order the tool declared its fields.
+/// The host writes one and the guest reads it, which is what keeps a JSON
+/// reader out of a plugin. See that file for the measurement behind it.
+pub const args = @import("chock-plugin-core/args.zig");
 /// The call ABI: the one exported function that runs a tool, and where the
 /// answer is in the guest's own memory. See its own top comment for why every
 /// field of an answer is bounds checked by the host.
@@ -37,6 +45,9 @@ pub const call = @import("chock-plugin-core/call.zig");
 pub const VersionConstraint = metadata.VersionConstraint;
 pub const LocaleField = metadata.LocaleField;
 pub const ToolDescriptor = metadata.ToolDescriptor;
+pub const Property = schema.Property;
+pub const Shape = schema.Shape;
+pub const Kind = schema.Kind;
 pub const Metadata = metadata.Metadata;
 
 pub const Magic = wire.Magic;
@@ -46,6 +57,8 @@ pub const Refusal = wire.Refusal;
 pub const ParseError = wire.ParseError;
 pub const PrefixError = wire.PrefixError;
 pub const SerializeError = wire.SerializeError;
+pub const max_properties = wire.max_properties;
+pub const max_schema_depth = wire.max_schema_depth;
 pub const Parsed = wire.Parsed;
 
 pub const abiVersion = wire.abiVersion;

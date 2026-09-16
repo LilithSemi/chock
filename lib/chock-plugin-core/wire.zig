@@ -55,7 +55,10 @@
 
 const std = @import("std");
 const metadata = @import("metadata.zig");
+const schema = @import("schema.zig");
 
+const Property = schema.Property;
+const Shape = schema.Shape;
 const Metadata = metadata.Metadata;
 const LocaleField = metadata.LocaleField;
 const ToolDescriptor = metadata.ToolDescriptor;
@@ -77,6 +80,24 @@ pub const max_tools: u32 = 256;
 
 /// The largest number of capabilities one tool may declare.
 pub const max_capabilities: u32 = 64;
+
+/// The largest number of fields one argument object may hold.
+///
+/// **Every one of them is read by the model on every turn of the session.** A
+/// tool that took more separate values than this is a tool nobody can call
+/// correctly, and a blob that states more is a blob that wants the host to
+/// allocate on its say so.
+pub const max_properties: u32 = 32;
+
+/// How deeply one argument schema may nest.
+///
+/// A property's own shape is depth one, the item shape of an array is depth
+/// two, and a field of that item is depth three. The deepest shape the mapping
+/// in `schema.zig` can build is a list of records, which reaches depth three,
+/// so this leaves room and still stops a blob that asks this reader to recurse
+/// until the stack runs out. **The check is on the way in, before any memory
+/// is spent**, which is the only place it does any good.
+pub const max_schema_depth: u32 = 8;
 
 /// The magic word, and the symbol whose name carries the same claim.
 ///
@@ -113,10 +134,22 @@ pub const Magic = struct {
 /// Numbering starts at one. Zero is never a valid ABI version, so a zeroed
 /// region of memory fails on the ABI field as well as on the magic.
 pub const AbiVersion = enum(u32) {
+    /// The first ABI. Its tool records carry a name, a description and a
+    /// capability set, and nothing about what the tool takes.
     v1 = 1,
+    /// v1 with an argument schema on every tool record. See
+    /// `lib/chock-plugin-core/schema.zig`.
+    v2 = 2,
 
     /// The ABI this build writes and the one it prefers to read.
-    pub const current: AbiVersion = .v1;
+    pub const current: AbiVersion = .v2;
+
+    /// Whether a tool record in this ABI carries an argument schema. A v1
+    /// plugin still loads, and every tool of it takes nothing, which is what
+    /// that plugin already meant.
+    pub fn carriesSchema(self: AbiVersion) bool {
+        return self != .v1;
+    }
 };
 
 /// The ABI version `word` names, or null when this build does not know that
@@ -307,6 +340,28 @@ pub fn serializedLen(record: Metadata) usize {
         total +|= localesLen(tool.description);
         total +|= 4;
         for (tool.capabilities) |capability| total +|= stringLen(capability);
+        total +|= propertiesLen(tool.parameters);
+    }
+    return total;
+}
+
+fn propertiesLen(properties: []const Property) usize {
+    var total: usize = 4;
+    for (properties) |property| {
+        total +|= stringLen(property.name);
+        total +|= stringLen(property.description);
+        total +|= 1;
+        total +|= shapeLen(property.shape);
+    }
+    return total;
+}
+
+fn shapeLen(shape: Shape) usize {
+    var total: usize = 1;
+    switch (shape.kind) {
+        .array => total +|= 1 +| if (shape.items) |item| shapeLen(item.*) else 0,
+        .object => total +|= propertiesLen(shape.properties),
+        else => {},
     }
     return total;
 }
@@ -362,6 +417,7 @@ pub fn serializeInto(record: Metadata, out: []u8) SerializeError!usize {
         putLocales(out, &at, tool.description);
         putU32(out, &at, @intCast(tool.capabilities.len));
         for (tool.capabilities) |capability| putString(out, &at, capability);
+        putProperties(out, &at, tool.parameters);
     }
 
     std.debug.assert(at == total);
@@ -411,6 +467,33 @@ fn checkBounds(record: Metadata) SerializeError!void {
         try checkLocales(tool.description);
         if (tool.capabilities.len > max_capabilities) return error.TooLarge;
         for (tool.capabilities) |capability| try checkString(capability);
+        try checkProperties(tool.parameters, 0);
+    }
+}
+
+/// **A writer refuses everything the reader refuses.** A guest that could
+/// serialise a schema this same file will not read back would ship a plugin no
+/// host loads, and the author would learn it from a user rather than from the
+/// build.
+///
+/// The depth is checked by `checkShape` and not here. Every road into this
+/// function has already passed through that one at the same depth, so a check
+/// here would never fire.
+fn checkProperties(properties: []const Property, depth: u32) SerializeError!void {
+    if (properties.len > max_properties) return error.TooLarge;
+    for (properties) |property| {
+        try checkString(property.name);
+        try checkString(property.description);
+        try checkShape(property.shape, depth + 1);
+    }
+}
+
+fn checkShape(shape: Shape, depth: u32) SerializeError!void {
+    if (depth > max_schema_depth) return error.TooLarge;
+    switch (shape.kind) {
+        .array => if (shape.items) |item| try checkShape(item.*, depth + 1),
+        .object => try checkProperties(shape.properties, depth),
+        else => {},
     }
 }
 
@@ -483,6 +566,39 @@ fn putConstraint(out: []u8, at: *usize, constraint: VersionConstraint) void {
     putOptionalVersion(out, at, constraint.max);
 }
 
+fn putProperties(out: []u8, at: *usize, properties: []const Property) void {
+    putU32(out, at, @intCast(properties.len));
+    for (properties) |property| {
+        putString(out, at, property.name);
+        putString(out, at, property.description);
+        out[at.*] = @intFromBool(property.required);
+        at.* += 1;
+        putShape(out, at, property.shape);
+    }
+}
+
+/// One shape: the kind byte, then whatever that kind carries. An array writes a
+/// presence byte before its item shape, because an array with no item shape and
+/// an array of strings are different declarations.
+fn putShape(out: []u8, at: *usize, shape: Shape) void {
+    out[at.*] = @intFromEnum(shape.kind);
+    at.* += 1;
+    switch (shape.kind) {
+        .array => {
+            if (shape.items) |item| {
+                out[at.*] = 1;
+                at.* += 1;
+                putShape(out, at, item.*);
+            } else {
+                out[at.*] = 0;
+                at.* += 1;
+            }
+        },
+        .object => putProperties(out, at, shape.properties),
+        else => {},
+    }
+}
+
 fn putLocales(out: []u8, at: *usize, fields: []const LocaleField) void {
     putU32(out, at, @intCast(fields.len));
     for (fields) |field| {
@@ -535,7 +651,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, refusal: ?*?Refusal) Par
         .at = Prefix.len,
         .refusal = refusal,
     };
-    const record = try readBody(arena.allocator(), &reader);
+    const record = try readBody(arena.allocator(), &reader, known);
 
     if (reader.at != reader.bytes.len) {
         return note(refusal, .{ .malformed_body = .{
@@ -547,7 +663,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, refusal: ?*?Refusal) Par
     return .{ .arena = arena, .abi_version = known, .record = record };
 }
 
-fn readBody(arena: std.mem.Allocator, reader: *Reader) ParseError!Metadata {
+fn readBody(arena: std.mem.Allocator, reader: *Reader, abi: AbiVersion) ParseError!Metadata {
     const name = try reader.string("the plugin name");
     const version = try reader.version("the plugin version");
     const chock_version = try reader.constraint();
@@ -564,10 +680,20 @@ fn readBody(arena: std.mem.Allocator, reader: *Reader) ParseError!Metadata {
         for (capabilities) |*capability| {
             capability.* = try arena.dupe(u8, try reader.string("a capability name"));
         }
+        // **A v1 plugin still loads, and its tools take nothing.** That is
+        // what a v1 plugin already meant: the ABI it was built for had no way
+        // to say a tool takes an argument, so an empty schema is the truth
+        // about it and not a guess.
+        const parameters = if (abi.carriesSchema())
+            try reader.properties(arena, 0)
+        else
+            &.{};
+
         tool.* = .{
             .name = try arena.dupe(u8, tool_name),
             .description = tool_description,
             .capabilities = capabilities,
+            .parameters = parameters,
         };
     }
 
@@ -702,6 +828,55 @@ const Reader = struct {
         };
     }
 
+    /// One argument object's fields. `depth` is how far this reader has already
+    /// nested, and `shape` is what checks it: every road into this function has
+    /// passed through that one at the same depth, so a check here would never
+    /// fire.
+    fn properties(self: *Reader, arena: std.mem.Allocator, depth: u32) ParseError![]const Property {
+        const total = try self.count("an argument field count", max_properties);
+        const fields = try arena.alloc(Property, total);
+        for (fields) |*field| {
+            const name = try self.string("an argument field name");
+            const description = try self.string("an argument field description");
+            field.* = .{
+                .name = try arena.dupe(u8, name),
+                .description = try arena.dupe(u8, description),
+                .required = try self.tag("an argument field requirement"),
+                .shape = try self.shape(arena, depth + 1),
+            };
+        }
+        return fields;
+    }
+
+    /// One value's shape. The kind byte is checked against the set before it
+    /// decides anything, so a byte nobody wrote is a refusal and never a jump.
+    fn shape(self: *Reader, arena: std.mem.Allocator, depth: u32) ParseError!Shape {
+        if (depth > max_schema_depth) {
+            return note(self.refusal, .{ .too_large = .{
+                .what = "the argument schema nesting",
+                .found = depth,
+                .bound = max_schema_depth,
+            } }, error.TooLarge);
+        }
+
+        const raw = try self.take(1, "an argument field type");
+        const kind = schema.Kind.fromWord(raw[0]) orelse return note(self.refusal, .{ .malformed_body = .{
+            .what = "an argument field type this Chock does not have",
+            .at = self.at - 1,
+        } }, error.MalformedBody);
+
+        switch (kind) {
+            .array => {
+                if (!try self.tag("an array item shape")) return .{ .kind = .array };
+                const item = try arena.create(Shape);
+                item.* = try self.shape(arena, depth + 1);
+                return .{ .kind = .array, .items = item };
+            },
+            .object => return .{ .kind = .object, .properties = try self.properties(arena, depth) },
+            else => return .{ .kind = kind },
+        }
+    }
+
     fn locales(self: *Reader, arena: std.mem.Allocator, what: []const u8) ParseError![]const LocaleField {
         const total = try self.count(what, max_locales);
         const fields = try arena.alloc(LocaleField, total);
@@ -814,10 +989,13 @@ test "an unknown ABI version is refused with both numbers in the message" {
     defer text.deinit();
     try refusal.?.format(&text.writer);
 
-    try testing.expectEqualStrings(
-        "built for plugin ABI 7, this Chock speaks plugin ABI 1: rebuild the plugin",
-        text.written(),
+    const want = try std.fmt.allocPrint(
+        testing.allocator,
+        "built for plugin ABI 7, this Chock speaks plugin ABI {d}: rebuild the plugin",
+        .{@intFromEnum(AbiVersion.current)},
     );
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, text.written());
 }
 
 test "a wrong magic is a different refusal from a wrong ABI version" {
@@ -985,7 +1163,10 @@ test "the prefix is at the offsets the format promises" {
     defer testing.allocator.free(bytes);
 
     try testing.expectEqual(@as(u32, 0x9E4B_4843), std.mem.readInt(u32, bytes[0..4], .little));
-    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[4..8], .little));
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(AbiVersion.current)),
+        std.mem.readInt(u32, bytes[4..8], .little),
+    );
     try testing.expectEqual(@as(u32, @intCast(bytes.len)), std.mem.readInt(u32, bytes[8..12], .little));
     try testing.expectEqualSlices(u8, &.{ 'C', 'H', 'K', 0x9E }, bytes[0..4]);
 }
@@ -1055,4 +1236,209 @@ test "an empty record still carries a readable prefix" {
     defer parsed.deinit();
     try testing.expect(bare.eql(parsed.record));
     try testing.expectEqual(@as(usize, 0), parsed.record.tools.len);
+}
+
+/// A schema that uses every part of the format: a required string, an optional
+/// flag, a list of strings, and a list of records.
+const schema_sample: []const Property = &.{
+    .{ .name = "who", .description = "Who to greet.", .required = true, .shape = .{ .kind = .string } },
+    .{ .name = "loudly", .description = "True to shout.", .required = false, .shape = .{ .kind = .boolean } },
+    .{ .name = "times", .description = "How many.", .required = false, .shape = .{ .kind = .integer } },
+    .{ .name = "ratio", .description = "How much.", .required = false, .shape = .{ .kind = .number } },
+    .{
+        .name = "argv",
+        .description = "The words.",
+        .required = false,
+        .shape = .{ .kind = .array, .items = &.{ .kind = .string } },
+    },
+    .{
+        .name = "steps",
+        .description = "The list.",
+        .required = true,
+        .shape = .{ .kind = .array, .items = &.{ .kind = .object, .properties = &.{
+            .{ .name = "title", .description = "What it is.", .required = true, .shape = .{ .kind = .string } },
+        } } },
+    },
+};
+
+test "an argument schema survives the round trip field for field" {
+    // The schema is what the model writes its arguments against. A field that
+    // was dropped, reordered, or read back with the wrong requirement would
+    // leave the model told something the plugin does not mean.
+    var record = sample;
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = schema_sample }};
+    record.tools = &tools;
+
+    const bytes = try serializeAlloc(testing.allocator, record);
+    defer testing.allocator.free(bytes);
+
+    var parsed = try parse(testing.allocator, bytes, null);
+    defer parsed.deinit();
+    try testing.expect(record.eql(parsed.record));
+
+    const read = parsed.record.tools[0].parameters;
+    try testing.expectEqual(@as(usize, 6), read.len);
+    try testing.expectEqualStrings("who", read[0].name);
+    try testing.expect(read[0].required);
+    try testing.expect(!read[1].required);
+    try testing.expectEqual(schema.Kind.array, read[4].shape.kind);
+    try testing.expectEqual(schema.Kind.string, read[4].shape.items.?.kind);
+    try testing.expectEqual(schema.Kind.object, read[5].shape.items.?.kind);
+    try testing.expectEqualStrings("title", read[5].shape.items.?.properties[0].name);
+}
+
+test "a schema with more fields than the bound is refused, and the bound is named" {
+    // The count comes out of a file somebody else wrote, and every field of it
+    // is read by the model on every turn. A reader that allocated on the
+    // count's say so would allocate whatever the file asked for.
+    var many: [max_properties + 1]Property = @splat(.{
+        .name = "f",
+        .description = "A field.",
+        .required = false,
+        .shape = .{ .kind = .string },
+    });
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &many }};
+    var record = sample;
+    record.tools = &tools;
+
+    // The writer refuses what the reader refuses, so a guest cannot ship a
+    // blob this same file will not read back.
+    try testing.expectError(error.TooLarge, serializeAlloc(testing.allocator, record));
+
+    // And the reader refuses it, measured by writing the count by hand into a
+    // blob that is otherwise well formed.
+    var small: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{} }};
+    record.tools = &small;
+    const bytes = try serializeAlloc(testing.allocator, record);
+    defer testing.allocator.free(bytes);
+
+    const at = std.mem.lastIndexOf(u8, bytes, &.{ 0, 0, 0, 0 }).?;
+    std.mem.writeInt(u32, bytes[at..][0..4], max_properties + 1, .little);
+
+    var refusal: ?Refusal = null;
+    try testing.expectError(error.TooLarge, parse(testing.allocator, bytes, &refusal));
+    try testing.expectEqual(@as(u64, max_properties), refusal.?.too_large.bound);
+    try testing.expectEqualStrings("an argument field count", refusal.?.too_large.what);
+}
+
+test "a schema that nests past the bound is refused before it is followed" {
+    // A blob that asked this reader to recurse a thousand levels would run the
+    // stack out before anything noticed. The check is on the way in.
+    // Each slot points at the one before it, so the nesting is real and the
+    // walk is finite. A slot that pointed at itself would be a test that hangs
+    // rather than one that measures the bound.
+    var holder: [max_schema_depth + 2]Shape = undefined;
+    holder[0] = .{ .kind = .string };
+    for (holder[1..], 0..) |*slot, before| {
+        slot.* = .{ .kind = .array, .items = &holder[before] };
+    }
+
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{.{
+        .name = "deep",
+        .description = "A field.",
+        .required = false,
+        .shape = holder[holder.len - 1],
+    }} }};
+    var record = sample;
+    record.tools = &tools;
+    try testing.expectError(error.TooLarge, serializeAlloc(testing.allocator, record));
+}
+
+test "a blob that nests deeper than the bound is refused before it is followed" {
+    // **The reader's own guard, against bytes rather than against a record.**
+    // The writer refuses what the reader refuses, so a blob this deep cannot be
+    // built by serialising one: it is spliced together here, which is exactly
+    // how a hostile one would arrive.
+    //
+    // Mutation check: take the depth check out of `Reader.shape` and this runs
+    // the stack out instead of answering.
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{.{
+        .name = "argv",
+        .description = "The words.",
+        .required = true,
+        .shape = .{ .kind = .array, .items = &.{ .kind = .string } },
+    }} }};
+    var record = sample;
+    record.tools = &tools;
+
+    const bytes = try serializeAlloc(testing.allocator, record);
+    defer testing.allocator.free(bytes);
+
+    // The shape is the last three bytes: an array, a present item, a string.
+    const shape_at = bytes.len - 3;
+    try testing.expectEqual(@intFromEnum(schema.Kind.array), bytes[shape_at]);
+    try testing.expectEqual(@as(u8, 1), bytes[shape_at + 1]);
+    try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[shape_at + 2]);
+
+    // One more array level is two bytes: the kind, then the present byte of
+    // the item that follows.
+    const levels = max_schema_depth + 4;
+    const deeper = try testing.allocator.alloc(u8, bytes.len + levels * 2);
+    defer testing.allocator.free(deeper);
+    @memcpy(deeper[0..shape_at], bytes[0..shape_at]);
+    for (0..levels) |level| {
+        deeper[shape_at + level * 2] = @intFromEnum(schema.Kind.array);
+        deeper[shape_at + level * 2 + 1] = 1;
+    }
+    @memcpy(deeper[shape_at + levels * 2 ..], bytes[shape_at..]);
+    std.mem.writeInt(u32, deeper[Prefix.total_len_offset..][0..4], @intCast(deeper.len), .little);
+
+    var refusal: ?Refusal = null;
+    try testing.expectError(error.TooLarge, parse(testing.allocator, deeper, &refusal));
+    try testing.expectEqual(@as(u64, max_schema_depth), refusal.?.too_large.bound);
+    try testing.expectEqualStrings("the argument schema nesting", refusal.?.too_large.what);
+}
+
+test "a field type byte this Chock does not have is refused rather than read" {
+    // The byte decides what is read next. A reader that indexed with it would
+    // take a number nobody wrote as a shape.
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{.{
+        .name = "who",
+        .description = "Who to greet.",
+        .required = true,
+        .shape = .{ .kind = .string },
+    }} }};
+    var record = sample;
+    record.tools = &tools;
+
+    const bytes = try serializeAlloc(testing.allocator, record);
+    defer testing.allocator.free(bytes);
+
+    // The kind byte is the last one of the blob: name, description, the
+    // requirement byte, then the shape.
+    try testing.expectEqual(@intFromEnum(schema.Kind.string), bytes[bytes.len - 1]);
+    bytes[bytes.len - 1] = 200;
+
+    var refusal: ?Refusal = null;
+    try testing.expectError(error.MalformedBody, parse(testing.allocator, bytes, &refusal));
+    try testing.expectEqualStrings(
+        "an argument field type this Chock does not have",
+        refusal.?.malformed_body.what,
+    );
+}
+
+test "a plugin built for the first ABI still loads, and its tools take nothing" {
+    // The reason the ABI number went up rather than the body changing under
+    // it. A v1 plugin said nothing about what its tools take, because its ABI
+    // had no way to, so an empty schema is the truth about it.
+    var tools: [1]ToolDescriptor = .{.{ .name = "greet", .parameters = &.{} }};
+    var record = sample;
+    record.tools = &tools;
+
+    const bytes = try serializeAlloc(testing.allocator, record);
+    defer testing.allocator.free(bytes);
+
+    // A v2 blob whose tools carry an empty schema is a v1 blob with four zero
+    // bytes on the end of each tool record. Take them off and call it v1.
+    const shortened = try testing.allocator.alloc(u8, bytes.len - 4);
+    defer testing.allocator.free(shortened);
+    @memcpy(shortened, bytes[0 .. bytes.len - 4]);
+    std.mem.writeInt(u32, shortened[Prefix.abi_version_offset..][0..4], 1, .little);
+    std.mem.writeInt(u32, shortened[Prefix.total_len_offset..][0..4], @intCast(shortened.len), .little);
+
+    var parsed = try parse(testing.allocator, shortened, null);
+    defer parsed.deinit();
+    try testing.expectEqual(AbiVersion.v1, parsed.abi_version);
+    try testing.expectEqual(@as(usize, 1), parsed.record.tools.len);
+    try testing.expectEqual(@as(usize, 0), parsed.record.tools[0].parameters.len);
 }

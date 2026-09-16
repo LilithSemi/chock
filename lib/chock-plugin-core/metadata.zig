@@ -13,6 +13,12 @@
 
 const std = @import("std");
 
+const schema = @import("schema.zig");
+
+pub const Property = schema.Property;
+pub const Shape = schema.Shape;
+pub const Kind = schema.Kind;
+
 /// The range of Chock a plugin says it works with.
 ///
 /// `min` is required, because a plugin that names no floor gives a host
@@ -60,6 +66,18 @@ pub const ToolDescriptor = struct {
     description: []const LocaleField = &.{},
     capabilities: []const []const u8 = &.{},
 
+    /// What the tool takes, as the fields of one JSON object. Empty for a tool
+    /// that takes nothing.
+    ///
+    /// **The host advertises this to the model and holds the plugin to it.**
+    /// A plugin's argument type is Zig the host never sees, so the schema has
+    /// to travel as data, and it travels in this record so that discovery
+    /// still costs no guest execution: a host reads what a tool takes at the
+    /// same moment it reads what the tool is called. See
+    /// `lib/chock-plugin-core/schema.zig` for the mapping and
+    /// `lib/chock-plugin-core/wire.zig` for the bytes.
+    parameters: []const schema.Property = &.{},
+
     pub fn eql(a: ToolDescriptor, b: ToolDescriptor) bool {
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!localesEql(a.description, b.description)) return false;
@@ -67,7 +85,7 @@ pub const ToolDescriptor = struct {
         for (a.capabilities, b.capabilities) |x, y| {
             if (!std.mem.eql(u8, x, y)) return false;
         }
-        return true;
+        return schema.propertiesEql(a.parameters, b.parameters);
     }
 };
 
@@ -177,4 +195,22 @@ test "a null ceiling and a stated ceiling are different constraints" {
         .max = .{ .major = 9, .minor = 0, .patch = 0 },
     };
     try std.testing.expect(!open.eql(closed));
+}
+
+test "a tool that takes a field differs from one that takes none" {
+    // The schema is what the model writes its arguments against, so a
+    // comparison that skipped it would let a round trip that lost every
+    // property pass as unchanged.
+    const bare: ToolDescriptor = .{ .name = "greet" };
+    const typed: ToolDescriptor = .{
+        .name = "greet",
+        .parameters = &.{.{
+            .name = "who",
+            .description = "Who to greet.",
+            .required = true,
+            .shape = .{ .kind = .string },
+        }},
+    };
+    try std.testing.expect(!bare.eql(typed));
+    try std.testing.expect(bare.eql(.{ .name = "greet", .parameters = &.{} }));
 }

@@ -130,8 +130,13 @@ test "the host side reader reads the real module as the author wrote it" {
     try testing.expect(declared.eql(read.record()));
     try testing.expectEqualStrings("hello", read.record().name);
     try testing.expectEqualStrings("A simple hello world plugin", read.record().description[0].value);
-    try testing.expectEqual(@as(usize, 1), read.record().tools.len);
+    try testing.expectEqual(@as(usize, 2), read.record().tools.len);
     try testing.expectEqualStrings("hello", read.record().tools[0].name);
+    // And what the second one takes, read out of a real module with no engine.
+    // A schema that did not survive the linker would leave this empty.
+    try testing.expectEqualStrings("greet", read.record().tools[1].name);
+    try testing.expectEqual(@as(usize, 2), read.record().tools[1].parameters.len);
+    try testing.expectEqualStrings("who", read.record().tools[1].parameters[0].name);
     try testing.expectEqual(@as(u32, @intFromEnum(core.AbiVersion.current)), read.abi_word);
     try testing.expectEqual(core.AbiVersion.current, read.parsed.abi_version);
 }
@@ -225,10 +230,16 @@ test "a real module built for another plugin ABI is refused with both numbers" {
     );
     const text = try sentence(refusal.?);
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings(
-        "built for plugin ABI 7, this Chock speaks plugin ABI 1: rebuild the plugin",
-        text,
+    // The number this Chock speaks comes from the enum and not from a literal,
+    // so a later ABI keeps this test measuring the sentence rather than the
+    // version it was written in.
+    const want = try std.fmt.allocPrint(
+        testing.allocator,
+        "built for plugin ABI 7, this Chock speaks plugin ABI {d}: rebuild the plugin",
+        .{@intFromEnum(core.AbiVersion.current)},
     );
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, text);
 }
 
 test "a real module whose two ABI numbers disagree is refused" {
@@ -247,10 +258,13 @@ test "a real module whose two ABI numbers disagree is refused" {
     );
     const text = try sentence(refusal.?);
     defer testing.allocator.free(text);
-    try testing.expectEqualStrings(
-        "the module says it is plugin ABI 1 and its metadata says ABI 7",
-        text,
+    const want = try std.fmt.allocPrint(
+        testing.allocator,
+        "the module says it is plugin ABI {d} and its metadata says ABI 7",
+        .{@intFromEnum(core.AbiVersion.current)},
     );
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, text);
 }
 
 test "a real module with the magic word struck out of its blob is not a plugin" {
@@ -391,8 +405,29 @@ test "the real plugin loads, and its tool is offered under a dotted action" {
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
     defer offered.deinit(testing.allocator);
     try session.appendDefinitions(testing.allocator, &offered);
-    try testing.expectEqual(@as(usize, 1), offered.items.len);
+    try testing.expectEqual(@as(usize, 2), offered.items.len);
     try testing.expectEqualStrings("hello", offered.items[0].name);
+
+    // **The schema the model reads, out of a real module.** `hello` takes
+    // nothing and says so, and `greet` names its one required field. A host
+    // that still advertised an empty object would pass every unit test and
+    // tell the model nothing here.
+    const nothing = try std.json.Stringify.valueAlloc(
+        testing.allocator,
+        offered.items[0].parameters,
+        .{},
+    );
+    defer testing.allocator.free(nothing);
+    try testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{},\"required\":[]}", nothing);
+
+    const greet = offered.items[1].parameters.object;
+    try testing.expectEqualStrings("object", greet.get("type").?.string);
+    const who = greet.get("properties").?.object.get("who").?.object;
+    try testing.expectEqualStrings("string", who.get("type").?.string);
+    try testing.expectEqualStrings("The name to greet.", who.get("description").?.string);
+    try testing.expectEqualStrings("boolean", greet.get("properties").?.object.get("loudly").?.object.get("type").?.string);
+    try testing.expectEqual(@as(usize, 1), greet.get("required").?.array.items.len);
+    try testing.expectEqualStrings("who", greet.get("required").?.array.items[0].string);
 }
 
 test "the real plugin's tool is refused by policy like any other action" {
@@ -417,7 +452,11 @@ test "the real plugin's tool is refused by policy like any other action" {
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
     defer offered.deinit(testing.allocator);
     try session.appendDefinitions(testing.allocator, &offered);
-    try testing.expectEqual(@as(usize, 0), offered.items.len);
+    // **One denied action takes one tool and no more.** The plugin's other
+    // tool has its own action and its own row, so a refusal that reached it
+    // would be a refusal about a rule nobody wrote.
+    try testing.expectEqual(@as(usize, 1), offered.items.len);
+    try testing.expectEqualStrings("greet", offered.items[0].name);
 }
 
 test "a real module whose tool is named after a built-in fails to load entirely" {

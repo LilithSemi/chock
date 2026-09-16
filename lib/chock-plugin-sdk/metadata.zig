@@ -46,12 +46,27 @@ pub const Tool = struct {
     run: *const anyopaque,
 
     /// The part of this that reaches the host.
+    ///
+    /// **The argument schema is built here and travels as data.** The `type`
+    /// itself cannot cross: it is this plugin's own Zig, and a host that read
+    /// it would be a host coupled to the plugin's compiled layout. What crosses
+    /// is what `core.schema.propertiesOf` makes of it, which is the same
+    /// mapping a built-in tool's own schema is made with, so the model reads
+    /// one spelling of one idea.
     pub fn descriptor(comptime self: Tool) core.ToolDescriptor {
         return .{
             .name = self.name,
             .description = self.description,
             .capabilities = self.capabilities,
+            .parameters = core.schema.propertiesOf(self.type, self.whose()),
         };
+    }
+
+    /// How this tool is named in a compile error. Every refusal the schema
+    /// mapping raises says which tool has the field it cannot describe, and
+    /// this is where that name comes from.
+    pub fn whose(comptime self: Tool) []const u8 {
+        return "the tool \"" ++ self.name ++ "\"";
     }
 };
 
@@ -100,9 +115,14 @@ pub fn runOf(comptime tool: Tool) *const RunFn(tool.type) {
     comptime {
         const Args = tool.type;
         const info = @typeInfo(Args);
-        if (info != .@"struct" and info != .@"union" and info != .@"enum" and info != .@"opaque") {
+        // **A struct and nothing else.** The model writes a tool's arguments as
+        // a JSON object, and `core.schema.propertiesOf` refuses anything else
+        // with a message of its own. This check is here as well because a
+        // `@hasDecl` on a non struct is a worse error than that message.
+        if (info != .@"struct") {
             @compileError("the tool '" ++ tool.name ++ "' declares .type = " ++
-                @typeName(Args) ++ ", which cannot hold arguments");
+                @typeName(Args) ++ ", and a tool's arguments must be a struct, because " ++
+                "the model writes them as a JSON object");
         }
         if (@hasDecl(Args, "run")) {
             const declared = @field(Args, "run");
@@ -124,6 +144,8 @@ const testing = std.testing;
 
 const Greet = struct {
     who: []const u8 = "world",
+
+    pub const docs = .{ .who = "Who to greet." };
 
     pub fn run(ctx: tools.Context, args: Greet) tools.Result {
         return ctx.successResult(args.who);
@@ -166,6 +188,16 @@ test "lower drops the type and the run and keeps everything else" {
     // The whole point: nothing that only exists inside the guest survived.
     try testing.expect(!@hasField(core.ToolDescriptor, "run"));
     try testing.expect(!@hasField(core.ToolDescriptor, "type"));
+
+    // What the type became. The `type` did not cross and the shape of it did,
+    // which is the whole reason a host can describe a tool it cannot compile.
+    try testing.expectEqual(@as(usize, 1), lowered.tools[0].parameters.len);
+    try testing.expectEqualStrings("who", lowered.tools[0].parameters[0].name);
+    try testing.expectEqualStrings("Who to greet.", lowered.tools[0].parameters[0].description);
+    // `who` has a default, and a default is not what decides this: an optional
+    // Zig field is what the model may leave out.
+    try testing.expect(lowered.tools[0].parameters[0].required);
+    try testing.expectEqual(core.schema.Kind.string, lowered.tools[0].parameters[0].shape.kind);
 }
 
 test "runOf gives back a callable body with its real signature" {

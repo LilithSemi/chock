@@ -11,6 +11,12 @@
 //! which is what keeps discovery free of execution. Nothing here allocates:
 //! the blob is a constant array the compiler builds.
 //!
+//! **The blob carries what each tool takes as well as what it is called**, so
+//! that stays true of the argument schema too: a host learns what a tool takes
+//! at the moment it learns the tool exists. `thunkFor` is the other half, and
+//! it turns the record the host writes into a value of the tool's own argument
+//! type before the author's body runs.
+//!
 //! ## Two ways in, and why there are two
 //!
 //! `Exports` is the whole mechanism, and it takes the declaration as a
@@ -43,11 +49,15 @@ const root = @import("root");
 /// whose root is the test runner. See this file's top comment.
 pub const declares_plugin = @hasDecl(root, "chock_plugin_metadata");
 
-/// One tool, bound. `args` points at a value of that tool's own argument
-/// type, which the generated thunk is the only thing that knows.
+/// One tool, bound.
+///
+/// **The thunk takes the context alone.** A tool's arguments are its own Zig
+/// type, and the thunk is the only thing in the binary that knows which type
+/// that is, so the thunk is where the model's text becomes a value of it. See
+/// `thunkFor`.
 pub const Bound = struct {
     name: []const u8,
-    call: *const fn (tools.Context, *const anyopaque) tools.Result,
+    call: *const fn (tools.Context) tools.Result,
 };
 
 /// The guest side of one plugin. Instantiating this emits the three symbols,
@@ -115,8 +125,9 @@ pub fn Exports(comptime declared: meta.Metadata) type {
         /// nothing, so every index is out of range and this answers zero,
         /// which is the same refusal.
         ///
-        /// `args_ptr` and `args_len` are the argument text the model wrote,
-        /// carried through to the tool body untouched. See `Context`.
+        /// `args_ptr` and `args_len` are the argument record the host wrote,
+        /// which the thunk reads into the tool's own argument type. See
+        /// `lib/chock-plugin-core/args.zig` and `thunkFor`.
         pub fn chockPluginCall(index: u32, args_ptr: usize, args_len: usize) callconv(.c) usize {
             if (index >= bound_count) return core.call.no_answer;
             const entry = bound[index];
@@ -129,10 +140,7 @@ pub fn Exports(comptime declared: meta.Metadata) type {
             else
                 @as([*]const u8, @ptrFromInt(args_ptr))[0..args_len];
 
-            const result = entry.call(
-                .{ .tool = entry.name, .arguments = arguments },
-                &empty_arguments,
-            );
+            const result = entry.call(.{ .tool = entry.name, .arguments = arguments });
             const outcome: core.call.Outcome = switch (result.outcome) {
                 .success => .success,
                 .failure => .failure,
@@ -141,7 +149,7 @@ pub fn Exports(comptime declared: meta.Metadata) type {
             return @intFromPtr(&answer);
         }
 
-        /// Where a host may write the argument text, and how much of it fits.
+        /// Where a host may write the argument record, and how much of it fits.
         ///
         /// **A function and not a data symbol**, unlike the metadata blob. A
         /// buffer of zeros lands in `.bss`, which has no data segment at all,
@@ -160,7 +168,7 @@ pub fn Exports(comptime declared: meta.Metadata) type {
             return @intFromPtr(&argument_buffer);
         }
 
-        /// How much argument text a plugin built with this SDK accepts.
+        /// How large an argument record a plugin built with this SDK accepts.
         ///
         /// 64 kibibytes, which is one wasm page. It costs a plugin nothing on
         /// disk: a buffer of zeros is `.bss` and carries no data segment, so
@@ -169,35 +177,7 @@ pub fn Exports(comptime declared: meta.Metadata) type {
 
         var argument_buffer: [argument_bytes]u8 = @splat(0);
 
-        /// The value a thunk casts to a tool's own argument type.
-        ///
-        /// **A tool's argument type is comptime checked to hold no field**,
-        /// below, so every such type has exactly one value and this one byte
-        /// is a valid instance of all of them. The byte exists so there is an
-        /// address to hand over: a zero sized type has no storage of its own
-        /// and `@ptrCast` of a null pointer is not something this may build.
-        var empty_arguments: u8 = 0;
-
         comptime {
-            // **Argument lowering is not built, so a tool that needs it must
-            // not compile.** The thunk casts the host's pointer straight to
-            // the tool's own argument type, and nothing turns the model's
-            // argument text into a value of that type. A tool with a field
-            // would therefore read whatever `empty_arguments` happens to sit
-            // beside, which is a silent wrong answer rather than a failure.
-            //
-            // A tool body that wants the model's text today reads
-            // `ctx.arguments`, which carries it whole.
-            for (declared.tools) |tool| {
-                if (@typeInfo(tool.type) != .@"struct" or
-                    @typeInfo(tool.type).@"struct".fields.len != 0)
-                {
-                    @compileError("the tool \"" ++ tool.name ++ "\" declares an argument type with " ++
-                        "fields, and this Chock does not lower the model's arguments into one. " ++
-                        "Give the tool an argument type with no field and read ctx.arguments.");
-                }
-            }
-
             @export(&abi_word, .{ .name = core.Magic.symbol });
             @export(&blob, .{ .name = core.Metadata.symbol });
             @export(&chockPluginInit, .{ .name = core.init_symbol });
@@ -207,12 +187,51 @@ pub fn Exports(comptime declared: meta.Metadata) type {
     };
 }
 
-fn thunkFor(comptime tool: meta.Tool) *const fn (tools.Context, *const anyopaque) tools.Result {
+/// How much scratch one call may use for the lists its arguments hold.
+///
+/// **Only a list needs storage.** A string is the bytes of the record itself
+/// and is never copied, so a tool that takes no list never touches this at all.
+/// Four kibibytes holds a thousand entries, and a record that needs more than
+/// that is one the host could not have written: the whole record is bounded by
+/// `Exports.argument_bytes`.
+///
+/// It costs a plugin nothing on disk: a buffer of zeros is `.bss` and carries
+/// no data segment, so the module's own file does not grow by one byte for it.
+const decode_bytes = 4 << 10;
+
+var decode_buffer: [decode_bytes]u8 align(16) = @splat(0);
+
+/// One tool's entry point: read the record the host wrote into the tool's own
+/// argument type, and call the author's body with it.
+///
+/// **A tool that takes nothing reads nothing.** The branch is `comptime`, so
+/// such a plugin carries no reader at all and behaves exactly as it did before
+/// schemas existed.
+///
+/// **A record that does not read is an ordinary answer and never a trap.** The
+/// tool answers a failure saying so, and the body never runs on a value that
+/// was guessed at. See `lib/chock-plugin-core/args.zig` for why the record is
+/// not the model's own JSON.
+fn thunkFor(comptime tool: meta.Tool) *const fn (tools.Context) tools.Result {
     const body = comptime meta.runOf(tool);
+    const Args = tool.type;
+    const takes_nothing = comptime @typeInfo(Args).@"struct".fields.len == 0;
+
     return &struct {
-        fn call(ctx: tools.Context, args: *const anyopaque) tools.Result {
-            const typed: *const tool.type = @ptrCast(@alignCast(args));
-            return body(ctx, typed.*);
+        fn call(ctx: tools.Context) tools.Result {
+            if (takes_nothing) return body(ctx, .{});
+
+            var scratch: std.heap.FixedBufferAllocator = .init(&decode_buffer);
+            const typed = core.args.decode(Args, ctx.arguments, scratch.allocator()) catch |err|
+                return ctx.errorResult(switch (err) {
+                    error.OutOfMemory => "the arguments for \"" ++ tool.name ++
+                        "\" hold more entries than this plugin has room for",
+                    error.MissingField => "the arguments for \"" ++ tool.name ++
+                        "\" leave out a field it needs",
+                    else => "the arguments for \"" ++ tool.name ++
+                        "\" are not a record this plugin can read",
+                });
+            return body(ctx, typed);
         }
     }.call;
 }

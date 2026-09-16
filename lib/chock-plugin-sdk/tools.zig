@@ -30,15 +30,17 @@ pub const Result = struct {
 /// `tool` is the name of the tool the host called, so one body that serves
 /// several tools can tell them apart.
 ///
-/// `arguments` is the argument text the model wrote, carried through
-/// untouched. **It is text and not a parsed value**, because nothing lowers
-/// the model's arguments into a tool's own argument type yet: see the comptime
-/// block in `lib/chock-plugin-sdk/exports.zig`, which refuses to compile a
-/// tool that declares one. A tool that needs an argument today reads this.
+/// `arguments` is the argument record the host wrote, and **a tool body has no
+/// reason to read it.** The generated thunk reads it into the tool's own
+/// argument type and hands the body that value instead, which is the whole
+/// point of declaring one: see `lib/chock-plugin-sdk/exports.zig`. It is left
+/// here because the thunk is what reads it, and a body that looks is told what
+/// it is holding rather than finding a field that is not documented.
 ///
-/// **Every byte of it was written by a model.** A tool body treats it as data
-/// the same way the harness does, and a body that cannot read it answers
-/// `errorResult` rather than guessing.
+/// **It is not the model's own JSON.** The host parses that, checks it against
+/// the schema this plugin advertised, and writes the values as a record in the
+/// order the tool declared its fields. See `lib/chock-plugin-core/args.zig` for
+/// the layout and for the measurement that put the parse on the host.
 pub const Context = struct {
     tool: []const u8 = "",
     arguments: []const u8 = "",

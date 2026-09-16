@@ -136,6 +136,7 @@ const chock_policy = @import("chock-policy");
 const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
 const chock_io = @import("chock-io");
+const plugin_core = @import("chock-plugin-core");
 const memory = @import("memory.zig");
 const idle_mod = @import("idle.zig");
 const guidance = @import("guidance.zig");
@@ -1906,57 +1907,19 @@ pub const Context = struct {
     role: Role = .worker,
 };
 
-/// What one argument field looks like in a JSON schema, read from the Zig
-/// type of the field itself.
+/// The properties of one tool's argument struct.
 ///
-/// The `else` branch is a compile error on purpose: an argument struct that
-/// gains a field of a type this function has no mapping for fails the build,
-/// rather than being described to the model as something it is not.
-const FieldSchema = struct {
-    json_type: []const u8,
-    /// True for an array of strings.
-    items_are_strings: bool = false,
-    /// The struct each entry of an array field holds, for the one nested
-    /// shape a tool argument has: a list of records. Null for every other
-    /// field. **This makes `FieldSchema` a comptime only type**, which is
-    /// what it already was in practice: every call site reads it at comptime.
-    items_are: ?type = null,
-    /// True when the model may leave the field out. Read from the Zig type:
-    /// an optional field is optional in the schema too, and there is no
-    /// second place to keep the two in step.
-    optional: bool = false,
-};
-
-fn fieldSchema(comptime T: type) FieldSchema {
-    return switch (T) {
-        []const u8 => .{ .json_type = "string" },
-        ?[]const u8 => .{ .json_type = "string", .optional = true },
-        []const []const u8 => .{ .json_type = "array", .items_are_strings = true },
-        ?[]const []const u8 => .{ .json_type = "array", .items_are_strings = true, .optional = true },
-        // Only ever optional. A required flag is a field every call has to
-        // carry to say the ordinary thing, and the ordinary thing is what a
-        // default is for.
-        ?bool => .{ .json_type = "boolean", .optional = true },
-        else => {
-            // A list of records, which `update_plan` needs: a task list is
-            // many steps, and one tool call per step would cost a round trip
-            // each. The item struct carries its own `docs`, so the nested
-            // schema is built by the same rule as the outer one and there is
-            // still exactly one description of each field.
-            const info = @typeInfo(T);
-            if (info == .pointer and info.pointer.size == .slice and
-                @typeInfo(info.pointer.child) == .@"struct")
-            {
-                return .{ .json_type = "array", .items_are = info.pointer.child };
-            }
-            @compileError("no JSON schema is defined for a tool argument of type " ++ @typeName(T));
-        },
-    };
+/// **The mapping itself is `chock_plugin_core.schema`, and it is the only one
+/// in this project.** A plugin tool's schema is built by that same function and
+/// travels to this host as data, so a built-in tool and a plugin tool describe
+/// themselves to the model in one spelling rather than two that drift. See
+/// `lib/chock-plugin-core/schema.zig` for the mapping, for the `docs`
+/// declaration each argument struct carries, and for what is a compile error.
+fn propertiesOf(comptime T: type) []const plugin_core.schema.Property {
+    return plugin_core.schema.propertiesOf(T, "a built-in tool");
 }
 
-/// The JSON schema for `T`, an argument struct. Built from the struct's own
-/// fields and from its `docs` declaration, which holds one sentence per
-/// field.
+/// The JSON schema for `T`, an argument struct.
 ///
 /// **This is what the FIXME over the two hand written schema builders asked
 /// for.** Two schemas written by hand next to two structs read by a parser
@@ -1967,33 +1930,7 @@ fn fieldSchema(comptime T: type) FieldSchema {
 /// The caller owns the returned value and everything under it. An arena is
 /// the simplest way to release the whole tree at once.
 fn schemaFor(comptime T: type, allocator: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
-    var properties: std.json.ObjectMap = .empty;
-    var required = std.json.Array.init(allocator);
-
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const shape = comptime fieldSchema(field.type);
-
-        var property: std.json.ObjectMap = .empty;
-        try property.put(allocator, "type", .{ .string = shape.json_type });
-        if (shape.items_are_strings) {
-            var items: std.json.ObjectMap = .empty;
-            try items.put(allocator, "type", .{ .string = "string" });
-            try property.put(allocator, "items", .{ .object = items });
-        }
-        if (comptime shape.items_are) |Item| {
-            try property.put(allocator, "items", try schemaFor(Item, allocator));
-        }
-        try property.put(allocator, "description", .{ .string = @field(T.docs, field.name) });
-
-        try properties.put(allocator, field.name, .{ .object = property });
-        if (!shape.optional) try required.append(.{ .string = field.name });
-    }
-
-    var root: std.json.ObjectMap = .empty;
-    try root.put(allocator, "type", .{ .string = "object" });
-    try root.put(allocator, "properties", .{ .object = properties });
-    try root.put(allocator, "required", .{ .array = required });
-    return .{ .object = root };
+    return plugin_core.schema.jsonValue(comptime propertiesOf(T), allocator);
 }
 
 /// The names of `T`'s required fields, quoted and joined, for the message a
@@ -2002,10 +1939,10 @@ fn schemaFor(comptime T: type, allocator: std.mem.Allocator) std.mem.Allocator.E
 /// one.
 fn requiredFieldNames(comptime T: type) []const u8 {
     var text: []const u8 = "";
-    for (@typeInfo(T).@"struct".fields) |field| {
-        if (comptime fieldSchema(field.type).optional) continue;
+    for (propertiesOf(T)) |property| {
+        if (!property.required) continue;
         if (text.len != 0) text = text ++ ", ";
-        text = text ++ "\"" ++ field.name ++ "\"";
+        text = text ++ "\"" ++ property.name ++ "\"";
     }
     return text;
 }
@@ -6829,12 +6766,12 @@ test "a tool's schema names the fields its own parser reads, and no others" {
             // field the model has to guess at.
             try std.testing.expect(property.get("description").?.string.len != 0);
 
-            const shape = comptime fieldSchema(arg.type);
-            try std.testing.expectEqualStrings(shape.json_type, property.get("type").?.string);
-            if (shape.items_are_strings) {
+            const shape = comptime propertiesOf(Args)[std.meta.fieldIndex(Args, arg.name).?].shape;
+            try std.testing.expectEqualStrings(shape.kind.jsonName(), property.get("type").?.string);
+            if (shape.kind == .array and shape.items.?.kind == .string) {
                 try std.testing.expectEqualStrings("string", property.get("items").?.object.get("type").?.string);
             }
-            if (!shape.optional) {
+            if (@typeInfo(arg.type) != .optional) {
                 required_count += 1;
                 var found = false;
                 for (required.items) |item| {
