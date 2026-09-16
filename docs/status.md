@@ -173,13 +173,27 @@ tenth.
   instead and the session hands over once the work is recorded, which carries
   the same work for a far smaller change. What is still missing is a handover
   that does not make the person wait for a long build.
-- **Only a git project's workspace moves.** A project with no git of its own
-  gets the overlay backing, and `overlay.create` cannot be called twice on the
-  same scratch directory: the Linux driver refuses a directory that exists, and
-  Darwin's clone refuses the same. The upper layer does survive the process that
-  made it, so nothing is lost by rebuilding the paths. What is missing is an
-  `overlay.adopt` beside `overlay.create`, one per driver. Until then
-  `chock detach` refuses a running overlay session by name.
+- **Only a git project's workspace moves to a second process.** A project with
+  no git of its own gets the overlay backing, and `overlay.create` cannot be
+  called twice on the same scratch directory: the Linux driver refuses a
+  directory that exists, and Darwin's clone refuses the same. `overlay.adopt`
+  now stands beside `overlay.create`, one per driver, and rebuilds the four
+  paths over a layout that is already on disk. What is still missing is the rest
+  of a live handover for that backing: `Workspace.adopt` takes a `base_commit` a
+  project with no git does not have, and `src/run.zig`'s own `takenOver` reads
+  only a worktree `workspace.open`. So `chock detach` still refuses a running
+  overlay session by name, and now names `chock workspace adopt` in the same
+  sentence.
+- **The work of an overlay session is reachable, and it is never applied for
+  you.** `chock workspace adopt <session>` rebuilds the overlay, reads the
+  upper layer with `Overlay.changedFiles`, and copies what changed into
+  `.chock-adopted/<session>/files` inside the project. **Nothing of yours is
+  written over and nothing of yours is deleted**: a destination that already
+  holds something is refused by name, and every path the session deleted is
+  written to `.chock-adopted/<session>/deleted` for you to act on rather than
+  removed. The act is recorded as a `workspace.adopt` event on the session's own
+  log, with the three counts. This is the overlay's answer to
+  `refs/chock/<session>`: inert, complete, and yours to take with one `cp`.
 - **A session that ended some other abnormal way still rebuilds from committed
   state.** Those sessions keep their workspace too, and adopting one is a
   separate decision with its own refusal.

@@ -186,6 +186,49 @@ pub fn create(
     return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
 }
 
+/// Rebuild the scratch layout of an overlay that is already on disk, rather
+/// than make a new one. The Darwin half of `../overlay.zig`'s own `adopt`, and
+/// it answers the same question the Linux half does from a different starting
+/// point.
+///
+/// **This clones nothing.** `create` clones the whole project into `upper`
+/// with `clonefile(2)`, which refuses a destination that already exists, so a
+/// second process cannot call it. The clone is still on disk after the process
+/// that made it ends, with every change the agent wrote in it, so there is
+/// nothing to copy and nothing to merge: this is `create`'s own joins with the
+/// clone replaced by a check.
+///
+/// `upper` is the one directory that has to be there, because on this platform
+/// it is the whole workspace. `error.NoOverlayToAdopt` when it is not a
+/// directory or is not there at all.
+///
+/// `work` and `merged` are made when they are missing and reused when they are
+/// there, exactly as the Linux driver does. Neither is read on Darwin: see
+/// `create`.
+pub fn adopt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    project: []const u8,
+    scratch: []const u8,
+    diag: ?*?Diagnostic,
+) Error!Overlay {
+    const project_owned = allocator.dupe(u8, project) catch return error.OutOfMemory;
+    errdefer allocator.free(project_owned);
+
+    const upper = std.fs.path.join(allocator, &.{ scratch, "upper" }) catch return error.OutOfMemory;
+    errdefer allocator.free(upper);
+    const work = std.fs.path.join(allocator, &.{ scratch, "work" }) catch return error.OutOfMemory;
+    errdefer allocator.free(work);
+    const merged = std.fs.path.join(allocator, &.{ scratch, "merged" }) catch return error.OutOfMemory;
+    errdefer allocator.free(merged);
+
+    if (!try iface.scratchDirOnDisk(io, upper, diag)) return error.NoOverlayToAdopt;
+    if (!try iface.scratchDirOnDisk(io, work, diag)) try makeScratchDir(io, work, diag);
+    if (!try iface.scratchDirOnDisk(io, merged, diag)) try makeScratchDir(io, merged, diag);
+
+    return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
+}
+
 /// One `clonefile` call, with every errno it can give mapped to an error that
 /// names what went wrong. See this file's own top comment.
 fn cloneTree(

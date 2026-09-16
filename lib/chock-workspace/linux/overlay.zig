@@ -129,6 +129,56 @@ pub fn create(
     return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
 }
 
+/// Rebuild the scratch layout of an overlay that is already on disk, rather
+/// than make a new one. The overlay analogue of `worktree.adopt`, and it is a
+/// far smaller call for the same reason a worktree adoption is small: nothing
+/// in the layout names the process that made it.
+///
+/// **This makes no upper layer and it copies nothing.** All three directories
+/// `create` made are still there after the process that made them ends, and
+/// every byte the agent wrote is in `upper`. What a second process cannot do
+/// is call `create` again: `create` makes all three with `createDirAbsolute`,
+/// which answers `error.PathAlreadyExists` for a directory that is there. So
+/// this is `create`'s own joins, from the same components in the same order,
+/// with the making replaced by a check.
+///
+/// `upper` is the one directory that has to be there, because it is the one
+/// that holds the work. `error.NoOverlayToAdopt` when it is not a directory or
+/// is not there at all, which covers a scratch directory a person has already
+/// cleared and a session that never opened an overlay.
+///
+/// **`work` and `merged` are made when they are missing and reused when they
+/// are there**, the rule `worktree.adopt` keeps for the scratch object store,
+/// and for the same reason: both belong to the session and not to one process,
+/// and neither holds anything the agent wrote. `work` is overlayfs's own
+/// scratch directory, which no caller of this file ever reads, and `merged` is
+/// a mount point. A failure after either is made leaves them where they are,
+/// because this call never removes a thing it did not make and the work is in
+/// the directory beside them.
+pub fn adopt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    project: []const u8,
+    scratch: []const u8,
+    diag: ?*?Diagnostic,
+) Error!Overlay {
+    const project_owned = allocator.dupe(u8, project) catch return error.OutOfMemory;
+    errdefer allocator.free(project_owned);
+
+    const upper = std.fs.path.join(allocator, &.{ scratch, "upper" }) catch return error.OutOfMemory;
+    errdefer allocator.free(upper);
+    const work = std.fs.path.join(allocator, &.{ scratch, "work" }) catch return error.OutOfMemory;
+    errdefer allocator.free(work);
+    const merged = std.fs.path.join(allocator, &.{ scratch, "merged" }) catch return error.OutOfMemory;
+    errdefer allocator.free(merged);
+
+    if (!try iface.scratchDirOnDisk(io, upper, diag)) return error.NoOverlayToAdopt;
+    if (!try iface.scratchDirOnDisk(io, work, diag)) try makeScratchDir(io, work, diag);
+    if (!try iface.scratchDirOnDisk(io, merged, diag)) try makeScratchDir(io, merged, diag);
+
+    return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
+}
+
 fn makeScratchDir(io: std.Io, absolute_path: []const u8, diag: ?*?Diagnostic) Error!void {
     std.Io.Dir.createDirAbsolute(io, absolute_path, .default_dir) catch |err| {
         diagnostic.noteErr(diag, .overlay_scratch_mkdir, err);
@@ -1062,6 +1112,384 @@ test "resolveKind falls back to statx when the caller reports unknown" {
 
     const kind = try resolveKind(allocator, file_path, .unknown, null);
     try std.testing.expectEqual(std.Io.File.Kind.file, kind);
+}
+
+/// Write `contents` to `<upper>/<relative>`, making the directories it needs.
+/// A test that wants an added or a changed file in the upper layer writes it
+/// straight there: that is exactly what overlayfs itself leaves behind, and
+/// the tests below then need no mount and no namespace, so they measure the
+/// same thing on every machine.
+fn writeUpper(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8, contents: []const u8) !void {
+    const file_path = try std.fs.path.join(allocator, &.{ ov.upper, relative });
+    defer allocator.free(file_path);
+    if (std.fs.path.dirname(file_path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+    }
+    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, file_path, .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, contents);
+}
+
+/// Make the whiteout overlayfs makes for a deleted path: a character device
+/// with major and minor both 0, at the same path in the upper layer.
+///
+/// **A real `mknod`, and not a stand-in.** An ordinary user may make a
+/// character device 0,0, measured on this box, so this builds the same inode
+/// `isWhiteout` reads in a real mount. A test that faked a whiteout some other
+/// way would pass while `changedFiles` read nothing.
+fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8) !void {
+    const file_path = try std.fs.path.join(allocator, &.{ ov.upper, relative });
+    defer allocator.free(file_path);
+    if (std.fs.path.dirname(file_path)) |parent| {
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+    }
+    const path_z = try allocator.dupeZ(u8, file_path);
+    defer allocator.free(path_z);
+    const rc = linux.mknod(path_z.ptr, linux.S.IFCHR | 0o600, 0);
+    // **A failure fails the test, and never skips it.** A machine that cannot
+    // make this node measures nothing about deletion, and a row of passes is
+    // what a person would read instead.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    try std.testing.expect(try isWhiteout(allocator, file_path, null));
+}
+
+fn readCarried(allocator: std.mem.Allocator, destination: []const u8, relative: []const u8) ![]u8 {
+    const file_path = try std.fs.path.join(allocator, &.{ destination, relative });
+    defer allocator.free(file_path);
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, file_path, allocator, .limited(4096));
+}
+
+test "adopt rebuilds every path create built, over the work that is already there" {
+    // The whole point of the call: the process that made the overlay has gone,
+    // and a second one needs the same four paths without making anything. The
+    // upper layer holds the session's work, so this also holds that the work is
+    // still there afterwards, byte for byte.
+    //
+    // Mutation check: make `adopt` call `makeScratchDir` on `upper` the way
+    // `create` does, and it returns `error.Unexpected` for every real workspace,
+    // because the directory is there. Make it join `scratch` with anything but
+    // "upper" and the content check below reads nothing.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try project.writeFile("tracked.txt", "original\n");
+
+    var made = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer made.deinit(allocator);
+    try writeUpper(allocator, made, "tracked.txt", "the agent changed this\n");
+
+    // The second owner. It is given the project and the scratch directory, and
+    // nothing else: no value the first one held.
+    var taken = try adopt(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer taken.deinit(allocator);
+
+    try std.testing.expectEqualStrings(made.project, taken.project);
+    try std.testing.expectEqualStrings(made.upper, taken.upper);
+    try std.testing.expectEqualStrings(made.work, taken.work);
+    try std.testing.expectEqualStrings(made.merged, taken.merged);
+
+    const kept = try readUpperFile(allocator, taken, "tracked.txt");
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("the agent changed this\n", kept);
+}
+
+test "adopt refuses a scratch directory with no upper layer, and a symbolic link where one should be" {
+    // The two ways there is nothing to take. The first is what a person has
+    // after `chock workspace clear`. The second is why the check reads the kind
+    // and does not follow the link: a link at `upper` is not a layout this
+    // process made, and adopting it would make every later join follow it
+    // somewhere else.
+    //
+    // Mutation check: drop the `NoOverlayToAdopt` return and `adopt` answers an
+    // `Overlay` whose `upper` is not there, so `carryOut` reports zero files
+    // changed for a session that changed plenty.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    try std.testing.expectError(error.NoOverlayToAdopt, adopt(
+        allocator,
+        std.testing.io,
+        project.root_path,
+        project.scratch_path,
+        null,
+    ));
+
+    const upper_path = try std.fs.path.join(allocator, &.{ project.scratch_path, "upper" });
+    defer allocator.free(upper_path);
+    try std.Io.Dir.symLinkAbsolute(std.testing.io, project.root_path, upper_path, .{});
+    try std.testing.expectError(error.NoOverlayToAdopt, adopt(
+        allocator,
+        std.testing.io,
+        project.root_path,
+        project.scratch_path,
+        null,
+    ));
+}
+
+test "carryOut brings a changed file and a new one out, and changes nothing in the project" {
+    // The headline promise. A file the session changed and a file it made both
+    // arrive at the destination, under the paths they have in the project, and
+    // the project itself is byte for byte what it was.
+    //
+    // Mutation check: make `carryOut` copy into `destination` rather than into
+    // `<destination>/files` and the reads below fail. Make it write into
+    // `self.project` instead and the last two reads fail, which is the one
+    // failure that would mean real loss.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try project.writeFile("tracked.txt", "original\n");
+    try project.writeFile("untouched.txt", "leave me\n");
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+    try writeUpper(allocator, ov, "tracked.txt", "the agent changed this\n");
+    try writeUpper(allocator, ov, "notes/new.md", "the agent made this\n");
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+
+    const carried = try ov.carryOut(allocator, std.testing.io, destination, null);
+    try std.testing.expectEqual(@as(usize, 2), carried.files);
+    try std.testing.expectEqual(@as(usize, 0), carried.deleted);
+    try std.testing.expectEqual(@as(usize, 0), carried.skipped);
+
+    const changed = try readCarried(allocator, destination, "files/tracked.txt");
+    defer allocator.free(changed);
+    try std.testing.expectEqualStrings("the agent changed this\n", changed);
+    const added = try readCarried(allocator, destination, "files/notes/new.md");
+    defer allocator.free(added);
+    try std.testing.expectEqualStrings("the agent made this\n", added);
+
+    // **The half that matters.** Nothing of the person's moved.
+    const still_there = try readProjectFile(allocator, project, "tracked.txt");
+    defer allocator.free(still_there);
+    try std.testing.expectEqualStrings("original\n", still_there);
+    const untouched = try readProjectFile(allocator, project, "untouched.txt");
+    defer allocator.free(untouched);
+    try std.testing.expectEqualStrings("leave me\n", untouched);
+}
+
+test "a path the session deleted is named in the deleted file and is still in the project" {
+    // **A deletion is work, and it is carried as a name.** The file the session
+    // removed is named, once, in `deleted`, and the person's own copy of it is
+    // still where it was: this command never removes anybody's file.
+    //
+    // Mutation check: drop the `.deleted` arm of `carryOut` and the count is
+    // zero and the file is empty, so a session that deleted three files reports
+    // an adoption that says nothing about them. Make the arm delete the path in
+    // the project instead and the last read fails, which is the loss this whole
+    // shape exists to refuse.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try project.writeFile("gone.txt", "the agent deleted me\n");
+    try project.writeFile("kept.txt", "still here\n");
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+    try makeWhiteout(allocator, ov, "gone.txt");
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+
+    const carried = try ov.carryOut(allocator, std.testing.io, destination, null);
+    try std.testing.expectEqual(@as(usize, 0), carried.files);
+    try std.testing.expectEqual(@as(usize, 1), carried.deleted);
+
+    const named = try readCarried(allocator, destination, "deleted");
+    defer allocator.free(named);
+    try std.testing.expectEqualStrings("gone.txt\n", named);
+
+    // Nothing was removed, which is the promise the count and the file are
+    // there to keep honest.
+    const survivor = try readProjectFile(allocator, project, "gone.txt");
+    defer allocator.free(survivor);
+    try std.testing.expectEqualStrings("the agent deleted me\n", survivor);
+    const other = try readProjectFile(allocator, project, "kept.txt");
+    defer allocator.free(other);
+    try std.testing.expectEqualStrings("still here\n", other);
+}
+
+test "the deleted and skipped files are written even when nothing was deleted or skipped" {
+    // A file that is there and empty says nothing was deleted. A file that is
+    // missing says only that some build did not write one, and a person cannot
+    // tell those apart. So both are always written.
+    //
+    // Mutation check: write `deleted` only when the list is not empty and this
+    // test reads a file that is not there.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+
+    const carried = try ov.carryOut(allocator, std.testing.io, destination, null);
+    try std.testing.expectEqual(@as(usize, 0), carried.files);
+
+    const deleted = try readCarried(allocator, destination, "deleted");
+    defer allocator.free(deleted);
+    try std.testing.expectEqualStrings("", deleted);
+    const skipped = try readCarried(allocator, destination, "skipped");
+    defer allocator.free(skipped);
+    try std.testing.expectEqualStrings("", skipped);
+}
+
+test "carryOut refuses a destination that already holds something, and reads nothing out of the upper layer" {
+    // **Not silent, and not a merge.** A destination that is already there may
+    // hold a carry out somebody has since edited, and nothing can tell those
+    // files from the ones this call would write. So it refuses by name, and it
+    // refuses before it opens the upper layer at all, which is what lets the
+    // caller name another destination and still get everything.
+    //
+    // Mutation check: replace the refusal with a `createDirPath` that tolerates
+    // a directory that exists, and the file already at the destination is
+    // written over with no word to anybody.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+    try project.writeFile("tracked.txt", "original\n");
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+    try writeUpper(allocator, ov, "tracked.txt", "the agent changed this\n");
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+    try std.Io.Dir.createDirAbsolute(std.testing.io, destination, .default_dir);
+    const in_the_way = try std.fs.path.join(allocator, &.{ destination, "files" });
+    defer allocator.free(in_the_way);
+    var handle = try std.Io.Dir.createFileAbsolute(std.testing.io, in_the_way, .{});
+    try handle.writeStreamingAll(std.testing.io, "a person put this here\n");
+    handle.close(std.testing.io);
+
+    try std.testing.expectError(
+        error.WorkAlreadyCarriedOut,
+        ov.carryOut(allocator, std.testing.io, destination, null),
+    );
+
+    // Untouched, which is the whole claim.
+    const still_there = try readCarried(allocator, destination, "files");
+    defer allocator.free(still_there);
+    try std.testing.expectEqualStrings("a person put this here\n", still_there);
+
+    // And the work is still in the upper layer, so a second destination gets it.
+    const second = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted-again" });
+    defer allocator.free(second);
+    const carried = try ov.carryOut(allocator, std.testing.io, second, null);
+    try std.testing.expectEqual(@as(usize, 1), carried.files);
+}
+
+test "a symbolic link the session made is carried as a link, and an executable file keeps its mode" {
+    // Two facts a plain read and write would lose. Following the link would
+    // copy whatever it points at, which can be a file outside the project the
+    // session never wrote. Dropping the mode would hand back a script that no
+    // longer runs.
+    //
+    // Mutation check: make `carryOne` stat with `follow_symlinks = true` and
+    // the link arrives as a copy of the file, so the first check fails. Pass
+    // `.permissions` to `copyFile` and the mode check fails.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+    try writeUpper(allocator, ov, "build.sh", "#!/bin/sh\necho hello\n");
+
+    const script_path = try std.fs.path.join(allocator, &.{ ov.upper, "build.sh" });
+    defer allocator.free(script_path);
+    const script_z = try allocator.dupeZ(u8, script_path);
+    defer allocator.free(script_z);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(script_z.ptr, 0o755)));
+
+    const link_path = try std.fs.path.join(allocator, &.{ ov.upper, "latest" });
+    defer allocator.free(link_path);
+    // A relative target, which is what an agent makes, and the case that
+    // panics through `symLinkAbsolute`.
+    try std.Io.Dir.cwd().symLink(std.testing.io, "build.sh", link_path, .{});
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+    const carried = try ov.carryOut(allocator, std.testing.io, destination, null);
+    try std.testing.expectEqual(@as(usize, 2), carried.files);
+
+    const carried_link = try std.fs.path.join(allocator, &.{ destination, "files", "latest" });
+    defer allocator.free(carried_link);
+    const link_stat = try std.Io.Dir.cwd().statFile(std.testing.io, carried_link, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, link_stat.kind);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try std.Io.Dir.readLinkAbsolute(std.testing.io, carried_link, &buffer);
+    try std.testing.expectEqualStrings("build.sh", buffer[0..length]);
+
+    const carried_script = try std.fs.path.join(allocator, &.{ destination, "files", "build.sh" });
+    defer allocator.free(carried_script);
+    const carried_script_z = try allocator.dupeZ(u8, carried_script);
+    defer allocator.free(carried_script_z);
+    var stx: linux.Statx = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        carried_script_z.ptr,
+        linux.AT.SYMLINK_NOFOLLOW,
+        .{ .MODE = true },
+        &stx,
+    )));
+    try std.testing.expectEqual(@as(u32, 0o755), stx.mode & 0o777);
+}
+
+test "a fifo the session made is named in the skipped file rather than dropped" {
+    // `changedFiles` already records a path it cannot classify. `carryOut`
+    // carries that record through to the destination, so the person reads which
+    // paths did not come and why, rather than counting files and wondering.
+    //
+    // Mutation check: drop the loop that turns `report.skipped` into lines and
+    // the count is zero and the file is empty for a workspace that really did
+    // hold something nothing could carry.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    var ov = try create(allocator, std.testing.io, project.root_path, project.scratch_path, null);
+    defer ov.deinit(allocator);
+
+    const fifo_path = try std.fs.path.join(allocator, &.{ ov.upper, "pipe" });
+    defer allocator.free(fifo_path);
+    const fifo_z = try allocator.dupeZ(u8, fifo_path);
+    defer allocator.free(fifo_z);
+    // A fifo needs no privilege at all. A failure here fails the test, because
+    // a machine that cannot make one measures nothing about a skip.
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknod(fifo_z.ptr, linux.S.IFIFO | 0o600, 0)));
+
+    const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
+    defer allocator.free(destination);
+    const carried = try ov.carryOut(allocator, std.testing.io, destination, null);
+    try std.testing.expectEqual(@as(usize, 0), carried.files);
+    try std.testing.expectEqual(@as(usize, 1), carried.skipped);
+
+    const named = try readCarried(allocator, destination, "skipped");
+    defer allocator.free(named);
+    try std.testing.expect(std.mem.startsWith(u8, named, "pipe: "));
 }
 
 test "nestedMounts finds nothing under a project with no mounts of its own" {

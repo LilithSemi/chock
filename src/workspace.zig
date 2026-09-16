@@ -34,9 +34,30 @@
 //! prune` is what removes that record, and this command runs it once after the
 //! deletes. A project with no git of its own has no such record and needs no
 //! prune.
+//!
+//! ## `adopt` is how a project with no git gets its work back
+//!
+//! A git project already has one way out of a kept workspace: the session's
+//! commits are real git objects in the project's own store and
+//! `refs/chock/<session>` names them, so `git log` reads the work and `git
+//! merge` takes it. Nothing of the person's moved, and the person decides.
+//!
+//! A project with no git got the overlay backing and had no way out at all.
+//! The work is in the upper layer, which outlives the process that wrote it,
+//! and no command reached it: `list` said how many bytes were there and `clear`
+//! deleted them. So a person whose project is not a git repository, and whose
+//! session died, had work on disk and one command that destroys it.
+//!
+//! `adopt` is the missing half. It rebuilds the overlay with
+//! `chock_workspace.overlay.adopt`, and copies the changed files out to
+//! `.chock-adopted/<session>/files` inside the project, beside a `deleted` file
+//! naming every path the session removed. **It writes over nothing.** See
+//! `chock_workspace.overlay.carryOut`, which holds the reasoning for the shape,
+//! and `adoptWorkspace` below for every refusal.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
+const chock_proto = @import("chock-proto");
 const chock_workspace = @import("chock-workspace");
 
 const approval = @import("approval.zig");
@@ -51,7 +72,7 @@ const tty = @import("tty.zig");
 const work_suffix = ".work";
 
 const usage_text =
-    \\Usage: chock workspace [list|clear] [options]
+    \\Usage: chock workspace [list|clear|adopt <session>] [options]
     \\
     \\With no subcommand, says which workspaces this project's sessions left behind.
     \\A session that ends cleanly removes its own. A session that errored, was
@@ -61,6 +82,13 @@ const usage_text =
     \\clear removes every one of them. It names them and says how many bytes go
     \\first, and then it asks. Nothing else holds a copy of what is in them, so take
     \\what you want out of them before you answer yes.
+    \\
+    \\adopt <session> takes the work out of one kept workspace of a project that is
+    \\not a git repository, and puts it in .chock-adopted/<session> inside the
+    \\project. Nothing of yours is written over and nothing of yours is deleted: the
+    \\changed files arrive under files/, and every path the session deleted is named
+    \\in deleted for you to act on. A git project needs none of this, because its
+    \\work is already at refs/chock/<session>.
     \\
     \\A workspace whose session is running now is never removed, because that session
     \\is writing into it. Such a row is marked with a * at the start.
@@ -77,9 +105,14 @@ const Options = struct {
     /// The caller has decided already, so `clear` does not ask. The same option
     /// `chock sessions remove` takes, and it means the same thing.
     yes: bool = false,
+    /// Which workspace `adopt` takes. **Named by the person and never chosen
+    /// here**: `list` is what says which sessions left one, and a command that
+    /// picked for itself would write a directory into the project for a session
+    /// nobody named.
+    session: ?[]const u8 = null,
 };
 
-const Action = enum { list, clear };
+const Action = enum { list, clear, adopt };
 
 pub fn main(
     arena: std.mem.Allocator,
@@ -121,6 +154,9 @@ pub fn main(
     const kept = try list(arena, io, dir);
 
     if (options.action == .list) return listWorkspaces(kept, dir);
+    if (options.action == .adopt) {
+        return adoptWorkspace(arena, io, kept, project_root, dir, options.session);
+    }
 
     // `hasTerminal` reads what standard input really is. It is read here, in
     // the one function no test drives, so that the rule itself stays in
@@ -496,9 +532,16 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         }
         if (argument.len != 0 and argument[0] == '-') return error.BadArguments;
 
-        if (saw_action) return error.BadArguments;
-        options.action = std.meta.stringToEnum(Action, argument) orelse return error.BadArguments;
-        saw_action = true;
+        if (!saw_action) {
+            options.action = std.meta.stringToEnum(Action, argument) orelse return error.BadArguments;
+            saw_action = true;
+            continue;
+        }
+        // The second word, and only `adopt` has one: it is the session whose
+        // workspace is taken. A second word after any other action is a typo,
+        // and a typo that is quietly ignored is the wrong workspace acted on.
+        if (options.action != .adopt or options.session != null) return error.BadArguments;
+        options.session = argument;
     }
     return options;
 }
@@ -519,6 +562,320 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
     return std.process.currentPathAlloc(io, arena);
 }
 
+/// What `adopt` calls the directory it puts a session's work in, inside the
+/// project. One directory per session under it.
+///
+/// **Inside the project, and named.** The git path lands the work inside the
+/// project too, under its own `.git`, and that is what makes `git merge` one
+/// step away. A directory somewhere else would be a path the person has to keep
+/// hold of, and a directory under Chock's own state is a directory the next
+/// `chock cache clear` or a tidy up of a state directory takes away.
+pub const adopted_dir_name = ".chock-adopted";
+
+/// Take the work out of one kept overlay workspace and put it in the project,
+/// where the person can see it and decide.
+///
+/// ## Every refusal, and what each one is protecting
+///
+/// * **No session named.** `list` is what says which sessions left a workspace,
+///   and this never picks one: a command that chose for itself would write a
+///   directory into the project for a session nobody asked about.
+/// * **A session that is running, or whose lock could not be tested.** The
+///   same rule `clear` keeps and for a sharper reason: the agent is writing
+///   into the upper layer at this moment, so a copy taken now is a copy of a
+///   half written file. An absent answer is never a permissive answer.
+/// * **A log that names no workspace.** That is a session from a build before
+///   `workspace.open` existed. Nothing here can tell which attempt directory
+///   held the overlay, and guessing at one would read a directory that belongs
+///   to another run.
+/// * **A workspace that is a git worktree.** The work is already in the
+///   project's own object store at `refs/chock/<session>`, and this says so
+///   rather than making a second copy of it that nothing keeps up to date. This
+///   is what leaves the git path exactly as it was.
+/// * **No overlay under the attempt directory.** `chock workspace clear` has
+///   already been run, or the directory never held one.
+/// * **A destination that already holds something.** See
+///   `chock_workspace.overlay.carryOut`. Nothing at the destination is read or
+///   written, and the upper layer still holds every byte, so naming another
+///   destination gets the lot.
+///
+/// ## What lands in the log
+///
+/// One `workspace.adopt` event on the session's own log, with the attempt, the
+/// destination, and the three counts. **Written only after the work is really
+/// at the destination**, so a log that says an adoption happened is a log about
+/// a directory that is there. The lock is taken for the append and given back,
+/// which a running session would hold, and a running session is refused above.
+fn adoptWorkspace(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    kept: []const Kept,
+    project_root: []const u8,
+    dir: []const u8,
+    wanted: ?[]const u8,
+) u8 {
+    const session_id = wanted orelse {
+        tty.print(
+            .err,
+            "chock workspace adopt: name the session whose work you want. " ++
+                "`chock workspace` lists the sessions of this project that left one.\n",
+            .{},
+        );
+        return Exit.usage.code();
+    };
+    if (!session_paths.isValidId(session_id)) {
+        tty.print(
+            .err,
+            "chock workspace adopt: {s} is not a session identifier.\n",
+            .{session_id},
+        );
+        return Exit.usage.code();
+    }
+
+    // The same rows `list` and `clear` read, so the three commands can never
+    // disagree about which workspace a session still owns.
+    const one = findKept(kept, session_id) orelse {
+        tty.print(
+            .err,
+            "chock workspace adopt: session {s} left no workspace in {s}.\n",
+            .{ session_id, dir },
+        );
+        return Exit.usage.code();
+    };
+    if (!one.removable()) {
+        tty.print(.err, "chock workspace adopt: {s} is kept: {s}\n", .{ session_id, whyKept(one) });
+        tty.print(
+            .err,
+            "chock workspace adopt: nothing was copied. A workspace being written into now " ++
+                "gives a copy of half written files.\n",
+            .{},
+        );
+        return Exit.refused.code();
+    }
+
+    const log_path = std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ dir, session_id }, 0) catch return Exit.usage.code();
+    const opened = lastWorkspaceOpen(arena, io, log_path, session_id) orelse {
+        tty.print(
+            .err,
+            "chock workspace adopt: the log of session {s} names no workspace, so which " ++
+                "directory held its work is unknown. Look in {s} yourself.\n",
+            .{ session_id, one.path },
+        );
+        return Exit.usage.code();
+    };
+
+    switch (opened.kind) {
+        .worktree => {
+            tty.print(
+                .err,
+                "chock workspace adopt: session {s} worked in a git worktree, and its work is " ++
+                    "already in this project: the commits are objects in {s} and refs/chock/{s} " ++
+                    "names them. Read it with `git log refs/chock/{s}` and take it with " ++
+                    "`git merge refs/chock/{s}`.\n",
+                .{ session_id, project_root, session_id, session_id, session_id },
+            );
+            return Exit.usage.code();
+        },
+        .unknown => |name| {
+            tty.print(
+                .err,
+                "chock workspace adopt: session {s} worked in a {s} workspace, which this build " ++
+                    "does not know how to take. Nothing was copied.\n",
+                .{ session_id, name },
+            );
+            return Exit.usage.code();
+        },
+        .overlay => {},
+    }
+
+    const scratch = std.fs.path.join(arena, &.{ one.path, opened.attempt }) catch return Exit.usage.code();
+    var diag: ?chock_workspace.Diagnostic = null;
+    var overlay = chock_workspace.overlay.adopt(arena, io, project_root, scratch, &diag) catch |err| {
+        switch (err) {
+            error.NoOverlayToAdopt => tty.print(
+                .err,
+                "chock workspace adopt: session {s} left no overlay at {s}. Its work is not " ++
+                    "there to take.\n",
+                .{ session_id, scratch },
+            ),
+            else => sayFault(session_id, "the overlay could not be taken", err, diag),
+        }
+        return Exit.usage.code();
+    };
+    defer overlay.deinit(arena);
+
+    const adopted_root = std.fs.path.join(arena, &.{ project_root, adopted_dir_name }) catch return Exit.usage.code();
+    const destination = std.fs.path.join(arena, &.{ adopted_root, session_id }) catch return Exit.usage.code();
+
+    diag = null;
+    const carried = overlay.carryOut(arena, io, destination, &diag) catch |err| {
+        switch (err) {
+            error.WorkAlreadyCarriedOut => tty.print(
+                .err,
+                "chock workspace adopt: {s} already holds something, so nothing was written " ++
+                    "over. The work is still in {s}. Move that directory out of the way and run " ++
+                    "this again.\n",
+                .{ destination, overlay.upper },
+            ),
+            else => sayFault(session_id, "the work could not be copied out", err, diag),
+        }
+        return Exit.refused.code();
+    };
+
+    recordAdoption(arena, io, log_path, session_id, opened.attempt, destination, carried);
+
+    tty.print(.plain, "chock workspace adopt: {d} files of session {s} are in {s}/{s}\n", .{
+        carried.files,
+        session_id,
+        destination,
+        chock_workspace.overlay.carried_files_name,
+    });
+    tty.out(
+        .plain,
+        "Nothing of yours was written over. Take what you want: cp -a {s}/{s}/. {s}/\n",
+        .{ destination, chock_workspace.overlay.carried_files_name, project_root },
+    );
+    // **Said even when it is zero**, because the reader has to learn that a
+    // deletion is a thing this command never performs, and a line that only
+    // appears sometimes teaches nobody that.
+    tty.out(
+        .plain,
+        "{d} paths the session deleted are named in {s}/{s}. None of them was removed from " ++
+            "the project: that is yours to do.\n",
+        .{ carried.deleted, destination, chock_workspace.overlay.carried_deleted_name },
+    );
+    if (carried.skipped != 0) {
+        tty.print(
+            .warn,
+            "chock workspace adopt: {d} paths could not be carried, each with its reason in " ++
+                "{s}/{s}.\n",
+            .{ carried.skipped, destination, chock_workspace.overlay.carried_skipped_name },
+        );
+    }
+    tty.detail("The workspace is still in {s}. `chock workspace clear` removes it.\n", .{one.path});
+    return Exit.finished.code();
+}
+
+/// The row `list` already built for this session, or null when it built none.
+fn findKept(kept: []const Kept, session_id: []const u8) ?Kept {
+    for (kept) |one| {
+        if (std.mem.eql(u8, one.session_id, session_id)) return one;
+    }
+    return null;
+}
+
+/// What one `workspace.open` in a session's log said, with the strings copied
+/// into the caller's allocator.
+const Opened = struct {
+    kind: chock_proto.event.WorkspaceKind,
+    attempt: []const u8,
+};
+
+/// The last `workspace.open` in the log of `session_id`, or null when the log
+/// holds none, cannot be read, or names an attempt this build will not join
+/// onto a path.
+///
+/// **The last one, and never the first.** A session that was continued has one
+/// `workspace.open` per attempt, and an earlier one names a directory an
+/// earlier run worked in. The last is the one that holds the work the session
+/// ended with. The same rule `src/detach.zig`'s own `endedHandedOver` keeps for
+/// the same reason.
+///
+/// A replay takes no lock. The caller has already refused a session that is
+/// running, so the log is not moving under this.
+fn lastWorkspaceOpen(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    session_id: []const u8,
+) ?Opened {
+    const log = chock_proto.log.Log.open(io, log_path, session_id) catch return null;
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+
+    var replay = store.replay(arena, io, 0) catch return null;
+    defer replay.deinit();
+
+    var found: ?Opened = null;
+    while (replay.next(io) catch null) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .workspace_open) continue;
+        const opened = parsed.value.event.workspace_open;
+        // **An identifier of another length is never joined onto a path**, the
+        // rule `session.zig` keeps and the reason `isValidId` exists. A log a
+        // later build wrote is still read for its kind, so the caller can say
+        // it does not know that kind rather than say nothing.
+        if (!session_paths.isValidId(opened.attempt)) continue;
+        // Copied now: the replay owns these bytes only until the next line.
+        const kind: chock_proto.event.WorkspaceKind = switch (opened.kind) {
+            .worktree => .worktree,
+            .overlay => .overlay,
+            .unknown => |name| .{ .unknown = arena.dupe(u8, name) catch return null },
+        };
+        found = .{ .kind = kind, .attempt = arena.dupe(u8, opened.attempt) catch return null };
+    }
+    return found;
+}
+
+/// Write down what this adoption did, on the session's own log.
+///
+/// **Best effort, and said out loud when it fails.** The work is already at the
+/// destination by the time this runs, and a log that could not be appended to
+/// is not a reason to pretend the files are not there. What it is a reason for
+/// is a line the person can read, because a log with no row is a session whose
+/// history stops short of the last thing that happened to it.
+fn recordAdoption(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    log_path: [:0]const u8,
+    session_id: []const u8,
+    attempt: []const u8,
+    destination: []const u8,
+    carried: chock_workspace.overlay.CarriedOut,
+) void {
+    const log = chock_proto.log.Log.open(io, log_path, session_id) catch |err| return sayLogFault(session_id, err);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+
+    var locked = store.lock(io) catch |err| return sayLogFault(session_id, err);
+    defer locked.unlock(io) catch {};
+    _ = locked.append(arena, io, .{ .workspace_adopt = .{
+        .attempt = attempt,
+        .path = destination,
+        .files = carried.files,
+        .deleted = carried.deleted,
+        .skipped = carried.skipped,
+    } }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| sayLogFault(session_id, err);
+}
+
+fn sayLogFault(session_id: []const u8, err: anyerror) void {
+    tty.print(
+        .warn,
+        "chock workspace adopt: the files are in place and the log of session {s} could not be " ++
+            "written ({s}), so this adoption is not recorded there.\n",
+        .{ session_id, @errorName(err) },
+    );
+}
+
+/// One line naming the step, then the call that failed underneath it. The shape
+/// `chock run` uses for the same pair, so a reader gets the command's own
+/// sentence and never only a bare error name.
+fn sayFault(
+    session_id: []const u8,
+    doing: []const u8,
+    err: anyerror,
+    diag: ?chock_workspace.Diagnostic,
+) void {
+    if (diag) |fault| {
+        var held = fault;
+        tty.print(.err, "chock workspace adopt: {s} of session {s}: {f}\n", .{ doing, session_id, &held });
+        return;
+    }
+    tty.print(.err, "chock workspace adopt: {s} of session {s}: {s}\n", .{ doing, session_id, @errorName(err) });
+}
+
 const testing = std.testing;
 
 test "the command line names an action and nothing else" {
@@ -534,6 +891,17 @@ test "the command line names an action and nothing else" {
     try testing.expect((try parseOptions(&.{ "clear", "--yes" })).yes);
     try testing.expect((try parseOptions(&.{ "--yes", "clear" })).yes);
     try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "--force" }));
+
+    // `adopt` is the one action with a second word, and that word is the
+    // session. Mutation check: let any action take a second word and
+    // `chock workspace clear 01J...` reads as a clear of everything, with the
+    // session a person typed quietly ignored.
+    const taking = try parseOptions(&.{ "adopt", "01JQAAAAAAAAAAAAAAAAAAAAAA" });
+    try testing.expectEqual(Action.adopt, taking.action);
+    try testing.expectEqualStrings("01JQAAAAAAAAAAAAAAAAAAAAAA", taking.session.?);
+    try testing.expectEqual(@as(?[]const u8, null), (try parseOptions(&.{"adopt"})).session);
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "01JQAAAAAAAAAAAAAAAAAAAAAA" }));
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "adopt", "one", "two" }));
 
     try testing.expectError(error.BadArguments, parseOptions(&.{"remove-everything"}));
     try testing.expectError(error.BadArguments, parseOptions(&.{ "clear", "clear" }));
@@ -908,6 +1276,408 @@ test "a clear with nothing to clear does not report success" {
     // a number a person has to look up.
     try testing.expect(std.mem.indexOf(u8, said.err(), root) != null);
     try testing.expectEqualStrings("", said.out());
+}
+
+/// A session directory holding one session whose log names an overlay
+/// workspace, with `upper` really on disk under the attempt directory.
+///
+/// Built out of the same pieces the real thing is: the log is a real
+/// `chock_proto` log with a real `workspace.open` in it, so a change to that
+/// event's own shape breaks this rather than letting it drift.
+fn makeOverlaySession(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    id: []const u8,
+    attempt: []const u8,
+    kind: chock_proto.event.WorkspaceKind,
+) ![]const u8 {
+    std.Io.Dir.createDirAbsolute(io, root, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const work = try std.fmt.allocPrint(arena, "{s}/{s}.work", .{ root, id });
+    try std.Io.Dir.createDirAbsolute(io, work, .default_dir);
+    const scratch = try std.fs.path.join(arena, &.{ work, attempt });
+    try std.Io.Dir.createDirAbsolute(io, scratch, .default_dir);
+    const upper = try std.fs.path.join(arena, &.{ scratch, "upper" });
+    try std.Io.Dir.createDirAbsolute(io, upper, .default_dir);
+
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ root, id }, 0);
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var locked = try store.lock(io);
+    // **An earlier attempt first, and its directory is never made.** A session
+    // that was continued has one `workspace.open` per attempt, and a build that
+    // read the first would open a directory that is not there. See
+    // `lastWorkspaceOpen`.
+    _ = try locked.append(arena, io, .{ .workspace_open = .{
+        .kind = kind,
+        .attempt = "01JQ" ++ "T" ** 22,
+        .path = "/gone",
+        .base_commit = "",
+    } }, 500);
+    _ = try locked.append(arena, io, .{ .workspace_open = .{
+        .kind = kind,
+        .attempt = attempt,
+        .path = upper,
+        .base_commit = "",
+    } }, 1000);
+    _ = try locked.append(arena, io, .{ .session_end = .{ .reason = .errored, .detail = "rate limited" } }, 2000);
+    try locked.unlock(io);
+    return upper;
+}
+
+fn writeUnder(arena: std.mem.Allocator, io: std.Io, root: []const u8, relative: []const u8, contents: []const u8) !void {
+    const file_path = try std.fs.path.join(arena, &.{ root, relative });
+    if (std.fs.path.dirname(file_path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    var handle = try std.Io.Dir.createFileAbsolute(io, file_path, .{});
+    defer handle.close(io);
+    try handle.writeStreamingAll(io, contents);
+}
+
+/// The one `workspace.adopt` row in the log of `id`, or null when there is
+/// none. Read back through a real replay, because a test that checked only the
+/// files would pass against a build that never wrote the row.
+fn adoptionRow(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    id: []const u8,
+) !?chock_proto.event.WorkspaceAdopt {
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ root, id }, 0);
+    const log = try chock_proto.log.Log.open(io, log_path, id);
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(io);
+    var replay = try store.replay(arena, io, 0);
+    defer replay.deinit();
+
+    var found: ?chock_proto.event.WorkspaceAdopt = null;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event != .workspace_adopt) continue;
+        const row = parsed.value.event.workspace_adopt;
+        found = .{
+            .attempt = try arena.dupe(u8, row.attempt),
+            .path = try arena.dupe(u8, row.path),
+            .files = row.files,
+            .deleted = row.deleted,
+            .skipped = row.skipped,
+        };
+    }
+    return found;
+}
+
+/// A whiteout at `<upper>/<relative>`: the character device 0,0 overlayfs
+/// itself makes for a deleted path. An ordinary user may make one, so this
+/// needs no namespace and no mount, and a machine that refuses it fails the
+/// test rather than skipping it.
+fn makeWhiteoutAt(arena: std.mem.Allocator, upper: []const u8, relative: []const u8) !void {
+    const file_path = try std.fs.path.join(arena, &.{ upper, relative });
+    const path_z = try arena.dupeZ(u8, file_path);
+    const rc = std.os.linux.mknod(path_z.ptr, std.os.linux.S.IFCHR | 0o600, 0);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
+}
+
+test "an overlay a session left behind is adopted, and what it changed and what it deleted both arrive" {
+    // **The whole gap, end to end.** A project with no git of its own, a
+    // session that ended badly, and work in an upper layer that no command
+    // reached. This is the command that reaches it.
+    //
+    // Three facts, and the second and third are the ones a file count alone
+    // would hide: the changed file is at the destination, the deleted path is
+    // named rather than acted on, and the log holds a row saying which.
+    //
+    // Mutation check: make `adoptWorkspace` read the first `workspace.open`
+    // rather than the last and it opens an attempt directory that is not there.
+    // Drop the `recordAdoption` call and the last block fails, so a session's
+    // history would stop before the last thing that happened to it.
+    if (@import("builtin").os.tag != .linux) return;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+    try writeUnder(arena, testing.io, project, "tracked.txt", "original\n");
+    try writeUnder(arena, testing.io, project, "gone.txt", "the agent deleted me\n");
+
+    const id = "01JQ" ++ "A" ** 22;
+    const attempt = "01JQ" ++ "B" ** 22;
+    const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
+    try writeUnder(arena, testing.io, upper, "tracked.txt", "the agent changed this\n");
+    try writeUnder(arena, testing.io, upper, "notes/new.md", "the agent made this\n");
+    try makeWhiteoutAt(arena, upper, "gone.txt");
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const kept = try list(arena, testing.io, root);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqual(
+        Exit.finished.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, id),
+    );
+
+    const destination = try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ project, adopted_dir_name, id });
+
+    const changed = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ destination, "files", "tracked.txt" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("the agent changed this\n", changed);
+    const added = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ destination, "files", "notes", "new.md" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("the agent made this\n", added);
+
+    // **The deletion is a name, and never an act.**
+    const deleted = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ destination, "deleted" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("gone.txt\n", deleted);
+    const survivor = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ project, "gone.txt" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("the agent deleted me\n", survivor);
+    // And the person's own copy of the changed file is what it was.
+    const untouched = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ project, "tracked.txt" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("original\n", untouched);
+
+    // What was said, so a person knows where the files are and that the
+    // deletions are theirs to make.
+    try testing.expect(std.mem.indexOf(u8, said.out(), destination) != null);
+    try testing.expect(std.mem.indexOf(u8, said.out(), "None of them was removed") != null);
+
+    // **And the log says it happened**, the way `workspace.integrate` says what
+    // an apply did.
+    const row = (try adoptionRow(arena, testing.io, root, id)) orelse return error.NoAdoptionRecorded;
+    try testing.expectEqualStrings(attempt, row.attempt);
+    try testing.expectEqualStrings(destination, row.path);
+    try testing.expectEqual(@as(u64, 2), row.files);
+    try testing.expectEqual(@as(u64, 1), row.deleted);
+    try testing.expectEqual(@as(u64, 0), row.skipped);
+}
+
+test "a session that worked in a git worktree is refused, and sent to the ref that already holds its work" {
+    // **The git path is not changed, and is not copied either.** A worktree
+    // session's commits are already objects in the project, and a second copy
+    // of them in a directory would be a copy nothing keeps up to date. So this
+    // says where the work is and stops.
+    //
+    // Mutation check: take the `.worktree` arm out and the command builds an
+    // overlay path under a worktree checkout, finds no `upper`, and refuses
+    // with a sentence about an overlay for a project that has none.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+
+    const id = "01JQ" ++ "C" ** 22;
+    const attempt = "01JQ" ++ "D" ** 22;
+    _ = try makeOverlaySession(arena, testing.io, root, id, attempt, .worktree);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const kept = try list(arena, testing.io, root);
+    try testing.expectEqual(
+        Exit.usage.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, id),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "refs/chock/") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "git merge") != null);
+
+    // **And it wrote nothing into the project.** A refusal that had already
+    // made a directory would be a refusal that acted.
+    const adopted = try std.fmt.allocPrint(arena, "{s}/{s}", .{ project, adopted_dir_name });
+    try testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(testing.io, adopted, .{}),
+    );
+    try testing.expectEqual(@as(?chock_proto.event.WorkspaceAdopt, null), try adoptionRow(arena, testing.io, root, id));
+}
+
+test "an adoption that would write over an earlier one is refused by name, and nothing is written over" {
+    // **Not silent.** The destination may already hold a carry out a person has
+    // edited since, and nothing can tell those files from the ones this would
+    // write. So it names the path, says the work is still in the upper layer,
+    // and stops.
+    //
+    // Mutation check: let `carryOut` merge into a destination that exists and
+    // the file a person put there is gone with no word to anybody.
+    if (@import("builtin").os.tag != .linux) return;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+
+    const id = "01JQ" ++ "E" ** 22;
+    const attempt = "01JQ" ++ "F" ** 22;
+    const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
+    try writeUnder(arena, testing.io, upper, "tracked.txt", "the agent changed this\n");
+
+    // An earlier adoption, with a person's own edit in it.
+    const destination = try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ project, adopted_dir_name, id });
+    try writeUnder(arena, testing.io, destination, "files/tracked.txt", "a person edited this\n");
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const kept = try list(arena, testing.io, root);
+    try testing.expectEqual(
+        Exit.refused.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, id),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), destination) != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "nothing was written over") != null);
+    // The upper layer is named too, so the person knows the work did not go.
+    try testing.expect(std.mem.indexOf(u8, said.err(), upper) != null);
+
+    const still_there = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fs.path.join(arena, &.{ destination, "files", "tracked.txt" }),
+        arena,
+        .limited(4096),
+    );
+    try testing.expectEqualStrings("a person edited this\n", still_there);
+    try testing.expectEqual(@as(?chock_proto.event.WorkspaceAdopt, null), try adoptionRow(arena, testing.io, root, id));
+}
+
+test "adopt refuses a session nobody named, one that is not an identifier, and one with no workspace" {
+    // Three ways to reach this command with nothing to act on. **None of them
+    // picks a session**: a command that chose one for itself would write a
+    // directory into the project for a session nobody asked about.
+    //
+    // Mutation check: make the null arm fall through to the newest kept
+    // workspace and the first case adopts something the person never named.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+
+    const id = "01JQ" ++ "G" ** 22;
+    const attempt = "01JQ" ++ "H" ** 22;
+    _ = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const kept = try list(arena, testing.io, root);
+    try testing.expectEqual(
+        Exit.usage.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, null),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "name the session") != null);
+
+    try testing.expectEqual(
+        Exit.usage.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, "../../etc"),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "not a session identifier") != null);
+
+    const never_ran = "01JQ" ++ "Z" ** 22;
+    try testing.expectEqual(
+        Exit.usage.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, never_ran),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "left no workspace") != null);
+
+    // Nothing was written into the project by any of the three.
+    const adopted = try std.fmt.allocPrint(arena, "{s}/{s}", .{ project, adopted_dir_name });
+    try testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(testing.io, adopted, .{}),
+    );
+}
+
+test "a workspace whose overlay has already been cleared is refused, and the clearing is named" {
+    // `chock workspace clear` removes the attempt directory and leaves the log
+    // alone, so the log still names an overlay that is not there. The refusal
+    // says which directory it looked in, because that is the one fact a person
+    // needs to tell "cleared" from "this build looked in the wrong place".
+    //
+    // Mutation check: drop `error.NoOverlayToAdopt` from `overlay.adopt` and
+    // this returns a success with zero files, which reads as "the session
+    // changed nothing" for a session that may have changed everything.
+    if (@import("builtin").os.tag != .linux) return;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    const root = try std.fmt.allocPrint(arena, "{s}/sessions", .{buffer[0..len]});
+    const project = try std.fmt.allocPrint(arena, "{s}/project", .{buffer[0..len]});
+    try std.Io.Dir.createDirAbsolute(testing.io, project, .default_dir);
+
+    const id = "01JQ" ++ "K" ** 22;
+    const attempt = "01JQ" ++ "M" ** 22;
+    const upper = try makeOverlaySession(arena, testing.io, root, id, attempt, .overlay);
+    try std.Io.Dir.cwd().deleteTree(testing.io, upper);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    const kept = try list(arena, testing.io, root);
+    try testing.expectEqual(
+        Exit.usage.code(),
+        adoptWorkspace(arena, testing.io, kept, project, root, id),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "left no overlay") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), attempt) != null);
 }
 
 test "a project that never ran a session lists nothing rather than failing" {

@@ -170,6 +170,7 @@ pub const Kind = enum {
     policy_self,
     workspace_open,
     workspace_integrate,
+    workspace_adopt,
     sandbox_open,
     sandbox_supervisor,
     sandbox_syscalls,
@@ -222,6 +223,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .policy_self = "policy.self",
     .workspace_open = "workspace.open",
     .workspace_integrate = "workspace.integrate",
+    .workspace_adopt = "workspace.adopt",
     .sandbox_open = "sandbox.open",
     .sandbox_supervisor = "sandbox.supervisor",
     .sandbox_syscalls = "sandbox.syscalls",
@@ -1471,6 +1473,48 @@ pub const WorkspaceIntegrate = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// **What one `chock workspace adopt` took out of an overlay a session left
+/// behind.**
+///
+/// This exists for the reason `WorkspaceIntegrate` exists: an act that moves a
+/// person's work has to be distinguishable afterwards from one that did not
+/// happen. A git project already has that record, because the work lands at
+/// `refs/chock/<session>` and `workspace.integrate` says so. A project with no
+/// git had neither the act nor the record until this.
+///
+/// **Written after `session.end`, and that is correct.** The session whose
+/// workspace this was has already stopped: that is what makes the workspace
+/// adoptable at all. A handover already appends to a log past its own
+/// `session.end`, so a reader that folds these in order needs nothing new.
+///
+/// **The counts are three, and they are not one number.** `files` alone would
+/// let an adoption that carried no deletion at all read as a complete answer.
+/// See `chock_workspace.overlay.CarriedOut`, whose three fields these are.
+pub const WorkspaceAdopt = struct {
+    /// The attempt whose overlay was adopted, the same identifier the
+    /// `workspace.open` this answers carries.
+    attempt: []const u8,
+    /// Absolute host path of the directory the work was put in. It holds
+    /// `files/`, `deleted` and `skipped`.
+    path: []const u8,
+    /// How many files and links arrived under `files/`.
+    files: u64 = 0,
+    /// How many paths the session deleted. **Named in `deleted` and never
+    /// applied to the project**: a deletion is the destructive half of the
+    /// work, so the person makes it and this does not. A reader that wants to
+    /// know whether somebody's file was removed by Chock reads this field and
+    /// gets the same answer every time, which is no.
+    deleted: u64 = 0,
+    /// How many paths could not be carried, each named with its reason in
+    /// `skipped`.
+    skipped: u64 = 0,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// The sandbox one attempt at a session ran under.
 ///
 /// **This exists so that a session which gave up hardening is distinguishable
@@ -1964,6 +2008,7 @@ pub const Event = union(Kind) {
     policy_self: PolicySelf,
     workspace_open: WorkspaceOpen,
     workspace_integrate: WorkspaceIntegrate,
+    workspace_adopt: WorkspaceAdopt,
     sandbox_open: SandboxOpen,
     sandbox_supervisor: SandboxSupervisor,
     sandbox_syscalls: SandboxSyscalls,
@@ -2617,6 +2662,10 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
             .branch_from = nl,
             .branch_to = nl,
             .parked = nl,
+        } },
+        .{ .workspace_adopt = .{
+            .attempt = nl,
+            .path = nl,
         } },
         .{ .sandbox_open = .{
             .attempt = nl,

@@ -169,6 +169,22 @@ chock workspace                     # every kept workspace, with its size
 chock workspace clear
 ```
 
+**A project that is not a git repository gets its work back a different way.**
+There is no commit and no ref, because the workspace is an overlay over your
+project rather than a worktree of it. `chock workspace adopt <session id>`
+copies what the session changed into `.chock-adopted/<session id>/files` inside
+the project.
+
+Nothing of yours is written over, and nothing of yours is removed. The changed
+files sit there for you to read with `diff -r` and take with `cp`, and every
+path the session deleted is named in `.chock-adopted/<session id>/deleted` for
+you to act on. A destination that already holds something is refused by name,
+and a path that could not be carried is named with its reason in `skipped`.
+
+```
+chock workspace adopt 01K2...       # take the work out of one kept overlay
+```
+
 ## Exit codes
 
 | Code | Meaning |

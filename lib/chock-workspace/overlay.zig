@@ -47,6 +47,15 @@ pub const Error = error{
     /// an earlier session left it behind. `clonefile(2)` refuses a
     /// destination that exists. Only the Darwin driver returns this.
     ScratchAlreadyExists,
+    /// `adopt` found no upper layer under the scratch directory it was given,
+    /// so there is no overlay there to take. **Never a fault**: it is what a
+    /// person gets after `chock workspace clear`, and what a caller gets for a
+    /// session that never opened an overlay at all.
+    NoOverlayToAdopt,
+    /// `carryOut` was given a destination that already holds something. The
+    /// work is still in the upper layer, and nothing at the destination was
+    /// read, written, or removed. See `carryOut`.
+    WorkAlreadyCarriedOut,
 };
 
 /// How one path under the upper layer changed. `changedFiles` reports one of
@@ -140,6 +149,36 @@ pub fn freeNestedMounts(allocator: std.mem.Allocator, list: []NestedMount) void 
     for (list) |*item| item.deinit(allocator);
     allocator.free(list);
 }
+
+/// What `carryOut` put at the destination it was given.
+///
+/// **Three counts and not one**, because the three are different promises. A
+/// caller says all three to the person: a count of files alone would let a
+/// carried out directory that dropped every deletion read as a complete
+/// answer.
+pub const CarriedOut = struct {
+    /// How many files and links arrived under `<destination>/files`.
+    files: usize,
+    /// How many paths the session deleted. Every one of them is named in
+    /// `<destination>/deleted`, and **not one of them is applied to the
+    /// project**: see `carryOut`.
+    deleted: usize,
+    /// How many paths `changedFiles` found and could not classify, plus every
+    /// path that went away between the walk and the copy. Every one of them is
+    /// named in `<destination>/skipped`, with the reason.
+    skipped: usize,
+};
+
+/// What `carryOut` calls the directory it puts the changed files in.
+pub const carried_files_name = "files";
+
+/// What `carryOut` calls the file it writes the deleted paths into, one per
+/// line.
+pub const carried_deleted_name = "deleted";
+
+/// What `carryOut` calls the file it writes the skipped paths into, one
+/// `path: reason` per line.
+pub const carried_skipped_name = "skipped";
 
 /// The overlayfs layers for one project that has no git repository of its own.
 /// Every field is an absolute host path, and every field is owned by this
@@ -251,6 +290,120 @@ pub const Overlay = struct {
     ) Error!ChangeReport {
         return driver.changedFiles(self, allocator, io, diag);
     }
+
+    /// Put the work of an overlay at `destination`, and answer what arrived.
+    ///
+    /// ## Why the work goes beside the project and never over it
+    ///
+    /// A git project gets its work back at `refs/chock/<session>`: the objects are
+    /// in the repository, a name points at them, **nothing of the person's has
+    /// moved**, and the person runs `git merge` when they choose. That property is
+    /// what makes an apply safe to run without asking about every file.
+    ///
+    /// A project with no git has no object store and no ref, so the nearest thing
+    /// that keeps the same property is a plain directory the person owns. This
+    /// call writes the changed files into `<destination>/files`, at the paths they
+    /// have in the project, and writes nothing anywhere else. A person reads it
+    /// with `ls` and `diff -r` and takes what they want with `cp`. No format has to
+    /// be learned, and no step of this can lose a file the person already had.
+    ///
+    /// The two other ways this could have gone, and why neither is this one:
+    ///
+    /// * **Copy the upper layer over the project.** It finishes the job and it is
+    ///   the one way that can destroy work. A project with no git has no commit to
+    ///   go back to, so a wrong file written over a right one is gone. The git path
+    ///   never writes into the person's checked out files without an approved
+    ///   `workspace.apply`, and there is no approval here, because the session that
+    ///   did the work has already ended.
+    /// * **Make a patch or an archive.** It is portable and it costs a format
+    ///   Chock then owns. A patch carries no binary file, no symbolic link and no
+    ///   file mode, and a project with no git is exactly the project with no `git
+    ///   apply` either. An archive needs a second step before anybody can read what
+    ///   is in it.
+    ///
+    /// ## A deletion is work, so it is carried as a name and never as an act
+    ///
+    /// The session that removed a file did work, and a carry out that quietly left
+    /// the file in place would report success for an answer that is wrong. A
+    /// deletion also cannot be a file in `<destination>/files`: the absence of a
+    /// path says nothing, since a path the session never touched is absent too.
+    ///
+    /// So every deleted path is written to `<destination>/deleted`, one per line,
+    /// sorted. `CarriedOut.deleted` counts them, the caller says the count out
+    /// loud, and the log records it. **Not one of them is applied to the project**,
+    /// for the reason above: removing a person's file is the destructive act this
+    /// call refuses to take on its own.
+    ///
+    /// ## The destination has to be free
+    ///
+    /// `error.WorkAlreadyCarriedOut` when anything at all is at `destination`,
+    /// checked before a single byte is read out of the upper layer. Merging into a
+    /// directory that already holds a carry out would write over files a person may
+    /// have already edited, and there is no way to tell those apart from the ones
+    /// this call put there. The upper layer is not changed by this call, so a
+    /// caller that meets the refusal names another destination and gets everything.
+    pub fn carryOut(
+        self: Overlay,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        destination: []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!CarriedOut {
+        // **First, and before the upper layer is opened at all.** See the doc
+        // comment: a refusal that had already written half a directory is a
+        // refusal a caller cannot act on.
+        const occupied = std.Io.Dir.cwd().statFile(io, destination, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => {
+                diagnostic.noteErr(diag, .carried_work_check, err);
+                return error.Unexpected;
+            },
+        };
+        if (occupied != null) return error.WorkAlreadyCarriedOut;
+
+        var report = try self.changedFiles(allocator, io, diag);
+        defer report.deinit(allocator);
+
+        const files_root = std.fs.path.join(allocator, &.{ destination, carried_files_name }) catch return error.OutOfMemory;
+        defer allocator.free(files_root);
+        std.Io.Dir.cwd().createDirPath(io, files_root) catch |err| {
+            diagnostic.noteErr(diag, .carried_work_mkdir, err);
+            return error.Unexpected;
+        };
+
+        var deleted: std.ArrayList([]const u8) = .empty;
+        defer deleted.deinit(allocator);
+        // One owned line per skip, `path: reason`. Owned by `allocator` and freed
+        // below, whichever way this call leaves.
+        var skipped: std.ArrayList([]u8) = .empty;
+        defer {
+            for (skipped.items) |line| allocator.free(line);
+            skipped.deinit(allocator);
+        }
+
+        for (report.skipped) |one| {
+            const line = std.fmt.allocPrint(allocator, "{s}: {s}", .{ one.path, one.reason }) catch return error.OutOfMemory;
+            errdefer allocator.free(line);
+            skipped.append(allocator, line) catch return error.OutOfMemory;
+        }
+
+        var carried: usize = 0;
+        for (report.changed) |one| {
+            if (one.kind == .deleted) {
+                deleted.append(allocator, one.path) catch return error.OutOfMemory;
+                continue;
+            }
+            if (try carryOne(allocator, io, self.upper, files_root, one.path, &skipped, diag)) carried += 1;
+        }
+
+        std.mem.sort([]const u8, deleted.items, {}, lessThanBytes);
+        std.mem.sort([]u8, skipped.items, {}, lessThanBytesMutable);
+
+        try writeLines(allocator, io, destination, carried_deleted_name, deleted.items, diag);
+        try writeLinesMutable(allocator, io, destination, carried_skipped_name, skipped.items, diag);
+
+        return .{ .files = carried, .deleted = deleted.items.len, .skipped = skipped.items.len };
+    }
 };
 
 const driver = switch (builtin.os.tag) {
@@ -289,6 +442,213 @@ pub fn createWithLayout(
     return made;
 }
 
+/// Take over the overlay of a session whose process has ended, instead of
+/// making a new one: see whichever driver `builtin.os.tag` selects. Both
+/// drivers rebuild the same four paths `create` built, from the same
+/// components in the same order, and neither makes an upper layer and neither
+/// copies anything.
+///
+/// **The overlay analogue of `worktree.adopt`, and the same rule holds: this
+/// call never removes a thing it did not make.** The upper layer holds work
+/// nothing else has a copy of, so a failure part way through leaves every file
+/// where it was.
+///
+/// `error.NoOverlayToAdopt` when there is no upper layer under `scratch`.
+///
+/// Where the work goes afterwards is `carryOut`'s question, not this one's.
+pub fn adopt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    project: []const u8,
+    scratch: []const u8,
+    diag: ?*?Diagnostic,
+) Error!Overlay {
+    return driver.adopt(allocator, io, project, scratch, diag);
+}
+
+/// `adopt`, with the layout named rather than read from the target. See
+/// `createWithLayout`, which this stands beside for the same reason.
+pub fn adoptWithLayout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    project: []const u8,
+    scratch: []const u8,
+    layout: Layout,
+    diag: ?*?Diagnostic,
+) Error!Overlay {
+    var taken = try driver.adopt(allocator, io, project, scratch, diag);
+    taken.layout = layout;
+    return taken;
+}
+
+/// Whether `absolute_path` is a directory on disk now. Used by both drivers'
+/// own `adopt` to tell a scratch layout that is there from one that is not.
+///
+/// **The link is not followed, and the kind is checked.** A symbolic link at
+/// one of the three scratch paths is not a scratch layout this process made,
+/// and adopting it would make every later path join follow it somewhere else.
+pub fn scratchDirOnDisk(io: std.Io, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
+    const found = std.Io.Dir.cwd().statFile(io, absolute_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => {
+            diagnostic.noteErr(diag, .overlay_scratch_check, err);
+            return error.Unexpected;
+        },
+    };
+    return found.kind == .directory;
+}
+
+/// Copy one changed path out of `upper` into `files_root`, at the same
+/// relative path. Answers whether it arrived.
+///
+/// **A symbolic link is copied as a link and never as what it points at.** A
+/// link the agent made can point outside the project, and following it here
+/// would copy a file the session never wrote, at a size nobody asked for.
+///
+/// A path that went away between `changedFiles` and this copy is recorded as a
+/// skip rather than dropped, and rather than failing the whole carry out: the
+/// other files are still work worth having.
+fn carryOne(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    upper: []const u8,
+    files_root: []const u8,
+    relative: []const u8,
+    skipped: *std.ArrayList([]u8),
+    diag: ?*?Diagnostic,
+) Error!bool {
+    const source = std.fs.path.join(allocator, &.{ upper, relative }) catch return error.OutOfMemory;
+    defer allocator.free(source);
+    const target = std.fs.path.join(allocator, &.{ files_root, relative }) catch return error.OutOfMemory;
+    defer allocator.free(target);
+
+    const found = std.Io.Dir.cwd().statFile(io, source, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return try noteSkip(allocator, skipped, relative, "it went away while the work was being carried out"),
+        else => {
+            diagnostic.noteErr(diag, .carried_entry_stat, err);
+            return error.Unexpected;
+        },
+    };
+
+    switch (found.kind) {
+        .file => {
+            // `copyFile` carries the permissions of the source with it, so a
+            // script the agent made executable is still executable here. The
+            // parent directories come with `make_path`.
+            std.Io.Dir.copyFileAbsolute(source, target, io, .{ .make_path = true }) catch |err| {
+                diagnostic.noteErr(diag, .carried_file_copy, err);
+                return error.Unexpected;
+            };
+            return true;
+        },
+        .sym_link => {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const length = std.Io.Dir.readLinkAbsolute(io, source, &buffer) catch |err| {
+                diagnostic.noteErr(diag, .carried_link_read, err);
+                return error.Unexpected;
+            };
+            const parent = std.fs.path.dirname(target) orelse target;
+            std.Io.Dir.cwd().createDirPath(io, parent) catch |err| {
+                diagnostic.noteErr(diag, .carried_work_mkdir, err);
+                return error.Unexpected;
+            };
+            // **`cwd().symLink` and never `symLinkAbsolute`.** The second
+            // asserts that the target is absolute, and a link an agent makes
+            // inside a project is usually relative, so that call panics in a
+            // Debug or ReleaseSafe build on the ordinary case. Measured: this
+            // is what the test below found the first time it ran.
+            std.Io.Dir.cwd().symLink(io, buffer[0..length], target, .{}) catch |err| {
+                diagnostic.noteErr(diag, .carried_link_write, err);
+                return error.Unexpected;
+            };
+            return true;
+        },
+        // `changedFiles` reports a path as added or modified only for a file
+        // or a link, so anything else here is a path that changed kind since
+        // the walk. Recorded, never guessed at.
+        else => |other| {
+            const reason = std.fmt.allocPrint(
+                allocator,
+                "it is a {s} now, and only a file or a link is carried",
+                .{@tagName(other)},
+            ) catch return error.OutOfMemory;
+            defer allocator.free(reason);
+            return try noteSkip(allocator, skipped, relative, reason);
+        },
+    }
+}
+
+/// Add one `path: reason` line to `skipped`. Always answers false, so a caller
+/// writes `return try noteSkip(...)` where the path did not arrive.
+fn noteSkip(
+    allocator: std.mem.Allocator,
+    skipped: *std.ArrayList([]u8),
+    relative: []const u8,
+    reason: []const u8,
+) Error!bool {
+    const line = std.fmt.allocPrint(allocator, "{s}: {s}", .{ relative, reason }) catch return error.OutOfMemory;
+    errdefer allocator.free(line);
+    skipped.append(allocator, line) catch return error.OutOfMemory;
+    return false;
+}
+
+fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn lessThanBytesMutable(_: void, a: []u8, b: []u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+/// Write one file under `destination` holding `lines`, one per line, each with
+/// a newline after it. **Written whether or not there are any lines**: a file
+/// that is there and empty says that nothing was deleted, and a file that is
+/// missing says only that some build did not write it.
+fn writeLines(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    destination: []const u8,
+    name: []const u8,
+    lines: []const []const u8,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (lines) |line| {
+        text.appendSlice(allocator, line) catch return error.OutOfMemory;
+        text.append(allocator, '\n') catch return error.OutOfMemory;
+    }
+
+    const path = std.fs.path.join(allocator, &.{ destination, name }) catch return error.OutOfMemory;
+    defer allocator.free(path);
+    var file = std.Io.Dir.createFileAbsolute(io, path, .{}) catch |err| {
+        diagnostic.noteErr(diag, .carried_list_write, err);
+        return error.Unexpected;
+    };
+    defer file.close(io);
+    file.writeStreamingAll(io, text.items) catch |err| {
+        diagnostic.noteErr(diag, .carried_list_write, err);
+        return error.Unexpected;
+    };
+}
+
+/// `writeLines`, for a list of owned lines. Zig has no implicit conversion
+/// from `[][]u8` to `[]const []const u8`, and one copy of the body is better
+/// than one cast that hides which list is owned.
+fn writeLinesMutable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    destination: []const u8,
+    name: []const u8,
+    lines: []const []u8,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var view: std.ArrayList([]const u8) = .empty;
+    defer view.deinit(allocator);
+    for (lines) |line| view.append(allocator, line) catch return error.OutOfMemory;
+    return writeLines(allocator, io, destination, name, view.items, diag);
+}
+
 /// Find every directory under `project` that is itself the mount point of a
 /// separate filesystem: see whichever driver `builtin.os.tag` selects, and
 /// `NestedMount`'s own doc comment.
@@ -315,7 +675,7 @@ test "the linux driver and the darwin driver expose the same public shape" {
     const linux_driver = @import("linux/overlay.zig");
     const darwin_driver = @import("darwin/overlay.zig");
 
-    const shape = .{ "create", "changedFiles", "nestedMounts" };
+    const shape = .{ "create", "adopt", "changedFiles", "nestedMounts" };
     inline for (shape) |name| {
         if (!@hasDecl(linux_driver, name)) @compileError("linux overlay driver is missing " ++ name);
         if (!@hasDecl(darwin_driver, name)) @compileError("darwin overlay driver is missing " ++ name);

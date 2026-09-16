@@ -524,13 +524,15 @@ fn endedHandedOver(gpa: std.mem.Allocator, io: std.Io, log_path: [:0]const u8) b
 /// session that has ended and nobody owning it.
 ///
 /// A project with no git of its own gets the overlay backing, and that one does
-/// not move yet. The upper layer survives the process that made it, so nothing
-/// is lost by rebuilding, but `overlay.create` cannot be called a second time
-/// on the same scratch directory: the Linux driver refuses a directory that
-/// already exists and Darwin's clone refuses the same. What is missing is an
-/// `overlay.adopt` beside `overlay.create`, one per driver, and until it exists
-/// a handover of one of those sessions would leave the agent's work in a
-/// directory the next owner never opens.
+/// not move to another process yet. **The work is not lost, and this is now an
+/// answer rather than only a refusal.** The upper layer survives the process
+/// that made it, `chock_workspace.overlay.adopt` rebuilds the four paths over
+/// it, and `chock workspace adopt` copies the work into the project. What is
+/// still missing here is the rest of a live handover for that backing: see
+/// `chock_workspace.Workspace.adopt`, which refuses the overlay kind by name,
+/// and `takenOver` in `src/run.zig`, which takes only the worktree kind. So the
+/// sentence below sends the person to the two commands that do work today, and
+/// never to a flag that would drop the session's own files.
 ///
 /// **A log that says nothing about a workspace is not a refusal.** That is a
 /// session from a build before `workspace.open` existed, and the next owner
@@ -566,9 +568,9 @@ fn reportMovableWorkspace(
     tty.print(
         .err,
         "chock detach: session {s} works in a {s} workspace, and only a git worktree moves to " ++
-            "another process yet. Stop it with Ctrl-C first: a session that has stopped is handed " ++
-            "over the way it always was, and its work stays where it is.\n",
-        .{ id, @tagName(found) },
+            "another process yet. Stop it with Ctrl-C first. Its work stays where it is, and " ++
+            "`chock workspace adopt {s}` copies that work into the project.\n",
+        .{ id, @tagName(found), id },
     );
     return false;
 }
@@ -1362,6 +1364,12 @@ test "a workspace that does not move yet is refused before the session is ever a
             // as a limit a person can work around.
             try testing.expect(std.mem.indexOf(u8, said.err(), "overlay") != null);
             try testing.expect(std.mem.indexOf(u8, said.err(), "Ctrl-C") != null);
+            // **And it names the command that reaches the work.** A refusal
+            // that only said the workspace does not move leaves a person with
+            // an overlay full of work and no next step. Mutation check: take
+            // the command out of the sentence and this fails.
+            try testing.expect(std.mem.indexOf(u8, said.err(), "chock workspace adopt") != null);
+            try testing.expect(std.mem.indexOf(u8, said.err(), id) != null);
         }
         try testing.expectEqualStrings("", said.out());
     }

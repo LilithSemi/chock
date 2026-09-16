@@ -99,11 +99,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         // Overlay.mounts only ever builds one Mount.overlay entry from the
         // four paths already on `ov`; it never touches a driver, so this
         // program, which only ever runs on Linux, can never actually see any
-        // of the errors only the Darwin driver's own create returns. See
-        // chock-workspace/overlay.zig's own top comment.
+        // of the errors only the Darwin driver's own create returns. The last
+        // two belong to `adopt` and `carryOut`, which this program never calls
+        // either. See chock-workspace/overlay.zig's own top comment.
         error.NoOverlayFilesystem,
         error.ScratchOnAnotherVolume,
         error.ScratchAlreadyExists,
+        error.NoOverlayToAdopt,
+        error.WorkAlreadyCarriedOut,
         => unreachable,
     };
     const overlay_mount = switch (described[0]) {

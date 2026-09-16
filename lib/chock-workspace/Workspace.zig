@@ -48,8 +48,9 @@ pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || e
     /// overlay backing, and no second process can take one of those over
     /// today. **A refusal, not a fault, and not a claim that the work is
     /// lost**: `Workspace.adopt`'s own doc comment records what was read and
-    /// what is missing, and the whole of what is missing is an
-    /// `overlay.adopt` beside `overlay.create`, one per driver.
+    /// what is missing. `overlay.adopt` now exists, so the work of a session
+    /// that has ended is reachable with `chock workspace adopt`. What is
+    /// refused here is one *running* session moving to a second process.
     OverlayCannotBeAdopted,
     /// `chock.zon` names a symbolic link instead of an ordinary file, in the
     /// checkout `findChockZon` was asked to read. Chock's own policy file
@@ -304,7 +305,11 @@ pub const Workspace = struct {
     /// the session log.
     ///
     /// **The overlay backing is refused, by name, with
-    /// `error.OverlayCannotBeAdopted`.** What was read, and what it says:
+    /// `error.OverlayCannotBeAdopted`.** That refusal is about moving a
+    /// *running* session to a second process, and not about reaching the work:
+    /// see `chock workspace adopt` in `src/workspace.zig`, which takes the work
+    /// out of an overlay a session that has ended left behind. What was read,
+    /// and what it says:
     ///
     /// - The backing itself does outlive the process that made it. `upper`,
     ///   `work`, and `merged` are three plain directories under the session
@@ -317,24 +322,23 @@ pub const Workspace = struct {
     ///   `buildRoot` performs it again inside every `Sandbox.spawn` child's
     ///   own mount namespace, once per tool call. Nothing about it is bound
     ///   to one long lived process.
-    /// - What is missing is the rebuild. `overlay.create` cannot be called a
-    ///   second time on a scratch directory that already holds a layout: the
-    ///   Linux driver makes all three directories with `createDirAbsolute`,
-    ///   which answers `error.PathAlreadyExists`, folded into
-    ///   `error.Unexpected`, and the Darwin driver's `clonefile` answers
-    ///   `EEXIST`, which is `error.ScratchAlreadyExists`. Rebuilding the four
-    ///   paths here by hand instead would put the scratch layout that
-    ///   `overlay.zig` and its two drivers own into a second file, where it
-    ///   can drift from theirs without either side noticing.
+    /// - The rebuild now exists. `overlay.adopt` stands beside `overlay.create`,
+    ///   one per driver, and rebuilds the four paths over a layout that is
+    ///   already on disk. `overlay.create` still cannot be called a second time
+    ///   on the same scratch directory, which is why `adopt` is a separate call
+    ///   rather than a flag on `create`.
     /// - And `base_commit`, the one argument this call adds to `open`, has no
     ///   meaning for a project with no git: there is no commit, and
     ///   `headMoved` is not the test that decides what an overlay session
     ///   carries back. `Overlay.changedFiles` is.
     ///
-    /// So the refusal names a gap in `overlay.zig`, not a fault in the
-    /// backing. Closing it needs an `overlay.adopt` beside `overlay.create`,
-    /// one per driver, which rebuilds the four paths and refuses a scratch
-    /// directory that holds no layout.
+    /// **So this refusal is about a live handover, and no longer about the work
+    /// being unreachable.** A session that has ended gives its work up through
+    /// `chock workspace adopt`, which calls `overlay.adopt` and then
+    /// `Overlay.carryOut`. What is left before this call can take the overlay
+    /// kind is the rest of a handover: `base_commit` has to stop being an
+    /// argument a caller must supply, and `src/run.zig`'s own `takenOver` has to
+    /// accept an overlay `workspace.open`.
     ///
     /// **`chock.zon` gets a fallback here that `open` does not need.** See
     /// `findChockZonForAdopt`.
