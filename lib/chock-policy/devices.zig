@@ -52,7 +52,7 @@ const serial_segment = "serial";
 
 /// The longest action name `actionInto` can build. `usb` and a tty with no
 /// serial both spell `device.<bus>.<vendor>.<product>`, two labels of
-/// `table.max_label_bytes` each; a tty with a serial spells
+/// `table.max_label_bytes` each. A tty with a serial spells
 /// `device.tty.serial.<serial>`, one label. The first shape is longer, so it
 /// is the one this bounds against.
 pub const max_action_bytes = action_prefix.len + 1 +
@@ -131,9 +131,51 @@ test "bytes that cannot be one label of a rule get no action name" {
     // so either would let a device name rules nobody wrote.
     var buffer: [max_action_bytes]u8 = undefined;
     try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, .{
-        .subsystem = .usb, .vendor = "1d.50", .product = "6018", .serial = "",
+        .subsystem = .usb,
+        .vendor = "1d.50",
+        .product = "6018",
+        .serial = "",
     }));
     try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, .{
-        .subsystem = .usb, .vendor = "1d50", .product = "60*8", .serial = "",
+        .subsystem = .usb,
+        .vendor = "1d50",
+        .product = "60*8",
+        .serial = "",
+    }));
+}
+
+test "a tty with no serial is named by its vendor and product" {
+    // **The no-serial branch has its own example line and its own segments,
+    // so it needs its own test.** A tty and a usb device share the
+    // `<vendor>.<product>` shape, but the `tty` segment only comes from this
+    // branch, and a copy-paste from the usb branch could silently drop the
+    // `labelIsUsable` check on either field without either existing test
+    // noticing.
+    var buffer: [max_action_bytes]u8 = undefined;
+
+    try testing.expectEqualStrings("device.tty.1209.c0ca", actionInto(&buffer, .{
+        .subsystem = .tty,
+        .vendor = "1209",
+        .product = "c0ca",
+        .serial = "",
+    }).?);
+
+    // An unusable vendor must still refuse, the same as it does on the usb
+    // branch. Skipping this check here would let a dot or a `*` in the
+    // vendor split into a segment nobody wrote a rule for.
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, .{
+        .subsystem = .tty,
+        .vendor = "12.09",
+        .product = "c0ca",
+        .serial = "",
+    }));
+
+    // Same refusal, on the product this time, so the branch cannot have
+    // checked only one of the two fields it reads.
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, .{
+        .subsystem = .tty,
+        .vendor = "1209",
+        .product = "c0*a",
+        .serial = "",
     }));
 }
