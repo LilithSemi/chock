@@ -1569,13 +1569,18 @@ fn start(
             .{ paths.work, &attempt },
         );
         return error.Reported;
-    } else chock_workspace.Workspace.open(
+    } else chock_workspace.Workspace.openAndDenied(
         arena,
         io,
         env,
         project_root,
         paths.work,
         &attempt,
+        // **The org policy bundle's own `deny_read`, folded as a union.** A
+        // project adds to this list and takes nothing off it. Empty for an
+        // installation with no bundle, which is the ordinary case, and then
+        // this is exactly what `Workspace.open` would have built.
+        if (org_bundle) |bundle| bundle.deny_read else &.{},
         &open_diag,
     ) catch |err| {
         // Which call failed and what it answered. The workspace builder used

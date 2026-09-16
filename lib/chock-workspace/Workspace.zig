@@ -219,6 +219,33 @@ pub const Workspace = struct {
         return openWithLayout(allocator, io, env, project_root, scratch_dir, session_id, Layout.forHost(), diag);
     }
 
+    /// `open`, plus paths denied by something other than the project's own
+    /// file. The layout is this host's, exactly as `open` picks it. See
+    /// `openWithLayoutAndDenied` for what the extra list is and why it is a
+    /// union.
+    pub fn openAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
+        return openWithLayoutAndDenied(
+            allocator,
+            io,
+            env,
+            project_root,
+            scratch_dir,
+            session_id,
+            Layout.forHost(),
+            also_denied,
+            diag,
+        );
+    }
+
     /// `open`, with the layout named rather than read from the target. See
     /// `worktree.createWithLayout` for why the two calls exist.
     pub fn openWithLayout(
@@ -231,6 +258,48 @@ pub const Workspace = struct {
         layout: Layout,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
+        return openWithLayoutAndDenied(
+            allocator,
+            io,
+            env,
+            project_root,
+            scratch_dir,
+            session_id,
+            layout,
+            &.{},
+            diag,
+        );
+    }
+
+    /// `openWithLayout`, plus paths denied by something other than the
+    /// project's own file.
+    ///
+    /// **This is where an org policy bundle's `deny_read` arrives.** A project
+    /// may add to the list and can take nothing off it, so the fold is a union
+    /// and not a minimum: a bundle that hid a file would be answered by a
+    /// `chock.zon` that simply did not name it, if the project's list were the
+    /// only one read.
+    ///
+    /// **They are checked here, by the same `deny.check` the project's own
+    /// entries go through.** The rules live in one place and this call does not
+    /// carry a second copy of them: see `deny.check`, which is public for that
+    /// reason. An entry an organisation wrote that breaks a rule refuses the
+    /// session with the same error a project's own would.
+    ///
+    /// A separate entry point rather than one more argument on `open`, because
+    /// `open` has one caller that knows about bundles and a hundred that do
+    /// not.
+    pub fn openWithLayoutAndDenied(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        env: *const std.process.Environ.Map,
+        project_root: []const u8,
+        scratch_dir: []const u8,
+        session_id: []const u8,
+        layout: Layout,
+        also_denied: []const []const u8,
+        diag: ?*?Diagnostic,
+    ) Error!Workspace {
         // **Before either backing is built**, so a `deny_read` block this
         // cannot honour refuses the session rather than half building one. It
         // reads the host project's own `chock.zon`, which for the worktree
@@ -240,7 +309,10 @@ pub const Workspace = struct {
         // the project is not known until the backing exists: under
         // `Layout.in_place` it is the agent's own copy, at its own real path.
         // See `deny.loadEntries`.
-        const entries = try deny_mod.loadEntries(allocator, io, project_root, diag);
+        const own = try deny_mod.loadEntries(allocator, io, project_root, diag);
+        defer deny_mod.free(allocator, own);
+
+        const entries = try withAlsoDenied(allocator, own, also_denied);
         defer deny_mod.free(allocator, entries);
 
         if (try git.isRepository(allocator, io, env, project_root, diag)) {
@@ -288,6 +360,50 @@ pub const Workspace = struct {
             .chock_zon_target = chock_zon.target,
             .deny_paths = denied,
         };
+    }
+
+    /// The project's own denied paths and the ones a layer above it added, in
+    /// one owned list. The caller frees it with `deny.free`.
+    ///
+    /// **Every added entry goes through `deny.check` first**, so a rule an
+    /// organisation broke is refused with the error a project's own entry
+    /// would have raised, and there is no second copy of those rules here.
+    ///
+    /// **The bound is on the whole list and not on each half.** `deny.max_paths`
+    /// is what a sandbox can carry, so a project at the bound and a bundle that
+    /// added one more is over it, however the two were counted.
+    fn withAlsoDenied(
+        allocator: std.mem.Allocator,
+        own: []const []u8,
+        also: []const []const u8,
+    ) Error![]const []u8 {
+        // An empty `also` still copies, so one `deny.free` in the caller
+        // releases the list whichever path built it.
+        for (also) |entry| try deny_mod.check(entry);
+        if (own.len + also.len > deny_mod.max_paths) return error.TooManyDenyPaths;
+        return copiedInto(allocator, own, also);
+    }
+
+    fn copiedInto(
+        allocator: std.mem.Allocator,
+        own: []const []u8,
+        also: []const []const u8,
+    ) Error![]const []u8 {
+        const list = try allocator.alloc([]u8, own.len + also.len);
+        var filled: usize = 0;
+        errdefer {
+            for (list[0..filled]) |one| allocator.free(one);
+            allocator.free(list);
+        }
+        for (own) |one| {
+            list[filled] = try allocator.dupe(u8, one);
+            filled += 1;
+        }
+        for (also) |one| {
+            list[filled] = try allocator.dupe(u8, one);
+            filled += 1;
+        }
+        return list;
     }
 
     /// Take over the workspace of a session that is handing over, instead of
@@ -1718,4 +1834,94 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
         "0000000000000000000000000000000000000000",
         null,
     ));
+}
+
+
+test "a layer above the project adds denied paths, and the project cannot take one off" {
+    // **The gap this closes.** An org policy bundle could narrow a rule and
+    // could not hide a file, so a `chock.zon` that simply did not name a path
+    // answered the organisation completely. The fold is therefore a union: see
+    // `openWithLayoutAndDenied`.
+    //
+    // Mutation check: make `withAlsoDenied` ignore `also` and the first two
+    // expectations fail.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    // The project names one file. The layer above it names another, and a
+    // project that named nothing would still be held to the second.
+    try writeChockZon(project, ".{ .deny_read = .{ \"own.txt\" } }\n");
+
+    var workspace = try Workspace.openAndDenied(
+        allocator,
+        std.testing.io,
+        &project.env,
+        project.root_path,
+        project.scratch_path,
+        "sess1",
+        &.{"from-the-org.txt"},
+        null,
+    );
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    try std.testing.expectEqual(@as(usize, 2), workspace.deny_paths.len);
+    try std.testing.expect(endsWithAny(workspace.deny_paths, "own.txt"));
+    try std.testing.expect(endsWithAny(workspace.deny_paths, "from-the-org.txt"));
+}
+
+test "a path the layer above names is refused by the same rules a project's own is" {
+    // **One copy of the rules, and it is `deny.check`.** A bundle that named an
+    // absolute path, or one that climbed out of the project, used to have
+    // nowhere to be caught: this module cannot reach the policy module, and a
+    // second copy of a rule that decides what the sandbox may hold is worse
+    // than a check one moment later.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    const refused = [_]struct { entry: []const u8, want: anyerror }{
+        .{ .entry = "/etc/shadow", .want = error.DenyPathNotRelative },
+        .{ .entry = "../outside.txt", .want = error.DenyPathLeavesProject },
+        .{ .entry = "secret*.txt", .want = error.DenyPathIsAPattern },
+        .{ .entry = "chock.zon", .want = error.DenyPathIsChockZon },
+    };
+    for (refused) |one| {
+        try std.testing.expectError(one.want, Workspace.openAndDenied(
+            allocator,
+            std.testing.io,
+            &project.env,
+            project.root_path,
+            project.scratch_path,
+            "sess1",
+            &.{one.entry},
+            null,
+        ));
+    }
+}
+
+/// Write a `chock.zon` into the project without committing it. The union tests
+/// use the overlay backing, which reads the project in place, so nothing here
+/// needs a git repository.
+fn writeChockZon(project: TestProject, source: []const u8) !void {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{project.root_path});
+    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
+    try file.writeStreamingAll(std.testing.io, source);
+    file.close(std.testing.io);
+}
+
+/// Whether any denied path ends with `leaf`. The paths are absolute and joined
+/// onto a sandbox root a test cannot predict, so the leaf is what it checks.
+fn endsWithAny(paths: []const []u8, leaf: []const u8) bool {
+    for (paths) |one| {
+        if (std.mem.endsWith(u8, one, leaf)) return true;
+    }
+    return false;
 }

@@ -337,6 +337,22 @@ pub const Bundle = struct {
     /// the budget ceiling refuses. **An org can now cap fan-out**, which for a
     /// runaway spawn tree is the more expensive of the two.
     subagents: ?subagent.Ceiling = null,
+    /// Files every project of this installation must keep out of the sandbox,
+    /// on top of whatever its own `deny_read` block names. Empty for a bundle
+    /// that hides nothing, which is every bundle that predates this field.
+    ///
+    /// **A field and not a rule, and a union and not a minimum.** A project
+    /// adds to this list and can take nothing off it. The other direction
+    /// would be no control at all: a bundle that hid a file would be answered
+    /// by a `chock.zon` that simply did not name it.
+    ///
+    /// **The entries are checked by `chock_workspace.deny.check`**, which is
+    /// the one place those rules live, and not by anything in this file. This
+    /// module cannot reach that one, and a second copy of a rule that decides
+    /// what the sandbox may hold is worse than a check that happens a moment
+    /// later: see `Workspace.openWithLayoutAndDenied`, which refuses a session
+    /// whose bundle names a path no project could have named either.
+    deny_read: []const []const u8 = &.{},
     /// The version of the bundle format. See `max_version`.
     version: u32 = 1,
 
