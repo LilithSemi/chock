@@ -296,3 +296,12 @@ chock doctor
 says which are on. It exits `0` when a first run can work here, even with a
 layer missing, and `2` when it cannot. See [sandbox.md](sandbox.md) for what
 the rows mean.
+
+On an installation an organisation manages, it also reports what that
+organisation's policy bundle imposes: the audit sinks it requires, and every
+ceiling it sets on spending, on how far a spawn tree may grow, and on the paths
+kept out of every sandbox. **These rows are facts and never faults**, so a
+managed machine that is well still reads ready. A machine with no bundle gains
+no rows at all. They are there because a cap is otherwise invisible until it
+bites: a session that stops at a number nobody wrote in `chock.zon` reads as a
+fault until you know where the number came from.

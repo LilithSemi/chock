@@ -396,6 +396,11 @@ pub const Measured = struct {
     /// and for a build that measured nothing. So a machine with no bundle
     /// gains no row and reads exactly as it did before export was a control.
     required_sinks: []const SinkProbe = &.{},
+    /// Every ceiling this installation's org policy bundle sets, one sentence
+    /// each, in a fixed order. Empty for an installation nobody gave a bundle
+    /// and for a bundle that sets none, so a machine with no organisation over
+    /// it reports nothing here at all. See `measureOrgCeilings`.
+    org_ceilings: []const []const u8 = &.{},
 };
 
 /// The reason every layer carries on a build whose driver gives no layer at
@@ -792,6 +797,15 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
     // One row each, and none at all for an installation with no bundle. See
     // `Measured.required_sinks`.
     for (m.required_sinks) |one| try rows.append(arena, try requiredSinkRow(arena, one));
+    // One row each, and none at all for an installation with no bundle. See
+    // `Measured.org_ceilings`.
+    for (m.org_ceilings) |means| try rows.append(arena, .{
+        .name = org_ceiling_name,
+        .state = .on,
+        .means = means,
+        .why = "an organisation can cap what a project of this installation does, and these are " ++
+            "the caps it set. A project's own chock.zon may narrow them and can never widen one",
+    });
 
     return rows.toOwnedSlice(arena);
 }
@@ -1084,6 +1098,9 @@ fn toolCallRow(m: Measured) Row {
 /// `isFirstRunRow` needs no list of paths and a bundle that requires three
 /// sinks reads as three rows of one kind.
 pub const required_sink_name = "audit sink";
+
+/// The name every org ceiling row carries. See `measureOrgCeilings`.
+pub const org_ceiling_name = "org ceiling";
 
 /// One sink this installation requires.
 ///
@@ -1795,6 +1812,7 @@ fn measureHost(
     measureCardSeal(arena, io, m);
 
     m.required_sinks = measureRequiredSinks(arena, io, env);
+    m.org_ceilings = measureOrgCeilings(arena, io, env);
 
     m.write_execute = measureHardening(arena, io, env, project_root, defaultModel(arena, io, env));
 
@@ -2050,6 +2068,75 @@ const probe_drop_name = ".chock-doctor.probe";
 /// reason, and a row here would be a second, shorter answer to keep true. What
 /// this command has to add is the part no reader can know, which is whether the
 /// machine can reach the places the bundle names.
+/// Every ceiling this installation's org policy bundle sets, as sentences.
+///
+/// **A person can see the effect and never the cause.** A session that stops at
+/// a number nobody wrote in `chock.zon`, or a spawn refused by a limit the
+/// project did not set, reads as a fault until you know an organisation set it.
+/// `doctor` reported the bundle's required sinks and nothing else it imposes,
+/// so the three caps below were invisible on the machine they bound.
+///
+/// **Read and never reached.** This opens no socket and starts nothing: it
+/// reads the same bundle a session reads and reports what it says. So a row
+/// here is never a fault and never blocks a first run, which is why each is
+/// `.on` with a value in `means`: a number is an answer and not a lesson.
+fn measureOrgCeilings(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+) []const []const u8 {
+    const data_dir = chock_auth.paths.dataDir(arena, env) catch return &.{};
+    const path = std.fs.path.join(arena, &.{ data_dir, chock_policy.org.file_name }) catch return &.{};
+    const bundle = chock_policy.org.load(arena, io, path, null) catch return &.{};
+
+    var found: std.ArrayList([]const u8) = .empty;
+
+    if (bundle.budget) |ceiling| {
+        const currency = if (ceiling.currency.len != 0) ceiling.currency else "USD";
+        const line = std.fmt.allocPrint(
+            arena,
+            "a session of this installation may spend at most {d} {s}, and a project that asks " ++
+                "for more is refused when it starts",
+            .{ ceiling.max_cost, currency },
+        ) catch return found.items;
+        found.append(arena, line) catch return found.items;
+    }
+
+    if (bundle.subagents) |ceiling| {
+        const line = if (ceiling.max_depth != null and ceiling.max_width != null)
+            std.fmt.allocPrint(
+                arena,
+                "a spawn tree of this installation reaches at most {d} deep and {d} wide",
+                .{ ceiling.max_depth.?, ceiling.max_width.? },
+            ) catch return found.items
+        else if (ceiling.max_width) |width|
+            std.fmt.allocPrint(
+                arena,
+                "an agent of this installation may start at most {d} subagents",
+                .{width},
+            ) catch return found.items
+        else
+            std.fmt.allocPrint(
+                arena,
+                "a spawn tree of this installation reaches at most {d} deep",
+                .{ceiling.max_depth.?},
+            ) catch return found.items;
+        found.append(arena, line) catch return found.items;
+    }
+
+    if (bundle.deny_read.len != 0) {
+        const line = std.fmt.allocPrint(
+            arena,
+            "{d} {s} named by this installation are kept out of every sandbox, whatever a " ++
+                "project's own deny_read says",
+            .{ bundle.deny_read.len, if (bundle.deny_read.len == 1) "path" else "paths" },
+        ) catch return found.items;
+        found.append(arena, line) catch return found.items;
+    }
+
+    return found.items;
+}
+
 fn measureRequiredSinks(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -5208,4 +5295,50 @@ test "a record from the probe pipe with a byte that names no step is dropped" {
     try testing.expectEqual(Step.namespaces, std.enums.fromInt(Step, 1).?);
     try testing.expectEqual(@as(?Answer, null), std.enums.fromInt(Answer, 9));
     try testing.expectEqual(Answer.ok, std.enums.fromInt(Answer, 0).?);
+}
+
+
+test "an org ceiling is reported, and an installation with no bundle adds no row" {
+    // **A person can see the effect and never the cause.** A session that stops
+    // at a number nobody wrote in `chock.zon`, or a spawn refused by a limit the
+    // project did not set, reads as a fault until you know an organisation set
+    // it. `doctor` reported the bundle's required sinks and nothing else it
+    // imposes, so every cap below was invisible on the machine it bound.
+    //
+    // **On, and blocking nothing.** A cap is a fact about this installation and
+    // not a fault, so a managed machine that is well still reads ready. A row
+    // that warned would fire on every managed machine and nobody would read it
+    // by the second week, which is the same argument the required sink row
+    // already makes.
+    //
+    // Mutation check: give the ceiling rows `.blocks = true` and the verdict
+    // below stops being `ready`.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var capped = healthy();
+    capped.org_ceilings = &.{
+        "a session of this installation may spend at most 5 USD",
+        "a spawn tree of this installation reaches at most 3 deep and 2 wide",
+    };
+    const rows = try rowsFor(arena, capped);
+
+    var found: usize = 0;
+    for (rows) |row| {
+        if (!std.mem.eql(u8, row.name, org_ceiling_name)) continue;
+        try testing.expectEqual(ui.Layer.State.on, row.state);
+        try testing.expectEqualStrings("", row.fix);
+        try testing.expect(!row.blocks);
+        found += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), found);
+    try testing.expectEqual(Verdict.ready, verdictFor(rows));
+
+    // **An installation nobody gave a bundle gains nothing at all**, which is
+    // what keeps every machine that predates this reading exactly as it did.
+    const plain = try rowsFor(arena, healthy());
+    for (plain) |row| {
+        try testing.expect(!std.mem.eql(u8, row.name, org_ceiling_name));
+    }
 }
