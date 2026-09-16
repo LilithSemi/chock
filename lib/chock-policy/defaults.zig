@@ -284,6 +284,32 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "git.worktree", .decision = .allow },
 };
 
+// `device.*` holds no shipped default, on purpose, and a `deny` was tried
+// here and rejected. An action nobody names already answers `ask`, which is
+// the table's own safe default, so the class needs no entry at all, and
+// `ask` is genuinely answerable for a device: it arrives mid-session, when a
+// person is there to be asked, unlike a language server's question, which
+// would arrive at startup with nobody to answer it.
+//
+// **The `deny` was rejected because it was the first shipped default ranked
+// below `ask`, and that rank alone broke policies that had nothing to do
+// with a device.** `table.zig`'s `representatives` samples every class
+// `defaults.zig` ships, including one that names nothing else, so a `deny`
+// here would give `checkChildrenAreWeaker` an action class where the answer
+// can fall below `ask` for the first time ever. Before this, an unscoped
+// child rule of `ask` could never outrank a parent, because nothing shipped
+// ever ranked lower. A `chock.zon` where a child agent kind holds a rule
+// broader than its parent, leaning on shipped defaults to fill the rest,
+// would have stopped parsing the moment this `deny` shipped, in a project
+// that never named a device at all. See the test just below, and
+// `table.zig`'s own test `"a name that holds the byte the read time check
+// invents is refused"`, which pins the exact fixture this would have broken.
+//
+// Whoever reaches for this again: the fix is not to scope the `deny` more
+// narrowly. Any class ranked below `ask` in the shipped defaults reaches
+// every policy in existence through `representatives`, not only the ones
+// that mention it.
+
 const std = @import("std");
 
 /// A key for one action, with the parts these tests do not vary held still.
@@ -588,6 +614,24 @@ test "exec.unparsed holds no shipped default, and answers ask like any other unn
     defer table.Table.destroy(gpa, t);
 
     try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("exec.unparsed")));
+}
+
+test "device.* holds no shipped default, and answers ask like any other unnamed action" {
+    // A `deny` was tried here and rejected: see the comment above `rules`
+    // where `device.*` would have gone. `device.*` would have been the first
+    // shipped default ranked below `ask`, and `table.zig`'s
+    // `checkChildrenAreWeaker` samples every class a default ships, so that
+    // one entry would have broken a `chock.zon` that never named a device at
+    // all, wherever a child agent kind held a rule broader than its parent
+    // and leaned on shipped defaults for the rest. `ask` is genuinely
+    // answerable for a device, since it arrives mid-session when a person is
+    // there to answer, so the class needs no entry and this is the table's
+    // own safe default already.
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("device.usb.1d50.6018")));
 }
 
 test "a project rule denying every exec class still denies a path that could not be classified" {

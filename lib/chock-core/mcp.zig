@@ -107,8 +107,10 @@ pub const max_tools_per_server = 64;
 /// The longest name this host accepts for a server or for a tool.
 ///
 /// Sixty four, which is what the providers accept in a tool name and what
-/// `chock_core.tools.Tool` stays far below.
-pub const max_name_bytes = 64;
+/// `chock_core.tools.Tool` stays far below. The value now lives at
+/// `chock_policy.table.max_label_bytes`, beside the shape rule it bounds, and
+/// this is an alias so nothing outside this file has to change.
+pub const max_name_bytes = chock_policy.table.max_label_bytes;
 
 /// The longest description this host carries for one tool. Every byte of it is
 /// paid for on every turn, the same rule `chock_core.tools.Tool.description`
@@ -298,16 +300,15 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
 /// **This is a shape rule and not a policy**, the same split
 /// `chock_sandbox.net_broker.hostBytesAreUsable` states: it says the bytes are
 /// a name, and says nothing about which name.
+///
+/// **The rule itself lives at `chock_policy.table.labelIsUsable` now.**
+/// `lib/chock-core/lsp_driver.zig` already borrowed this function, and a
+/// device identity needed the same rule with no chock-core to borrow it from,
+/// since `chock-policy` imports no other chock library. This keeps its public
+/// name, so nothing outside this file changes, and calls through to the one
+/// copy instead of holding a second.
 pub fn nameIsUsable(name: []const u8) bool {
-    if (name.len == 0 or name.len > max_name_bytes) return false;
-    for (name) |byte| {
-        const ok = (byte >= 'a' and byte <= 'z') or
-            (byte >= 'A' and byte <= 'Z') or
-            (byte >= '0' and byte <= '9') or
-            byte == '-' or byte == '_';
-        if (!ok) return false;
-    }
-    return true;
+    return chock_policy.table.labelIsUsable(name);
 }
 
 /// True when `name` is the name of a tool this build already has.

@@ -1217,6 +1217,38 @@ pub fn patternIsWellFormed(pattern: []const u8) bool {
         std.mem.indexOfScalar(u8, body, 0) == null;
 }
 
+/// The longest single label this file lets a caller build into an action
+/// name. Sixty four, moved down from `chock_core.mcp.max_name_bytes`, which
+/// this same number used to bound alone before `labelIsUsable` existed.
+pub const max_label_bytes = 64;
+
+/// True when `bytes` can be one label of an action name: a segment between
+/// two dots, or the whole name when it holds none.
+///
+/// Letters, digits, hyphen and underscore, one byte up to `max_label_bytes`.
+/// **No dot**, which is what separates the segments of an action name: a
+/// caller that could put one in a label could name a class of actions an
+/// author never wrote. **No `*`**, for the same reason `patternIsWellFormed`
+/// above refuses one: it names a class, and a label is not a class. No NUL.
+///
+/// **Down from `chock_core.mcp.nameIsUsable`, which now calls this.** The
+/// rule used to live there alone, and `lib/chock-core/lsp_driver.zig`
+/// borrowed it a second time. `chock-policy` imports no other chock library,
+/// so a device identity needed the same rule and a naive implementation would
+/// have made a third copy. One copy, in the lowest layer both callers already
+/// sit above, is the fix: see `lib/chock-policy/devices.zig`.
+pub fn labelIsUsable(bytes: []const u8) bool {
+    if (bytes.len == 0 or bytes.len > max_label_bytes) return false;
+    for (bytes) |byte| {
+        const ok = (byte >= 'a' and byte <= 'z') or
+            (byte >= 'A' and byte <= 'Z') or
+            (byte >= '0' and byte <= '9') or
+            byte == '-' or byte == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// The score of every exact name, which is above the score of every class. A
 /// class score is the number of names in its prefix, and no file can push that
 /// this high, because `max_file_bytes` bounds the length of a name.

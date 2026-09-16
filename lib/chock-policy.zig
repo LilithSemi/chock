@@ -43,6 +43,7 @@
 //! place.
 
 pub const table = @import("chock-policy/table.zig");
+pub const devices = @import("chock-policy/devices.zig");
 pub const subagents = @import("chock-policy/subagents.zig");
 pub const ratchet = @import("chock-policy/ratchet.zig");
 pub const org = @import("chock-policy/org.zig");
