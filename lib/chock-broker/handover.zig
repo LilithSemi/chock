@@ -49,12 +49,13 @@
 //! answer one. **There is no log event for a handover ask**, because a
 //! question that nobody records is not a thing a log holds. Inventing one
 //! would put a word in the log's vocabulary that no log ever contains. So the
-//! frames here are three plain lines:
+//! frames here are plain lines:
 //!
 //! | Direction | Frame | Meaning |
 //! |---|---|---|
 //! | client to session | `ask` | will you hand this session over? |
 //! | session to client | `ready` | yes, and I am waiting for you to say take |
+//! | session to client | `waiting <reason>` | not yet, this is what I hold, and I will say ready when it is done |
 //! | session to client | `busy <reason>` | no, and this is why |
 //! | client to session | `take` | take it, I am the next owner |
 //! | session to client | `handing over` | I am stopping now |
@@ -81,7 +82,7 @@
 //! place, and the next turn boundary reads its `take`. The budget bounds how
 //! long one turn waits and it is not a deadline the client agreed to.
 //!
-//! ## What this refuses, and why refusing is the honest answer
+//! ## What this waits for, and why the ask is held rather than refused
 //!
 //! A running session holds work that its log does not, and `src/detach.zig`
 //! lists it. Two of those rows are still real at a turn boundary:
@@ -89,15 +90,36 @@
 //! * **A background command.** Its thread and its output live in this process.
 //!   `Loop.recordFinishedTasks` writes a `task.complete` when it finishes, and
 //!   a task still running when the process ends is never recorded at all.
-//! * **A subagent started in the background.** Same shape: its own process and
-//!   its own log, but the parent is what records the `agent.complete`, and the
-//!   parent is what is about to go.
+//!   `src/run.zig` ends every task that still runs when a session stops, so a
+//!   handover would not only lose the record, it would stop the command.
+//! * **A subagent started in the background.** Its own process and its own
+//!   log, both of which outlive this one, but the parent is what records the
+//!   `agent.complete`, and the parent is what is about to go.
 //!
-//! Neither moves. So `look` refuses the handover while either one exists, by
-//! name, and the session carries on as though nothing had asked. That is a
-//! refusal a person can act on: wait, and ask again. A handover that took the
-//! session anyway would be exactly the false promise `src/detach.zig` refuses
-//! to make.
+//! **Neither one moves to another process, so this waits for it instead.** A
+//! client that asks a session holding either is told `waiting <reason>`, which
+//! names the counts, and then the ask stays open. Every turn boundary after
+//! that looks again, and the first one that holds nothing answers `ready`. The
+//! session keeps running its turns the whole time, so the wait costs the
+//! session nothing and the work finishes as it would have.
+//!
+//! **This replaces a refusal, and it keeps what the refusal was for.** The old
+//! answer was `busy <reason>` at once, which was honest and made a person ask
+//! again by hand. Holding the ask makes the same promise the machine keeps:
+//! the handover happens after the work is recorded, or it does not happen at
+//! all. Nothing is carried that cannot be carried, and nothing is dropped.
+//!
+//! **The client owns the bound.** This file waits forever, because a session
+//! has no opinion about how long a person will stand there. `chock detach`
+//! passes its `--wait`, and a client whose patience runs out simply stops
+//! reading: the session never got a `take`, so it never stops, and it carries
+//! on with the work it was holding. See `Client.readOffer`.
+//!
+//! **A session may start more of that work while an ask is held**, because the
+//! agent keeps taking turns and a turn may call `run_command` in the
+//! background again. That is what the client's bound is for. Refusing the
+//! agent a tool it is allowed to use, because somebody asked for the session,
+//! would put the person's command in the agent's way.
 //!
 //! The other rows are not losses at this point. A tool call in flight cannot
 //! exist at a turn boundary, because a turn boundary is where every tool result
@@ -114,6 +136,12 @@
 //! than unbounded. **No client Chock ships behaves that way**: `chock detach`
 //! closes its stream on every path out, and a closed peer is dropped on the
 //! next look.
+//!
+//! **A held ask costs less than that, and not more.** It has not been answered
+//! `ready`, so no confirm budget is spent on it at all: a turn boundary reads
+//! whatever the client already sent, without waiting, and looks at the counts.
+//! A client that died while its ask was held is dropped by that same read, so a
+//! wait that may last hours cannot lock every other asker out.
 //!
 //! ## One asker at a time
 //!
@@ -156,6 +184,14 @@ pub const handing_over_frame = "handing over";
 /// What a refusal starts with. The rest of the line is a sentence a person
 /// reads: see `look`.
 pub const busy_prefix = "busy ";
+/// What a held ask is answered with, once. The rest of the line names the work
+/// the session still holds, and `ready` follows it when that work is done: see
+/// `look`.
+///
+/// **Sent once per exchange and never repeated.** A session that said it again
+/// at every turn boundary would fill a client's buffer with the same sentence,
+/// and the client is already waiting for the one frame that changes anything.
+pub const waiting_prefix = "waiting ";
 
 /// How long a session waits for `take` after it answered `ready`, when its
 /// caller states nothing else.
@@ -261,6 +297,14 @@ pub const Endpoint = struct {
     /// its place across turn boundaries, and this is what stops the next look
     /// from reading its `take` as an `ask` and answering `ready` twice.
     offered: bool = false,
+    /// Whether the peer asked and the session answered `waiting` rather than
+    /// `ready`, because it still held work that does not move.
+    ///
+    /// **The ask stays open across turn boundaries while this is set.** The
+    /// frame has already been read, so a later look must not try to read it
+    /// again: it looks at the counts instead, and answers `ready` at the first
+    /// boundary that holds nothing. See this file's own top comment.
+    waiting: bool = false,
     /// How many peers were closed because they were somebody else, or because
     /// one was already asking. Counted rather than only printed, so a test can
     /// pin that a refusal happened and not merely that no handover did.
@@ -357,7 +401,15 @@ pub const Endpoint = struct {
 
         const handle = self.peer orelse return .carry_on;
 
-        if (!self.offered) {
+        if (self.waiting) {
+            // The ask was read at an earlier boundary and is still open. See
+            // this file's own top comment: the work does not move, so the
+            // session waits for it rather than refusing the person.
+            self.noticeGoneWhileWaiting(io, handle);
+            if (self.peer == null) return .carry_on;
+            if (!in_flight.empty()) return .carry_on;
+            if (!self.offer(io, handle)) return .carry_on;
+        } else if (!self.offered) {
             // Nothing waited for here. A peer that has sent nothing yet is the
             // ordinary state of a socket nobody is using.
             const line = self.readFrame(io, handle, 0) orelse return .carry_on;
@@ -371,30 +423,29 @@ pub const Endpoint = struct {
                 return .carry_on;
             }
 
-            // The refusal this whole file is careful about. See the top
-            // comment: neither of these moves to another process, so a
-            // handover that carried them would be a false promise.
+            // The wait this whole file is careful about. See the top comment:
+            // neither of these moves to another process, so a handover that
+            // carried them would be a false promise, and the ask is held until
+            // they are done instead.
             if (!in_flight.empty()) {
-                var reason: [max_frame_bytes]u8 = undefined;
+                var line_buffer: [max_frame_bytes]u8 = undefined;
                 const said = std.fmt.bufPrint(
-                    &reason,
-                    "this session still holds {d} background command(s) and {d} running " ++
-                        "subagent(s), and neither moves to another process. Wait for them and " ++
-                        "ask again.",
+                    &line_buffer,
+                    waiting_prefix ++ "this session still holds {d} background command(s) and " ++
+                        "{d} running subagent(s). Neither one moves to another process, so this " ++
+                        "hands over at the first turn boundary after they finish.\n",
                     .{ in_flight.tasks, in_flight.children },
-                ) catch "this session still holds work that does not move to another process";
-                self.refuse(io, handle, said);
+                ) catch waiting_prefix ++ "this session still holds work that does not move to " ++
+                    "another process, so this hands over once it is done\n";
+                if (!socket.writeAll(handle, said)) {
+                    self.dropPeer(io);
+                    return .carry_on;
+                }
+                self.waiting = true;
                 return .carry_on;
             }
 
-            if (!socket.writeAll(handle, ready_frame ++ "\n")) {
-                // The client went away between asking and being answered.
-                // Nothing has changed about the session, which is the point of
-                // answering before stopping rather than after.
-                self.dropPeer(io);
-                return .carry_on;
-            }
-            self.offered = true;
+            if (!self.offer(io, handle)) return .carry_on;
         }
 
         // **The confirm, and the one place this waits.** `readFrame` drops the
@@ -462,6 +513,7 @@ pub const Endpoint = struct {
             self.start = 0;
             self.filled = 0;
             self.offered = false;
+            self.waiting = false;
         }
     }
 
@@ -524,6 +576,61 @@ pub const Endpoint = struct {
         }
     }
 
+    /// Answer `ready` and remember it. False when the client went away between
+    /// asking and being answered, which leaves the session unchanged: that is
+    /// the point of answering before stopping rather than after.
+    fn offer(self: *Endpoint, io: std.Io, handle: std.posix.fd_t) bool {
+        if (!socket.writeAll(handle, ready_frame ++ "\n")) {
+            self.dropPeer(io);
+            return false;
+        }
+        self.waiting = false;
+        self.offered = true;
+        return true;
+    }
+
+    /// Drop the peer of a held ask when it has gone, and keep anything it sent.
+    ///
+    /// **A held ask is the one state where nothing is read for many turns**, so
+    /// a client that died would keep the one peer slot for the rest of the
+    /// session and shut every other asker out. This is the read that notices.
+    ///
+    /// Whatever arrived is kept in the buffer rather than parsed. A client that
+    /// puts `ask` and `take` in the socket together is speaking this protocol
+    /// in a hurry and not incorrectly, and its `take` is read by the confirm
+    /// step once `ready` has gone out.
+    fn noticeGoneWhileWaiting(self: *Endpoint, io: std.Io, handle: std.posix.fd_t) void {
+        while (socket.readable(handle, 0)) {
+            if (self.start != 0) {
+                const rest = self.buffer[self.start..self.filled];
+                std.mem.copyForwards(u8, self.buffer[0..rest.len], rest);
+                self.filled = rest.len;
+                self.start = 0;
+            }
+            // A peer that filled the whole buffer and sent no line break is not
+            // speaking this protocol, and it is holding the slot of a client
+            // that is. `readFrame` drops one for the same reason.
+            if (self.filled == self.buffer.len) {
+                self.dropPeer(io);
+                return;
+            }
+            const read = std.posix.read(handle, self.buffer[self.filled..]) catch |err| switch (err) {
+                // The poll said there was something and there was not. Nothing
+                // is lost, so leave the client where it is.
+                error.WouldBlock => return,
+                else => {
+                    self.dropPeer(io);
+                    return;
+                },
+            };
+            if (read == 0) {
+                self.dropPeer(io);
+                return;
+            }
+            self.filled += read;
+        }
+    }
+
     /// Say no, with a sentence, and end the exchange.
     fn refuse(self: *Endpoint, io: std.Io, handle: std.posix.fd_t, reason: []const u8) void {
         var frame: [max_frame_bytes]u8 = undefined;
@@ -543,6 +650,7 @@ pub const Endpoint = struct {
         self.start = 0;
         self.filled = 0;
         self.offered = false;
+        self.waiting = false;
     }
 };
 
@@ -576,6 +684,17 @@ pub const Answer = union(enum) {
 pub const Offer = union(enum) {
     /// `ready`. The session will stop if this client sends `take`.
     offered,
+    /// `waiting`, with the sentence it gave. Borrowed from the client's buffer.
+    ///
+    /// **The ask is still open and the session is still running.** It holds
+    /// work that does not move to another process, it named that work, and it
+    /// answers `ready` at the first turn boundary after the work is done. A
+    /// caller that wants to keep waiting calls `readOffer` again.
+    ///
+    /// **An arm of its own, and never `busy`.** A `busy` ended the exchange and
+    /// told a person to ask again by hand. This one is the session saying it
+    /// will do the asking again itself, which is the opposite instruction.
+    waiting: []const u8,
     /// `busy`, with the sentence it gave. Borrowed from the client's buffer.
     busy: []const u8,
     /// Nothing arrived before the client's patience ran out. **The session is
@@ -631,9 +750,18 @@ pub const Client = struct {
     /// **A turn can be minutes long, so this is the read that waits.** A
     /// `.silent` here is not a failure of anything: the session is working, and
     /// it has neither agreed to hand over nor refused.
+    ///
+    /// **`patience_ms` bounds this one read**, the way it bounds every other
+    /// read of this client. A session that answers `.waiting` has said what it
+    /// holds and has kept the ask open, so a caller that reads again gives the
+    /// work its own patience rather than what was left of the first wait. See
+    /// `Offer.waiting`.
     pub fn readOffer(self: *Client, patience_ms: u64) Offer {
         const said = self.frames.next(self.handle, patience_ms) orelse
             return if (readEnded(self.handle)) .ended else .silent;
+        if (std.mem.startsWith(u8, said, waiting_prefix)) {
+            return .{ .waiting = said[waiting_prefix.len..] };
+        }
         if (std.mem.startsWith(u8, said, busy_prefix)) return .{ .busy = said[busy_prefix.len..] };
         if (!std.mem.eql(u8, said, ready_frame)) return .{ .unreadable = said };
         return .offered;
@@ -723,14 +851,23 @@ pub fn ask(io: std.Io, socket_path: []const u8, patience_ms: u64, buffer: []u8) 
 
     var client = Client.over(stream.socket.handle, buffer);
     if (!client.sendAsk()) return .not_listening;
-    switch (client.readOffer(patience_ms)) {
-        .offered => {},
-        .busy => |said| return .{ .busy = said },
-        .silent => return .silent,
-        // Nobody is there to hand anything over, which reads to a caller of
-        // this shortcut the same way a socket with no listener does.
-        .ended => return .not_listening,
-        .unreadable => |said| return .{ .unreadable = said },
+    // Two reads at most. The session sends `waiting` once per exchange, so a
+    // second one is a session this build cannot read: see `waiting_prefix`.
+    for (0..2) |attempt| {
+        switch (client.readOffer(patience_ms)) {
+            .offered => break,
+            // The session named what it holds and kept the ask open, so read
+            // again for the `ready` that follows the work. A caller that wants
+            // a say in between uses `Client` instead, which is what
+            // `src/detach.zig` does.
+            .waiting => |said| if (attempt == 0) continue else return .{ .unreadable = said },
+            .busy => |said| return .{ .busy = said },
+            .silent => return .silent,
+            // Nobody is there to hand anything over, which reads to a caller of
+            // this shortcut the same way a socket with no listener does.
+            .ended => return .not_listening,
+            .unreadable => |said| return .{ .unreadable = said },
+        }
     }
     if (!client.sendTake()) return .silent;
     return client.readFinal(patience_ms);
@@ -951,11 +1088,12 @@ test "a session with nothing in flight hands over only after the client confirms
     try testing.expectEqual(Answer.handed_over, client.readFinal(0));
 }
 
-test "work that does not move to another process refuses the handover by name" {
+test "work that does not move to another process holds the handover open by name" {
     // A background command and a background subagent both live in this process,
     // and this process is what writes their record into the log. A handover
     // would lose whichever was running, and would tell the person who asked
-    // that the work carried on.
+    // that the work carried on. So the ask is held rather than taken, and the
+    // session says what it holds.
     //
     // Mutation check: drop the `in_flight.empty()` guard in `look`, and a
     // session with a build running hands itself over, which loses that build's
@@ -984,19 +1122,35 @@ test "work that does not move to another process refuses the handover by name" {
         try testing.expectEqual(Decision.carry_on, bench.endpoint.look(io, in_flight, 0));
 
         const offer = client.readOffer(0);
-        try testing.expect(offer == .busy);
-        // The sentence names what to wait for, and not merely that something is
-        // wrong. A person told "busy" has to guess.
-        try testing.expect(std.mem.indexOf(u8, offer.busy, "background command") != null);
-        try testing.expect(std.mem.indexOf(u8, offer.busy, "subagent") != null);
+        try testing.expect(offer == .waiting);
+        // The sentence names what is waited for, and not merely that something
+        // is in the way. A person told "wait" has to guess what for.
+        try testing.expect(std.mem.indexOf(u8, offer.waiting, "background command") != null);
+        try testing.expect(std.mem.indexOf(u8, offer.waiting, "subagent") != null);
 
-        // And the session is still the owner, with its peer let go, so the next
-        // turn costs nothing.
-        try testing.expect(!bench.endpoint.asking());
+        // **The ask is still this client's**, which is the whole difference
+        // from the refusal this replaced. A dropped peer here would make the
+        // person ask again by hand for work the session is already waiting on.
+        try testing.expect(bench.endpoint.asking());
+
+        // Every further turn boundary with the work still running says nothing
+        // more and takes nothing. The `waiting` frame is sent once: a session
+        // that repeated it would fill the client's buffer with one sentence.
+        try testing.expectEqual(Decision.carry_on, bench.endpoint.look(io, in_flight, 0));
+        try testing.expectEqual(Decision.carry_on, bench.endpoint.look(io, in_flight, 0));
+        try testing.expectEqual(Offer.silent, client.readOffer(0));
+
+        // And the first boundary that holds nothing hands over, on the `take`
+        // this client sent before any of it. **This is the property the whole
+        // change is for**: the work was waited for and then the session moved,
+        // with nothing asked of the person in between.
+        try testing.expectEqual(Decision.hand_over, bench.endpoint.look(io, .{}, 0));
+        try testing.expectEqual(Offer.offered, client.readOffer(0));
+        try testing.expectEqual(Answer.handed_over, client.readFinal(0));
     }
 
-    // With both counts at zero the same client shape is taken, so the refusals
-    // above were the counts and nothing else about this session.
+    // With both counts at zero from the start no `waiting` is sent at all, so
+    // the sentences above were the counts and nothing else about this session.
     var bench = try Bench.init(gpa, io);
     defer bench.deinit(io);
     const stream = try bench.attach(io);
@@ -1006,6 +1160,50 @@ test "work that does not move to another process refuses the handover by name" {
     try testing.expect(client.sendAsk());
     try testing.expect(client.sendTake());
     try testing.expectEqual(Decision.hand_over, bench.endpoint.look(io, .{}, 0));
+    try testing.expectEqual(Offer.offered, client.readOffer(0));
+}
+
+test "a client that goes away while its ask is held lets the next one in" {
+    // **The one state where nothing is read for many turns.** A held ask waits
+    // for work, not for a frame, so a client that died between asking and the
+    // work finishing would keep the one peer slot for the rest of the session
+    // and shut every other asker out with `busy`.
+    //
+    // Mutation check: take `noticeGoneWhileWaiting` out of `look`, and the
+    // second client below is refused as a second asker, which is a session no
+    // process can ever take.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var bench = try Bench.init(gpa, io);
+    defer bench.deinit(io);
+
+    {
+        const gone = try bench.attach(io);
+        defer gone.close(io);
+        var answers: [max_frame_bytes]u8 = undefined;
+        var client = Client.over(gone.socket.handle, &answers);
+        try testing.expect(client.sendAsk());
+        try testing.expectEqual(Decision.carry_on, bench.endpoint.look(io, .{ .tasks = 1 }, 0));
+        try testing.expect(client.readOffer(0) == .waiting);
+        try testing.expect(bench.endpoint.asking());
+    }
+
+    // The client has gone. The next look notices, with the work still running,
+    // and lets the slot go.
+    try testing.expectEqual(Decision.carry_on, bench.endpoint.look(io, .{ .tasks = 1 }, 0));
+    try testing.expect(!bench.endpoint.asking());
+
+    // So a second person can ask, and is answered rather than told that
+    // somebody else is already asking.
+    const next = try bench.attach(io);
+    defer next.close(io);
+    var answers: [max_frame_bytes]u8 = undefined;
+    var client = Client.over(next.socket.handle, &answers);
+    try testing.expect(client.sendAsk());
+    try testing.expect(client.sendTake());
+    try testing.expectEqual(Decision.hand_over, bench.endpoint.look(io, .{}, 0));
+    try testing.expectEqual(Offer.offered, client.readOffer(0));
 }
 
 test "a client that goes away after asking leaves the session running" {

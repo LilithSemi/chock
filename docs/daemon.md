@@ -172,11 +172,17 @@ git: a linked worktree records nothing about the process that made it, so taking
 one costs no git command at all. The scratchpad moves the same way, because it is
 keyed on the session identifier.
 
-**Two things still do not move, and a handover refuses while either exists.** A
-background command and a background subagent both live in the process that
-started them, and that process is what writes their record into the log. So a
-session running one says no, names the counts, and carries on. Wait for them and
-ask again.
+**Two things still do not move, so a handover waits for them.** A background
+command and a background subagent both live in the process that started them,
+and that process is what writes their record into the log. A session asked while
+it holds either one names the counts, keeps the ask open, and hands over at the
+first turn boundary after that work is recorded. It keeps running its turns the
+whole time, so the wait costs the session nothing.
+
+`--wait` bounds each read of the exchange on its own, so a session that names
+background work gets one wait for the turn boundary and one for the work. At the
+bound `chock detach` says what the session is still holding and leaves it
+running, unchanged. Nothing was taken, so asking again costs nothing.
 
 A session that ended some other abnormal way also keeps its workspace, and that
 one is still refused: `chock detach` names the kept workspace and points at

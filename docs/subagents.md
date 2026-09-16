@@ -70,5 +70,7 @@ nobody by default and is refused at once. `chock approve` can attach to it,
 and a rule in `chock.zon` is the way to answer without a person there. See
 [approvals.md](approvals.md).
 
-A session running a background command or a background subagent cannot be
-handed to the daemon. See [daemon.md](daemon.md).
+A session running a background command or a background subagent is handed to
+the daemon only after that work finishes, because neither one moves to another
+process. `chock detach` says what it is waiting for. See
+[daemon.md](daemon.md).

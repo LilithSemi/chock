@@ -41,14 +41,21 @@
 //! | The scratchpad | **It moves.** Keyed by session under `TMPDIR`, so the next owner builds the same path. A run that handed over does not remove it. |
 //! | A tool call in flight | **Cannot exist here.** A turn boundary is the point where every tool result of the last turn is already in the log. |
 //! | A language server helper | Ends with the process. The new owner starts one on demand, so nothing is lost. |
-//! | A background command | **Refuses the handover while one runs.** Its thread is in that process and only that process writes its `task.complete`. |
-//! | A live subagent | **Refuses the handover while one runs.** The child has its own log and outlives the parent, but the parent is what writes the `agent.complete` that pairs with the `session.spawn` already in the log. |
+//! | A background command | **The handover waits for it.** Its thread is in that process and only that process writes its `task.complete`, so it cannot move. |
+//! | A live subagent | **The handover waits for it.** The child has its own log and outlives the parent, but the parent is what writes the `agent.complete` that pairs with the `session.spawn` already in the log. |
 //!
-//! The last two are the rows that are still losses, and the answer is a
-//! refusal, not a silent handover: `chock_broker.handover.Endpoint.look` names
-//! the counts and the session carries on. **A handover that claimed to carry
-//! them would be a lie**, which is the same reason this command refused
-//! everything before.
+//! The last two are the rows that would be losses, and the answer is a wait,
+//! not a silent handover: `chock_broker.handover.Endpoint.look` names the
+//! counts, holds the ask open, and answers `ready` at the first turn boundary
+//! after the work is done. The session keeps running its turns the whole time.
+//! **A handover that claimed to carry them would be a lie**, which is the same
+//! reason this command refused everything before.
+//!
+//! **The wait is the person's to bound, and `--wait` is that bound.** Each read
+//! of the exchange gets the whole of it, so a session that names its background
+//! work gets one wait for the turn boundary and one for the work. At the bound
+//! this command says what the session is still holding and leaves it running,
+//! unchanged: nothing was taken, and asking again costs nothing.
 //!
 //! ## The window between one owner and the next, and what is really in it
 //!
@@ -165,8 +172,9 @@ const usage_text =
     \\
     \\A session that is still running is asked, and it answers at its next turn
     \\boundary, so this waits. A session running a background command or a
-    \\background subagent refuses, because neither of those moves to another
-    \\process. Its workspace and its scratchpad do move.
+    \\background subagent says so and hands over once that work finishes,
+    \\because neither of those moves to another process. Its workspace and its
+    \\scratchpad do move.
     \\
     \\Options:
     \\  --project <dir>    The project. Defaults to the current directory.
@@ -177,8 +185,9 @@ const usage_text =
     \\                     as `--daemon 127.0.0.1:<n>`. Only a daemon started with
     \\                     --host listens on one.
     \\  --wait <seconds>   How long to wait for a running session to reach a turn
-    \\                     boundary. Default 300. A session that does not answer in
-    \\                     time keeps running, unchanged.
+    \\                     boundary, and again for any background work it names.
+    \\                     Default 300. A session that does not answer in time
+    \\                     keeps running, unchanged.
     \\
 ++ tty.options_text;
 
@@ -191,6 +200,14 @@ const usage_text =
 /// and that refusal costs nothing but it wastes the person's time. Waiting
 /// longer costs nothing either: the session runs the whole time, and Ctrl-C on
 /// this command leaves it running.
+///
+/// **It bounds each read of the exchange and not the exchange as a whole.** A
+/// session that holds a background command answers `waiting` at its first turn
+/// boundary and `ready` when that work is done, which are two waits of very
+/// different lengths: a turn is minutes and a build is as long as the build.
+/// One number for both would have to be the larger of the two, and a person
+/// who set it for the build would then wait that long for every session that
+/// simply never answered.
 pub const default_patience_ms: u64 = 300_000;
 
 const Options = struct {
@@ -655,50 +672,83 @@ fn askRunningSession(
         .{id},
     );
 
-    switch (client.readOffer(patience_ms)) {
-        .offered => {},
-        .busy => |said| {
-            tty.print(
-                .err,
-                "chock detach: session {s} will not hand over: {s}\n",
-                .{ id, said },
-            );
-            return .refused;
-        },
-        // **Nothing changed, and this says so.** The session never answered
-        // `ready`, so it never got a `take`, so it cannot stop later for an ask
-        // this command has given up on.
-        .silent => {
-            tty.print(
-                .err,
-                "chock detach: session {s} did not reach a turn boundary in time, so it was not " ++
-                    "handed over and it is still running normally. Give it longer with " ++
-                    "--wait <seconds>, or stop it with Ctrl-C.\n",
-                .{id},
-            );
-            return .silent;
-        },
-        // **Said out loud, and not silently retried.** A person who asked to
-        // move a running session should learn that it finished on its own,
-        // because what happens to its work is a different thing from here on:
-        // a session that ended is handed over the way it always was.
-        .ended => {
-            tty.detail(
-                "chock detach: session {s} ended on its own while this waited, so it is handed " ++
-                    "over the way a stopped session always was.\n",
-                .{id},
-            );
-            return .ended;
-        },
-        .unreadable => |said| {
-            tty.print(
-                .err,
-                "chock detach: session {s} answered something this build cannot read ({s}), so it " ++
-                    "was not handed over.\n",
-                .{ id, said },
-            );
-            return .unreadable;
-        },
+    // **Two reads at most, and the second one is only for a session that said
+    // what it is holding.** `chock_broker.handover` sends `waiting` once per
+    // exchange, so a second one is a session this build cannot read. The
+    // patience bounds each read on its own, which is what `Client.readOffer`
+    // states: a session holding a background command gets the person's whole
+    // `--wait` for the work, and not what was left of the wait for a turn
+    // boundary.
+    var named_work = false;
+    for (0..2) |attempt| {
+        switch (client.readOffer(patience_ms)) {
+            .offered => break,
+            // **The work is waited for and never carried.** Neither a
+            // background command nor a background subagent moves to another
+            // process, so the session holds this ask open and answers `ready`
+            // once the work is recorded in its log. Said out loud, because a
+            // wait that is minutes longer than the last one reads as a hang.
+            .waiting => |said| {
+                if (attempt != 0) {
+                    tty.print(
+                        .err,
+                        "chock detach: session {s} said twice what it is waiting for, which this " ++
+                            "build cannot read, so it was not handed over.\n",
+                        .{id},
+                    );
+                    return .unreadable;
+                }
+                named_work = true;
+                tty.detail(
+                    "chock detach: session {s} is not ready yet: {s}\n",
+                    .{ id, said },
+                );
+                continue;
+            },
+            .busy => |said| {
+                tty.print(
+                    .err,
+                    "chock detach: session {s} will not hand over: {s}\n",
+                    .{ id, said },
+                );
+                return .refused;
+            },
+            // **Nothing changed, and this says so.** The session never answered
+            // `ready`, so it never got a `take`, so it cannot stop later for an
+            // ask this command has given up on. What it is still doing differs,
+            // and so does what a person should do about it: a session that
+            // named its background work is working through that work, and a
+            // silent one is in the middle of a turn.
+            .silent => {
+                tty.print(
+                    .err,
+                    "chock detach: session {s} {s}\n",
+                    .{ id, silentNote(named_work) },
+                );
+                return .silent;
+            },
+            // **Said out loud, and not silently retried.** A person who asked to
+            // move a running session should learn that it finished on its own,
+            // because what happens to its work is a different thing from here on:
+            // a session that ended is handed over the way it always was.
+            .ended => {
+                tty.detail(
+                    "chock detach: session {s} ended on its own while this waited, so it is " ++
+                        "handed over the way a stopped session always was.\n",
+                    .{id},
+                );
+                return .ended;
+            },
+            .unreadable => |said| {
+                tty.print(
+                    .err,
+                    "chock detach: session {s} answered something this build cannot read ({s}), " ++
+                        "so it was not handed over.\n",
+                    .{ id, said },
+                );
+                return .unreadable;
+            },
+        }
     }
 
     if (!client.sendTake()) {
@@ -740,6 +790,35 @@ fn askRunningSession(
         return .still_holding;
     }
     return .handed_over;
+}
+
+/// What a person is told when the patience ran out with no `ready`, and why
+/// that is two sentences and not one.
+///
+/// **Nothing changed either way.** The session never answered `ready`, so it
+/// never got a `take`, so it cannot stop later for an ask this command has
+/// given up on. What differs is what the session is doing and therefore what
+/// the person should do about it.
+///
+/// * **It named its background work.** It holds a background command or a
+///   background subagent, neither of which moves to another process, and it
+///   hands over on its own at the first turn boundary after that work is
+///   recorded. So the advice is to wait longer, and stopping the session is the
+///   thing that loses the work.
+/// * **It said nothing at all.** It is in the middle of a turn, which is a
+///   model call plus its tool calls.
+///
+/// One sentence for both would send a person waiting on a twenty minute build
+/// to Ctrl-C, which ends the very command they are waiting for.
+fn silentNote(named_work: bool) []const u8 {
+    if (named_work) {
+        return "still holds the background work it named, so it was not handed over and it is " ++
+            "still running normally. It hands over on its own at the first turn boundary after " ++
+            "that work finishes: give it longer with --wait <seconds>. Ctrl-C on the session " ++
+            "stops that work rather than waiting for it.";
+    }
+    return "did not reach a turn boundary in time, so it was not handed over and it is still " ++
+        "running normally. Give it longer with --wait <seconds>, or stop it with Ctrl-C.";
 }
 
 /// Whether the session may change hands. Says why it may not, in this command's
@@ -1453,6 +1532,129 @@ test "a live handover moves the lock, and never lets two processes hold it at on
         chock_proto.event.SessionEndReason.handed_over,
         std.meta.activeTag(folded.end_reason),
     );
+}
+
+test "a live handover waits for background work, and moves the lock only after it" {
+    // **The row `chock detach` used to refuse, driven over the real exchange.**
+    // A background command and a background subagent both live in the process
+    // that owns the session, and only that process writes their record into the
+    // log. So the session keeps the lock while either one runs, says what it is
+    // waiting for, and lets go at the first turn boundary that holds nothing.
+    //
+    // Every piece is the real one: a real log with a real `flock`, a real unix
+    // socket, and the real client steps `askRunningSession` runs. The looks are
+    // apart so each one is a turn boundary, and nothing here needs a thread or
+    // a clock.
+    //
+    // Mutation check: answer `ready` in `look` without reading `in_flight`, and
+    // the "still the owner" line below stops holding, which is a session handed
+    // over with a build running and that build's `task.complete` lost.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = try ShortTmp.open(io);
+    defer tmp.cleanup(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const session_dir = tmp.path();
+    const id = "01JQ" ++ "W" ** 22;
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}.jsonl", .{ session_dir, id }, 0);
+
+    const first_log = try chock_proto.log.Log.open(io, log_path, id);
+    var first_backing = chock_proto.storage.JsonLines{ .log = first_log };
+    const first_store = first_backing.storage();
+    var first_locked = try first_store.lock(io);
+    const content = [_]chock_proto.event.ContentPart{.{ .text = "build it" }};
+    _ = try first_locked.append(gpa, io, .{ .message = .{ .role = .user, .content = &content } }, 1);
+
+    const paths = try chock_broker.handover.pathsFor(arena, session_dir, id);
+    var endpoint = try chock_broker.handover.Endpoint.open(io, paths, null);
+
+    const address = try chock_proto.control.unixAddress(paths.socket);
+    const stream = try address.connect(io);
+    defer stream.close(io);
+    var answers: [chock_broker.handover.max_frame_bytes]u8 = undefined;
+    var client = chock_broker.handover.Client.over(stream.socket.handle, &answers);
+
+    try testing.expect(client.sendAsk());
+    // The confirm goes in ahead of every look, so a session that agreed early
+    // would reach `hand_over` and this test would catch it.
+    try testing.expect(client.sendTake());
+
+    // A turn boundary with one background command running. The session names
+    // what it holds and keeps the session.
+    const running = chock_broker.handover.InFlight{ .tasks = 1 };
+    try testing.expectEqual(
+        chock_broker.handover.Decision.carry_on,
+        endpoint.look(io, running, 0),
+    );
+    const offer = client.readOffer(0);
+    try testing.expect(offer == .waiting);
+    try testing.expect(std.mem.indexOf(u8, offer.waiting, "background command") != null);
+
+    // More turn boundaries, the command still running. **Still the owner**, and
+    // `chock detach` reads exactly that.
+    try testing.expectEqual(
+        chock_broker.handover.Decision.carry_on,
+        endpoint.look(io, running, 0),
+    );
+    try testing.expectEqual(sessions_cmd.Readiness.running, sessions_cmd.readinessOf(gpa, io, log_path, id));
+    try testing.expect(!client.waitForEnd(0));
+
+    // The command finished, so this turn boundary recorded its `task.complete`
+    // and holds nothing. Now the session lets go, on the `take` this client
+    // sent before any of it.
+    try testing.expectEqual(chock_broker.handover.Decision.hand_over, endpoint.look(io, .{}, 0));
+    try testing.expectEqual(chock_broker.handover.Offer.offered, client.readOffer(0));
+    try testing.expectEqual(chock_broker.handover.Answer.handed_over, client.readFinal(0));
+
+    _ = try first_locked.append(gpa, io, .{ .session_end = .{
+        .reason = .handed_over,
+        .detail = "",
+    } }, 2);
+    try first_locked.unlock(io);
+    endpoint.close(io);
+    first_store.close(io);
+
+    // And the next owner can take it, which is the whole point of the wait: the
+    // work was carried by finishing it, and the session moved afterwards.
+    try testing.expect(client.waitForEnd(0));
+    try testing.expectEqual(sessions_cmd.Readiness.ready, sessions_cmd.readinessOf(gpa, io, log_path, id));
+}
+
+test "the bound on a wait says what to do, and it is not the same advice twice" {
+    // **The one thing a person reads when the patience runs out.** Both notes
+    // describe a session that is still running and was not taken, so both have
+    // to say how to get more time. Only one of them is about work that the
+    // session is already finishing on its own, and telling that person to press
+    // Ctrl-C would end the build they are waiting for.
+    //
+    // Mutation check: return the same note for both, and the last line stops
+    // holding.
+    const holding = silentNote(true);
+    const quiet = silentNote(false);
+
+    // Neither one claims anything moved.
+    try testing.expect(std.mem.indexOf(u8, holding, "not handed over") != null);
+    try testing.expect(std.mem.indexOf(u8, quiet, "not handed over") != null);
+    try testing.expect(std.mem.indexOf(u8, holding, "still running") != null);
+    try testing.expect(std.mem.indexOf(u8, quiet, "still running") != null);
+
+    // Both name the flag that gives more time, because that is the answer to a
+    // wait that was too short.
+    try testing.expect(std.mem.indexOf(u8, holding, "--wait") != null);
+    try testing.expect(std.mem.indexOf(u8, quiet, "--wait") != null);
+
+    // The one about background work says the session finishes it by itself, and
+    // says what Ctrl-C would cost. The other one offers Ctrl-C plainly.
+    try testing.expect(std.mem.indexOf(u8, holding, "background work") != null);
+    try testing.expect(std.mem.indexOf(u8, holding, "on its own") != null);
+    try testing.expect(std.mem.indexOf(u8, holding, "stops that work") != null);
+    try testing.expect(std.mem.indexOf(u8, quiet, "turn boundary") != null);
+
+    try testing.expect(!std.mem.eql(u8, holding, quiet));
 }
 
 test "the two control sockets share a directory and never share a descriptor" {

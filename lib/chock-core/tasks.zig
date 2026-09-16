@@ -368,12 +368,14 @@ pub const Table = struct {
 
     /// How many tasks are running right now.
     ///
-    /// **What a handover asks about.** A background command lives in this
+    /// **What a handover waits for.** A background command lives in this
     /// process: its thread is here and only this process writes its
-    /// `task.complete` into the log. So a session that let another process
-    /// take it while one was running would lose that record, and the person
-    /// who asked for the handover would believe the command carried on. See
-    /// `chock_broker.handover`, which refuses for exactly this count.
+    /// `task.complete` into the log, and `src/run.zig` ends every task still
+    /// running when the session stops. So a session that let another process
+    /// take it while one was running would lose that record and stop the
+    /// command, and the person who asked for the handover would believe it
+    /// carried on. See `chock_broker.handover`, which holds the ask open until
+    /// this count is zero.
     ///
     /// **Counted from two totals and never from the thread list.** `threads`
     /// holds every thread this table ever started, because a thread is removed

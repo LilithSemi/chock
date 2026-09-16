@@ -149,7 +149,7 @@ test "a session that armed nothing refuses every ask, and one that armed a socke
     try testing.expect(requested(io, .{}));
 }
 
-test "what the loop counts reaches the socket, so a refusal names the right work" {
+test "what the loop counts reaches the socket, so the wait is for the right work" {
     // `chock_core.Loop.InFlight` and `chock_broker.handover.InFlight` are two
     // types with the same shape, and this file is the only thing that copies
     // one into the other. A copy that dropped a field would let a session hand
@@ -157,29 +157,36 @@ test "what the loop counts reaches the socket, so a refusal names the right work
     // `task.complete`.
     //
     // Mutation check: pass `.{}` to `look` instead of the caller's counts, and
-    // the two refusals below become handovers.
+    // the held ask below is taken on the first turn, which is that build lost.
     const gpa = testing.allocator;
     const io = testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try tmp.dir.realPath(io, &path_buffer);
-
-    var paths = try chock_broker.handover.pathsFor(gpa, path_buffer[0..len], "01COUNTS");
-    defer paths.deinit();
-    var endpoint = try chock_broker.handover.Endpoint.open(io, paths, null);
-    defer endpoint.close(io);
-
-    arm(&endpoint);
-    defer disarm();
     setConfirmBudgetForTest(1000);
     defer setConfirmBudgetForTest(chock_broker.handover.default_confirm_budget_ms);
 
-    const address = try chock_broker.socket.addressFor(paths.socket, null);
-
+    // **One endpoint per count, and not one for all of them.** A session that
+    // agreed to hand over keeps its peer, so the client can read the end of the
+    // stream, and a second ask on the same endpoint is answered `busy`. That is
+    // right for a session, which stops after it agrees, and it makes two
+    // handovers on one endpoint a state no session reaches.
     const held = [_]chock_core.Loop.InFlight{ .{ .tasks = 1 }, .{ .children = 1 } };
-    for (held) |in_flight| {
+    for (held, 0..) |in_flight, index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try tmp.dir.realPath(io, &path_buffer);
+
+        var id: [8]u8 = "01COUNT0".*;
+        id[7] = '0' + @as(u8, @intCast(index));
+        var paths = try chock_broker.handover.pathsFor(gpa, path_buffer[0..len], &id);
+        defer paths.deinit();
+        var endpoint = try chock_broker.handover.Endpoint.open(io, paths, null);
+        defer endpoint.close(io);
+
+        arm(&endpoint);
+        defer disarm();
+
+        const address = try chock_broker.socket.addressFor(paths.socket, null);
         const client = try address.connect(io);
         defer client.close(io);
         try testing.expect(chock_broker.socket.writeAll(
@@ -190,20 +197,17 @@ test "what the loop counts reaches the socket, so a refusal names the right work
             client.socket.handle,
             chock_broker.handover.take_frame ++ "\n",
         ));
-        try testing.expect(!requested(io, in_flight));
-    }
 
-    // And with both counts back at zero the same client shape is taken, so the
-    // refusal above was the counts and not something else about this session.
-    const taker = try address.connect(io);
-    defer taker.close(io);
-    try testing.expect(chock_broker.socket.writeAll(
-        taker.socket.handle,
-        chock_broker.handover.ask_frame ++ "\n",
-    ));
-    try testing.expect(chock_broker.socket.writeAll(
-        taker.socket.handle,
-        chock_broker.handover.take_frame ++ "\n",
-    ));
-    try testing.expect(requested(io, .{}));
+        // The work is still running, so the session keeps the session.
+        try testing.expect(!requested(io, in_flight));
+        // And it keeps it for as long as the work runs, rather than for one
+        // turn.
+        try testing.expect(!requested(io, in_flight));
+
+        // **And the very same client is taken once the work is done**, with
+        // nothing asked of the person in between. This is the whole of what the
+        // loop's counts decide: not whether a handover may ever happen, but
+        // when.
+        try testing.expect(requested(io, .{}));
+    }
 }

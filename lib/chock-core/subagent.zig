@@ -723,13 +723,21 @@ pub const Table = struct {
 
     /// How many children are running right now.
     ///
-    /// **What a handover asks about.** A child has its own process, its own
+    /// **What a handover waits for.** A child has its own process, its own
     /// log and its own lock, so it survives this process. What does not survive
     /// is the parent's own record of it: this process is what writes the
     /// `agent.complete` that pairs with the `session.spawn` already in the log.
     /// A session handed over while one ran would leave that pair open for ever,
     /// and the new owner would never tell the agent what its child answered.
-    /// See `chock_broker.handover`, which refuses for exactly this count.
+    /// See `chock_broker.handover`, which holds the ask open until this count
+    /// is zero.
+    ///
+    /// **A new owner could adopt the child instead, and this does not.** The
+    /// child's log names its own end and its own lock says whether it still
+    /// runs, so a process that never started it could read both. What that
+    /// costs is the property `recordAtTheEnd` states: every `session.spawn` in
+    /// a log has an `agent.complete` after it. Waiting keeps that property and
+    /// carries the same work, so the cheaper answer is the one taken.
     ///
     /// Counted from two totals and never from the thread list, for the reason
     /// `tasks.Table.runningCount` gives.

@@ -160,15 +160,19 @@ tenth.
   reaches another host is asked about and still does not run, even approved:
   the act that leaves the sandbox has no caller yet.
 
-- **A handover cannot carry a background command or a background subagent, so a
-  session running one refuses.** Both live in the process that started them, and
-  that process is what writes their record into the log, so a handover would
-  drop the record and tell the person who asked that the work carried on. What
-  is missing is a way to hand a running thread's result to another process:
-  either the record has to be written before the work finishes, which is a lie
-  about work that has not happened, or the next owner has to wait for a process
-  it did not start, which is a second ownership model. Neither is a small
-  change, so the refusal is what is built.
+- **A handover cannot carry a background command or a background subagent, so
+  it waits for one.** Both live in the process that started them, and that
+  process is what writes their record into the log, so a handover that took the
+  session would drop the record and tell the person who asked that the work
+  carried on. A background command cannot move by any means: its thread reads
+  the command's output in this process, and the session's own teardown ends the
+  command. A background subagent could in principle be adopted, because its
+  process and its log both outlive the parent and its log's lock says whether it
+  still runs, but that costs the property every replay reads, that each
+  `session.spawn` has an `agent.complete` after it. So the ask is held open
+  instead and the session hands over once the work is recorded, which carries
+  the same work for a far smaller change. What is still missing is a handover
+  that does not make the person wait for a long build.
 - **Only a git project's workspace moves.** A project with no git of its own
   gets the overlay backing, and `overlay.create` cannot be called twice on the
   same scratch directory: the Linux driver refuses a directory that exists, and

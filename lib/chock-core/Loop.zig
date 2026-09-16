@@ -446,13 +446,13 @@ pub const no_progress_distinct: usize = 2;
 ///
 /// **Only the loop can count this**, because the two tables live beside the
 /// loop and nothing outside the process can read them. It is handed to
-/// `Deps.handover` so a caller can refuse to give away a session that would
-/// lose work by moving. See `chock_broker.handover` for what a refusal reads
-/// like, and `src/detach.zig` for the table of everything a running session
-/// holds and what becomes of each part.
+/// `Deps.handover` so a caller can hold off giving away a session that would
+/// lose work by moving. See `chock_broker.handover`, which names the counts to
+/// the asking client and then waits for them, and `src/detach.zig` for the
+/// table of everything a running session holds and what becomes of each part.
 ///
-/// Counts and not a boolean, so a refusal can say how many and a person knows
-/// what to wait for.
+/// Counts and not a boolean, so the session can say how many and a person
+/// knows what is being waited for.
 pub const InFlight = struct {
     /// Background commands started and not yet recorded in the log.
     tasks: usize = 0,
