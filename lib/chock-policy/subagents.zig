@@ -62,6 +62,17 @@ pub const Limits = struct {
     max_depth: u16 = default_max_depth,
     /// The most subagents any one agent may start.
     max_width: u16 = default_max_width,
+    /// True when `max_depth` is the org policy bundle's number and not this
+    /// project's own. **Only `explain` reads it**, and it exists because that
+    /// sentence names the source of the limit: a refusal that blamed
+    /// `chock.zon` for a number an organisation set would send the author to
+    /// edit a file that does not hold it. See `underCeiling`.
+    depth_from_org: bool = false,
+    /// True when `max_width` is the org policy bundle's number. Separate from
+    /// `depth_from_org` because a bundle may cap one and say nothing about the
+    /// other, and then one sentence names the file and the other names the
+    /// bundle.
+    width_from_org: bool = false,
 
     /// How many agents the largest tree these limits allow holds, the agent
     /// a person started included. Saturating, because a file names both
@@ -94,6 +105,58 @@ pub const Standing = struct {
     /// number of `session.spawn` events in its own log.
     width: usize = 0,
 };
+
+/// The most an organisation lets any project of this installation spawn.
+///
+/// **A field and not a rule, and a minimum and not a decision**, the same shape
+/// `org.BudgetCeiling` has. Each member is optional on its own, so a bundle may
+/// cap the width of a tree and say nothing about its depth.
+///
+/// **This lives here and not in `org.zig`** so that `org.zig` imports this file
+/// and this file imports nothing but `std`. The fold is `underCeiling` below,
+/// beside the limits it folds, rather than in the module that carries the
+/// bundle.
+pub const Ceiling = struct {
+    /// The deepest spawn chain any project may ask for, or null for a bundle
+    /// that does not cap depth.
+    max_depth: ?u16 = null,
+    /// The most subagents any one agent may start, or null for a bundle that
+    /// does not cap width. **Zero is a real answer here**: it turns subagents
+    /// off across the installation.
+    max_width: ?u16 = null,
+};
+
+/// `limits` held to `ceiling`, member by member.
+///
+/// **A minimum, and never a refusal.** A budget above its org ceiling refuses
+/// the session, because a budget that is quietly lowered ends a session in the
+/// middle of the work with nothing said about why. This is the other case: a
+/// spawn refused by one of these limits says so at the moment it happens, and
+/// `explain` names the limit, the number, and now the source as well. So the
+/// narrowing is silent here and loud where it lands, which is the same shape
+/// the rule ratchet already has: narrowing is free.
+///
+/// **The source travels with the number.** Whichever side wins sets the
+/// matching flag, so the sentence a refused agent reads names the file or the
+/// bundle correctly. A fold that kept only the number would make every org
+/// narrowing read as the project's own.
+pub fn underCeiling(limits: Limits, ceiling: ?Ceiling) Limits {
+    const bound = ceiling orelse return limits;
+    var held = limits;
+    if (bound.max_depth) |depth| {
+        if (depth < held.max_depth) {
+            held.max_depth = depth;
+            held.depth_from_org = true;
+        }
+    }
+    if (bound.max_width) |width| {
+        if (width < held.max_width) {
+            held.max_width = width;
+            held.width_from_org = true;
+        }
+    }
+    return held;
+}
 
 /// Which limit refused a spawn. An enum and not a sentence, so a caller acts
 /// on the member and never on the words, the same reason
@@ -145,15 +208,27 @@ pub fn explain(
             gpa,
             "no subagent was started: {s} sets max_depth to {d}, and this agent is already {d} " ++
                 "{s} down the spawn chain.",
-            .{ file_name, limits.max_depth, standing.depth, plural(standing.depth, "agent", "agents") },
+            .{ sourceOf(limits, refusal), limits.max_depth, standing.depth, plural(standing.depth, "agent", "agents") },
         ),
         .width => std.fmt.allocPrint(
             gpa,
             "no subagent was started: {s} sets max_width to {d}, and this agent has already " ++
                 "started {d} {s}.",
-            .{ file_name, limits.max_width, standing.width, plural(standing.width, "subagent", "subagents") },
+            .{ sourceOf(limits, refusal), limits.max_width, standing.width, plural(standing.width, "subagent", "subagents") },
         ),
     };
+}
+
+/// What names the limit that refused: this project's own file, or the org
+/// policy bundle that lowered it. See `Limits.depth_from_org`.
+pub const org_source_name = "this installation's org policy bundle";
+
+fn sourceOf(limits: Limits, refusal: Refusal) []const u8 {
+    const from_org = switch (refusal) {
+        .depth => limits.depth_from_org,
+        .width => limits.width_from_org,
+    };
+    return if (from_org) org_source_name else file_name;
 }
 
 fn plural(count: usize, one: []const u8, many: []const u8) []const u8 {
@@ -674,4 +749,79 @@ test "no two faults of this module read the same" {
     for (lines, 0..) |line, i| {
         for (lines[i + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, line, other));
     }
+}
+
+
+test "an org ceiling narrows a project's limits and never widens them" {
+    // **The gap this closes.** A bundle could cap what a project spends and
+    // not how wide its spawn tree grows, so an organisation had no answer at
+    // all to a runaway tree, which is the more expensive of the two.
+    //
+    // Mutation check: make `underCeiling` take the ceiling rather than the
+    // minimum and the first expectation below fails, because a project that
+    // asked for less than its org allows would be raised to the org's number.
+    const generous = Limits{ .max_depth = 8, .max_width = 8 };
+    const capped = Ceiling{ .max_depth = 3, .max_width = 2 };
+
+    const held = underCeiling(generous, capped);
+    try testing.expectEqual(@as(u16, 3), held.max_depth);
+    try testing.expectEqual(@as(u16, 2), held.max_width);
+
+    // A project already below the ceiling keeps its own numbers, and neither
+    // is read as coming from the bundle. Narrowing is free, and widening is
+    // not a thing this function can do.
+    const modest = Limits{ .max_depth = 2, .max_width = 1 };
+    const untouched = underCeiling(modest, capped);
+    try testing.expectEqual(@as(u16, 2), untouched.max_depth);
+    try testing.expectEqual(@as(u16, 1), untouched.max_width);
+    try testing.expect(!untouched.depth_from_org);
+    try testing.expect(!untouched.width_from_org);
+
+    // A bundle that predates the field changes nothing at all.
+    const none = underCeiling(generous, null);
+    try testing.expectEqual(@as(u16, 8), none.max_depth);
+    try testing.expectEqual(@as(u16, 8), none.max_width);
+}
+
+test "a bundle may cap one limit and say nothing about the other" {
+    // Each member is optional on its own, so the two are folded apart. A
+    // ceiling that named only a width used to have to name a depth as well,
+    // and the number it invented would have bound every project.
+    const project = Limits{ .max_depth = 8, .max_width = 8 };
+    const width_only = underCeiling(project, .{ .max_width = 2 });
+
+    try testing.expectEqual(@as(u16, 8), width_only.max_depth);
+    try testing.expectEqual(@as(u16, 2), width_only.max_width);
+    try testing.expect(!width_only.depth_from_org);
+    try testing.expect(width_only.width_from_org);
+
+    // **Zero is a real ceiling**: it turns subagents off across the
+    // installation, and `check` refuses the first spawn.
+    const off = underCeiling(project, .{ .max_width = 0 });
+    try testing.expectEqual(@as(u16, 0), off.max_width);
+    try testing.expectEqual(Refusal.width, check(off, .{ .depth = 1, .width = 0 }).?);
+}
+
+test "a refusal names the org bundle when the org is what lowered the limit" {
+    // **The sentence has to name the file that holds the number.** A refusal
+    // that blamed `chock.zon` for a limit an organisation set would send the
+    // author to edit a file that does not hold it, and the number they found
+    // there would be the larger one they already wrote.
+    //
+    // Mutation check: make `sourceOf` answer `file_name` always, and the first
+    // expectation fails.
+    const gpa = testing.allocator;
+    const lowered = underCeiling(.{ .max_depth = 8, .max_width = 8 }, .{ .max_width = 2 });
+
+    const width_text = try explain(gpa, .width, lowered, .{ .depth = 1, .width = 2 });
+    defer gpa.free(width_text);
+    try testing.expect(std.mem.indexOf(u8, width_text, org_source_name) != null);
+    try testing.expect(std.mem.indexOf(u8, width_text, file_name) == null);
+
+    // And the limit the bundle said nothing about still names the project's
+    // own file, in the same session and out of the same `Limits`.
+    const depth_text = try explain(gpa, .depth, lowered, .{ .depth = 8, .width = 0 });
+    defer gpa.free(depth_text);
+    try testing.expect(std.mem.indexOf(u8, depth_text, file_name) != null);
+    try testing.expect(std.mem.indexOf(u8, depth_text, org_source_name) == null);
 }

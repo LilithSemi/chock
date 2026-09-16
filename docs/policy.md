@@ -375,3 +375,24 @@ expired when it is first given to Chock is refused instead.
 A bundle can also require an audit sink. A session whose required sink still
 held none of the tail of the log at the end exits `9`, which is a status and
 never a refusal to run. See [running.md](running.md).
+
+### The two ceilings that are fields and not rules
+
+Some things a project sets are numbers rather than decisions, and a rule cannot
+narrow a number. A bundle therefore carries two blocks of its own:
+
+- `budget` sets the most a session of this installation may spend. A project
+  that asks for more is **refused when it starts**, and both numbers are in
+  what the person reads. It is not lowered quietly, because a session that ran
+  at the lower number would stop in the middle of the work with nothing said
+  about why.
+- `subagents` sets the largest spawn tree any project may ask for, with
+  `max_depth` and `max_width`. Each is optional on its own. A project above
+  either one is **held to the bundle's number** and is not refused, because a
+  spawn this stops says so at the moment it happens. The message names the
+  bundle as the source, so nobody is sent to edit a `chock.zon` that does not
+  hold that limit.
+
+The two differ on purpose. A refusal is right when the narrowing would
+otherwise be discovered late and without a reason, and a quiet minimum is right
+when the narrowing announces itself where it lands.

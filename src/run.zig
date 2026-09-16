@@ -1865,7 +1865,7 @@ fn start(
     // is how a project turns subagents off.
     var subagents_diag: ?chock_policy.subagents.Diagnostic = null;
     defer if (subagents_diag) |*d| d.deinit(arena);
-    const subagent_limits = chock_policy.subagents.load(arena, io, project_root, &subagents_diag) catch |err| {
+    const limits_from_file = chock_policy.subagents.load(arena, io, project_root, &subagents_diag) catch |err| {
         // The field that is wrong and the value it holds, which the error
         // name alone does not carry.
         if (subagents_diag) |*d| {
@@ -1875,6 +1875,12 @@ fn start(
         }
         return error.Reported;
     };
+    // **Held under the org ceiling, the same as the budget above.** An
+    // organisation could cap what a project spends and not how wide its spawn
+    // tree grows, and a runaway tree is the more expensive of the two. This
+    // narrows quietly and says so where it lands, which is the opposite of the
+    // budget and for a stated reason: see `subagents.underCeiling`.
+    const subagent_limits = subagentsUnderOrg(limits_from_file, org_bundle);
 
     // This project's language server, read from the same file and for the
     // same reason. **Null is the ordinary answer**, and it costs the session
@@ -2756,6 +2762,27 @@ fn orgBudgetCeiling(
         else
             chock_cost.budget.default_currency,
     };
+}
+
+/// How wide and how deep this session's spawn tree may grow: the `subagents`
+/// block of `chock.zon`, held under the ceiling the org policy bundle sets.
+///
+/// **One function and not two, for the reason `budgetUnderOrg` gives.** A
+/// `start` that read the project's block and skipped the ceiling would pass
+/// every test of the fold itself, which is how a mechanism ships with green
+/// tests and no caller. There is one answer to "how far may this tree grow",
+/// and it is this.
+///
+/// **It narrows quietly, where the budget refuses.** A spawn this stops says
+/// so at the moment it happens and names the bundle as the source, so nothing
+/// is hidden by folding rather than refusing. See
+/// `chock_policy.subagents.underCeiling`.
+fn subagentsUnderOrg(
+    from_file: chock_policy.subagents.Limits,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) chock_policy.subagents.Limits {
+    const bundle = org_bundle orelse return from_file;
+    return chock_policy.subagents.underCeiling(from_file, bundle.subagents);
 }
 
 /// What this session may spend: the cap in `chock.zon`, the slice a parent
@@ -20215,4 +20242,37 @@ test "the broker is given the same values, without the ones nobody can match" {
     // broker with nothing replaces nothing and copies nothing.
     const empty = try brokerRedaction(arena, .{});
     try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+
+test "an org subagent ceiling binds this session, and it is the session's own limits that carry it" {
+    // **The wiring, and not only the fold.** `chock_policy.subagents` has its
+    // own tests for the minimum. What this one says is that the value a
+    // session runs on has been through it, which no test of the fold alone can
+    // say: see this project's own record of mechanisms that shipped with green
+    // tests and no caller.
+    //
+    // Mutation check: make `subagentsUnderOrg` answer `from_file` and the
+    // first two expectations fail.
+    const capped: chock_policy.org.Bundle = .{ .subagents = .{ .max_depth = 3, .max_width = 2 } };
+    const greedy = chock_policy.subagents.Limits{ .max_depth = 9, .max_width = 9 };
+
+    const held = subagentsUnderOrg(greedy, &capped);
+    try testing.expectEqual(@as(u16, 3), held.max_depth);
+    try testing.expectEqual(@as(u16, 2), held.max_width);
+    // The source travels with the number, so the refusal a spawn reads names
+    // the bundle and not a file that does not hold this limit.
+    try testing.expect(held.depth_from_org);
+    try testing.expect(held.width_from_org);
+
+    // A bundle that sets no ceiling, and no bundle at all, both leave the
+    // project's own block exactly as it was written.
+    const rules_only: chock_policy.org.Bundle = .{};
+    const untouched = subagentsUnderOrg(greedy, &rules_only);
+    try testing.expectEqual(@as(u16, 9), untouched.max_depth);
+    try testing.expect(!untouched.depth_from_org);
+
+    const unmanaged = subagentsUnderOrg(greedy, null);
+    try testing.expectEqual(@as(u16, 9), unmanaged.max_depth);
+    try testing.expectEqual(@as(u16, 9), unmanaged.max_width);
 }

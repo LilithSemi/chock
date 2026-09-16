@@ -185,6 +185,7 @@
 
 const std = @import("std");
 const table = @import("table.zig");
+const subagent = @import("subagents.zig");
 
 /// The name of the bundle file. It lives in the data directory
 /// `lib/chock-auth/paths.zig` names, beside the credential store, because the
@@ -326,6 +327,16 @@ pub const Bundle = struct {
     /// **A field and not a rule, and a minimum and not an intersection**: see
     /// `BudgetCeiling`.
     budget: ?BudgetCeiling = null,
+    /// The largest spawn tree any project of this installation may ask for.
+    /// Null for a bundle that caps neither depth nor width, which is every
+    /// bundle that predates this field, and then the project's own `subagents`
+    /// block is the only limit there is.
+    ///
+    /// **A field and not a rule, and a minimum and not a refusal**: see
+    /// `subagents.underCeiling`, which also says why this narrows quietly where
+    /// the budget ceiling refuses. **An org can now cap fan-out**, which for a
+    /// runaway spawn tree is the more expensive of the two.
+    subagents: ?subagent.Ceiling = null,
     /// The version of the bundle format. See `max_version`.
     version: u32 = 1,
 
@@ -379,6 +390,11 @@ pub const ParseError = error{
     /// of zero would refuse the first turn of every session in the
     /// installation, and a negative one has no meaning at all.
     InvalidBudgetCeiling,
+    /// The subagent ceiling names neither `max_depth` nor `max_width`. A
+    /// ceiling that caps nothing is a block somebody meant to fill in, and
+    /// reading it as "no ceiling" would hide the mistake for as long as the
+    /// bundle lives.
+    InvalidSubagentCeiling,
 };
 
 /// What can go wrong while reading a bundle from a path.
@@ -433,6 +449,8 @@ pub const Diagnostic = union(enum) {
     /// The budget ceiling names a `max_cost` that is not a number above zero.
     /// The value is what the file said.
     budget_max_cost_not_positive: f64,
+    /// The subagent ceiling names neither limit.
+    subagent_ceiling_names_nothing,
 
     pub const NameTooLong = struct {
         field: []const u8,
@@ -501,6 +519,10 @@ pub const Diagnostic = union(enum) {
             .sink_path_too_long => |which| try writer.print(
                 "audit sink {d} of the org policy bundle names a path longer than {d} bytes.",
                 .{ which, max_sink_path_bytes },
+            ),
+            .subagent_ceiling_names_nothing => try writer.writeAll(
+                "the org policy bundle's subagent ceiling names neither max_depth nor " ++
+                    "max_width, so it caps nothing. Name at least one, or remove the block.",
             ),
             .budget_max_cost_not_positive => |value| try writer.print(
                 "the org policy bundle's budget ceiling must be a number above zero, and this " ++
@@ -665,6 +687,16 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         if (!(ceiling.max_cost > 0) or !std.math.isFinite(ceiling.max_cost)) {
             _ = note(diag, .{ .budget_max_cost_not_positive = ceiling.max_cost });
             return error.InvalidBudgetCeiling;
+        }
+    }
+
+    // **Zero is a real ceiling here and an empty block is not.** A `max_width`
+    // of zero turns subagents off across the installation, which somebody may
+    // well mean, so the only shape refused is the one that caps nothing at all.
+    if (bundle.subagents) |ceiling| {
+        if (ceiling.max_depth == null and ceiling.max_width == null) {
+            _ = note(diag, .subagent_ceiling_names_nothing);
+            return error.InvalidSubagentCeiling;
         }
     }
 }
@@ -1182,4 +1214,43 @@ test "a budget ceiling of zero or below is refused when the bundle is read" {
         error.InvalidBudgetCeiling,
         parse(gpa, ".{ .budget = .{ .max_cost = -1.0 } }", null),
     );
+}
+
+
+test "a bundle carries a subagent ceiling, and one that caps nothing is refused" {
+    const gpa = testing.allocator;
+
+    // The shape an organisation writes. A bundle may cap one limit and leave
+    // the other to the project, so both are read back exactly as written.
+    const both = try parse(gpa, ".{ .subagents = .{ .max_depth = 3, .max_width = 2 } }", null);
+    defer destroy(gpa, both);
+    try testing.expectEqual(@as(?u16, 3), both.subagents.?.max_depth);
+    try testing.expectEqual(@as(?u16, 2), both.subagents.?.max_width);
+
+    const width_only = try parse(gpa, ".{ .subagents = .{ .max_width = 0 } }", null);
+    defer destroy(gpa, width_only);
+    try testing.expectEqual(@as(?u16, null), width_only.subagents.?.max_depth);
+    // **Zero is kept and not read as absent**: it turns subagents off for
+    // every project of this installation, which is a thing an organisation
+    // may well mean.
+    try testing.expectEqual(@as(?u16, 0), width_only.subagents.?.max_width);
+
+    // Every bundle written before this field sets no ceiling at all.
+    const older = try parse(gpa, ".{ .rules = .{} }", null);
+    defer destroy(gpa, older);
+    try testing.expectEqual(@as(?subagent.Ceiling, null), older.subagents);
+
+    // A block that names neither limit caps nothing. Reading it as "no
+    // ceiling" would hide the mistake for as long as the bundle lives, so it
+    // is refused when the file is read, with the reason.
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSubagentCeiling,
+        parse(gpa, ".{ .subagents = .{} }", &diag),
+    );
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "max_depth") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "max_width") != null);
 }
