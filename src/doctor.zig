@@ -183,18 +183,22 @@ pub const ToolchainState = union(enum) {
     none,
 };
 
-/// What a routed sandbox would find at the three files it writes for itself.
+/// Which of the two ways a routed sandbox on this host places the three files
+/// it writes for itself.
 ///
-/// **A host property and not a namespace probe, and it is the one that saves
-/// the most confusion.** A sandbox with a network of its own has a resolver of
-/// its own, and glibc only finds it through `/etc/resolv.conf`, so
-/// `namespace.substitute` puts that file and two more inside the sandbox.
-/// **It refuses a target that is a symbolic link rather than following one**: a
-/// bind over a link lands wherever the link points, which the sandbox does not
-/// hold. On a machine with systemd and no Nix, `/etc` is bound from the host
-/// and `/etc/resolv.conf` there is a link into `/run/systemd/resolve`, so that
-/// machine can start no routed sandbox at all, and the only way to learn it
-/// today is to try.
+/// **A host property and not a namespace probe.** A sandbox with a network of
+/// its own has a resolver of its own, and glibc only finds it through
+/// `/etc/resolv.conf`, so `namespace.substitute` puts that file and two more
+/// inside the sandbox. Where the sandbox holds no `/etc` at all it simply
+/// makes them. Where it binds the host's own, it takes that directory for
+/// itself first, with `namespace.ownDirectory`, and what the host keeps at
+/// those paths stops mattering: a link into `/run/systemd/resolve` and an
+/// `nsswitch.conf` that is not there both answer the same way.
+///
+/// **So no answer here blocks on its own.** The one machine that is still
+/// refused is one that has to take the directory and whose kernel has no
+/// rootless overlayfs, and `resolverFilesRow` reads the `overlayfs` probe to
+/// say that.
 ///
 /// See `measureResolverFiles` for how each answer is reached, and
 /// `Sandbox.resolver_substitutions` for the list this reads.
@@ -207,20 +211,10 @@ pub const ResolverFiles = union(enum) {
     /// itself. Every machine with a Nix store, and every project with a dev
     /// shell.
     made_inside,
-    /// A routed sandbox binds this host's own `/etc`, and every target there
-    /// is a regular file. A bind mount covers one whatever it holds and needs
-    /// no write permission on it, so this works.
-    covered,
-    /// A routed sandbox binds this host's own `/etc` and this target there is
-    /// a symbolic link. **No routed sandbox starts on this machine.** The text
-    /// is the target, which is `/etc/resolv.conf` on a systemd machine.
-    linked: []const u8,
-    /// A routed sandbox binds this host's own `/etc` and this target is not
-    /// there at all. `substitute` then makes the file where it belongs, which
-    /// is inside a mount that is read only, and `writeSubstitute` answers
-    /// `EROFS`. **No routed sandbox starts on this machine either**, and it is
-    /// the same fault as the one above pointing the other way.
-    missing: []const u8,
+    /// A routed sandbox binds this host's own `/etc` and takes it for itself
+    /// with an overlay, so the files are made in a directory the sandbox owns
+    /// and the host's own is read through it and never written.
+    owned,
     /// The `/etc` a routed sandbox holds comes from this project's container
     /// image, so this host's own says nothing about it. The text names the
     /// image. **Nothing here unpacked one to read it**, and the row says so:
@@ -652,7 +646,7 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                 "the kernel itself filters that network, so a connection reaches only an address a policy let out",
                 router_filter_fix,
             ));
-            try rows.append(arena, try resolverFilesRow(arena, m.resolver_files));
+            try rows.append(arena, try resolverFilesRow(arena, m.resolver_files, m.overlayfs));
         }
 
         try rows.append(arena, .{
@@ -765,12 +759,21 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                     "a project with no git of its own has no workspace: {s}",
                     .{m.overlayfs.why()},
                 ),
-            .why = "a project with no git of its own still gets a workspace",
-            .fix = if (m.overlayfs == .ok) "" else "A git project is unaffected: it gets a worktree. Rootless overlayfs needs kernel 5.11 or later.",
-            // Deliberately not blocking. Only a project with no git of its
-            // own needs an overlay, and this command does not run `git` to
-            // find out, so it says which projects are affected instead of
-            // refusing for every project.
+            // **Two users, and the second one is easy to miss.** A routed
+            // sandbox that binds this host's own `/etc` takes that directory
+            // for itself with an overlay, so on such a machine this mechanism
+            // gates every foreground tool call. The `resolver files` row is
+            // where that reads as BLOCKED, because only that row knows which
+            // `/etc` this host's sandbox holds.
+            .why = "a project with no git of its own still gets a workspace, and a routed sandbox " ++
+                "takes a host /etc for itself",
+            .fix = if (m.overlayfs == .ok) "" else "A git project is unaffected: it gets a worktree. " ++
+                "Rootless overlayfs needs kernel 5.11 or later.",
+            // Deliberately not blocking on its own. Only a project with no git
+            // of its own needs an overlay for a workspace, and this command
+            // does not run `git` to find out. The machine where this really
+            // does stop every tool call is named by the `resolver files` row,
+            // which reads this answer.
             .blocks = false,
         });
 
@@ -858,10 +861,17 @@ const router_refusal_fix = "The sandbox builds this inside a network namespace o
 /// Whether this host lets a routed sandbox write the three files it needs.
 ///
 /// **The one row here that is a question about the host and not about a
-/// namespace**, and the one that blocks the most machines. See `ResolverFiles`.
+/// namespace.** See `ResolverFiles`.
+///
+/// `overlayfs` is read as well, and only for the one answer it can change. A
+/// sandbox that binds the host's own `/etc` takes that directory for itself
+/// with an overlay, so a kernel that refuses a rootless overlay refuses every
+/// foreground tool call on such a machine. A sandbox that holds no host `/etc`
+/// takes nothing and is not affected.
 fn resolverFilesRow(
     arena: std.mem.Allocator,
     files: ResolverFiles,
+    overlayfs: Probe,
 ) std.mem.Allocator.Error!Row {
     const why = "the sandbox writes its own resolv.conf, nsswitch.conf and hosts, so a program in it " ++
         "asks the sandbox's own resolver and no other";
@@ -877,44 +887,26 @@ fn resolverFilesRow(
             .means = "",
             .why = why,
         },
-        .covered => .{
+        // **`unavailable` and not `unsupported`.** The machine has a kernel
+        // that is too old for one mechanism and a person can change that.
+        // `NONE` would read as nothing to configure.
+        .owned => if (overlayfs == .ok) .{
             .name = resolver_files_name,
             .state = .on,
-            .means = "this host's own /etc is bound into the sandbox, and each file is covered by a bind mount",
+            .means = "this host's own /etc is bound into the sandbox, and a routed call takes that " ++
+                "directory for itself with an overlay, so what the host keeps there does not matter",
             .why = why,
-        },
-        // **`unavailable` and not `unsupported`.** The machine has everything
-        // it needs and one file on it is the wrong kind of thing, which a
-        // person can change. `NONE` would read as nothing to configure.
-        .linked => |target| .{
+        } else .{
             .name = resolver_files_name,
             .state = .unavailable,
             .means = try std.fmt.allocPrint(
                 arena,
-                "no foreground tool call can start: {s} on this host is a symbolic link, and Chock " ++
-                    "refuses such a target rather than following it",
-                .{target},
+                "no foreground tool call can start: this host's own /etc is bound into the sandbox, " ++
+                    "and the overlay a routed call takes it with was refused ({s})",
+                .{overlayfs.why()},
             ),
             .why = why,
-            .fix = "A bind over a link lands where the link points, which the sandbox does not hold. " ++
-                resolver_files_fix ++ " The other answer is to make that path a regular file on the host.",
-            .blocks = true,
-        },
-        // The same fault pointing the other way. The directory is bound from
-        // the host and it is read only, so a file that is not already there
-        // cannot be made there.
-        .missing => |target| .{
-            .name = resolver_files_name,
-            .state = .unavailable,
-            .means = try std.fmt.allocPrint(
-                arena,
-                "no foreground tool call can start: {s} is not on this host, and the directory it " ++
-                    "belongs in is bound into the sandbox read only, so Chock cannot make it there",
-                .{target},
-            ),
-            .why = why,
-            .fix = resolver_files_fix ++ " The other answer is to make that file on the host, with " ++
-                "whatever content: Chock binds its own over it.",
+            .fix = "Rootless overlayfs needs kernel 5.11 or later. " ++ resolver_files_fix,
             .blocks = true,
         },
         // **On, and the sentence says which /etc the answer is about.** What
@@ -936,11 +928,11 @@ fn resolverFilesRow(
     };
 }
 
-/// The one answer that works for either fault, and the one this project can
-/// really state: both toolchains put a sandbox together out of paths that hold
-/// no `/etc`, so neither reads this host's own at all.
-const resolver_files_fix = "Give this project a flake.nix dev shell or a chock.zon container image, " ++
-    "and the sandbox holds no host /etc at all.";
+/// The other answer, and the one this project can really state: both
+/// toolchains put a sandbox together out of paths that hold no `/etc`, so
+/// neither takes one from this host and neither needs an overlay to do it.
+const resolver_files_fix = "The other answer is to give this project a flake.nix dev shell or a " ++
+    "chock.zon container image, and the sandbox holds no host /etc at all.";
 
 /// The name of the row `resolverFilesRow` writes. Named once, because a test
 /// reads it and that function writes it.
@@ -1814,22 +1806,29 @@ fn measureHost(
     }
 }
 
-/// Whether this host lets a routed sandbox write the three files it needs.
+/// Which of the two ways a routed sandbox on this host places the three files
+/// it writes for itself.
 ///
-/// **Two questions, and both are needed.** The first is which `/etc` a routed
-/// sandbox would hold, which the toolchain decides: a Nix closure and a dev
-/// shell hold none, so the files are made inside and nothing on the host is
-/// touched. The second is whether a target this host really does bind in is a
-/// symbolic link, which `namespace.substitute` refuses rather than follows.
+/// **One question, and the toolchain answers most of it.** A Nix closure and a
+/// dev shell hold no `/etc`, so the files are made inside a root the sandbox
+/// already owns and nothing on the host is read. A host toolchain binds the
+/// host's own `/etc`, because that is where the CA certificates are, and a
+/// routed call then takes that directory for itself.
 ///
-/// **The `hide` entries are left out on purpose.** `namespace.hidePath` binds
-/// over whatever it finds and follows a link to do it, so only a `text` target
-/// can be refused for being one.
+/// **What is at those paths on the host is no longer read, and that is the
+/// point.** It used to be: a link into `/run/systemd/resolve` refused the
+/// session, and so did a missing `nsswitch.conf`. `namespace.ownDirectory`
+/// removed both, so the only thing left worth measuring is which directory the
+/// files land in.
+///
+/// **The `hide` entries are left out on purpose.** They name `/run`, not the
+/// directory a substitution writes into, so they say nothing about this
+/// question.
 ///
 /// `host_root` is empty for the real host. A test states a tree of its own
-/// there, so the one answer that stops a machine can be measured on a machine
-/// that does not have it. Every path below is read under that prefix, the Nix
-/// store included, so a stated tree is a whole host and never half of one.
+/// there, so this can be measured on a machine whose own shape is different.
+/// Every path below is read under that prefix, the Nix store included, so a
+/// stated tree is a whole host and never half of one.
 fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []const u8) ResolverFiles {
     switch (toolchain) {
         .image => |reference| return .{ .from_image = reference },
@@ -1848,39 +1847,21 @@ fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []cons
         if (pathIsDirectory(io, store)) return .made_inside;
     }
 
-    var covered: usize = 0;
+    // **The directory each file belongs in, read from the list itself.** A
+    // host that has it is a host whose sandbox binds it, because
+    // `hostToolchainPaths` keeps every candidate that really exists, and a
+    // host that has not is one where the sandbox makes the directory too.
     for (sandbox.Sandbox.resolver_substitutions) |one| {
         const target = switch (one) {
             .text => |text| text.target,
             .hide => continue,
         };
-
-        // **The directory decides which of the two ways this file is placed.**
-        // A directory the host has is one `hostToolchainPaths` binds, read
-        // only, so the file has to be there already and gets a bind mount over
-        // it. A directory the host has not is one the sandbox makes in its own
-        // writable root, and the file is written there. See `placeText`, which
-        // has exactly these two paths.
         const parent = std.fs.path.dirname(target) orelse continue;
         const parent_path = under(&buffer, host_root, parent) orelse continue;
-        if (!pathIsDirectory(io, parent_path)) continue;
-
-        const path = under(&buffer, host_root, target) orelse continue;
-        const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return .{ .missing = target },
-            // A path this process cannot read says nothing about what a
-            // sandbox finds there, and a report that called that a fault would
-            // refuse to start on a machine that works.
-            else => continue,
-        };
-        if (stat.kind == .sym_link) return .{ .linked = target };
-        covered += 1;
+        if (pathIsDirectory(io, parent_path)) return .owned;
     }
 
-    // Not one of the three sits in a directory this host binds, so a routed
-    // sandbox makes all of them itself.
-    if (covered == 0) return .made_inside;
-    return .covered;
+    return .made_inside;
 }
 
 /// True when `path` is a directory, or a link that leads to one. The same
@@ -4238,7 +4219,7 @@ fn broken() Measured {
     m.network_namespace = refused;
     m.router_network = .{ .absent = "the dummy_create step needs a kernel module that is not loaded" };
     m.router_filter = .{ .absent = "the batch_begin step needs a kernel module that is not loaded" };
-    m.resolver_files = .{ .linked = "/etc/resolv.conf" };
+    m.resolver_files = .owned;
     m.landlock = .{ .absent = "the kernel answered that it has no Landlock" };
     m.landlock_abi = null;
     m.seccomp = refused;
@@ -4297,9 +4278,10 @@ test "every row that stops a first run is one Sandbox.spawn or chock run really 
         // `SpawnError.NetRouterUnavailable`.
         "router network",
         "router filter",
-        // `namespace.substitute` answers `BindTargetIsSymlink` for a target
-        // that is a link, and `applyLayers` ends the call on it, so no routed
-        // sandbox starts at all.
+        // A sandbox that binds this host's own `/etc` takes that directory
+        // for itself with an overlay, and `applyLayers` ends the call when
+        // the kernel refuses one, so no routed sandbox starts at all. See
+        // `resolverFilesRow`, which reads the `overlayfs` answer for this.
         resolver_files_name,
         "landlock",
         "seccomp",
@@ -4954,16 +4936,18 @@ test "a child that never reached the network says so, and is never read as a ker
     try testing.expectEqualStrings(router_absent_text, unnamed.router_network.why());
 }
 
-test "a host whose resolv.conf is a link cannot start a routed sandbox, and the row says which file" {
-    // **The blocker most Linux machines outside NixOS have.** `/etc` is bound
-    // from the host, `/etc/resolv.conf` there is a link into
+test "a host whose resolv.conf is a link starts a routed sandbox, and the row says the sandbox owns /etc" {
+    // **The blocker most Linux machines outside NixOS used to have.** `/etc` is
+    // bound from the host, `/etc/resolv.conf` there is a link into
     // `/run/systemd/resolve`, and `namespace.substitute` refuses a link rather
-    // than following it. Today the only way to learn that is to start a session
-    // and watch the first tool call die.
+    // than following it. `namespace.ownDirectory` puts the sandbox somewhere
+    // else: it takes `/etc` for the sandbox with an overlay and removes the
+    // three names from it, so what the host keeps there is never touched.
     //
-    // Mutation check: follow the link in `measureResolverFiles` by dropping
-    // `.follow_symlinks = false`, and this machine answers `covered`, which is
-    // the report saying yes to a host that cannot run a tool call.
+    // Mutation check: have `measureResolverFiles` answer `made_inside` for a
+    // host toolchain whose `/etc` really is there, and the row stops saying
+    // which `/etc` a session gets and stops reading the `overlayfs` answer, so
+    // the machine below that cannot overlay reads as ready.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4973,13 +4957,14 @@ test "a host whose resolv.conf is a link cannot start a routed sandbox, and the 
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
 
-    // **A host with no `/etc` of its own is not a blocked host**, and this is
-    // the half that is easy to lose. The sandbox binds no such directory, so
-    // it makes one in its own writable root and writes the three files there.
+    // **A host with no `/etc` of its own is not a host whose sandbox takes
+    // one**, and this is the half that is easy to lose. The sandbox binds no
+    // such directory, so it makes one in its own writable root and writes the
+    // three files there, with no overlay involved at all.
     //
-    // Mutation check: drop the parent directory test in `measureResolverFiles`
-    // and this reads `missing`, which puts a BLOCKED row on a machine where a
-    // session works.
+    // Mutation check: drop the directory test in `measureResolverFiles` and
+    // this reads `owned`, which makes a machine with no `/etc` depend on a
+    // mechanism its session never uses.
     try testing.expectEqual(
         ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
@@ -4995,61 +4980,52 @@ test "a host whose resolv.conf is a link cannot start a routed sandbox, and the 
         .{},
     );
     try testing.expectEqual(
-        ResolverFiles{ .linked = "/etc/resolv.conf" },
+        ResolverFiles.owned,
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
-    const rows = try rowsFor(arena, linkedHost());
-    const row = rowNamed(rows, resolver_files_name).?;
-    try testing.expectEqual(ui.Layer.State.unavailable, row.state);
-    try testing.expect(row.blocks);
-    try testing.expectEqualStrings("BLOCKED", wordFor(row));
-    // The file, by name. A row that only said "a substitution target" would
-    // leave a person reading this project's source to find out which one.
-    try testing.expect(std.mem.indexOf(u8, row.means, "/etc/resolv.conf") != null);
-    try testing.expect(std.mem.indexOf(u8, row.means, "symbolic link") != null);
+    // **And it is not a blocked machine.** The link is still a link on the
+    // host, and the sandbox writes its own file in a directory it owns.
+    var linked = healthy();
+    linked.toolchain = .{ .host = 9 };
+    linked.resolver_files = .owned;
+    const row = rowNamed(try rowsFor(arena, linked), resolver_files_name).?;
+    try testing.expectEqual(ui.Layer.State.on, row.state);
+    try testing.expect(!row.blocks);
+    try testing.expect(std.mem.indexOf(u8, row.means, "overlay") != null);
+
+    // **The same host with no `nsswitch.conf` at all**, which is Alpine. It
+    // used to be the same fault pointing the other way: the directory is bound
+    // read only, so a file that is not already there could not be made there.
+    // The answer does not depend on what is at the three paths any more, which
+    // is exactly why this machine now works.
+    try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
+    try testing.expectEqual(
+        ResolverFiles.owned,
+        measureResolverFiles(testing.io, .{ .host = 9 }, root),
+    );
+
+    // **The one machine that is still refused**, and the row names the
+    // mechanism rather than a file. A sandbox that has to take `/etc` needs a
+    // rootless overlay, and a kernel before 5.11 has none.
+    //
+    // Mutation check: ignore the `overlayfs` answer in `resolverFilesRow` and
+    // this machine reads as ready, which tells a script that a box where no
+    // tool call can start is fine.
+    const refused = rowNamed(try rowsFor(arena, noOverlayHost()), resolver_files_name).?;
+    try testing.expectEqual(ui.Layer.State.unavailable, refused.state);
+    try testing.expect(refused.blocks);
+    try testing.expectEqualStrings("BLOCKED", wordFor(refused));
+    try testing.expect(std.mem.indexOf(u8, refused.means, "overlay") != null);
+    try testing.expect(std.mem.indexOf(u8, refused.fix, "5.11") != null);
     // And the two ways out, both of which are true: either of the two
     // toolchains puts no host `/etc` in the sandbox at all.
-    try testing.expect(std.mem.indexOf(u8, row.fix, "dev shell") != null);
-    try testing.expect(std.mem.indexOf(u8, row.fix, "container image") != null);
-    try testing.expect(std.mem.indexOf(u8, row.fix, "regular file") != null);
-
-    // **The same fault pointing the other way, and it is easy to miss.** The
-    // host's `/etc` is bound read only, so a file that is not already there
-    // cannot be made there either: `writeSubstitute` answers `EROFS`, which it
-    // reads as `NotPermitted`, and the call ends. A report that only looked
-    // for a link would say yes to this machine.
-    //
-    // Mutation check: count a target that is not there as one that is covered,
-    // and this expectation reads `covered`.
-    try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
-    try testing.expectEqual(
-        ResolverFiles{ .missing = "/etc/resolv.conf" },
-        measureResolverFiles(testing.io, .{ .host = 9 }, root),
-    );
-
-    var absent = healthy();
-    absent.resolver_files = .{ .missing = "/etc/resolv.conf" };
-    const absent_row = rowNamed(try rowsFor(arena, absent), resolver_files_name).?;
-    try testing.expect(absent_row.blocks);
-    try testing.expectEqualStrings("BLOCKED", wordFor(absent_row));
-    try testing.expect(std.mem.indexOf(u8, absent_row.means, "/etc/resolv.conf") != null);
-    try testing.expect(std.mem.indexOf(u8, absent_row.means, "read only") != null);
-
-    // All three there as regular files, which is what every ordinary machine
-    // with an `/etc` has. Each one is covered by a bind mount and works.
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/resolv.conf", .data = "nameserver 1.1.1.1\n" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/nsswitch.conf", .data = "hosts: files\n" });
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "etc/hosts", .data = "127.0.0.1 localhost\n" });
-    try testing.expectEqual(
-        ResolverFiles.covered,
-        measureResolverFiles(testing.io, .{ .host = 9 }, root),
-    );
+    try testing.expect(std.mem.indexOf(u8, refused.fix, "dev shell") != null);
+    try testing.expect(std.mem.indexOf(u8, refused.fix, "container image") != null);
 
     // And the same machine with a Nix store mounts that and nothing else, so
-    // the link is never touched: the sandbox has no `/etc` to put it in. The
-    // link is still there, which is what makes this the interesting half.
-    try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
+    // there is no host `/etc` to take: the sandbox makes its own. The link is
+    // still there, which is what makes this the interesting half.
     try tmp.dir.symLink(testing.io, "../run/systemd/resolve/stub-resolv.conf", "etc/resolv.conf", .{});
     try tmp.dir.createDir(testing.io, "nix", .default_dir);
     try tmp.dir.createDir(testing.io, "nix/store", .default_dir);
@@ -5133,12 +5109,14 @@ test "a build whose driver isolates no network gets none of the three router row
     try testing.expect(rowNamed(rows, "net namespace") != null);
 }
 
-/// A machine whose `/etc/resolv.conf` is a link, and healthy in every other
-/// way. The machine most people outside NixOS are on.
-fn linkedHost() Measured {
+/// A machine whose sandbox binds the host's own `/etc`, on a kernel with no
+/// rootless overlayfs. The one shape that is still refused: the sandbox has to
+/// take that directory for itself and the kernel will not let it.
+fn noOverlayHost() Measured {
     var m = healthy();
     m.toolchain = .{ .host = 9 };
-    m.resolver_files = .{ .linked = "/etc/resolv.conf" };
+    m.resolver_files = .owned;
+    m.overlayfs = .{ .absent = "the kernel answered that it does not have it" };
     return m;
 }
 
@@ -5173,7 +5151,7 @@ test "a machine that cannot route says so in its exit code, because every tool c
 
     // The same for a host whose resolver file is a link, which is a different
     // fault with the same consequence.
-    const linked_rows = try rowsFor(arena, linkedHost());
+    const linked_rows = try rowsFor(arena, noOverlayHost());
     try testing.expectEqual(Verdict.blocked, verdictFor(linked_rows));
     try testing.expectEqual(@as(u8, 2), exitFor(verdictFor(linked_rows)).code());
 

@@ -229,6 +229,16 @@ and binding a subdirectory does not expose its parent. The knowledgebase is
 mounted for `read_memory` and `write_memory` and for no other call, so it is
 not merely read only to the rest of the sandbox: it is not there.
 
+**A tool call with a network takes `/etc` for itself.** The sandbox has a
+resolver of its own, and a program only finds it through `/etc/resolv.conf`, so
+Chock writes that file and two more. On a machine with no Nix the host's own
+`/etc` is in the mount set, because the CA certificates are there, and Chock
+does not own it. So a routed call puts an overlay on that directory: everything
+the host has stays readable at the same path with the same bytes, the three
+files Chock writes go into a layer the sandbox made, and nothing reaches the
+host. This is the one place a tool call needs rootless overlayfs on such a
+machine, and `chock doctor` says so on the `resolver files` row.
+
 The full list is in [toolchains.md](toolchains.md). Paths a project denies by
 name are covered before the workspace is built, and their bytes are not in the
 tree at all. See [policy.md](policy.md).
@@ -408,12 +418,15 @@ from a kernel version.
 | pid namespace | yes |
 | ipc namespace | yes |
 | net namespace | yes |
+| router network | yes |
+| router filter | yes |
+| resolver files | yes, when the sandbox has to take a host /etc and the kernel has no rootless overlayfs |
 | landlock, with its ABI number | yes |
 | seccomp | yes |
 | write^execute | no, it is hardening and not a boundary |
 | pidfd | yes |
 | disk cap tmpfs | yes |
-| overlayfs | no, only a project with no git needs it |
+| overlayfs | no on its own; the resolver files row is where it stops a tool call |
 | cgroup v2, with the vantage it found | no, it degrades |
 | nix | no |
 | dev shell | no |

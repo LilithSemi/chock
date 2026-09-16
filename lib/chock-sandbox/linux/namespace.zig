@@ -839,6 +839,8 @@ pub const Diagnostic = struct {
         substitute_file,
         substitute_write,
         substitute_stat,
+        owned_stat,
+        owned_remove,
         deny_target_stat,
         deny_target_open,
         overlay_mount,
@@ -871,6 +873,8 @@ pub const Diagnostic = struct {
                 .substitute_file => "open on a substituted file",
                 .substitute_write => "the write of a substituted file",
                 .substitute_stat => "statx on a substituted path",
+                .owned_stat => "statx on a directory the sandbox takes for itself",
+                .owned_remove => "unlinkat on a name the sandbox takes away",
                 .deny_target_stat => "statx on a denied path",
                 .deny_target_open => "open on a denied path",
                 .overlay_mount => "the overlay mount",
@@ -1546,6 +1550,12 @@ const substitute_empty_file_name = ".chock-empty-file";
 /// read only and cannot be written at all. Both leave the same bytes at the
 /// same path, and the second is the only one that works on a read only mount.
 ///
+/// **Neither way can put a file into a directory this sandbox does not own**,
+/// and `ownDirectory` is what puts it in that position before this runs. A
+/// target that is a symbolic link is refused here, and a target that is absent
+/// in a read only directory cannot be written, so a routed call takes `/etc`
+/// for itself first. See `ownDirectory` for what that costs.
+///
 /// **A project that substitutes nothing pays nothing**: the function returns
 /// before it makes any file, so a sandbox with an empty list makes exactly the
 /// calls it always made.
@@ -1583,11 +1593,14 @@ fn placeText(
     // error rather than running with a resolver file that is not the one this
     // function wrote.
     //
-    // **A known gap, and named here rather than left to be discovered.** On a
-    // machine with systemd and no Nix, `/etc` is bound from the host and
-    // `/etc/resolv.conf` there is a link into `/run/systemd/resolve`. Such a
-    // machine gets this refusal today. See `applyDenyMounts`, which refuses a
-    // link for a different reason and with the same error.
+    // **A routed sandbox is never in that position, and that is how the
+    // machine with systemd is answered.** On such a machine `/etc` is bound
+    // from the host and `/etc/resolv.conf` there is a link into
+    // `/run/systemd/resolve`. `ownDirectory` runs first, makes `/etc` a
+    // directory the sandbox owns, and takes that name out of it, so what this
+    // function finds is nothing at all and it writes a real file. The refusal
+    // below is what still holds for any other caller. See `applyDenyMounts`,
+    // which refuses a link for a different reason and with the same error.
     if (try pathIsSymlink(target_z.ptr, diag)) return error.BindTargetIsSymlink;
 
     switch (try existingPathKind(target_z.ptr, .substitute_stat, diag)) {
@@ -1721,6 +1734,183 @@ fn writeSubstitute(path: [*:0]const u8, contents: []const u8, diag: ?*?Diagnosti
         }
         written += rc;
     }
+}
+
+/// The directory a sandbox owned layer keeps its two halves in. It is a tmpfs
+/// mounted under the sandbox root, and it is detached again before
+/// `ownDirectory` returns, so nothing extra is inside the sandbox.
+const owned_backing_name = ".chock-owned";
+
+/// How much the owned layer may hold. **Small on purpose.** The only writes it
+/// ever takes are the few files `substitute` places and the whiteouts that
+/// stand where a name was removed, all of them made before the sandboxed
+/// program starts. A tool call itself gets the directory read only, because
+/// the caller's own Landlock rule for it says read only, so nothing inside the
+/// sandbox can add to this.
+const owned_backing_bytes: u64 = 1 << 20;
+
+/// `umount2`'s "take this mount out of the tree now and free it when the last
+/// user is done with it". `std.os.linux` states no name for it.
+const mnt_detach: u32 = 2;
+
+/// A directory inside the sandbox that the sandbox takes for itself. See
+/// `ownDirectory`.
+pub const OwnedDirectory = struct {
+    /// The path inside the sandbox. It must already be a directory there, and
+    /// a path that is anything else is left alone.
+    target: []const u8,
+    /// Names inside `target` that go away with it. Absolute, spelled the way
+    /// a `Substitution.Text.target` is spelled. A name that is not there is
+    /// not a fault.
+    remove: []const []const u8 = &.{},
+};
+
+/// Make `owned.target` a directory the sandbox owns, keeping everything that
+/// is already there readable, and remove `owned.remove` from it. True when the
+/// sandbox took it, false when there is no such directory to take.
+///
+/// ## What this is for
+///
+/// **A routed sandbox has to put three files into `/etc`, and on most Linux
+/// machines it does not own that directory.** `src/run.zig`'s own
+/// `hostToolchainPaths` binds the host's `/etc` read only, because that is
+/// where the CA certificates are and TLS needs them. `substitute` then has two
+/// ways to place a file and neither one works there:
+///
+///  * **A target that is a symbolic link is refused**, correctly, because a
+///    bind over a link lands where the link points and the sandbox does not
+///    hold that. On a machine with systemd, `/etc/resolv.conf` is a link into
+///    `/run/systemd/resolve`.
+///  * **A target that is absent cannot be made**, because the directory it
+///    belongs in is read only and `open` answers `EROFS`. Alpine ships no
+///    `/etc/nsswitch.conf` at all.
+///
+/// Measured on 2026-09-15: each of the two ends every foreground tool call of
+/// the session, because every one of them takes a filtered network. Between
+/// them they cover most Linux machines that are not NixOS.
+///
+/// ## What it does instead
+///
+/// An overlay, with the directory the mount tree already put there as the read
+/// only lower layer and a tmpfs of this sandbox's own as the upper layer. So:
+///
+///  * everything the host has there is still readable, at the same path, with
+///    the same bytes. The CA certificates, `ld.so.cache` and `alternatives`
+///    are all still what the host has.
+///  * every write lands in the tmpfs and the host's own directory is never
+///    touched. **Nothing here can change the machine.**
+///  * the names in `owned.remove` are removed from the sandbox's view alone.
+///    A removal of a name the lower layer holds is a whiteout in the upper
+///    layer, which is why the host's own `/etc/resolv.conf` is still a link
+///    to whatever it was after a session ends.
+///
+/// `substitute` then finds nothing at those names and writes a real file,
+/// which is the branch a machine with Nix already took. **So `substitute`
+/// keeps every promise it had**: it still never follows a link and still never
+/// binds over one.
+///
+/// ## What it costs
+///
+/// **Rootless overlayfs, which needs Linux 5.11 or later.** A kernel without
+/// it answers `error.OverlayNotSupported`, and `chock doctor`'s own
+/// `overlayfs` row is where a person reads that. A machine that old could
+/// start no routed sandbox before this either, so nothing that worked stops
+/// working.
+///
+/// The backing tmpfs is detached before this returns. The overlay holds the
+/// two directories inside it open, so it goes on working, and the sandbox is
+/// left with nothing extra in it. Measured by hand on 2026-09-15 on Linux
+/// 6.18.49: the files written into the upper layer read back after the detach.
+pub fn ownDirectory(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    owned: OwnedDirectory,
+    diag: ?*?Diagnostic,
+) MountError!bool {
+    const target = try std.fs.path.join(allocator, &.{ root, owned.target });
+    defer allocator.free(target);
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+
+    // **Nothing there is the ordinary answer on a machine with Nix**, whose
+    // sandbox binds `/nix/store` and no `/etc` at all. Such a sandbox writes
+    // its resolver files into a root it already owns, so there is nothing here
+    // to take, and this must not refuse to start it.
+    if (try existingPathKind(target_z.ptr, .owned_stat, diag) != .directory) return false;
+
+    const backing = try std.fs.path.join(allocator, &.{ root, owned_backing_name });
+    defer allocator.free(backing);
+    const backing_z = try allocator.dupeZ(u8, backing);
+    defer allocator.free(backing_z);
+    try makeDir(backing_z.ptr, diag);
+
+    var options_buffer: [32]u8 = undefined;
+    const options = std.fmt.bufPrintZ(&options_buffer, "size={d}", .{owned_backing_bytes}) catch
+        return error.Unexpected;
+    try mountCall(
+        "tmpfs",
+        backing_z,
+        "tmpfs",
+        linux.MS.NOSUID | linux.MS.NODEV,
+        @intFromPtr(options.ptr),
+        diag,
+    );
+    // Runs whichever way this function leaves, the same way `applyDenyMounts`
+    // removes the name of the file its mounts hold. The overlay keeps the two
+    // directories below open, so a lazy detach takes the tmpfs out of the
+    // sandbox's view and leaves the overlay working.
+    defer {
+        _ = linux.umount2(backing_z.ptr, mnt_detach);
+        _ = linux.unlinkat(linux.AT.FDCWD, backing_z.ptr, linux.AT.REMOVEDIR);
+    }
+
+    const upper = try std.fs.path.join(allocator, &.{ backing, "upper" });
+    defer allocator.free(upper);
+    const upper_z = try allocator.dupeZ(u8, upper);
+    defer allocator.free(upper_z);
+    try makeDir(upper_z.ptr, diag);
+
+    const work = try std.fs.path.join(allocator, &.{ backing, "work" });
+    defer allocator.free(work);
+    const work_z = try allocator.dupeZ(u8, work);
+    defer allocator.free(work_z);
+    try makeDir(work_z.ptr, diag);
+
+    // **The lower layer is the target itself**, and that is not a circle. The
+    // kernel resolves a lower layer to the directory it names when the mount
+    // is made, and goes on reading that directory afterward, whatever else is
+    // mounted over the name. So this works for a target that came from the
+    // host, from a container image, or from anywhere else, and this function
+    // never has to know which.
+    try mountOverlay(allocator, .{
+        .lower = target,
+        .upper = upper,
+        .work = work,
+        .target = target,
+    }, diag);
+
+    for (owned.remove) |name| {
+        const path = try std.fs.path.join(allocator, &.{ root, name });
+        defer allocator.free(path);
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+        // `unlinkat` acts on the name and never on what a link leads to, which
+        // is the whole reason a name is removed here rather than written
+        // through. A name the lower layer holds becomes a whiteout in the
+        // upper layer and the host's own file is untouched.
+        switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, path_z.ptr, 0))) {
+            // Not there is not a fault: a host that ships no
+            // `nsswitch.conf` is one of the two machines this exists for.
+            .SUCCESS, .NOENT, .NOTDIR => {},
+            .PERM, .ACCES, .ROFS => return error.NotPermitted,
+            else => |err| {
+                note(diag, .owned_remove, err);
+                return error.Unexpected;
+            },
+        }
+    }
+
+    return true;
 }
 
 const proc_mask_source_name = ".chock-proc-mask";
@@ -2230,7 +2420,6 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
 
     // Detach the old root. Without this the process keeps a path to every host file.
     // MNT_DETACH removes it from the tree even while something still uses it.
-    const mnt_detach: u32 = 2;
     switch (linux.errno(linux.umount2("/.old_root", mnt_detach))) {
         .SUCCESS => {},
         else => |err| {

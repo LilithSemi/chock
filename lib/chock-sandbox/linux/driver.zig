@@ -3117,10 +3117,10 @@ const hosts_file =
 /// to `/run` on most machines and a real directory on some, and glibc has used
 /// each of the two over time.
 ///
-/// **Public because `src/doctor.zig` reads the same list**, and asks this host
-/// whether a `text` target there is a symbolic link before a session starts.
-/// `substitute` refuses such a target rather than following it, so a machine
-/// that has one can start no routed sandbox at all.
+/// **Public because `src/doctor.zig` reads the same list**, and says which of
+/// the two ways a routed sandbox on this host places these files: into an
+/// `/etc` it makes itself, or into one it takes from the host with
+/// `namespace.ownDirectory`. Neither answer blocks a session.
 pub const resolver_substitutions = [_]namespace.Substitution{
     .{ .text = .{ .target = "/etc/resolv.conf", .contents = resolv_conf } },
     .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = nsswitch_conf } },
@@ -3128,6 +3128,47 @@ pub const resolver_substitutions = [_]namespace.Substitution{
     .{ .hide = "/run/nscd" },
     .{ .hide = "/var/run/nscd" },
 };
+
+/// The `text` targets of `resolver_substitutions`, which is what
+/// `ownDirectory` takes away before `substitute` writes them again.
+///
+/// Built from that list, so a file added to it is a file this removes, and
+/// neither list can be edited without the other following.
+const resolver_text_targets = blk: {
+    var targets: []const []const u8 = &.{};
+    for (resolver_substitutions) |one| switch (one) {
+        .text => |text| targets = targets ++ [_][]const u8{text.target},
+        .hide => {},
+    };
+    break :blk targets;
+};
+
+/// The directory a routed sandbox takes for itself, so that it can write the
+/// three files above into it. See `namespace.ownDirectory` for what taking it
+/// means and what it costs.
+///
+/// **`/etc` and nothing else.** That is where glibc looks for a resolver, and
+/// it is the one directory a sandbox both needs to write and does not own on
+/// an ordinary Linux machine. The `comptime` block below is what keeps the two
+/// facts together: a `text` target added anywhere but `/etc` would be a file
+/// this sandbox still could not place, and the build stops rather than the
+/// session.
+const owned_etc = namespace.OwnedDirectory{
+    .target = "/etc",
+    .remove = resolver_text_targets,
+};
+
+comptime {
+    for (resolver_text_targets) |target| {
+        const parent = std.fs.path.dirname(target) orelse @compileError(
+            "sandbox: a resolver substitution target must be an absolute path",
+        );
+        if (!std.mem.eql(u8, parent, owned_etc.target)) @compileError(
+            "sandbox: every resolver substitution has to sit in the directory a routed " ++
+                "sandbox takes for itself. See ownDirectory and owned_etc.",
+        );
+    }
+}
 
 /// Steps 2 to 6 of the order above, in B, the process that runs the caller's
 /// program. **The mount tree is built here and not in A**, because a procfs
@@ -3182,6 +3223,17 @@ fn applyLayers(
     // to name, and rewriting a machine's `nsswitch.conf` for a program that
     // cannot reach anything would be a change with no purpose.
     if (config.net_router != null) {
+        // **First the directory, then the files in it.** On a machine whose
+        // sandbox binds the host's own `/etc`, `substitute` can neither cover
+        // a target that is a symbolic link nor make one that is absent, and
+        // between them those two cover most Linux machines that are not
+        // NixOS. This takes `/etc` for the sandbox and takes the three names
+        // out of it, so `substitute` finds nothing there and writes a real
+        // file. A sandbox that holds no `/etc` at all, which is every machine
+        // with Nix, gets `false` back and is unchanged.
+        _ = namespace.ownDirectory(allocator, config.root, owned_etc, &diag) catch |err|
+            dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
+
         namespace.substitute(allocator, config.root, &resolver_substitutions, &diag) catch |err|
             dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
     }

@@ -3242,11 +3242,18 @@ const Toolchain = struct {
 /// directory an ordinary user of that machine can already read.
 ///
 /// `/etc` is on the list and it is the only entry that is not obviously a
-/// toolchain. Debian resolves `/usr/bin/cc` through `/etc/alternatives`, and
-/// glibc reads `/etc/ld.so.cache` to find a shared library, so a session
-/// without it gets a compiler that does not start. It holds no secret an
+/// toolchain. Debian resolves `/usr/bin/cc` through `/etc/alternatives`, glibc
+/// reads `/etc/ld.so.cache` to find a shared library, and the CA certificates
+/// TLS needs are at `/etc/ssl/certs`, so a session without it gets a compiler
+/// that does not start and no https at all. It holds no secret an
 /// unprivileged process can read: `/etc/shadow` and a host key are readable by
 /// root alone, and the sandbox has the user's own privilege and no more.
+///
+/// **A routed tool call takes this one directory for itself**, because it has
+/// to write a `resolv.conf` into it and the bind above is read only. Everything
+/// here is still readable at the same path with the same bytes, and nothing a
+/// tool call writes reaches the host. See
+/// `chock_sandbox.namespace.ownDirectory`.
 ///
 /// The list is filtered by what really exists, so a machine with no `/lib64`
 /// gets no mount for one. See `hostToolchainPaths`.

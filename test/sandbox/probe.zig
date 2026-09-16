@@ -211,6 +211,28 @@ fn readToEnd(fd: i32, buffer: []u8) []u8 {
     return buffer[0..filled];
 }
 
+/// The most this probe reads out of one host file. A trust store is a few
+/// hundred kilobytes of PEM, and a file larger than this is read short. That
+/// is not a fault here: the bytes that were read are the bytes written into
+/// the host `/etc` the sandbox binds, so the two sides still agree.
+const max_host_file_bytes = 4 << 20;
+
+/// Read a whole file on the host into `arena`. **Follows a link on purpose**:
+/// this reads the host's own trust store, which is a link into the Nix store
+/// on a NixOS machine, and the bytes are what matters.
+fn readWholeFile(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const path_z = try arena.dupeZ(u8, path);
+    const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.SetupFailed;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+
+    const buffer = try arena.alloc(u8, max_host_file_bytes);
+    const filled = readToEnd(fd, buffer);
+    if (filled.len == 0) return error.SetupFailed;
+    return filled;
+}
+
 /// A sandbox that cannot be built, for the two setup fault operations.
 ///
 /// `root` is a path under the caller's own scratch directory that was never
@@ -1166,19 +1188,136 @@ const HostileEtc = struct {
 
     const hosts = "127.0.0.1\tlocalhost\n";
 
-    /// Write the three files into a directory beside the sandbox root, and
-    /// answer its path. **Beside the root and never inside it**, because
-    /// everything inside the root is removed between calls.
-    fn build(arena: std.mem.Allocator, beside: []const u8) ![]const u8 {
+    /// Which shape of host `/etc` to write. **Each one is a real machine**,
+    /// and each one used to end every foreground tool call on it.
+    const Shape = enum {
+        /// Three regular files. `substitute` covers each of them with a bind
+        /// mount, which is the only branch that ever worked on a read only
+        /// `/etc`.
+        regular,
+        /// `resolv.conf` is a symbolic link into `/run/systemd/resolve`, which
+        /// no sandbox holds. **Every machine with systemd**, which is most
+        /// Linux machines that are not NixOS. `substitute` refuses such a
+        /// target rather than following it, and `ownDirectory` is what stops
+        /// it ever seeing one.
+        linked,
+        /// No `resolv.conf` and no `nsswitch.conf` at all. **Alpine**, which
+        /// ships neither. The directory is bound read only, so a file that is
+        /// not there cannot be made there and `writeSubstitute` answers
+        /// `EROFS`.
+        absent,
+    };
+
+    /// Where the link points on a systemd machine. **Nothing inside the
+    /// sandbox is there**, which is the whole reason a bind over it would land
+    /// nowhere.
+    const systemd_stub = "../run/systemd/resolve/stub-resolv.conf";
+
+    /// The trust store `std.crypto.Certificate.Bundle.rescan` reads first on
+    /// Linux, written into every shape. **This is what TLS needs out of
+    /// `/etc`**, and a sandbox that takes that directory for itself has to go
+    /// on reading the host's own bytes at this path or npm, git over https and
+    /// `fetch_url` all break.
+    const trust_store_directory = "ssl/certs";
+    const trust_store_name = "ssl/certs/ca-certificates.crt";
+    pub const trust_store_path = "/etc/ssl/certs/ca-certificates.crt";
+
+    /// The host's own trust store, or a stand in when this machine has none.
+    const TrustStore = struct {
+        /// `std.hash.Wyhash` over the bytes written, which the sandboxed child
+        /// takes on its command line and must find at `trust_store_path`.
+        hash: u64,
+        /// True when the bytes are this host's real certificates, so a child
+        /// may require that they parse into a trust store with something in
+        /// it. A machine with no certificates still gets the byte for byte
+        /// check, and never a skip.
+        real: bool,
+    };
+
+    /// What is written when this host has no trust store of its own. It is not
+    /// a certificate and it is not meant to parse: the byte for byte check is
+    /// what it is for.
+    const no_trust_store = "# this host has no certificates\n";
+
+    /// Write a host `/etc` of `shape` into a directory beside the sandbox
+    /// root, and answer its path and its trust store. **Beside the root and
+    /// never inside it**, because everything inside the root is removed
+    /// between calls.
+    fn build(arena: std.mem.Allocator, beside: []const u8, shape: Shape) !struct {
+        path: []const u8,
+        trust_store: TrustStore,
+    } {
         const path = try std.fmt.allocPrintSentinel(arena, "{s}-host-etc", .{beside}, 0);
         switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, path.ptr, 0o755))) {
             .SUCCESS, .EXIST => {},
             else => return error.SetupFailed,
         }
-        try write(arena, path, "nsswitch.conf", nsswitch);
-        try write(arena, path, "resolv.conf", resolv);
-        try write(arena, path, "hosts", hosts);
-        return path;
+        // Whatever a previous run of this probe left, so the shape written
+        // here is the shape the sandbox meets and not the union of two.
+        try remove(arena, path, "nsswitch.conf");
+        try remove(arena, path, "resolv.conf");
+        try remove(arena, path, "hosts");
+
+        switch (shape) {
+            .regular => {
+                try write(arena, path, "nsswitch.conf", nsswitch);
+                try write(arena, path, "resolv.conf", resolv);
+                try write(arena, path, "hosts", hosts);
+            },
+            .linked => {
+                try write(arena, path, "nsswitch.conf", nsswitch);
+                try write(arena, path, "hosts", hosts);
+                try link(arena, path, "resolv.conf", systemd_stub);
+            },
+            .absent => {
+                try write(arena, path, "hosts", hosts);
+            },
+        }
+
+        return .{ .path = path, .trust_store = try writeTrustStore(arena, path) };
+    }
+
+    /// Put this host's own certificates into the `/etc` the sandbox will bind,
+    /// at the path `Bundle.rescan` reads.
+    fn writeTrustStore(arena: std.mem.Allocator, directory: []const u8) !TrustStore {
+        const ssl = try std.fmt.allocPrintSentinel(arena, "{s}/ssl", .{directory}, 0);
+        switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, ssl.ptr, 0o755))) {
+            .SUCCESS, .EXIST => {},
+            else => return error.SetupFailed,
+        }
+        const certs = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, trust_store_directory }, 0);
+        switch (linux.errno(linux.mkdirat(linux.AT.FDCWD, certs.ptr, 0o755))) {
+            .SUCCESS, .EXIST => {},
+            else => return error.SetupFailed,
+        }
+
+        const real = readWholeFile(arena, trust_store_path) catch null;
+        const bytes = real orelse no_trust_store;
+        try write(arena, directory, trust_store_name, bytes);
+        return .{ .hash = std.hash.Wyhash.hash(0, bytes), .real = real != null };
+    }
+
+    fn remove(arena: std.mem.Allocator, directory: []const u8, name: []const u8) !void {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
+        // `unlinkat` acts on the name, so it takes away a link as readily as a
+        // file, which is what a second run of this probe needs.
+        switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, path.ptr, 0))) {
+            .SUCCESS, .NOENT, .NOTDIR => {},
+            else => return error.SetupFailed,
+        }
+    }
+
+    fn link(
+        arena: std.mem.Allocator,
+        directory: []const u8,
+        name: []const u8,
+        target: []const u8,
+    ) !void {
+        const path = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ directory, name }, 0);
+        const target_z = try arena.dupeZ(u8, target);
+        if (linux.errno(linux.symlinkat(target_z.ptr, linux.AT.FDCWD, path.ptr)) != .SUCCESS) {
+            return error.SetupFailed;
+        }
     }
 
     fn write(
@@ -1200,6 +1339,212 @@ const HostileEtc = struct {
         if (linux.errno(wrote) != .SUCCESS or wrote != bytes.len) return error.SetupFailed;
     }
 };
+
+/// Run glibc's own resolver inside a routed sandbox whose `/etc` came from the
+/// host in `shape`, and require that the router answered it and that nobody
+/// else did.
+fn routedGlibc(arena: std.mem.Allocator, root_arg: []const u8, shape: HostileEtc.Shape) !u8 {
+    // **The only test that proves a real program finds the router.** Every
+    // other routed probe writes its own DNS query, which measures that the
+    // router answers and says nothing about whether anything would ever
+    // ask it. glibc is what a tool call really runs, and it looks for a
+    // resolver in three places this sandbox has to get right at once:
+    // `/etc/resolv.conf`, which does not exist on a machine that binds
+    // only `/nix/store`; `/etc/nsswitch.conf`, whose own
+    // `[NOTFOUND=return]` on this machine returns before the lookup ever
+    // reaches `dns`; and the nscd socket, which is `AF_UNIX` and which a
+    // network namespace does not touch at all.
+    //
+    // **The host's own nscd is bound in on purpose.** Without it the
+    // socket is simply absent inside the sandbox, so the masking would be
+    // true by accident and no mutation of it could be seen. With it bound,
+    // an unmasked nscd answers from the host's view of the network, and
+    // the address it gives is not the one the far side hands out.
+    const base = try baseEscapeConfig(arena);
+    const listener = listenLoopback() catch |err| {
+        std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+        return 3;
+    };
+    defer _ = linux.close(listener.fd);
+
+    var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 3);
+    mounts.appendSliceAssumeCapacity(base.mounts);
+    mounts.appendAssumeCapacity(.{ .bind = .{
+        .source = try absolutePath(arena, dynamic_probe_path),
+        .target = "/dynamic",
+        .read_only = true,
+    } });
+    // **An `/etc` of the shape a machine without Nix gives**, read only,
+    // which is how `src/run.zig` really binds one. `shape` says which of
+    // the three real machines this run is: three regular files, a
+    // `resolv.conf` that is a link into `/run/systemd/resolve`, or no
+    // resolver files at all. Only the first of the three could ever start
+    // a routed sandbox before `namespace.ownDirectory`.
+    const host_etc = HostileEtc.build(arena, root_arg, shape) catch |err| {
+        std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+        return 3;
+    };
+    mounts.appendAssumeCapacity(.{ .bind = .{
+        .source = host_etc.path,
+        .target = "/etc",
+        .read_only = true,
+    } });
+
+    if (pathExists(nscd_directory_z)) {
+        // **Not read only.** Connecting to a unix socket needs write
+        // permission on the socket itself, so a read only bind would leave
+        // nscd unreachable for a reason that has nothing to do with the
+        // masking, and the masking would then be untestable.
+        mounts.appendAssumeCapacity(.{ .bind = .{
+            .source = nscd_directory_z,
+            .target = nscd_target,
+            .read_only = false,
+        } });
+    }
+
+    var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 3);
+    rules.appendSliceAssumeCapacity(base.rules);
+    // A file and not a directory, so `read_only_file`: the kernel refuses
+    // a directory right over a file.
+    rules.appendAssumeCapacity(.{
+        .path = "/dynamic",
+        .access = sandbox.landlock.AccessFs.read_only_file,
+    });
+    // **The resolver files the sandbox wrote for itself.** They are inside
+    // the root, made before the pivot, so by the time Landlock runs they
+    // are ordinary paths of this sandbox. Without this rule glibc cannot
+    // open them and the whole lookup fails for a reason that has nothing
+    // to do with the router.
+    rules.appendAssumeCapacity(.{
+        .path = "/etc",
+        .access = sandbox.landlock.AccessFs.read_only,
+    });
+    if (pathExists(nscd_directory_z)) {
+        rules.appendAssumeCapacity(.{
+            .path = nscd_target,
+            .access = sandbox.landlock.AccessFs.read_write,
+        });
+    }
+
+    const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var transport = ProbeTransport{
+        .resolves_to = filtered_public_address,
+        .port = listener.port,
+    };
+    var network = chock_broker.network.Network{
+        .gpa = arena,
+        .io = io_impl.io(),
+        .table = policy,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "main",
+        .tool = "mcp",
+        .transport = transport.transport(),
+    };
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root_arg,
+        .mounts = mounts.items,
+        .rules = rules.items,
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_router = network.netRouter(),
+    }, &.{ "/dynamic", "resolve", filtered_host, "93.184.216.34" }, null, null);
+
+    if (term != .exited or term.exited != 0) return reportChildTerm(term);
+
+    // **One lookup on the far side, and the address glibc got is the one
+    // the far side handed out.** Zero lookups with a successful resolve is
+    // exactly what an unmasked nscd looks like: the program was answered
+    // by somebody else and the router was never asked anything.
+    if (transport.lookups != 1) {
+        std.debug.print(
+            "glibc resolved a name and the far side was asked {d} times\n",
+            .{transport.lookups},
+        );
+        return 5;
+    }
+    return 0;
+}
+
+/// Prove that a routed sandbox whose `/etc` it took for itself still reads the
+/// host's own certificates at the path TLS looks for them.
+///
+/// **This is the one thing `/etc` is bound for.** `src/run.zig`'s own
+/// `host_toolchain_candidates` names it because Debian resolves a compiler
+/// through `/etc/alternatives` and glibc reads `/etc/ld.so.cache`, and because
+/// the certificates are there. An overlay that hid any of it would break npm,
+/// git over https and `fetch_url` at once, and the failure would read as a
+/// network fault rather than as a mount.
+///
+/// The child is handed the hash of the bytes this wrote, so it measures that
+/// the file it reads is the host's own file and not a gap that happens to
+/// open.
+fn routedTrustStore(arena: std.mem.Allocator, root_arg: []const u8) !u8 {
+    const base = try baseEscapeConfig(arena);
+
+    // **The shape that could already start**, on purpose. What is under test
+    // here is not whether the sandbox starts: it is what is left readable once
+    // it takes `/etc` for itself.
+    const host_etc = HostileEtc.build(arena, root_arg, .regular) catch |err| {
+        std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+        return 3;
+    };
+
+    var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 1);
+    mounts.appendSliceAssumeCapacity(base.mounts);
+    mounts.appendAssumeCapacity(.{ .bind = .{
+        .source = host_etc.path,
+        .target = "/etc",
+        .read_only = true,
+    } });
+
+    var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 1);
+    rules.appendSliceAssumeCapacity(base.rules);
+    rules.appendAssumeCapacity(.{
+        .path = "/etc",
+        .access = sandbox.landlock.AccessFs.read_only,
+    });
+
+    const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
+    var io_impl: std.Io.Threaded = .init_single_threaded;
+    var transport = ProbeTransport{ .resolves_to = filtered_public_address, .port = routed_port };
+    var network = chock_broker.network.Network{
+        .gpa = arena,
+        .io = io_impl.io(),
+        .table = policy,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "main",
+        .tool = "mcp",
+        .transport = transport.transport(),
+    };
+
+    const spec = try std.fmt.allocPrint(arena, "{x}:{d}", .{
+        host_etc.trust_store.hash,
+        @intFromBool(host_etc.trust_store.real),
+    });
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root_arg,
+        .mounts = mounts.items,
+        .rules = rules.items,
+        .cwd = "/",
+        .env = &.{},
+        .network = .filtered,
+        .net_router = network.netRouter(),
+    }, &.{ "/probe", "routed-trust-store", spec }, null, null);
+
+    return reportChildTerm(term);
+}
+
+/// What `namespace.ownDirectory` calls the tmpfs it keeps an owned layer on,
+/// as that layer is named inside the sandbox. **Spelled here on purpose**:
+/// this is a test, and a constant imported from the file under test would
+/// still name the same string after somebody changed it.
+const owned_backing_inside: [:0]const u8 = "/.chock-owned";
 
 /// The directory the name service cache daemon puts its socket in, on the
 /// host.
@@ -4501,127 +4846,20 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         return reportChildTerm(term);
     }
 
-    if (std.mem.eql(u8, args[1], "spawn-routed-glibc")) {
-        // **The only test that proves a real program finds the router.** Every
-        // other routed probe writes its own DNS query, which measures that the
-        // router answers and says nothing about whether anything would ever
-        // ask it. glibc is what a tool call really runs, and it looks for a
-        // resolver in three places this sandbox has to get right at once:
-        // `/etc/resolv.conf`, which does not exist on a machine that binds
-        // only `/nix/store`; `/etc/nsswitch.conf`, whose own
-        // `[NOTFOUND=return]` on this machine returns before the lookup ever
-        // reaches `dns`; and the nscd socket, which is `AF_UNIX` and which a
-        // network namespace does not touch at all.
-        //
-        // **The host's own nscd is bound in on purpose.** Without it the
-        // socket is simply absent inside the sandbox, so the masking would be
-        // true by accident and no mutation of it could be seen. With it bound,
-        // an unmasked nscd answers from the host's view of the network, and
-        // the address it gives is not the one the far side hands out.
-        const base = try baseEscapeConfig(arena);
-        const listener = listenLoopback() catch |err| {
-            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
-            return 3;
-        };
-        defer _ = linux.close(listener.fd);
-
-        var mounts = try std.ArrayList(sandbox.namespace.Mount).initCapacity(arena, base.mounts.len + 3);
-        mounts.appendSliceAssumeCapacity(base.mounts);
-        mounts.appendAssumeCapacity(.{ .bind = .{
-            .source = try absolutePath(arena, dynamic_probe_path),
-            .target = "/dynamic",
-            .read_only = true,
-        } });
-        // **An `/etc` of the shape a machine without Nix gives**, so the
-        // substitution has a file to replace rather than a gap to fill. The
-        // two branches are different code: a target that is not there is
-        // created and written, and a target that is there is covered by a bind
-        // mount, which is the only one that works on a read only mount. This
-        // probe takes the second, and the machine this runs on takes the
-        // first, so both are measured.
-        mounts.appendAssumeCapacity(.{ .bind = .{
-            .source = try HostileEtc.build(arena, root_arg),
-            .target = "/etc",
-            .read_only = true,
-        } });
-
-        if (pathExists(nscd_directory_z)) {
-            // **Not read only.** Connecting to a unix socket needs write
-            // permission on the socket itself, so a read only bind would leave
-            // nscd unreachable for a reason that has nothing to do with the
-            // masking, and the masking would then be untestable.
-            mounts.appendAssumeCapacity(.{ .bind = .{
-                .source = nscd_directory_z,
-                .target = nscd_target,
-                .read_only = false,
-            } });
-        }
-
-        var rules = try std.ArrayList(sandbox.Config.Rule).initCapacity(arena, base.rules.len + 3);
-        rules.appendSliceAssumeCapacity(base.rules);
-        // A file and not a directory, so `read_only_file`: the kernel refuses
-        // a directory right over a file.
-        rules.appendAssumeCapacity(.{
-            .path = "/dynamic",
-            .access = sandbox.landlock.AccessFs.read_only_file,
-        });
-        // **The resolver files the sandbox wrote for itself.** They are inside
-        // the root, made before the pivot, so by the time Landlock runs they
-        // are ordinary paths of this sandbox. Without this rule glibc cannot
-        // open them and the whole lookup fails for a reason that has nothing
-        // to do with the router.
-        rules.appendAssumeCapacity(.{
-            .path = "/etc",
-            .access = sandbox.landlock.AccessFs.read_only,
-        });
-        if (pathExists(nscd_directory_z)) {
-            rules.appendAssumeCapacity(.{
-                .path = nscd_target,
-                .access = sandbox.landlock.AccessFs.read_write,
-            });
-        }
-
-        const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
-        var io_impl: std.Io.Threaded = .init_single_threaded;
-        var transport = ProbeTransport{
-            .resolves_to = filtered_public_address,
-            .port = listener.port,
-        };
-        var network = chock_broker.network.Network{
-            .gpa = arena,
-            .io = io_impl.io(),
-            .table = policy,
-            .chain = &.{"main"},
-            .agent_kind = "main",
-            .model = "main",
-            .tool = "mcp",
-            .transport = transport.transport(),
-        };
-
-        const term = try sandbox.spawn(arena, .{
-            .root = root_arg,
-            .mounts = mounts.items,
-            .rules = rules.items,
-            .cwd = "/",
-            .env = &.{},
-            .network = .filtered,
-            .net_router = network.netRouter(),
-        }, &.{ "/dynamic", "resolve", filtered_host, "93.184.216.34" }, null, null);
-
-        if (term != .exited or term.exited != 0) return reportChildTerm(term);
-
-        // **One lookup on the far side, and the address glibc got is the one
-        // the far side handed out.** Zero lookups with a successful resolve is
-        // exactly what an unmasked nscd looks like: the program was answered
-        // by somebody else and the router was never asked anything.
-        if (transport.lookups != 1) {
-            std.debug.print(
-                "glibc resolved a name and the far side was asked {d} times\n",
-                .{transport.lookups},
-            );
-            return 5;
-        }
-        return 0;
+    if (std.mem.startsWith(u8, args[1], "spawn-routed-glibc")) {
+        // **The three shapes of host `/etc` a real machine has**, run through
+        // one function so that the sandbox each of them meets is the same in
+        // everything but that directory. See `HostileEtc.Shape`.
+        const shape: HostileEtc.Shape = if (std.mem.endsWith(u8, args[1], "-linked"))
+            .linked
+        else if (std.mem.endsWith(u8, args[1], "-absent"))
+            .absent
+        else
+            .regular;
+        return routedGlibc(arena, root_arg, shape);
+    }
+    if (std.mem.eql(u8, args[1], "spawn-routed-trust-store")) {
+        return routedTrustStore(arena, root_arg);
     }
     if (std.mem.startsWith(u8, args[1], "spawn-routed-")) {
         // One listener, which is where a granted connection really lands. The
@@ -6403,6 +6641,74 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     // resolves and connects the way any program does.
     // -----------------------------------------------------------------------
 
+    if (std.mem.eql(u8, args[1], "routed-trust-store")) {
+        // **What TLS really needs out of `/etc`, read from inside a routed
+        // sandbox that took that directory for itself.** The overlay reads
+        // through to the host's own file, so the bytes here must be the bytes
+        // the caller wrote, to the last one.
+        //
+        // `id_arg` is `<hash>:<real>`: the Wyhash of what was written, and
+        // whether it is this host's own certificates or a stand in for a
+        // machine that has none. A stand in still gets the byte check, so this
+        // never turns into a skip.
+        const colon = std.mem.indexOfScalar(u8, id_arg, ':') orelse {
+            std.debug.print("the trust store argument has no separator\n", .{});
+            return 2;
+        };
+        const want = std.fmt.parseInt(u64, id_arg[0..colon], 16) catch {
+            std.debug.print("the trust store argument has no hash\n", .{});
+            return 2;
+        };
+        const real = std.mem.eql(u8, id_arg[colon + 1 ..], "1");
+
+        const found = readWholeFile(arena, HostileEtc.trust_store_path) catch |err| {
+            std.debug.print(
+                "the trust store was not readable inside the sandbox: {s}\n",
+                .{@errorName(err)},
+            );
+            return 1;
+        };
+        const got = std.hash.Wyhash.hash(0, found);
+        if (got != want) {
+            std.debug.print(
+                "the trust store inside the sandbox is not the host's: {d} bytes, hash {x}\n",
+                .{ found.len, got },
+            );
+            return 5;
+        }
+        // **And the layer the sandbox owns `/etc` with left nothing behind.**
+        // `ownDirectory` mounts its upper layer on a tmpfs under the sandbox
+        // root and detaches it again, so a sandbox is left with exactly what
+        // its caller asked for. A name still there would be a directory a
+        // tool call can see and nobody asked for.
+        //
+        // Mutation check: take the detach out of `ownDirectory` and this
+        // fails, while every other check in this file still passes.
+        if (pathExists(owned_backing_inside)) {
+            std.debug.print("the sandbox was left holding {s}\n", .{owned_backing_inside});
+            return 5;
+        }
+
+        if (!real) return 0;
+
+        // **The same call `chock_broker.actions` makes for a TLS fetch.** A
+        // file that reads back byte for byte and still parses into an empty
+        // trust store would be a pass that means nothing, so the certificates
+        // are counted.
+        var io_impl: std.Io.Threaded = .init_single_threaded;
+        const io = io_impl.io();
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        defer bundle.deinit(arena);
+        bundle.rescan(arena, io, std.Io.Clock.real.now(io)) catch |err| {
+            std.debug.print("the trust store did not parse: {s}\n", .{@errorName(err)});
+            return 5;
+        };
+        if (bundle.map.count() == 0) {
+            std.debug.print("the trust store parsed and holds no certificate\n", .{});
+            return 5;
+        }
+        return 0;
+    }
     if (std.mem.eql(u8, args[1], "routed-reach")) {
         // **The whole path, in one program.** Ask the sandbox's own resolver,
         // take the address it gives, and connect to it. Nothing here knows

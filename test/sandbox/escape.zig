@@ -954,6 +954,82 @@ test "glibc inside a routed sandbox is answered by the router and by nobody else
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+test "a routed sandbox starts on a host whose resolv.conf is a symbolic link" {
+    // **The machine most Linux users are on, and it could start no foreground
+    // tool call at all.** On a host with systemd and no Nix, `src/run.zig`
+    // binds the host's own `/etc` into the sandbox, because that is where the
+    // CA certificates are, and `/etc/resolv.conf` there is a link into
+    // `/run/systemd/resolve`. `namespace.substitute` refuses a link rather than
+    // following it, correctly, because a bind over a link lands where the link
+    // points and the sandbox does not hold that.
+    //
+    // `namespace.ownDirectory` answers it by not being in that position: it
+    // makes `/etc` an overlay the sandbox owns and takes the three names out of
+    // it, so `substitute` finds nothing there and writes a real file. The host
+    // keeps its link.
+    //
+    // The probe binds a host `/etc` of exactly that shape and then runs the
+    // whole glibc lookup through it, so this requires the same three things
+    // the test above does and not merely that the sandbox started.
+    //
+    // Mutation check, measured on 2026-09-15: take the `ownDirectory` call out
+    // of `applyLayers` and the spawn ends with `MountTreeFailed`, with
+    // "a bind mount's target names a symbolic link" on standard error, so the
+    // probe exits 1.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-glibc-linked", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a routed sandbox starts on a host that ships no nsswitch.conf" {
+    // **The same blocker pointing the other way, and it is Alpine.** A host
+    // `/etc` is bound read only, so a file that is not already there cannot be
+    // made there: `writeSubstitute` answers `EROFS`. Alpine ships no
+    // `nsswitch.conf` at all, and this probe's host `/etc` ships neither that
+    // nor `resolv.conf`.
+    //
+    // An `/etc` the sandbox owns is writable because the sandbox made the
+    // layer, so both files are simply written.
+    //
+    // Mutation check, measured on 2026-09-15: take the `ownDirectory` call out
+    // of `applyLayers` and the spawn ends with `MountTreeFailed`, with
+    // "open on a mount target failed: ROFS" on standard error, so the probe
+    // exits 1.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-glibc-absent", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a routed sandbox that owns /etc still reads the host's own certificates" {
+    // **`/etc` is bound for the certificates, and this is what would break.**
+    // `src/run.zig`'s own `host_toolchain_candidates` names `/etc` because
+    // Debian resolves a compiler through `/etc/alternatives`, glibc reads
+    // `/etc/ld.so.cache`, and the trust store is there. A sandbox that took
+    // that directory and showed an empty one instead would break npm, git over
+    // https and `fetch_url` at once, and each failure would read as a network
+    // fault rather than as a mount.
+    //
+    // So the probe writes this host's own certificates into the `/etc` it
+    // binds, and the child inside the routed sandbox requires two things: the
+    // bytes at `/etc/ssl/certs/ca-certificates.crt` hash to what was written,
+    // and `std.crypto.Certificate.Bundle.rescan`, which is the call
+    // `chock_broker.actions` makes for a TLS fetch, parses them into a trust
+    // store that holds something. A machine with no certificates of its own
+    // still gets the byte for byte half, and never a skip.
+    //
+    // Mutation check, measured on 2026-09-15: give `ownDirectory` a bare tmpfs
+    // over the target instead of an overlay on it, so the sandbox owns `/etc`
+    // and nothing of the host's is under it. Both resolver tests above still
+    // pass, because the files are still written, and this one fails with "the
+    // trust store was not readable inside the sandbox: SetupFailed".
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-routed-trust-store", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
 test "a routed program cannot take away the ruleset that bounds it" {
     // **The ruleset is worth nothing while something running under it can take
     // it away.** Measured on 2026-09-14 in the prototype: with `CAP_NET_ADMIN`
