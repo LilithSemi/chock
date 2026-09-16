@@ -836,6 +836,83 @@ pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, router_calls);
 }
 
+/// Every call the device helper may make, and the only ones it may make.
+///
+/// **An allowlist, and the same shape `router_calls` has, for the same
+/// reason.** The helper is the one process inside the sandbox that holds a
+/// descriptor for a device node the host opened, and a capability the
+/// sandboxed program does not have: the right to place that node where
+/// ordinary programs find it. So what it may do has to be written down
+/// completely rather than left to a denylist.
+///
+/// **Everything that opens something happens before this filter goes on.**
+/// The far side opens the device node, sends the descriptor down the link,
+/// and only after that does the helper install this filter. So there is no
+/// `openat` and no `socket` here at all, exactly as `router_calls` has
+/// neither: the helper cannot open a path of its own choosing, and it cannot
+/// make a channel of its own. The one descriptor it ever holds for the device
+/// itself is the one `recvmsg` hands it.
+///
+/// What each one is for:
+///
+///   * `recvmsg` is the one exchange with a descriptor in it. It is how the
+///     device node the far side opened reaches this process at all.
+///   * `mount` places that node into the tree the sandboxed program can see.
+///     `umount2` takes it back out again when the device goes away, so a
+///     device that was granted for a session does not outlive the session.
+///   * `mkdirat` makes the directories the node is mounted under. The staging
+///     tree is built as devices arrive, not laid out in advance.
+///   * `ppoll` is the wait the helper's loop is built on, the same call
+///     `router_calls` waits on its own link with.
+///   * `write` says what the helper did, onto a descriptor it already holds.
+///     It is not a general purpose write: there is no `openat` to hand it a
+///     path to write to.
+///   * `exit_group`, `exit`, `rt_sigreturn` and `restart_syscall` are how a
+///     process ends and how it comes back from a signal.
+///
+/// **No `openat` and no `socket`.** A device helper that could open a path
+/// could reach any file the sandbox's mount tree makes visible to it, not
+/// only the one device it was sent, and one that could make a socket could
+/// build a channel the log never saw. Neither is here, and neither should be
+/// added without the same argument this comment makes for everything that is.
+pub const device_calls: []const linux.SYS = &.{
+    .recvmsg,
+    .mount,
+    .umount2,
+    .mkdirat,
+    .ppoll,
+    .write,
+    .exit_group,
+    .exit,
+    .rt_sigreturn,
+    .restart_syscall,
+};
+
+comptime {
+    // **The helper must not be able to open a path or make a channel.** It
+    // holds a descriptor for a device node and the right to mount it, and the
+    // only reason that is bounded is that it cannot open anything new by
+    // name and cannot build a new channel of its own. A call added to the
+    // list above without reading this comment stops the build.
+    for (device_calls) |call| {
+        const refused = switch (call) {
+            .openat, .socket, .socketpair, .connect, .bind, .listen, .execve, .kill, .ptrace => true,
+            else => false,
+        };
+        if (refused) @compileError(
+            "the device helper may not open a path or make a channel. See device_calls.",
+        );
+    }
+}
+
+/// The filter the device helper runs under. **An allowlist**: every call not
+/// in `device_calls` kills the process.
+///
+/// The caller owns the memory.
+pub fn buildDevice(allocator: std.mem.Allocator) ![]bpf.Insn {
+    return buildAllowlist(allocator, device_calls);
+}
+
 fn buildAllowlist(allocator: std.mem.Allocator, calls: []const linux.SYS) ![]bpf.Insn {
     var insns: std.ArrayList(bpf.Insn) = .empty;
     errdefer insns.deinit(allocator);
@@ -2067,6 +2144,107 @@ test "the router may not open a path, run a program, or write to a descriptor" {
     for (needed) |call| {
         var found = false;
         for (router_calls) |permitted| {
+            if (call == permitted) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "the device helper's filter permits the calls it needs and kills the rest" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    // **A list is not a filter until the kernel enforces it.** This drives
+    // `buildDevice`'s own output in a real process, against a call the helper
+    // really makes and one it must never be able to make.
+    //
+    // Mutation check: make `buildDevice` ignore its own allowlist and return,
+    // say, an empty program, or one built from `router_calls` instead of
+    // `device_calls`. `router_calls` has `ppoll` but not `write`, so a filter
+    // built from it still kills this child with `SIGSYS`, only at `write`
+    // instead of at the forbidden call below. Dying is not enough proof by
+    // itself: the marker read below is what tells the two apart, because it
+    // only arrives if `write` actually ran. Mutation check: put `.openat` in
+    // `device_calls`. The child then exits 13 instead of dying, because the
+    // filter that should kill it now lets it through, and the marker read
+    // still succeeds so only the final `expect(IFSIGNALED)` catches it.
+    const allocator = std.testing.allocator;
+    const insns = try buildDevice(allocator);
+    defer allocator.free(insns);
+
+    // Opened before the filter goes on, the same rule `device_calls`' own doc
+    // comment states: everything the helper touches by name is open before
+    // install, and only descriptors already in hand cross the filter.
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{})));
+    defer _ = linux.close(pipe_fds[0]);
+
+    const message = "ok";
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    if (fork_rc == 0) {
+        install(bpf.Prog.init(insns)) catch |err| std.process.exit(installFaultCode(err));
+
+        // The wait the link is read on.
+        var none: [0]linux.pollfd = .{};
+        var instant: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        if (linux.errno(linux.ppoll(&none, 0, &instant, null)) != .SUCCESS) {
+            std.process.exit(11);
+        }
+
+        // Saying what it did, onto a descriptor already held. This is the
+        // marker the parent reads below, so it only arrives if `write` is
+        // actually permitted, not merely if the process happens to die later.
+        const written = linux.write(pipe_fds[1], message.ptr, message.len);
+        if (written != message.len) std.process.exit(12);
+
+        // Nobody put this on the list, and it is exactly what a helper that
+        // takes its one descriptor from `recvmsg` must never be able to do.
+        // The filter kills this process here, so the exit below is never
+        // reached.
+        _ = linux.openat(linux.AT.FDCWD, "/", .{ .ACCMODE = .RDONLY }, 0);
+        std.process.exit(13);
+    }
+
+    // The parent holds no write end of its own. Once the child's copy closes,
+    // whether by exit or by a signal, this read unblocks: with the marker if
+    // `write` ran, or with nothing at all if the child died before it did.
+    _ = linux.close(pipe_fds[1]);
+    var buf: [message.len]u8 = undefined;
+    const read_back = linux.read(pipe_fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(usize, message.len), read_back);
+    try std.testing.expectEqualStrings(message, buf[0..read_back]);
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 3) return error.SkipZigTest;
+
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(linux.SIG.SYS, linux.W.TERMSIG(status));
+}
+
+test "the device helper may not open a path or make a new channel" {
+    // **A list and not a filter**, so the reasoning is checked without a fork
+    // and on every target. `openat` would let the helper read a path of its
+    // own choosing instead of the one descriptor `recvmsg` gave it, and
+    // `socket` would let it make a channel of its own instead of the one it
+    // was handed. Either would undo the reason this process holds a
+    // descriptor the sandboxed program does not: that what it may do is
+    // written down completely.
+    const forbidden = [_]linux.SYS{ .openat, .socket };
+    for (forbidden) |call| {
+        for (device_calls) |permitted| {
+            try std.testing.expect(call != permitted);
+        }
+    }
+
+    // And the calls the helper really makes are all there, so a list that
+    // lost one is caught here as well as by a helper that dies in production.
+    const needed = [_]linux.SYS{ .recvmsg, .mount, .umount2, .mkdirat, .ppoll, .write };
+    for (needed) |call| {
+        var found = false;
+        for (device_calls) |permitted| {
             if (call == permitted) found = true;
         }
         try std.testing.expect(found);
