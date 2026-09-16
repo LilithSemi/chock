@@ -383,6 +383,23 @@ A bundle can also require an audit sink. A session whose required sink still
 held none of the tail of the log at the end exits `9`, which is a status and
 never a refusal to run. See [running.md](running.md).
 
+`lsp.<program>` is the action for starting a project's language server, named
+after the last part of the program's path: a `command` of
+`/nix/store/aaa/bin/zls` asks about `lsp.zls`. Chock ships `lsp.*` as `allow`,
+so a project that already has one is unchanged, and an organisation that wants
+none writes one rule:
+
+```zon
+.{ .action = "lsp.*", .decision = .deny }
+```
+
+**A label is not an identity.** A project writes its own `chock.zon`, so a
+project that wanted to could point the name `zls` at another binary. `lsp.*` is
+the rule to trust, and `lsp.zls` is a convenience. What bounds the damage is
+not the name: the server runs inside the same sandbox a tool call gets, and
+reaches nothing a tool call cannot. A program whose name cannot be one label of
+a rule does not start at all, and says so.
+
 ### The two ceilings that are fields and not rules
 
 Some things a project sets are numbers rather than decisions, and a rule cannot

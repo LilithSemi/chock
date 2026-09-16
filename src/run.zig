@@ -4092,6 +4092,67 @@ fn provisionDecision(
     return decision;
 }
 
+/// Whether this session may start the language server its project names.
+///
+/// **This was the one act of a session that nothing could refuse.** The command
+/// came out of `chock.zon` and was started, with no action name, so it reached
+/// no policy table and no org bundle: an organisation that had narrowed every
+/// other path had no say over which program ran beside its agent. Giving the
+/// act a name is the whole fix, and it needed no new field anywhere, because
+/// the bundle's rules already fold over every action name there is.
+///
+/// **Only `allow` starts it**, the same rule `provisionDecision` keeps for
+/// `provide_tool`. There is nobody to prompt when a session is starting up, so
+/// `ask` means off here, and it says so rather than starting quietly.
+///
+/// **A program that cannot be named refuses**, and never passes. A caller that
+/// cannot build an action name cannot ask the table, and starting the server
+/// anyway would run a program no rule could ever have named.
+fn languageServerPermitted(
+    arena: std.mem.Allocator,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+    command: []const []const u8,
+) std.mem.Allocator.Error!bool {
+    var buffer: [chock_core.lsp_driver.max_action_bytes]u8 = undefined;
+    const action = chock_core.lsp_driver.actionInto(&buffer, command) orelse {
+        tty.print(
+            .warn,
+            "chock run: the language server is off: its program cannot be one label of a policy " ++
+                "rule, so no rule could have permitted it. The last part of the path has to be " ++
+                "letters, digits, hyphen and underscore.\n",
+            .{},
+        );
+        return false;
+    };
+
+    // The chain `evaluateChain` wants is the parents and this session, in that
+    // order. The same shape `provisionDecision` builds, and for the same
+    // reason: a session cannot state its own parents.
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    defer arena.free(chain);
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    var fault: ?chock_policy.table.ChainFault = null;
+    const decision = policy.evaluateChain(chain, .{
+        .agent_kind = agent_kind,
+        .model = model,
+        .tool = chock_core.lsp_driver.policy_tool,
+        .action = action,
+    }, &fault);
+    if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+
+    if (decision == .allow) return true;
+    tty.detail(
+        "chock: the language server is off, because this project's policy answers {t} for {s}\n",
+        .{ decision, action },
+    );
+    return false;
+}
+
 /// What this session's policy answered about sandbox hardening, and what that
 /// answer means for the filter. Both halves, because the log records the reason
 /// as well as the outcome.
@@ -11120,7 +11181,22 @@ fn runSession(
     var server_arena = std.heap.ArenaAllocator.init(gpa);
     defer server_arena.deinit();
 
-    if (started.language_server) |settings| {
+    // **Asked once, here, and not on every diagnostic.** Starting the server is
+    // the act a policy decides; what it then reports is the session's own
+    // business. See `languageServerPermitted`.
+    const server_settings: ?chock_core.lsp_driver.Settings = if (started.language_server) |settings|
+        (if (try languageServerPermitted(
+            gpa,
+            started.policy,
+            started.spawn_chain,
+            options.agent_kind,
+            started.model,
+            settings.command,
+        )) settings else null)
+    else
+        null;
+
+    if (server_settings) |settings| {
         // The same sandbox a tool call gets, built by the same two functions
         // `chock_core.tools.Registry.dispatchWith` uses, so a helper reaches
         // nothing a tool call cannot: the session's toolchain, then the mount
@@ -20280,4 +20356,91 @@ test "an org subagent ceiling binds this session, and it is the session's own li
     const unmanaged = subagentsUnderOrg(greedy, null);
     try testing.expectEqual(@as(u16, 9), unmanaged.max_depth);
     try testing.expectEqual(@as(u16, 9), unmanaged.max_width);
+}
+
+
+test "an org bundle can stop every project starting a language server" {
+    // **The gap this closes.** `language_servers` was the one block of
+    // `chock.zon` with no lever at all: the command was read and started, and
+    // no rule and no bundle could refuse it. An organisation that had narrowed
+    // every other path had no say over which program ran beside its agent.
+    //
+    // **And it took no new bundle field.** Giving the act an action name is the
+    // whole of it, because the bundle's rules already fold over every action
+    // name there is. See `chock_core.lsp_driver.actionInto`.
+    //
+    // Mutation check: make `languageServerPermitted` answer true before it
+    // reads the table, and the second expectation fails.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const zls: []const []const u8 = &.{"/nix/store/aaa/bin/zls"};
+
+    // A project with no `chock.zon` at all still starts its server, because
+    // `defaults.zig` ships `lsp.*` as `allow`. **Nothing changed for anybody**
+    // who already had one, which is what makes this safe to land.
+    const own = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, own);
+    try testing.expect(try languageServerPermitted(arena, own, &.{}, "main", "a-model", zls));
+
+    // The same project, under an organisation that said no. The bundle is one
+    // more term of the minimum, so the project's own file cannot answer it.
+    const bundle: []const chock_policy.table.Rule = &.{
+        .{ .action = "lsp.*", .decision = .deny },
+    };
+    const under = try chock_policy.table.Table.parseUnder(arena, ".{}", bundle, null);
+    defer chock_policy.table.Table.destroy(arena, under);
+    try testing.expect(!try languageServerPermitted(arena, under, &.{}, "main", "a-model", zls));
+
+    // And an organisation may permit one server and not another, which is what
+    // a label buys over a single on and off switch.
+    const only_zls: []const chock_policy.table.Rule = &.{
+        .{ .action = "lsp.*", .decision = .deny },
+        .{ .action = "lsp.zls", .decision = .allow },
+    };
+    const picked = try chock_policy.table.Table.parseUnder(arena, ".{}", only_zls, null);
+    defer chock_policy.table.Table.destroy(arena, picked);
+    try testing.expect(try languageServerPermitted(arena, picked, &.{}, "main", "a-model", zls));
+    try testing.expect(!try languageServerPermitted(
+        arena,
+        picked,
+        &.{},
+        "main",
+        "a-model",
+        &.{"/usr/bin/rust-analyzer"},
+    ));
+}
+
+test "a language server whose program cannot be named in a rule does not start" {
+    // **Null from `actionInto` is a refusal and never a pass.** A caller that
+    // cannot build an action name cannot ask the table, and starting the
+    // program anyway would run something no rule could ever have named.
+    //
+    // Mutation check: make `languageServerPermitted` return true on the null
+    // arm and this fails.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    const own = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, own);
+
+    try testing.expect(!try languageServerPermitted(
+        arena,
+        own,
+        &.{},
+        "main",
+        "a-model",
+        &.{"/opt/weird/node.js"},
+    ));
+    // And the person is told why, rather than left with a server that quietly
+    // never started.
+    try testing.expect(std.mem.indexOf(u8, said.err(), "cannot be one label") != null);
 }

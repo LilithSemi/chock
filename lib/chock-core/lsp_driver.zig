@@ -71,6 +71,7 @@
 const std = @import("std");
 const helper = @import("helper.zig");
 const lsp = @import("lsp.zig");
+const mcp = @import("mcp.zig");
 
 /// The name of the configuration file, in the project root. The same file
 /// `lib/chock-policy/table.zig` and `lib/chock-policy/subagents.zig` read, and
@@ -99,6 +100,71 @@ pub const max_source_bytes = 1 << 20;
 /// diagnostics reach the model, and a server that publishes four hundred still
 /// writes well under this.
 pub const max_inbox_bytes = 4 << 20;
+
+/// What every action name for a language server starts with.
+///
+/// **A language server is an act the policy table decides, like every other
+/// act.** It used to be the one block of `chock.zon` with no lever at all: the
+/// command was read from the file and started, and nothing could refuse it, so
+/// an organisation that had narrowed every other path had no say over which
+/// program a project ran beside its agent. There is no second policy system
+/// here, and there is no new field in the org bundle either: an action name is
+/// what makes the bundle's rules fold over this the same way they fold over
+/// everything else.
+pub const action_prefix = "lsp";
+
+/// The longest program label an action name carries.
+pub const max_name_bytes: usize = mcp.max_name_bytes;
+
+/// The longest action name `actionInto` builds.
+pub const max_action_bytes = action_prefix.len + 1 + max_name_bytes;
+
+/// The `tool` part of the policy key for starting a language server. **Not the
+/// name of a tool a model may call**, because no model may call this: the
+/// project names the server in `chock.zon` and the session starts it. The key
+/// still needs three parts beside the action, so this is the honest name for
+/// the one that asked. The same shape `chock_broker.askpass.policy_tool` has,
+/// for the same reason.
+pub const policy_tool = "language_server";
+
+/// The label a language server is known by in the policy table: the last path
+/// component of its program. Null when the bytes cannot be a policy key.
+///
+/// **A label is not an identity, and the documentation says so.** A project
+/// writes its own `chock.zon`, so a project that wanted to could point the
+/// name `zls` at some other binary. `lsp.*` is therefore the rule an
+/// organisation can trust, and `lsp.zls` is a convenience rather than a
+/// guarantee. What bounds the damage is not this name: the server runs inside
+/// the same sandbox a tool call gets, and reaches nothing a tool call cannot.
+///
+/// **The shape rule is `mcp.nameIsUsable` and not a second copy of it.** It
+/// says these bytes can be one segment of an action name: no dot, which
+/// separates segments, no `*`, which would name a class the author never
+/// wrote, and no NUL. The same borrowing `mcp.zig` itself does from
+/// `chock_sandbox.net_broker.hostBytesAreUsable`, for the same reason: a rule
+/// that decides the shape of a policy key must have one copy.
+pub fn programLabel(command: []const []const u8) ?[]const u8 {
+    if (command.len == 0) return null;
+    const program = command[0];
+    const cut = if (std.mem.lastIndexOfScalar(u8, program, '/')) |at|
+        program[at + 1 ..]
+    else
+        program;
+    if (!mcp.nameIsUsable(cut)) return null;
+    return cut;
+}
+
+/// The action name for starting `command`, written into `buffer`, or null when
+/// the program cannot be one segment of a policy key.
+///
+/// **Null is a refusal and never a pass.** A caller that cannot build a name
+/// cannot ask the table, and starting the server anyway would run a program
+/// that no rule could ever have named. See `src/run.zig`'s own
+/// `languageServerDecision`.
+pub fn actionInto(buffer: []u8, command: []const []const u8) ?[]const u8 {
+    const label = programLabel(command) orelse return null;
+    return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}", .{label}) catch null;
+}
 
 /// What one project says about its language server.
 ///
@@ -2132,4 +2198,42 @@ test "a server that stopped answering is unavailable once, and never asked again
     // Said once. The second edit of the session gets the tool result byte for
     // byte as the tool built it.
     try testing.expect(try session.afterWrite(gpa, io, "src/main.zig") == null);
+}
+
+
+test "a language server's action name is its program, and a path does not change it" {
+    // **The name is what gives this act a lever at all.** Before it, the
+    // command was read from `chock.zon` and started, and no rule and no org
+    // bundle could refuse it.
+    //
+    // Mutation check: make `programLabel` answer the whole of `command[0]` and
+    // the second expectation fails, because the action then carries slashes
+    // and is no longer one label.
+    var buffer: [max_action_bytes]u8 = undefined;
+
+    try testing.expectEqualStrings("lsp.zls", actionInto(&buffer, &.{"zls"}).?);
+    try testing.expectEqualStrings("lsp.zls", actionInto(&buffer, &.{"/nix/store/aaa/bin/zls"}).?);
+    // Arguments after the program change nothing: the program is what runs.
+    try testing.expectEqualStrings(
+        "lsp.rust-analyzer",
+        actionInto(&buffer, &.{ "/usr/bin/rust-analyzer", "--stdio" }).?,
+    );
+}
+
+test "a program that cannot be one label of a rule gets no action name at all" {
+    // **Null is a refusal and never a pass.** A caller that cannot build a name
+    // cannot ask the table, so `src/run.zig` refuses to start the server. A dot
+    // separates the segments of an action name and a `*` names a class, so a
+    // program carrying either could name rules its author never wrote.
+    //
+    // Mutation check: drop the `mcp.nameIsUsable` call from `programLabel` and
+    // the first two expectations fail.
+    var buffer: [max_action_bytes]u8 = undefined;
+
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, &.{"node.js"}));
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, &.{"zls*"}));
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, &.{""}));
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, &.{}));
+    // A path whose last component is empty names no program either.
+    try testing.expectEqual(@as(?[]const u8, null), actionInto(&buffer, &.{"/usr/bin/"}));
 }

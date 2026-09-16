@@ -219,6 +219,15 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
+    // **A language server, which every project that has one already runs.**
+    // Shipped `allow` so that giving this act a name changes nothing for
+    // anybody: a project with a `language_servers` block behaves exactly as it
+    // did. What the name buys is a lever that did not exist, and the one that
+    // matters is an organisation's: `lsp.*` deny in an org bundle now stops
+    // every project of an installation starting one. See
+    // `chock_core.lsp_driver.actionInto`, which also says why a label is not an
+    // identity.
+    .{ .action = "lsp.*", .decision = .allow },
 
     // **The git shim's own names.** See this file's own top comment, "The git
     // shim asks too". Every one of these changes the session's own scratch
