@@ -12,6 +12,10 @@
             .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#7694e28f3c8d24e8a44b8ec755792375d26e3891",
             .hash = "phantom-0.1.0-HsUDTP_bGgCTDs95R8grcWK53sN7H27QbByzHTPN138k",
         },
+        .udev = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig.git#67e0061ab53028c93134c9fe8e44a5a89a17137f",
+            .hash = "udev-0.1.0-ZWb7H_1aBwCNMTs30b9SL6tTkvpmDLzz_RfKP1UPC1FZ",
+        },
     },
     .paths = .{
         "build.zig",

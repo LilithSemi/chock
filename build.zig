@@ -375,6 +375,45 @@ pub fn build(b: *std.Build) void {
     run_policy_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_policy_tests.step);
 
+    // The udev client, for the device identity and hotplug events a later
+    // milestone wires into `lib/chock-policy/devices.zig`. That file is pure
+    // and reads no udev of its own, on purpose: this dependency is what will
+    // hand it a bus, a vendor id, and a product id, and nothing here builds
+    // that wiring yet.
+    //
+    // Chock uses only the client half the package exports: linux.zig,
+    // uevent.zig, context.zig, device.zig, enumerate.zig, and monitor.zig.
+    // There is no rules engine, no hwdb, no udev_db, no udevadm, and no
+    // daemon here, and this build links none of those in.
+    //
+    // **The package also pulls `blkid`, which only its rule builtins call.**
+    // Nothing in Chock reaches a rule builtin. That is a published fact about
+    // a package built to be depended on whole, not a shape Chock chose, and
+    // the owner's call is to let the unused half sit unused rather than
+    // vendor six files out of it or ask upstream for a client-only module.
+    //
+    // Not gated behind `linux_only`: `test/devices/udev.zig` carries its own
+    // runtime check and skips itself on a target with no kernel netlink to
+    // open, the same shape `pcsc_daemon_tests` above already follows.
+    const udev = b.dependency("udev", .{ .target = target, .optimize = optimize });
+
+    // The proof and not a library test: it opens a real netlink monitor and
+    // enumerates real devices, because a fake here would prove nothing about
+    // a kernel this build has not yet touched. See that file's own top
+    // comment.
+    const udev_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/devices/udev.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "udev", .module = udev.module("udev") }},
+        }),
+    });
+    const run_udev_tests = b.addRunArtifact(udev_tests);
+    // Same reasoning as run_sandbox_tests above.
+    run_udev_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_udev_tests.step);
+
     // The broker: the actor that asks the user and then does the privileged
     // work itself. It imports chock-proto, because an approval travels as
     // events in the session log and not over a channel of its own, and
