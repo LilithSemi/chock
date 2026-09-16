@@ -51,6 +51,18 @@ pub const secrets = @import("chock-broker/secrets.zig");
 /// or by nobody, and a prompt nobody can answer is refused.
 pub const askpass = @import("chock-broker/askpass.zig");
 
+/// The ssh agent proxy: the sandbox gets "can sign with this key" and never
+/// the key. **The capability lasts as long as the approved push and no
+/// longer**, which is the whole defence, because the agent protocol cannot say
+/// what a signature is for and so no proxy can decide by reading the bytes.
+pub const agentproxy = @import("chock-broker/agentproxy.zig");
+
+/// Which credential a `git push` needs, read on the host out of the
+/// repository's own configuration before anybody is asked. **Every doubt
+/// resolves to the password prompt**, because a prompt is visible and
+/// refusable where an agent proxy is neither.
+pub const git_remote = @import("chock-broker/git_remote.zig");
+
 /// The reviewer agent, for the two policy decisions that a subagent answers
 /// before anybody else does. **The arbitrator is told why an
 /// action is guarded and the agent that asked is not**, and that asymmetry is

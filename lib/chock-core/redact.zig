@@ -204,6 +204,13 @@ pub const Policy = struct {
     pub fn tooShort(self: Policy) usize {
         var count: usize = 0;
         for (self.secrets) |secret| {
+            // **An empty value is not a short credential, it is no credential
+            // at all.** A caller may hold a slot open for a value that arrives
+            // later, and counting it would tell somebody a credential of theirs
+            // is unprotected when they have none. `src/run.zig`'s own
+            // `redactionFor` keeps one such slot for a git password, and it
+            // already says the same thing about an empty token.
+            if (secret.value.len == 0) continue;
             if (secret.value.len < min_secret_bytes) count += 1;
         }
         return count;
@@ -665,6 +672,46 @@ test "a secret shorter than the floor is skipped rather than carpeting the text"
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
     try testing.expect(policy.isEmpty());
     try testing.expectEqual(@as(?[]u8, null), try find(gpa, policy, "abcdef abc abc"));
+}
+
+test "an empty slot is inert, counts as nothing, and takes a value later" {
+    // **A caller may hold a slot open for a value that arrives mid session.**
+    // `src/run.zig` keeps one for the git password a person types when they
+    // approve a push: it is empty for every session that never pushes, and it
+    // is filled for exactly as long as the push runs.
+    //
+    // Mutation check: drop the `value.len == 0` guard from `tooShort` and the
+    // second expectation reports a credential nobody holds as unprotected.
+    const gpa = testing.allocator;
+
+    var slots = [_]Secret{
+        .{ .value = "sk-a-real-looking-token-here", .source = .credential },
+        .{ .value = "", .source = .credential },
+    };
+    var policy = Policy{ .secrets = &slots };
+
+    try testing.expect(!policy.isEmpty());
+    try testing.expectEqual(@as(usize, 0), policy.tooShort());
+
+    // Nothing of the empty slot reaches the text, and an empty needle cannot
+    // match everywhere.
+    const before = try text(gpa, policy, "plain words and nothing else");
+    try testing.expectEqualStrings("plain words and nothing else", before);
+
+    // Filled, and now it is matched like any other.
+    slots[1].value = "hunter2-correct-horse";
+    policy = .{ .secrets = &slots };
+    const after = try find(gpa, policy, "remote says hunter2-correct-horse is wrong");
+    defer if (after) |one| gpa.free(one);
+    try testing.expect(after != null);
+    try testing.expect(std.mem.indexOf(u8, after.?, "hunter2-correct-horse") == null);
+
+    // Emptied again, and the policy is back to what it was.
+    slots[1].value = "";
+    policy = .{ .secrets = &slots };
+    try testing.expectEqual(@as(usize, 0), policy.tooShort());
+    const again = try text(gpa, policy, "remote says hunter2-correct-horse is wrong");
+    try testing.expectEqualStrings("remote says hunter2-correct-horse is wrong", again);
 }
 
 test "the longer of two overlapping secrets wins" {

@@ -1569,6 +1569,30 @@ pub fn build(b: *std.Build) void {
         // machine has nothing it can run.
         run_broker_askpass_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_broker_askpass_tests.step);
+
+        // test/broker/git_push.zig drives a real `git push` against a server of
+        // its own that demands Basic auth, and reads the credential back out of
+        // the `Authorization` header. The suite above proves that git reaches
+        // the socket; this one proves that a push asks at all and that what
+        // comes back is what goes out on the wire. It also holds the test that
+        // matters most in this whole path: the password is in neither the
+        // session log nor anything git printed.
+        const broker_push_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/broker/git_push.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "chock-broker", .module = chock_broker },
+                    .{ .name = "chock-policy", .module = chock_policy },
+                    .{ .name = "chock-proto", .module = chock_proto },
+                    .{ .name = "chock_path", .module = chock_path_options.createModule() },
+                },
+            }),
+        });
+        const run_broker_push_tests = b.addRunArtifact(broker_push_tests);
+        run_broker_push_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_broker_push_tests.step);
     }
 
     // The guest half: what a plugin author imports. It reads the author's own

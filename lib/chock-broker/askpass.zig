@@ -70,6 +70,12 @@
 //! `Network.answer` keeps. A refusal that changed depending on whether Chock
 //! holds a credential would tell the caller which hosts Chock holds one for.
 //!
+//! **A `Grant` is a live answer and never a stored one.** The one caller that
+//! fills `Grants` is `src/run.zig`, which prompts a person at the moment they
+//! approve a push and holds what they typed for that one tool call. Nothing
+//! reads a credential store to fill it, nothing writes one, and the value is
+//! wiped when the call ends. See `Asker.mayPrompt`.
+//!
 //! ## A grant has no name, so no handle can spell it
 //!
 //! A `Grant` is keyed by host and holds no name of its own. That is
@@ -88,18 +94,44 @@
 //! `Grants.redactor` is how the values still reach the redaction of section
 //! 11.3 without ever becoming a name.
 //!
-//! ## Nobody to ask is a refusal
+//! ## `ask` means ask, and this section used to say the opposite
 //!
-//! A subagent, a session `chock daemon` started, and a piped `chock run` all
-//! have nobody at a keyboard, and the process performing a `git.push` is
-//! waiting on `git` while `git` waits on this helper. **So this file asks
-//! nobody anything.** The only decision that gives a value is a policy table
-//! that already said `allow` before `git` ever ran. Every other decision,
-//! including `ask`, is a refusal here.
+//! **Every claim in the paragraph that stood here is now false, and it is
+//! written out rather than deleted, because a stale comment arguing for the
+//! old behaviour is how a fix gets reverted.** It said this file asks nobody
+//! anything, that `allow` is the only decision which gives a value, and that
+//! `ask` is therefore a refusal. The reason given was that the process
+//! performing a `git.push` is waiting on `git` while `git` waits on this
+//! helper, so there is no moment at which a person could be reached.
 //!
-//! That is the approval rule read in the safe direction, and it is the same
-//! reading `socket.timeoutMs` gives: a question nobody can answer is answered
-//! no.
+//! What changed is **when** the person is asked. They are asked at the moment
+//! they approve the push, before `git` starts, on the thread that writes the
+//! approval. What they type is held for that one tool call and wiped after it.
+//! So by the time `git` writes a prompt, the answer is already in this
+//! process, and nothing here has to reach anybody.
+//!
+//! So the fold is now:
+//!
+//! * `deny` refuses, and nobody is prompted.
+//! * `ask` and `allow` both mean a person is prompted. **They collapse to the
+//!   same behaviour and there is no difference to invent between them**, since
+//!   there is no stored credential for `allow` to hand over without asking.
+//!   `allow` still says something a reader can use: it records that a project
+//!   decided this host is one Chock may prompt for, where `ask`, the default
+//!   for a host with no rule, records nothing at all.
+//! * A decision that needs a reviewer agent refuses. A reviewer agent cannot
+//!   type a password, so folding it into `ask` would silently drop the
+//!   reviewer this project's policy asked for. See `Refusal.reviewer_cannot_answer`.
+//!
+//! **Nobody at a keyboard is still a refusal.** A subagent, a session `chock
+//! daemon` started, and a piped `chock run` all have nobody to prompt, and the
+//! caller refuses the push before it starts rather than starting a `git` that
+//! will fail. **The approval socket is never asked either**, whatever is
+//! attached to it: `src/serve.zig` and `src/daemon.zig` both say that Chock
+//! does no authentication over a network, so a password crossing that socket
+//! would be a password on the wire for anybody who ran `chock serve --host`.
+//! A terminal and the display are the only two surfaces, and there is no
+//! exception for one push.
 //!
 //! ## Where the value goes, and every place it does not
 //!
@@ -401,11 +433,21 @@ pub const Refusal = enum {
     prompt_not_read,
     /// The prompt asks for a user name. See `Asker.answer`.
     prompt_wants_a_user_name,
-    /// The policy table does not answer `allow` for this host. Every decision
-    /// that is not `allow` reaches here, including `ask`: see this file's own
-    /// top comment on why nobody can be asked.
+    /// The policy table answers `deny` for this host.
+    ///
+    /// **Only `deny` reaches here now.** It used to be every decision that was
+    /// not `allow`, `ask` included: see this file's own top comment on what
+    /// changed and why the old reading is written out rather than deleted.
     host_not_permitted,
+    /// The policy names a reviewer agent for this host, and a reviewer agent
+    /// cannot type a password. See this file's own top comment.
+    reviewer_cannot_answer,
     /// The policy permits it and no `Grant` names this host.
+    ///
+    /// **This is what a prompt for a host nobody typed a password for gets.**
+    /// The person is prompted once, for the host the remote names, and the
+    /// prompt `git` writes is untrusted text, so a prompt naming some other
+    /// host finds nothing here.
     no_credential_for_that_host,
     /// The client could not reach a session at all, or the session said
     /// nothing. This one is only ever reached in `src/askpass.zig`.
@@ -422,10 +464,14 @@ pub const Refusal = enum {
             .prompt_wants_a_user_name => "chock askpass answers a password and never a user name. " ++
                 "Put the user in the remote URL, as in https://you@example.com/project.git.",
             .host_not_permitted => "chock askpass was not permitted to answer for that host. " ++
-                "Add a secret.password rule for it to chock.zon. A host with no rule is refused, " ++
-                "and so is a rule that asks, because nobody can be asked while git is waiting.",
-            .no_credential_for_that_host => "chock holds no password for that host. " ++
-                "The host must be the one the remote URL names, letter for letter.",
+                "A secret.password rule in chock.zon denies it. A host with no rule at all is " ++
+                "prompted for, so this is a rule somebody wrote on purpose.",
+            .reviewer_cannot_answer => "chock askpass cannot answer for that host, because the " ++
+                "secret.password rule for it names a reviewer agent, and a reviewer agent cannot " ++
+                "type a password. Change the rule to ask or to allow, both of which prompt a person.",
+            .no_credential_for_that_host => "nobody typed a password for that host, so chock has " ++
+                "none to give. A person is prompted once, for the host the remote URL names, and " ++
+                "the host in this prompt must be that same host letter for letter.",
             .nobody_answered => "chock askpass reached no session, so nothing answered. " ++
                 "A tool call inside the sandbox never can: the sandbox has no path to a session's socket.",
         };
@@ -474,9 +520,26 @@ pub const Asker = struct {
         // **The policy first, and the credential second.** See this file's own
         // top comment: a refusal that depended on which credentials are held
         // would report which credentials are held.
+        if (self.mayPrompt(prompt.host)) |refusal| return .{ .refused = refusal };
+
+        const value = self.grants.find(prompt.host) orelse
+            return .{ .refused = .no_credential_for_that_host };
+        return .{ .secret = value };
+    }
+
+    /// Whether the policy lets a person be prompted for `host`. Null means it
+    /// does, and a `Refusal` says why it does not.
+    ///
+    /// **One decider, asked from two places.** `src/run.zig` asks it before it
+    /// prompts anybody, so a `deny` costs no prompt at all, and `answer` above
+    /// asks it again when `git` writes its prompt. A second copy of this fold
+    /// would be a second place the meaning of `ask` could drift.
+    ///
+    /// See this file's own top comment for the whole of the fold and for what
+    /// it used to be.
+    pub fn mayPrompt(self: Asker, host: []const u8) ?Refusal {
         var buffer: [max_action_bytes]u8 = undefined;
-        const action = actionInto(&buffer, prompt.host) orelse
-            return .{ .refused = .prompt_not_read };
+        const action = actionInto(&buffer, host) orelse return .prompt_not_read;
 
         const decision = self.table.evaluateChain(self.chain, .{
             .agent_kind = self.agent_kind,
@@ -484,11 +547,11 @@ pub const Asker = struct {
             .tool = self.tool,
             .action = action,
         }, null);
-        if (decision != .allow) return .{ .refused = .host_not_permitted };
-
-        const value = self.grants.find(prompt.host) orelse
-            return .{ .refused = .no_credential_for_that_host };
-        return .{ .secret = value };
+        return switch (decision) {
+            .deny => .host_not_permitted,
+            .agent_review, .agent_then_human => .reviewer_cannot_answer,
+            .ask, .allow => null,
+        };
     }
 };
 
@@ -573,6 +636,9 @@ const Locked = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
+/// How many prompts an `Endpoint` keeps the text of. See `Endpoint.kept`.
+pub const max_kept_prompts: usize = 8;
+
 /// The listening end of one session's askpass socket.
 ///
 /// **One peer at a time, and the peer is closed when it has been answered.**
@@ -601,6 +667,25 @@ pub const Endpoint = struct {
     strangers: usize = 0,
     /// Why the first stranger was refused, for the caller to report.
     diagnostic: ?Diagnostic = null,
+    /// The prompts this answered, kept so a caller that could not write the log
+    /// at the moment they arrived can write them after.
+    ///
+    /// **This exists because of `lib/chock-core/idle.zig`'s own contract.** The
+    /// one caller that drives a live session polls `step` from the gap between
+    /// two slices of a wait, and a look there **may not append to the session
+    /// log**: it runs in the middle of a call the loop has not returned from.
+    /// So that caller passes `locked` as null, and reads these back when the
+    /// tool call has ended. See `keptPrompt`.
+    ///
+    /// **Bounded, and the bound is not a target.** A `git push` writes one
+    /// prompt, or two when it retries. Past this bound the count still rises
+    /// and the text is dropped, so a program that prompts in a loop cannot make
+    /// this process hold memory on its behalf.
+    kept: [max_kept_prompts][max_prompt_bytes]u8 = undefined,
+    kept_lens: [max_kept_prompts]usize = @splat(0),
+    /// How many prompts arrived. May be past `max_kept_prompts`, which is how a
+    /// caller knows text was dropped.
+    kept_count: usize = 0,
 
     pub const OpenError = socket.Endpoint.OpenError;
     pub const StepError = std.mem.Allocator.Error || chock_proto.storage.StorageError;
@@ -728,6 +813,11 @@ pub const Endpoint = struct {
         }) catch return .{ .refused = .prompt_not_read };
         defer parsed.deinit();
 
+        // **Kept before it is decided, and whatever the decision is.** A
+        // prompt that was refused is a fact a person reading the session needs
+        // just as much as one that was answered.
+        self.keep(parsed.value.prompt);
+
         if (locked) |handle| {
             var id_buffer: [32]u8 = undefined;
             const correlation = std.fmt.bufPrint(
@@ -746,6 +836,26 @@ pub const Endpoint = struct {
         }
 
         return asker.answer(parsed.value.prompt);
+    }
+
+    /// Keep one prompt's text, cut to `max_prompt_bytes`.
+    fn keep(self: *Endpoint, prompt: []const u8) void {
+        const at = self.kept_count;
+        self.kept_count += 1;
+        if (at >= max_kept_prompts) return;
+        const room = @min(prompt.len, max_prompt_bytes);
+        @memcpy(self.kept[at][0..room], prompt[0..room]);
+        self.kept_lens[at] = room;
+    }
+
+    /// The text of prompt `index`, or null when this endpoint kept none for it.
+    ///
+    /// **Never a credential.** What is kept is the bytes `git` wrote, which are
+    /// built out of a remote URL and hold no value: see `appendPrompt`, whose
+    /// signature takes no `Grants` for the same reason.
+    pub fn keptPrompt(self: *const Endpoint, index: usize) ?[]const u8 {
+        if (index >= @min(self.kept_count, max_kept_prompts)) return null;
+        return self.kept[index][0..self.kept_lens[index]];
     }
 };
 
@@ -833,6 +943,29 @@ const ask_every_host: [:0]const u8 =
     \\    .policy = .{
     \\        .rules = .{
     \\            .{ .action = "secret.*", .decision = .ask },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// A table that denies every host.
+const deny_every_host: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "secret.*", .decision = .deny },
+    \\        },
+    \\    },
+    \\}
+;
+
+/// A table that names a reviewer agent for every host. A reviewer agent cannot
+/// type a password, so this is a refusal and never an `ask`.
+const review_every_host: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "secret.*", .decision = .agent_review },
     \\        },
     \\    },
     \\}
@@ -979,9 +1112,9 @@ test "the action name reverses the labels, so a class rule cannot be reached by 
 test "a host the policy permits gets the credential, and every other answer is a refusal" {
     // The four gates, one at a time, over a real policy table.
     //
-    // Mutation check: change `if (decision != .allow)` in `Asker.answer` to
-    // `if (decision == .deny)` and the `ask` case below stops being a
-    // refusal, so this test fails.
+    // Mutation check: make `Asker.mayPrompt` answer `.host_not_permitted` for
+    // `.ask` as well as for `.deny`, which is what this file used to do, and
+    // the `ask` case below stops giving the value, so this test fails.
     const gpa = testing.allocator;
 
     const permitting = try table.Table.parse(gpa, one_host, null);
@@ -1003,9 +1136,11 @@ test "a host the policy permits gets the credential, and every other answer is a
         asker.answer("Username for 'https://git.example.com': "),
     );
     // Gate 3: a host with no rule. The table's own safe default is `ask`, and
-    // `ask` is a refusal here.
+    // `ask` now means a person was prompted, so the gate that stops this one
+    // is the grant and not the policy. The person typed a password for
+    // `git.example.com` and for nothing else.
     try testing.expectEqual(
-        Answer{ .refused = .host_not_permitted },
+        Answer{ .refused = .no_credential_for_that_host },
         asker.answer("Password for 'https://ross@evil.test': "),
     );
     // Gate 4: the policy permits it and no grant names it.
@@ -1020,23 +1155,78 @@ test "a host the policy permits gets the credential, and every other answer is a
         no_grants.answer("Password for 'https://ross@git.example.com': "),
     );
 
-    // A table that asks about everything answers nothing, because nobody can
-    // be asked while git waits. This is the case the approval rule decides,
-    // and it decides it as a refusal.
+    // **A table that asks about everything now gives the value**, because a
+    // person was prompted before `git` ever started. This expectation is the
+    // reverse of what it used to be: see this file's own top comment on what
+    // changed and why the old reading is written out rather than deleted.
     const asking = try table.Table.parse(gpa, ask_every_host, null);
     defer table.Table.destroy(gpa, asking);
-    try testing.expectEqual(
-        Answer{ .refused = .host_not_permitted },
-        askerOver(asking).answer("Password for 'https://ross@git.example.com': "),
-    );
+    const asked = askerOver(asking).answer("Password for 'https://ross@git.example.com': ");
+    try testing.expect(asked == .secret);
+    try testing.expectEqualStrings(the_password, asked.secret);
 
-    // And an empty table, which is a project that said nothing at all.
+    // And an empty table, which is a project that said nothing at all. `ask`
+    // is what a host with no rule resolves to, so this is the same case.
     const empty = try table.Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
     defer table.Table.destroy(gpa, empty);
+    const unruled = askerOver(empty).answer("Password for 'https://ross@git.example.com': ");
+    try testing.expect(unruled == .secret);
+
+    // **`deny` still refuses, and it is the only decision that does so on its
+    // own.** A project writes this rule on purpose, and it is the one way to
+    // stop the prompt happening at all.
+    const denying = try table.Table.parse(gpa, deny_every_host, null);
+    defer table.Table.destroy(gpa, denying);
     try testing.expectEqual(
         Answer{ .refused = .host_not_permitted },
-        askerOver(empty).answer("Password for 'https://ross@git.example.com': "),
+        askerOver(denying).answer("Password for 'https://ross@git.example.com': "),
     );
+
+    // A reviewer agent cannot type a password, so a rule naming one refuses
+    // rather than quietly dropping the reviewer the project asked for.
+    const reviewed = try table.Table.parse(gpa, review_every_host, null);
+    defer table.Table.destroy(gpa, reviewed);
+    try testing.expectEqual(
+        Answer{ .refused = .reviewer_cannot_answer },
+        askerOver(reviewed).answer("Password for 'https://ross@git.example.com': "),
+    );
+}
+
+test "mayPrompt is the one decider, and answer reaches the same verdict" {
+    // **The fault this closes.** `src/run.zig` asks whether it may prompt, and
+    // `Asker.answer` asks again when git writes its prompt. Two folds would be
+    // two places the meaning of `ask` could drift, and a drift here is either
+    // a prompt whose answer is then refused, or a refusal with no prompt to
+    // explain it.
+    const gpa = testing.allocator;
+
+    const cases = [_]struct { text: [:0]const u8, refusal: ?Refusal }{
+        .{ .text = one_host, .refusal = null },
+        .{ .text = ask_every_host, .refusal = null },
+        .{ .text = deny_every_host, .refusal = .host_not_permitted },
+        .{ .text = review_every_host, .refusal = .reviewer_cannot_answer },
+    };
+    for (cases) |case| {
+        const policy = try table.Table.parse(gpa, case.text, null);
+        defer table.Table.destroy(gpa, policy);
+        const asker = askerOver(policy);
+
+        try testing.expectEqual(case.refusal, asker.mayPrompt("git.example.com"));
+
+        const answer = asker.answer("Password for 'https://ross@git.example.com': ");
+        if (case.refusal) |refusal| {
+            try testing.expectEqual(Answer{ .refused = refusal }, answer);
+        } else {
+            try testing.expect(answer == .secret);
+        }
+    }
+
+    // A host name too long to build an action out of is not a host, and it is
+    // refused before any table is asked.
+    var long: [max_host_bytes + 8]u8 = @splat('a');
+    const policy = try table.Table.parse(gpa, one_host, null);
+    defer table.Table.destroy(gpa, policy);
+    try testing.expectEqual(Refusal.prompt_not_read, askerOver(policy).mayPrompt(&long).?);
 }
 
 test "a grant is found by an exact host and never by a suffix" {
@@ -1165,8 +1355,8 @@ test "a prompt over a real socket is answered, and one for another host is not" 
     // real policy table and a real log. No git here: `test/broker/askpass.zig`
     // is what proves a real git can drive it.
     //
-    // Mutation check: drop the `if (decision != .allow)` line from
-    // `Asker.answer` and the second half of this test hands out the
+    // Mutation check: make `Grants.find` answer the first entry whatever host
+    // it was asked about and the second half of this test hands out the
     // credential for `evil.test`.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1212,7 +1402,11 @@ test "a prompt over a real socket is answered, and one for another host is not" 
         try testing.expectEqualStrings(the_password, parsed.value.secret.?);
     }
 
-    // A host nobody permitted.
+    // **A host nobody typed a password for.** The policy's own default is
+    // `ask`, which now means a person was prompted, so what stops this one is
+    // that the person typed a password for `git.example.com` and for no other
+    // host. The prompt `git` writes is untrusted text and this is what that
+    // costs an agent that crafts one.
     {
         const client = try address.connect(io);
         defer client.close(io);
@@ -1231,7 +1425,7 @@ test "a prompt over a real socket is answered, and one for another host is not" 
         var parsed = try std.json.parseFromSlice(Reply, gpa, said, .{});
         defer parsed.deinit();
         try testing.expectEqual(@as(?[]const u8, null), parsed.value.secret);
-        try testing.expectEqualStrings("host_not_permitted", parsed.value.refused.?);
+        try testing.expectEqualStrings("no_credential_for_that_host", parsed.value.refused.?);
     }
 
     // Both prompts are in the log, and the value is in none of it.
@@ -1267,8 +1461,9 @@ test "every refusal names what to do instead, and none of them is a bare no" {
         try testing.expectEqual(refusal, Refusal.fromWireName(refusal.wireName()).?);
     }
 
-    // The two a reader is most likely to hit name the fix by name.
+    // The ones a reader is most likely to hit name the fix by name.
     try testing.expect(std.mem.indexOf(u8, Refusal.host_not_permitted.text(), "secret.password") != null);
+    try testing.expect(std.mem.indexOf(u8, Refusal.reviewer_cannot_answer.text(), "secret.password") != null);
     try testing.expect(std.mem.indexOf(u8, Refusal.prompt_wants_a_user_name.text(), "https://you@") != null);
     try testing.expect(std.mem.indexOf(u8, Refusal.prompt_not_read.text(), "LC_ALL=C") != null);
 }

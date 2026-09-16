@@ -92,6 +92,12 @@ pub const plugin_host = @import("chock-core/plugin_host.zig");
 pub const Diagnostic = @import("chock-core/diagnostic.zig").Diagnostic;
 
 pub const cache = @import("chock-core/cache.zig");
+
+/// What one approved act may reach that no other tool call may: a directory of
+/// sockets and one helper program, bound into the sandbox for the length of
+/// that act and gone after it. **The lifetime is the whole of the security
+/// property.**
+pub const credentials = @import("chock-core/credentials.zig");
 /// The packages a project's own manifest declares, fetched on the host at
 /// session start and left in the workspace where the build looks for them.
 /// The sandbox has no network, so this is what makes a real build possible at

@@ -105,6 +105,14 @@ pub const Ask = struct {
     /// when `reason` is `option_not_read`, because the shim stopped before
     /// it reached one.
     subcommand: []const u8,
+    /// Everything after the subcommand, as a slice of the caller's own
+    /// argument vector. Empty when `reason` is `option_not_read`.
+    ///
+    /// **Here so there is one reader of a git command line in this project.**
+    /// A caller that wanted the arguments of a push used to have to find the
+    /// subcommand in the vector again, and `git -C push push` makes that search
+    /// answer the wrong index: the first `push` is the value of `-C`.
+    rest: []const []const u8 = &.{},
     reason: Reason,
     /// Which act carries out the effect this subcommand is reaching for, when
     /// there is one. Null for every other case. See this file's own top
@@ -179,12 +187,14 @@ pub fn classify(argv: []const []const u8) Verdict {
     if (isOneOf(subcommand, changes_state)) {
         return .{ .ask = .{
             .subcommand = subcommand,
+            .rest = rest,
             .reason = .subcommand_changes_state,
             .kind = kindFor(subcommand, rest),
         } };
     }
     return .{ .ask = .{
         .subcommand = subcommand,
+        .rest = rest,
         .reason = .subcommand_not_known,
         .kind = null,
     } };
@@ -846,6 +856,40 @@ test "a subcommand that changes state sends a request, and the request names the
         defer refused.deinit(gpa);
         try testing.expect(refused.answer == .refused);
         try testing.expectEqual(Broker.Outcome.refused_by_user, refused.answer.refused);
+    }
+}
+
+test "the rest of a push is the arguments after the subcommand, whatever came before it" {
+    // **The fault this closes.** A caller that wanted the arguments of a push
+    // used to find `push` in the vector for itself, and `git -C push push` then
+    // answered the index of the value of `-C`, so the remote read out of it was
+    // the wrong one.
+    //
+    // Mutation check: set `.rest = argv` on the `changes_state` arm of
+    // `classify` and the first expectation fails.
+    switch (classify(&.{ "git", "-C", "push", "push", "origin", "main" })) {
+        .ask => |ask| {
+            try testing.expectEqualStrings("push", ask.subcommand);
+            try testing.expectEqual(@as(usize, 2), ask.rest.len);
+            try testing.expectEqualStrings("origin", ask.rest[0]);
+            try testing.expectEqualStrings("main", ask.rest[1]);
+        },
+        .run_the_real_git => return error.ShouldHaveAsked,
+    }
+
+    switch (classify(&.{ "git", "push" })) {
+        .ask => |ask| try testing.expectEqual(@as(usize, 0), ask.rest.len),
+        .run_the_real_git => return error.ShouldHaveAsked,
+    }
+
+    // An option the shim cannot read stops it before it reaches a subcommand,
+    // so there is nothing after one to report.
+    switch (classify(&.{ "git", "--not-read", "push", "origin" })) {
+        .ask => |ask| {
+            try testing.expectEqualStrings("", ask.subcommand);
+            try testing.expectEqual(@as(usize, 0), ask.rest.len);
+        },
+        .run_the_real_git => return error.ShouldHaveAsked,
     }
 }
 

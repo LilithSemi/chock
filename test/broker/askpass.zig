@@ -126,7 +126,23 @@ const Ask = struct {
     /// is a helper with nobody to ask, which is every tool call inside the
     /// sandbox.
     tell_the_helper_where: bool = true,
+    /// The policy table this session runs under. The one that permits the test
+    /// host by default.
+    policy: [:0]const u8 = permit_one_host,
 };
+
+/// A table that denies the test host. **`deny` is the one decision that stops
+/// a prompt on its own**, now that `ask` means a person is prompted: see
+/// `lib/chock-broker/askpass.zig`'s own top comment.
+const deny_the_host: [:0]const u8 =
+    \\.{
+    \\    .policy = .{
+    \\        .rules = .{
+    \\            .{ .action = "secret.password.com.example.git", .decision = .deny },
+    \\        },
+    \\    },
+    \\}
+;
 
 /// Build a scratch session, start a real `git credential fill`, and answer it
 /// off a real socket while it runs.
@@ -169,7 +185,7 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var locked = try store.lock(io);
     defer locked.unlock(io) catch {};
 
-    const policy = try table.Table.parse(gpa, permit_one_host, null);
+    const policy = try table.Table.parse(gpa, ask.policy, null);
     defer table.Table.destroy(gpa, policy);
 
     const asker = askpass.Asker{
@@ -310,13 +326,17 @@ test "a real git asks over the socket and gets the password, and the value is no
     try testing.expect(std.mem.indexOf(u8, run.stderr, the_password) == null);
 }
 
-test "a host nobody permitted gets no password, and git fails rather than carrying on" {
+test "a host nobody typed a password for gets none, and git fails rather than carrying on" {
     // The safe direction, measured at the far end.
-    // The policy table permits one host. Asking about another one is refused,
-    // and the refusal reaches git as a failure and not as an empty password.
     //
-    // Mutation check: drop the policy question from `Asker.answer` and this
-    // test finds `password=` in git's own output for a host no rule names.
+    // **A person is prompted once, for the host the remote names.** The prompt
+    // `git` writes is untrusted text, so a prompt naming a different host
+    // finds nothing, and the refusal reaches git as a failure and never as an
+    // empty password.
+    //
+    // Mutation check: make `Grants.find` answer its first entry whatever host
+    // it was asked about, and this test finds `password=` in git's own output
+    // for a host nobody typed one for.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -333,13 +353,39 @@ test "a host nobody permitted gets no password, and git fails rather than carryi
     // The person reading git's output is told which refusal it was and what to
     // do about it, rather than only that something failed.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "chock askpass") != null);
-    try testing.expect(std.mem.indexOf(u8, run.stderr, "secret.password") != null);
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "nobody typed a password") != null);
     // git's own message about the same failure is beside it.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "askpass") != null);
 
     // The prompt is still recorded, so a person can see that Chock was asked
     // and said no.
     try testing.expect(std.mem.indexOf(u8, run.log, "prompt.password") != null);
+    try testing.expect(std.mem.indexOf(u8, run.log, the_password) == null);
+}
+
+test "a host the policy denies gets no password even when somebody typed one" {
+    // **`deny` is the one decision that refuses on its own**, now that `ask`
+    // means a person is prompted. This drives the same host, with the same
+    // credential held, under a table that denies it, and a real git still
+    // fails without the value.
+    //
+    // Mutation check: delete the `.deny` arm of `Asker.mayPrompt` and this
+    // test finds the password in git's own output.
+    if (git_path.len == 0) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var run = try drive(gpa, io, .{ .host = the_host, .policy = deny_the_host });
+    defer run.deinit();
+
+    try testing.expect(run.exited() != @as(?u8, 0));
+    try testing.expect(std.mem.indexOf(u8, run.stdout, "password=") == null);
+    try testing.expect(std.mem.indexOf(u8, run.stdout, the_password) == null);
+    try testing.expectEqual(@as(usize, 0), run.answered);
+    try testing.expectEqual(@as(usize, 1), run.refused);
+
+    // The rule is named, so whoever wrote it can find it.
+    try testing.expect(std.mem.indexOf(u8, run.stderr, "secret.password") != null);
     try testing.expect(std.mem.indexOf(u8, run.log, the_password) == null);
 }
 

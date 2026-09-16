@@ -2137,13 +2137,42 @@ fn start(
 ///    A `token_file` gives a path and not a value, so there is nothing to add
 ///    for one that this session did not resolve.
 ///
-/// **Three things were left out on purpose, and each has a reason.** A git
-/// password in a `chock_broker.askpass.Grants` has no producer: no code in this
-/// command opens an `askpass.Endpoint`, so the set is always empty and an entry
-/// here would read as cover that is not there. A `chock_broker.secrets.Store`
-/// entry is the same, and `Broker.secrets` is never filled either. The
-/// heuristics stay off, which is `redact.zig`'s own default and its own
-/// argument.
+/// **A git password now has a producer, and this paragraph used to say it had
+/// none.** What stood here said that no code in this command opens an
+/// `askpass.Endpoint`, that the grant set is therefore always empty, and that
+/// an entry here would read as cover that is not there. All three stopped being
+/// true when `GitCredentials` landed, and a stale comment arguing for the old
+/// behaviour is how a fix gets reverted, so here is what happens instead.
+///
+/// **What flows.** A person approves a `git push` to an `https` remote and is
+/// then prompted, at the terminal or in the display's own question region, for
+/// the password. What they type is held in `GitCredentials.secret` for that one
+/// tool call, handed to a `chock_broker.askpass.Grants` for that call alone,
+/// and answered over a unix socket to the `chock askpass` that the real `git`
+/// runs inside the sandbox. It is overwritten when the call ends. **It is never
+/// stored**: there is no credential store entry for it, no configuration field,
+/// and nothing written to disk.
+///
+/// **So the policy carries a slot for it.** The slice built below is one longer
+/// than the number of credentials, and the extra entry is empty. `armPassword`
+/// writes the person's own bytes into it while the push runs and `disarm`
+/// empties it again, so the value is covered by the redaction funnel for
+/// exactly as long as it exists and for no longer. An empty value is inert:
+/// `Policy.isEmpty` and `brokerRedaction` both skip anything shorter than
+/// `redact.min_secret_bytes`, so a session that never pushes is unchanged.
+///
+/// **What it covers and what it does not.** It covers what this session sends
+/// to the provider, which is where a leaked value would leave the machine.
+/// `brokerRedaction` below reads the slice once, in phase 1, so the broker's
+/// own copy does not gain the live value; that is not a hole, because nothing
+/// the broker writes ever holds it. `git` puts the password in an HTTP header
+/// and in nothing it prints, and `askpass.appendPrompt` takes no `Grants` at
+/// all, so the session log has no route to it either. Both halves are held to
+/// by a test that greps the log and the standard error of a real push.
+///
+/// **A `chock_broker.secrets.Store` entry is still left out**, and its reason
+/// is unchanged: `Broker.secrets` is never filled. The heuristics stay off,
+/// which is `redact.zig`'s own default and its own argument.
 ///
 /// **Built in phase 1, out of the arena, because the policy borrows.**
 /// `redact.Policy.secrets` is kept alive by the caller for the whole session,
@@ -2198,10 +2227,18 @@ fn redactionFor(
         try named.append(arena, .{ .name = one.name, .value = inline_token });
     }
 
-    const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len);
-    for (named.items, secrets) |one, *slot| {
+    // **One slot more than there are credentials**, and the last one is empty.
+    // It is where a git password goes while an approved push is running: see
+    // `GitCredentials.armPassword`, which writes the person's own bytes into
+    // it, and `disarm`, which empties it again. An empty value is inert, so a
+    // session that never pushes carries exactly the policy it always did:
+    // `Policy.isEmpty` and `brokerRedaction` both skip anything shorter than
+    // `min_secret_bytes`.
+    const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + 1);
+    for (named.items, secrets[0..named.items.len]) |one, *slot| {
         slot.* = .{ .value = one.value, .source = .credential };
     }
+    secrets[named.items.len] = .{ .value = "", .source = .credential };
 
     for (named.items) |one| {
         if (one.value.len >= chock_core.redact.min_secret_bytes) continue;
@@ -7633,6 +7670,587 @@ fn warnUnmeasurableBudget(
         .{ cap.max_cost, cap.currency, model, provider_name },
     );
 }
+/// The longest credential a person may type at a prompt.
+///
+/// Well above a forge token, which is about ninety characters, and far below
+/// `chock_core.ask.max_answer_bytes`, which is what the display's own question
+/// buffer holds. A person who types more than this is refused plainly rather
+/// than given a value cut in half, because half a password is a wrong password.
+const max_secret_bytes: usize = 512;
+
+/// How long a person has to type a credential.
+///
+/// **Longer than an approval deadline on purpose.** An approval is a key
+/// press. This is a password somebody may have to fetch from a manager first,
+/// and a prompt that expired while they were looking would fail a push the
+/// person had already said yes to.
+const secret_prompt_timeout_ms: i64 = 180_000;
+
+/// How long one look at the display's question region waits.
+const secret_look_ms: u64 = 100;
+
+/// How a person is asked to type a credential.
+///
+/// **A terminal and the display, and never the approval socket.** The unix
+/// path of that socket checks `peercred` and the TCP path checks nobody:
+/// `src/serve.zig` and `src/daemon.zig` both say that Chock does no
+/// authentication over a network, and a pairing bootstrap is planned and not
+/// built. So a password crossing it would be a password on the wire in any
+/// deployment that used `--host`, and there is no exception for one push.
+///
+/// **A session with neither refuses the push**, and the refusal says which two
+/// surfaces exist. That is the same direction every other "nobody could be
+/// asked" case in this project takes.
+const SecretAsker = struct {
+    io: std.Io,
+    /// The display, when one is up. Borrowed: `runSession` owns it.
+    screen: ?*ui.Ui = null,
+    /// Whether this process has a terminal of its own.
+    at_terminal: bool = false,
+
+    /// Whether anybody can be asked at all.
+    fn canAsk(self: SecretAsker) bool {
+        return self.screen != null or self.at_terminal;
+    }
+
+    /// One sentence for a person, and for the agent's own tool result, when
+    /// nobody can be asked.
+    const nobody_text = "this session cannot prompt anybody for a password: a credential is typed " ++
+        "at the terminal running chock, or into the display's own question region, and this " ++
+        "session has neither. It is never asked for over the approval socket, because chock " ++
+        "does no authentication on that socket. Push from a session you are sitting at, or use " ++
+        "an ssh remote, whose key never leaves your machine.";
+
+    /// Ask, and copy what was typed into `into`. Null is every way of not
+    /// getting one: nobody there, nothing typed, a person who cancelled, or
+    /// more bytes than `into` holds.
+    ///
+    /// **The display wins over the terminal and never joins it.** Both read the
+    /// same device, and the display holds it in raw mode and owns every cell,
+    /// so a prompt written around it lands in cells it believes it owns. That
+    /// is the rule `Approvers.waiter` already keeps.
+    fn ask(self: SecretAsker, question: []const u8, into: []u8) ?[]const u8 {
+        if (self.screen) |screen| return askDisplay(screen, self.io, question, into);
+        if (!self.at_terminal) return null;
+        return tty.readSecret(self.io, question, into) catch null;
+    }
+
+    /// The display's own question region, masked. See `ui.Question.Echo`.
+    fn askDisplay(screen: *ui.Ui, io: std.Io, question: []const u8, into: []u8) ?[]const u8 {
+        screen.showQuestion(.{ .text = question, .echo = .masked });
+        // **On every path out**, which is what puts the terminal back and
+        // overwrites the buffer the person typed into.
+        defer screen.clearQuestion();
+
+        const started_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        const deadline_ms = started_ms + secret_prompt_timeout_ms;
+        while (true) {
+            const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+            if (now_ms >= deadline_ms) return null;
+            screen.questionLeft(deadline_ms - now_ms);
+            switch (screen.awaitText(secret_look_ms)) {
+                .waiting => continue,
+                // A person who pressed Ctrl-C is leaving, and one who pressed
+                // Enter with nothing typed has refused. Both are a no.
+                .canceled, .declined => return null,
+                .answered => |said| {
+                    if (said.len == 0 or said.len > into.len) return null;
+                    @memcpy(into[0..said.len], said);
+                    return into[0..said.len];
+                },
+            }
+        }
+    }
+};
+
+/// What one approved `git push` may reach, and nothing else may.
+///
+/// **The lifetime is the whole of the security property.** `arm` opens what
+/// the push needs, `disarm` closes it, and `grantFn` answers null for every
+/// call but the one between them. `lib/chock-broker/agentproxy.zig` says at
+/// length why that matters for the ssh agent: a proxied agent can sign
+/// anything at all while it is reachable, and the agent protocol cannot say
+/// what a signature is for, so no proxy can decide by reading the bytes. Scope
+/// is the only defence there is.
+///
+/// **Exactly one of the two is ever armed.** The remote's scheme decides
+/// which, on the host, before anybody is asked: see
+/// `lib/chock-broker/git_remote.zig`. An `https` remote prompts for a password
+/// and opens the askpass socket; an `ssh` remote proxies the agent and prompts
+/// for nothing; a local remote needs neither and gets neither.
+///
+/// **The value never rests anywhere.** It is typed by a person, held in
+/// `secret` for one tool call, and overwritten in `disarm`. There is no
+/// credential store entry, no configuration field, and nothing written to
+/// disk.
+const GitCredentials = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// The directory this session's per act sockets live in. Owned by the
+    /// caller's arena.
+    ///
+    /// **Not the session's `.ctl` directory.** That one holds the approval
+    /// socket and the handover socket, and it is bound into no sandbox ever:
+    /// an agent that could reach the approval socket could answer its own
+    /// questions.
+    dir: []const u8,
+    /// The chock binary, absolute, or empty when it could not be resolved.
+    /// Bound into the sandbox as the askpass helper.
+    helper: []const u8,
+    /// Who is prompted.
+    secrets: SecretAsker,
+    /// The policy this session reads `secret.password.*` under. `grants` is
+    /// filled per act and is empty the rest of the time.
+    asker: chock_broker.askpass.Asker,
+    /// The person's own `SSH_AUTH_SOCK`, or empty when they run no agent.
+    host_agent: []const u8,
+    /// The slot in this session's redaction policy that a live password fills.
+    ///
+    /// **Filled the moment a person types and emptied the moment the call
+    /// ends**, so the value is covered by the redaction funnel for exactly as
+    /// long as it exists. See `redactionFor`, which reserves it and says why an
+    /// empty slot costs a session that never pushes nothing.
+    live: ?*chock_core.redact.Secret = null,
+
+    /// The call this is armed for, or null. **Everything below it is read only
+    /// while this is not null.**
+    armed_call: ?[]const u8 = null,
+    /// Owned per act and freed by `disarm`.
+    socket_path: []u8 = &.{},
+    agent_path: []u8 = &.{},
+    env: []const []const u8 = &.{},
+    endpoint: ?chock_broker.askpass.Endpoint = null,
+    proxy: ?chock_broker.agentproxy.Proxy = null,
+
+    /// The one host a person typed a password for, and the value they typed.
+    host: [chock_broker.askpass.max_host_bytes]u8 = undefined,
+    host_len: usize = 0,
+    secret: [max_secret_bytes]u8 = undefined,
+    secret_len: usize = 0,
+    grant: [1]chock_broker.askpass.Grant = undefined,
+
+    /// What arming one act came to, for the caller to turn into a sentence.
+    const Outcome = union(enum) {
+        /// Armed, or deliberately armed with nothing, which is a local remote.
+        ready,
+        /// Not armed, and this is what to tell the agent. Owned by the caller.
+        refused: []u8,
+    };
+
+    fn seam(self: *GitCredentials) chock_core.credentials.Seam {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.credentials.Seam.VTable{ .grant = grantFn, .step = stepFn };
+
+    /// What this tool call may reach. **Null for every call but the one act a
+    /// person approved**, which is the whole point.
+    fn grantFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?chock_core.credentials.Grant {
+        const self: *GitCredentials = @ptrCast(@alignCast(ptr));
+        const armed = self.armed_call orelse return null;
+        if (!std.mem.eql(u8, armed, call_id)) return null;
+        // The tool is checked as well as the call, so a grant cannot travel to
+        // a different tool that happened to be given the same id.
+        if (!std.mem.eql(u8, tool, "run_command")) return null;
+
+        return .{
+            .host_dir = self.dir,
+            .helper_source = if (self.endpoint != null and self.helper.len != 0) self.helper else null,
+            .helper_name = chock_broker.askpass.link_name,
+            .env = self.env,
+        };
+    }
+
+    /// One look at whichever socket is open. **Writes no log**, which is
+    /// `lib/chock-core/idle.zig`'s own contract: this runs in the middle of a
+    /// tool call the loop has not returned from. The prompts are kept by the
+    /// endpoint and written by `record` once the call has ended.
+    fn stepFn(ptr: *anyopaque) void {
+        const self: *GitCredentials = @ptrCast(@alignCast(ptr));
+        if (self.endpoint) |*one| _ = one.step(self.gpa, self.io, null, self.asker, step_budget_ms) catch {};
+        if (self.proxy) |*one| one.step(self.io, step_budget_ms);
+    }
+
+    /// How long one look waits. Short, because it runs in the gap between two
+    /// slices of a wait and a display is repainting in the same gap.
+    const step_budget_ms = 20;
+
+    /// Open what one approved push needs, and nothing it does not.
+    ///
+    /// **Called after a person has already said yes to the push**, so this
+    /// asks nobody whether the act may happen. What it may ask is for a
+    /// password, which is a different question with a different answer.
+    ///
+    /// `rest` is what follows the `push` subcommand, which `git_shim.classify`
+    /// already cut out of the argument vector.
+    ///
+    /// The caller owns any `refused` text and frees it with `gpa.free`.
+    fn arm(
+        self: *GitCredentials,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        project_root: []const u8,
+        call_id: []const u8,
+        rest: []const []const u8,
+    ) std.mem.Allocator.Error!Outcome {
+        std.debug.assert(self.armed_call == null);
+
+        const resolved = self.remoteUrl(gpa, io, project_root, rest) catch null;
+        defer if (resolved) |url| gpa.free(url);
+
+        const url = resolved orelse return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
+
+        switch (chock_broker.git_remote.credentialFor(url)) {
+            // Nothing authenticates, so nothing is armed and the push runs with
+            // no credential surface at all. **This is a third case and not a
+            // gap**: a `file://` or a local path remote needs neither of the
+            // two, and arming one anyway would be a capability nobody asked
+            // for.
+            .none => return .ready,
+            .unreadable => return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) },
+            .password => return self.armPassword(gpa, io, call_id, url),
+            .agent => return self.armAgent(gpa, io, call_id, url),
+        }
+    }
+
+    /// The URL of the remote this push names, owned by the caller, or null when
+    /// it cannot be read. See `lib/chock-broker/git_remote.zig` for why every
+    /// doubt ends here.
+    fn remoteUrl(
+        self: *GitCredentials,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        project_root: []const u8,
+        rest: []const []const u8,
+    ) !?[]u8 {
+        _ = self;
+        const named = chock_broker.git_remote.remoteNameIn(rest) orelse return null;
+        // A push may name a URL where a remote's name would go.
+        if (chock_broker.git_remote.namesAUrl(named)) return try gpa.dupe(u8, named);
+
+        const path = try projectConfigPath(gpa, project_root);
+        defer gpa.free(path);
+
+        const text = std.Io.Dir.readFileAlloc(
+            .cwd(),
+            io,
+            path,
+            gpa,
+            .limited(chock_broker.git_remote.max_config_bytes),
+        ) catch return null;
+        defer gpa.free(text);
+
+        const url = chock_broker.git_remote.remoteUrlIn(text, named) orelse return null;
+        return try gpa.dupe(u8, url);
+    }
+
+    /// Prompt a person, hold what they typed for this one call, and open the
+    /// askpass socket.
+    fn armPassword(
+        self: *GitCredentials,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call_id: []const u8,
+        url: []const u8,
+    ) std.mem.Allocator.Error!Outcome {
+        const host = chock_broker.git_remote.hostIn(url) orelse
+            return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
+        if (!isPlainHost(host)) return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
+
+        // **The policy first, and the prompt second.** A host the project
+        // denies costs no prompt at all, and the refusal is the same one
+        // `git` would have read off the socket: one decider, two callers. See
+        // `askpass.Asker.mayPrompt`.
+        if (self.asker.mayPrompt(host)) |refusal| {
+            return .{ .refused = try std.fmt.allocPrint(
+                gpa,
+                "git push was not run: {s}",
+                .{refusal.text()},
+            ) };
+        }
+
+        if (!self.secrets.canAsk()) {
+            return .{ .refused = try gpa.dupe(u8, SecretAsker.nobody_text) };
+        }
+        if (self.helper.len == 0) {
+            return .{ .refused = try gpa.dupe(u8, no_helper_text) };
+        }
+
+        const question = try std.fmt.allocPrint(
+            gpa,
+            "password for {s} (git push, nothing is stored): ",
+            .{host},
+        );
+        defer gpa.free(question);
+
+        const typed = self.secrets.ask(question, &self.secret) orelse {
+            return .{ .refused = try gpa.dupe(u8, nothing_typed_text) };
+        };
+        self.secret_len = typed.len;
+        errdefer self.wipe();
+
+        // **Before anything is opened.** Nothing can echo the value until the
+        // socket exists, and covering it first means there is no window at all
+        // rather than a short one.
+        if (self.live) |slot| slot.value = self.secret[0..self.secret_len];
+
+        @memcpy(self.host[0..host.len], host);
+        self.host_len = host.len;
+        self.grant[0] = .{
+            .host = self.host[0..self.host_len],
+            .secret = self.secret[0..self.secret_len],
+        };
+        self.asker.grants = .{ .entries = &self.grant };
+
+        self.socket_path = try std.fmt.allocPrint(
+            gpa,
+            "{s}/{s}",
+            .{ self.dir, chock_broker.askpass.socket_name },
+        );
+        errdefer {
+            gpa.free(self.socket_path);
+            self.socket_path = &.{};
+        }
+
+        self.endpoint = chock_broker.askpass.Endpoint.open(io, self.socket_path, null) catch {
+            return .{ .refused = try gpa.dupe(u8, no_socket_text) };
+        };
+        errdefer if (self.endpoint) |*one| {
+            one.close(io);
+            self.endpoint = null;
+        };
+
+        const inside = chock_core.credentials.sandboxDirFor(self.dir);
+        const helper_inside = try chock_core.credentials.helperPathFor(
+            gpa,
+            self.helper,
+            chock_broker.askpass.link_name,
+        );
+        defer gpa.free(helper_inside);
+
+        var entries: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (entries.items) |entry| gpa.free(entry);
+            entries.deinit(gpa);
+        }
+        try entries.append(gpa, try std.fmt.allocPrint(gpa, "GIT_ASKPASS={s}", .{helper_inside}));
+        // **A path and never a value.** That is the only reason a variable may
+        // be in this design at all: see `lib/chock-broker/askpass.zig`.
+        try entries.append(gpa, try std.fmt.allocPrint(
+            gpa,
+            "{s}={s}/{s}",
+            .{ chock_broker.askpass.env_socket, inside, chock_broker.askpass.socket_name },
+        ));
+        // git writes its two prompts through gettext, so a translated git
+        // writes bytes `askpass.readPrompt` cannot read and then refuses. See
+        // that function's own comment.
+        try entries.append(gpa, try gpa.dupe(u8, "LC_ALL=C"));
+        // Nothing may fall back to a terminal: the helper is the only route to
+        // a password, and a git that opened /dev/tty inside the sandbox would
+        // be asking nobody.
+        try entries.append(gpa, try gpa.dupe(u8, "GIT_TERMINAL_PROMPT=0"));
+        self.env = try entries.toOwnedSlice(gpa);
+
+        self.armed_call = try gpa.dupe(u8, call_id);
+        return .ready;
+    }
+
+    /// Open the proxy to the person's own ssh agent. **No prompt**, because an
+    /// agent is what answers instead of a person.
+    fn armAgent(
+        self: *GitCredentials,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call_id: []const u8,
+        url: []const u8,
+    ) std.mem.Allocator.Error!Outcome {
+        _ = url;
+        if (self.host_agent.len == 0) {
+            return .{ .refused = try gpa.dupe(u8, no_agent_text) };
+        }
+
+        self.agent_path = try std.fmt.allocPrint(
+            gpa,
+            "{s}/{s}",
+            .{ self.dir, chock_broker.agentproxy.socket_name },
+        );
+        errdefer {
+            gpa.free(self.agent_path);
+            self.agent_path = &.{};
+        }
+
+        self.proxy = chock_broker.agentproxy.Proxy.open(
+            io,
+            self.agent_path,
+            self.host_agent,
+            null,
+        ) catch {
+            return .{ .refused = try gpa.dupe(u8, no_socket_text) };
+        };
+        errdefer if (self.proxy) |*one| {
+            one.close(io);
+            self.proxy = null;
+        };
+
+        const inside = chock_core.credentials.sandboxDirFor(self.dir);
+        var entries: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (entries.items) |entry| gpa.free(entry);
+            entries.deinit(gpa);
+        }
+        // **A path, and the agent is on the other end of it.** The key stays on
+        // the host: see `lib/chock-broker/agentproxy.zig`.
+        try entries.append(gpa, try std.fmt.allocPrint(
+            gpa,
+            "{s}={s}/{s}",
+            .{ chock_broker.agentproxy.env_socket, inside, chock_broker.agentproxy.socket_name },
+        ));
+        try entries.append(gpa, try gpa.dupe(u8, "GIT_TERMINAL_PROMPT=0"));
+        self.env = try entries.toOwnedSlice(gpa);
+
+        self.armed_call = try gpa.dupe(u8, call_id);
+        return .ready;
+    }
+
+    /// Close everything this act opened, and overwrite the value.
+    ///
+    /// **Called on every path out of an approved push**, including a failing
+    /// one, because the socket existing for one moment longer than the act is
+    /// the whole of what this design is guarding against.
+    fn disarm(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io) void {
+        if (self.endpoint) |*one| one.close(io);
+        self.endpoint = null;
+        if (self.proxy) |*one| one.close(io);
+        self.proxy = null;
+
+        if (self.socket_path.len != 0) gpa.free(self.socket_path);
+        self.socket_path = &.{};
+        if (self.agent_path.len != 0) gpa.free(self.agent_path);
+        self.agent_path = &.{};
+        if (self.env.len != 0) chock_core.credentials.freeEnvironment(gpa, self.env);
+        self.env = &.{};
+        if (self.armed_call) |one| gpa.free(one);
+        self.armed_call = null;
+
+        self.wipe();
+    }
+
+    /// Overwrite the value and forget the host it belonged to.
+    fn wipe(self: *GitCredentials) void {
+        // **The redaction slot first.** It borrows the very bytes the next line
+        // overwrites, so a slot left pointing at them would hand the redactor a
+        // run of zeroes to search for.
+        if (self.live) |slot| slot.value = "";
+        chock_broker.askpass.wipe(self.secret[0..self.secret_len]);
+        self.secret_len = 0;
+        self.host_len = 0;
+        self.grant = undefined;
+        self.asker.grants = .{};
+    }
+
+    /// Write what the sockets did into the session log, **after** the tool call
+    /// has ended.
+    ///
+    /// **This is here and not in the look, because of
+    /// `lib/chock-core/idle.zig`'s own contract**: a look runs in the middle of
+    /// a call the loop has not returned from and may not append to the log. So
+    /// the endpoint keeps each prompt's text and this writes them once it is
+    /// safe to. See `askpass.Endpoint.kept`.
+    ///
+    /// **A prompt's text is bytes `git` composed out of a URL and holds no
+    /// value.** `askpass.appendPrompt` takes no `Grants` at all, so there is
+    /// nothing in scope here that could put a credential in the log even by
+    /// mistake.
+    fn record(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io, locked: ?*chock_core.arbiter.Locked) void {
+        const endpoint = if (self.endpoint) |*one| one else return;
+        const handle = locked orelse return;
+
+        var index: usize = 0;
+        while (endpoint.keptPrompt(index)) |prompt| : (index += 1) {
+            var id_buffer: [32]u8 = undefined;
+            const correlation = std.fmt.bufPrint(&id_buffer, "askpass-{d}", .{index + 1}) catch "askpass";
+            _ = chock_broker.askpass.appendPrompt(
+                gpa,
+                io,
+                handle,
+                correlation,
+                prompt,
+                std.Io.Timestamp.now(io, .real).toMilliseconds(),
+            ) catch return;
+        }
+    }
+};
+
+/// Where a project's git configuration is, for reading a remote's URL.
+///
+/// **The project's own `.git`, and never the session workspace's.** The
+/// workspace is the agent's to write, so a configuration read from it is text
+/// the agent chose. The project root is not mounted writable into any sandbox,
+/// so what is read here is what the person themselves configured. A linked
+/// worktree shares the project's configuration anyway, so this is also the file
+/// `git` would really read.
+fn projectConfigPath(gpa: std.mem.Allocator, project_root: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/.git/config", .{project_root});
+}
+
+/// True when every byte could be part of a host name. **A host reaches a
+/// prompt a person reads and a terminal a person watches**, and it comes out of
+/// a file, so it is checked rather than trusted. `askpass.actionInto` refuses
+/// what it cannot build an action from; this refuses what it cannot print.
+fn isPlainHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > chock_broker.askpass.max_host_bytes) return false;
+    for (host) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// What the agent is told when the remote cannot be read.
+///
+/// **Named alternatives, because that is what makes a model adapt**, which is
+/// the rule `git_shim.hostReachingRefusal` keeps and which was measured on the
+/// refusal of a shell name.
+const unreadable_remote_text = "git push was not run: chock could not read which remote this " ++
+    "push goes to, and it will not guess. A credential is armed from the remote's scheme, so a " ++
+    "remote it cannot read is one it cannot arm the right thing for. Name the remote's URL on " ++
+    "the command line, as in git push https://host/project.git HEAD:main, and run it again.";
+
+/// What the agent is told when the push needs the person's ssh agent and there
+/// is none.
+const no_agent_text = "git push was not run: this remote authenticates with an ssh key, and " ++
+    "there is no ssh agent for chock to proxy. chock never copies a key into the sandbox, so an " ++
+    "agent is the only way a key can sign for it. Start one and add the key, as in ssh-add, and " ++
+    "run chock again. An https remote is prompted for instead and needs no agent.";
+
+/// What the agent is told when the socket could not be opened at all.
+const no_socket_text = "git push was not run: chock could not open the socket the credential " ++
+    "travels on. Nothing was sent anywhere. This is a fault on this machine and not a refusal.";
+
+/// What the agent is told when chock cannot find its own binary to bind in as
+/// the askpass helper.
+const no_helper_text = "git push was not run: chock could not resolve its own path, so it " ++
+    "could not put the password helper inside the sandbox. This is a fault on this machine and " ++
+    "not a refusal.";
+
+/// What the agent is told by a runner that was given no way to arm a
+/// credential at all.
+///
+/// **A wiring this file forgot is a loud failure and never a silent grant.**
+/// The same direction `GitToolRunner.asker` takes when it is null.
+const credentials_not_wired_text = "git push was not run: this session has no way to hold a " ++
+    "credential, so nothing could authenticate. This is a fault in how the session was started " ++
+    "and not a refusal. Report it, and work with what is already in the workspace.";
+
+/// What the agent is told when the person was asked and typed nothing.
+///
+/// **This is a refusal and it says so.** A person who pressed Enter with
+/// nothing typed, or who pressed Ctrl-C, has declined, and a message that
+/// blamed the machine would send a model looking for something to fix.
+const nothing_typed_text = "git push was not run: chock asked for the password and nobody " ++
+    "typed one, so the push was declined. Nothing was sent anywhere. Ask the user whether they " ++
+    "want this push to happen at all before trying it again.";
+
 
 /// A `ToolRunner` that reads a `run_command` call for a git command line
 /// before it runs, and answers the subcommands that cannot work inside the
@@ -7707,6 +8325,16 @@ const GitToolRunner = struct {
     /// this file forgot is then a loud failure and never a silent grant. See
     /// `chock_core.arbiter.Asker.decide`.
     asker: ?chock_core.arbiter.Asker = null,
+    /// What arms the credential of one approved push, or null for a runner
+    /// that cannot arm one at all.
+    ///
+    /// **Null refuses every push and says what is missing.** That is the same
+    /// direction `asker` above takes: a wiring this file forgot is a loud
+    /// failure and never a silent grant.
+    credentials: ?*GitCredentials = null,
+    /// The project this session works on, for reading a remote's URL out of
+    /// the person's own git configuration. See `projectConfigPath`.
+    project_root: []const u8 = "",
 
     fn runner(self: *GitToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
@@ -7729,6 +8357,13 @@ const GitToolRunner = struct {
         call: chock_proto.event.ToolCall,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *GitToolRunner = @ptrCast(@alignCast(ptr));
+        // **On every path out, whichever one it is.** A socket that outlived
+        // the act it was opened for is the one thing this whole design exists
+        // to stop, so the closing is a `defer` over both branches below and
+        // never a line at the end of the happy one. It does nothing at all
+        // when no push was armed, which is every other call.
+        defer self.finishPush(gpa, io);
+
         if (try self.gitAnswer(gpa, io, call)) |output| {
             // The same shape an ordinary refused tool call already has: an
             // `is_error` result the model reads and answers, never an error
@@ -7741,6 +8376,19 @@ const GitToolRunner = struct {
             };
         }
         return self.inner.dispatch(gpa, io, call);
+    }
+
+    /// Write what the sockets did into the log, then close them.
+    ///
+    /// **The record comes first and the closing second**, because the endpoint
+    /// is what kept the prompts: see `GitCredentials.record`, and
+    /// `lib/chock-core/idle.zig` for why they could not be written while the
+    /// call was still running.
+    fn finishPush(self: *GitToolRunner, gpa: std.mem.Allocator, io: std.Io) void {
+        const creds = self.credentials orelse return;
+        if (creds.armed_call == null) return;
+        creds.record(gpa, io, if (self.asker) |one| one.locked else null);
+        creds.disarm(gpa, io);
     }
 
     /// What the agent is told instead of running `call`, or null when this call
@@ -7817,13 +8465,38 @@ const GitToolRunner = struct {
         // reads exactly like any other refused act.
         if (!answer.permitted) return try chock_core.arbiter.refusalText(gpa, action, answer);
 
-        // Approved, and still not run. See this struct's own top comment: the
-        // act that reaches the host is not built, and the honest answer names
+        // **An approved push runs, and this is where its credential is
+        // armed.** Exactly one of the two is opened, chosen from the remote's
+        // own scheme, and it is closed again in `finishPush` whatever happens
+        // next. See `GitCredentials`.
+        if (std.mem.eql(u8, ask.subcommand, "push")) {
+            return try self.armPush(gpa, io, call, ask.rest);
+        }
+
+        // Every other subcommand that has to reach a host is asked about and
+        // still does not run. See this struct's own top comment: the act that
+        // reaches the host is not built for those, and the honest answer names
         // what is missing rather than implying the yes was a no.
         if (chock_broker.git_shim.needsNetwork(ask.subcommand)) {
             return try chock_broker.git_shim.hostReachingRefusal(gpa, ask.subcommand);
         }
         return null;
+    }
+
+    /// Arm what this push needs, or answer what to tell the agent instead.
+    /// Null means the real git runs.
+    fn armPush(
+        self: *GitToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        rest: []const []const u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        const creds = self.credentials orelse return try gpa.dupe(u8, credentials_not_wired_text);
+        return switch (try creds.arm(gpa, io, self.project_root, call.call_id, rest)) {
+            .ready => null,
+            .refused => |text| text,
+        };
     }
 };
 
@@ -10848,6 +11521,88 @@ fn runSession(
     // every subcommand the shim classifies, `git add` included.
     git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
 
+    // **And what one approved push may reach.** Built here because it needs the
+    // display, which is not known where `git_aware` itself is built, and it is
+    // ended with this frame: `disarm` runs on every path out of a tool call, so
+    // by the time this is torn down there is nothing left open.
+    //
+    // **A directory of its own, and never the session's `.ctl`.** That one
+    // holds the approval socket and the handover socket, and an agent that
+    // could reach the approval socket could answer its own questions. This one
+    // holds nothing but the sockets of the act being performed, and it is made
+    // `0o700` by `chock_broker.socket.ensureDir`, which both `Endpoint.open`
+    // and `Proxy.open` call on the parent of the path they are given.
+    const credential_dir = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}.cred",
+        .{ started.paths.dir, started.session_id },
+    );
+    defer gpa.free(credential_dir);
+    // Scratch, and this is the only thing that removes it. A directory that is
+    // not there is not a fault: nothing was ever armed in that session.
+    defer std.Io.Dir.cwd().deleteTree(io, credential_dir) catch {};
+
+    // **The absolute path of this binary, because a bind mount needs a real
+    // one.** `chock` is statically linked, so binding it into the sandbox needs
+    // nothing else on the far side. An empty string is a machine where the path
+    // could not be resolved, and `armPassword` refuses rather than building a
+    // mount tree that names nothing.
+    const credential_helper = std.Io.Dir.realPathFileAlloc(
+        .cwd(),
+        io,
+        started.exe_path,
+        gpa,
+    ) catch try gpa.dupe(u8, "");
+    defer gpa.free(credential_helper);
+
+    const credential_chain = try policyChain(gpa, started, options);
+    defer gpa.free(credential_chain);
+
+    var git_credentials = GitCredentials{
+        .gpa = gpa,
+        .io = io,
+        .dir = credential_dir,
+        .helper = credential_helper,
+        .secrets = .{
+            .io = io,
+            .screen = screen,
+            // **The same rule the approval prompt keeps**: the display replaces
+            // the bare terminal and never joins it, because both read the same
+            // device. See `SecretAsker.ask`.
+            .at_terminal = approval.hasTerminal(io) and screen == null,
+        },
+        .asker = .{
+            .table = started.policy,
+            .chain = credential_chain,
+            .agent_kind = options.agent_kind,
+            .model = started.model,
+        },
+        // **The person's own agent, out of the process environment and never
+        // the dev shell's.** A key belongs to whoever started chock.
+        .host_agent = env.get(chock_broker.agentproxy.env_socket) orelse "",
+        // **The reserved slot at the end, which `redactionFor` put there.**
+        // `@constCast` is sound here: the slice was allocated mutable in phase
+        // 1's arena and `Policy.secrets` is `const` only because a policy is
+        // passed by value everywhere else. This is the one owner that writes
+        // it, and it writes it from one thread.
+        .live = if (started.redact.secrets.len != 0)
+            &@constCast(started.redact.secrets)[started.redact.secrets.len - 1]
+        else
+            null,
+    };
+    // Nothing is ever open here by now, because `finishPush` closes on every
+    // path out of a tool call. This is the belt: a session that ended inside a
+    // call still leaves no socket behind.
+    defer git_credentials.disarm(gpa, io);
+
+    git_aware.credentials = &git_credentials;
+    git_aware.project_root = started.project_root;
+    // **A tool call can be armed from here, and from nowhere else.**
+    // `tool_runner.context` was copied into `tool_runner` above, so the field
+    // is set on the copy directly, the same way `context.net` and
+    // `context.idle` already are. See `chock_core.tools.Context.credentials`.
+    tool_runner.context.credentials = git_credentials.seam();
+
     // The handle each of those four needs, handed over once by `Loop.run`.
     // See `GiveLockedToAll`.
     var give_locked = GiveLockedToAll{
@@ -13729,10 +14484,13 @@ test "a subcommand that reaches another host is asked about, and an approved one
     const gpa = testing.allocator;
     const io = testing.io;
 
+    // **`push` is no longer on this list**, and that is the change this whole
+    // task made: an approved push arms a credential and runs. See the tests
+    // below it. Every other host reaching subcommand is still asked about and
+    // still told what is missing.
     for ([_][]const u8{
         "{\"argv\":[\"git\",\"fetch\",\"origin\"]}",
         "{\"argv\":[\"git\",\"pull\"]}",
-        "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
         "{\"argv\":[\"git\",\"clone\",\"https://example.invalid/x.git\"]}",
         // An option before the subcommand is read the same way, so a fetch
         // does not get through by being spelled with one.
@@ -13754,6 +14512,37 @@ test "a subcommand that reaches another host is asked about, and an approved one
         try testing.expect(std.mem.indexOf(u8, result.output, "not a refusal") != null);
         try testing.expect(std.mem.indexOf(u8, result.output, "has no network") == null);
     }
+}
+
+test "an approved push with no way to hold a credential is refused loudly, never run" {
+    // **A wiring this file forgot must be a loud failure and never a silent
+    // grant.** `GitToolRunner.credentials` is null here, which is what a runner
+    // built without one has, and the push is refused with a sentence that says
+    // the session is at fault rather than the person.
+    //
+    // Mutation check: make `armPush` answer null when `self.credentials` is
+    // null and `inner.calls` below reaches one, which is a push running with no
+    // credential surface and no socket.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arbitrator = CountingArbiter{ .permitted = true };
+    var inner = CountingToolRunner{};
+    const result = try driveGitRunner(
+        gpa,
+        io,
+        &arbitrator,
+        &inner,
+        "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expectEqual(@as(usize, 1), arbitrator.asks);
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.output, "no way to hold a credential") != null);
+    try testing.expect(std.mem.indexOf(u8, result.output, "not a refusal") != null);
 }
 
 test "a read only subcommand reaches the real git and asks nobody at all" {
@@ -19159,8 +19948,15 @@ test "this session's own credential is what the redactor is given" {
     const token = "sk-not-a-real-key-0123456789";
     const policy = try redactionFor(arena, "hub", token, &.{});
 
-    try testing.expectEqual(@as(usize, 1), policy.secrets.len);
+    // **One credential, plus the empty slot a live git password goes in.** See
+    // `redactionFor`: an empty value is inert, which is what keeps a session
+    // that never pushes exactly as it was.
+    //
+    // Mutation check: drop the reserved slot from `redactionFor` and this is 1
+    // rather than 2, and the push path then has nothing to write into.
+    try testing.expectEqual(@as(usize, 2), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
+    try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
     // The source and not a guess, so an agent reading a marker can tell a
     // credential Chock holds from a pattern that fired.
     try testing.expectEqual(chock_core.redact.Source.credential, policy.secrets[0].source);
@@ -19213,7 +20009,10 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     // auth, has nothing to protect and nothing to say about it.
     said.clear();
     const none = try redactionFor(arena, "local", "", &.{});
-    try testing.expectEqual(@as(usize, 0), none.secrets.len);
+    // The reserved slot alone, and it is empty, so this policy still changes
+    // nothing and warns about nothing.
+    try testing.expectEqual(@as(usize, 1), none.secrets.len);
+    try testing.expectEqualStrings("", none.secrets[0].value);
     try testing.expectEqual(@as(usize, 0), none.tooShort());
     try testing.expect(none.isEmpty());
     try testing.expectEqualStrings("", said.err());
@@ -19312,7 +20111,9 @@ test "every credential the configuration holds is in the set, and not only the o
     };
 
     const policy = try redactionFor(arena, "hub", in_use, &instances);
-    try testing.expectEqual(@as(usize, 2), policy.secrets.len);
+    // Two credentials, plus the reserved slot. See `redactionFor`.
+    try testing.expectEqual(@as(usize, 3), policy.secrets.len);
+    try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
 
     var saw_in_use = false;
     var saw_idle = false;

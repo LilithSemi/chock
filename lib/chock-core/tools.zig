@@ -141,6 +141,7 @@ const memory = @import("memory.zig");
 const idle_mod = @import("idle.zig");
 const guidance = @import("guidance.zig");
 const cache = @import("cache.zig");
+const credentials_mod = @import("credentials.zig");
 const scratchpad = @import("scratchpad.zig");
 const tasks = @import("tasks.zig");
 const handback = @import("handback.zig");
@@ -1943,6 +1944,23 @@ pub const Context = struct {
     /// exception: see that function's own note on why it resets the network
     /// back to `none` for the call it starts, rather than reading this.
     net: ?NetSeam = null,
+    /// What one approved act may reach that no other tool call may, or null
+    /// for a session in which no act is ever armed, which is every caller
+    /// before this field existed.
+    ///
+    /// **Asked once per foreground `run_command` call, right before that
+    /// call's own sandbox is built.** A caller answers null for every call but
+    /// the one act a person approved, so the capability exists during that act
+    /// and at no other time: see `lib/chock-core/credentials.zig`, and
+    /// `lib/chock-broker/agentproxy.zig` for why scope is the only defence a
+    /// proxied ssh agent has.
+    ///
+    /// **A background call is never armed.** The program it starts runs on a
+    /// task's own thread long after this dispatch returned, and the sockets of
+    /// an approved act are torn down when the act ends, so a background call
+    /// would find a socket that had gone. It is the same reason a background
+    /// call keeps `Network.none`.
+    credentials: ?credentials_mod.Seam = null,
     /// The host directory this project's knowledgebase lives in, or null for
     /// a session that has none. `Support.memory` decides whether the model is
     /// told the two memory tools exist. This is where they actually work.
@@ -2637,6 +2655,33 @@ fn runCommand(
         config.env = entries;
     }
 
+    // What this one call may reach that no other may. See
+    // `lib/chock-core/credentials.zig`, and `Context.credentials` for why a
+    // background call is never armed.
+    //
+    // **Held in this function's own frame**, because a mount borrows its
+    // target and a `Chain` is a seam built in place: both have to outlive the
+    // call, and both are ended after `runInSandboxWith` has returned.
+    var armed: ?credentials_mod.Armed = null;
+    defer if (armed) |*one| one.deinit(allocator);
+    var credential_chain = credentials_mod.Chain{ .inner = context.idle };
+
+    if (!in_background) {
+        if (context.credentials) |seam| {
+            if (seam.grant(call.tool, call.call_id)) |granted| {
+                armed = try credentials_mod.arm(
+                    allocator,
+                    granted,
+                    config.env,
+                    &extra_mounts,
+                    &extra_rules,
+                );
+                config.env = armed.?.env;
+                credential_chain.seam = seam;
+            }
+        }
+    }
+
     const ran = runInSandboxWith(allocator, io, env, config, .{
         .argv = parsed.value.argv,
         .extra_mounts = extra_mounts.items,
@@ -2649,7 +2694,17 @@ fn runCommand(
         // program the model chose, so it is the one that can take minutes. A
         // `grep`, a `read_file` and a `write_file` are each one short program
         // Chock itself chose, under the same deadline. See `Context.idle`.
-        .idle = if (in_background) null else context.idle,
+        // **The chain, and only when something is armed.** A call with
+        // nothing armed keeps exactly the idle it always had, including null,
+        // which `drainCapture` reads as a reason to wait on its whole deadline
+        // rather than in slices. A call with something armed always gets a
+        // look, display or no display: without that a piped `chock run` would
+        // never serve the socket at all, and `git` would wait for a prompt
+        // nobody was listening for. See `credentials.Chain`.
+        .idle = if (in_background) null else if (credential_chain.seam != null)
+            credential_chain.idle()
+        else
+            context.idle,
         .approval_wait_ns = if (in_background) null else context.approval_wait_ns,
     }) catch |err| switch (err) {
         error.TooManyTasks => return toolErrorResult(

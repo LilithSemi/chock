@@ -2564,6 +2564,36 @@ pub const Question = struct {
     options: []const []const u8 = &.{},
     /// How long is left, in milliseconds, as the asker last measured it.
     left_ms: i64 = 0,
+    /// Whether what the person types is drawn back to them.
+    ///
+    /// **A named type and not a `bool`, so the guard below stays tight.** The
+    /// rule this region is built under is that a `Question` names no act, and a
+    /// bare `bool` member would let a `permitted` through the very check that
+    /// exists to stop one. See the test at the end of this file.
+    echo: Echo = .on,
+
+    /// Whether what a person types is drawn back to them.
+    pub const Echo = enum {
+        /// The ordinary case. The person reads what they typed.
+        on,
+        /// The bytes are a credential, so one mark is drawn for each and the
+        /// bytes themselves are never on screen.
+        ///
+        /// **This is the only way a password is typed into a display.** A
+        /// person at a full screen display cannot be prompted through the
+        /// terminal, because the display holds the device in raw mode and owns
+        /// every cell, so a prompt written around it lands in cells it believes
+        /// it owns and two readers race for every byte.
+        ///
+        /// **The length still shows.** One mark per byte is what every password
+        /// field does, and a field that showed nothing at all leaves a person
+        /// unable to tell a keystroke that arrived from one that did not.
+        ///
+        /// **A masked question carries no options**, and the digit shortcut is
+        /// off while it is up: a password beginning with a digit would
+        /// otherwise be replaced by whichever option that digit named.
+        masked,
+    };
 };
 
 /// How one look at the question region ended. See `Ui.awaitText`.
@@ -4657,6 +4687,12 @@ pub const Ui = struct {
     /// `src/interrupt.zig` owns Ctrl-C again. Idempotent.
     pub fn clearQuestion(self: *Ui) void {
         if (self.question == null) return;
+        // **Overwritten and not merely forgotten.** A masked question holds a
+        // credential in this buffer, and memory that is abandoned rather than
+        // cleared keeps its bytes until something else happens to reuse it.
+        // Done for every question, because a caller cannot be relied on to say
+        // which ones mattered.
+        std.crypto.secureZero(u8, self.question_typed[0..self.question_filled]);
         self.question = null;
         self.question_said = null;
         self.question_filled = 0;
@@ -6423,10 +6459,26 @@ pub const Ui = struct {
         // The answer line. **The person's own bytes**, after Chock's own prompt,
         // and put through `visibleLine` like every other row: a paste can carry
         // anything.
+        //
+        // **A masked question draws marks and never the bytes.** The value is a
+        // credential, and a screen is read by whoever is in the room and by
+        // whatever is recording it. See `Question.masked`.
+        //
+        // Mutation check: drop the `one.masked` branch and the password shows
+        // on screen, which `test "a masked question draws marks and never the
+        // bytes"` fails on.
+        const shown: []const u8 = switch (one.echo) {
+            .on => self.question_typed[0..self.question_filled],
+            .masked => marks: {
+                const cells = ctx.arena.alloc(u8, self.question_filled) catch break :marks "";
+                @memset(cells, '*');
+                break :marks cells;
+            },
+        };
         lines.add(ctx.arena, self.regionRow(ctx, std.fmt.allocPrint(
             ctx.arena,
             answer_prompt ++ "{s}\u{2588}",
-            .{self.question_typed[0..self.question_filled]},
+            .{shown},
         ) catch answer_prompt, colors.fg));
 
         lines.add(ctx.arena, self.regionRow(
@@ -7091,7 +7143,7 @@ pub const Ui = struct {
         const typed = event.text orelse return false;
         if (typed.len == 0) return false;
 
-        if (self.question_filled == 0 and one.options.len != 0 and typed.len == 1) {
+        if (one.echo == .on and self.question_filled == 0 and one.options.len != 0 and typed.len == 1) {
             if (typed[0] >= '1' and typed[0] <= '9') {
                 if (self.question_settle != 0) return false;
                 const index: usize = typed[0] - '1';
@@ -13838,6 +13890,79 @@ test "a digit chooses from the list, and only while the answer line is empty" {
     try testing.expectEqualStrings("either 1", h.screen.question_typed[0..h.screen.question_filled]);
 }
 
+test "a masked question draws marks and never the bytes" {
+    // **The worst bug this feature could ship.** A password typed into the
+    // question region is a password on a screen, read by whoever is in the
+    // room and by whatever is recording it. So the bytes are never drawn, and
+    // this asserts on the rendered screen and not on a flag.
+    //
+    // Mutation check: make the `.masked` arm of the answer line in
+    // `questionRows` answer `self.question_typed[0..self.question_filled]` and
+    // the second expectation finds the password on screen.
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    const password = "hunter2correcthorse";
+    try asksIn(h, .{ .text = "password for git.example.com", .echo = .masked });
+    h.screen.question_settle = 0;
+    try pressKeys(h, password);
+    try testing.expectEqual(Text.waiting, h.screen.awaitText(50));
+
+    // It arrived, whole, where the caller reads it.
+    try testing.expectEqualStrings(password, h.screen.question_typed[0..h.screen.question_filled]);
+
+    // And no part of it is on the screen. One mark for each byte is, so a
+    // person can tell a keystroke that landed from one that did not.
+    // Borrowed from the headless display, which owns it.
+    const drawn = try screenText(h);
+    try testing.expect(std.mem.indexOf(u8, drawn, password) == null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "hunter") == null);
+    try testing.expect(std.mem.indexOf(u8, drawn, "*" ** password.len) != null);
+
+    // The prompt itself still shows, because a person has to know what is
+    // being asked for.
+    try testing.expect(std.mem.indexOf(u8, drawn, "git.example.com") != null);
+
+    // **The buffer is overwritten when the question goes**, not merely
+    // forgotten. Mutation check: drop the `secureZero` from `clearQuestion`
+    // and the last expectation here fails.
+    h.screen.clearQuestion();
+    try testing.expect(std.mem.indexOf(u8, &h.screen.question_typed, "hunter2") == null);
+}
+
+test "a masked question never turns a leading digit into an option" {
+    // A password beginning with a digit would otherwise be thrown away and
+    // replaced by whichever option that digit named. A masked question carries
+    // no options, and the shortcut is off regardless, so both halves hold.
+    //
+    // Mutation check: drop the `one.echo == .on` guard and the first
+    // expectation below finds `postgres` where the password should be.
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    try asksIn(h, .{
+        .text = "password",
+        .options = &.{ "postgres", "sqlite" },
+        .echo = .masked,
+    });
+    h.screen.question_settle = 0;
+    try pressKeys(h, "1234");
+    try testing.expectEqualStrings("1234", h.screen.question_typed[0..h.screen.question_filled]);
+    h.screen.clearQuestion();
+
+    // And the ordinary question still chooses, so the guard narrowed nothing
+    // else.
+    try asksIn(h, .{ .text = "which one?", .options = &.{ "postgres", "sqlite" } });
+    h.screen.question_settle = 0;
+    try pressKeys(h, "1");
+    switch (h.screen.awaitText(50)) {
+        .answered => |said| try testing.expectEqualStrings("postgres", said),
+        else => return error.NothingCameBack,
+    }
+}
+
 test "an ask decides nothing, and there is no member of an answer that could" {
     // **The rule this whole region is built under.** An approval asks "may I do
     // this act" and its answer is a decision recorded against that act; an ask
@@ -13854,11 +13979,16 @@ test "an ask decides nothing, and there is no member of an answer that could" {
         );
     }
     inline for (@typeInfo(Question).@"struct".fields) |field| {
-        const ok = field.type == []const u8 or field.type == []const []const u8 or field.type == i64;
+        // `Echo` is here because it says how a member is drawn and never what
+        // may happen. **It is named one by one on purpose**: allowing every
+        // enum, or every `bool`, would let a `permitted` through the very check
+        // this is.
+        const ok = field.type == []const u8 or field.type == []const []const u8 or
+            field.type == i64 or field.type == Question.Echo;
         if (!ok) @compileError(
-            "Question gained the member \"" ++ field.name ++ "\", which is neither text nor the " ++
-                "deadline. An ask names no act, and a member that named one would make this an " ++
-                "approval by another name",
+            "Question gained the member \"" ++ field.name ++ "\", which is neither text, the " ++
+                "deadline, nor how it is drawn. An ask names no act, and a member that named one " ++
+                "would make this an approval by another name",
         );
     }
 
