@@ -1407,6 +1407,29 @@ test "a cgroup name is read strictly, and any other shape is refused" {
 /// The first ancestor of this process's own cgroup that delegates every wanted
 /// controller, in `buffer`. The two tests below make a directory of their own
 /// there, which is the same place `create` makes one.
+/// The nearest ancestor cgroup that delegates the wanted controllers, or null.
+///
+/// **Null is why the cgroup tests skip, and a skip here is not a pass.** Four
+/// tests below and one in `driver.zig` need an ancestor that both delegates the
+/// controllers and lets this user create a subdirectory in it. An ordinary
+/// login session gets neither: it sits in a `session-N.scope` with an empty
+/// `cgroup.subtree_control` that it may not write to, so this walks to the root
+/// and answers null.
+///
+/// **To run them on a developer machine**, make a cgroup this user owns and put
+/// the shell in it before the tests start:
+///
+/// ```
+/// sudo mkdir -p /sys/fs/cgroup/chocktest/leaf
+/// echo "+cpu +io +memory +pids" \
+///   | sudo tee /sys/fs/cgroup/chocktest/cgroup.subtree_control
+/// sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/chocktest
+/// sudo sh -c "echo $$ > /sys/fs/cgroup/chocktest/leaf/cgroup.procs"
+/// ```
+///
+/// Measured 2026-09-16 on the author's machine: the suite goes from 9 skipped
+/// to 4, and the five that were skipped run and pass. `ci.yml` does the same
+/// thing for every Linux runner, and fails the build if the runner refuses.
 fn testDelegatingAncestor(buffer: []u8) ?usize {
     const root = findRoot() orelse return null;
     var relative_buffer: [max_control_file_bytes]u8 = undefined;

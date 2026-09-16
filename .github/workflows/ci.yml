@@ -65,8 +65,51 @@ jobs:
           fi
           echo "a Seatbelt profile can be entered on this runner"
 
+      - name: Permit a delegated cgroup
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          echo "this job starts in:"
+          cat /proc/self/cgroup
+
+          # **The cgroup layer is the third sandbox layer, and it was the only
+          # one this file did not prove.** Four tests in
+          # lib/chock-sandbox/linux/cgroup.zig and one in linux/driver.zig need
+          # an ancestor cgroup that delegates the controllers AND that this
+          # user may create a subdirectory in. A runner puts every step under
+          # system.slice, which delegates nothing, so all five answered
+          # SkipZigTest and the layer went untested. Measured on the author's
+          # own machine: with the cgroup below, skips drop from 9 to 4 and the
+          # five run and pass.
+          sudo mkdir -p /sys/fs/cgroup/chock/leaf
+          echo "+cpu +io +memory +pids" \
+            | sudo tee /sys/fs/cgroup/chock/cgroup.subtree_control > /dev/null
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/chock
+
+          # The proof, and not the assumption: make a directory as this user,
+          # which is the one thing every one of those tests does first.
+          if ! mkdir /sys/fs/cgroup/chock/proof; then
+            echo "::error::this runner refuses a delegated cgroup, so the" \
+                 "cgroup tests cannot run here. NOT skipping: a check that" \
+                 "was not made is never a pass." >&2
+            exit 1
+          fi
+          rmdir /sys/fs/cgroup/chock/proof
+          echo "a cgroup can be delegated on this runner"
+
       - name: Test the sandbox for real
-        run: nix develop --command zig build test --summary all
+        run: |
+          set -euo pipefail
+          # **The move happens here and not in the step above**, because every
+          # step is its own shell and a cgroup a dead shell was in moves
+          # nothing. The tests read /proc/self/cgroup and walk up from it, so
+          # the process that runs them is the one that has to be inside.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo sh -c "echo $$ > /sys/fs/cgroup/chock/leaf/cgroup.procs"
+            echo "the tests run in:"
+            cat /proc/self/cgroup
+          fi
+          nix develop --command zig build test --summary all
 
   release:
     if: github.event_name != 'pull_request'
