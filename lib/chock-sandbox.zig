@@ -77,6 +77,12 @@ pub const router = @import("chock-sandbox/linux/router.zig");
 /// serves the wire and calls the seam. Re-exported so a test can drive the
 /// exchange without a sandbox.
 pub const net_router = @import("chock-sandbox/linux/routerlink.zig");
+/// The channel a device passthrough uses to cross the sandbox boundary: one
+/// descriptor and one destination path, host to sandbox. Re-exported beside
+/// `net_router` for the same reason: a caller outside this library implements
+/// `devicelink.DeviceSeam` and drives `devicelink.serveOne` without reaching a
+/// driver file directly. See its own top comment for the whole design.
+pub const devicelink = @import("chock-sandbox/linux/devicelink.zig");
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
