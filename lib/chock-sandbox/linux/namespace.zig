@@ -2434,6 +2434,15 @@ pub fn pivotInto(allocator: std.mem.Allocator, root: []const u8, diag: ?*?Diagno
 }
 
 test "a resolver file the sandbox does not hold is made where it belongs and written" {
+    // **Linux only, and a crash without this.** This drives the substitution
+    // path in this file, which reaches the kernel through `std.os.linux`. On
+    // macOS those numbers are not the same calls, so the test died with
+    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
+    // build and not as a platform that does not apply. The same guard
+    // `linux/cgroup.zig` carries for the same reason.
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     // **The Nix case, which is the one this project's own machine takes.**
     // `src/run.zig`'s `hostToolchainPaths` binds `/nix/store` and nothing
     // else, so the sandbox has no `/etc` at all: there is nothing to replace
@@ -2474,6 +2483,15 @@ test "a resolver file the sandbox does not hold is made where it belongs and wri
 }
 
 test "a path the sandbox does not hold is not hidden, and is not a fault either" {
+    // **Linux only, and a crash without this.** This drives the substitution
+    // path in this file, which reaches the kernel through `std.os.linux`. On
+    // macOS those numbers are not the same calls, so the test died with
+    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
+    // build and not as a platform that does not apply. The same guard
+    // `linux/cgroup.zig` carries for the same reason.
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     // **Nothing to hide is the ordinary answer.** A sandbox that binds only a
     // toolchain has no `/run` at all, so the nscd socket is already
     // unreachable, and a `hide` that refused to start such a sandbox would
@@ -2493,6 +2511,15 @@ test "a path the sandbox does not hold is not hidden, and is not a fault either"
 }
 
 test "a substitution target that is a symbolic link is refused and never followed" {
+    // **Linux only, and a crash without this.** This drives the substitution
+    // path in this file, which reaches the kernel through `std.os.linux`. On
+    // macOS those numbers are not the same calls, so the test died with
+    // `SIGSYS` on the CI Mac rather than failing: a crash reads as a broken
+    // build and not as a platform that does not apply. The same guard
+    // `linux/cgroup.zig` carries for the same reason.
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     // `mount` resolves its target, so a bind over a link lands wherever the
     // link points, and a link into a path this sandbox does not hold lands
     // nowhere at all. **Refused, loudly, rather than run with a resolver file

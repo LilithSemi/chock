@@ -401,7 +401,17 @@ test "a grant becomes two mounts and two rules, and the socket directory is read
     // version of this function freed the helper path before returning, and the
     // mount tree then named memory that had gone. This is what caught it.
     try testing.expectEqualStrings(armed.helper_path.?, mounts.items[1].bind.target);
-    try testing.expect(std.mem.endsWith(u8, mounts.items[1].bind.target, "/askpass"));
+    // **Both platforms asserted, because both behaviours are deliberate.**
+    // `helperPathFor` puts the helper at `<helper_dir>/<name>` where a build
+    // moves paths, so the target ends in the name that selects the command a
+    // multi-call binary runs. macOS moves no path, so the helper appears where
+    // it really is and the target is the source verbatim. This test asserted
+    // only the first and so failed on the CI Mac.
+    if (sandbox.expresses.moved_paths) {
+        try testing.expect(std.mem.endsWith(u8, mounts.items[1].bind.target, "/askpass"));
+    } else {
+        try testing.expectEqualStrings("/usr/bin/chock", mounts.items[1].bind.target);
+    }
 
     // An act with no helper is one mount and one rule, and owns no path.
     mounts.clearRetainingCapacity();

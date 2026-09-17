@@ -4990,17 +4990,24 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     // The call the kernel refused, by name.
     try testing.expect(std.mem.indexOf(u8, filter.means, "relay_rule") != null);
     // And the command a person runs, with every module in it.
-    try testing.expect(std.mem.indexOf(u8, filter.fix, "modprobe") != null);
-    try testing.expect(std.mem.indexOf(u8, filter.fix, sandbox.Sandbox.filter_modules) != null);
-    for ([_][]const u8{
-        "nf_tables",
-        "nf_nat",
-        "nft_chain_nat",
-        "nft_redir",
-        "nft_reject",
-        "nf_conntrack",
-    }) |module| {
-        try testing.expect(std.mem.indexOf(u8, filter.fix, module) != null);
+    // **Guarded on the module list and not on the platform.** `filter_modules`
+    // is empty off Linux, because nftables is a Linux filter, so there is no
+    // module for a fix line to name and this loop would assert the presence of
+    // an empty string. Reading the constant rather than `os.tag` keeps the test
+    // measuring the mechanism.
+    if (sandbox.Sandbox.filter_modules.len != 0) {
+        try testing.expect(std.mem.indexOf(u8, filter.fix, "modprobe") != null);
+        try testing.expect(std.mem.indexOf(u8, filter.fix, sandbox.Sandbox.filter_modules) != null);
+        for ([_][]const u8{
+            "nf_tables",
+            "nf_nat",
+            "nft_chain_nat",
+            "nft_redir",
+            "nft_reject",
+            "nf_conntrack",
+        }) |module| {
+            try testing.expect(std.mem.indexOf(u8, filter.fix, module) != null);
+        }
     }
     // The network above it came up, so its row is still on and says nothing.
     try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "router network").?.state);
@@ -5017,8 +5024,18 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     const dummy_rows = try rowsFor(arena, no_dummy);
     const network = rowNamed(dummy_rows, "router network").?;
     try testing.expect(std.mem.indexOf(u8, network.means, "dummy_create") != null);
-    try testing.expect(std.mem.indexOf(u8, network.fix, "modprobe dummy") != null);
-    try testing.expect(std.mem.indexOf(u8, network.fix, "nft_redir") == null);
+    // **Guarded on the module list, for the reason the filter row above is.**
+    // `network_modules` is empty off Linux, so the fix line names no module
+    // there and this assertion would look for an empty string inside it.
+    if (sandbox.Sandbox.network_modules.len != 0) {
+        try testing.expect(std.mem.indexOf(u8, network.fix, "modprobe") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            network.fix,
+            sandbox.Sandbox.network_modules,
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, network.fix, "nft_redir") == null);
+    }
     // And the ruleset was never reached, so it is not reported as a kernel
     // that answered no to anything.
     const never = rowNamed(dummy_rows, "router filter").?;
@@ -5121,8 +5138,16 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
         "etc/resolv.conf",
         .{},
     );
+    // **Both answers asserted, and the platform decides which.**
+    // `Sandbox.resolver_substitutions` is empty off Linux, so the loop in
+    // `measureResolverFiles` has nothing to walk and the only honest answer is
+    // that the sandbox makes its own. Asserting `owned` everywhere failed on
+    // the CI Mac for a reason that was never a fault.
     try testing.expectEqual(
-        ResolverFiles.owned,
+        if (sandbox.Sandbox.resolver_substitutions.len != 0)
+            ResolverFiles.owned
+        else
+            ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
@@ -5142,8 +5167,12 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
     // The answer does not depend on what is at the three paths any more, which
     // is exactly why this machine now works.
     try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
+    // The same platform split as above, and for the same reason.
     try testing.expectEqual(
-        ResolverFiles.owned,
+        if (sandbox.Sandbox.resolver_substitutions.len != 0)
+            ResolverFiles.owned
+        else
+            ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
