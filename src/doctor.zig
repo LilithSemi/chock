@@ -344,6 +344,15 @@ pub const Measured = struct {
     pidfd: Probe = .{ .absent = driver_gives_nothing },
     tmpfs: Probe = .{ .absent = driver_gives_nothing },
 
+    /// Whether this build's driver can bind a device node into the sandbox at
+    /// all. **Read from `chock_sandbox.Sandbox.expresses.device_passthrough`**,
+    /// true only on Linux: Darwin's driver reads `Config.device_tree` and
+    /// `Config.device_source` and applies neither, so a session there never
+    /// opens `/dev`. See `deviceRow`'s own doc comment for why a build that
+    /// answers false gets no row here at all, rather than one that reads
+    /// `unsupported`.
+    device_passthrough: bool = sandbox.Sandbox.expresses.device_passthrough,
+
     /// Where `git` is, or null when it is not on this machine's PATH.
     ///
     /// **A session needs it, and the report had no row for it.** Measured on
@@ -785,6 +794,12 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
         try rows.append(arena, try cgroupRow(arena, m.cgroup, m.cgroup_vantage));
     }
 
+    // **Gated on `device_passthrough` alone, and never on `m.family`.** The
+    // two agree on every real build today, but this row states its own fact
+    // and reads its own field, the rule the whole file keeps: see
+    // `Measured.device_passthrough`'s own doc comment.
+    if (m.device_passthrough) try rows.append(arena, deviceRow());
+
     try rows.append(arena, gitRow(m));
     try rows.append(arena, nixRow(m));
     try rows.append(arena, try devShellRow(arena, m.dev_shell));
@@ -1101,6 +1116,39 @@ pub const required_sink_name = "audit sink";
 
 /// The name every org ceiling row carries. See `measureOrgCeilings`.
 pub const org_ceiling_name = "org ceiling";
+
+/// The device passthrough row. **A fact about this build, and never a
+/// fault.** `Measured.device_passthrough` is a compile time constant, so
+/// there is no partial or refused state a kernel could hand back the way a
+/// dialled probe can: it is always exactly `.on` when this row exists at
+/// all. A build that answers false gets no row: `unsupported` would read as
+/// a setting a person could change, and there is none to change. See
+/// `rowsFor`'s own guard.
+///
+/// **On says nothing about whether any device reaches a sandbox today.**
+/// That still needs a project's own `devices` block naming the device, and a
+/// `policy` rule answering `allow` for the same action: a session on a
+/// machine with this row on and neither of those still exposes no device at
+/// all. See `docs/policy.md` and `docs/running.md`.
+///
+/// **A grant this row reports on is coarse by nature, and never narrower
+/// than the whole device.** A device node is a direct channel to a kernel
+/// driver, and seccomp filters `ioctl` by request number and cannot tell
+/// which descriptor it was called on, so "these ioctls on the programmer and
+/// not on the disk" is not a rule this row, or anything else in Chock, can
+/// express. See `docs/sandbox.md`.
+fn deviceRow() Row {
+    return .{
+        .name = "device passthrough",
+        .state = .on,
+        .means = "this build can bind a USB or serial device node into a sandbox, for a device " ++
+            "a project names in its devices block and a policy rule allows",
+        .why = "a device node reaches a kernel driver directly. Chock binds it under the same " ++
+            "uid and mode the person already has, so a session reaches only what that account " ++
+            "could already open, and never a narrower slice of one device",
+        .blocks = false,
+    };
+}
 
 /// One sink this installation requires.
 ///
@@ -3568,6 +3616,7 @@ fn healthy() Measured {
         .overlayfs = .ok,
         .pidfd = .ok,
         .tmpfs = .ok,
+        .device_passthrough = true,
         .git_program = "/run/current-system/sw/bin/git",
         .nix_program = "/run/current-system/sw/bin/nix",
         .dev_shell = .{ .read = false },
@@ -4332,6 +4381,12 @@ fn broken() Measured {
     // form of this row is not a machine that cannot hold it: every machine can,
     // and only a project's own policy takes it away. See `measureHardening`.
     m.write_execute = .relaxed;
+    // `device_passthrough` is a compile time fact and never a probe: nothing
+    // above is a kernel mechanism that could refuse it. Stated false here so
+    // this machine carries no row for it at all, the same as a real Darwin
+    // build would, rather than the one row on this whole struct that could
+    // never read anything but `.on`. See `deviceRow`'s own doc comment.
+    m.device_passthrough = false;
     return m;
 }
 
@@ -5297,7 +5352,6 @@ test "a record from the probe pipe with a byte that names no step is dropped" {
     try testing.expectEqual(Answer.ok, std.enums.fromInt(Answer, 0).?);
 }
 
-
 test "an org ceiling is reported, and an installation with no bundle adds no row" {
     // **A person can see the effect and never the cause.** A session that stops
     // at a number nobody wrote in `chock.zon`, or a spawn refused by a limit the
@@ -5341,4 +5395,33 @@ test "an org ceiling is reported, and an installation with no bundle adds no row
     for (plain) |row| {
         try testing.expect(!std.mem.eql(u8, row.name, org_ceiling_name));
     }
+}
+
+test "device passthrough is a fact this build's driver can act on, and a build with none gets no row" {
+    // **A fact and never a fault.** `device_passthrough` is a compile time
+    // constant, so a build that has it always reads `.on` here: there is no
+    // measurement that could come back partial or refused. A build that
+    // answers false gets no row at all, the same as an installation with no
+    // org bundle gets no ceiling row: `unsupported` would read as a setting
+    // a person could change, and there is none.
+    //
+    // Mutation check: give this row `.blocks = true` and the verdict below
+    // stops being `ready`.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var on = healthy();
+    on.device_passthrough = true;
+    const rows_on = try rowsFor(arena, on);
+    const row = rowNamed(rows_on, "device passthrough").?;
+    try testing.expectEqual(ui.Layer.State.on, row.state);
+    try testing.expectEqualStrings("", row.fix);
+    try testing.expect(!row.blocks);
+    try testing.expectEqual(Verdict.ready, verdictFor(rows_on));
+
+    var off = healthy();
+    off.device_passthrough = false;
+    const rows_off = try rowsFor(arena, off);
+    try testing.expectEqual(@as(?Row, null), rowNamed(rows_off, "device passthrough"));
 }

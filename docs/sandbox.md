@@ -328,6 +328,38 @@ The limits report then reads `supplied` for the cgroup row, which says exactly
 what happened: the program is contained, and Chock wrote none of what contains
 it. Nothing in Chock itself uses this today. A tool call takes the default.
 
+## Device passthrough
+
+**Linux only.** `Sandbox.expresses.device_passthrough` answers `true` on
+Linux and `false` on macOS, and it stays that way: Darwin's driver reads the
+same config a device asks through and applies none of it, so a project that
+names a device on macOS gets no device and no crash, and no row for it in
+`chock doctor` either. See [The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do)
+below for what that build has instead.
+
+When a device is named in a project's `devices` block and let through by a
+`policy` rule, Chock binds its node into the sandbox by the same mechanism a
+workspace path gets: `mknodat` makes a placeholder and a bind mount lands the
+real node on top of it, read and write. See [policy.md](policy.md) for the
+two-block shape that has to agree before any of this runs.
+
+**The grant is the whole device, and never a part of it.** A device node is a
+direct channel to a kernel driver, and most of what the sandbox reasons about
+does not reach past it. seccomp filters `ioctl` by its request number, and a
+filter has no way to read which file descriptor a call was made on, so "let
+the programmer's own ioctls through and refuse the disk's" is not a rule
+Chock, or seccomp itself, can write. A policy that allows
+`device.usb.1d50.6018` allows every operation that node's driver answers to,
+not a chosen subset of them.
+
+**Chock grants nothing the person at the keyboard could not already open.**
+The node is bound in and the sandboxed program opens it under the same uid
+and the same file mode bits the node already has on the host. If the person
+running Chock is not in the `dialout` group, a program in the sandbox is not
+either, and no policy rule changes that: this is ordinary Unix file
+permission, working exactly as it does outside the sandbox, and it is not a
+control Chock adds.
+
 ## The sandbox on macOS, and what it does not do
 
 **A session runs on macOS, with four layers on.** Seatbelt holds the paths, the
@@ -428,6 +460,7 @@ from a kernel version.
 | disk cap tmpfs | yes |
 | overlayfs | no on its own; the resolver files row is where it stops a tool call |
 | cgroup v2, with the vantage it found | no, it degrades |
+| device passthrough | no; absent outright on a build with none, rather than reading unsupported |
 | nix | no |
 | dev shell | no |
 | credential | yes, when one is configured and unreadable |

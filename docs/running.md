@@ -75,6 +75,34 @@ lands on a ref of the session's own, which you read with `git log` and take with
 because only a commit is carried back. Every other tool call still runs without
 asking anybody: see [status.md](status.md).
 
+## Devices
+
+A project can name a USB or serial device it wants a session to reach, in a
+`devices` block of `chock.zon`, one entry per device, named by the action
+`chock doctor` and a policy rule both use:
+
+```zon
+.{
+    .devices = .{
+        .{ .action = "device.usb.1d50.6018" },
+    },
+}
+```
+
+Naming a device here is not enough on its own: `chock.zon` still needs a
+`policy` rule for the same action, because Chock ships no default for
+`device.*`. See [policy.md](policy.md) for the action names and the rule, and
+[sandbox.md](sandbox.md) for what the grant itself does and does not bound.
+
+**A device is picked up at the start of each tool call, and never in the
+middle of one.** A sandbox is built fresh for every tool call and the call
+blocks until the sandboxed program exits, so the machine is scanned once, at
+the moment that call starts, for every device a project named and a policy
+rule allows. Plug a board in while a long running call is already going and
+that call does not see it: the next tool call does, because it scans the
+machine again from nothing. There is no live watch inside a call that is
+already running.
+
 ## What the harness tells the agent
 
 The loop knows things the model can only estimate, and it says them at the end

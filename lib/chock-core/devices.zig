@@ -61,10 +61,16 @@
 //! own state, moved into a process of its own, the same reason
 //! `lib/chock-core/arbiter.zig` is a seam and not a call to
 //! `chock_policy.table.Table` directly. `PolicySeam` is this file's version
-//! of that same seam. A later wiring task fills it in, most plausibly by
-//! routing a device action through the same mid-session ask a tool call
-//! already gets, since a device arrives while a person is there to answer
-//! for it. This file only names the question it needs answered.
+//! of that same seam. This file only names the question it needs answered.
+//!
+//! **`src/run.zig`'s `DevicePolicySeam` is what fills it, and it does NOT
+//! prompt.** Only `allow` exposes a device, and `ask` is a flat refusal. An
+//! earlier draft of this comment guessed that a device action would route
+//! through the same mid-session ask a tool call gets, because a device arrives
+//! while a person is there to answer. That is not what was built, and a comment
+//! that describes a mechanism the code does not have is how a reader ends up
+//! trusting a prompt that never comes. Chock ships no default for `device.*`,
+//! so a project must write an explicit rule to expose one.
 
 const std = @import("std");
 const udev = @import("udev");

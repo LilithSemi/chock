@@ -286,6 +286,44 @@ reaches your repository through nothing but a commit.
 that names the file and this block, so the model reads it once and carries on
 instead of spending turns on a file it will never see.
 
+## Devices
+
+A project reaches a USB or serial device only when it is named twice: once in
+a `devices` block of `chock.zon`, and once in a `policy` rule for the action
+that block names. Chock ships no default for `device.*`, so a device named in
+the `devices` block and nowhere in `policy.rules` still answers `ask`, and
+`ask` refuses here: there is nobody at the keyboard to ask while a session is
+already running.
+
+```zon
+.{
+    .devices = .{
+        .{ .action = "device.usb.1d50.6018" },
+    },
+    .policy = .{
+        .rules = .{
+            .{ .action = "device.usb.1d50.6018", .decision = .allow },
+        },
+    },
+}
+```
+
+**The action name is the device's identity and never its path.**
+`/dev/ttyUSB0` changes with plug order and after a reboot, so a rule written
+against it stops being true the moment the board is unplugged and plugged
+back in. A USB device is named `device.usb.<vendor>.<product>`, in lower case
+hex. A serial adapter with a serial of its own is named
+`device.tty.serial.<serial>`, because a whole run of USB-to-serial chips from
+one factory can share a vendor and product id, and the serial is what tells
+two of them apart. A serial adapter with none is named
+`device.tty.<vendor>.<product>`, the same shape as a USB device.
+
+Naming a device in the `devices` block only says the project wants it. The
+`policy` rule beside it is what lets a session reach the node. See
+[running.md](running.md) for what the `devices` block does and when a device
+that arrives is picked up, and [sandbox.md](sandbox.md) for what the grant
+itself does and does not bound.
+
 ## The ratchet
 
 **An agent may propose policy, for a subagent it spawns and for itself.
