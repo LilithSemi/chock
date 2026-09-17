@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - "release/**"
     tags:
       - "v[0-9]*.[0-9]*.[0-9]*"
 
@@ -128,9 +129,17 @@ jobs:
       - name: Build the release artefacts
         run: |
           set -euo pipefail
+          version=$(nix eval .#default.version --raw)
+
+          # **A version-less copy is made for a tagged release alone.**
+          # GitHub serves `releases/latest/download/<name>` out of the latest
+          # FULL release and never out of a prerelease, and every unstable
+          # build is a prerelease. So on those, a second copy is the same
+          # bytes under a name nothing resolves: it doubled the assets of
+          # every unstable release and nobody could reach half of them.
           case "${GITHUB_REF}" in
-            refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
-            *) version="0.0.0-g$(git rev-parse --short HEAD)" ;;
+            refs/tags/v*) permanent_name=1 ;;
+            *) permanent_name=0 ;;
           esac
 
           mkdir -p artifacts
@@ -170,7 +179,11 @@ jobs:
             # timestamp of its own. Two builds of the same commit then give the
             # same digest, which is what makes SHA256SUMS worth publishing for
             # a tool whose whole claim is about boundaries.
-            for shape in "${name}" "chock-${target}"; do
+            shapes=("${name}")
+            if [ "${permanent_name}" = 1 ]; then
+              shapes+=("chock-${target}")
+            fi
+            for shape in "${shapes[@]}"; do
               rm -rf "stage/${shape}"
               mkdir -p "stage/${shape}"
               cp "build/${target}/bin/chock" "stage/${shape}/chock"
@@ -186,7 +199,7 @@ jobs:
           # **A digest beside every artefact.** A tool whose whole claim is
           # about boundaries, downloaded with nothing to check it against, is
           # the first thing a sceptic points at. Written last so it covers the
-          # version-less copies too.
+          # version-less copy too, on a release that has one.
           ( cd artifacts && sha256sum chock-*.tar.gz > SHA256SUMS )
 
           ls -l artifacts
@@ -220,10 +233,22 @@ jobs:
           # **So this job cannot be re-run over a published tag.** Immutability
           # is what refuses it, and that is the point of immutability: the
           # bytes under a version never change. Cut a new version instead.
+          # **A candidate is published as a prerelease.** `releases/latest`
+          # and `releases/latest/download/<name>` are both served from the
+          # newest FULL release, so a candidate published as one would put
+          # itself in front of every reader who asked for the release. A tag
+          # carrying a pre-release part is exactly what a candidate is:
+          # `v0.1.0-rc1` has one and `v0.1.0` does not.
+          mark=()
+          case "${GITHUB_REF_NAME}" in
+            *-*) mark=(--prerelease) ;;
+          esac
+
           if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
               --draft \
               --verify-tag \
+              ${mark[@]+"${mark[@]}"} \
               --title "${GITHUB_REF_NAME}" \
               --generate-notes
           fi
@@ -242,7 +267,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="unstable-${GITHUB_SHA:0:7}"
+          tag=$(nix eval .#default.version --raw)
 
           # **A tag per build, and never a tag that moves.** A release is
           # immutable once it is published, so the assets of one that already
@@ -262,10 +287,17 @@ jobs:
             --draft \
             --prerelease \
             --title "unstable (${GITHUB_SHA:0:7})" \
-            --notes "Built from master at ${GITHUB_SHA}. This is not a release: it is one build of the default branch, tested no further than the checks on this commit."
+            --generate-notes
           gh release upload "${tag}" artifacts/*
           gh release edit "${tag}" --draft=false
 
+          # **Matched on `-unstable` inside the tag, and never on the
+          # prerelease flag.** The tag is the version now, so an unstable
+          # build is `0.1.0-unstable-<date>-<rev>` and a release candidate
+          # somebody cut by hand is `1.0.0-rc1`. Both are prereleases, and
+          # only one of them is this job's to delete: matching the flag alone
+          # would eventually eat a release candidate.
+          #
           # **Pruned, because one release per push grows without bound.**
           # The newest few stay, so a person who linked to one yesterday is
           # not immediately broken, and the rest go with their tags.
@@ -277,7 +309,7 @@ jobs:
           keep=5
           mapfile -t stale < <(
             gh release list --limit 100 --json tagName,isPrerelease \
-              --jq "[.[] | select(.isPrerelease and (.tagName | startswith(\"unstable-\")))] | .[${keep}:] | .[].tagName"
+              --jq "[.[] | select(.isPrerelease and (.tagName | contains(\"-unstable\")))] | .[${keep}:] | .[].tagName"
           )
           for old in "${stale[@]:-}"; do
             [ -z "${old}" ] && continue
