@@ -1836,7 +1836,6 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
     ));
 }
 
-
 test "a layer above the project adds denied paths, and the project cannot take one off" {
     // **The gap this closes.** An org policy bundle could narrow a rule and
     // could not hide a file, so a `chock.zon` that simply did not name a path

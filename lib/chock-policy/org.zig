@@ -1232,7 +1232,6 @@ test "a budget ceiling of zero or below is refused when the bundle is read" {
     );
 }
 
-
 test "a bundle carries a subagent ceiling, and one that caps nothing is refused" {
     const gpa = testing.allocator;
 

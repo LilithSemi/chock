@@ -751,7 +751,6 @@ test "no two faults of this module read the same" {
     }
 }
 
-
 test "an org ceiling narrows a project's limits and never widens them" {
     // **The gap this closes.** A bundle could cap what a project spends and
     // not how wide its spawn tree grows, so an organisation had no answer at

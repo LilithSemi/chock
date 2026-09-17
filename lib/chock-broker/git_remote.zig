@@ -128,15 +128,15 @@ pub fn namesAUrl(named: []const u8) bool {
 
 /// Options of `git push` that carry no value of their own.
 const no_value_options: []const []const u8 = &.{
-    "--all",           "--atomic",         "--delete",             "-d",
-    "--dry-run",       "-n",               "--follow-tags",        "--force",
-    "-f",              "--force-with-lease", "--no-force-with-lease", "--ipv4",
-    "-4",              "--ipv6",           "-6",                   "--mirror",
-    "--no-atomic",     "--no-progress",    "--no-signed",          "--no-thin",
-    "--no-verify",     "--porcelain",      "--progress",           "--prune",
-    "--quiet",         "-q",               "--set-upstream",       "-u",
-    "--signed",        "--tags",           "--thin",               "--verbose",
-    "-v",              "--verify",
+    "--all",       "--atomic",           "--delete",              "-d",
+    "--dry-run",   "-n",                 "--follow-tags",         "--force",
+    "-f",          "--force-with-lease", "--no-force-with-lease", "--ipv4",
+    "-4",          "--ipv6",             "-6",                    "--mirror",
+    "--no-atomic", "--no-progress",      "--no-signed",           "--no-thin",
+    "--no-verify", "--porcelain",        "--progress",            "--prune",
+    "--quiet",     "-q",                 "--set-upstream",        "-u",
+    "--signed",    "--tags",             "--thin",                "--verbose",
+    "-v",          "--verify",
 };
 
 /// Options of `git push` that take the argument after them.
@@ -145,8 +145,8 @@ const no_value_options: []const []const u8 = &.{
 /// absent from both lists stops the reading, which costs a prompt and never a
 /// wrong answer.
 const value_options: []const []const u8 = &.{
-    "--exec",          "-o",               "--push-option",        "--receive-pack",
-    "--recurse-submodules", "--repo",      "--server-option",
+    "--exec",               "-o",     "--push-option",   "--receive-pack",
+    "--recurse-submodules", "--repo", "--server-option",
 };
 
 fn isOneOf(needle: []const u8, list: []const []const u8) bool {

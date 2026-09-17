@@ -2200,7 +2200,6 @@ test "a server that stopped answering is unavailable once, and never asked again
     try testing.expect(try session.afterWrite(gpa, io, "src/main.zig") == null);
 }
 
-
 test "a language server's action name is its program, and a path does not change it" {
     // **The name is what gives this act a lever at all.** Before it, the
     // command was read from `chock.zon` and started, and no rule and no org

@@ -1601,7 +1601,6 @@ test "a record the table could not keep reaches the caller, and no longer only a
     try testing.expectEqual(@as(?Diagnostic, null), table.takeLost());
 }
 
-
 test "a rate limited child is not reported as a refused one" {
     // **The bug this member exists for, measured in a real session.** A
     // subagent spawned in parallel with three others was rate limited, spent

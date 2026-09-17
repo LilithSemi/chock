@@ -369,7 +369,7 @@ test "the pid namespace still applies over an image" {
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
-            "/bin/busybox", "sh", "-c",
+            "/bin/busybox",                                                                               "sh", "-c",
             "n=$(ls /proc | grep -c '^[0-9]'); [ \"$n\" -ge 2 ] || exit 10; [ \"$n\" -le 16 ] || exit 9",
         }),
     );
