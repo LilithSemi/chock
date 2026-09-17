@@ -134,7 +134,19 @@ jobs:
           esac
 
           mkdir -p artifacts
-          for target in x86_64-linux aarch64-linux; do
+          # **macOS is cross compiled from here and not built on a Mac.**
+          # Measured 2026-09-16: `zig build -Dtarget=aarch64-macos` on Linux
+          # produces a real Mach-O arm64 executable. The site says Chock runs on
+          # Linux and macOS, so a release that shipped Linux alone left half the
+          # readers with no file at all.
+          #
+          # **Apple Silicon only, and no `x86_64-macos`.** It cross compiles
+          # cleanly, so this is not a limit of the toolchain. macOS 27 shipped
+          # on 2026-09-14 and dropped every Intel Mac; Tahoe 26 was the last
+          # release that ran on one, and it holds security updates only into
+          # 2028. A new tool shipping an Intel Mac binary now is building for a
+          # platform that ended this month.
+          for target in x86_64-linux aarch64-linux aarch64-macos; do
             name="chock-${version}-${target}"
             nix develop --command zig build \
               -Doptimize=ReleaseSmall \
@@ -142,9 +154,24 @@ jobs:
               -Dversion="${version}" \
               --prefix "build/${target}"
             cp "build/${target}/bin/chock" "artifacts/${name}"
+            # **A copy with no version in the name, beside the versioned one.**
+            # GitHub serves `releases/latest/download/<name>`, which is a
+            # permanent address only when the name never changes. The versioned
+            # name changes every release and so cannot be linked to, and the
+            # website would otherwise have to bake in a URL that is only as
+            # fresh as its last deploy. People who want to pin still have the
+            # versioned name.
+            cp "build/${target}/bin/chock" "artifacts/chock-${target}"
           done
 
+          # **A digest beside every artefact.** A tool whose whole claim is
+          # about boundaries, downloaded with nothing to check it against, is
+          # the first thing a sceptic points at. Written last so it covers the
+          # version-less copies too.
+          ( cd artifacts && sha256sum chock-* > SHA256SUMS )
+
           ls -l artifacts
+          cat artifacts/SHA256SUMS
 
           reported="$(./artifacts/chock-${version}-x86_64-linux --version)"
           echo "the binary reports: ${reported}"
@@ -172,3 +199,51 @@ jobs:
               --generate-notes
           fi
           gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber
+
+      # **A rolling build of master that a stranger can actually download.**
+      # Measured 2026-09-16: a workflow artefact answers `401` to an anonymous
+      # request even on a public repository, and it expires after ninety days.
+      # So until this existed, nothing built from master was reachable by
+      # anybody who was not signed in. A prerelease is anonymous, does not
+      # expire, and is one file per target rather than a zip of all of them.
+      - name: Publish the rolling unstable build
+        if: github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # **The tag is moved first and the release is never deleted.**
+          # Deleting and recreating would leave a window with no unstable
+          # release at all, and a job that failed in that window would leave
+          # the download page empty. Moving the tag and clobbering the assets
+          # has no such window.
+          git tag -f unstable "${GITHUB_SHA}"
+          git push -f origin refs/tags/unstable
+
+          if ! gh release view unstable >/dev/null 2>&1; then
+            gh release create unstable \
+              --prerelease \
+              --title "unstable (${GITHUB_SHA:0:7})" \
+              --notes "Built from master. This is not a release: it moves with every push, and it is not tested beyond the checks on this commit."
+          fi
+
+          gh release upload unstable artifacts/* --clobber
+          gh release edit unstable --title "unstable (${GITHUB_SHA:0:7})"
+
+      # **Only after the assets are up.** The page reads the release list at
+      # build time, so a rebuild that ran first would publish the previous
+      # state. Skipped entirely when nobody has configured the hook, so this is
+      # inert until the secret exists rather than a red job.
+      - name: Refresh the download page
+        if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')
+        env:
+          HOOK: ${{ secrets.NETLIFY_BUILD_HOOK }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOOK:-}" ]; then
+            echo "no NETLIFY_BUILD_HOOK is set, so the page will refresh on its next deploy"
+            exit 0
+          fi
+          curl -fsS -X POST -d '{}' "${HOOK}" > /dev/null
+          echo "asked the site to rebuild"
