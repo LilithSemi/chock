@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan#8dbb53dca5e923ec497b00a802b25e762ed86369",
-            .hash = "vulcan-0.0.0-d6EfZEDfhAD7LsCcFmT2iQvBeXNm6hPtxPo96ZpF_bFR",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/vulcan.git#2cb8ca63f37e2abe7c710e1691f3349bd86ab5be",
+            .hash = "vulcan-0.0.0-d6EfZEUBnwACn46df0z0srU6bg59280658kqUnGkuMGK",
         },
         .phantom = .{
             .url = "git+https://git.lilithsemi.com/PhantomUI/phantom#7694e28f3c8d24e8a44b8ec755792375d26e3891",
