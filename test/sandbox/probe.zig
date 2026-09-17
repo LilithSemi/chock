@@ -5538,12 +5538,17 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             network.netBroker(),
         );
 
-        if (run.served != 1) {
-            std.debug.print("the device link was not served alongside the broker: drained {d}\n", .{run.served});
-            return 5;
-        }
-        if (network.granted != 1 or network.refused != 0) {
-            std.debug.print("the broker granted {d} and refused {d}\n", .{ network.granted, network.refused });
+        // **Both counts on one line, whichever of them is wrong.** This is
+        // the only report anyone gets: the caller reads an exit status, and a
+        // run that printed the device count alone would leave a reader
+        // guessing at the broker's, which is the other half of the very
+        // property this operation is about. Measured 2026-09-17: one CI run
+        // failed here and named neither, because the line went nowhere.
+        if (run.served != 1 or network.granted != 1 or network.refused != 0) {
+            std.debug.print(
+                "the multiplexed loop drained {d} of 1 device changes, and the broker granted {d} of 1 and refused {d} of 0\n",
+                .{ run.served, network.granted, network.refused },
+            );
             return 5;
         }
         return reportChildTerm(run.term);

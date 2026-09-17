@@ -98,6 +98,35 @@ fn runProbeWithRoot(op: []const u8, root: []const u8) !std.process.Child.Term {
     return runProbeArgv(&.{ probe_path, op, root });
 }
 
+/// Same as `runProbeWithRoot`, and it lets the probe's own diagnostics through
+/// to this binary's standard error.
+///
+/// **For an operation that ends with a printed reason and a status of its
+/// own.** The device operations answer 3 for a setup fault and 5 for a
+/// measured one, each beside a line naming which check refused and with what
+/// numbers, and `runProbeWithRoot` discards every one of them. A CI run then
+/// says "expected 0, found 5" and the reason the probe printed is gone.
+/// Measured on 2026-09-17: that is exactly what one aarch64 run reported, and
+/// the line that would have named the cause had been thrown away.
+///
+/// **Safe for the `quiet test binaries` step**, which is why this is
+/// `inherit` rather than a pipe this file would print from. None of these
+/// operations writes a byte on a run that passes, so nothing reaches this
+/// binary's standard error unless the test is already failing. See
+/// `test/proto/lock.zig`'s own `spawned_programs` for the rule, and
+/// `test/core/lsp.zig` for the same choice made the same way.
+fn runProbeSayingWithRoot(op: []const u8, root: []const u8) !std.process.Child.Term {
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ probe_path, op, root },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(term);
+    return term;
+}
+
 /// Same as `runProbe`, for an operation that needs one or more further
 /// arguments on the command line, such as a scratch root this test built with
 /// `scratchRoot`, or a host pid or a host shmid the test built outside every
@@ -816,7 +845,7 @@ test "a device the caller pushes inward lands read-write, and the sandboxed prog
     // rather than on a content mismatch, which is still a failure here.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeWithRoot("spawn-device-place", scratch.path());
+    const term = try runProbeSayingWithRoot("spawn-device-place", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -831,7 +860,7 @@ test "the sandboxed program cannot read the hidden device tree, though it reads 
     // open a path under the hidden tree that nobody placed there for it.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeWithRoot("spawn-device-hidden-denied", scratch.path());
+    const term = try runProbeSayingWithRoot("spawn-device-hidden-denied", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
@@ -850,7 +879,7 @@ test "the multiplexed loop serves a device source alongside a broker link" {
     // the device source is never drained while the broker is being served.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeWithRoot("spawn-device-with-broker", scratch.path());
+    const term = try runProbeSayingWithRoot("spawn-device-with-broker", scratch.path());
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
