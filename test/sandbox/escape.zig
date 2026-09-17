@@ -98,33 +98,60 @@ fn runProbeWithRoot(op: []const u8, root: []const u8) !std.process.Child.Term {
     return runProbeArgv(&.{ probe_path, op, root });
 }
 
-/// Same as `runProbeWithRoot`, and it lets the probe's own diagnostics through
-/// to this binary's standard error.
+/// Same as `runProbeWithRoot`, and it keeps what the probe said on standard
+/// error so a failure can name itself.
 ///
 /// **For an operation that ends with a printed reason and a status of its
 /// own.** The device operations answer 3 for a setup fault and 5 for a
 /// measured one, each beside a line naming which check refused and with what
 /// numbers, and `runProbeWithRoot` discards every one of them. A CI run then
 /// says "expected 0, found 5" and the reason the probe printed is gone.
-/// Measured on 2026-09-17: that is exactly what one aarch64 run reported, and
-/// the line that would have named the cause had been thrown away.
+/// Measured on 2026-09-17: that is exactly what two CI runners reported.
 ///
-/// **Safe for the `quiet test binaries` step**, which is why this is
-/// `inherit` rather than a pipe this file would print from. None of these
-/// operations writes a byte on a run that passes, so nothing reaches this
-/// binary's standard error unless the test is already failing. See
-/// `test/proto/lock.zig`'s own `spawned_programs` for the rule, and
-/// `test/core/lsp.zig` for the same choice made the same way.
-fn runProbeSayingWithRoot(op: []const u8, root: []const u8) !std.process.Child.Term {
+/// **A pipe this test owns, and never `inherit`.** Measured on 2026-09-17,
+/// the same day, by trying `inherit` first: a host that refuses the
+/// namespaces writes `sandbox: open on /proc/self/setgroups failed: ACCES`
+/// on the way to the status that makes these tests SKIP, and `inherit` put
+/// those bytes on this binary's own standard error. `build.zig`'s `quiet test
+/// binaries` step then failed the build over three lines from three tests
+/// that had all passed. A pipe cannot do that: the bytes are this test's to
+/// hold and to show only when it is already failing.
+///
+/// **Standard output stays ignored, on purpose.** Reading two pipes to the
+/// end, one after the other, blocks forever if the one nobody is reading
+/// fills while this waits on the other. None of the operations this serves
+/// writes to standard output, so there is one pipe here, and one pipe cannot
+/// deadlock against itself.
+fn runProbeSayingWithRoot(op: []const u8, root: []const u8) !CaptureResult {
     var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ probe_path, op, root },
         .stdin = .ignore,
         .stdout = .ignore,
-        .stderr = .inherit,
+        .stderr = .pipe,
     });
-    const term = try child.wait(std.testing.io);
-    try skipIfNothingMeasured(term);
-    return term;
+
+    var result = CaptureResult{ .term = undefined };
+    result.err_len = readPipeToEnd(child.stderr.?.handle, &result.err_buffer);
+    result.term = try child.wait(std.testing.io);
+    try skipIfNothingMeasured(result.term);
+    return result;
+}
+
+/// Assert the probe ended cleanly, and put what it said in front of the
+/// reader when it did not. An exit status on its own names no cause.
+///
+/// **Reported through `std.testing` and never through a print of this file's
+/// own.** `test/proto/lock.zig` holds every file that may name standard
+/// error, and a test binary is not one of them: the line has to arrive as a
+/// failing comparison, which is printed by the test runner and only when
+/// something has already gone wrong.
+fn expectProbeSucceeded(result: CaptureResult) !void {
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    try std.testing.expectEqualStrings("", result.err());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 }
 
 /// Same as `runProbe`, for an operation that needs one or more further
@@ -845,8 +872,7 @@ test "a device the caller pushes inward lands read-write, and the sandboxed prog
     // rather than on a content mismatch, which is still a failure here.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeSayingWithRoot("spawn-device-place", scratch.path());
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try expectProbeSucceeded(try runProbeSayingWithRoot("spawn-device-place", scratch.path()));
 }
 
 test "the sandboxed program cannot read the hidden device tree, though it reads the node placed out of it" {
@@ -860,8 +886,7 @@ test "the sandboxed program cannot read the hidden device tree, though it reads 
     // open a path under the hidden tree that nobody placed there for it.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeSayingWithRoot("spawn-device-hidden-denied", scratch.path());
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try expectProbeSucceeded(try runProbeSayingWithRoot("spawn-device-hidden-denied", scratch.path()));
 }
 
 test "the multiplexed loop serves a device source alongside a broker link" {
@@ -879,8 +904,7 @@ test "the multiplexed loop serves a device source alongside a broker link" {
     // the device source is never drained while the broker is being served.
     var scratch = try scratchRoot();
     defer scratch.cleanup();
-    const term = try runProbeSayingWithRoot("spawn-device-with-broker", scratch.path());
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try expectProbeSucceeded(try runProbeSayingWithRoot("spawn-device-with-broker", scratch.path()));
 }
 
 test "a session with no device source forks no helper, counted at the process table" {
