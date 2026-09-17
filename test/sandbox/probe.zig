@@ -3453,6 +3453,63 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
             return 0;
         }
 
+        if (std.mem.eql(u8, args[1], "spawned-filtered-grant-and-device")) {
+            // **Both halves of the multiplexed loop, measured from inside.**
+            // This program asks the broker AND waits for the device node, so
+            // it cannot end well unless the one loop outside served both
+            // descriptors of the same call.
+            //
+            // **Written because counting from outside measured a race and
+            // never a property.** The operation that starts this used to run
+            // the grant on its own, which never touches the device, and the
+            // caller then asserted that the loop had drained the device
+            // source by the time the program happened to exit. Nothing made
+            // the loop do that before the program ended, so the assertion
+            // held on the development machine and failed on two CI runners,
+            // each reporting `drained 0 of 1` beside `granted 1 of 1`. A
+            // program that waits for the device has no such window: the loop
+            // serves it, or this program fails on its own bound.
+            const grant_refused: u8 = 3;
+            const never_appeared: u8 = 5;
+            const read_failed: u8 = 6;
+            const wrong_content: u8 = 7;
+
+            const answer = sandbox.net_broker.ask(
+                sandbox.net_broker.fd_number,
+                filtered_host,
+                granted_port,
+            ) catch |err| {
+                std.debug.print("ask failed: {s}\n", .{@errorName(err)});
+                return grant_refused;
+            };
+            switch (answer) {
+                .granted => |fd| _ = linux.close(fd),
+                .refused => {
+                    std.debug.print("a host the policy permits was refused\n", .{});
+                    return grant_refused;
+                },
+            }
+
+            // The same bounded retry "spawned-device-place" uses, and for the
+            // same reason: neither half is ordered against the other, so this
+            // polls rather than assumes which one won.
+            var attempt: usize = 0;
+            while (attempt < 200) : (attempt += 1) {
+                const fd_rc = linux.open(device_probe_path, .{ .ACCMODE = .RDONLY }, 0);
+                if (linux.errno(fd_rc) == .SUCCESS) {
+                    const fd: i32 = @intCast(fd_rc);
+                    defer _ = linux.close(fd);
+                    var buffer: [64]u8 = undefined;
+                    const n = linux.read(fd, &buffer, buffer.len);
+                    if (linux.errno(n) != .SUCCESS) return read_failed;
+                    return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else wrong_content;
+                }
+                var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+                _ = linux.nanosleep(&pause, null);
+            }
+            return never_appeared;
+        }
+
         if (std.mem.eql(u8, args[1], "spawned-filtered-refused")) {
             // **What a refusal tells this process, which must be nothing.**
             // The descriptor table before and after is the whole check: a
@@ -5497,11 +5554,11 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
     if (std.mem.eql(u8, args[1], "spawn-device-with-broker")) {
         // Task 4b's own third property: the loop serves the device link
         // while a broker link is also present. The sandboxed program only
-        // ever asks the broker, through the existing "spawned-filtered-grant"
-        // operation; the device is fed from the outside and never opened
-        // from in here at all, so a pass proves the multiplexing and nothing
-        // about `runDevice`'s own placement work, which "spawn-device-place"
-        // above already covers.
+        // asks the broker AND waits for the device node, through
+        // "spawned-filtered-grant-and-device", so it cannot end well unless
+        // the one loop out here served both descriptors of this same call.
+        // The two counts below are then a second reading of the same fact,
+        // and never the only reading, which is what they used to be.
         const granted = listenLoopback() catch |err| {
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
@@ -5531,7 +5588,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const run = try deviceEscape(
             arena,
             root_arg,
-            "spawned-filtered-grant",
+            "spawned-filtered-grant-and-device",
             &.{ports},
             &.{},
             &.{},
