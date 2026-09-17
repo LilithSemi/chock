@@ -355,6 +355,64 @@ pub const Config = struct {
     /// **`Config.copy` carries this across as it is**, for the reason
     /// `net_broker` gives.
     net_router: ?NetRouter = null,
+    /// Who pushes a device inward, while the sandboxed program runs.
+    ///
+    /// **Exclusive with neither `net_broker` nor `net_router`.** A hardware
+    /// session may want a network and a JTAG adapter at once, so a caller may
+    /// name this alongside either of the two above, or alongside neither.
+    ///
+    /// **Never required and never refused for being absent.** A session with
+    /// no hardware to hand over sets this to `null`, forks no helper for it,
+    /// and polls no extra descriptor for it: see `linux/driver.zig`'s own
+    /// `spawn`, and the test that proves that session is byte for byte
+    /// unchanged from one built before this field existed.
+    ///
+    /// The Darwin driver reads this field and applies nothing, the same as
+    /// every other field on this struct.
+    ///
+    /// **`Config.copy` carries this across as it is**, for the reason
+    /// `net_broker` gives.
+    ///
+    /// **Needs `Config.device_tree`.** The device helper places a device by
+    /// binding a path out of that field's own `host` directory, so a config
+    /// that names this field with no `device_tree` is refused with
+    /// `error.DeviceSourceNeedsTree` before anything forks, the same as a
+    /// filtered network with no broker. See `Config.device_tree` and
+    /// `linux/driver.zig`'s `placeDevice`.
+    device_source: ?DeviceSource = null,
+    /// The one host directory a device may be placed out of, and where
+    /// `spawn` binds it inside the session's own root, before anything
+    /// pivots. See `Config.device_source`.
+    ///
+    /// **This is the boundary that replaces a descriptor's own guarantee.**
+    /// A device passthrough used to cross the sandbox boundary as an open
+    /// descriptor, which needed no path resolved on either side. A
+    /// descriptor opened on the host cannot become a mount inside the
+    /// in-sandbox helper's own mount namespace, so this field exists to draw
+    /// the boundary a path can still hold: only Chock's own host side
+    /// decides what `host` names, and the helper only ever resolves a path
+    /// relative to it, checked to never climb back out. See
+    /// `linux/devicelink.zig`'s own top comment for the whole argument, and
+    /// `linux/driver.zig`'s `buildDeviceSource` for the check itself.
+    ///
+    /// **`inside` is never granted through `Config.rules`.** Landlock is an
+    /// allowlist, so a path this list never names is a path the sandboxed
+    /// program cannot open, list, or resolve through, even though the bind
+    /// itself is really there in its own filesystem view after the pivot. A
+    /// caller that added a rule for `inside` would be handing the sandboxed
+    /// program the same reach into `host` that only the helper is meant to
+    /// have.
+    ///
+    /// Null exactly when `device_source` is: naming one without the other is
+    /// refused before anything forks. See `SpawnError.DeviceSourceNeedsTree`.
+    ///
+    /// The Darwin driver reads this field and applies nothing, the same as
+    /// every other field on this struct.
+    ///
+    /// **`Config.copy` carries this across as its own duplicate strings**,
+    /// the same as `root` and `cwd`: a caller's arena can free before the
+    /// copy is done with it.
+    device_tree: ?DeviceTree = null,
     /// Filled in with what the limits layer actually did, when a caller wants
     /// to know. Null is the ordinary case.
     ///
@@ -431,6 +489,19 @@ pub const Config = struct {
         access: landlock.AccessFs,
     };
 
+    /// Both halves of `device_tree`. See that field's own doc comment.
+    pub const DeviceTree = struct {
+        /// A directory outside the sandbox, chosen by Chock's own host side
+        /// policy. Never a path the sandboxed program named: the far side
+        /// that owns `Config.device_source` is the only caller who ever sets
+        /// this.
+        host: []const u8,
+        /// Where `host` is bound, inside the session's own root, before
+        /// anything pivots. Absolute, relative to `Config.root`, and never
+        /// named in `Config.rules`.
+        inside: []const u8,
+    };
+
     /// A copy of this config in `allocator`, sharing no memory with the
     /// original.
     ///
@@ -461,6 +532,11 @@ pub const Config = struct {
         out.root = try allocator.dupe(u8, self.root);
         out.cwd = try allocator.dupe(u8, self.cwd);
         out.env = try copyStrings(allocator, self.env);
+
+        if (self.device_tree) |tree| out.device_tree = .{
+            .host = try allocator.dupe(u8, tree.host),
+            .inside = try allocator.dupe(u8, tree.inside),
+        };
 
         const mounts = try allocator.alloc(namespace.Mount, self.mounts.len);
         for (self.mounts, mounts) |from, *to| {
@@ -808,6 +884,58 @@ pub const NetRouter = struct {
     pub fn open(self: NetRouter, address: Address, port: u16) NetBroker.Grant {
         return self.vtable.open(self.ptr, address, port);
     }
+};
+
+/// Who decides when a device crosses into the sandbox. See `Config.device_source`,
+/// and `linux/devicelink.zig` for the wire that carries the decision in.
+///
+/// ## Why a wakeup descriptor, and not a callback the loop calls on a timer
+///
+/// The driver's own serve loop blocks in `poll`, the same as it does for
+/// `NetBroker` and `NetRouter`. A source that could only be **asked** would
+/// force the loop to wake on a timer and ask again and again, which is a busy
+/// loop with extra steps. A descriptor lets the kernel do the waiting, which
+/// is what every other part of this driver already does: see `wakeup` below.
+///
+/// ## Why this seam runs the other way round from `NetBroker`
+///
+/// `NetBroker` and `NetRouter` answer a question the sandboxed program asks,
+/// on its own schedule. This one runs the other way: the outside decides on
+/// its own schedule, with no question from the inside to answer. A device
+/// becomes available, so the driver is told to place it; a device goes away,
+/// so the driver is told to drop it. Nothing here waits to be asked.
+pub const DeviceSource = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// A descriptor the driver polls. Readable when a placement or a
+        /// removal is waiting. **The source owns it, and the driver never
+        /// closes it**: this seam's `ptr` outlives one `spawn` call, the same
+        /// as `NetBroker`'s and `NetRouter`'s do, and a descriptor closed by
+        /// a borrower would leave the source unable to signal a second call.
+        wakeup: *const fn (ptr: *anyopaque) i32,
+        /// Take the next thing to do, or null when the wakeup fired and
+        /// there was nothing after all. **Called in a loop of its own**: one
+        /// wakeup can carry more than one change, and the driver keeps
+        /// calling this until it answers null before it goes back to `poll`.
+        next: *const fn (ptr: *anyopaque) ?Change,
+    };
+
+    /// One thing to do inside the sandbox.
+    pub const Change = union(enum) {
+        /// Put the node at `source`, relative to `Config.device_tree.host`,
+        /// at `target`, an absolute path inside the sandbox. **No descriptor
+        /// rides with this.** A device passthrough used to hand the driver an
+        /// open descriptor here; that cannot cross into the in-sandbox
+        /// helper's own mount namespace as a mount, so this carries a path
+        /// instead, checked on the far side against the one directory
+        /// `Config.device_tree` names. See that field's own doc comment for
+        /// what stands in for the descriptor's own guarantee.
+        place: struct { kind: u8, source: []const u8, target: []const u8 },
+        /// Take the node at `target` back out.
+        drop: struct { target: []const u8 },
+    };
 };
 
 /// Which cgroup holds the sandboxed program, and **which of the two promises
@@ -1560,6 +1688,13 @@ pub const SetupError = error{
     /// it. See `SpawnError.NetRouterUnavailable`, which is the same member
     /// read from the other side of the pipe.
     NetRouterUnavailable,
+    /// A device source was named, but the in-sandbox helper that places its
+    /// devices never said it was ready. **A setup step and not a config
+    /// fault**: the namespace was taken and the helper's own filter was built,
+    /// and what the kernel refused is something inside that helper's own
+    /// startup, such as `capabilities.keepOnly` or `seccomp.install`. See
+    /// `Config.device_source`.
+    DeviceHelperFailed,
     ProcessGroupFailed,
     /// The process could not be moved into the cgroup that carries its
     /// resource limits. Reported rather than ignored: a program that ran on
@@ -1642,6 +1777,17 @@ pub const SpawnError = error{
     /// Both `Config.net_broker` and `Config.net_router` are set. The two
     /// cannot be on together: see `Config.net_router`.
     NetRouterAndBroker,
+    /// The socket pair that carries a device placement into the sandbox
+    /// could not be made. See `Config.device_source`.
+    DeviceSourceSocketFailed,
+    /// `Config.device_source` is set and `Config.device_tree` is null.
+    /// **Refused rather than left to fail deep inside a session**: the device
+    /// helper resolves a placement's own source relative to
+    /// `device_tree.host`, and a config that named a source with no tree to
+    /// resolve it against would only fail once a real device arrived, as an
+    /// unexplained `MountFailed` this deep into a session. See
+    /// `Config.device_tree`.
+    DeviceSourceNeedsTree,
     /// `Config.containment` is `.supplied` and this build cannot put a child
     /// into a cgroup as the kernel creates it. On Linux that means a kernel
     /// older than `linux/cgroup.zig`'s own `clone_into_cgroup_since`. On
@@ -1954,6 +2100,7 @@ test "a copied config shares no memory with the original, scratch areas included
         .cwd = "/",
         .env = &.{"PATH=/bin"},
         .path_audit = true,
+        .device_tree = .{ .host = "/tmp/chock-devices", .inside = "/.chock-device-tree" },
     };
 
     const copied = try original.copy(arena);
@@ -1977,6 +2124,19 @@ test "a copied config shares no memory with the original, scratch areas included
     try std.testing.expect(original.env.ptr != copied.env.ptr);
     try std.testing.expect(original.mounts.ptr != copied.mounts.ptr);
     try std.testing.expect(original.rules.ptr != copied.rules.ptr);
+
+    // `device_tree` is the same case as `root` and `cwd`: two owned strings,
+    // both duplicated so a copy that outlives its own arena still names a
+    // real directory and not freed memory.
+    //
+    // Mutation check: drop the `if (self.device_tree) |tree| ...` block in
+    // `copy` and `copied.device_tree` reads null, failing the `orelse` below.
+    const original_tree = original.device_tree orelse return error.TestUnexpectedResult;
+    const copied_tree = copied.device_tree orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(original_tree.host, copied_tree.host);
+    try std.testing.expect(original_tree.host.ptr != copied_tree.host.ptr);
+    try std.testing.expectEqualStrings(original_tree.inside, copied_tree.inside);
+    try std.testing.expect(original_tree.inside.ptr != copied_tree.inside.ptr);
 
     // The five numbers and the report pointer are carried across as they are,
     // on purpose: a number is not memory to duplicate, and the report points at
@@ -2035,7 +2195,44 @@ test "a copied config shares no memory with the original, scratch areas included
         @as(?*anyopaque, &stub),
         if (routed.net_router) |one| one.ptr else null,
     );
+
+    // `device_source` is the same case again, for the same reason
+    // `net_router` above is checked with a seam that is really there.
+    //
+    // Mutation check: write `out.device_source = null;` in `copy` and this
+    // fails.
+    var device_stub: StubDevice = .{};
+    const with_device = try (Config{
+        .root = "/",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+        .device_source = device_stub.deviceSource(),
+    }).copy(arena);
+    try std.testing.expectEqual(
+        @as(?*anyopaque, &device_stub),
+        if (with_device.device_source) |one| one.ptr else null,
+    );
 }
+
+/// A device seam that answers nothing. **For `Config.copy` alone**, which
+/// carries the pointer and never calls through it.
+const StubDevice = struct {
+    fn deviceSource(self: *StubDevice) DeviceSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = DeviceSource.VTable{ .wakeup = wakeupFn, .next = nextFn };
+
+    fn wakeupFn(_: *anyopaque) i32 {
+        return -1;
+    }
+
+    fn nextFn(_: *anyopaque) ?DeviceSource.Change {
+        return null;
+    }
+};
 
 /// A router seam that answers nothing. **For `Config.copy` alone**, which
 /// carries the pointer and never calls through it.

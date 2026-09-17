@@ -254,6 +254,15 @@ fn baseEscapeConfig(arena: std.mem.Allocator) !struct {
     const mounts = try arena.dupe(sandbox.namespace.Mount, &.{
         .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
         .{ .bind = .{ .source = self_path, .target = "/probe", .read_only = true } },
+        // A procfs of the sandbox's own, matching what a real tool call
+        // mounts: see `lib/chock-core/tools.zig`'s own `.{ .proc = .{} }`.
+        .{ .proc = .{} },
+        // **`/dev/null`, which is also what makes `/dev` exist.** A Landlock
+        // rule names a path the kernel must be able to resolve when the
+        // ruleset is built, so a rule on `/dev` for a directory nothing has
+        // created yet buys nothing and the program meets EACCES. A real tool
+        // call binds this for its own reasons: see `lib/chock-core/tools.zig`.
+        .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } },
     });
     const rules = try arena.dupe(sandbox.Config.Rule, &.{
         .{ .path = "/nix/store", .access = sandbox.landlock.AccessFs.read_only },
@@ -441,6 +450,366 @@ const FilteredRun = struct {
     granted: usize,
     refused: usize,
 };
+
+/// The path a device probe places its node at, inside the sandbox. Fixed,
+/// so `deviceEscape` and the "spawned-device-place" operation it starts agree
+/// on it without either having to pass it down as an argv of its own.
+const device_probe_path = "/dev/chock-probe0";
+
+/// Where the hidden device tree lands, inside the session's own root, before
+/// anything pivots. See `sandbox.Config.device_tree`.
+const device_tree_inside = "/.chock-device-tree";
+
+/// The name a probe device is written under, relative to the hidden tree's
+/// own host directory. `Change.place.source` names this same string, so the
+/// helper resolves it against the hidden tree and not against anything else.
+const device_probe_source = "probe0";
+
+/// What `DeviceSourceStub` writes for a placed probe device, and what
+/// "spawned-device-place" reads back. A fixed string, so the proof is that
+/// these exact bytes arrived and not merely that something did: the same
+/// shape `filtered_token` already has for the broker's own probes.
+const device_probe_content = "chock device probe content\n";
+
+/// One change `DeviceSourceStub` hands the driver's own multiplexed loop,
+/// plus what to write on the host side first, and when.
+const QueuedChange = struct {
+    /// Written the instant `DeviceSourceStub.nextFn` hands `change` back,
+    /// never before. **This is task 4b's own second property, proved by
+    /// construction rather than by a separate test:** `nextFn` only ever
+    /// runs from inside `sandbox.spawn`, on the real parent's own serve
+    /// loop, which only starts once both the sandboxed program and the
+    /// device helper already exist. A file written here is a file made in
+    /// the hidden tree strictly after the helper bound it in and started
+    /// listening, which is the hotplug property the redesign turns on: see
+    /// `.superpowers/sdd/task-4b-report.md`.
+    ///
+    /// Mutation check: write this file in `deviceEscape` before
+    /// `sandbox.spawn` runs instead of here, and the test still passes,
+    /// because nothing distinguishes a snapshot copy from a live bind at
+    /// that point. Writing it from inside `nextFn` is what makes a pass
+    /// mean anything.
+    write: ?struct { path: []const u8, content: []const u8 } = null,
+    change: sandbox.DeviceSource.Change,
+};
+
+/// A `sandbox.DeviceSource` that feeds a fixed list of changes to the
+/// driver's own multiplexed loop, then answers null forever.
+///
+/// **The wakeup is a pipe with one byte written per queued change, read back
+/// one at a time inside `next`.** That is what makes it readable exactly
+/// while a change is still waiting and never a moment longer, the contract
+/// `sandbox.DeviceSource.VTable.wakeup`'s own doc comment asks for: once the
+/// queue empties, the pipe has nothing left in it and a `poll` on the read
+/// end blocks, the same as a real source with nothing more to say would.
+const DeviceSourceStub = struct {
+    wakeup_fds: [2]i32,
+    queue: [4]QueuedChange = undefined,
+    queue_len: usize = 0,
+    /// How many times `next` has handed a change back. Read after
+    /// `sandbox.spawn` returns, to prove the driver's own multiplexed loop
+    /// really drained this source and not merely left it untouched: see
+    /// task 4b's own third property.
+    served: usize = 0,
+
+    fn init(changes: []const QueuedChange) !DeviceSourceStub {
+        var fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        var self = DeviceSourceStub{ .wakeup_fds = fds };
+        for (changes, 0..) |c, i| self.queue[i] = c;
+        self.queue_len = changes.len;
+        const marks = [_]u8{1} ** 4;
+        const written = linux.write(fds[1], &marks, changes.len);
+        if (linux.errno(written) != .SUCCESS or written != changes.len) return error.PipeFailed;
+        return self;
+    }
+
+    fn deinit(self: *DeviceSourceStub) void {
+        _ = linux.close(self.wakeup_fds[0]);
+        _ = linux.close(self.wakeup_fds[1]);
+    }
+
+    fn deviceSource(self: *DeviceSourceStub) sandbox.DeviceSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = sandbox.DeviceSource.VTable{ .wakeup = wakeupFn, .next = nextFn };
+
+    fn wakeupFn(ptr: *anyopaque) i32 {
+        const self: *DeviceSourceStub = @ptrCast(@alignCast(ptr));
+        return self.wakeup_fds[0];
+    }
+
+    fn nextFn(ptr: *anyopaque) ?sandbox.DeviceSource.Change {
+        const self: *DeviceSourceStub = @ptrCast(@alignCast(ptr));
+        if (self.served >= self.queue_len) return null;
+        const queued = self.queue[self.served];
+        self.served += 1;
+
+        if (queued.write) |w| {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fmt.bufPrintZ(&path_buf, "{s}", .{w.path})) |path_z| {
+                const fd_rc = linux.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+                if (linux.errno(fd_rc) == .SUCCESS) {
+                    const fd: i32 = @intCast(fd_rc);
+                    _ = linux.write(fd, w.content.ptr, w.content.len);
+                    _ = linux.close(fd);
+                }
+            } else |_| {}
+        }
+
+        // One byte per queued change went onto the wakeup pipe in `init`:
+        // this is the matching read, which is what makes the pipe stop
+        // answering `POLLIN` the instant this was the last one.
+        var one: [1]u8 = undefined;
+        _ = linux.read(self.wakeup_fds[0], &one, 1);
+        return queued.change;
+    }
+};
+
+/// What one device spawn came back with, for the operation that started it.
+const DeviceRun = struct {
+    term: std.process.Child.Term,
+    /// How many changes the multiplexed loop drained from the stub. See
+    /// `DeviceSourceStub.served`.
+    served: usize,
+};
+
+/// Run `/probe <op>` inside a real sandbox with `Config.device_source` and
+/// `Config.device_tree` named. The device tree's own host half is a fresh
+/// directory, a sibling of `root`, standing in for the one real host
+/// directory Chock's own policy would bind; its own `inside` half is
+/// `device_tree_inside`. One device is fed the moment the loop first looks,
+/// written under `device_probe_source` inside that hidden tree and placed
+/// at `device_probe_path`. `extra_mounts` and `extra_rules` let a caller add
+/// a second seam alongside the device, such as a network broker: see
+/// `filteredEscapeWithDevice`.
+fn deviceEscape(
+    arena: std.mem.Allocator,
+    root: []const u8,
+    op: []const u8,
+    op_argv: []const []const u8,
+    extra_mounts: []const sandbox.namespace.Mount,
+    extra_rules: []const sandbox.Config.Rule,
+    extra_net_broker: ?sandbox.NetBroker,
+) !DeviceRun {
+    const base = try baseEscapeConfig(arena);
+
+    // `/dev` has to exist, as a real directory, before `applyLayers` builds
+    // this call's Landlock ruleset: a rule can only be added for a path that
+    // already resolves. Binding `/dev/null` in, the same bind every real
+    // session already carries, is what makes `/dev` itself first: see
+    // `namespace.buildRoot`'s own parent creation for a bind mount's target.
+    const devnull_mount = sandbox.namespace.Mount{
+        .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false },
+    };
+    const mounts = try std.mem.concat(
+        arena,
+        sandbox.namespace.Mount,
+        &.{ base.mounts, &.{devnull_mount}, extra_mounts },
+    );
+
+    // A rule on `/dev` itself, not only on `/dev/null`: Landlock's own
+    // access check walks the hierarchy live, at the moment a path is opened,
+    // so a rule granted here covers a file that appears under it later, the
+    // way `device_probe_path` does once the device helper places it. This is
+    // what lets a device arrive mid session and still be opened: see
+    // `linux/driver.zig`'s own `runDevice`.
+    //
+    // **No rule is added for `device_tree_inside`.** That is task 4b's own
+    // third property: Landlock is an allowlist, so a path never named here
+    // is denied, even though the bind is really there in the sandboxed
+    // program's own filesystem view after the pivot. See
+    // "spawned-device-hidden-denied".
+    const dev_rule = sandbox.Config.Rule{
+        .path = "/dev",
+        .access = .{ .read_file = true, .write_file = true },
+    };
+    const rules = try std.mem.concat(
+        arena,
+        sandbox.Config.Rule,
+        &.{ base.rules, &.{dev_rule}, extra_rules },
+    );
+
+    // A sibling of `root`, never a path inside it: `root` becomes the
+    // sandbox's own filesystem view, and this directory stands in for the
+    // one host directory Chock's own policy would have chosen.
+    const host_dir = try std.fs.path.join(arena, &.{ root, "..", "chock-device-tree" });
+    try makeTestDir(arena, host_dir);
+    const source_path = try std.fs.path.join(arena, &.{ host_dir, device_probe_source });
+
+    var stub = try DeviceSourceStub.init(&.{
+        .{
+            .write = .{ .path = source_path, .content = device_probe_content },
+            .change = .{ .place = .{ .kind = 0, .source = device_probe_source, .target = device_probe_path } },
+        },
+    });
+    defer stub.deinit();
+
+    const argv = try std.mem.concat(arena, []const u8, &.{ &.{ "/probe", op }, op_argv });
+
+    const term = try sandbox.spawn(arena, .{
+        .root = root,
+        .mounts = mounts,
+        .rules = rules,
+        .cwd = "/",
+        .env = &.{},
+        .network = if (extra_net_broker != null) .filtered else .none,
+        .net_broker = extra_net_broker,
+        .device_source = stub.deviceSource(),
+        .device_tree = .{ .host = host_dir, .inside = device_tree_inside },
+    }, argv, null, null);
+
+    return .{ .term = term, .served = stub.served };
+}
+
+/// How many direct children `pid` has right now, read out of
+/// `/proc/<pid>/task/<pid>/children`. Zero for a pid this machine has no such
+/// file for, which `childCountEscape` reads as "nothing was there to count"
+/// and never as a real answer of zero.
+fn countChildren(pid: linux.pid_t) usize {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/task/{d}/children", .{ pid, pid }) catch return 0;
+    const fd_rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return 0;
+    const fd: i32 = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var buf: [256]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return 0;
+    var it = std.mem.tokenizeAny(u8, buf[0..n], " \n");
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    return count;
+}
+
+/// What one background `sandbox.spawn` call, made by `childCountEscape`,
+/// needs to carry across the thread boundary and hand back.
+const ChildCountContext = struct {
+    arena: std.mem.Allocator,
+    root: []const u8,
+    read_fd: i32,
+    device: bool,
+    middle: sandbox.Middle = .{},
+    term: std.process.Child.Term = undefined,
+    err: ?anyerror = null,
+};
+
+/// The body of the background thread `childCountEscape` starts. A plain
+/// function and not a closure, because `std.Thread.spawn` takes one: every
+/// answer this needs to give back travels through `ctx`, read by the caller
+/// only after `thread.join()` has returned.
+fn runChildCountSpawn(ctx: *ChildCountContext) void {
+    const base = baseEscapeConfig(ctx.arena) catch |err| {
+        ctx.err = err;
+        return;
+    };
+
+    // Declared here, at function scope, and not inside the `if` below: a
+    // `sandbox.DeviceSource` borrows this address for the whole of the
+    // `spawn` call further down, so it must stay alive exactly as long as
+    // `device_source` does, whichever way this run goes.
+    var stub: DeviceSourceStub = undefined;
+    var device_source: ?sandbox.DeviceSource = null;
+    var device_tree: ?sandbox.Config.DeviceTree = null;
+    if (ctx.device) {
+        stub = DeviceSourceStub.init(&.{}) catch |err| {
+            ctx.err = err;
+            return;
+        };
+        device_source = stub.deviceSource();
+        // A `device_tree` is required exactly when `device_source` is,
+        // whether or not anything is ever placed through it: see
+        // `SpawnError.DeviceSourceNeedsTree`. Nothing is placed here, so an
+        // empty directory is enough.
+        const host_dir = std.fs.path.join(ctx.arena, &.{ ctx.root, "..", "chock-device-tree-none" }) catch |err| {
+            ctx.err = err;
+            return;
+        };
+        makeTestDir(ctx.arena, host_dir) catch |err| {
+            ctx.err = err;
+            return;
+        };
+        device_tree = .{ .host = host_dir, .inside = device_tree_inside };
+    }
+    defer if (ctx.device) stub.deinit();
+
+    ctx.term = sandbox.spawn(ctx.arena, .{
+        .root = ctx.root,
+        .mounts = base.mounts,
+        .rules = base.rules,
+        .cwd = "/",
+        .env = &.{},
+        .network = .none,
+        .stdin_fd = ctx.read_fd,
+        .device_source = device_source,
+        .device_tree = device_tree,
+    }, &.{ "/probe", "spawned-hold-until-closed" }, null, &ctx.middle) catch |err| {
+        ctx.err = err;
+        return;
+    };
+}
+
+/// What one child count run came back with.
+const ChildCountRun = struct {
+    term: std.process.Child.Term,
+    /// A's own direct children, counted while the sandboxed program was
+    /// deliberately held open on its own standard input. See
+    /// `spawned-hold-until-closed`.
+    children: usize,
+};
+
+/// Run `/probe spawned-hold-until-closed` inside a real sandbox, with
+/// `Config.device_source` named when `device` is true and left null
+/// otherwise, and count A's own direct children while the sandboxed program
+/// is still blocked reading its own standard input.
+///
+/// **`sandbox.spawn` blocks until the whole call has ended, so counting A's
+/// children needs a window this same process is inside of at the same
+/// time.** That is what the background thread is for: this function starts
+/// one, waits for `Config.stdin_fd`'s own pipe to name a real pid, counts,
+/// and only then closes its own write end, which is what lets the
+/// sandboxed program, and the whole call behind it, finish.
+fn childCountEscape(arena: std.mem.Allocator, root: []const u8, device: bool) !ChildCountRun {
+    var pipe_fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&pipe_fds, .{})) != .SUCCESS) return error.SetupFailed;
+    const read_fd = pipe_fds[0];
+    const write_fd = pipe_fds[1];
+
+    var ctx = ChildCountContext{ .arena = arena, .root = root, .read_fd = read_fd, .device = device };
+    const thread = try std.Thread.spawn(.{}, runChildCountSpawn, .{&ctx});
+
+    // Bounded: a machine that never gives this call a pid at all must not
+    // hang this test forever. `iface.Middle.pid`'s own doc comment is what
+    // this load reads: zero until spawn has forked, and an acquire load is
+    // what pairs with the release store on the other side of the thread.
+    var tries: usize = 0;
+    while (@atomicLoad(std.posix.pid_t, &ctx.middle.pid, .acquire) == 0 and tries < 500) : (tries += 1) {
+        var pause: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+        _ = linux.nanosleep(&pause, null);
+    }
+    const a_pid = @atomicLoad(std.posix.pid_t, &ctx.middle.pid, .acquire);
+
+    var children: usize = 0;
+    if (a_pid != 0) {
+        // A moment for B, and D when `device` is true, to actually be forked
+        // and reach the point `/proc` can see them at: A's own pid appears
+        // the instant `fork` returns, well before either child exists.
+        var pause: linux.timespec = .{ .sec = 0, .nsec = 200_000_000 };
+        _ = linux.nanosleep(&pause, null);
+        children = countChildren(a_pid);
+    }
+
+    // Ends the hold: "spawned-hold-until-closed" reads end of file and
+    // exits, which is what lets the whole call, and the thread waiting on
+    // it, finish. `spawn` itself already closed this process's copy of
+    // `read_fd`: see `Config.stdin_fd`'s own doc comment.
+    _ = linux.close(write_fd);
+    thread.join();
+
+    if (ctx.err) |err| return err;
+    return .{ .term = ctx.term, .children = children };
+}
 
 /// Run `/probe <op> <ports>` inside a real filtered sandbox, with the real
 /// network broker answering.
@@ -2355,6 +2724,14 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // real broker answering it. See `filteredEscape`.
         std.mem.startsWith(u8, args[1], "spawn-filtered-") or
         std.mem.startsWith(u8, args[1], "spawn-routed-") or
+        // Task 4b's own device operations. Each spawns a real sandbox with a
+        // `DeviceSource` seam of its own: see `deviceEscape` and
+        // `childCountEscape`.
+        std.mem.eql(u8, args[1], "spawn-device-place") or
+        std.mem.eql(u8, args[1], "spawn-device-hidden-denied") or
+        std.mem.eql(u8, args[1], "spawn-device-with-broker") or
+        std.mem.eql(u8, args[1], "spawn-device-children") or
+        std.mem.eql(u8, args[1], "spawn-device-children-none") or
         // The three resource limit runs, each in a bounded and an unbounded
         // form. They belong here for the reason every other "spawn-" operation
         // does: each one forks and lets sandbox.spawn build the whole sandbox
@@ -3459,6 +3836,96 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const line = std.fmt.bufPrint(&buffer, "{d}\n", .{linux.getpid()}) catch unreachable;
         _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
         return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-device-place")) {
+        // **The end to end proof.** `deviceEscape` fed the change the moment
+        // its own multiplexed loop first looked, and the in-sandbox helper
+        // places it independently of when this program happens to reach its
+        // own execve, so this polls rather than assumes either side won the
+        // race. Bounded, so a helper that never placed it fails this probe
+        // instead of hanging it.
+        // **Two distinct codes for the two ways this probe can fail**, and
+        // never the same one for both. Before this, a read that failed after
+        // a successful open and a path that never appeared in the whole
+        // budget both answered `5`, so a person reading only the sandboxed
+        // program's own exit status could not tell "the helper never placed
+        // it" apart from "the helper placed it and something about the read
+        // itself was wrong". `never_appeared` covers the loop falling through
+        // its own bound with no open ever succeeding; `read_failed` covers a
+        // successful open followed by a read this probe did not expect.
+        const never_appeared: u8 = 5;
+        const read_failed: u8 = 6;
+        var attempt: usize = 0;
+        while (attempt < 200) : (attempt += 1) {
+            const fd_rc = linux.open(device_probe_path, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd_rc) == .SUCCESS) {
+                const fd: i32 = @intCast(fd_rc);
+                defer _ = linux.close(fd);
+                var buffer: [64]u8 = undefined;
+                const n = linux.read(fd, &buffer, buffer.len);
+                if (linux.errno(n) != .SUCCESS) return read_failed;
+                return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else 1;
+            }
+            var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        return never_appeared;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-device-hidden-denied")) {
+        // Task 4b's own third property: Landlock never named the hidden
+        // tree, so the sandboxed program cannot open a path under it, even
+        // though the same node is readable at `device_probe_path`. Waits for
+        // the placed node first, the same bounded retry
+        // "spawned-device-place" uses, so this can tell "the hidden tree is
+        // readable" apart from "the helper never placed anything yet".
+        const never_appeared: u8 = 5;
+        const hidden_still_readable: u8 = 6;
+        var attempt: usize = 0;
+        var appeared = false;
+        while (attempt < 200) : (attempt += 1) {
+            const fd_rc = linux.open(device_probe_path, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(fd_rc) == .SUCCESS) {
+                _ = linux.close(@intCast(fd_rc));
+                appeared = true;
+                break;
+            }
+            var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+            _ = linux.nanosleep(&pause, null);
+        }
+        if (!appeared) return never_appeared;
+
+        var path_buf: [256]u8 = undefined;
+        const hidden_path = std.fmt.bufPrintZ(
+            &path_buf,
+            "{s}/{s}",
+            .{ device_tree_inside, device_probe_source },
+        ) catch return never_appeared;
+
+        // Mutation check: grant `device_tree_inside` a Landlock rule
+        // anywhere `deviceEscape` builds its ruleset, and this open
+        // succeeds, so this test would then answer
+        // `hidden_still_readable` instead of 0.
+        const hidden_rc = linux.open(hidden_path.ptr, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(hidden_rc) == .SUCCESS) {
+            _ = linux.close(@intCast(hidden_rc));
+            return hidden_still_readable;
+        }
+        return 0;
+    }
+    if (std.mem.eql(u8, args[1], "spawned-hold-until-closed")) {
+        // Blocks on its own standard input until the caller, on the host
+        // side of `Config.stdin_fd`, closes its write end. See
+        // `childCountEscape`, which uses exactly this window to count A's
+        // own children while the sandboxed program is still alive.
+        var buffer: [8]u8 = undefined;
+        while (true) {
+            const n = linux.read(std.posix.STDIN_FILENO, &buffer, buffer.len);
+            switch (linux.errno(n)) {
+                .SUCCESS => if (n == 0) return 0,
+                .INTR => continue,
+                else => return 5,
+            }
+        }
     }
     if (std.mem.eql(u8, args[1], "spawned-default-signal")) {
         _ = linux.kill(linux.getpid(), .TERM);
@@ -4997,6 +5464,108 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
 
         std.debug.print("unknown routed operation: {s}\n", .{args[1]});
         return 2;
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-device-place")) {
+        // Task 4b's own first property: the end to end proof. A file
+        // written into the hidden tree, strictly after the device helper
+        // has already bound it in and started listening, crosses the
+        // device link as a path, the helper binds it, and
+        // "spawned-device-place" reads the bytes back from inside the
+        // sandbox. See `QueuedChange.write`'s own doc comment for why this
+        // is also the hotplug proof, task 4b's own second property, with no
+        // separate test needed for it.
+        const run = try deviceEscape(arena, root_arg, "spawned-device-place", &.{}, &.{}, &.{}, null);
+        if (run.served != 1) {
+            std.debug.print("the multiplexed loop drained {d} changes, not 1\n", .{run.served});
+            return 5;
+        }
+        return reportChildTerm(run.term);
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-device-hidden-denied")) {
+        // Task 4b's own third property: the sandboxed program cannot read
+        // the hidden tree, only the node the helper placed out of it.
+        const run = try deviceEscape(arena, root_arg, "spawned-device-hidden-denied", &.{}, &.{}, &.{}, null);
+        if (run.served != 1) {
+            std.debug.print("the multiplexed loop drained {d} changes, not 1\n", .{run.served});
+            return 5;
+        }
+        return reportChildTerm(run.term);
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-device-with-broker")) {
+        // Task 4b's own third property: the loop serves the device link
+        // while a broker link is also present. The sandboxed program only
+        // ever asks the broker, through the existing "spawned-filtered-grant"
+        // operation; the device is fed from the outside and never opened
+        // from in here at all, so a pass proves the multiplexing and nothing
+        // about `runDevice`'s own placement work, which "spawn-device-place"
+        // above already covers.
+        const granted = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(granted.fd);
+        const other = listenLoopback() catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        defer _ = linux.close(other.fd);
+        const ports = try filteredPorts(arena, granted.port, other.port);
+
+        const policy = try chock_policy.table.Table.parse(arena, filtered_policy, null);
+        var io_impl: std.Io.Threaded = .init_single_threaded;
+        var transport = ProbeTransport{ .resolves_to = filtered_public_address, .port = granted.port };
+        var network = chock_broker.network.Network{
+            .gpa = arena,
+            .io = io_impl.io(),
+            .table = policy,
+            .chain = &.{"main"},
+            .agent_kind = "main",
+            .model = "main",
+            .tool = "mcp",
+            .transport = transport.transport(),
+        };
+
+        const run = try deviceEscape(
+            arena,
+            root_arg,
+            "spawned-filtered-grant",
+            &.{ports},
+            &.{},
+            &.{},
+            network.netBroker(),
+        );
+
+        if (run.served != 1) {
+            std.debug.print("the device link was not served alongside the broker: drained {d}\n", .{run.served});
+            return 5;
+        }
+        if (network.granted != 1 or network.refused != 0) {
+            std.debug.print("the broker granted {d} and refused {d}\n", .{ network.granted, network.refused });
+            return 5;
+        }
+        return reportChildTerm(run.term);
+    }
+
+    if (std.mem.eql(u8, args[1], "spawn-device-children") or
+        std.mem.eql(u8, args[1], "spawn-device-children-none"))
+    {
+        // Task 4b's own fourth property: a session with no `device_source`
+        // forks no helper. Proved here by counting A's own direct children
+        // while the sandboxed program is deliberately held open, and
+        // comparing a run with `device_source` against one without: the only
+        // difference the driver's own code can make to this count is D.
+        const with_device = std.mem.eql(u8, args[1], "spawn-device-children");
+        const result = childCountEscape(arena, root_arg, with_device) catch |err| {
+            std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
+            return 3;
+        };
+        var buffer: [16]u8 = undefined;
+        const line = std.fmt.bufPrint(&buffer, "{d}\n", .{result.children}) catch unreachable;
+        _ = linux.write(std.posix.STDOUT_FILENO, line.ptr, line.len);
+        return reportChildTerm(result.term);
     }
 
     if (std.mem.startsWith(u8, args[1], "spawn-filtered-")) {

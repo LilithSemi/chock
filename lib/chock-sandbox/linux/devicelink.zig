@@ -1,31 +1,56 @@
-//! The channel a device passthrough uses to cross the sandbox boundary: one
-//! descriptor, one destination, and nothing else.
+//! The channel a device passthrough uses to cross the sandbox boundary: two
+//! paths and nothing else.
 //!
 //! ## What this is for
 //!
 //! Giving a sandboxed program a USB device or a serial adapter needs work on
 //! both sides of the boundary. **Outside**, a process that is not sandboxed
-//! decides which device is permitted and opens it: that decision needs the
-//! real device tree, which the sandbox never sees. **Inside**, a helper puts
-//! the open descriptor where a program can find it, at a path inside the
-//! sandbox's own filesystem view. This file is the wire between those two: a
-//! fixed size message that carries one open descriptor and the path it goes
-//! to, over `SCM_RIGHTS`, the same way `netbroker.zig` and `routerlink.zig`
-//! carry a descriptor across the same boundary for a connection.
+//! decides which device is permitted, by Chock's own policy, and names it as
+//! a path relative to the one host directory that policy already chose: see
+//! `Sandbox.Config.device_tree`. **Inside**, a helper resolves that path
+//! against a hidden copy of that directory, bound into the sandbox's own
+//! root before anything pivots, and binds the node it finds there to a path
+//! a program can open. This file is the wire between those two: a fixed
+//! size message that carries the two paths, over an ordinary
+//! `SOCK_SEQPACKET` pair, the same kind of pair `netbroker.zig` and
+//! `routerlink.zig` use for their own channels.
 //!
-//! ## Authority is the descriptor, never the path
+//! ## Authority is a path Chock chose, out of a tree the program cannot read
 //!
-//! `Place.path` says where the node goes **inside** the sandbox. It is never
-//! a source: the inside half never resolves it against a filesystem, never
-//! opens it, and never reads it as a name for anything the outside holds.
-//! What the outside decided is already an open descriptor by the time it
-//! reaches this wire, and the descriptor is what the receiving end places.
+//! **This channel used to carry an open descriptor, and this file used to
+//! claim that authority was the descriptor and never a path. That claim no
+//! longer holds, and it must not be repeated.** A descriptor opened on the
+//! host and sent across `SCM_RIGHTS` cannot become a mount inside the
+//! in-sandbox helper's own mount namespace: a bind mount can only be made
+//! from a filesystem that belongs to the caller's *own current* mount
+//! namespace, and a descriptor opened before the helper's own `unshare`
+//! never does, whichever of `open_tree` or plain `mount` does the binding.
+//! Measured directly against this project's own kernel; see
+//! `.superpowers/sdd/task-4b-report.md` for both dead ends.
 //!
-//! This is what keeps a path race from handing over a device nobody
-//! permitted. A check of the shape "is this path allowed, then open it" has a
-//! gap between the two steps that a symlink can widen. There is no such gap
-//! here, because there is no open by name on this side of the boundary at
-//! all: the path only says where the already open descriptor is put.
+//! The guarantee this channel gives instead is narrower, and has to be
+//! stated as what it really is: **the helper binds a path Chock's host side
+//! chose, after asking its own policy, out of a tree the sandboxed program
+//! cannot read.** `Place.source` is a path, and the inside half really does
+//! resolve it, against `Sandbox.Config.device_tree.host`, bound into the
+//! sandbox's own root at `device_tree.inside` before anything pivots and
+//! never granted through Landlock. The sandboxed program cannot open that
+//! directory by name, list it, or resolve any path under it. Only Chock's
+//! own host side decides what `device_tree.host` names, and only Chock's
+//! own host side ever holds the writing end of this pair, so the caller of
+//! `sendPlace` controls both what the hidden tree is and what `source` may
+//! be relative to it. A sandboxed process controls neither. That is
+//! equivalent in practice to what the descriptor gave, even though it is
+//! not the same mechanism: an agent inside the sandbox has no path to the
+//! hidden tree at all, and the one path it does control, `target`, is
+//! merely where the node lands, checked the same way it always was.
+//!
+//! **`serveOne` still refuses nothing about `source` beyond its length.**
+//! The one check that stops a `source` from climbing back out of the hidden
+//! tree, no leading `/`, no `..` component, no empty component, lives in
+//! `driver.zig`'s own `buildDeviceSource`, not here: the same division this
+//! file already keeps between the wire's shape and the seam's own policy
+//! over what a path may resolve to. See `serveOne`'s own doc comment.
 //!
 //! ## `Place` and `Drop`, and why they are not a request and a reply
 //!
@@ -55,7 +80,7 @@
 //!
 //! ## Linux only, and why the file is here
 //!
-//! `SCM_RIGHTS` exists on Darwin too, but `Sandbox.spawn` refuses a
+//! Bind mounts exist on Darwin too, but `Sandbox.spawn` refuses a
 //! `.filtered` call there, so there is no channel to serve. The file sits
 //! under `linux/` with the rest of the mechanism, for the same reason
 //! `netbroker.zig` and `routerlink.zig` do. It compiles for Darwin, and every
@@ -64,8 +89,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
-
-const netbroker = @import("netbroker.zig");
 
 /// The descriptor number the in-sandbox helper finds its channel on. **Not
 /// `routerlink.fd_number`**: see this file's own top comment for why the two
@@ -82,20 +105,19 @@ pub const request_magic: u32 = 0x31564443;
 /// The bytes "CDR1". Carried by `Drop`. See `request_magic`.
 pub const reply_magic: u32 = 0x31524443;
 
-/// The longest destination path one message may carry. `sun_path` on an
-/// `AF_UNIX` address is 108 bytes on Linux, including the trailing nul, and a
-/// device node's destination is a plain filesystem path of the same practical
-/// length as the one Chock already binds a device special file to.
+/// The longest `source` or `target` one message may carry. Generous over a
+/// real device path: `bus/usb/001/005` and `/dev/bus/usb/001/005` are both
+/// far short of it, and it is the same bound this file has always used for a
+/// device node's own destination.
 pub const max_path_bytes: usize = 108;
 
-/// Told to the in-sandbox helper: put `handle` at `path`, which names where
-/// the node goes **inside** the sandbox. Fixed size, so `serveOne` can refuse
-/// a message of the wrong length outright rather than parsing whatever
-/// arrived. One descriptor rides with this in `SCM_RIGHTS`, and that
-/// descriptor is `handle`: nothing in the structure itself names it.
+/// Told to the in-sandbox helper: bind the node at `source`, relative to
+/// `Sandbox.Config.device_tree.host`, at `target`, an absolute path inside
+/// the sandbox. Fixed size, so `serveOne` can refuse a message of the wrong
+/// length outright rather than parsing whatever arrived.
 pub const Place = extern struct {
     magic: u32 = request_magic,
-    /// Which kind of node `path` should become. Opaque to this file: the
+    /// Which kind of node `target` should become. Opaque to this file: the
     /// helper that implements `DeviceSeam.place` is the one that reads it.
     /// Left as a plain byte, and not an enum, because this file never
     /// branches on it and has no set of values to be authoritative about.
@@ -104,15 +126,25 @@ pub const Place = extern struct {
     /// chose, which would otherwise send this process's own memory across
     /// the boundary in the gap.
     _pad: [3]u8 = @splat(0),
-    /// How many bytes of `path` are the destination. Bounded by `serveOne`
-    /// before it is used.
-    path_len: u32 = 0,
-    path: [max_path_bytes]u8 = @splat(0),
+    /// How many bytes of `source` are the path. Bounded by `serveOne` before
+    /// it is used.
+    source_len: u32 = 0,
+    /// A path relative to the hidden device tree. **Never resolved here.**
+    /// This file only bounds its length; whether it climbs back out of the
+    /// tree it is relative to is `driver.zig`'s own `buildDeviceSource`
+    /// question, the same as it always was for `target` below.
+    source: [max_path_bytes]u8 = @splat(0),
+    /// How many bytes of `target` are the path. Bounded by `serveOne` before
+    /// it is used.
+    target_len: u32 = 0,
+    /// The destination, inside the sandbox.
+    target: [max_path_bytes]u8 = @splat(0),
 };
 
-/// Told to the in-sandbox helper: take the node at `path` back out. No
-/// descriptor rides with this one: removing a node needs no authority beyond
-/// naming which node, unlike putting one there.
+/// Told to the in-sandbox helper: take the node at `path` back out. `path`
+/// names the same destination `Place.target` would have named: there is no
+/// `source` to carry, since removing a node needs no authority beyond
+/// naming which one.
 pub const Drop = extern struct {
     magic: u32 = reply_magic,
     path_len: u32 = 0,
@@ -120,11 +152,11 @@ pub const Drop = extern struct {
 };
 
 /// Who does the real work once a message has been read and bounded. The
-/// in-sandbox helper implements this. `serveOne` only ever hands it a path
-/// and, for a `place`, a descriptor already known to be open. **Which paths
-/// may be written and how a node is made there is the seam's question**, the
-/// same division `netbroker.NetBroker` draws between the wire and the policy
-/// behind it.
+/// in-sandbox helper implements this. `serveOne` only ever hands it the two
+/// paths a `Place` carried, or the one path a `Drop` carried. **Which paths
+/// may be resolved and how a node is made there is the seam's question**,
+/// the same division `netbroker.NetBroker` draws between the wire and the
+/// policy behind it.
 pub const DeviceSeam = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -132,8 +164,9 @@ pub const DeviceSeam = struct {
     /// What one call to `place` or `drop` did.
     ///
     /// **Two answers, and nothing beyond them.** A mount can fail, a name can
-    /// already be taken, a permission can be missing, or `kind` can be a byte
-    /// the seam does not implement. None of that is this file's business:
+    /// already be taken, a permission can be missing, a `source` can climb
+    /// back out of the tree it is relative to, or `kind` can be a byte the
+    /// seam does not implement. None of that is this file's business:
     /// `netbroker.NetBroker.Grant` and `NetRouter.Resolution`, the two seams
     /// this one is modelled on, both stop at "it worked" or "it did not" and
     /// leave the reason to the implementation's own log. `Result` keeps the
@@ -147,27 +180,24 @@ pub const DeviceSeam = struct {
     /// reads the same at every call site, which is the whole point of naming
     /// the two states instead of leaving them as `1` and `0`.
     pub const Result = enum {
-        /// The seam did what was asked. `handle` is now reachable at `path`,
-        /// or the node at `path` is gone, depending on which call this
-        /// answers.
+        /// The seam did what was asked. The node is now reachable at
+        /// `target`, or the node at `path` is gone, depending on which call
+        /// this answers.
         done,
-        /// It could not. The seam still owns whatever it was given: see
-        /// `VTable.place`.
+        /// It could not.
         failed,
     };
 
     pub const VTable = struct {
-        /// Put `handle` at `path`. **The seam owns `handle` from here**: it
-        /// closes it, or moves it somewhere a program can reach, and
-        /// `serveOne` never touches it again either way, whether this
-        /// answers `.done` or `.failed`.
-        place: *const fn (ptr: *anyopaque, kind: u8, path: []const u8, handle: i32) Result,
+        /// Bind the node at `source`, relative to the seam's own hidden
+        /// tree, at `target`, inside the sandbox.
+        place: *const fn (ptr: *anyopaque, kind: u8, source: []const u8, target: []const u8) Result,
         /// Take the node at `path` back out.
         drop: *const fn (ptr: *anyopaque, path: []const u8) Result,
     };
 
-    pub fn place(self: DeviceSeam, kind: u8, path: []const u8, handle: i32) Result {
-        return self.vtable.place(self.ptr, kind, path, handle);
+    pub fn place(self: DeviceSeam, kind: u8, source: []const u8, target: []const u8) Result {
+        return self.vtable.place(self.ptr, kind, source, target);
     }
 
     pub fn drop(self: DeviceSeam, path: []const u8) Result {
@@ -213,19 +243,13 @@ pub const Outcome = enum {
 ///
 /// ## What is checked here, and what is not
 ///
-/// The shape, and only the shape: exactly one `Place` with our magic and
-/// exactly one descriptor, or exactly one `Drop` with our magic and no
-/// descriptor at all, and for either a `path_len` that fits in `path`.
-/// **Which paths the seam will actually write is its question**, and this
-/// file must never grow a second answer to it: the same division
-/// `netbroker.serveOne` and `routerlink.serveOne` draw against their own
-/// seams.
-///
-/// A `Place` with no descriptor, or a `Drop` with one, is refused outright
-/// rather than handed to the seam anyway: `handle` is the one thing `Place`
-/// exists to carry, and a `Drop` that carried a descriptor would be a far end
-/// that is not the one this file expects, since removing a node needs no
-/// authority to hand over.
+/// The shape, and only the shape: exactly one `Place` with our magic and a
+/// `source_len` and `target_len` that each fit in their own buffer, or
+/// exactly one `Drop` with our magic and a `path_len` that fits. **Whether
+/// `source` may resolve to anything, or where `target` may land, is the
+/// seam's own question**, and this file must never grow a second answer to
+/// it: the same division `netbroker.serveOne` and `routerlink.serveOne` draw
+/// against their own seams.
 pub fn serveOne(fd: i32, seam: DeviceSeam) Outcome {
     // Sized for the larger of the two messages. A `Drop`, which is shorter,
     // still lands whole in it: `SOCK_SEQPACKET` keeps message boundaries, so
@@ -233,22 +257,17 @@ pub fn serveOne(fd: i32, seam: DeviceSeam) Outcome {
     // one still to come.
     var buffer: [@sizeOf(Place)]u8 align(@alignOf(Place)) = undefined;
     var iov = [1]std.posix.iovec{.{ .base = &buffer, .len = buffer.len }};
-    var control: [control_bytes]u8 align(@alignOf(linux.cmsghdr)) = undefined;
     var message = linux.msghdr{
         .name = null,
         .namelen = 0,
         .iov = &iov,
         .iovlen = 1,
-        .control = &control,
-        .controllen = control.len,
+        .control = null,
+        .controllen = 0,
         .flags = 0,
     };
 
-    // `MSG_CMSG_CLOEXEC` so a descriptor that arrives is close-on-exec. The
-    // helper never runs another program with it before `place` has had the
-    // chance to move it, and the safe default is the one that does not leak
-    // a device into a process nobody meant to give it to.
-    const rc = linux.recvmsg(fd, &message, linux.MSG.CMSG_CLOEXEC);
+    const rc = linux.recvmsg(fd, &message, 0);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .AGAIN, .INTR => return .nothing,
@@ -257,27 +276,27 @@ pub fn serveOne(fd: i32, seam: DeviceSeam) Outcome {
     // Zero is the end of the stream: the far end closed.
     if (rc == 0) return .peer_gone;
 
-    const received = netbroker.firstReceivedFd(&message, &control);
     const truncated = (message.flags & linux.MSG.TRUNC) != 0;
 
     if (rc == @sizeOf(Place) and !truncated) {
         const place: *const Place = @ptrCast(@alignCast(&buffer));
         if (place.magic == request_magic and
             std.mem.allEqual(u8, &place._pad, 0) and
-            place.path_len > 0 and place.path_len <= max_path_bytes)
+            place.source_len > 0 and place.source_len <= max_path_bytes and
+            place.target_len > 0 and place.target_len <= max_path_bytes)
         {
-            if (received) |handle| {
-                return switch (seam.place(place.kind, place.path[0..place.path_len], handle)) {
-                    .done => .placed,
-                    .failed => .place_failed,
-                };
-            }
+            return switch (seam.place(
+                place.kind,
+                place.source[0..place.source_len],
+                place.target[0..place.target_len],
+            )) {
+                .done => .placed,
+                .failed => .place_failed,
+            };
         }
     } else if (rc == @sizeOf(Drop) and !truncated) {
         const drop: *const Drop = @ptrCast(@alignCast(buffer[0..@sizeOf(Drop)]));
-        if (drop.magic == reply_magic and received == null and
-            drop.path_len > 0 and drop.path_len <= max_path_bytes)
-        {
+        if (drop.magic == reply_magic and drop.path_len > 0 and drop.path_len <= max_path_bytes) {
             return switch (seam.drop(drop.path[0..drop.path_len])) {
                 .done => .dropped,
                 .failed => .drop_failed,
@@ -285,67 +304,43 @@ pub fn serveOne(fd: i32, seam: DeviceSeam) Outcome {
         }
     }
 
-    // Whatever this was, it is not a message this file understood. A
-    // descriptor that rode with it is not handed to the seam: closing it
-    // here is the only way it is not simply leaked.
-    if (received) |handle| _ = linux.close(handle);
+    // Whatever this was, it is not a message this file understood.
     return .nothing;
 }
 
 // ---------------------------------------------------------------------------
-// The outside half: the process that opened the device sends here.
+// The outside half: the process that named the device sends here.
 // ---------------------------------------------------------------------------
 
 /// Why a send did not go out. Both members are the same fact a caller of
 /// `netbroker.ask` already reads as `error.BrokerGone`: the far end is not
 /// there to carry the message, whichever step noticed it first.
 pub const SendError = error{
-    /// `path` is empty or longer than `max_path_bytes`.
+    /// `source` or `target` is empty or longer than `max_path_bytes`.
     PathUnusable,
     /// The far end has gone, or would not take the message.
     PeerGone,
 };
 
-/// Send a `Place` naming `handle` and `path`. **This is the outside half**,
-/// called by the process that opened the device, on the end of the pair that
-/// stayed outside the sandbox.
-///
-/// `handle` still belongs to this call's caller once it returns: sending a
-/// descriptor with `SCM_RIGHTS` duplicates it into the receiving process, and
-/// closing it here is left to the caller, the same as `netbroker.zig`'s own
-/// grant leaves its handle to whoever passed it in.
-pub fn sendPlace(fd: i32, kind: u8, path: []const u8, handle: i32) SendError!void {
-    if (path.len == 0 or path.len > max_path_bytes) return error.PathUnusable;
+/// Send a `Place` naming `kind`, `source`, and `target`. **This is the
+/// outside half**, called by the process that named the device, on the end
+/// of the pair that stayed outside the sandbox.
+pub fn sendPlace(fd: i32, kind: u8, source: []const u8, target: []const u8) SendError!void {
+    if (source.len == 0 or source.len > max_path_bytes) return error.PathUnusable;
+    if (target.len == 0 or target.len > max_path_bytes) return error.PathUnusable;
 
-    var place = Place{ .kind = kind, .path_len = @intCast(path.len) };
-    @memcpy(place.path[0..path.len], path);
+    var place = Place{ .kind = kind, .source_len = @intCast(source.len), .target_len = @intCast(target.len) };
+    @memcpy(place.source[0..source.len], source);
+    @memcpy(place.target[0..target.len], target);
 
-    var iov = [1]std.posix.iovec_const{.{ .base = @ptrCast(&place), .len = @sizeOf(Place) }};
-    var control: [control_bytes]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-    const header: *linux.cmsghdr = @ptrCast(@alignCast(&control));
-    header.* = .{ .len = cmsg_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
-    // `@memcpy` and not a pointer store, because the payload of a control
-    // message has the alignment of the buffer and not of an `i32`: see
-    // `netbroker.grant`, whose own comment this reasoning is copied from.
-    @memcpy(control[cmsg_data_offset..][0..@sizeOf(i32)], std.mem.asBytes(&handle));
-
-    var message = linux.msghdr_const{
-        .name = null,
-        .namelen = 0,
-        .iov = &iov,
-        .iovlen = 1,
-        .control = &control,
-        .controllen = control.len,
-        .flags = 0,
-    };
     // `MSG_NOSIGNAL` so a peer that has already gone answers `EPIPE` here
     // instead of raising `SIGPIPE` at this whole process. See `netbroker.ask`
     // for the measurement behind the same flag on the same socket type.
-    const rc = linux.sendmsg(fd, &message, linux.MSG.NOSIGNAL);
+    const rc = linux.sendto(fd, @ptrCast(&place), @sizeOf(Place), linux.MSG.NOSIGNAL, null, 0);
     if (linux.errno(rc) != .SUCCESS or rc != @sizeOf(Place)) return error.PeerGone;
 }
 
-/// Send a `Drop` naming `path`. No descriptor rides with it: see `Drop`'s own
+/// Send a `Drop` naming `path`. No `source` rides with it: see `Drop`'s own
 /// doc comment for why removing a node needs none.
 pub fn sendDrop(fd: i32, path: []const u8) SendError!void {
     if (path.len == 0 or path.len > max_path_bytes) return error.PathUnusable;
@@ -356,10 +351,6 @@ pub fn sendDrop(fd: i32, path: []const u8) SendError!void {
     const sent = linux.sendto(fd, @ptrCast(&drop), @sizeOf(Drop), linux.MSG.NOSIGNAL, null, 0);
     if (linux.errno(sent) != .SUCCESS or sent != @sizeOf(Drop)) return error.PeerGone;
 }
-
-const cmsg_data_offset: usize = netbroker.cmsg_data_offset;
-const cmsg_len: usize = netbroker.cmsg_len;
-const control_bytes: usize = netbroker.control_bytes;
 
 /// Make the pair one device passthrough uses. `[0]` stays outside the
 /// sandbox and `[1]` crosses into it, the same split `routerlink.makePair`
@@ -388,67 +379,16 @@ fn linuxOnly() !void {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
 }
 
-/// A device number: the pair `statx` answers `dev_major`/`dev_minor` as, and
-/// what proves two descriptors name the same inode when paired with `ino`.
-/// `st_dev` on an ordinary `fstat` is this same pair packed into one integer,
-/// and `statx` hands the two halves over unpacked instead.
-const Identity = struct {
-    dev_major: u32,
-    dev_minor: u32,
-    ino: u64,
-
-    fn of(fd: i32) !Identity {
-        var stx: linux.Statx = undefined;
-        const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stx);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-        return .{ .dev_major = stx.dev_major, .dev_minor = stx.dev_minor, .ino = stx.ino };
-    }
-};
-
-/// A temporary file with no name in the directory tree: `O_TMPFILE` makes an
-/// inode that exists only through the descriptor this opens, so nothing else
-/// on the machine can hand a test the same identity by accident.
-fn openTempFile() !i32 {
-    const rc = linux.open("/tmp", .{ .ACCMODE = .RDWR, .DIRECTORY = true, .TMPFILE = true, .CLOEXEC = true }, 0o600);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-    return @intCast(rc);
-}
-
-/// How many descriptors this process holds, read out of `/proc/self/fd`. The
-/// same helper `netbroker.zig` uses for its own "a descriptor a sandboxed
-/// process sends across is never received" test, copied here rather than made
-/// public there: it reads process state and takes no part of either wire.
-fn openDescriptorCount() usize {
-    const rc = linux.open("/proc/self/fd", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (linux.errno(rc) != .SUCCESS) return 0;
-    const dir: i32 = @intCast(rc);
-    defer _ = linux.close(dir);
-
-    var count: usize = 0;
-    var buffer: [4096]u8 = undefined;
-    while (true) {
-        const nread = linux.getdents64(dir, &buffer, buffer.len);
-        if (linux.errno(nread) != .SUCCESS or nread == 0) break;
-        var offset: usize = 0;
-        while (offset < nread) {
-            const entry: *align(1) const linux.dirent64 = @ptrCast(&buffer[offset]);
-            count += 1;
-            offset += entry.reclen;
-        }
-    }
-    return count;
-}
-
-/// A seam that records what it was asked, and hands back the paths and the
-/// descriptor identity it saw. A test reads these rather than trusting that
-/// `serveOne` called it correctly.
+/// A seam that records what it was asked. A test reads these rather than
+/// trusting that `serveOne` called it correctly.
 const StubSeam = struct {
     places: usize = 0,
     drops: usize = 0,
     place_kind: u8 = 0,
-    place_path: [max_path_bytes]u8 = @splat(0),
-    place_path_len: usize = 0,
-    place_identity: ?Identity = null,
+    place_source: [max_path_bytes]u8 = @splat(0),
+    place_source_len: usize = 0,
+    place_target: [max_path_bytes]u8 = @splat(0),
+    place_target_len: usize = 0,
     drop_path: [max_path_bytes]u8 = @splat(0),
     drop_path_len: usize = 0,
     /// What `placeFn` answers. A test that wants to see `.place_failed` carry
@@ -463,14 +403,14 @@ const StubSeam = struct {
 
     const vtable = DeviceSeam.VTable{ .place = placeFn, .drop = dropFn };
 
-    fn placeFn(ptr: *anyopaque, kind: u8, path: []const u8, handle: i32) DeviceSeam.Result {
+    fn placeFn(ptr: *anyopaque, kind: u8, source: []const u8, target: []const u8) DeviceSeam.Result {
         const self: *StubSeam = @ptrCast(@alignCast(ptr));
         self.places += 1;
         self.place_kind = kind;
-        @memcpy(self.place_path[0..path.len], path);
-        self.place_path_len = path.len;
-        self.place_identity = Identity.of(handle) catch null;
-        _ = linux.close(handle);
+        @memcpy(self.place_source[0..source.len], source);
+        self.place_source_len = source.len;
+        @memcpy(self.place_target[0..target.len], target);
+        self.place_target_len = target.len;
         return self.place_result;
     }
 
@@ -482,8 +422,12 @@ const StubSeam = struct {
         return self.drop_result;
     }
 
-    fn sawPlacePath(self: *const StubSeam) []const u8 {
-        return self.place_path[0..self.place_path_len];
+    fn sawPlaceSource(self: *const StubSeam) []const u8 {
+        return self.place_source[0..self.place_source_len];
+    }
+
+    fn sawPlaceTarget(self: *const StubSeam) []const u8 {
+        return self.place_target[0..self.place_target_len];
     }
 
     fn sawDropPath(self: *const StubSeam) []const u8 {
@@ -495,42 +439,47 @@ test "both wire structures are a fixed size with no padding a compiler chose" {
     // **The size is the framing.** `serveOne` tells a `Place` from a `Drop`
     // by the byte count `recvmsg` reports, which is only a fact both ends
     // agree on while the size is written out and not left to the compiler.
-    try testing.expectEqual(@as(usize, 4 + 1 + 3 + 4 + max_path_bytes), @sizeOf(Place));
+    try testing.expectEqual(
+        @as(usize, 4 + 1 + 3 + 4 + max_path_bytes + 4 + max_path_bytes),
+        @sizeOf(Place),
+    );
     try testing.expectEqual(@as(usize, 4 + 4 + max_path_bytes), @sizeOf(Drop));
     try testing.expect(@sizeOf(Place) != @sizeOf(Drop));
     try testing.expect(request_magic != reply_magic);
 }
 
-test "a placement carries a descriptor and a destination, and nothing else" {
+test "a placement carries a source and a target, and nothing else" {
     try linuxOnly();
-    // Authority is the descriptor. The far side never resolves a host path,
-    // so a path race cannot hand it a file nobody permitted: there is no
-    // path to race. See this file's own top comment.
+    // Authority is a path Chock chose, out of a tree the program cannot
+    // read. See this file's own top comment.
     const pair = try makePair();
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-    const sent_identity = try Identity.of(given);
-
-    try sendPlace(pair[0], 7, "/dev/chock-widget0", given);
+    try sendPlace(pair[0], 7, "bus/usb/001/005", "/dev/chock-widget0");
 
     var stub = StubSeam{};
     try testing.expectEqual(Outcome.placed, serveOne(pair[1], stub.seam()));
     try testing.expectEqual(@as(usize, 1), stub.places);
     try testing.expectEqual(@as(usize, 0), stub.drops);
     try testing.expectEqual(@as(u8, 7), stub.place_kind);
-    try testing.expectEqualStrings("/dev/chock-widget0", stub.sawPlacePath());
+    try testing.expectEqualStrings("bus/usb/001/005", stub.sawPlaceSource());
+    try testing.expectEqualStrings("/dev/chock-widget0", stub.sawPlaceTarget());
+}
 
-    // **The proof a descriptor crossed, and not merely that one arrived.** A
-    // send that carried the wrong number, or a fresh descriptor with nothing
-    // behind it, would still make `serveOne` answer `.placed`; only the
-    // identity comparison catches that.
-    const got_identity = stub.place_identity orelse return error.NoIdentityRead;
-    try testing.expectEqual(sent_identity.dev_major, got_identity.dev_major);
-    try testing.expectEqual(sent_identity.dev_minor, got_identity.dev_minor);
-    try testing.expectEqual(sent_identity.ino, got_identity.ino);
+test "a removal carries a target and nothing else" {
+    try linuxOnly();
+    const pair = try makePair();
+    defer _ = linux.close(pair[0]);
+    defer _ = linux.close(pair[1]);
+
+    try sendDrop(pair[0], "/dev/chock-widget0");
+
+    var stub = StubSeam{};
+    try testing.expectEqual(Outcome.dropped, serveOne(pair[1], stub.seam()));
+    try testing.expectEqual(@as(usize, 0), stub.places);
+    try testing.expectEqual(@as(usize, 1), stub.drops);
+    try testing.expectEqualStrings("/dev/chock-widget0", stub.sawDropPath());
 }
 
 test "a message of the wrong length is refused outright" {
@@ -557,55 +506,14 @@ test "a message of the wrong length is refused outright" {
     // tail nobody saw. `MSG_TRUNC` in the answered flags is the only sign of
     // it.
     var oversize: [@sizeOf(Place) + 64]u8 = @splat(0);
-    var place = Place{ .path_len = 3 };
-    @memcpy(place.path[0..3], "abc");
+    var place = Place{ .source_len = 3, .target_len = 3 };
+    @memcpy(place.source[0..3], "abc");
+    @memcpy(place.target[0..3], "abc");
     @memcpy(oversize[0..@sizeOf(Place)], std.mem.asBytes(&place));
     const long_rc = linux.sendto(pair[0], &oversize, oversize.len, linux.MSG.NOSIGNAL, null, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(long_rc));
     try testing.expectEqual(Outcome.nothing, serveOne(pair[1], stub.seam()));
     try testing.expectEqual(@as(usize, 0), stub.places);
-}
-
-test "a drop names no descriptor, and one is closed rather than handed over" {
-    try linuxOnly();
-    const pair = try makePair();
-    defer _ = linux.close(pair[0]);
-    defer _ = linux.close(pair[1]);
-
-    try sendDrop(pair[0], "/dev/chock-widget0");
-
-    var stub = StubSeam{};
-    try testing.expectEqual(Outcome.dropped, serveOne(pair[1], stub.seam()));
-    try testing.expectEqual(@as(usize, 1), stub.drops);
-    try testing.expectEqualStrings("/dev/chock-widget0", stub.sawDropPath());
-
-    // A `Drop` sent with a descriptor riding along anyway, as `sendDrop`
-    // itself never does but a hostile or broken sender might. **Refused
-    // outright, and the seam is never asked**: removing a node needs no
-    // authority to hand over, so a descriptor here names a sender this file
-    // does not expect.
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-
-    var drop = Drop{ .path_len = 3 };
-    @memcpy(drop.path[0..3], "abc");
-    var iov = [1]std.posix.iovec_const{.{ .base = @ptrCast(&drop), .len = @sizeOf(Drop) }};
-    var control: [control_bytes]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-    const header: *linux.cmsghdr = @ptrCast(@alignCast(&control));
-    header.* = .{ .len = cmsg_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
-    @memcpy(control[cmsg_data_offset..][0..@sizeOf(i32)], std.mem.asBytes(&given));
-    var message = linux.msghdr_const{
-        .name = null,
-        .namelen = 0,
-        .iov = &iov,
-        .iovlen = 1,
-        .control = &control,
-        .controllen = control.len,
-        .flags = 0,
-    };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sendmsg(pair[0], &message, 0)));
-    try testing.expectEqual(Outcome.nothing, serveOne(pair[1], stub.seam()));
-    try testing.expectEqual(@as(usize, 1), stub.drops);
 }
 
 test "a seam that cannot place or drop is carried outward, not swallowed" {
@@ -621,9 +529,7 @@ test "a seam that cannot place or drop is carried outward, not swallowed" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-    try sendPlace(pair[0], 1, "/dev/chock-widget0", given);
+    try sendPlace(pair[0], 1, "bus/usb/001/005", "/dev/chock-widget0");
 
     var stub = StubSeam{ .place_result = .failed };
     try testing.expectEqual(Outcome.place_failed, serveOne(pair[1], stub.seam()));
@@ -635,76 +541,6 @@ test "a seam that cannot place or drop is carried outward, not swallowed" {
     try testing.expectEqual(@as(usize, 1), stub.drops);
 }
 
-test "a message this file refuses does not leak the descriptor that rode with it" {
-    try linuxOnly();
-    // The property is descriptor hygiene by reading, not by a test: the last
-    // lines of `serveOne` close `handle` when nothing else claimed it. This
-    // is the same proof `netbroker.zig`'s own "a descriptor a sandboxed
-    // process sends across is never received" uses: both ends of the pair are
-    // in this one process, so a descriptor that crossed and was not closed
-    // shows up as a higher `openDescriptorCount()` afterward, and one that was
-    // closed does not.
-    //
-    // Mutation check: delete the `if (received) |handle| _ = linux.close(handle);`
-    // line at the end of `serveOne` and this test fails, because the copy of
-    // `given` that crossed to `pair[1]` stays open on a fresh number.
-    const pair = try makePair();
-    defer _ = linux.close(pair[0]);
-    defer _ = linux.close(pair[1]);
-
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-
-    const before = openDescriptorCount();
-
-    // A magic that is not ours, so `serveOne` falls through past both the
-    // `Place` and the `Drop` branches to the final, catch-all close. `given`
-    // still rides along in `SCM_RIGHTS`.
-    var place = Place{ .magic = 0xdeadbeef, .path_len = 3 };
-    @memcpy(place.path[0..3], "abc");
-    var iov = [1]std.posix.iovec_const{.{ .base = @ptrCast(&place), .len = @sizeOf(Place) }};
-    var control: [control_bytes]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-    const header: *linux.cmsghdr = @ptrCast(@alignCast(&control));
-    header.* = .{ .len = cmsg_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
-    @memcpy(control[cmsg_data_offset..][0..@sizeOf(i32)], std.mem.asBytes(&given));
-    var message = linux.msghdr_const{
-        .name = null,
-        .namelen = 0,
-        .iov = &iov,
-        .iovlen = 1,
-        .control = &control,
-        .controllen = control.len,
-        .flags = 0,
-    };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sendmsg(pair[0], &message, 0)));
-
-    var stub = StubSeam{};
-    try testing.expectEqual(Outcome.nothing, serveOne(pair[1], stub.seam()));
-    try testing.expectEqual(@as(usize, 0), stub.places);
-
-    try testing.expectEqual(before, openDescriptorCount());
-}
-
-test "a placement with no descriptor is refused rather than handed to the seam" {
-    try linuxOnly();
-    // `sendPlace` never sends one of these, so this is a far end that is not
-    // the one this file expects: the same shape check `netbroker.serveOne`
-    // keeps against a message that is well formed but missing what makes it
-    // usable.
-    const pair = try makePair();
-    defer _ = linux.close(pair[0]);
-    defer _ = linux.close(pair[1]);
-
-    var place = Place{ .path_len = 3 };
-    @memcpy(place.path[0..3], "abc");
-    const rc = linux.sendto(pair[0], @ptrCast(&place), @sizeOf(Place), linux.MSG.NOSIGNAL, null, 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-
-    var stub = StubSeam{};
-    try testing.expectEqual(Outcome.nothing, serveOne(pair[1], stub.seam()));
-    try testing.expectEqual(@as(usize, 0), stub.places);
-}
-
 test "a magic that is not ours, a reserved byte, or a path of no length is refused" {
     try linuxOnly();
     // Every one of these is refused without the seam being asked anything,
@@ -712,17 +548,21 @@ test "a magic that is not ours, a reserved byte, or a path of no length is refus
     // `routerlink`'s own test of the same name for the pattern.
     const cases = [_]struct { name: []const u8, place: Place }{
         .{ .name = "a magic that is not ours", .place = blk: {
-            var one = Place{ .magic = 0xdeadbeef, .path_len = 3 };
-            @memcpy(one.path[0..3], "abc");
+            var one = Place{ .magic = 0xdeadbeef, .source_len = 3, .target_len = 3 };
+            @memcpy(one.source[0..3], "abc");
+            @memcpy(one.target[0..3], "abc");
             break :blk one;
         } },
         .{ .name = "a reserved byte that is not zero", .place = blk: {
-            var one = Place{ .path_len = 3, ._pad = .{ 1, 0, 0 } };
-            @memcpy(one.path[0..3], "abc");
+            var one = Place{ .source_len = 3, .target_len = 3, ._pad = .{ 1, 0, 0 } };
+            @memcpy(one.source[0..3], "abc");
+            @memcpy(one.target[0..3], "abc");
             break :blk one;
         } },
-        .{ .name = "a path of no length", .place = Place{ .path_len = 0 } },
-        .{ .name = "a path longer than the buffer", .place = Place{ .path_len = max_path_bytes + 1 } },
+        .{ .name = "a source of no length", .place = Place{ .source_len = 0, .target_len = 3 } },
+        .{ .name = "a source longer than the buffer", .place = Place{ .source_len = max_path_bytes + 1, .target_len = 3 } },
+        .{ .name = "a target of no length", .place = Place{ .source_len = 3, .target_len = 0 } },
+        .{ .name = "a target longer than the buffer", .place = Place{ .source_len = 3, .target_len = max_path_bytes + 1 } },
     };
 
     var got_through: std.ArrayList(u8) = .empty;
@@ -733,25 +573,8 @@ test "a magic that is not ours, a reserved byte, or a path of no length is refus
         defer _ = linux.close(pair[0]);
         defer _ = linux.close(pair[1]);
 
-        const given = try openTempFile();
-        defer _ = linux.close(given);
-
-        var place = case.place;
-        var iov = [1]std.posix.iovec_const{.{ .base = @ptrCast(&place), .len = @sizeOf(Place) }};
-        var control: [control_bytes]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-        const header: *linux.cmsghdr = @ptrCast(@alignCast(&control));
-        header.* = .{ .len = cmsg_len, .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
-        @memcpy(control[cmsg_data_offset..][0..@sizeOf(i32)], std.mem.asBytes(&given));
-        var message = linux.msghdr_const{
-            .name = null,
-            .namelen = 0,
-            .iov = &iov,
-            .iovlen = 1,
-            .control = &control,
-            .controllen = control.len,
-            .flags = 0,
-        };
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sendmsg(pair[0], &message, 0)));
+        const rc = linux.sendto(pair[0], @ptrCast(&case.place), @sizeOf(Place), linux.MSG.NOSIGNAL, null, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
 
         var stub = StubSeam{};
         const outcome = serveOne(pair[1], stub.seam());
@@ -782,11 +605,10 @@ test "sendPlace and sendDrop refuse a path they could not put in a message" {
     defer _ = linux.close(pair[0]);
     defer _ = linux.close(pair[1]);
 
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-
-    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "", given));
-    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "a" ** (max_path_bytes + 1), given));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "", "/dev/chock-widget0"));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "a" ** (max_path_bytes + 1), "/dev/chock-widget0"));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "bus/usb/001/005", ""));
+    try testing.expectError(error.PathUnusable, sendPlace(pair[0], 0, "bus/usb/001/005", "a" ** (max_path_bytes + 1)));
     try testing.expectError(error.PathUnusable, sendDrop(pair[0], ""));
     try testing.expectError(error.PathUnusable, sendDrop(pair[0], "a" ** (max_path_bytes + 1)));
 }
@@ -797,9 +619,6 @@ test "a channel that has gone answers PeerGone rather than waiting" {
     _ = linux.close(pair[1]);
     defer _ = linux.close(pair[0]);
 
-    const given = try openTempFile();
-    defer _ = linux.close(given);
-
-    try testing.expectError(error.PeerGone, sendPlace(pair[0], 0, "/dev/chock-widget0", given));
+    try testing.expectError(error.PeerGone, sendPlace(pair[0], 0, "bus/usb/001/005", "/dev/chock-widget0"));
     try testing.expectError(error.PeerGone, sendDrop(pair[0], "/dev/chock-widget0"));
 }

@@ -26,6 +26,7 @@ const cgroup = @import("cgroup.zig");
 const netbroker = @import("netbroker.zig");
 const routerlink = @import("routerlink.zig");
 const router = @import("router.zig");
+const devicelink = @import("devicelink.zig");
 const netns = @import("netns.zig");
 const nftables = @import("nftables.zig");
 const iface = @import("../Sandbox.zig");
@@ -65,6 +66,7 @@ const SetupStep = enum(u8) {
     resource_limits,
     namespace,
     network,
+    device,
     scratch_mount,
     mount_tree,
     pivot,
@@ -394,6 +396,19 @@ pub fn spawn(
         },
     }
 
+    // **A device source with no device tree is refused here, before anything
+    // forks, the same as a filtered network with no broker above.**
+    // `placeDevice` resolves a placement's own `source` against
+    // `Config.device_tree.host`, which the device helper binds into the
+    // sandbox's own root before anything pivots: see `runDevice`'s own
+    // `bindDeviceTree`. Without this refusal, the config only found out once
+    // a real device arrived, as a `MountFailed` this deep into a session,
+    // with nothing in the error naming the field that was missing. See
+    // `Config.device_source`, `Config.device_tree`, and
+    // `SpawnError.DeviceSourceNeedsTree`.
+    if (config.device_source != null and config.device_tree == null)
+        return error.DeviceSourceNeedsTree;
+
     // Whether this call gets a network of its own with a ruleset on it. Read
     // in A, in B and in the parent below, so the three cannot disagree.
     const routed = config.net_router != null;
@@ -499,6 +514,18 @@ pub fn spawn(
     else
         &[_]bpf.Insn{};
     defer if (routed) allocator.free(router_insns);
+
+    // The fifth program, for D, the device helper. **Built here for the
+    // reason the three above are**, and D is forked from A as N is. Read
+    // once, here, whether a device source was named at all: a session with
+    // none must not pay for this build, and every later branch that asks the
+    // same question reads this same value, so they cannot disagree.
+    const wants_device = config.device_source != null;
+    const device_insns = if (wants_device)
+        seccomp.buildDevice(allocator) catch |err| return err
+    else
+        &[_]bpf.Insn{};
+    defer if (wants_device) allocator.free(device_insns);
 
     // The keeper is always present, so its filter is built before any fork.
     // The keeper holds process 1 in the pid namespace and reaps orphans.
@@ -639,6 +666,25 @@ pub fn spawn(
         };
     }
 
+    // The device link's own pair, for a session that names `device_source` and
+    // for no other. **Exclusive with neither of the two above**: a hardware
+    // session may want a network and a device at once, so this is made
+    // whenever `wants_device` is true, whatever `routed` or `config.net_broker`
+    // say. `[0]` stays in this process, the same as the broker's and the
+    // router's own `[0]`, and this process never reads from it: see
+    // `serveLinks`'s own comment on why it only ever writes here.
+    var device_fds: [2]i32 = .{ -1, -1 };
+    if (wants_device) {
+        device_fds = devicelink.makePair() catch {
+            _ = linux.close(read_fd);
+            _ = linux.close(write_fd);
+            _ = linux.close(middle_read_fd);
+            _ = linux.close(middle_write_fd);
+            return error.DeviceSourceSocketFailed;
+        };
+    }
+    errdefer closeBrokerPair(&device_fds);
+
     // The page the path reader writes and this process reads. It is shared
     // memory so the reader can report without a write capable descriptor.
     //
@@ -702,6 +748,14 @@ pub fn spawn(
             _ = linux.close(router_fds[0]);
             router_fds[0] = -1;
         }
+        // The same rule again for the device link's pair. Nothing on this side
+        // of the boundary ever reads a device placement back: see
+        // `serveLinks`'s own comment on why this process only ever writes to
+        // its own copy of `[0]`, further down this function.
+        if (device_fds[0] >= 0) {
+            _ = linux.close(device_fds[0]);
+            device_fds[0] = -1;
+        }
 
         // Every failure from here to `execve` ends the process with a record on
         // the setup pipe, through `die` or `dieErrno`. Neither function returns,
@@ -739,7 +793,21 @@ pub fn spawn(
         // names both seams, so at most one of these is open: the broker's end,
         // which B keeps and the caller's program is handed, or the router's,
         // which A hands to N and nothing else ever holds.
-        enterNamespaces(config, write_fd, middle_write_fd, @max(broker_fds[1], router_fds[1]));
+        //
+        // **`device_fds[1]` is its own argument, and never folded into the
+        // `@max` above.** A device source is exclusive with neither seam, so a
+        // call can carry a device source alongside a filtered network, and the
+        // `@max` trick that picks one of two mutually exclusive pairs would
+        // silently drop whichever of the two was smaller. See
+        // `closeInheritedFds`'s own doc comment for what happened the one time
+        // this argument was missing outright.
+        enterNamespaces(
+            config,
+            write_fd,
+            middle_write_fd,
+            @max(broker_fds[1], router_fds[1]),
+            device_fds[1],
+        );
 
         // **The network, here, before anything is forked into it.** A is in
         // the network namespace `enterNamespaces` just took and holds
@@ -949,6 +1017,90 @@ pub fn spawn(
             table_session = .{ .fd = -1 };
         }
 
+        // **D, the device helper, forked here for the reason N is forked just
+        // above: a device session may want a network too, so the two are
+        // never mutually exclusive and D's own place in this order does not
+        // depend on whether N ran.** It has to be a child of A for the reason
+        // R and N are: every child A makes after `unshare(CLONE_NEWPID)` is
+        // inside the pid namespace, and A is the only process that can reap
+        // it. It has to come before B, for the reason N does: a program that
+        // asks for a path before D is confined and listening would race it.
+        //
+        // **A waits for D to say it is up, the same handshake N's own
+        // comment explains.** A device placed before D has installed its own
+        // filter would be a device placed by a process this driver has not
+        // yet bounded, which is the one thing `seccomp.device_calls` exists
+        // to prevent.
+        var device_pid: linux.pid_t = -1;
+        var device_control_fd: i32 = -1;
+        if (wants_device) {
+            var device_ready_fds: [2]i32 = undefined;
+            const device_pair_rc = linux.socketpair(
+                linux.AF.UNIX,
+                linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+                0,
+                &device_ready_fds,
+            );
+            if (linux.errno(device_pair_rc) != .SUCCESS) {
+                dieErrno(
+                    write_fd,
+                    config.stderr_fd,
+                    .fork,
+                    "socketpair for the device helper",
+                    linux.errno(device_pair_rc),
+                );
+            }
+
+            const device_fork_rc = linux.fork();
+            if (linux.errno(device_fork_rc) != .SUCCESS) {
+                die(write_fd, config.stderr_fd, .fork, error.Unexpected);
+            }
+            if (device_fork_rc == 0) {
+                _ = linux.close(device_ready_fds[0]);
+                _ = linux.close(keeper_fds[0]);
+                if (notify_fds[0] >= 0) _ = linux.close(notify_fds[0]);
+                if (notify_fds[1] >= 0) _ = linux.close(notify_fds[1]);
+                if (path_record) |record| unmapPathRecord(record);
+                runDevice(
+                    device_ready_fds[1],
+                    device_fds[1],
+                    config.root,
+                    config.device_tree.?.host,
+                    config.device_tree.?.inside,
+                    middle_pidfd,
+                    device_insns,
+                    write_fd,
+                    config.stderr_fd,
+                );
+            }
+            device_pid = @intCast(device_fork_rc);
+
+            _ = linux.close(device_ready_fds[1]);
+            var device_ready: [1]u8 = undefined;
+            var device_read_rc = linux.read(device_ready_fds[0], &device_ready, device_ready.len);
+            while (linux.errno(device_read_rc) == .INTR) {
+                device_read_rc = linux.read(device_ready_fds[0], &device_ready, device_ready.len);
+            }
+            if (linux.errno(device_read_rc) != .SUCCESS or device_read_rc != device_ready.len or
+                device_ready[0] != 1)
+            {
+                die(write_fd, config.stderr_fd, .device, error.Unexpected);
+            }
+            // **A keeps its end, and that is what tells D to leave later.**
+            // The same shape `router_control_fd` above has, and for the same
+            // reason: see `reapDevice`.
+            device_control_fd = device_ready_fds[0];
+
+            // **A gives up its own copy the moment D holds it.** A copy here
+            // would keep the far end's read from ever reaching the end of the
+            // stream, so a caller could send a placement after A's copy alone
+            // remained open and have it silently go nowhere. A is about to
+            // fork B, and a descriptor A still holds is a descriptor B
+            // inherits, which a device link has no business crossing into.
+            _ = linux.close(device_fds[1]);
+            device_fds[1] = -1;
+        }
+
         const inner_fork_rc = linux.fork();
         if (linux.errno(inner_fork_rc) != .SUCCESS) {
             die(write_fd, config.stderr_fd, .fork, error.Unexpected);
@@ -1146,6 +1298,9 @@ pub fn spawn(
         waitAndRelay(inner_pid, keeper_pid, .{
             .pid = router_pid,
             .control_fd = router_control_fd,
+        }, .{
+            .pid = device_pid,
+            .control_fd = device_control_fd,
         }, keeper_fds[0], &areas, middle_write_fd, if (reader_pid >= 0) .{
             .pid = reader_pid,
             .record = path_record.?,
@@ -1167,11 +1322,18 @@ pub fn spawn(
         _ = linux.close(router_fds[1]);
         router_fds[1] = -1;
     }
+    // The same rule again for the device link's pair, whose child end belongs
+    // to A and then to D alone.
+    if (device_fds[1] >= 0) {
+        _ = linux.close(device_fds[1]);
+        device_fds[1] = -1;
+    }
     // Closed on the way out of every branch below, the same rule the two pipes
     // follow: a session runs thousands of calls, and a descriptor left open on
     // an error path ends with the harness unable to open a file.
     errdefer closeBrokerPair(&broker_fds);
     errdefer closeBrokerPair(&router_fds);
+    errdefer closeBrokerPair(&device_fds);
 
     if (middle) |out| {
         // **Opened here, in the real parent, and before the pid is
@@ -1265,30 +1427,36 @@ pub fn spawn(
     }
 
     // The sandboxed program is running now, so this is where its requests for
-    // a connection are answered. **The blocking wait below cannot come first**:
-    // it would leave nobody reading the pair for the whole call, and the
-    // program inside would block on an answer that arrives after it has ended.
-    // **The router is served the same way and in the same place.** Exactly one
-    // of the two loops below ever runs, because `spawn` refuses a config that
-    // names both seams.
-    if (router_fds[0] >= 0) {
-        serveRouter(pid, router_fds[0], config.net_router.?) catch |err| {
-            closeBrokerPair(&router_fds);
-            _ = linux.close(middle_read_fd);
-            _ = linux.kill(pid, .KILL);
-            var reap_status: u32 = undefined;
-            var reap_rc = linux.waitpid(pid, &reap_status, 0);
-            while (linux.errno(reap_rc) == .INTR) {
-                reap_rc = linux.waitpid(pid, &reap_status, 0);
-            }
-            return err;
-        };
-        closeBrokerPair(&router_fds);
-    }
+    // a connection are answered and where a device the caller pushed inward
+    // is carried across. **The blocking wait below cannot come first**: it
+    // would leave nobody reading either link for the whole call, and the
+    // program inside would block on an answer that arrives after it has
+    // ended. **One multiplexed loop, and never two run at once.** The broker
+    // and the router are still mutually exclusive, because `spawn` refuses a
+    // config that names both seams, but a device source is exclusive with
+    // neither: see `serveLinks`'s own top comment.
+    const link: Link = if (router_fds[0] >= 0)
+        .{ .router = .{ .fd = router_fds[0], .seam = config.net_router.? } }
+    else if (broker_fds[0] >= 0)
+        .{ .broker = .{ .fd = broker_fds[0], .seam = config.net_broker.? } }
+    else
+        .none;
+    const device: ?DeviceOut = if (device_fds[0] >= 0)
+        .{ .fd = device_fds[0], .source = config.device_source.? }
+    else
+        null;
 
-    if (broker_fds[0] >= 0) {
-        serveBroker(pid, broker_fds[0], config.net_broker.?) catch |err| {
+    // **A session with no link and no device source runs this loop for
+    // nothing.** `link == .none and device == null` is exactly the config
+    // this whole call already had before either seam existed: no descriptor
+    // to poll and no reason to wait here before the blocking wait below, so
+    // that byte for byte unchanged case skips the loop entirely rather than
+    // enter it only to poll nothing. See task 4b's own second property.
+    if (link != .none or device != null) {
+        serveLinks(pid, link, device) catch |err| {
             closeBrokerPair(&broker_fds);
+            closeBrokerPair(&router_fds);
+            closeBrokerPair(&device_fds);
             _ = linux.close(middle_read_fd);
             // A is still running and this process is its only reaper, so end
             // it rather than leave a call nobody is watching.
@@ -1301,6 +1469,8 @@ pub fn spawn(
             return err;
         };
         closeBrokerPair(&broker_fds);
+        closeBrokerPair(&router_fds);
+        closeBrokerPair(&device_fds);
     }
 
     // End of file with no data: execve happened, and every byte of A's own
@@ -1433,31 +1603,100 @@ fn closeBrokerPair(fds: *[2]i32) void {
     }
 }
 
-/// Answer the sandboxed program's requests for a connection until it ends.
+/// Which of the two mutually exclusive network seams this call serves, or
+/// neither. `spawn` refuses a config that names both `net_broker` and
+/// `net_router`, so at most one of these ever carries a real descriptor. See
+/// `Config.net_router`.
+const Link = union(enum) {
+    none,
+    broker: struct { fd: i32, seam: iface.NetBroker },
+    router: struct { fd: i32, seam: iface.NetRouter },
+};
+
+/// The host side of a device link, for a call that names `Config.device_source`.
+/// `fd` is `device_fds[0]`: this process only ever writes to it, through
+/// `devicelink.sendPlace` and `devicelink.sendDrop`, because
+/// `devicelink.zig`'s own top comment is explicit that nothing ever answers
+/// back on it.
+const DeviceOut = struct {
+    fd: i32,
+    source: iface.DeviceSource,
+};
+
+/// Send one `change` to the in-sandbox helper. Errors are not this
+/// function's to report: a `PeerGone` here means D has already ended, which
+/// `serveLinks`' own loop learns on its next look through the ordinary
+/// death of the sandboxed program, and a `PathUnusable` here is
+/// `config.device_source`'s own bug, already unreachable from a sandboxed
+/// process and so never something this file's own audit exists to catch.
+///
+/// False when the helper could not be reached, which is the only way either
+/// send fails: the link is a socket pair with exactly two ends and this one is
+/// writing. **The caller stops offering devices and keeps serving everything
+/// else**, because a helper that has gone must not take a working network down
+/// with it. See `serveLinks`, which is the only caller.
+fn sendChange(fd: i32, change: iface.DeviceSource.Change) bool {
+    switch (change) {
+        .place => |p| {
+            devicelink.sendPlace(fd, p.kind, p.source, p.target) catch return false;
+            return true;
+        },
+        .drop => |d| {
+            devicelink.sendDrop(fd, d.target) catch return false;
+            return true;
+        },
+    }
+}
+
+/// Answer the sandboxed program's requests for a connection, and carry a
+/// device the caller pushes inward, until the call has ended.
 ///
 /// **This runs in the real parent**, the process that called `spawn`, and that
-/// is the whole design: the parent holds the policy, so a sandboxed process
-/// cannot reach a host merely by knowing its address, and it also holds the
-/// host's own network namespace, which A gave up in `enterNamespaces` and B
-/// never had. A is the wrong process for this twice over.
+/// is the whole design for `link`: the parent holds the policy, so a
+/// sandboxed process cannot reach a host merely by knowing its address, and
+/// it also holds the host's own network namespace, which A gave up in
+/// `enterNamespaces` and B never had. A is the wrong process for this twice
+/// over. `device` runs here for a different reason: `config.device_source` is
+/// the caller's own object, alive for as long as the caller keeps it, and
+/// only the real parent's own stack frame is guaranteed to still be there
+/// when a device becomes available partway through a long running call.
 ///
-/// **Nothing waits without a bound.** The loop polls two descriptors: the
-/// broker pair, which becomes readable when a request arrives and reaches the
-/// end of the stream when the sandbox is gone, and a `pidfd` on A, which
-/// becomes readable the moment A exits. So a program that never asks for
-/// anything costs one blocked `poll` and no wakeups at all, and a program that
-/// ends while nothing is in flight ends this loop at once.
+/// **One loop where this driver used to run two, because devices are
+/// exclusive with neither.** A hardware session may want a network and a
+/// device at once, so the set of descriptors this polls is whichever of
+/// `link`'s two members is real, plus `device`'s own wakeup when one was
+/// named, plus the pidfd every call polls regardless. `poll`'s own manual
+/// says a negative `fd` in one slot is simply skipped, so a member `link`
+/// does not carry, or a call with no `device`, costs nothing here beyond the
+/// slot in this array staying unused.
 ///
-/// **The pidfd is not decoration.** Without it, a sandboxed program that keeps
-/// its end of the pair open in a process that never exits, such as a
-/// grandchild the program forked and abandoned, would hold this loop after the
-/// program itself had finished, and the caller's own `waitpid` would never
-/// run.
+/// **Nothing waits without a bound.** A program that never asks for
+/// anything, on a call with no device source either, costs one blocked
+/// `poll` and no wakeups at all, and a program that ends while nothing is in
+/// flight ends this loop at once. **The pidfd is not decoration.** Without
+/// it, a sandboxed program that keeps its end of a pair open in a process
+/// that never exits, such as a grandchild the program forked and abandoned,
+/// would hold this loop after the program itself had finished, and the
+/// caller's own `waitpid` would never run.
 ///
-/// `netbroker.max_requests` bounds the work: past it this loop closes its end
-/// and returns, so a program that asks in a tight loop meets the end of the
-/// stream rather than an unbounded cost here.
-fn serveBroker(pid: linux.pid_t, broker_fd: i32, broker: iface.NetBroker) SpawnError!void {
+/// **The request is read before the pidfd, every look, and the device
+/// wakeup is drained before it too.** A program that asked and then exited
+/// has its request already in the pair, and the kernel reports both on the
+/// same look: reading the request first costs one answer nobody collects,
+/// and reading the pidfd first would lose a request that was really made.
+/// The same reasoning extends to the device wakeup, which this loop reads
+/// before the pidfd for the same reason, though the risk it closes is
+/// smaller: a placement fed in the instant the program exits is one this
+/// driver can still forward, and D outlives B by design, so forwarding it
+/// costs nothing even when nothing is left to use it.
+///
+/// `netbroker.max_requests` and `routerlink.max_requests` still bound the
+/// two links exactly as they always did: past the budget the link closes and
+/// this loop reads that as the end of the stream. **The device source has no
+/// such budget**, because it is never the sandboxed, untrusted program that
+/// drives it: `config.device_source` is the caller's own trusted code, the
+/// same reason nothing here rate limits `restrictMiddle` or `reportTraps`.
+fn serveLinks(pid: linux.pid_t, link: Link, device: ?DeviceOut) SpawnError!void {
     // **Opened here, before anything reaps A**, for the reason the `middle`
     // handle gives: this process is A's only reaper and has not run its
     // `waitpid` yet, so A is still a task the kernel can resolve, alive or a
@@ -1468,83 +1707,58 @@ fn serveBroker(pid: linux.pid_t, broker_fd: i32, broker: iface.NetBroker) SpawnE
     const watch: i32 = @intCast(watch_rc);
     defer _ = linux.close(watch);
 
-    var served: usize = 0;
-    while (served < netbroker.max_requests) {
-        var fds = [2]linux.pollfd{
-            .{ .fd = broker_fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = watch, .events = linux.POLL.IN, .revents = 0 },
-        };
-        const ready = linux.poll(&fds, fds.len, -1);
-        switch (linux.errno(ready)) {
-            .SUCCESS => {},
-            // A signal reached this process while it waited. Nothing was lost,
-            // so look again rather than end a call over it.
-            .INTR => continue,
-            else => return,
-        }
+    const link_fd: i32 = switch (link) {
+        .none => -1,
+        .broker => |b| b.fd,
+        .router => |r| r.fd,
+    };
+    // Read once, outside the loop: `Config.device_source` names one live
+    // descriptor for the whole of one `spawn` call, the same as `link_fd`
+    // above does, and re-asking on every turn would cost a call through the
+    // seam's own vtable for an answer that cannot change.
+    const wakeup_fd: i32 = if (device) |d| d.source.vtable.wakeup(d.source.ptr) else -1;
+    // A budget only a real link needs: see this function's own top comment
+    // on why the device source has none. `.none` never reads `served`
+    // against it, because the loop below only ever counts a served link
+    // request, and there is no link to serve.
+    const budget: usize = switch (link) {
+        .none => 0,
+        .broker => netbroker.max_requests,
+        .router => routerlink.max_requests,
+    };
 
-        // **The request is read first, and A's death second.** A program that
-        // asked and then exited has its request already in the pair, and the
-        // kernel reports both descriptors on the same look. Reading the
-        // request first costs one answer nobody collects. Reading the death
-        // first would lose a request that was really made.
-        if (fds[0].revents & linux.POLL.IN != 0) {
-            switch (netbroker.serveOne(broker_fd, broker)) {
-                // Counted, because this is the one a sandboxed process can
-                // make happen on purpose.
-                .served => {
-                    served += 1;
-                    continue;
-                },
-                // Not counted: a signal that interrupted the read is not a
-                // request, and counting it would let a signal storm this
-                // process did not cause spend a call's whole budget.
-                //
-                // **This cannot spin.** The two errnos behind it are `EINTR`,
-                // which needs a real signal at this process and so cannot
-                // repeat without one, and `EAGAIN`, which a blocking
-                // descriptor that `poll` has just called readable does not
-                // answer. Nothing a sandboxed process can send produces
-                // either one.
-                .nothing => continue,
-                .peer_gone => return,
-            }
-        }
-        // The end of the stream on the pair, with nothing to read: every copy
-        // of the child's end is closed, so nothing will ask again.
-        if (fds[0].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) return;
-        if (fds[1].revents != 0) return;
+    // **Sized for what this call actually has, and never padded with a
+    // sentinel slot.** `link_idx` and `device_idx` are `null` for a member
+    // this call does not carry, and `fds[0..fds_len]` below is exactly the
+    // set of descriptors this call polls: a session with no link and no
+    // device source never reaches this function at all, see `spawn`'s own
+    // guard, and a session with one of the two but not the other polls two
+    // descriptors here and never three. This is what task 4b's own second
+    // property rests on, and a fixed three element array with `-1` in the
+    // unused slot would only be `poll`'s own business to skip, not a fact a
+    // test could see from outside.
+    var fds: [3]linux.pollfd = undefined;
+    fds[0] = .{ .fd = watch, .events = linux.POLL.IN, .revents = 0 };
+    var fds_len: usize = 1;
+    var link_idx: ?usize = null;
+    if (link_fd >= 0) {
+        link_idx = fds_len;
+        fds[fds_len] = .{ .fd = link_fd, .events = linux.POLL.IN, .revents = 0 };
+        fds_len += 1;
     }
-}
-
-/// Answer the network router until the sandboxed call has ended. **This is
-/// the parent side**, and it is the mirror of `serveBroker` above: the same
-/// wait on the same two descriptors, and the same rule about which one is read
-/// first.
-///
-/// **The budget is larger than the broker's, and it is still a budget.** One
-/// request is one name a program resolved or one connection it made, and a
-/// program that installs a package really does make hundreds of both. What a
-/// budget bounds is the work a program inside the sandbox can spend on the
-/// far side by asking in a loop. Past it the pair closes, and the router then
-/// reads the end of the stream and refuses everything, which is the same
-/// answer a policy that permits nothing gives.
-fn serveRouter(pid: linux.pid_t, router_fd: i32, seam: iface.NetRouter) SpawnError!void {
-    // **Opened here, before anything reaps A**, for the reason `serveBroker`
-    // gives: this process is A's only reaper and has not run its `waitpid`
-    // yet, so A is still a task the kernel can resolve, alive or a zombie.
-    const watch_rc = linux.pidfd_open(pid, 0);
-    if (linux.errno(watch_rc) != .SUCCESS) return error.Unexpected;
-    const watch: i32 = @intCast(watch_rc);
-    defer _ = linux.close(watch);
+    var device_idx: ?usize = null;
+    if (device != null) {
+        device_idx = fds_len;
+        fds[fds_len] = .{ .fd = wakeup_fd, .events = linux.POLL.IN, .revents = 0 };
+        fds_len += 1;
+    }
 
     var served: usize = 0;
-    while (served < routerlink.max_requests) {
-        var fds = [2]linux.pollfd{
-            .{ .fd = router_fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = watch, .events = linux.POLL.IN, .revents = 0 },
-        };
-        const ready = linux.poll(&fds, fds.len, -1);
+    while (link == .none or served < budget) {
+        // `poll` writes every `revents` field it examines fresh on every
+        // call, for every index below `fds_len`, so nothing here has to
+        // clear a slot before asking again.
+        const ready = linux.poll(&fds, fds_len, -1);
         switch (linux.errno(ready)) {
             .SUCCESS => {},
             // A signal reached this process while it waited. Nothing was lost,
@@ -1553,20 +1767,76 @@ fn serveRouter(pid: linux.pid_t, router_fd: i32, seam: iface.NetRouter) SpawnErr
             else => return,
         }
 
-        // **The request is read first, and A's death second**, the same order
-        // and for the same reason `serveBroker` gives.
-        if (fds[0].revents & linux.POLL.IN != 0) {
-            switch (routerlink.serveOne(router_fd, seam)) {
-                .served => {
-                    served += 1;
-                    continue;
-                },
-                .nothing => continue,
-                .peer_gone => return,
+        // **The link is read first**, the property every server loop this
+        // file has ever had states in its own comment, and for the same
+        // reason: the kernel reports both this and the pidfd on the same
+        // look, and reading the request first costs one answer nobody
+        // collects, where reading the pidfd first would lose a request that
+        // was really made.
+        // **Two calls to `serveOne` and not one, because `netbroker.Outcome`
+        // and `routerlink.Outcome` are two distinct types with the same
+        // three members.** Zig has no common type a single `switch`
+        // expression could return here, so the switch on `link` picks the
+        // call and each arm switches its own answer, rather than force one
+        // shared `Outcome` on two wires that owe each other nothing.
+        if (link_idx) |i| {
+            if (fds[i].revents & linux.POLL.IN != 0) {
+                switch (link) {
+                    .none => unreachable,
+                    .broker => |b| switch (netbroker.serveOne(b.fd, b.seam)) {
+                        // Counted, because this is the one a sandboxed
+                        // process can make happen on purpose.
+                        .served => {
+                            served += 1;
+                            continue;
+                        },
+                        // Not counted: a signal that interrupted the read is
+                        // not a request, and counting it would let a signal
+                        // storm this process did not cause spend a call's
+                        // whole budget.
+                        .nothing => continue,
+                        .peer_gone => return,
+                    },
+                    .router => |r| switch (routerlink.serveOne(r.fd, r.seam)) {
+                        .served => {
+                            served += 1;
+                            continue;
+                        },
+                        .nothing => continue,
+                        .peer_gone => return,
+                    },
+                }
             }
         }
-        if (fds[0].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) return;
-        if (fds[1].revents != 0) return;
+
+        // **The device wakeup is read next, and before the pidfd too**, for
+        // the smaller version of the same reason. Drained in a loop of its
+        // own: one wakeup can carry more than one change, and
+        // `iface.DeviceSource.VTable.next`'s own doc comment says to keep
+        // calling until it answers null.
+        if (device) |d| {
+            if (fds[device_idx.?].revents & linux.POLL.IN != 0) {
+                while (d.source.vtable.next(d.source.ptr)) |change| {
+                    if (sendChange(d.fd, change)) continue;
+                    // **The helper is gone, so stop offering devices and keep
+                    // serving the rest.** A negative descriptor is the one
+                    // thing `poll` ignores, so this drops the wakeup out of
+                    // the set without moving any other index. Tearing the
+                    // whole loop down here would take a working network with
+                    // it, which is a larger fault than the one that happened.
+                    fds[device_idx.?].fd = -1;
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // The end of the stream on the link, with nothing to read: every
+        // copy of the child's end is closed, so nothing will ask again.
+        if (link_idx) |i| if (fds[i].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) return;
+        // The pidfd, always at index 0: A has exited, so nothing more will
+        // ever be there to serve.
+        if (fds[0].revents != 0) return;
     }
 }
 
@@ -2042,6 +2312,10 @@ fn setupErrorFor(step: SetupStep) SetupError {
         // repair is a different one: a kernel module the host has to load.
         // See `iface.SpawnError.NetRouterUnavailable`.
         .network => error.NetRouterUnavailable,
+        // **Its own member, for the same reason `.network` has one.** A
+        // device source was named, and the helper that places its devices
+        // never said it was ready. See `iface.SpawnError.DeviceHelperFailed`.
+        .device => error.DeviceHelperFailed,
         .scratch_mount => error.ScratchMountFailed,
         .mount_tree => error.MountTreeFailed,
         .pivot => error.PivotFailed,
@@ -2571,6 +2845,10 @@ fn waitAndRelay(
     keeper_pid: linux.pid_t,
     /// The network router. Both members are -1 for a call that has none.
     network_router: RouterWatch,
+    /// The device helper. Both members are -1 for a call that names no
+    /// `device_source`. Same shape as `network_router`, and reaped the same
+    /// way, through `reapDevice`.
+    device: DeviceWatch,
     keeper_fd: i32,
     areas: *const ScratchAreas,
     middle_write_fd: i32,
@@ -2604,6 +2882,11 @@ fn waitAndRelay(
     // ended. There is nothing for it to finish and nothing it could be waiting
     // on, so the wait below cannot block on work in flight.
     if (network_router.pid >= 0) reapRouter(network_router);
+
+    // **D is ended the same way and for the same reason N is, just above.**
+    // A device helper serves a loop with no way out of its own either: it
+    // runs for as long as the sandbox does, and the sandbox has just ended.
+    if (device.pid >= 0) reapDevice(device);
 
     // Closing this socket tells process 1 to leave. Its exit kills any process
     // that B left behind. Reap it last because its pid namespace cannot close
@@ -2705,6 +2988,57 @@ const RouterWatch = struct {
 /// would notice at the end of a tool call.
 const router_drain_tries: usize = 500;
 const router_drain_step_ns: isize = 1_000_000;
+
+/// End the device helper and reap it. Called by A, from `waitAndRelay`, the
+/// same moment `reapRouter` is: after the sandboxed program has been reaped
+/// and before process 1 is told to go.
+///
+/// **The same shape `reapRouter` has, and a simpler one underneath.** D
+/// carries no bytes of its own the way N's relay does: a placement is one
+/// `mount`, already finished the moment `devicelink.serveOne` returns, so
+/// there is nothing for D to drain and closing its control socket is enough
+/// to make it leave on its own. The wait below still has a bound, for the
+/// reason `reapRouter`'s own comment gives: a helper that will not leave must
+/// not hold the whole session.
+fn reapDevice(watch: DeviceWatch) void {
+    if (watch.control_fd >= 0) _ = linux.close(watch.control_fd);
+
+    var status: u32 = undefined;
+    var rc: usize = 0;
+    var tries: usize = 0;
+    while (tries < router_drain_tries) : (tries += 1) {
+        rc = linux.waitpid(watch.pid, &status, linux.W.NOHANG);
+        switch (linux.errno(rc)) {
+            .SUCCESS => if (rc != 0) return,
+            .INTR => continue,
+            else => break,
+        }
+        var pause: linux.timespec = .{ .sec = 0, .nsec = router_drain_step_ns };
+        _ = linux.nanosleep(&pause, null);
+    }
+
+    const kill_errno = linux.errno(linux.kill(watch.pid, .KILL));
+    switch (kill_errno) {
+        // `ESRCH` means D has already ended, which leaves a zombie to collect
+        // exactly as a kill does.
+        .SUCCESS, .SRCH => {},
+        else => dieRelayErrno("end the device helper", kill_errno),
+    }
+    rc = linux.waitpid(watch.pid, &status, 0);
+    while (linux.errno(rc) == .INTR) rc = linux.waitpid(watch.pid, &status, 0);
+    if (linux.errno(rc) != .SUCCESS) {
+        dieRelayErrno("waitpid on the device helper", linux.errno(rc));
+    }
+}
+
+/// What A holds about the device helper while it waits for B. Same shape as
+/// `RouterWatch`.
+const DeviceWatch = struct {
+    pid: linux.pid_t,
+    /// The socket D said it was ready on. **Closing it is how D is told the
+    /// call has ended.** -1 for a call with no `device_source`.
+    control_fd: i32,
+};
 
 /// Build the sandbox its own network and put the ruleset on it. Runs in A,
 /// inside the network namespace and while `CAP_NET_ADMIN` is still held.
@@ -2919,6 +3253,499 @@ const router_idle_step_ms: i32 = 20;
 const router_drain_steps: usize = 16;
 const router_drain_step_ms: i32 = 2;
 
+/// D, the device helper. Never returns.
+///
+/// **Confines itself before it serves anything**, the same order `runRouter`
+/// keeps and for the same reason: `armPdeathsig` first, so a death of A
+/// between the fork and this line does not leave D running with a link
+/// nobody reads; then every descriptor but the three it needs goes away;
+/// then the hidden device tree is bound in, while this process still holds
+/// every capability it inherited; then every capability but `CAP_SYS_ADMIN`,
+/// which is what a bind mount and an unmount both need in this sandbox's own
+/// user namespace; then the allowlist `seccomp.buildDevice` built. Only after
+/// all of that does it say it is ready, so "ready" means "fully confined and
+/// listening" here.
+///
+/// **The hidden tree is bound here, in D, and not in B's own mount tree.** D
+/// is forked and confined before B, precisely so a program inside the
+/// sandbox can never ask for a path before D is ready to answer it: see this
+/// file's own comment above D's fork in `spawn`. Binding the hidden tree in
+/// B's own `applyLayers` instead would let D start serving placements before
+/// that bind existed, for any device pushed in early enough, and a
+/// placement asked for in that window would answer `MountFailed` for a
+/// reason nothing near it explains.
+///
+/// **D never pivots, and it does not need to.** `pivot_root`, run later by B,
+/// changes the root mount for the whole namespace the two of them share, so
+/// D's own `/` moves to the sandbox's root at the instant B's own call
+/// happens, the same as B's does, with no unshare and no pivot of D's own
+/// asked for. Measured directly, standalone, outside this repository: two
+/// processes sharing one mount namespace, one of them pivoting, and the
+/// other one's fresh absolute lookups landing in the pivoted tree afterward,
+/// never in the detached old one, so long as the path it asks for is
+/// already sandbox-relative and carries no `Config.root` prefix of its own.
+/// This is why `placeDevice` and `dropDevice`, unlike `bindDeviceTree`, join
+/// `Config.root` onto nothing: see `placeDevice`'s own doc comment for the
+/// argument that D never serves a placement before that pivot has already
+/// happened, so a sandbox-relative path is the only kind this loop ever
+/// needs to resolve.
+///
+/// **`CAP_SYS_ADMIN` and never `CAP_MKNOD`.** This process makes the
+/// placeholder its own bind lands a device on with `mknodat`, and it never
+/// makes one with `S_IFCHR` or `S_IFBLK`: see `placeDevice`. Keeping
+/// `CAP_MKNOD` out of the set this process holds means a bug that tried to
+/// fabricate a device node's own identity would meet `EPERM` from the kernel,
+/// not merely a promise this file's own code keeps.
+///
+/// **What it is permitted afterwards is `seccomp.device_calls` and nothing
+/// else.** It cannot open a path of its own choosing, make a socket of any
+/// kind, run a program, or signal anything. It can only bind and unbind a
+/// path under the one hidden tree `bindDeviceTree` already mounted, onto a
+/// sandbox-relative path, both of them checked before they are ever passed
+/// to a syscall: see `buildDeviceSource` and `buildDeviceTarget`.
+///
+/// **A layer that will not go on ends this process rather than weakening
+/// it**, the same rule `runRouter`'s own comment states: D can reach the one
+/// hidden tree Chock's own policy chose, and running with less than its
+/// full confinement is the one outcome that must not happen quietly. Ending
+/// it is safe for the session: A is waiting for the readiness byte and
+/// reports a setup failure when it does not come.
+fn runDevice(
+    ready_fd: i32,
+    link_fd: i32,
+    root: []const u8,
+    hidden_host: []const u8,
+    hidden_inside: []const u8,
+    middle_pidfd: i32,
+    insns: []const bpf.Insn,
+    write_fd: i32,
+    stderr_fd: i32,
+) noreturn {
+    armPdeathsig(write_fd, stderr_fd, middle_pidfd);
+
+    // Every descriptor but the three this loop uses: the control socket, the
+    // device link, and standard error, which stays open for the whole of this
+    // process's life so a placement that fails can still say so. See
+    // `reportDeviceFault`.
+    keepOnlyTheseDescriptors(&.{ ready_fd, link_fd, stderr_fd });
+
+    // **Before any capability is dropped**, the same order `applyLayers`
+    // keeps for B's own mount tree: build it while this process still holds
+    // every capability it inherited, then narrow. See this function's own
+    // top comment for why this runs in D rather than in B.
+    var tree_buffer: [device_path_capacity]u8 = undefined;
+    if (!bindDeviceTree(&tree_buffer, root, hidden_inside, hidden_host)) linux.exit(1);
+
+    var cap_diag: ?capabilities.Diagnostic = null;
+    capabilities.keepOnly(linux.CAP.SYS_ADMIN, &cap_diag) catch linux.exit(1);
+    seccomp.install(bpf.Prog.init(insns)) catch linux.exit(1);
+
+    // **The last thing before the loop.** A is blocked on this byte and
+    // hands the caller's program a path to open only once it arrives, so
+    // nothing the program does can reach a helper that is not there yet.
+    //
+    // **`write`, and not `sendto`.** `runRouter`'s own readiness byte goes
+    // out with `sendto`, because `router_calls` gives N no general `write`
+    // at all: a router that could write to a descriptor is a router that
+    // could write to one the far side sent it. `device_calls` draws that
+    // line differently: `write` is already on it, for `reportDeviceFault`,
+    // and `sendto` is not on it at all. Measured on 2026-09-16: a helper
+    // that called `sendto` here died at exactly this line with `SIGSYS`,
+    // which is what `device_calls`'s own compile time guard cannot catch,
+    // because `sendto` is not one of the calls it refuses outright.
+    const ready = [1]u8{1};
+    const said = linux.write(ready_fd, &ready, ready.len);
+    if (linux.errno(said) != .SUCCESS or said != ready.len) linux.exit(1);
+
+    var state = DeviceSeamState{ .hidden = hidden_inside, .stderr_fd = stderr_fd };
+    const seam = state.seam();
+
+    while (true) {
+        // `ppoll` and never `poll`: `seccomp.device_calls` names only the
+        // former. Unlike `router_calls`, which permits whichever one the
+        // standard library calls on this architecture, this list is fixed at
+        // one, so this loop must call that one directly rather than through
+        // `linux.poll`, which resolves to the plain syscall on some
+        // architectures and would be killed here.
+        var fds = [2]linux.pollfd{
+            .{ .fd = link_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = ready_fd, .events = 0, .revents = 0 },
+        };
+        const ready_rc = linux.ppoll(&fds, fds.len, null, null);
+        switch (linux.errno(ready_rc)) {
+            .SUCCESS => {},
+            // A signal reached this process while it waited. Nothing was
+            // lost, so look again rather than end a call over it.
+            .INTR => continue,
+            else => linux.exit(1),
+        }
+
+        // **The link is read first, and A's own end of the control socket
+        // second.** The same rule `serveLinks`' own comment states for the
+        // real parent's loop, and for the same reason: a placement that
+        // arrived in the same look as A's own close must still be placed.
+        if (fds[0].revents & linux.POLL.IN != 0) {
+            const outcome = devicelink.serveOne(link_fd, seam);
+            switch (outcome) {
+                // Both are already reported, through `state`'s own call into
+                // `reportDeviceFault`: see `DeviceSeamState.placeFn` and
+                // `.dropFn`. Nothing more to do here but look again.
+                .placed, .place_failed, .dropped, .drop_failed, .nothing => continue,
+                // The real parent's own end of the link has gone, which only
+                // happens once the sandboxed program has ended: see
+                // `serveLinks`'s own comment on when it stops writing here.
+                .peer_gone => linux.exit(0),
+            }
+        }
+        // The end of the stream on the link, with nothing to read.
+        if (fds[0].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) linux.exit(0);
+        // A closed this end of the control socket to say the call has ended:
+        // see `reapDevice`.
+        if (fds[1].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) linux.exit(0);
+    }
+}
+
+/// Which kind of node `Place.kind` may ask for. **The only one this
+/// milestone implements.** `devicelink.DeviceSeam.Result`'s own doc comment
+/// names "kind can be a byte the seam does not implement" as one of the
+/// ordinary reasons `place` answers `.failed`, and any other value takes
+/// exactly that path: see `placeDevice`.
+const device_kind_file: u8 = 0;
+
+/// How large a full host path for a placed device may be: generous over any
+/// real `Config.root`, which lives under a session's own scratch directory,
+/// plus `devicelink.max_path_bytes` for the destination inside the sandbox.
+/// Stack allocated, never heap allocated: `seccomp.device_calls` has no
+/// `mmap` or `brk` in it, so this process may not grow its own heap once its
+/// filter is on.
+const device_path_capacity: usize = std.fs.max_path_bytes;
+
+/// What can go wrong placing or dropping a device, named so
+/// `reportDeviceFault` can say which step failed. **Never crosses a process
+/// boundary**: `devicelink.zig`'s own top comment is explicit that nothing
+/// answers back over the link, so this is reported the only other way this
+/// process can, `write`, onto the descriptor it is given for that. See
+/// `docs/error-handling.md`.
+const PlaceError = error{
+    /// `Place.kind` named something this helper does not implement.
+    UnsupportedKind,
+    /// `target` was empty, was not absolute, ended in `/`, carried a `..`
+    /// component, or, joined onto `root`, did not fit this helper's own
+    /// stack buffer.
+    PathUnusable,
+    /// A parent directory could not be made.
+    MkdirFailed,
+    /// The placeholder the bind lands the device on could not be made.
+    MknodFailed,
+    /// The bind, or the unmount that takes it back out, failed.
+    MountFailed,
+};
+
+/// Join `root` with `path`, the destination a `Place` or a `Drop` named,
+/// into `buffer` as a nul terminated string `mkdirat`, `mknodat`, `mount`'s
+/// own "to" side, and `umount2` can all read directly.
+///
+/// **`root` is `Config.root`, a host path, only before B's own pivot.**
+/// `bindDeviceTree` is the one caller that still passes it. Every other
+/// caller, `placeDevice` and `dropDevice`, passes `""`, because by the time
+/// either of them ever runs, this process's own `/` already is the
+/// sandbox's: see `placeDevice`'s own doc comment. An empty `root` makes
+/// this function a bounds check over `path` alone, joining nothing in
+/// front of it.
+///
+/// **`path` is bounded and refused, never resolved.** It has to start with
+/// `/`, so the join lands under `root` and never beside it; it may not end in
+/// `/`, so there is always a leaf component; and it may not carry a `..`
+/// component, so it cannot climb back out of the tree this call is scoped
+/// to. None of that opens anything: this is a string check against bytes
+/// that already crossed the wire, the same division `devicelink.serveOne`
+/// itself keeps against its own seam. Null when any check fails, or when the
+/// join would not fit `buffer`.
+///
+/// **Ordinary path resolution beyond this, the same as `namespace.zig`'s own
+/// `makePath` keeps for every bind mount's target.** Neither walks its
+/// intermediate components with `O_NOFOLLOW`, because neither can: this
+/// process holds no descriptor to walk through, only the strings `mount`
+/// and `mkdirat` read as names, and those two calls are all
+/// `seccomp.device_calls` permits that ever read a target by name.
+/// `config.root`'s own tree is this project's, built fresh for the call
+/// under way, the same trust `makePath` already places in it.
+fn buildDeviceTarget(buffer: []u8, root: []const u8, path: []const u8) ?[:0]u8 {
+    if (path.len <= 1 or path[0] != '/' or path[path.len - 1] == '/') return null;
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return null;
+    }
+
+    if (root.len + path.len >= buffer.len) return null;
+    @memcpy(buffer[0..root.len], root);
+    @memcpy(buffer[root.len..][0..path.len], path);
+    buffer[root.len + path.len] = 0;
+    return buffer[0 .. root.len + path.len :0];
+}
+
+/// Join `hidden` and `source` into `buffer`. **`hidden` is never prefixed
+/// with `root` here**: by the time this runs, this process's own `/` is the
+/// sandbox's, exactly the same as `namespace.pivotInto` already made B's,
+/// so `hidden`, `Config.device_tree.inside`, is already an absolute path
+/// this process can resolve directly. See `placeDevice`'s own doc comment
+/// for why that is true only after the pivot, and never before it.
+///
+/// **This is the one new security check the whole path-based redesign turns
+/// on.** Descriptor passing used to make a check like this unnecessary: the
+/// far side opened the file itself, and this helper only ever placed the
+/// descriptor it was handed, never a name it resolved on its own. A path
+/// cannot carry that guarantee by itself, so `source` has to be checked
+/// before it is ever joined onto `hidden`: a leading `/` would make the join
+/// read from `/` directly and ignore `hidden` entirely; a `..` component
+/// would climb back out of `hidden` one step at a time; and an empty
+/// component, which a leading `/`, a trailing `/`, or a doubled `/` all
+/// produce, would resolve to `hidden` itself or skip a directory silently.
+/// One loop over every component catches all three, the same way
+/// `buildDeviceTarget`'s own loop catches `..` for `target`.
+///
+/// **`hidden` is not checked here.** It is `Config.device_tree.inside`,
+/// chosen by Chock's own host side and never by the far side that sends a
+/// `Place`, so it carries the same trust `buildDeviceTarget` already places
+/// in `root`. `bindDeviceTree` validates it once, at the one point it is
+/// ever turned into a mount.
+///
+/// Null when `source` fails any of those checks, or when the join would not
+/// fit `buffer`, the same contract `buildDeviceTarget` keeps.
+fn buildDeviceSource(buffer: []u8, hidden: []const u8, source: []const u8) ?[:0]u8 {
+    if (source.len == 0) return null;
+
+    var it = std.mem.splitScalar(u8, source, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, "..")) return null;
+    }
+
+    const total = hidden.len + 1 + source.len;
+    if (total >= buffer.len) return null;
+    @memcpy(buffer[0..hidden.len], hidden);
+    buffer[hidden.len] = '/';
+    @memcpy(buffer[hidden.len + 1 ..][0..source.len], source);
+    buffer[total] = 0;
+    return buffer[0..total :0];
+}
+
+/// Make every directory `buffer[0..full_len]`'s own parent needs, tolerating
+/// one that is already there. **The same loop `namespace.zig`'s own
+/// `makePath` walks**, written again here without an allocator: this runs
+/// after this helper's own filter is on, and `device_path_capacity`'s own doc
+/// comment is why that rules an allocator out. Mutates `buffer` in place and
+/// leaves it exactly as it was found: each `/` in turn becomes a nul for the
+/// one `mkdirat` call that needs it there, then goes back to a `/` before the
+/// walk continues.
+fn makeDeviceParents(buffer: []u8, full_len: usize) bool {
+    var i: usize = 1;
+    while (i < full_len) : (i += 1) {
+        if (buffer[i] != '/') continue;
+        buffer[i] = 0;
+        const rc = linux.mkdirat(linux.AT.FDCWD, @ptrCast(buffer.ptr), 0o755);
+        buffer[i] = '/';
+        switch (linux.errno(rc)) {
+            // `EEXIST` is not a failure here: `mkdir -p` tolerates a
+            // directory a previous placement, or `root`'s own tree, already
+            // made at this step.
+            .SUCCESS, .EXIST => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Bind `host`, the one host directory this call's own device policy chose,
+/// onto `root` joined with `inside`, so that a node made in `host` at any
+/// point afterward, including after this whole sandbox has started, is
+/// visible at that joined path. Spiked end to end before this function was
+/// written, in an unprivileged user and mount namespace with a real
+/// `pivot_root`: a directory bound in before the pivot shows a node created
+/// in it after the pivot, because a bind shows the same live filesystem and
+/// not a copy taken at bind time.
+///
+/// **This runs in D, before B exists, so `root` is still a plain host
+/// path here, and it has to be joined.** `namespace.pivotInto`, run later by
+/// B, changes what `/` means for every process that shares the namespace,
+/// D included, at the instant B's own `pivot_root` call runs: this is a
+/// property of `pivot_root` itself and not something either process asks
+/// for by name, and it is why `placeDevice` and `dropDevice`, below, both
+/// stop joining `root` onto anything. This call is the one exception,
+/// because it runs before that instant, not after it. See `placeDevice`'s
+/// own doc comment for the measurement and for why the two functions
+/// disagree about `root` on purpose.
+///
+/// **`root` need not already be a mount point of its own for this.** Unlike
+/// `pivot_root`, an ordinary bind mount lands on any directory that already
+/// exists, mount point or not. Called from `runDevice`, before B has even
+/// been forked, so `root` is still only a plain directory on the host disk
+/// at this point, and this works regardless.
+///
+/// True on success. False leaves nothing new mounted, and `runDevice` ends
+/// the process rather than serve a call it cannot answer.
+fn bindDeviceTree(buffer: []u8, root: []const u8, inside: []const u8, host: []const u8) bool {
+    const target = buildDeviceTarget(buffer, root, inside) orelse return false;
+    if (!makeDeviceParents(buffer, target.len)) return false;
+    const mkdir_rc = linux.mkdirat(linux.AT.FDCWD, target.ptr, 0o755);
+    switch (linux.errno(mkdir_rc)) {
+        .SUCCESS, .EXIST => {},
+        else => return false,
+    }
+
+    var host_buffer: [device_path_capacity]u8 = undefined;
+    const host_z = std.fmt.bufPrintZ(&host_buffer, "{s}", .{host}) catch return false;
+
+    const mount_rc = linux.mount(host_z.ptr, target.ptr, null, linux.MS.BIND, 0);
+    return linux.errno(mount_rc) == .SUCCESS;
+}
+
+/// Bind the node at `source`, relative to the hidden tree at `hidden`, at
+/// `target`. The real work behind `DeviceSeamState.placeFn`, kept apart
+/// from it so a test can call this directly with no fork, no filter, and no
+/// `Sandbox.spawn` at all.
+///
+/// **Neither `hidden` nor `target` is joined onto `Config.root` here, and
+/// that is deliberate, not an oversight.** Every call this function makes
+/// runs from inside D's own served loop, which never starts until B has
+/// already pivoted: `spawn`'s own real parent only calls `serveLinks`,
+/// the loop that drains `Config.device_source` and sends what it drains to
+/// D, after `readSetupReport` has read end of file with no failure record
+/// on it, and B's own copy of that pipe's write end is `CLOEXEC`, held open
+/// through the whole of `applyLayers`, including `namespace.pivotInto`, and
+/// closed only by B's own `execve`. So by the time any `Place` or `Drop`
+/// this function ever answers was even sent, `namespace.pivotInto` has
+/// already run, on the one namespace D and B both still share, and
+/// `pivot_root` changes what `/` resolves to for every process sharing
+/// that namespace, this one included, at the instant it runs: see
+/// `pivot_root(2)`'s own manual page, and `namespace.pivotInto`, which this
+/// process never calls itself and does not need to. `hidden` and `target`
+/// are therefore already sandbox-absolute paths by the time this runs, the
+/// same as they are from inside the sandboxed program's own view, and
+/// joining `Config.root` onto either one would resolve into whatever the
+/// detached old root's own directory of that same name used to hold, which
+/// is either nothing or the wrong thing.
+///
+/// **`bindDeviceTree` is the one exception, and it stays a exception on
+/// purpose.** It runs before B is even forked, so `/` has not moved yet
+/// when it runs, and joining `Config.root` there is still correct: see its
+/// own doc comment.
+///
+/// **Read-write, and never remounted, on purpose.** `namespace.markReadOnly`
+/// also sets `NODEV` on a read only mount, which then refuses to open the
+/// device node at all: the same trap that once bit `/dev/null`'s own bind,
+/// see `lib/chock-core/tools.zig`. No line below this one ever narrows what
+/// the placed mount grants.
+///
+/// **`mknodat` makes the placeholder, and only ever with `S_IFREG`.**
+/// Measured on 2026-09-16, with a raw `mount(2)` call and not only the
+/// `mount(8)` command: a bind mount only ever attaches to a target that
+/// already exists and already shares the source's own directory-ness, so a
+/// character or block device, which is what this helper is for, needs a
+/// target that is a file and not a directory before the mount can land on
+/// it, and `mkdirat` cannot make one. `mknodat` can, and this call never
+/// asks it for anything but `S_IFREG`: see `seccomp.device_calls`'s own doc
+/// comment on `mknodat` for the capability that backs this up when the code
+/// does not.
+///
+/// **The bind is named through two paths this call built and checked
+/// itself, and never through a descriptor.** A descriptor opened outside
+/// this process cannot become a mount inside its own mount namespace at
+/// all: see `devicelink.zig`'s own top comment for the measurement. The
+/// claim this file can honestly make instead is that the only source ever
+/// resolved is one `buildDeviceSource` has already confirmed cannot climb
+/// out of the one hidden tree `bindDeviceTree` bound in, and the sandboxed
+/// program can neither read that tree nor choose what lives in it.
+fn placeDevice(
+    target_buffer: []u8,
+    source_buffer: []u8,
+    hidden: []const u8,
+    kind: u8,
+    source: []const u8,
+    target: []const u8,
+) PlaceError!void {
+    if (kind != device_kind_file) return error.UnsupportedKind;
+
+    const target_z = buildDeviceTarget(target_buffer, "", target) orelse return error.PathUnusable;
+
+    if (!makeDeviceParents(target_buffer, target_z.len)) return error.MkdirFailed;
+
+    const mknod_rc = linux.mknodat(linux.AT.FDCWD, target_z.ptr, linux.S.IFREG | 0o600, 0);
+    if (linux.errno(mknod_rc) != .SUCCESS) return error.MknodFailed;
+
+    const source_z = buildDeviceSource(source_buffer, hidden, source) orelse return error.PathUnusable;
+
+    const mount_rc = linux.mount(source_z.ptr, target_z.ptr, null, linux.MS.BIND, 0);
+    if (linux.errno(mount_rc) != .SUCCESS) return error.MountFailed;
+}
+
+/// Take the node at `path` back out. The real work behind
+/// `DeviceSeamState.dropFn`, kept apart from it for the reason `placeDevice`
+/// is. **No `root` joined onto `path` here either**, for the same reason
+/// `placeDevice` stopped: see that function's own doc comment.
+fn dropDevice(buffer: []u8, path: []const u8) PlaceError!void {
+    const target = buildDeviceTarget(buffer, "", path) orelse return error.PathUnusable;
+    const rc = linux.umount2(target.ptr, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.MountFailed;
+}
+
+/// Say a placement or a removal failed, on the one descriptor this helper may
+/// still write to once its own filter is on. **Never silent**, per
+/// `docs/error-handling.md`: `devicelink.zig`'s own wire carries no answer
+/// back to the real parent for either outcome, so this is the only place a
+/// person reading the session's own log ever learns a device did not arrive.
+fn reportDeviceFault(stderr_fd: i32, verb: []const u8, path: []const u8, err: PlaceError) void {
+    var line_buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &line_buf,
+        "sandbox: device {s} failed for {s}: {t}\n",
+        .{ verb, path, err },
+    ) catch return;
+    _ = linux.write(stderr_fd, line.ptr, line.len);
+}
+
+/// The `devicelink.DeviceSeam` this helper serves `devicelink.serveOne` with.
+/// Holds only what `placeDevice`, `dropDevice`, and `reportDeviceFault`
+/// need: `hidden`, `Config.device_tree.inside`, read once at fork and never
+/// written again, already sandbox-absolute by the time this seam ever
+/// serves a placement, because nothing reaches this seam until after B has
+/// pivoted: see `placeDevice`'s own doc comment; and `stderr_fd`, the one
+/// descriptor left open for the whole of this process's life for exactly
+/// the report `placeDevice` and `dropDevice` may need made. **No `root`
+/// here.** `bindDeviceTree`, D's own earlier, one time call, is the only
+/// place left that still needs it, and it reads `Config.root` directly.
+const DeviceSeamState = struct {
+    hidden: []const u8,
+    stderr_fd: i32,
+
+    fn seam(self: *DeviceSeamState) devicelink.DeviceSeam {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = devicelink.DeviceSeam.VTable{ .place = placeFn, .drop = dropFn };
+
+    fn placeFn(ptr: *anyopaque, kind: u8, source: []const u8, target: []const u8) devicelink.DeviceSeam.Result {
+        const self: *DeviceSeamState = @ptrCast(@alignCast(ptr));
+        var target_buffer: [device_path_capacity]u8 = undefined;
+        var source_buffer: [device_path_capacity]u8 = undefined;
+        placeDevice(&target_buffer, &source_buffer, self.hidden, kind, source, target) catch |err| {
+            reportDeviceFault(self.stderr_fd, "place", target, err);
+            return .failed;
+        };
+        return .done;
+    }
+
+    fn dropFn(ptr: *anyopaque, path: []const u8) devicelink.DeviceSeam.Result {
+        const self: *DeviceSeamState = @ptrCast(@alignCast(ptr));
+        var buffer: [device_path_capacity]u8 = undefined;
+        dropDevice(&buffer, path) catch |err| {
+            reportDeviceFault(self.stderr_fd, "drop", path, err);
+            return .failed;
+        };
+        return .done;
+    }
+};
+
 /// True when the peer of `fd` has closed its end.
 ///
 /// **`POLLHUP` and not a read.** A read would take a byte the peer might have
@@ -3020,8 +3847,16 @@ fn runKeeper(
 /// pidfd on itself afterward and gives it to the keeper and B. The namespaces
 /// are taken here because `unshare(CLONE_NEWPID)` never moves its own caller.
 /// The keeper is the first child made afterward. B runs steps 2 to 6.
-fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_fd: i32) void {
-    closeInheritedFds(write_fd, middle_write_fd, config.stdout_fd, config.stderr_fd, config.stdin_fd, broker_fd);
+fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_fd: i32, device_fd: i32) void {
+    closeInheritedFds(
+        write_fd,
+        middle_write_fd,
+        config.stdout_fd,
+        config.stderr_fd,
+        config.stdin_fd,
+        broker_fd,
+        device_fd,
+    );
 
     // The slot is here for the reason `applyLayers` has one, and for one more:
     // `error.NamespaceFailed` on its own cannot tell a policy that refuses an
@@ -3860,8 +4695,8 @@ fn redirectStdinToDevNull(write_fd: i32, stderr_fd: i32) void {
 }
 
 /// Close every file descriptor above standard error, except `write_fd`,
-/// `middle_write_fd`, `stdout_fd`, `stderr_fd`, and `stdin_fd`, so a
-/// descriptor opened before
+/// `middle_write_fd`, `stdout_fd`, `stderr_fd`, `stdin_fd`, `broker_fd`, and
+/// `device_fd`, so a descriptor opened before
 /// the sandbox was entered cannot be used to reach the host filesystem after
 /// `pivot_root`. A descriptor does not go through path resolution again once
 /// it is open, so `namespace.pivotInto` cannot revoke one on its own, and a
@@ -3903,6 +4738,26 @@ fn redirectStdinToDevNull(write_fd: i32, stderr_fd: i32) void {
 /// fixed records this file chooses. Compare `joinCgroup`, which closes its
 /// descriptor before this pass on purpose, because it could.
 ///
+/// `broker_fd` and `device_fd` are each a seam's own child end, made in the
+/// real parent before this process forked from it and carried across that
+/// fork like any other descriptor. **Both must survive this pass, and each
+/// for its own child to inherit later.** `broker_fd` is `execute`'s own copy
+/// for B; `device_fd` is D's own copy of `device_fds[1]`, and D does not
+/// exist yet when this pass runs, so the number has to survive here or D
+/// forks with nothing open on it at all. `-1` when a call names no such seam,
+/// which this pass already treats as a fd number nothing here has.
+///
+/// **Measured on 2026-09-16: a session with a device source and no filtered
+/// network passed `-1` for this parameter before it had one of its own.**
+/// `device_fds[1]` was open in A at the time this pass ran and closed by it
+/// anyway, because nothing on the exception list named it. D, forked from A
+/// afterward, inherited a fork of A's own descriptor table, which by then had
+/// nothing at that number: `poll` answered `POLLNVAL` for it forever, and the
+/// real parent's own `sendmsg` on the paired end answered `EPIPE`, because the
+/// kernel counts a socket's peer as gone once every copy of the other end is
+/// closed. Nothing D did was ever wrong; the descriptor it was told to use had
+/// already gone before D could open it, let alone use it.
+///
 /// This runs before any namespace or mount is set up, while `/proc` still shows
 /// the host's view of this process's own descriptor table. The sandbox's mount
 /// tree is never required to carry its own `/proc` mount for this to work.
@@ -3913,6 +4768,7 @@ fn closeInheritedFds(
     stderr_fd: i32,
     stdin_fd: ?i32,
     broker_fd: i32,
+    device_fd: i32,
 ) void {
     const dir_rc = linux.open(
         "/proc/self/fd",
@@ -3951,11 +4807,11 @@ fn closeInheritedFds(
             if (std.fmt.parseInt(i32, name, 10)) |fd| {
                 // Skip the descriptor reading this directory, the two pipes,
                 // the three standard streams, the caller's own chosen output
-                // descriptors, and the broker pair's child end. Every other
-                // descriptor is one the parent held before this process was
-                // ever meant to run.
+                // descriptors, the broker or router pair's child end, and the
+                // device link's own child end. Every other descriptor is one
+                // the parent held before this process was ever meant to run.
                 if (fd > std.posix.STDERR_FILENO and fd != dir_fd and fd != write_fd and
-                    fd != middle_write_fd and fd != broker_fd and
+                    fd != middle_write_fd and fd != broker_fd and fd != device_fd and
                     fd != stdout_fd and fd != stderr_fd and fd != (stdin_fd orelse -1))
                 {
                     const close_errno = linux.errno(linux.close(fd));
@@ -4454,7 +5310,7 @@ test "closeInheritedFds closes every descriptor above stderr, and leaves stderr 
         // test still pins the function's real behaviour. Null is
         // `Config.stdin_fd` for every tool call, which is the case this test
         // is about.
-        closeInheritedFds(-1, -1, -1, -1, null, -1);
+        closeInheritedFds(-1, -1, -1, -1, null, -1, -1);
 
         // F_GETFD fails with EBADF on a closed descriptor, and succeeds on an
         // open one. This is the only way to observe the pass from outside the
@@ -4508,13 +5364,58 @@ test "closeInheritedFds keeps exactly the middle pipe's write end, and no other"
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, @intCast(extra_b), -1, -1, null, -1);
+        closeInheritedFds(-1, @intCast(extra_b), -1, -1, null, -1, -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
         const closed_the_other = linux.errno(a_result) == .BADF;
         const kept_the_middle_pipe = linux.errno(b_result) == .SUCCESS;
         std.process.exit(if (closed_the_other and kept_the_middle_pipe) 0 else 1);
+    }
+
+    var status: u32 = undefined;
+    const wait_rc = linux.waitpid(pid, &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+}
+
+test "closeInheritedFds keeps exactly the device link's own child end, and no other" {
+    // The regression test for the fault task 4b's own end to end device
+    // placement test found: `device_fd` named no exemption at all before this,
+    // so A closed its own copy of `device_fds[1]` here, before D, forked from
+    // A afterward, could ever inherit an open one. D's own `link_fd` then
+    // named a descriptor nothing in D's fd table held: `poll` answered
+    // `POLLNVAL` for it on every turn of D's own loop, and the real parent's
+    // `sendmsg` on the paired end answered `EPIPE`, because a `SOCK_SEQPACKET`
+    // pair with no process left holding the far end is exactly what `EPIPE`
+    // means. See `closeInheritedFds`'s own doc comment.
+    //
+    // Mutation check: drop `device_fd` from the guard in `closeInheritedFds`
+    // and `extra_b` is closed, which fails the second assertion. Widen the
+    // guard to keep anything more, and `extra_a` survives and fails the first.
+    const extra_a = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(extra_a));
+    const extra_b = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(extra_b));
+    defer _ = linux.close(@intCast(extra_a));
+    defer _ = linux.close(@intCast(extra_b));
+
+    // A forked child, for the reason every test around this one states: this
+    // call ends the process on any internal failure and would otherwise close
+    // the test runner's own descriptors.
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    const pid: linux.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        closeInheritedFds(-1, -1, -1, -1, null, -1, @intCast(extra_b));
+
+        const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
+        const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
+        const closed_the_other = linux.errno(a_result) == .BADF;
+        const kept_the_device_fd = linux.errno(b_result) == .SUCCESS;
+        std.process.exit(if (closed_the_other and kept_the_device_fd) 0 else 1);
     }
 
     var status: u32 = undefined;
@@ -4550,7 +5451,7 @@ test "closeInheritedFds keeps exactly the descriptor Config.stdin_fd names, and 
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, -1, -1, -1, @intCast(extra_b), -1);
+        closeInheritedFds(-1, -1, -1, -1, @intCast(extra_b), -1, -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
@@ -4778,6 +5679,60 @@ test "a filtered config that names both seams is refused, and one that names a r
             null,
         ));
     }
+}
+
+test "a device source with no device tree is refused, and refused before anything is forked" {
+    // **The dependency a placement has on a hidden tree of its own used to be
+    // implicit.** `buildDeviceSource` only has something to join a `source`
+    // onto once `Config.device_tree` names one, and a config that named
+    // `device_source` with no `device_tree` would only discover that once a
+    // real device arrived, as `MountFailed`, with the missing field never
+    // named anywhere in the error.
+    //
+    // The refusal comes before `probeAbi`, before any filter is built and
+    // before any fork, so this test needs no root, no mount and no program.
+    //
+    // Mutation check: drop the check this test pins and this call comes back
+    // with `LandlockUnavailable` or worse, a real attempt to fork, instead of
+    // `DeviceSourceNeedsTree`.
+    var report: LandlockReport = undefined;
+
+    const Never = struct {
+        fn wakeup(_: *anyopaque) i32 {
+            // Never reached: the call below refuses before it forks.
+            return -1;
+        }
+        fn next(_: *anyopaque) ?iface.DeviceSource.Change {
+            return null;
+        }
+    };
+    var nothing: u8 = 0;
+    const device = iface.DeviceSource{
+        .ptr = &nothing,
+        .vtable = &.{ .wakeup = Never.wakeup, .next = Never.next },
+    };
+
+    try std.testing.expectError(error.DeviceSourceNeedsTree, spawn(
+        std.testing.allocator,
+        .{
+            .root = "/does-not-exist",
+            .mounts = &.{},
+            .rules = &.{},
+            .cwd = "/",
+            .env = &.{},
+            .network = .none,
+            .device_source = device,
+        },
+        &.{"/does-not-exist"},
+        &report,
+        null,
+    ));
+
+    // The other side of this check, a `device_source` with a `device_tree`
+    // going on to place a device successfully, is not pinned here: clearing
+    // this check lets `spawn` go on to fork and build a real sandbox, which
+    // needs the same root and `probeAvailability` guard the full end to end
+    // tests already carry. `escape.zig`'s device tests are that proof.
 }
 
 test "spawn reports the Landlock ABI and its features before it ever forks" {
@@ -5711,4 +6666,344 @@ test "a reader that only claims to have started has still reported nothing" {
         .ended = 0,
         .ending = .signalled,
     }));
+}
+
+test "buildDeviceTarget joins root and path, and refuses what a device helper must never resolve" {
+    var buffer: [device_path_capacity]u8 = undefined;
+
+    const joined = buildDeviceTarget(&buffer, "/tmp/chock-session", "/dev/chock-widget0") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/tmp/chock-session/dev/chock-widget0", joined);
+
+    // A root with no trailing slash and a path with a leading one, joined
+    // with nothing in between and nul terminated: this is what every later
+    // `mkdirat`, `mknodat`, `mount`, and `umount2` call in this file reads.
+    try std.testing.expectEqual(@as(u8, 0), joined.ptr[joined.len]);
+
+    // Mutation check: drop the `path[0] != '/'` half of the guard and this
+    // answers a joined string instead of null.
+    try std.testing.expect(buildDeviceTarget(&buffer, "/tmp/chock-session", "dev/chock-widget0") == null);
+    // Mutation check: drop the `path.len <= 1` half and an empty path joins
+    // onto bare `root`, which names the session's own directory and not a
+    // device inside it.
+    try std.testing.expect(buildDeviceTarget(&buffer, "/tmp/chock-session", "/") == null);
+    // A path with no leaf: `mount`'s own target would be `root` again.
+    try std.testing.expect(buildDeviceTarget(&buffer, "/tmp/chock-session", "/dev/") == null);
+
+    // Mutation check: delete the `..` component check and this answers a
+    // string that climbs back out of `root` entirely.
+    try std.testing.expect(buildDeviceTarget(&buffer, "/tmp/chock-session", "/../etc/passwd") == null);
+    try std.testing.expect(buildDeviceTarget(&buffer, "/tmp/chock-session", "/dev/../../etc/passwd") == null);
+
+    // Mutation check: drop the capacity check and this overruns `small`.
+    var small: [8]u8 = undefined;
+    try std.testing.expect(buildDeviceTarget(&small, "/tmp/chock-session", "/dev/chock-widget0") == null);
+}
+
+test "buildDeviceSource joins hidden and source, and refuses a source that escapes the hidden tree" {
+    // **This is the one new security check the whole path-based redesign
+    // turns on.** Tested directly with `..`, with an absolute path, and with
+    // an embedded `../`, exactly as the task that introduced this function
+    // required. See `buildDeviceSource`'s own doc comment for why descriptor
+    // passing used to make this check unnecessary and a path cannot.
+    var buffer: [device_path_capacity]u8 = undefined;
+
+    const joined = buildDeviceSource(&buffer, "/.chock-device-tree", "bus/usb/001/005") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "/.chock-device-tree/bus/usb/001/005",
+        joined,
+    );
+    try std.testing.expectEqual(@as(u8, 0), joined.ptr[joined.len]);
+
+    // Mutation check: drop the `part.len == 0` half of the component check
+    // and a leading `/`, a trailing `/`, or a doubled `/` all join onto a
+    // path this function must refuse.
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "/etc/passwd") == null);
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "bus/usb/") == null);
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "bus//005") == null);
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "") == null);
+
+    // Mutation check: drop the `std.mem.eql(u8, part, "..")` half and a `..`
+    // component, alone or embedded, climbs back out of the hidden tree.
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "..") == null);
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "bus/../../etc/passwd") == null);
+    try std.testing.expect(buildDeviceSource(&buffer, "/.chock-device-tree", "../etc/passwd") == null);
+
+    // Mutation check: drop the capacity check and this overruns `small`.
+    var small: [8]u8 = undefined;
+    try std.testing.expect(buildDeviceSource(&small, "/.chock-device-tree", "bus/usb/001/005") == null);
+}
+
+test "makeDeviceParents makes every directory a path needs, and tolerates one already there" {
+    // Raw syscalls through `tmp.dir.handle` throughout, the same rule this
+    // whole file follows: `std.Io.Dir`'s own methods need an `Io` this file
+    // does not carry. See the comment above `namespace.zig`'s own `makePath`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = try absoluteDirPath(&path_buffer, tmp.dir.handle);
+
+    var buffer: [device_path_capacity]u8 = undefined;
+    const target = buildDeviceTarget(&buffer, root_z, "/dev/sub/chock-widget0") orelse
+        return error.TestUnexpectedResult;
+
+    try std.testing.expect(makeDeviceParents(&buffer, target.len));
+    // "dev" and "dev/sub" now exist, and the leaf itself does not: this
+    // function only ever makes what `path`'s own parents need, and leaves
+    // the leaf to `mknodat`.
+    const sub_rc = linux.openat(tmp.dir.handle, "dev/sub", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(sub_rc));
+    _ = linux.close(@intCast(sub_rc));
+    const leaf_rc = linux.openat(tmp.dir.handle, "dev/sub/chock-widget0", .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expectEqual(.NOENT, linux.errno(leaf_rc));
+
+    // Mutation check: turn the `.EXIST` tolerance into a failure and this
+    // second call, over the same directories the first one just made,
+    // answers false instead of true.
+    try std.testing.expect(makeDeviceParents(&buffer, target.len));
+}
+
+test "placeDevice binds a device read-write out of a hidden tree, once this process has pivoted the way B does, and a read only remount is the trap it must never repeat" {
+    // **No hardware.** A named temp file stands in for a device node. Naming
+    // it is a convenience for this test, not a requirement `placeDevice`
+    // itself has.
+    if (!namespace.probeAvailability().available()) return error.SkipZigTest;
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    const child: linux.pid_t = @intCast(fork_rc);
+
+    if (child == 0) {
+        var diag: ?namespace.Diagnostic = null;
+        namespace.enter(.{ .network = .none, .mount = true }, &diag) catch std.process.exit(20);
+
+        const tmp = std.testing.tmpDir(.{});
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const root_z = absoluteDirPath(&path_buffer, tmp.dir.handle) catch std.process.exit(21);
+
+        // A directory outside `root_z` entirely, standing in for the one
+        // real host directory Chock's own policy would bind: `root_z`
+        // becomes the sandbox's own filesystem view, and this must never be
+        // reachable there by anything but the one bind `bindDeviceTree`
+        // makes.
+        const host_tmp = std.testing.tmpDir(.{});
+        var host_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const host_z = absoluteDirPath(&host_path_buffer, host_tmp.dir.handle) catch std.process.exit(21);
+
+        var tree_buffer: [device_path_capacity]u8 = undefined;
+        if (!bindDeviceTree(&tree_buffer, root_z, "/.chock-device-tree", host_z)) std.process.exit(22);
+
+        // **Written only now, after `bindDeviceTree` has already run.** This
+        // is the hotplug property in miniature: a node made in the host
+        // directory after the bind is still visible through it, because a
+        // bind shows the same live filesystem and not a copy taken at bind
+        // time. See `.superpowers/sdd/task-4b-report.md`.
+        const source_content = "chock device probe content\n";
+        const create_rc = linux.openat(
+            host_tmp.dir.handle,
+            "named-source",
+            .{ .ACCMODE = .WRONLY, .CREAT = true },
+            0o644,
+        );
+        if (linux.errno(create_rc) != .SUCCESS) std.process.exit(23);
+        const create_fd: i32 = @intCast(create_rc);
+        const wrote = linux.write(create_fd, source_content.ptr, source_content.len);
+        _ = linux.close(create_fd);
+        if (linux.errno(wrote) != .SUCCESS or wrote != source_content.len) std.process.exit(23);
+
+        // **This process now does the same self-bind, `pivot_root`, and
+        // detach `namespace.pivotInto` runs for B.** D itself never does
+        // this: it is done here only so this test's own single process
+        // exercises `placeDevice` exactly the way D really calls it, after
+        // the namespace it shares has already pivoted. See `runDevice`'s
+        // own doc comment for why D does not need to pivot itself for that
+        // to be true.
+        if (linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0)) != .SUCCESS)
+            std.process.exit(24);
+        if (linux.errno(linux.mount(root_z, root_z, null, linux.MS.BIND | linux.MS.REC, 0)) != .SUCCESS)
+            std.process.exit(24);
+        var old_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const old_root_z = std.fmt.bufPrintZ(&old_root_buf, "{s}/.old_root", .{root_z}) catch std.process.exit(24);
+        if (linux.errno(linux.mkdir(old_root_z.ptr, 0o755)) != .SUCCESS) std.process.exit(24);
+        if (linux.errno(linux.pivot_root(root_z.ptr, old_root_z.ptr)) != .SUCCESS) std.process.exit(24);
+        if (linux.errno(linux.chdir("/")) != .SUCCESS) std.process.exit(24);
+        if (linux.errno(linux.umount2("/.old_root", linux.MNT.DETACH)) != .SUCCESS) std.process.exit(24);
+
+        // From here on, this process's own `/` is the sandbox's, the same
+        // as B's is once `applyLayers` reaches this same point, so every
+        // path below is sandbox-relative, never `root_z`-prefixed again.
+        var target_buffer: [device_path_capacity]u8 = undefined;
+        var source_buffer: [device_path_capacity]u8 = undefined;
+        placeDevice(
+            &target_buffer,
+            &source_buffer,
+            "/.chock-device-tree",
+            device_kind_file,
+            "named-source",
+            "/dev/chock-widget0",
+        ) catch std.process.exit(25);
+
+        // Read back what the probe wrote before the bind: proves the node
+        // really is the source, not an empty file `mknodat` left behind.
+        const placed_rc = linux.open("/dev/chock-widget0", .{ .ACCMODE = .RDWR }, 0);
+        if (linux.errno(placed_rc) != .SUCCESS) std.process.exit(26);
+        const placed_fd: i32 = @intCast(placed_rc);
+        var read_buffer: [64]u8 = undefined;
+        const read_n = linux.read(placed_fd, &read_buffer, read_buffer.len);
+        if (linux.errno(read_n) != .SUCCESS) std.process.exit(27);
+        if (!std.mem.eql(u8, read_buffer[0..read_n], source_content)) std.process.exit(28);
+
+        // **Read-write, proved by writing through the placed node and
+        // reading the change back from the original source.** Requirement 3
+        // of task 4b's own brief: the mount must never be read only, because
+        // `namespace.markReadOnly` also sets `NODEV`, which then refuses to
+        // open the device node at all. Verified through `host_tmp.dir.handle`,
+        // an already open descriptor from before the pivot: an ordinary file
+        // operation relative to a held descriptor keeps working after a
+        // detach, which is not true of a fresh, absolute lookup through the
+        // same now-detached tree. See `runDevice`'s own doc comment.
+        if (linux.errno(linux.lseek(placed_fd, 0, linux.SEEK.SET)) != .SUCCESS) std.process.exit(29);
+        const changed = "CHANGED";
+        const wrote_through = linux.write(placed_fd, changed.ptr, changed.len);
+        _ = linux.close(placed_fd);
+        if (linux.errno(wrote_through) != .SUCCESS or wrote_through != changed.len) std.process.exit(30);
+
+        const verify_rc = linux.openat(host_tmp.dir.handle, "named-source", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(verify_rc) != .SUCCESS) std.process.exit(31);
+        const verify_fd: i32 = @intCast(verify_rc);
+        var verify_buffer: [64]u8 = undefined;
+        const verify_n = linux.read(verify_fd, &verify_buffer, verify_buffer.len);
+        _ = linux.close(verify_fd);
+        if (linux.errno(verify_n) != .SUCCESS) std.process.exit(31);
+        if (!std.mem.startsWith(u8, verify_buffer[0..verify_n], changed)) std.process.exit(32);
+
+        // **The trap this test pins, in the negative.** A remount with the
+        // same flags `namespace.markReadOnly` uses proves the read only bind
+        // this file must never make: with it, opening the very same node for
+        // writing answers `EROFS`. If a later change made `placeDevice` call
+        // something with this shape, this second half of the test would stop
+        // finding the failure it expects and start finding a success
+        // instead, which the parent below reads as this whole test failing.
+        //
+        // Mutation check: add a `markReadOnly`-shaped remount inside
+        // `placeDevice` and the write-through assertion above starts failing
+        // with `EROFS`, well before this block ever runs.
+        const target_z = buildDeviceTarget(&target_buffer, "", "/dev/chock-widget0") orelse
+            std.process.exit(33);
+        const attr = MountAttrProbe{
+            .attr_set = mount_attr_rdonly_probe | mount_attr_nodev_probe,
+        };
+        const remount_rc = linux.syscall5(
+            .mount_setattr,
+            @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+            @intFromPtr(target_z.ptr),
+            @as(usize, linux.AT.RECURSIVE),
+            @intFromPtr(&attr),
+            @sizeOf(MountAttrProbe),
+        );
+        if (linux.errno(remount_rc) != .SUCCESS) std.process.exit(34);
+        const denied_rc = linux.open("/dev/chock-widget0", .{ .ACCMODE = .WRONLY }, 0);
+        if (linux.errno(denied_rc) == .SUCCESS) {
+            _ = linux.close(@intCast(denied_rc));
+            std.process.exit(35); // The read only remount did not hold.
+        }
+        if (linux.errno(denied_rc) != .ROFS) std.process.exit(36);
+
+        dropDevice(&target_buffer, "/dev/chock-widget0") catch std.process.exit(37);
+        // The placeholder `mknodat` made is empty again, its mount gone.
+        const after_rc = linux.open("/dev/chock-widget0", .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(after_rc) != .SUCCESS) std.process.exit(38);
+        const after_fd: i32 = @intCast(after_rc);
+        var after_drop: [8]u8 = undefined;
+        const after_n = linux.read(after_fd, &after_drop, after_drop.len);
+        _ = linux.close(after_fd);
+        if (linux.errno(after_n) != .SUCCESS) std.process.exit(39);
+        if (after_n != 0) std.process.exit(40);
+
+        // **The escape check, proved against a real bind and not only
+        // against the pure function.** The hidden tree really is bound in
+        // and really does hold a node, and a source that climbs out of it
+        // is still refused before `mount` is ever called.
+        placeDevice(
+            &target_buffer,
+            &source_buffer,
+            "/.chock-device-tree",
+            device_kind_file,
+            "../etc/passwd",
+            "/dev/chock-widget1",
+        ) catch |err| {
+            if (err != error.PathUnusable) std.process.exit(41);
+            std.process.exit(0);
+        };
+        std.process.exit(42); // The escape was not refused.
+    }
+
+    var status: u32 = undefined;
+    var wait_rc = linux.waitpid(child, &status, 0);
+    while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(child, &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 20) return error.SkipZigTest;
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+}
+
+/// `mount_setattr`'s own attribute structure, the same shape
+/// `namespace.zig`'s own (private) `MountAttr` has, kept here rather than
+/// exposed there: this file's own test above is the only caller outside that
+/// module that ever needs to make a mount read only, and only to prove the
+/// trap `placeDevice` must never walk back into. See `namespace.markReadOnly`.
+const MountAttrProbe = extern struct {
+    attr_set: u64 = 0,
+    attr_clr: u64 = 0,
+    propagation: u64 = 0,
+    userns_fd: u64 = 0,
+};
+const mount_attr_rdonly_probe: u64 = 0x00000001;
+const mount_attr_nodev_probe: u64 = 0x00000004;
+
+test "a kind this helper does not implement is refused before anything is touched" {
+    // Mutation check: delete the `kind != device_kind_file` check in
+    // `placeDevice` and this call goes on to `mkdirat`, which either succeeds
+    // on a path this test never authorised or fails for an unrelated reason,
+    // either of which reads as the wrong error here.
+    var target_buffer: [device_path_capacity]u8 = undefined;
+    var source_buffer: [device_path_capacity]u8 = undefined;
+    try std.testing.expectError(
+        error.UnsupportedKind,
+        placeDevice(
+            &target_buffer,
+            &source_buffer,
+            "/.chock-device-tree",
+            device_kind_file + 1,
+            "bus/usb/001/005",
+            "/dev/chock-widget0",
+        ),
+    );
+}
+
+test "a placement or a removal that fails says so on stderr, and never silently" {
+    // Task 4b's own fifth property: a failed placement must be observable.
+    // `reportDeviceFault` is the one place that promise is kept, since
+    // `devicelink.zig`'s own wire carries no answer back to the real parent
+    // for either outcome. This proves the line it writes names the verb, the
+    // path, and the reason, which is what makes it a report and not only a
+    // line.
+    //
+    // Mutation check: change `reportDeviceFault`'s format string to drop
+    // `{s}` for `path` and this test's `expect` for the path substring fails.
+    var pipe_fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{})));
+    defer _ = linux.close(pipe_fds[0]);
+
+    reportDeviceFault(pipe_fds[1], "place", "/dev/chock-widget0", error.MountFailed);
+    _ = linux.close(pipe_fds[1]);
+
+    var buf: [256]u8 = undefined;
+    const n = linux.read(pipe_fds[0], &buf, buf.len);
+    try std.testing.expect(linux.errno(n) == .SUCCESS);
+    const line = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, line, "place") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "/dev/chock-widget0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "MountFailed") != null);
 }

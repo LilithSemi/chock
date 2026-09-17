@@ -839,29 +839,49 @@ pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
 /// Every call the device helper may make, and the only ones it may make.
 ///
 /// **An allowlist, and the same shape `router_calls` has, for the same
-/// reason.** The helper is the one process inside the sandbox that holds a
-/// descriptor for a device node the host opened, and a capability the
-/// sandboxed program does not have: the right to place that node where
+/// reason.** The helper is the one process inside the sandbox that can reach
+/// the hidden device tree Chock's own policy chose, and a capability the
+/// sandboxed program does not have: the right to bind a node out of it where
 /// ordinary programs find it. So what it may do has to be written down
 /// completely rather than left to a denylist.
 ///
-/// **Everything that opens something happens before this filter goes on.**
-/// The far side opens the device node, sends the descriptor down the link,
-/// and only after that does the helper install this filter. So there is no
-/// `openat` and no `socket` here at all, exactly as `router_calls` has
-/// neither: the helper cannot open a path of its own choosing, and it cannot
-/// make a channel of its own. The one descriptor it ever holds for the device
-/// itself is the one `recvmsg` hands it.
+/// **No `openat`, so the helper can never read or write a file's own
+/// bytes.** Every call below only ever names a path to `mount`, `mkdirat`,
+/// `mknodat`, or `umount2` with, never to open its contents. The one
+/// directory this process may ever resolve a name against, the hidden tree
+/// `bindDeviceTree` bound in before this filter went on, and the one target
+/// path `Config.root` scopes every bind to, are both checked by
+/// `driver.zig`'s own `buildDeviceSource` and `buildDeviceTarget` before
+/// either call below ever sees them: see those functions' own doc comments
+/// for the one new check the path-based design turns on.
 ///
 /// What each one is for:
 ///
-///   * `recvmsg` is the one exchange with a descriptor in it. It is how the
-///     device node the far side opened reaches this process at all.
-///   * `mount` places that node into the tree the sandboxed program can see.
-///     `umount2` takes it back out again when the device goes away, so a
-///     device that was granted for a session does not outlive the session.
-///   * `mkdirat` makes the directories the node is mounted under. The staging
-///     tree is built as devices arrive, not laid out in advance.
+///   * `mount` binds a node from the hidden tree, once at startup for the
+///     tree itself and once per placement for each node inside it, into the
+///     path the sandboxed program can see. `umount2` takes a placed node back
+///     out again when the device goes away, so a device that was granted for
+///     a session does not outlive the session.
+///   * `mkdirat` makes the directories a node is mounted under, both the
+///     hidden tree's own mount point and each placement's own parents. The
+///     staging tree is built as devices arrive, not laid out in advance.
+///   * `mknodat` makes the file a placement's own bind lands on. **Measured
+///     on 2026-09-16**: `mount`'s own bind only ever attaches to a target
+///     that already exists and already has the same directory-ness as the
+///     source, confirmed against a real kernel with a raw `mount(2)` call and
+///     not only against the `mount(8)` command, which would leave open the
+///     question of which of the two refused it. A character or block device,
+///     which is what this helper is for, is not a directory, so `mkdirat`
+///     alone cannot make its landing spot: it only ever makes `S_IFDIR`.
+///     `mknodat` here is always called with `S_IFREG`, never `S_IFCHR` or
+///     `S_IFBLK`, so it never fabricates a device's own identity; it only
+///     ever makes the empty regular file the bind then covers. Creating a
+///     regular file this way needs no capability at all, unlike creating a
+///     character or block special file, which needs `CAP_MKNOD` and which
+///     this helper is never given: see `runDevice`'s own
+///     `capabilities.keepOnly`.
+///   * `recvmsg` is how a `Place` or a `Drop` reaches this process at all,
+///     over the link `devicelink.zig` carries the two paths on.
 ///   * `ppoll` is the wait the helper's loop is built on, the same call
 ///     `router_calls` waits on its own link with.
 ///   * `write` says what the helper did, onto a descriptor it already holds.
@@ -871,15 +891,17 @@ pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
 ///     process ends and how it comes back from a signal.
 ///
 /// **No `openat` and no `socket`.** A device helper that could open a path
-/// could reach any file the sandbox's mount tree makes visible to it, not
-/// only the one device it was sent, and one that could make a socket could
-/// build a channel the log never saw. Neither is here, and neither should be
-/// added without the same argument this comment makes for everything that is.
+/// could read any file the sandbox's mount tree makes visible to it, not
+/// only the tree its own policy named, and one that could make a socket
+/// could build a channel the log never saw. Neither is here, and neither
+/// should be added without the same argument this comment makes for
+/// everything that is.
 pub const device_calls: []const linux.SYS = &.{
     .recvmsg,
     .mount,
     .umount2,
     .mkdirat,
+    .mknodat,
     .ppoll,
     .write,
     .exit_group,
@@ -890,10 +912,10 @@ pub const device_calls: []const linux.SYS = &.{
 
 comptime {
     // **The helper must not be able to open a path or make a channel.** It
-    // holds a descriptor for a device node and the right to mount it, and the
-    // only reason that is bounded is that it cannot open anything new by
-    // name and cannot build a new channel of its own. A call added to the
-    // list above without reading this comment stops the build.
+    // can reach the one hidden tree Chock's own policy named and bind a node
+    // out of it, and the only reason that is bounded is that it cannot open
+    // anything by name and cannot build a new channel of its own. A call
+    // added to the list above without reading this comment stops the build.
     for (device_calls) |call| {
         const refused = switch (call) {
             .openat, .socket, .socketpair, .connect, .bind, .listen, .execve, .kill, .ptrace => true,
@@ -2241,7 +2263,7 @@ test "the device helper may not open a path or make a new channel" {
 
     // And the calls the helper really makes are all there, so a list that
     // lost one is caught here as well as by a helper that dies in production.
-    const needed = [_]linux.SYS{ .recvmsg, .mount, .umount2, .mkdirat, .ppoll, .write };
+    const needed = [_]linux.SYS{ .recvmsg, .mount, .umount2, .mkdirat, .mknodat, .ppoll, .write };
     for (needed) |call| {
         var found = false;
         for (device_calls) |permitted| {

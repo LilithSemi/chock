@@ -105,6 +105,11 @@ pub const NetBroker = Sandbox.NetBroker;
 /// Re-exported beside `NetBroker` for the same reason: `Config` names it, and
 /// `lib/chock-broker/network.zig` implements both.
 pub const NetRouter = Sandbox.NetRouter;
+/// See `Sandbox.DeviceSource`. Re-exported beside `NetBroker` and
+/// `NetRouter` for the same reason: `Config.device_source` names it, and a
+/// caller that implements one never has to reach a file under
+/// `chock-sandbox/` by path.
+pub const DeviceSource = Sandbox.DeviceSource;
 /// See `Sandbox.copyStrings`. Re-exported beside `Config.copy`, which uses it,
 /// because a caller that copies a config for a process that outlives one tool
 /// call has an argv to copy beside it and must not grow a second spelling of

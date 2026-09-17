@@ -794,6 +794,97 @@ test "a process the netbroker serves can use the descriptor it is handed, and ca
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 }
 
+// **Task 4b's own device passthrough tests.** A device source pushes a
+// placement inward while the sandboxed program runs, an in-sandbox helper
+// lands it read-write, and the real parent's own serve loop carries it
+// alongside whatever else that session was already serving. See
+// `lib/chock-sandbox/linux/driver.zig`'s own `runDevice` and `serveLinks`.
+
+test "a device the caller pushes inward lands read-write, and the sandboxed program reads the same bytes" {
+    // **The end to end proof, and the hotplug proof in one run.**
+    // `deviceEscape` (`test/sandbox/probe.zig`) writes a named file into the
+    // hidden device tree from inside `DeviceSourceStub.nextFn`, strictly
+    // after the device helper has already bound that tree in and started
+    // listening, and sends its path across the device link the moment its
+    // own multiplexed loop first looks. The in-sandbox helper binds it at a
+    // fixed path inside the sandbox. The sandboxed program,
+    // "spawned-device-place", polls for that path and compares what it
+    // reads against the exact bytes the outside wrote.
+    //
+    // Mutation check: have `placeDevice` skip its own `mount` call and this
+    // probe never finds the path at all, failing on its own bounded retry
+    // rather than on a content mismatch, which is still a failure here.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-device-place", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "the sandboxed program cannot read the hidden device tree, though it reads the node placed out of it" {
+    // Task 4b's own third property. `deviceEscape` never grants
+    // `device_tree_inside` a Landlock rule, so "spawned-device-hidden-denied"
+    // must find the placed node readable at `device_probe_path` and the
+    // hidden tree itself unreadable at any path under it.
+    //
+    // Mutation check: add a Landlock rule for `device_tree_inside` in
+    // `deviceEscape` and this fails, because the sandboxed program can then
+    // open a path under the hidden tree that nobody placed there for it.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-device-hidden-denied", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "the multiplexed loop serves a device source alongside a broker link" {
+    // Task 4b's own third property, and the one the whole restructure of
+    // `serveLinks` exists for. The sandboxed program only ever asks the
+    // broker, through the existing "spawned-filtered-grant" operation; the
+    // device is fed from the outside on its own schedule and never opened
+    // from inside the sandbox at all. A pass here means both descriptors
+    // this loop now polls were served out of the very same call, and it
+    // proves nothing about `placeDevice`'s own work, which the test above
+    // already covers.
+    //
+    // Mutation check: revert `serveLinks` to two separate loops, one for the
+    // link and one that never runs when a link is present, and this fails:
+    // the device source is never drained while the broker is being served.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const term = try runProbeWithRoot("spawn-device-with-broker", scratch.path());
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+}
+
+test "a session with no device source forks no helper, counted at the process table" {
+    // Task 4b's own second property. "spawn-device-children" names a
+    // `Config.device_source`; "spawn-device-children-none" does not. Both
+    // hold the sandboxed program open on its own standard input and count
+    // A's direct children while it waits, through `childCountEscape`
+    // (`test/sandbox/probe.zig`). The only difference the driver's own code
+    // can make to that count is D, so a session with no device source must
+    // count exactly one fewer child than one that has one.
+    //
+    // Mutation check: fork D unconditionally in `spawn`, ignoring
+    // `wants_device`, and the "none" run's own count rises to match the
+    // other one, and this fails.
+    var scratch = try scratchRoot();
+    defer scratch.cleanup();
+    const with_device = try runProbeCapturing(&.{ probe_path, "spawn-device-children", scratch.path() });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, with_device.term);
+
+    var scratch_none = try scratchRoot();
+    defer scratch_none.cleanup();
+    const without_device = try runProbeCapturing(
+        &.{ probe_path, "spawn-device-children-none", scratch_none.path() },
+    );
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, without_device.term);
+
+    const with_count = std.fmt.parseInt(usize, std.mem.trim(u8, with_device.out(), "\n"), 10) catch
+        return error.TestUnexpectedResult;
+    const without_count = std.fmt.parseInt(usize, std.mem.trim(u8, without_device.out(), "\n"), 10) catch
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(with_count, without_count + 1);
+}
+
 // **The network router, which is what `.filtered` does for every real caller
 // of this project.** The tests below are the ones the three pieces of the
 // router could not have: each one
