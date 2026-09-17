@@ -28,6 +28,12 @@ stdenv.mkDerivation (finalAttrs: {
     ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
   '';
 
+  zigBuildFlags = [
+    "-Dversion=${finalAttrs.version}"
+  ];
+
+  zigCheckFlags = finalAttrs.zigBuildFlags;
+
   doCheck = true;
 
   # Needed for unit tests

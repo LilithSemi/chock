@@ -1,7 +1,7 @@
 .{
     .name = .chock,
-    .version = "0.1.0",
-    .fingerprint = 0x311929c5f780c906,
+    .version = "0.1.0-unstable",
+    .fingerprint = 0x311929c57e1c1728,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .vulcan = .{
