@@ -140,6 +140,11 @@ pub const ask = @import("chock-core/ask.zig");
 /// is protection against an accident and it is not a boundary, and
 /// `redact.not_a_boundary` is the one sentence that says so.
 pub const redact = @import("chock-core/redact.zig");
+/// The host side of a device passthrough: resolve a udev event to a stable
+/// identity, ask policy over a seam, for the reason `arbiter` is one, and say
+/// where a permitted node should land inside the sandbox. See its own top
+/// comment for the three measured rules a wrong answer here breaks silently.
+pub const devices = @import("chock-core/devices.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

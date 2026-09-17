@@ -969,15 +969,23 @@ pub fn build(b: *std.Build) void {
     // for the close-on-exec pipe spawnCapturing reads a sandboxed program's
     // output from.
     //
-    // It imports chock-policy for two things, and neither is the table. The
-    // first is the subagent limits, which the loop measures a spawn request
-    // against because the loop is what holds the session state those limits
-    // count. The second is the policy ratchet: the loop decides whether a
-    // promise an agent makes about itself narrows or widens the promises that
-    // session already holds, which it reads from its own folded log. **It never
-    // evaluates the policy table**, which stays the broker's job, and
-    // chock-core still imports no chock-broker: see lib/chock-core/Loop.zig's
-    // own top comment.
+    // It imports chock-policy for three things, and none of them is the
+    // table. The first is the subagent limits, which the loop measures a
+    // spawn request against because the loop is what holds the session state
+    // those limits count. The second is the policy ratchet: the loop decides
+    // whether a promise an agent makes about itself narrows or widens the
+    // promises that session already holds, which it reads from its own
+    // folded log. The third is chock_policy.devices, for the Identity and
+    // actionInto a udev event turns into: chock_core.devices asks whether an
+    // action may reach the sandbox through its own PolicySeam, never through
+    // chock_policy.table.Table directly. **It never evaluates the policy
+    // table**, which stays the broker's job, and chock-core still imports no
+    // chock-broker: see lib/chock-core/Loop.zig's own top comment.
+    //
+    // It also imports the udev client, for chock_core.devices alone: the
+    // library that resolves a plugged-in device's identity off sysfs and a
+    // netlink monitor. See that file's own top comment for the three
+    // measurements it is built against.
     const chock_core = b.addModule("chock-core", .{
         .root_source_file = b.path("lib/chock-core.zig"),
         .target = target,
@@ -995,6 +1003,7 @@ pub fn build(b: *std.Build) void {
             // one thing that would let a plugin and a Chock disagree about
             // what a plugin said.
             .{ .name = "chock-plugin-core", .module = chock_plugin_core },
+            .{ .name = "udev", .module = udev.module("udev") },
         },
     });
 
@@ -1006,6 +1015,28 @@ pub fn build(b: *std.Build) void {
     const run_core_tests = b.addRunArtifact(core_tests);
     run_core_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_core_tests.step);
+
+    // The proof and not a library test: `chock_core.devices.drainInto`
+    // against a real `udev.Monitor`, because a fake here would prove nothing
+    // about whether the generic seam in `lib/chock-core/devices.zig`
+    // actually compiles and behaves against the production type it was
+    // written for. See that file's own top comment. Not gated behind
+    // `linux_only`, the same as `udev_tests` above: the test carries its own
+    // runtime skip.
+    const core_devices_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/core/devices.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "udev", .module = udev.module("udev") },
+                .{ .name = "chock-core", .module = chock_core },
+            },
+        }),
+    });
+    const run_core_devices_tests = b.addRunArtifact(core_devices_tests);
+    run_core_devices_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_core_devices_tests.step);
 
     // Linux only, by `linux_only` above. Every one of the thirteen tests in
     // test/core/tools.zig goes through the probe below, and the probe calls
