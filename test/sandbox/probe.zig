@@ -3490,24 +3490,33 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
                 },
             }
 
-            // The same bounded retry "spawned-device-place" uses, and for the
-            // same reason: neither half is ordered against the other, so this
-            // polls rather than assumes which one won.
+            // **Polled until the bytes are there, and never until the open
+            // works.** A bind mount needs its target to exist first, so the
+            // helper makes an empty file and mounts over it, and those are
+            // two steps. A program that polls this path can open the empty
+            // one in between. Measured 2026-09-17 under 24 runs at once: 5 of
+            // them read 0 bytes from a path that had just opened cleanly.
+            // So an open that answers nothing yet is this loop's "not yet",
+            // exactly like an open that fails.
             var attempt: usize = 0;
+            var opened = false;
             while (attempt < 200) : (attempt += 1) {
                 const fd_rc = linux.open(device_probe_path, .{ .ACCMODE = .RDONLY }, 0);
                 if (linux.errno(fd_rc) == .SUCCESS) {
+                    opened = true;
                     const fd: i32 = @intCast(fd_rc);
-                    defer _ = linux.close(fd);
                     var buffer: [64]u8 = undefined;
                     const n = linux.read(fd, &buffer, buffer.len);
+                    _ = linux.close(fd);
                     if (linux.errno(n) != .SUCCESS) return read_failed;
-                    return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else wrong_content;
+                    if (n != 0) {
+                        return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else wrong_content;
+                    }
                 }
                 var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
                 _ = linux.nanosleep(&pause, null);
             }
-            return never_appeared;
+            return if (opened) wrong_content else never_appeared;
         }
 
         if (std.mem.eql(u8, args[1], "spawned-filtered-refused")) {
@@ -3912,21 +3921,32 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // successful open followed by a read this probe did not expect.
         const never_appeared: u8 = 5;
         const read_failed: u8 = 6;
+        // **An open that answers nothing yet is "not yet", the same as an
+        // open that fails.** A bind mount needs its target to exist first, so
+        // the helper makes an empty file and mounts over it, and a program
+        // polling this path can open the empty one in between. Measured
+        // 2026-09-17 under load: a path that had just opened cleanly read 0
+        // bytes. Reading that as a content mismatch would report a placement
+        // fault for a placement that was merely still in progress.
         var attempt: usize = 0;
+        var opened = false;
         while (attempt < 200) : (attempt += 1) {
             const fd_rc = linux.open(device_probe_path, .{ .ACCMODE = .RDONLY }, 0);
             if (linux.errno(fd_rc) == .SUCCESS) {
+                opened = true;
                 const fd: i32 = @intCast(fd_rc);
-                defer _ = linux.close(fd);
                 var buffer: [64]u8 = undefined;
                 const n = linux.read(fd, &buffer, buffer.len);
+                _ = linux.close(fd);
                 if (linux.errno(n) != .SUCCESS) return read_failed;
-                return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else 1;
+                if (n != 0) {
+                    return if (std.mem.eql(u8, buffer[0..n], device_probe_content)) 0 else 1;
+                }
             }
             var pause: linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
             _ = linux.nanosleep(&pause, null);
         }
-        return never_appeared;
+        return if (opened) 1 else never_appeared;
     }
     if (std.mem.eql(u8, args[1], "spawned-device-hidden-denied")) {
         // Task 4b's own third property: Landlock never named the hidden

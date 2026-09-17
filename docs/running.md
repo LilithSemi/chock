@@ -103,6 +103,12 @@ that call does not see it: the next tool call does, because it scans the
 machine again from nothing. There is no live watch inside a call that is
 already running.
 
+**A program must wait for the device to answer, and never for its path to
+appear.** The device is bound over a file that has to exist first, so for a
+moment the path opens and reads nothing at all. A program that takes a
+successful open as the signal can read an empty file where it expects the
+device.
+
 ## What the harness tells the agent
 
 The loop knows things the model can only estimate, and it says them at the end
