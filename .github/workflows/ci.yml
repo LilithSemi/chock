@@ -153,27 +153,46 @@ jobs:
               -Dtarget="${target}" \
               -Dversion="${version}" \
               --prefix "build/${target}"
-            cp "build/${target}/bin/chock" "artifacts/${name}"
-            # **A copy with no version in the name, beside the versioned one.**
-            # GitHub serves `releases/latest/download/<name>`, which is a
-            # permanent address only when the name never changes. The versioned
-            # name changes every release and so cannot be linked to, and the
-            # website would otherwise have to bake in a URL that is only as
-            # fresh as its last deploy. People who want to pin still have the
-            # versioned name.
-            cp "build/${target}/bin/chock" "artifacts/chock-${target}"
+            # **A tarball and not a bare binary.** Apache-2.0 asks that the
+            # licence travels with the distribution, and a bare binary carries
+            # nothing. A tarball also keeps the executable bit, which a browser
+            # download drops, and unpacks to a plain `chock` so nobody has to
+            # rename the file before they can run it.
+            #
+            # **It unpacks into a directory of its own, not into the current
+            # one.** A flat tarball holding `chock`, `LICENSE` and `README.md`
+            # would overwrite a README.md the reader already had, in whatever
+            # directory they happened to be standing in. One path segment is a
+            # small price for never doing that.
+            #
+            # **Built for reproducibility**: a fixed owner, group and time, a
+            # sorted member order, and `gzip -n` so the archive carries no
+            # timestamp of its own. Two builds of the same commit then give the
+            # same digest, which is what makes SHA256SUMS worth publishing for
+            # a tool whose whole claim is about boundaries.
+            for shape in "${name}" "chock-${target}"; do
+              rm -rf "stage/${shape}"
+              mkdir -p "stage/${shape}"
+              cp "build/${target}/bin/chock" "stage/${shape}/chock"
+              cp LICENSE README.md "stage/${shape}/"
+              tar --sort=name \
+                  --owner=0 --group=0 --numeric-owner \
+                  --mtime="@${SOURCE_DATE_EPOCH:-0}" \
+                  -C stage -cf - "${shape}" \
+                | gzip -n > "artifacts/${shape}.tar.gz"
+            done
           done
 
           # **A digest beside every artefact.** A tool whose whole claim is
           # about boundaries, downloaded with nothing to check it against, is
           # the first thing a sceptic points at. Written last so it covers the
           # version-less copies too.
-          ( cd artifacts && sha256sum chock-* > SHA256SUMS )
+          ( cd artifacts && sha256sum chock-*.tar.gz > SHA256SUMS )
 
           ls -l artifacts
           cat artifacts/SHA256SUMS
 
-          reported="$(./artifacts/chock-${version}-x86_64-linux --version)"
+          reported="$(./build/x86_64-linux/bin/chock --version)"
           echo "the binary reports: ${reported}"
           case "${reported}" in
             "chock ${version}"*) ;;
