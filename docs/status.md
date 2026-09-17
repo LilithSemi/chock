@@ -23,6 +23,31 @@ description of an image and never a second copy of the bytes**: the `message`
 event carries them, because the context is folded from `message` events, and
 the `tool.result` event carries the media type, the size and a hash.
 
+**A plugin tool states the arguments it takes.** A tool declares a Zig type
+and the SDK lowers it into a schema the metadata carries, so the model is
+offered the field names and kinds rather than a free text box. The host bounds
+what it will carry: a schema larger than `max_schema_bytes` and a schema
+holding a field name the host will not put in front of a model are both
+refused by name, and the tool is refused with them rather than offered with an
+empty schema, because an empty schema would tell the model the tool takes
+nothing while the guest still reads fields.
+
+**A declared device reaches a session.** A project names a USB or serial
+device in a `devices` block of `chock.zon`, by identity and never by a path:
+`device.usb.1d50.6018` names a USB device by vendor and product, and
+`device.tty.serial.<serial>` names a serial adapter by its serial. Naming it
+is not enough on its own, because Chock ships no default for `device.*`, so
+`chock.zon` needs a policy rule for the same action as well. **Chock never
+grants a device a person could not open themselves**: the node is bound and
+the kernel answers the sandboxed program's own `open` on the mode, exactly as
+it would answer that person's. The machine is scanned at the start of each
+tool call and never in the middle of one, so a board plugged in while a long
+call is already running is seen by the next call and not by that one. `chock
+doctor` carries a row saying how many devices this machine could pass. See
+[running.md](running.md) for the block, [policy.md](policy.md) for the action
+names and the rule, and [sandbox.md](sandbox.md) for what the grant does not
+bound.
+
 ## The red team harness
 
 **The red team harness is built, and two models have been thrown at it.**
@@ -258,13 +283,6 @@ tenth.
   reaches the `nix` child the same way it reaches a subagent, but a build that
   never ends holds the session. It is also not asked about: the policy answer
   is read once, at the start, and decides whether the tool exists at all.
-- **A plugin tool takes no arguments a schema describes.** A tool body reads
-  the model's argument text whole, every offered plugin tool carries the empty
-  schema, and the SDK refuses to compile a tool that declares an argument type
-  with fields, so the gap is loud rather than a silently wrong read. Closing it
-  is two halves that have to land together: a schema in the metadata the host
-  reads, and a lowering in the guest with no allocator and no JSON parser
-  there yet.
 - **A project cannot ship guidance of its own.** The shelf `read_guidance`
   reads is compiled into Chock, which is why no tool call can write it. Letting
   a project add to it needs the read only path into the project that
@@ -301,6 +319,28 @@ tenth.
 
 ## Known open items
 
+- **A wasm plugin does not run on x86_64.** The engine answers
+  `error.Unsupported` when it instantiates a module, so no plugin tool can be
+  called on that architecture. aarch64 is unaffected, and nothing else in
+  Chock is.
+
+  **The cause is in Vulcan and not in Chock.** Its register allocator records
+  the clobber a call makes in the same place it records an ordinary occupant's
+  next use, so a register a call destroys at a position cannot be told from
+  one an occupant merely wants back at that position. A value that is both an argument of a call and live across
+  that same call then finds every register tied, and the allocator gives up
+  rather than spilling. x86_64 has 5 callee-saved general registers to
+  aarch64's 10, which is why one architecture meets this and the other never
+  does.
+
+  **Only a release build meets it.** A `ReleaseSafe` guest lowers to more
+  functions than a debug one, and the function that meets it is
+  `std.Io.Writer.writeAll`, which is standard library code and not a shape a
+  plugin author chose. A debug build of the same plugin compiles, so
+  `zig build test` on a development machine does not see this.
+
+  A fix exists on a Vulcan branch. Chock pins Vulcan by commit, and the pin
+  has not moved to it yet.
 - **The DNS rebinding window is closed for IPv4 and open for an IPv6-only
   name.** `fetch_url` resolves a permitted host, checks every address it
   answers with, and then holds the connection to a checked address, so the HTTP
