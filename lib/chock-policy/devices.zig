@@ -50,6 +50,13 @@ const usb_segment = "usb";
 const tty_segment = "tty";
 const serial_segment = "serial";
 
+/// The `tool` a device action is evaluated under, the same role
+/// `chock_core.lsp_driver.policy_tool` plays for a language server. A rule
+/// author writes `.tool = "device"` to state a row about every device action
+/// at once, and `src/run.zig`'s own seam passes this alongside the action
+/// `actionInto` built, so `evaluateChain` sees both.
+pub const policy_tool = "device";
+
 /// The longest action name `actionInto` can build. `usb` and a tty with no
 /// serial both spell `device.<bus>.<vendor>.<product>`, two labels of
 /// `table.max_label_bytes` each. A tty with a serial spells

@@ -69,6 +69,19 @@
 const std = @import("std");
 const udev = @import("udev");
 const chock_policy = @import("chock-policy");
+const chock_sandbox = @import("chock-sandbox");
+
+// `std.posix` in this build carries constants and types only, never a
+// wrapper function: see `lib/chock-sandbox/linux/driver.zig`'s own top
+// comment and its use of `std.os.linux` throughout for the reason, "std.Io
+// over std.posix over std.os.linux". `HostSource` below is the one place in
+// this file that opens a descriptor of its own rather than one `udev` hands
+// it, so it is the one place that needs this. `lib/chock-core/tools.zig`
+// calls `std.os.linux` the same way, with no platform guard around the call
+// itself: the decl compiles on every target this project builds, and
+// `chock_sandbox.expresses.device_passthrough` is what keeps it from ever
+// being reached on a build where it would not work.
+const linux = std.os.linux;
 
 const policy_devices = chock_policy.devices;
 
@@ -384,6 +397,578 @@ pub fn process(
     try registry.remember(allocator, devpath, arrival.target);
     return .{ .place = arrival };
 }
+
+// ---------------------------------------------------------------------------
+// The `devices` block of `chock.zon`: what this project declares it wants,
+// read the same way `chock_core.lsp_driver` and `chock_core.mcp` read their
+// own blocks of the same file.
+//
+// **A project that names none pays nothing.** `src/run.zig` reads this
+// before it ever opens `/dev`, asks policy, or builds a `PolicySeam`: a
+// project with no block gets `null` here, the same answer a file with no
+// such block gets, and every step downstream of it never runs. See this
+// project's own `.superpowers/sdd/task-6-brief.md` for why that has to be
+// provable and not merely true.
+//
+// **Declared, and never itself a grant.** Naming `device.usb.1d50.6018` here
+// only says this project cares about that device. Whether a session may ever
+// place it is a question for the policy table alone: `lib/chock-policy/devices.zig`
+// ships no default for `device.*`, so a device named here and nowhere in a
+// `policy` block still answers `ask`, and `ask` refuses. See
+// `src/run.zig`'s own `devicePolicySeam`.
+// ---------------------------------------------------------------------------
+
+/// The name of the configuration file, in the project root. The same file
+/// `lib/chock-core/lsp_driver.zig` and `lib/chock-core/mcp.zig` read, and the
+/// same split: this reader is strict inside its own block and says nothing
+/// about any other.
+pub const file_name = "chock.zon";
+
+/// The largest `chock.zon` this reader accepts, matching every other reader
+/// of the same file.
+pub const max_file_bytes = 1 << 20;
+
+/// How many devices one project may name. A person plugs in a few, never a
+/// warehouse of them.
+pub const max_devices = 8;
+
+/// What one project says about one device it wants. **Declared, not
+/// resolved**: `action` is a policy action name, never an identity, so a
+/// project writes exactly the string `chock_policy.devices.actionInto` would
+/// build for the device it means, for example `device.usb.1d50.6018`.
+pub const Settings = struct {
+    action: []const u8,
+};
+
+/// The shape one entry of the block is parsed into. Strict: an unknown field
+/// is a refusal, the same rule `chock_core.mcp.WireServer` keeps.
+const WireDevice = struct {
+    action: []const u8 = "",
+};
+
+pub const ParseError = error{
+    OutOfMemory,
+    /// The file is not valid ZON, or the `devices` block does not match the
+    /// schema. Pass a `Diagnostic` to learn which line, and why.
+    InvalidDevices,
+};
+
+pub const LoadError = ParseError || error{
+    /// The file is larger than `max_file_bytes`.
+    DevicesFileTooLarge,
+    /// The file exists and could not be read.
+    ReadFailed,
+};
+
+/// What went wrong while the `devices` block was read. The same shape, and
+/// the same ownership rule, as `chock_core.mcp.Diagnostic`: the two ZON
+/// variants own the syntax trees their message points into, so a caller that
+/// receives one must call `deinit`.
+pub const Diagnostic = union(enum) {
+    /// The file is not valid ZON at all.
+    file_not_zon: std.zon.parse.Diagnostics,
+    /// The file is valid ZON, and this block does not match the schema.
+    block_not_valid: std.zon.parse.Diagnostics,
+    /// The top level of the file is not a struct literal.
+    not_a_struct_literal,
+    /// The block names more devices than `max_devices`.
+    too_many_devices: usize,
+    /// An entry names no action at all.
+    empty_action,
+    /// An entry's action is longer than `chock_policy.devices.max_action_bytes`
+    /// can ever be, so no real device could ever build it.
+    action_too_long,
+    /// Two entries name the same action.
+    duplicate_action,
+    /// The file is larger than `max_file_bytes`, so it was not read.
+    file_too_large: usize,
+    /// The file exists and the read failed. The fault is the filesystem's.
+    read_failed: anyerror,
+
+    /// Release what the diagnostic owns. Safe on every variant.
+    pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
+            else => {},
+        }
+        self.* = undefined;
+    }
+
+    pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.*) {
+            .file_not_zon => |*zon_diag| try writer.print(
+                "{s} is not valid:\n{f}",
+                .{ file_name, zon_diag },
+            ),
+            .block_not_valid => |*zon_diag| try writer.print(
+                "{s}: the devices block is not valid:\n{f}",
+                .{ file_name, zon_diag },
+            ),
+            .not_a_struct_literal => try writer.print(
+                "{s}: the file must hold a struct literal",
+                .{file_name},
+            ),
+            .too_many_devices => |count| try writer.print(
+                "{s}: the devices block names {d} devices, and this build allows {d}",
+                .{ file_name, count, max_devices },
+            ),
+            .empty_action => try writer.print(
+                "{s}: a devices entry names no action",
+                .{file_name},
+            ),
+            .action_too_long => try writer.print(
+                "{s}: a devices entry's action is longer than any real device's ever is",
+                .{file_name},
+            ),
+            .duplicate_action => try writer.print(
+                "{s}: the devices block names the same action twice",
+                .{file_name},
+            ),
+            .file_too_large => |limit| try writer.print(
+                "{s}: the file is larger than {d} bytes, so it was not read",
+                .{ file_name, limit },
+            ),
+            .read_failed => |err| try writer.print(
+                "{s}: the file could not be read: {t}",
+                .{ file_name, err },
+            ),
+        }
+    }
+};
+
+/// Fill `out` when the caller asked for one, and say whether it took `value`.
+/// The first fault is kept, not the last. The answer matters because two
+/// variants own memory.
+fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
+    const slot = out orelse return false;
+    if (slot.* != null) return false;
+    slot.* = value;
+    return true;
+}
+
+/// Read the `devices` block out of `source`, the whole content of a
+/// `chock.zon`. **Null is the ordinary answer**: a project that named no
+/// device has none, and the session costs exactly what it cost before this
+/// file existed.
+///
+/// The result borrows nothing from `source` and is owned by `gpa`. Give an
+/// arena that outlives the session, the way every other reader of this file
+/// is given one.
+pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!?[]const Settings {
+    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var ast_owned = true;
+    defer if (ast_owned) ast.deinit(gpa);
+
+    var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
+    var zoir_owned = true;
+    defer if (zoir_owned) zoir.deinit(gpa);
+
+    if (zoir.hasCompileErrors()) {
+        if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
+            ast_owned = false;
+            zoir_owned = false;
+        }
+        return error.InvalidDevices;
+    }
+
+    const node = try findBlockNode(zoir, diag) orelse return null;
+
+    var zon_diag: std.zon.parse.Diagnostics = .{};
+    // From here the diagnostics own the two trees, the same handover
+    // `lib/chock-core/mcp.zig` makes.
+    ast_owned = false;
+    zoir_owned = false;
+    var zon_diag_owned = true;
+    defer if (zon_diag_owned) zon_diag.deinit(gpa);
+
+    const wire = std.zon.parse.fromZoirNodeAlloc(
+        []const WireDevice,
+        gpa,
+        ast,
+        zoir,
+        node,
+        &zon_diag,
+        .{},
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => {
+            if (note(diag, .{ .block_not_valid = zon_diag })) zon_diag_owned = false;
+            return error.InvalidDevices;
+        },
+    };
+    defer std.zon.parse.free(gpa, wire);
+
+    // A block that is there and empty is the same answer as no block at all:
+    // this project has no device.
+    if (wire.len == 0) return null;
+    if (wire.len > max_devices) {
+        _ = note(diag, .{ .too_many_devices = wire.len });
+        return error.InvalidDevices;
+    }
+
+    // A mistake in the file is heard when Chock reads the file, never on the
+    // turn a device happens to arrive.
+    for (wire, 0..) |one, index| {
+        if (one.action.len == 0) {
+            _ = note(diag, .empty_action);
+            return error.InvalidDevices;
+        }
+        if (one.action.len > policy_devices.max_action_bytes) {
+            _ = note(diag, .action_too_long);
+            return error.InvalidDevices;
+        }
+        for (wire[index + 1 ..]) |other| {
+            if (!std.mem.eql(u8, one.action, other.action)) continue;
+            _ = note(diag, .duplicate_action);
+            return error.InvalidDevices;
+        }
+    }
+
+    const out = try gpa.alloc(Settings, wire.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |one| gpa.free(one.action);
+        gpa.free(out);
+    }
+    for (wire, out) |one, *slot| {
+        slot.* = .{ .action = try gpa.dupe(u8, one.action) };
+        made += 1;
+    }
+    return out;
+}
+
+/// Read `chock.zon` from `project_root` and take its `devices` block. A
+/// project with no such file has no device, the same answer a file with no
+/// such block gets.
+pub fn load(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    diag: ?*?Diagnostic,
+) LoadError!?[]const Settings {
+    const path = try std.fs.path.join(gpa, &.{ project_root, file_name });
+    defer gpa.free(path);
+
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        path,
+        gpa,
+        .limited(max_file_bytes),
+        .of(u8),
+        0,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound, error.NotDir => return null,
+        error.StreamTooLong => {
+            _ = note(diag, .{ .file_too_large = max_file_bytes });
+            return error.DevicesFileTooLarge;
+        },
+        else => {
+            _ = note(diag, .{ .read_failed = err });
+            return error.ReadFailed;
+        },
+    };
+    defer gpa.free(source);
+
+    return parse(gpa, source, diag);
+}
+
+/// The node of the `devices` field at the top of the file. Null when the file
+/// has no such field. Every other top level field is skipped, because other
+/// milestones own the other blocks of this one file.
+fn findBlockNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
+    const root: std.zig.Zoir.Node.Index = .root;
+    switch (root.get(zoir)) {
+        .struct_literal => |fields| {
+            for (fields.names, 0..) |name, index| {
+                if (std.mem.eql(u8, name.get(zoir), "devices")) {
+                    return fields.vals.at(@intCast(index));
+                }
+            }
+            return null;
+        },
+        .empty_literal => return null,
+        else => {
+            _ = note(diag, .not_a_struct_literal);
+            return error.InvalidDevices;
+        },
+    }
+}
+
+fn freeSettings(gpa: std.mem.Allocator, settings: []const Settings) void {
+    for (settings) |one| gpa.free(one.action);
+    gpa.free(settings);
+}
+
+test "a project that names no device has no settings, and no block is the same answer" {
+    // The first rule of this whole block: a project with no `devices` block
+    // must cost nothing, the same rule `chock_core.lsp_driver` and
+    // `chock_core.mcp` each hold for their own. A project that names a
+    // language server and no device is the case a reader of one block could
+    // break for the other.
+    const gpa = testing.allocator;
+
+    try testing.expect(try parse(gpa, ".{}", null) == null);
+    try testing.expect(try parse(gpa, ".{ .subagents = .{ .max_width = 2 } }", null) == null);
+    try testing.expect(try parse(gpa, ".{ .devices = .{} }", null) == null);
+}
+
+test "the action comes from the file exactly as written, and never from a resolved identity" {
+    const gpa = testing.allocator;
+    const settings = (try parse(
+        gpa,
+        \\.{
+        \\    .devices = .{
+        \\        .{ .action = "device.usb.1d50.6018" },
+        \\        .{ .action = "device.tty.serial.DF62585783282137" },
+        \\    },
+        \\}
+    ,
+        null,
+    )).?;
+    defer freeSettings(gpa, settings);
+
+    try testing.expectEqual(@as(usize, 2), settings.len);
+    try testing.expectEqualStrings("device.usb.1d50.6018", settings[0].action);
+    try testing.expectEqualStrings("device.tty.serial.DF62585783282137", settings[1].action);
+}
+
+test "an entry with no action, two entries naming the same action, and too many entries all refuse" {
+    // A mistake here is heard when Chock reads the file, never on the turn a
+    // device happens to arrive: the same rule every other reader of
+    // `chock.zon` keeps.
+    const gpa = testing.allocator;
+
+    try testing.expectError(error.InvalidDevices, parse(gpa, ".{ .devices = .{ .{} } }", null));
+
+    try testing.expectError(error.InvalidDevices, parse(
+        gpa,
+        \\.{ .devices = .{
+        \\    .{ .action = "device.usb.1d50.6018" },
+        \\    .{ .action = "device.usb.1d50.6018" },
+        \\} }
+    ,
+        null,
+    ));
+
+    var too_many: std.ArrayList(u8) = .empty;
+    defer too_many.deinit(gpa);
+    try too_many.appendSlice(gpa, ".{ .devices = .{ ");
+    for (0..max_devices + 1) |i| {
+        const entry = try std.fmt.allocPrint(gpa, ".{{ .action = \"device.usb.1d50.{d:0>4}\" }},", .{i});
+        defer gpa.free(entry);
+        try too_many.appendSlice(gpa, entry);
+    }
+    try too_many.appendSlice(gpa, "} }");
+    const source = try gpa.dupeZ(u8, too_many.items);
+    defer gpa.free(source);
+    try testing.expectError(error.InvalidDevices, parse(gpa, source, null));
+}
+
+test "a diagnostic names which entry was wrong, and owns nothing when the file was fine" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(error.InvalidDevices, parse(gpa, ".{ .devices = .{ .{} } }", &diag));
+    try testing.expectEqual(Diagnostic.empty_action, diag.?);
+}
+
+// ---------------------------------------------------------------------------
+// The real device_source, for a session that has at least one permitted
+// device. Wraps one sysfs scan, built and torn down fresh by every
+// `Sandbox.spawn` call that names it: see `Sandbox.DeviceSource`'s own top
+// comment, "why this seam runs the other way round from `NetBroker`", and
+// `linux/driver.zig`'s `serveLinks`, which reads `wakeup()` exactly once, at
+// the start of one spawn, and never again for the whole of that call.
+//
+// **This is enumeration, and never the live monitor.** `HostSource.wakeup`
+// answers with what a fresh `udev.Enumerate` finds right now, permitted
+// devices only, and answers `next()` with nothing further once that snapshot
+// is drained. A device that arrives after `wakeup` ran is not seen by the
+// call already running: it is seen by the next one, which enumerates again
+// from nothing. `Registry`, `drainInto` and `OverflowTracker` above are built
+// for the live monitor a later task wires in to watch **while one call is
+// still running**; using them here for a one shot scan would hold state this
+// object never needs and never frees.
+// ---------------------------------------------------------------------------
+
+/// Wraps one `udev.Enumerate` scan behind `chock_sandbox.Sandbox.DeviceSource`.
+///
+/// **One signal pipe for the whole session, opened once and never closed
+/// until `deinit`.** `Sandbox.DeviceSource.next` takes no argument that could
+/// say which caller is asking, and `linux/driver.zig`'s own `serveLinks`
+/// keeps polling the descriptor `wakeup` returned for the whole of that one
+/// `Sandbox.spawn` call, which can outlive the single round `next` first
+/// drains to null: nothing tells this object when that call is really over.
+/// Closing and reopening the descriptor on a later `wakeup`, as an ordinary
+/// "one shot per call" design would, could hand that same descriptor number
+/// to something unrelated while an earlier call is still polling it. Never
+/// closing it removes that hazard: the worst a concurrent `Sandbox.spawn`
+/// (the ordinary turn loop's tool call racing a background task's own, both
+/// reading the one `device_source` a session builds) can do is see a queue
+/// this object is mid-rebuilding, drain fewer items than a later scan would
+/// have queued. `mutex` bounds that to "sees an inconsistent snapshot",
+/// never a corrupt one. Sequential use, one tool call at a time, is
+/// unaffected either way, and is the case this project's own turn loop keeps
+/// today.
+///
+/// **Enumeration, and never the live monitor.** See this file's own section
+/// comment above.
+pub const HostSource = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    seam: PolicySeam,
+    mutex: std.Io.Mutex,
+    queue: std.ArrayList(chock_sandbox.Sandbox.DeviceSource.Change),
+    index: usize,
+    signal: [2]i32,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, seam: PolicySeam) HostSource {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .seam = seam,
+            .mutex = .init,
+            .queue = .empty,
+            .index = 0,
+            .signal = .{ -1, -1 },
+        };
+    }
+
+    pub fn deviceSource(self: *HostSource) chock_sandbox.Sandbox.DeviceSource {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Release the last scan's own strings and close the signal pipe, if
+    /// either is open. Safe to call whether or not `wakeup` was ever reached:
+    /// a session with no permitted device builds a `HostSource` and may tear
+    /// it down having never scanned anything.
+    pub fn deinit(self: *HostSource) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.freeQueueLocked();
+        self.queue.deinit(self.gpa);
+        for (self.signal) |fd| {
+            if (fd >= 0) _ = linux.close(fd);
+        }
+        self.signal = .{ -1, -1 };
+    }
+
+    fn freeQueueLocked(self: *HostSource) void {
+        for (self.queue.items) |change| switch (change) {
+            .place => |p| {
+                self.gpa.free(p.source);
+                self.gpa.free(p.target);
+            },
+            .drop => |d| self.gpa.free(d.target),
+        };
+        self.queue.clearRetainingCapacity();
+    }
+
+    const vtable = chock_sandbox.Sandbox.DeviceSource.VTable{
+        .wakeup = wakeupFn,
+        .next = nextFn,
+    };
+
+    fn wakeupFn(ptr: *anyopaque) i32 {
+        const self: *HostSource = @ptrCast(@alignCast(ptr));
+
+        // Built lazily, and kept for the whole session once built: see this
+        // struct's own top comment for why this descriptor is never closed
+        // and reopened.
+        if (self.signal[0] < 0) {
+            var pipe: [2]i32 = undefined;
+            if (linux.errno(linux.pipe2(&pipe, .{ .NONBLOCK = true, .CLOEXEC = true })) != .SUCCESS) return -1;
+            self.signal = pipe;
+        }
+
+        self.mutex.lockUncancelable(self.io);
+        self.freeQueueLocked();
+        self.index = 0;
+        self.mutex.unlock(self.io);
+
+        // `scan` runs unlocked: it does no work on `self.queue` beyond the
+        // `append` calls inside it, each of which takes the lock for the
+        // length of that one call, so a concurrent `next` never sees a
+        // partially built entry.
+        self.scan();
+
+        self.mutex.lockUncancelable(self.io);
+        const has_work = self.queue.items.len != 0;
+        self.mutex.unlock(self.io);
+        if (has_work) {
+            // One byte says "something is queued". `nextFn` reads it back out
+            // the moment the queue empties, so a call with nothing further to
+            // place never spins `poll` against a descriptor that stays
+            // readable forever.
+            const byte: [1]u8 = .{'x'};
+            _ = linux.write(self.signal[1], &byte, 1);
+        }
+        return self.signal[0];
+    }
+
+    /// Scan sysfs for every device this session's declared `devices` block
+    /// and policy table both permit, and queue a `place` for each. Errors
+    /// from `udev` are swallowed here on purpose: a machine with no `/sys`,
+    /// or one this process cannot read it on, has no device to place, which
+    /// is the same answer as a machine with nothing plugged in, and neither
+    /// one is a reason to refuse the tool call this source was built for.
+    fn scan(self: *HostSource) void {
+        var ctx = udev.Context.init(self.gpa, self.io);
+        defer ctx.deinit();
+
+        var en = udev.Enumerate.init(&ctx);
+        defer en.deinit();
+        en.addMatchSubsystem("usb") catch return;
+        en.addMatchSubsystem("tty") catch return;
+        en.scanDevices() catch return;
+
+        var buffer: [policy_devices.max_action_bytes]u8 = undefined;
+        var it = en.devices();
+        while (it.next()) |syspath| {
+            var dev = udev.Device.fromSyspath(&ctx, syspath) catch continue;
+            defer dev.deinit();
+
+            const arrival = (evaluateArrival(self.gpa, &dev, self.seam, &buffer) catch continue) orelse continue;
+            const source = self.gpa.dupe(u8, arrival.source) catch continue;
+            const target = self.gpa.dupe(u8, arrival.target) catch {
+                self.gpa.free(source);
+                continue;
+            };
+            const change: chock_sandbox.Sandbox.DeviceSource.Change = .{
+                // `0` is `linux/driver.zig`'s own `device_kind_file`, the one
+                // kind that file's `placeDevice` accepts. Not exported: this
+                // is the only caller outside that file that has ever needed
+                // to name it.
+                .place = .{ .kind = 0, .source = source, .target = target },
+            };
+            self.mutex.lockUncancelable(self.io);
+            self.queue.append(self.gpa, change) catch {
+                self.mutex.unlock(self.io);
+                self.gpa.free(source);
+                self.gpa.free(target);
+                continue;
+            };
+            self.mutex.unlock(self.io);
+        }
+    }
+
+    fn nextFn(ptr: *anyopaque) ?chock_sandbox.Sandbox.DeviceSource.Change {
+        const self: *HostSource = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.index >= self.queue.items.len) {
+            var discard: [8]u8 = undefined;
+            _ = linux.read(self.signal[0], &discard, discard.len);
+            return null;
+        }
+        defer self.index += 1;
+        return self.queue.items[self.index];
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Tests.

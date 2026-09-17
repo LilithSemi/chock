@@ -107,6 +107,19 @@ pub const expresses = struct {
     /// a build that answers false refuses such a config rather than running it
     /// with no containment at all: see `darwin/driver.zig`'s own `spawn`.
     pub const cgroup_placement = builtin.os.tag == .linux;
+
+    /// A device bound in from `Config.device_tree` and placed by
+    /// `Config.device_source`. See `linux/devicelink.zig` and
+    /// `linux/driver.zig`'s `placeDevice`, both of which need `mknodat` and a
+    /// bind mount, neither of which macOS has. `darwin/driver.zig` reads
+    /// `device_tree` and `device_source` and applies neither, the same as
+    /// every other field this struct's own top comment names: a caller that
+    /// asks for a device on a build that answers false gets no device and no
+    /// crash. `src/run.zig` reads this before it ever asks policy, so a
+    /// session on macOS never opens `/dev` or asks a question nobody there
+    /// can answer, and the `device_exposed` event it writes says so, which is
+    /// the whole reason that event carries `enforced` apart from `decision`.
+    pub const device_passthrough = builtin.os.tag == .linux;
 };
 
 /// The path a mount source or a Landlock rule must name for `path` on this

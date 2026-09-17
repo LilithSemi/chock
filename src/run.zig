@@ -481,6 +481,10 @@ fn mainWith(
     // string the sandbox config and the tool environment borrowed lives in
     // this arena.
     if (started.dev_shell) |*shell| shell.deinit();
+    // The device source, at the same point and for the same reason: a tool
+    // call can still be running until here, and `sandbox_config.device_source`
+    // still points at it until this line.
+    if (started.device_source) |source| source.deinit();
     // And the image, for the same reason and at the same point: it owns the
     // strings the mount set and both environments borrowed.
     //
@@ -907,6 +911,14 @@ const Started = struct {
     /// editing a file. A project that named none pays nothing at all, and every
     /// write answers as it did before this existed.
     language_server: ?chock_core.lsp_driver.Settings,
+    /// The live source behind `sandbox_config.device_source`, or null when
+    /// this project named no device, or named one and every rule for it
+    /// answered less than `allow`. Owns the signal pipe and every scan's own
+    /// strings: see `chock_core.devices.HostSource`. Torn down in phase 3,
+    /// the same point `dev_shell` and `image` come down, because a tool call
+    /// can still be running before that and `sandbox_config` still borrows
+    /// this pointer.
+    device_source: ?*chock_core.devices.HostSource,
     /// This project's MCP servers, from the `mcp_servers` block of
     /// `chock.zon`, or null when it named none.
     ///
@@ -1820,6 +1832,39 @@ fn start(
     sandbox_config.seccomp_options.strict_wx = write_execute.rule == .strict;
     try recordSandbox(gpa, io, storage, &attempt, write_execute);
 
+    // This project's declared devices, from the `devices` block of
+    // `chock.zon`, read after the policy for the same reason the hardening
+    // row above is: the policy is what decides whether any of them actually
+    // reach a sandbox. **Null is the ordinary answer**, and it costs the
+    // session nothing: see `chock_core.devices.load`'s own top comment, "a
+    // project that names none pays nothing".
+    var devices_diag: ?chock_core.devices.Diagnostic = null;
+    defer if (devices_diag) |*d| d.deinit(arena);
+    const declared_devices = chock_core.devices.load(arena, io, project_root, &devices_diag) catch |err| {
+        if (devices_diag) |*d| {
+            tty.print(.err, "chock run: the devices block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the devices block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+    const device_wiring = try devicesFor(
+        arena,
+        gpa,
+        io,
+        policy,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+        declared_devices,
+    );
+    try recordDevices(gpa, io, storage, &attempt, device_wiring.seam);
+    const device_source: ?*chock_core.devices.HostSource = device_wiring.host;
+    if (device_wiring.host) |host| {
+        sandbox_config.device_tree = device_wiring.device_tree;
+        sandbox_config.device_source = host.deviceSource();
+    }
+
     // How an approved apply lands. **The one control that decides whether a "y"
     // at an approval prompt can move a branch of the user's**, so it is read
     // here, from the project's own file, under the row the organisation may
@@ -2108,6 +2153,7 @@ fn start(
         .subagents = subagent_limits,
         .apply_mode = apply_mode,
         .language_server = language_server,
+        .device_source = device_source,
         .mcp_servers = mcp_servers,
         .plugins = plugins,
         .prompt_project = prompt_project,
@@ -2655,6 +2701,81 @@ fn reportSandboxRecord(err: anyerror) StartError {
         .err,
         "chock run: the sandbox this run built could not be written to the log: {s}. A session " ++
             "that cannot say which layers it ran with is one nobody can audit afterwards.\n",
+        .{@errorName(err)},
+    );
+    return error.Reported;
+}
+
+/// Write down what this project's `devices` block asked for, and what
+/// policy answered for each one. **A no-op when `seam` is null**, which is
+/// what `devicesFor` answers for a project that named no device: no lock is
+/// taken and no line is written, the same silence `recordSandbox` above
+/// would keep if `SandboxOpen` did not exist to begin with.
+///
+/// **One row per declared device, whichever way policy went.** The same
+/// reasoning `recordSandbox` states for `SandboxOpen`: a fact recorded only
+/// when it is interesting is missing whenever somebody disagrees about what
+/// is interesting, and a project that named a device and was refused needs
+/// that refusal on the record as much as a project that was granted one.
+///
+/// **`enforced` reads `chock_sandbox.expresses.device_passthrough` and not
+/// only `decision`.** A build whose driver applies neither `Config.device_tree`
+/// nor `Config.device_source` grants nothing no matter what policy answers,
+/// and a reader auditing a session from such a machine has to be able to see
+/// that from the row alone: see `chock_proto.event.DeviceExposed`'s own top
+/// comment.
+///
+/// **A refusal is said out loud, not only logged.** The same reading
+/// `hardeningDecision` gives a project that gave up a layer: a person at the
+/// keyboard hears why a device they named is not there, and the line says
+/// what to do about it, which the log row alone does not.
+fn recordDevices(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    storage: chock_proto.storage.Storage,
+    attempt: []const u8,
+    seam: ?*const DevicePolicySeam,
+) StartError!void {
+    const table = seam orelse return;
+    if (table.declared.len == 0) return;
+
+    var locked = storage.lock(io) catch |err| return reportDevicesRecord(err);
+    defer locked.unlock(io) catch {};
+    for (table.declared) |one| {
+        const decision = table.decisionFor(one.action);
+        _ = locked.append(gpa, io, .{
+            .device_exposed = .{
+                .attempt = attempt,
+                .action = one.action,
+                .decision = @tagName(decision),
+                .enforced = decision == .allow and sandbox.expresses.device_passthrough,
+            },
+        }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| return reportDevicesRecord(err);
+
+        if (decision != .allow) tty.print(
+            .warn,
+            "chock: {s} is not exposed to this session, because this project's policy answers " ++
+                "{t} for it. Write a rule under .policy.rules in chock.zon that answers allow for " ++
+                "{s} to expose it.\n",
+            .{ one.action, decision, one.action },
+        );
+    }
+}
+
+/// The one message a failed `recordDevices` writes. **The session does not
+/// start**, the same rule `reportSandboxRecord` keeps: a device this project
+/// declared, granted or not, is invisible to anybody auditing this session
+/// afterward if the row that would have said so never reached the log.
+fn reportDevicesRecord(err: anyerror) StartError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (err == error.Busy) {
+        tty.print(.err, "chock run: {s}\n", .{busy_detail});
+        return error.Reported;
+    }
+    tty.print(
+        .err,
+        "chock run: the devices this run declared could not be written to the log: {s}. A " ++
+            "session that cannot say what it exposed is one nobody can audit afterwards.\n",
         .{@errorName(err)},
     );
     return error.Reported;
@@ -4151,6 +4272,157 @@ fn languageServerPermitted(
         .{ decision, action },
     );
     return false;
+}
+
+/// Implements `chock_core.devices.PolicySeam`, the same shape
+/// `languageServerPermitted` above answers for `lsp.<program>`.
+///
+/// **Only `allow` exposes a device.** `lib/chock-policy/devices.zig` ships no
+/// default for `device.*`, so an action nobody named in a `policy` block
+/// answers `ask`, and `ask` refuses here: there is nobody to prompt while a
+/// device is arriving mid session any more than there is while a language
+/// server is starting up, and prompting a person per arrival is a later
+/// change, not this one. See `.superpowers/sdd/task-6-brief.md`.
+///
+/// **Only a device this project named in its own `devices` block is ever
+/// asked about at all.** `chock_core.devices.HostSource.scan` calls this seam
+/// for every USB or serial device this machine has plugged in, named or not,
+/// because it cannot tell the difference from sysfs alone. `declared` is the
+/// list that draws the line: an identity this project never wrote down
+/// cannot reach the sandbox no matter what an organisation's bundle or this
+/// project's own policy table would have answered for it, the same as an
+/// MCP server this project never named cannot be started by a rule that
+/// would have permitted it.
+///
+/// **Folded over the whole spawn chain**, so a subagent cannot expose a
+/// device its parent could not, and the org bundle folds in beside it.
+/// Neither is code here: both are properties of `evaluateChain` taking a
+/// minimum, the same as `languageServerPermitted` relies on.
+const DevicePolicySeam = struct {
+    policy: *const chock_policy.table.Table,
+    chain: []const []const u8,
+    agent_kind: []const u8,
+    model: []const u8,
+    declared: []const chock_core.devices.Settings,
+
+    fn seam(self: *DevicePolicySeam) chock_core.devices.PolicySeam {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.devices.PolicySeam.VTable{ .permitted = permittedFn };
+
+    fn permittedFn(ptr: *anyopaque, action: []const u8) bool {
+        const self: *DevicePolicySeam = @ptrCast(@alignCast(ptr));
+        return self.decisionFor(action) == .allow;
+    }
+
+    /// The policy answer for `action`, or `.ask` when this project never
+    /// named `action` in its own `devices` block at all: see this struct's
+    /// own top comment, "only a device this project named". `.ask` and not
+    /// `.deny`, because the reason to read out of a decision this cheap is
+    /// the same reason a rule nobody wrote answers `.ask`: an unnamed action
+    /// never reached a rule, so it never reached a `deny` either.
+    fn decisionFor(self: *const DevicePolicySeam, action: []const u8) chock_policy.table.Decision {
+        var named = false;
+        for (self.declared) |one| {
+            if (std.mem.eql(u8, one.action, action)) {
+                named = true;
+                break;
+            }
+        }
+        if (!named) return .ask;
+
+        var fault: ?chock_policy.table.ChainFault = null;
+        const decision = self.policy.evaluateChain(self.chain, .{
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = chock_policy.devices.policy_tool,
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        return decision;
+    }
+};
+
+/// What this project's `devices` block resolved to for one attempt.
+///
+/// **Every field is null together when this project named no device.** See
+/// `devicesFor`'s own first line, and the test that proves it: no seam is
+/// built, no `HostSource` is built, and `Config.device_tree` names nothing,
+/// so a `Sandbox.spawn` that reads this session's config never binds `/dev`,
+/// never forks the device helper, and never polls an extra descriptor. See
+/// `lib/chock-sandbox/linux/driver.zig`'s own `wants_device` gate, which is
+/// what reads `device_source` and answers that question for a call.
+const DeviceWiring = struct {
+    /// Null exactly when this project named no device: see `DevicePolicySeam`
+    /// itself, which is never built for a project with nothing to evaluate.
+    /// Non-null on every build, Linux or not, because `recordDevices` needs
+    /// it to write a `device.exposed` row even where nothing can be enforced.
+    seam: ?*DevicePolicySeam = null,
+    /// Non-null only on a build that answers true for
+    /// `chock_sandbox.Sandbox.expresses.device_passthrough`. Null on every
+    /// other build, whatever this project declared: see that field's own doc
+    /// comment.
+    host: ?*chock_core.devices.HostSource = null,
+    /// Set together with `host`, and null whenever it is.
+    device_tree: ?sandbox.Config.DeviceTree = null,
+};
+
+/// Build this attempt's `DeviceWiring` from `declared`, this project's own
+/// `devices` block, already read by the caller. Null in and nothing out: see
+/// `DeviceWiring`'s own top comment.
+///
+/// **Folds the spawn chain the same way `hardeningDecision` does**, and for
+/// the same reason: `chain_links` is the parents and `agent_kind` is this
+/// session, and a session cannot state its own parents.
+fn devicesFor(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+    declared: ?[]const chock_core.devices.Settings,
+) std.mem.Allocator.Error!DeviceWiring {
+    const list = declared orelse return .{};
+
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    for (chain_links, chain[0 .. chain.len - 1]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain.len - 1] = agent_kind;
+
+    const seam = try arena.create(DevicePolicySeam);
+    seam.* = .{
+        .policy = policy,
+        .chain = chain,
+        .agent_kind = agent_kind,
+        .model = model,
+        .declared = list,
+    };
+
+    // **Only a build whose driver can act on `device_tree` and
+    // `device_source` ever names either.** A session on a build that answers
+    // false for `sandbox.expresses.device_passthrough` never opens `/dev`
+    // and never asks a question its own driver could not answer. The seam
+    // above is still returned, so `recordDevices` can still write a row that
+    // says what policy would have decided, with `enforced` false: see
+    // `chock_proto.event.DeviceExposed`'s own top comment.
+    if (!sandbox.expresses.device_passthrough) return .{ .seam = seam };
+
+    const host = try arena.create(chock_core.devices.HostSource);
+    host.* = chock_core.devices.HostSource.init(gpa, io, seam.seam());
+    return .{
+        .seam = seam,
+        .host = host,
+        // The hidden tree is the host's own `/dev`, mirrored: a node's path
+        // relative to it is what `DEVNAME` already gives, see
+        // `chock_core.devices.evaluateArrival`'s own doc comment. Never
+        // granted through `sandbox_config.rules`: Landlock is an allowlist,
+        // so a path this session never names is a path the sandboxed program
+        // cannot open, list, or resolve through, even though the bind is
+        // really there after the pivot.
+        .device_tree = .{ .host = "/dev", .inside = "/.chock-device-tree" },
+    };
 }
 
 /// What this session's policy answered about sandbox hardening, and what that
@@ -8343,7 +8615,6 @@ const credentials_not_wired_text = "git push was not run: this session has no wa
 const nothing_typed_text = "git push was not run: chock asked for the password and nobody " ++
     "typed one, so the push was declined. Nothing was sent anywhere. Ask the user whether they " ++
     "want this push to happen at all before trying it again.";
-
 
 /// A `ToolRunner` that reads a `run_command` call for a git command line
 /// before it runs, and answers the subcommands that cannot work inside the
@@ -16376,6 +16647,227 @@ test "the log says which sandbox one attempt ran under, and it says it either wa
     try std.testing.expect(std.mem.indexOf(u8, text, attempt) != null);
 }
 
+test "a project with no devices block builds no seam, no host, and names no tree" {
+    // **Task 6a's first property, proved and not asserted.** A session that
+    // never declared a device must cost exactly what it cost before this
+    // milestone existed: no tree bound, no watcher started, no helper
+    // forked, no extra descriptor polled. `devicesFor` is where every one of
+    // those starts, and this pins that a null `declared` produces a wholly
+    // empty `DeviceWiring` before any of it can happen.
+    //
+    // Mutation check: make `devicesFor` build the seam unconditionally
+    // before checking `declared`, and `wiring.seam` here reads non-null.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, empty);
+
+    const wiring = try devicesFor(arena, gpa, std.testing.io, empty, &.{}, "main", "a-model", null);
+    try std.testing.expectEqual(@as(?*DevicePolicySeam, null), wiring.seam);
+    try std.testing.expectEqual(@as(?*chock_core.devices.HostSource, null), wiring.host);
+    try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
+
+    // The other half: a `recordDevices` given that same null seam takes no
+    // lock and writes no line at all, so a session with nothing declared
+    // never even opens the log for this.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/01JQ.jsonl", .{buffer[0..len]}, 0);
+    const log = try chock_proto.log.Log.open(std.testing.io, log_path, "01JQ");
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(std.testing.io);
+
+    try recordDevices(gpa, std.testing.io, store, "01JQATTEMPT", wiring.seam);
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, log_path, arena, .limited(1 << 20));
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, text, "device.exposed"));
+}
+
+test "a named device whose rule says allow reaches the sandbox config" {
+    // Task 6a's second property: a device this project both declared in its
+    // `devices` block and permitted in its `policy` block is what
+    // `Sandbox.Config` actually carries, ready for `Sandbox.spawn` to bind.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The wildcard rule is what makes the assertion at the end of this test
+    // real: it would answer `allow` for any `device.*` action, named or not,
+    // so a pass that only checked the named action could not tell "the seam
+    // reads the declared list" from "the seam never reads it at all".
+    const allowed = try chock_policy.table.Table.parse(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "device.usb.1d50.6018", .tool = "device", .decision = .allow },
+        \\    .{ .action = "device.*", .decision = .allow },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(arena, allowed);
+
+    const declared: []const chock_core.devices.Settings = &.{
+        .{ .action = "device.usb.1d50.6018" },
+    };
+    const wiring = try devicesFor(arena, gpa, std.testing.io, allowed, &.{}, "main", "a-model", declared);
+    defer if (wiring.host) |host| host.deinit();
+
+    const seam = wiring.seam.?;
+    try std.testing.expectEqual(chock_policy.table.Decision.allow, seam.decisionFor("device.usb.1d50.6018"));
+    try std.testing.expect(seam.seam().permitted("device.usb.1d50.6018"));
+
+    // Only a build whose driver can act on it ever names `device_tree` and
+    // `device_source`: see `chock_sandbox.Sandbox.expresses.device_passthrough`.
+    if (sandbox.expresses.device_passthrough) {
+        try std.testing.expect(wiring.host != null);
+        try std.testing.expectEqualStrings("/dev", wiring.device_tree.?.host);
+        try std.testing.expectEqualStrings("/.chock-device-tree", wiring.device_tree.?.inside);
+    } else {
+        try std.testing.expectEqual(@as(?*chock_core.devices.HostSource, null), wiring.host);
+        try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
+    }
+
+    // A real device is never named to the seam on its own: an identity this
+    // project never declared is refused even though the wildcard rule above
+    // would answer allow for it, because it was never asked.
+    try std.testing.expect(!seam.seam().permitted("device.usb.dead.beef"));
+}
+
+test "a named device with no policy rule answers ask, is refused, and says to write a rule" {
+    // Task 6a's third property. `lib/chock-policy/devices.zig` ships no
+    // default for `device.*`, so a device this project only named in its
+    // `devices` block and never in a `policy` rule is exactly the project
+    // that has not yet said yes, and `ask` refuses here because there is
+    // nobody mid session to ask.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(std.testing.io, gpa);
+    defer said.stop(std.testing.io);
+
+    const no_rule = try chock_policy.table.Table.parse(arena, ".{}", null);
+    defer chock_policy.table.Table.destroy(arena, no_rule);
+
+    const declared: []const chock_core.devices.Settings = &.{
+        .{ .action = "device.tty.serial.DF62585783282137" },
+    };
+    const wiring = try devicesFor(arena, gpa, std.testing.io, no_rule, &.{}, "main", "a-model", declared);
+    defer if (wiring.host) |host| host.deinit();
+
+    const seam = wiring.seam.?;
+    try std.testing.expectEqual(chock_policy.table.Decision.ask, seam.decisionFor("device.tty.serial.DF62585783282137"));
+    try std.testing.expect(!seam.seam().permitted("device.tty.serial.DF62585783282137"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/01JQ.jsonl", .{buffer[0..len]}, 0);
+    const log = try chock_proto.log.Log.open(std.testing.io, log_path, "01JQ");
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(std.testing.io);
+
+    try recordDevices(gpa, std.testing.io, store, "01JQATTEMPT", wiring.seam);
+
+    // The refusal is said out loud, and it says what a project has to do
+    // about it: write the rule, not merely that one is missing.
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "device.tty.serial.DF62585783282137") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "policy.rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "allow") != null);
+}
+
+test "an org bundle that denies a device wins even when the project itself allows it" {
+    // Task 6a's fourth property. The same fold `hardeningDecision` and
+    // `languageServerPermitted` both rely on: the bundle above the project is
+    // one more term of the minimum, so a project's own `allow` cannot raise
+    // what an organisation closed.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const org_rules = [_]chock_policy.table.Rule{
+        .{ .action = "device.usb.1d50.6018", .tool = "device", .decision = .deny },
+    };
+    const under_org = try chock_policy.table.Table.parseUnder(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "device.usb.1d50.6018", .tool = "device", .decision = .allow },
+        \\} } }
+    , &org_rules, null);
+    defer chock_policy.table.Table.destroy(arena, under_org);
+
+    const declared: []const chock_core.devices.Settings = &.{
+        .{ .action = "device.usb.1d50.6018" },
+    };
+    const wiring = try devicesFor(arena, gpa, std.testing.io, under_org, &.{}, "main", "a-model", declared);
+    defer if (wiring.host) |host| host.deinit();
+
+    try std.testing.expectEqual(chock_policy.table.Decision.deny, wiring.seam.?.decisionFor("device.usb.1d50.6018"));
+    try std.testing.expect(!wiring.seam.?.seam().permitted("device.usb.1d50.6018"));
+}
+
+test "the device.exposed event records what was actually enforced, not what was asked for" {
+    // Task 6a's fifth property. `enforced` folds the policy decision with
+    // `chock_sandbox.Sandbox.expresses.device_passthrough`: a granted device
+    // on a build whose driver cannot act on it is not enforced, whatever
+    // `decision` says, and this is the one field that makes the gap
+    // checkable by somebody reading the log who was not there.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const table = try chock_policy.table.Table.parse(arena,
+        \\.{ .policy = .{ .rules = .{
+        \\    .{ .action = "device.usb.1d50.6018", .tool = "device", .decision = .allow },
+        \\} } }
+    , null);
+    defer chock_policy.table.Table.destroy(arena, table);
+
+    const declared: []const chock_core.devices.Settings = &.{
+        .{ .action = "device.usb.1d50.6018" },
+        .{ .action = "device.tty.serial.DF62585783282137" },
+    };
+    const wiring = try devicesFor(arena, gpa, std.testing.io, table, &.{}, "main", "a-model", declared);
+    defer if (wiring.host) |host| host.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const log_path = try std.fmt.allocPrintSentinel(arena, "{s}/01JQ.jsonl", .{buffer[0..len]}, 0);
+    const log = try chock_proto.log.Log.open(std.testing.io, log_path, "01JQ");
+    var backing = chock_proto.storage.JsonLines{ .log = log };
+    const store = backing.storage();
+    defer store.close(std.testing.io);
+
+    var said: tty.Capture = undefined;
+    said.start(std.testing.io, gpa);
+    defer said.stop(std.testing.io);
+
+    try recordDevices(gpa, std.testing.io, store, "01JQATTEMPT", wiring.seam);
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, log_path, arena, .limited(1 << 20));
+    try std.testing.expect(std.mem.indexOf(u8, text, "device.exposed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"action\":\"device.usb.1d50.6018\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"action\":\"device.tty.serial.DF62585783282137\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"ask\"") != null);
+
+    // The allowed device is enforced only on a build whose driver can act on
+    // it; the one with no rule is never enforced on any build.
+    const enforced_true = std.mem.indexOf(u8, text, "\"enforced\":true") != null;
+    try std.testing.expectEqual(sandbox.expresses.device_passthrough, enforced_true);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"enforced\":false") != null);
+}
+
 test "a promise the session made reaches the end of session approval, out of the log" {
     // The ratchet, along the route `applyWork` takes. An agent that promised
     // not to apply its work made that promise turns ago, in a `state.Session`
@@ -20325,7 +20817,6 @@ test "the broker is given the same values, without the ones nobody can match" {
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
-
 test "an org subagent ceiling binds this session, and it is the session's own limits that carry it" {
     // **The wiring, and not only the fold.** `chock_policy.subagents` has its
     // own tests for the minimum. What this one says is that the value a
@@ -20357,7 +20848,6 @@ test "an org subagent ceiling binds this session, and it is the session's own li
     try testing.expectEqual(@as(u16, 9), unmanaged.max_depth);
     try testing.expectEqual(@as(u16, 9), unmanaged.max_width);
 }
-
 
 test "an org bundle can stop every project starting a language server" {
     // **The gap this closes.** `language_servers` was the one block of

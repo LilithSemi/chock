@@ -174,6 +174,7 @@ pub const Kind = enum {
     sandbox_open,
     sandbox_supervisor,
     sandbox_syscalls,
+    device_exposed,
     network_summary,
     unknown,
 
@@ -227,6 +228,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .sandbox_open = "sandbox.open",
     .sandbox_supervisor = "sandbox.supervisor",
     .sandbox_syscalls = "sandbox.syscalls",
+    .device_exposed = "device.exposed",
     .network_summary = "network.summary",
     .unknown = "unknown",
 });
@@ -1833,6 +1835,60 @@ pub const SandboxSyscalls = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// One device this project's `chock.zon` named, and what became of it.
+///
+/// **This exists because a granted device is otherwise invisible in the
+/// record.** `chock_core.devices` places a device by binding it straight into
+/// a tool call's own sandbox, with no approval asked and no tool result that
+/// names it, the same silent path `net.connect` used to take before
+/// `NetworkSummary` existed. Without this event a session that reached real
+/// hardware and one that never could read the same afterward: nothing else in
+/// the log says which.
+///
+/// **`enforced` and not only `decision`.** The policy answer is what this
+/// project's rules and its organisation's said; `enforced` is whether a
+/// sandbox on this machine could act on that answer at all. The two agree on
+/// Linux whenever the answer is `allow`. They can disagree on a build whose
+/// driver reads `Sandbox.Config.device_tree` and `.device_source` and applies
+/// neither: see `chock_sandbox.Sandbox.expresses.device_passthrough`. A reader
+/// who was not there, auditing a session run on such a machine, needs the
+/// weaker platform's own story to be checkable from the row alone rather than
+/// inferred from which machine a session happened to run on.
+///
+/// **Written once per declared device, per attempt, whichever way the policy
+/// went.** The same reasoning `SandboxOpen` states for itself: a fact recorded
+/// only when it is interesting is missing whenever somebody disagrees about
+/// what is interesting, and a project that named a device and was refused
+/// needs that refusal on the record as much as a project that was granted one.
+pub const DeviceExposed = struct {
+    /// The identifier of this attempt, the same one `WorkspaceOpen.attempt`
+    /// and `SandboxOpen.attempt` carry, so every line of one run reads
+    /// together.
+    attempt: []const u8,
+    /// The action this project's `devices` block named, by the name
+    /// `chock_policy.devices.actionInto` gives it, for example
+    /// `device.usb.1d50.6018`. **Declared, and not necessarily arrived.** A
+    /// project may name a device that is not plugged in during this run; the
+    /// row still says what the policy would do for it.
+    action: []const u8,
+    /// The policy answer for this action, by the name
+    /// `chock_policy.table.Decision` gives it. **The reason and not only the
+    /// outcome**, the same as `SandboxOpen.decision`: a reader can otherwise
+    /// not tell a project that asked for this from an installation whose
+    /// organisation permitted it.
+    decision: []const u8,
+    /// Whether this machine's own driver can act on `decision` at all. False
+    /// on every build that answers false for
+    /// `chock_sandbox.Sandbox.expresses.device_passthrough`, whatever
+    /// `decision` says: see this struct's own top comment.
+    enforced: bool = false,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 /// A tool call's own network use over the whole session, one line rather than
 /// one per connection.
 ///
@@ -2045,6 +2101,7 @@ pub const Event = union(Kind) {
     sandbox_open: SandboxOpen,
     sandbox_supervisor: SandboxSupervisor,
     sandbox_syscalls: SandboxSyscalls,
+    device_exposed: DeviceExposed,
     network_summary: NetworkSummary,
     /// A kind this reader does not recognize. See `UnknownEvent`.
     unknown: UnknownEvent,
@@ -2279,6 +2336,58 @@ test "a path record survives a round trip, caveat and overflow count included" {
     // A call that recorded nothing carries no path record at all, and that
     // reads back as null rather than as a set of zeros.
     try std.testing.expectEqual(@as(?UnverifiedPaths, null), said.calls[1].unverified_paths);
+}
+
+test "device.exposed carries the policy answer and whether this machine could act on it" {
+    // The fact this pins: `enforced` is a field of its own and never read out
+    // of `decision`. A build whose driver applies neither `device_tree` nor
+    // `device_source` writes `enforced: false` here even when `decision` is
+    // `allow`, which is the one case a reader auditing a macOS session needs
+    // to be able to tell apart from a Linux one with nothing said about it.
+    const allocator = std.testing.allocator;
+
+    const granted = Envelope{
+        .id = 12,
+        .session = "01H0",
+        .time_ms = 5,
+        .event = .{ .device_exposed = .{
+            .attempt = "01ATTEMPT",
+            .action = "device.usb.1d50.6018",
+            .decision = "allow",
+            .enforced = true,
+        } },
+    };
+    const text = try toJson(allocator, granted);
+    defer allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"device.exposed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"enforced\":true") != null);
+
+    const parsed = try fromJson(allocator, text);
+    defer parsed.deinit();
+    const exposed = parsed.value.event.device_exposed;
+    try std.testing.expectEqual(Kind.device_exposed, std.meta.activeTag(parsed.value.event));
+    try std.testing.expectEqualStrings("01ATTEMPT", exposed.attempt);
+    try std.testing.expectEqualStrings("device.usb.1d50.6018", exposed.action);
+    try std.testing.expectEqualStrings("allow", exposed.decision);
+    try std.testing.expectEqual(true, exposed.enforced);
+
+    // A device this project named and this policy refused still gets a row,
+    // and `enforced` defaults false: nothing an `ask` answer ever grants.
+    const refused = Envelope{
+        .id = 13,
+        .session = "01H0",
+        .time_ms = 6,
+        .event = .{ .device_exposed = .{
+            .attempt = "01ATTEMPT",
+            .action = "device.tty.serial.DF62585783282137",
+            .decision = "ask",
+        } },
+    };
+    const refused_text = try toJson(allocator, refused);
+    defer allocator.free(refused_text);
+    const refused_parsed = try fromJson(allocator, refused_text);
+    defer refused_parsed.deinit();
+    try std.testing.expectEqual(false, refused_parsed.value.event.device_exposed.enforced);
 }
 
 test "the log holds the description of an image and never the bytes of one" {
@@ -2714,6 +2823,7 @@ test "no serialized envelope contains a raw newline, whatever the Kind, and ever
             .unreported = 2,
             .reason = nl,
         } },
+        .{ .device_exposed = .{ .attempt = nl, .action = nl, .decision = nl } },
         .{ .network_summary = .{ .granted = 3, .refused = 1, .diagnostic = nl } },
         .{ .unknown = .{ .kind = "future.kind", .payload = .{ .string = nl } } },
     };

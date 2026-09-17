@@ -47,3 +47,38 @@ test "drainInto compiles against a real udev.Monitor and drains it with no error
     var tracker = chock_core.devices.OverflowTracker{};
     try testing.expect(!tracker.observe(monitor.overflows()));
 }
+
+const DenyingSeam = struct {
+    fn seam() chock_core.devices.PolicySeam {
+        return .{ .ptr = undefined, .vtable = &vtable };
+    }
+    const vtable = chock_core.devices.PolicySeam.VTable{ .permitted = permittedFn };
+    fn permittedFn(_: *anyopaque, _: []const u8) bool {
+        return false;
+    }
+};
+
+test "HostSource compiles against a real udev.Enumerate and a real signal pipe with no error" {
+    // The proof and not a library test, the same reason the one above is:
+    // `chock_core.devices.HostSource.wakeup` opens a real `udev.Context`, a
+    // real `udev.Enumerate` over real `/sys`, and a real pipe, and a fake
+    // here would prove nothing about whether it actually compiles and
+    // behaves against the production types it was written for.
+    //
+    // The seam denies everything, so the property under test is that a real
+    // scan of this machine's own `/sys` runs to completion with no error and
+    // queues nothing a refusing seam would ever place, never what this
+    // machine happens to have plugged in.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var source = chock_core.devices.HostSource.init(testing.allocator, testing.io, DenyingSeam.seam());
+    defer source.deinit();
+
+    const device_source = source.deviceSource();
+    const fd = device_source.vtable.wakeup(device_source.ptr);
+    try testing.expect(fd >= 0);
+
+    // A seam that permits nothing places nothing, whatever this machine has
+    // plugged in right now.
+    try testing.expectEqual(@as(?@import("chock-sandbox").Sandbox.DeviceSource.Change, null), device_source.vtable.next(device_source.ptr));
+}

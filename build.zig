@@ -1031,6 +1031,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "udev", .module = udev.module("udev") },
                 .{ .name = "chock-core", .module = chock_core },
+                .{ .name = "chock-sandbox", .module = chock_sandbox },
             },
         }),
     });
