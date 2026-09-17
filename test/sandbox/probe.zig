@@ -5559,6 +5559,16 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         // difference the driver's own code can make to this count is D.
         const with_device = std.mem.eql(u8, args[1], "spawn-device-children");
         const result = childCountEscape(arena, root_arg, with_device) catch |err| {
+            // **The machine, and not the count.** A host that refuses the
+            // namespaces forks no A at all, so there is no child list to
+            // count and the run says nothing about what the driver forks.
+            // Read through the one status every operation here shares, and
+            // not as a fault of its own.
+            //
+            // Measured 2026-09-17: the nix build sandbox on both arches
+            // reached this line, and the exit status of 3 it used to return
+            // read at the caller as a sandbox that ended with a fault.
+            endIfNothingMeasured(err);
             std.debug.print("sandbox setup failed: {s}\n", .{@errorName(err)});
             return 3;
         };
