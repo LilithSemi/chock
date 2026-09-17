@@ -211,20 +211,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # **Draft first, assets second, published last**, the same order
+          # the unstable step below explains: a release is immutable once it
+          # is published, so its assets can never be added or replaced after
+          # that. A release published empty stays empty.
+          #
+          # **So this job cannot be re-run over a published tag.** Immutability
+          # is what refuses it, and that is the point of immutability: the
+          # bytes under a version never change. Cut a new version instead.
           if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
+              --draft \
               --verify-tag \
               --title "${GITHUB_REF_NAME}" \
               --generate-notes
           fi
           gh release upload "${GITHUB_REF_NAME}" artifacts/* --clobber
+          gh release edit "${GITHUB_REF_NAME}" --draft=false
 
       # **A rolling build of master that a stranger can actually download.**
       # Measured 2026-09-16: a workflow artefact answers `401` to an anonymous
       # request even on a public repository, and it expires after ninety days.
-      # So until this existed, nothing built from master was reachable by
-      # anybody who was not signed in. A prerelease is anonymous, does not
-      # expire, and is one file per target rather than a zip of all of them.
+      # So without this, nothing built from master is reachable by anybody who
+      # is not signed in. A prerelease is anonymous and does not expire.
       - name: Publish the rolling unstable build
         if: github.ref == 'refs/heads/master'
         env:
@@ -232,23 +242,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          # **The tag is moved first and the release is never deleted.**
-          # Deleting and recreating would leave a window with no unstable
-          # release at all, and a job that failed in that window would leave
-          # the download page empty. Moving the tag and clobbering the assets
-          # has no such window.
-          git tag -f unstable "${GITHUB_SHA}"
-          git push -f origin refs/tags/unstable
+          tag="unstable-${GITHUB_SHA:0:7}"
 
-          if ! gh release view unstable >/dev/null 2>&1; then
-            gh release create unstable \
-              --prerelease \
-              --title "unstable (${GITHUB_SHA:0:7})" \
-              --notes "Built from master. This is not a release: it moves with every push, and it is not tested beyond the checks on this commit."
-          fi
+          # **A tag per build, and never a tag that moves.** A release is
+          # immutable once it is published, so the assets of one that already
+          # exists can never be replaced. The first design moved a single
+          # `unstable` tag and clobbered its assets, and GitHub answered
+          # `422 Cannot upload assets to an immutable release` on
+          # 2026-09-17. A release that is written once and never touched
+          # again is the only shape immutability leaves.
+          git tag "${tag}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${tag}"
 
-          gh release upload unstable artifacts/* --clobber
-          gh release edit unstable --title "unstable (${GITHUB_SHA:0:7})"
+          # **Draft first, assets second, published last.** Immutability
+          # closes a release to new assets at the moment it is published, so
+          # the order here is the whole fix: a release published empty can
+          # never be filled.
+          gh release create "${tag}" \
+            --draft \
+            --prerelease \
+            --title "unstable (${GITHUB_SHA:0:7})" \
+            --notes "Built from master at ${GITHUB_SHA}. This is not a release: it is one build of the default branch, tested no further than the checks on this commit."
+          gh release upload "${tag}" artifacts/*
+          gh release edit "${tag}" --draft=false
+
+          # **Pruned, because one release per push grows without bound.**
+          # The newest few stay, so a person who linked to one yesterday is
+          # not immediately broken, and the rest go with their tags.
+          #
+          # **A failure here is reported and never fatal.** Whether an
+          # immutable release can be deleted at all is a property of the
+          # repository's own settings, and a build of master that already
+          # published its artefacts must not go red over tidying.
+          keep=5
+          mapfile -t stale < <(
+            gh release list --limit 100 --json tagName,isPrerelease \
+              --jq "[.[] | select(.isPrerelease and (.tagName | startswith(\"unstable-\")))] | .[${keep}:] | .[].tagName"
+          )
+          for old in "${stale[@]:-}"; do
+            [ -z "${old}" ] && continue
+            gh release delete "${old}" --yes --cleanup-tag \
+              || echo "::warning::${old} could not be deleted, so unstable builds are accumulating"
+          done
 
       # **Only after the assets are up.** The page reads the release list at
       # build time, so a rebuild that ran first would publish the previous
