@@ -883,6 +883,58 @@ test "a routed tool call gives the program a resolver it can read" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "nameserver ") != null);
 }
 
+test "a routed tool call can read the trust store it was given" {
+    // **A network it cannot verify anybody over is worse than no network.**
+    // On a machine with Nix the sandbox binds `/nix/store` and no `/etc`, so
+    // a routed call's `/etc` holds the three resolver files and nothing else,
+    // and the host's own bundle resolves into the store where no project's
+    // dev shell closure names it. Measured 2026-09-18: a name resolved, a
+    // connection opened, and the handshake answered `class=Os (2)`, which is
+    // `ENOENT` on a certificate file that was never placed.
+    //
+    // Mutation check: bind the host path by its own name rather than its
+    // resolved one and the whole mount tree fails, because a mount source is
+    // opened with `O_NOFOLLOW` and the usual path is a link.
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    const arguments = try std.fmt.allocPrint(
+        allocator,
+        "{{\"argv\":[\"grep\",\"-m\",\"1\",\"BEGIN CERTIFICATE\",\"{s}\"]}}",
+        .{chock_core.tools.trust_store_inside},
+    );
+    defer allocator.free(arguments);
+
+    var outcome = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        arguments,
+        .{ .routed = true },
+    );
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(!outcome.is_error);
+    // **A real bundle and not merely a readable file.** The first line of an
+    // NSS format bundle is a friendly name, so the header is what says this
+    // is certificates rather than any file that happened to be placed.
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "BEGIN CERTIFICATE") != null);
+}
+
 test "run_command cannot reach the home directory" {
     // **A tool call cannot read the home directory.** /home is never in the
     // mount tree Workspace.sandboxConfig builds, so it does not exist at all

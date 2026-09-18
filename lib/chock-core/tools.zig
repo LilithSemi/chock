@@ -1910,6 +1910,64 @@ pub const NetSeam = struct {
     }
 };
 
+/// Where a routed call finds a trust store, inside the sandbox.
+///
+/// **Under the runtime prefix and not in `/etc`.** See the caller for why.
+pub const trust_store_inside = sandbox.runtime_prefix ++ "/ca-bundle.crt";
+
+/// The host paths a trust store is kept at, most specific first.
+///
+/// **Three, because three families of machine put it in three places.** The
+/// first is what Debian and NixOS write, the second is what Fedora writes,
+/// and the third is what Alpine and macOS write. A machine with none of them
+/// gets no trust store placed and an https host it cannot verify, which is
+/// the state every machine was in before this.
+const host_trust_stores = [_][]const u8{
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+};
+
+/// The first trust store this host has, resolved through every link, or null
+/// when it has none. The caller owns the result.
+///
+/// **Resolved and never bound by its own name.** On NixOS the usual path is a
+/// link into the store, through a second link in `/etc/static`. A mount
+/// source here is opened with `O_NOFOLLOW`, which is what stops a link being
+/// used to reach outside the tree a caller named, so a link handed to it is
+/// refused and the whole mount tree fails. Measured 2026-09-18:
+/// `MountTreeFailed` on every routed call.
+fn hostTrustStore(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    for (host_trust_stores) |candidate| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const length = std.Io.Dir.cwd().realPathFile(io, candidate, &buffer) catch continue;
+        return allocator.dupe(u8, buffer[0..length]) catch return null;
+    }
+    return null;
+}
+
+/// `base` with `SSL_CERT_FILE` naming the trust store this call was given.
+///
+/// **Replaced and never added beside.** Two entries with one name is
+/// undefined in POSIX, and a dev shell that sets its own would otherwise win
+/// or lose depending on which one a libc reads first.
+fn trustEnvironment(
+    allocator: std.mem.Allocator,
+    base: []const []const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    var entries: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
+    for (base) |entry| {
+        if (std.mem.startsWith(u8, entry, "SSL_CERT_FILE=")) continue;
+        try entries.append(allocator, try allocator.dupe(u8, entry));
+    }
+    try entries.append(allocator, try allocator.dupe(u8, "SSL_CERT_FILE=" ++ trust_store_inside));
+    return entries.toOwnedSlice(allocator);
+}
+
 /// Everything about this session a tool may need beyond the workspace
 /// itself. A struct and not three more positional parameters, so a caller
 /// that has none of it passes `.{}` and a field added later touches no call
@@ -2696,6 +2754,46 @@ fn runCommand(
         const entries = try scratchpad.environment(allocator, config.env, area, scratch_inside);
         try owned_envs.append(allocator, entries);
         config.env = entries;
+    }
+
+    // **A routed call is given a trust store, or it has a network it cannot
+    // use safely.** On a machine with Nix the sandbox binds `/nix/store` and
+    // no `/etc` at all, so the `/etc` a routed call ends up with holds the
+    // three resolver files this driver wrote and nothing else. The host's own
+    // bundle is not reachable either: `/etc/ssl/certs/ca-certificates.crt`
+    // resolves into the store, and that store path is in no project's dev
+    // shell closure.
+    //
+    // **Measured 2026-09-18.** A name resolved, a connection opened, and the
+    // handshake failed with `class=Os (2)`, which is `ENOENT` on a
+    // certificate file that was never there.
+    //
+    // **Why this is Chock's to place and not a project's to remember.**
+    // Without it the only way to reach an https host is for every project to
+    // put `cacert` in its own dev shell, and the tempting shortcut when that
+    // is forgotten is to turn verification off. A sandbox that pushes a
+    // person towards that has made them less safe by existing.
+    //
+    // **Under the runtime prefix and never in `/etc`.** A routed sandbox
+    // takes `/etc` for itself when it finds one, and a bind placed there
+    // before that would be taken with it. `SSL_CERT_FILE` is what makes a
+    // client look here, and it is what OpenSSL, and therefore libgit2 and
+    // curl, already reads.
+    if (context.net != null) {
+        if (hostTrustStore(allocator, io)) |host_bundle| {
+            try extra_mounts.append(allocator, .{ .bind = .{
+                .source = host_bundle,
+                .target = trust_store_inside,
+                .read_only = true,
+            } });
+            try extra_rules.append(allocator, .{
+                .path = trust_store_inside,
+                .access = .{ .read_file = true },
+            });
+            const with_trust = try trustEnvironment(allocator, config.env);
+            try owned_envs.append(allocator, with_trust);
+            config.env = with_trust;
+        }
     }
 
     // What this one call may reach that no other may. See
