@@ -2841,6 +2841,95 @@ pub const Answer = union(enum) {
 /// the keyboard. `Ui.askForMessage` is its only caller, and it returns only the
 /// `message` arm: a command never becomes a user message, an event, or anything
 /// the model sees.
+/// Append the text of `text` to `into`, and nothing else.
+///
+/// **A paste carries more than the text somebody meant to paste.** A terminal
+/// hands over whatever is on its input stream, which includes the answers to
+/// whatever the terminal itself asked: a cursor position report, a mouse
+/// report, the tail of a sequence that was cut in half. Those are bytes, and
+/// a message is text.
+///
+/// **Measured 2026-09-18, from a session's own log.** Somebody pasted build
+/// output. What reached the model was 127 bytes beginning
+/// `00 37 e0 82 39 ff 00 00`: three NUL bytes and a truncated UTF-8 sequence
+/// in front of the words. A `[]u8` that is not valid UTF-8 is written by the
+/// JSON encoder as an array of numbers rather than as a string, so the
+/// request carried `"text": [0, 55, 224, ...]`, the backend answered
+/// `400 invalid_value`, and because a 400 is permanent the session ended and
+/// its workspace was kept. A paste of ordinary text ended the conversation.
+///
+/// **A newline and a tab are text and stay.** A person pasting several lines
+/// means all of them, and a message holds a newline perfectly well. Every
+/// other control character goes, and so does every byte that is not part of
+/// a valid UTF-8 sequence.
+fn keepText(gpa: std.mem.Allocator, into: *std.ArrayList(u8), text: []const u8) void {
+    var at: usize = 0;
+    while (at < text.len) {
+        // **A whole escape sequence goes, and never its first byte alone.**
+        // Dropping the `ESC` and keeping the rest turns a colour code into
+        // the literal `[0m` in the middle of somebody's message, which reads
+        // as nonsense to a person and to a model. Measured 2026-09-18: the
+        // paste that started this carried NO escape sequence at all, so this
+        // is for the ordinary case of pasting coloured build output rather
+        // than for that one.
+        //
+        // **Dropped and never translated.** Colour says nothing a model
+        // needs, and turning it into emphasis would invent a stress the
+        // writer never wrote.
+        if (text[at] == 0x1b) {
+            at += escapeLength(text[at..]);
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(text[at]) catch {
+            at += 1;
+            continue;
+        };
+        if (at + length > text.len) return;
+        const scalar = text[at..][0..length];
+        _ = std.unicode.utf8Decode(scalar) catch {
+            at += 1;
+            continue;
+        };
+        at += length;
+        if (length == 1) {
+            const byte = scalar[0];
+            // C0 except the two that are text, and DEL.
+            if (byte < 0x20 and byte != '\n' and byte != '\t') continue;
+            if (byte == 0x7f) continue;
+        }
+        into.appendSlice(gpa, scalar) catch return;
+    }
+}
+
+/// How many bytes the escape sequence at the front of `text` takes, which is
+/// at least one. `text[0]` is `ESC`.
+///
+/// **Two shapes, and everything else is the two byte kind.** `ESC [` runs to
+/// the first byte in `0x40` to `0x7e`, which is every colour, cursor move and
+/// erase a terminal writes. `ESC ]` is an operating system command and runs
+/// to a `BEL` or to `ESC \`, which is how a title or a hyperlink is written.
+fn escapeLength(text: []const u8) usize {
+    if (text.len < 2) return text.len;
+    switch (text[1]) {
+        '[' => {
+            var at: usize = 2;
+            while (at < text.len) : (at += 1) {
+                if (text[at] >= 0x40 and text[at] <= 0x7e) return at + 1;
+            }
+            return text.len;
+        },
+        ']' => {
+            var at: usize = 2;
+            while (at < text.len) : (at += 1) {
+                if (text[at] == 0x07) return at + 1;
+                if (text[at] == 0x1b and at + 1 < text.len and text[at + 1] == '\\') return at + 2;
+            }
+            return text.len;
+        },
+        else => return 2,
+    }
+}
+
 pub fn answerFor(line: []const u8) Answer {
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     if (trimmed.len == 0) return .nothing;
@@ -6682,7 +6771,7 @@ pub const Ui = struct {
         self.typed.clearRetainingCapacity();
         // A message that could not be kept is a message that stays as it was,
         // which the person sees on screen and can correct.
-        self.typed.appendSlice(self.gpa, text) catch {};
+        keepText(self.gpa, &self.typed, text);
     }
 
     /// Enter means "this is the message". Every other key is left alone, so the
@@ -14132,4 +14221,52 @@ test "a Ctrl-C says in the transcript what it did, because a frame takes the han
     h.screen.pumpStep();
     h.screen.pumpStep();
     try testing.expectEqual(rows, h.screen.lines.items.len);
+}
+
+test "a paste keeps its text and loses everything that is not text" {
+    const gpa = std.testing.allocator;
+    var kept: std.ArrayList(u8) = .empty;
+    defer kept.deinit(gpa);
+
+    // **The bytes that ended a real session, byte for byte.** Taken from the
+    // log of 2026-09-18: three NUL bytes and a truncated UTF-8 sequence in
+    // front of pasted build output. The whole 127 byte message reached the
+    // model as an array of numbers and the backend refused the request.
+    const measured = "\x00\x37\xe0\x82\x39\xff\x00\x00build v0.8.0";
+    keepText(gpa, &kept, measured);
+    try std.testing.expectEqualStrings("79build v0.8.0", kept.items);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(kept.items));
+
+    // A newline and a tab are text, because a person pasting several lines
+    // means all of them.
+    kept.clearRetainingCapacity();
+    keepText(gpa, &kept, "first\nsecond\tthird");
+    try std.testing.expectEqualStrings("first\nsecond\tthird", kept.items);
+
+    // Text that was already text is untouched, accents and all.
+    kept.clearRetainingCapacity();
+    keepText(gpa, &kept, "héllo wörld");
+    try std.testing.expectEqualStrings("héllo wörld", kept.items);
+}
+
+test "a paste of coloured output keeps the words and none of the colour" {
+    const gpa = std.testing.allocator;
+    var kept: std.ArrayList(u8) = .empty;
+    defer kept.deinit(gpa);
+
+    // **The whole sequence goes.** Dropping the `ESC` alone would leave
+    // `[0;32m` in the middle of the message, which is worse than the colour.
+    keepText(gpa, &kept, "\x1b[0;32m   Compiling\x1b[0m flakebom v0.8.0\n");
+    try std.testing.expectEqualStrings("   Compiling flakebom v0.8.0\n", kept.items);
+
+    // An operating system command, which is how a terminal is told a title
+    // or given a hyperlink, ends at BEL.
+    kept.clearRetainingCapacity();
+    keepText(gpa, &kept, "before\x1b]0;a title\x07after");
+    try std.testing.expectEqualStrings("beforeafter", kept.items);
+
+    // And the same thing ended the other legal way, with ESC backslash.
+    kept.clearRetainingCapacity();
+    keepText(gpa, &kept, "before\x1b]8;;https://example.com\x1b\\after");
+    try std.testing.expectEqualStrings("beforeafter", kept.items);
 }
