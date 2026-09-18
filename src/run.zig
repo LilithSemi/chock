@@ -12996,6 +12996,10 @@ const Printer = struct {
                 self.write(done.task_id);
                 self.write(" finished, ");
                 self.write(done.status.wireName());
+                // The number, for the reason `src/ui.zig` gives beside the
+                // same line: without it a failure reads as a success.
+                var code_buffer: [16]u8 = undefined;
+                self.write(std.fmt.bufPrint(&code_buffer, " {d}", .{done.code}) catch "");
                 self.write(": ");
                 self.write(done.command);
                 self.write("\n");

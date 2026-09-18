@@ -5135,9 +5135,17 @@ pub const Ui = struct {
                 }) catch "a subagent came back";
                 self.sayFolded(.chock, said, .subagent, done.result);
             },
-            .task_complete => |done| self.sayFmt(.chock, "the background task {s} finished, {s}", .{
+            // **The number, because without it a failure reads as a success.**
+            // This said "finished, exited" for a task that exited 0 and for
+            // one that exited 101, so the one line a person watching gets
+            // told about a background build said nothing about whether it
+            // worked. Measured 2026-09-18, from a session where a build
+            // failed and the line was indistinguishable from the one before
+            // it.
+            .task_complete => |done| self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
                 done.task_id,
                 done.status.wireName(),
+                done.code,
             }),
             .policy_self => |update| for (update.restrictions) |one| {
                 self.sayFmt(.chock, "the agent promised {s} at most {s}", .{
