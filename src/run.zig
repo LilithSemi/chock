@@ -1839,6 +1839,32 @@ fn start(
     // router: see `chock_policy.table.Table.wantsRouter` for what decides it
     // and why a router is a mechanism rather than a permission.
     sandbox_config.network = if (policy.wantsRouter()) .filtered else .none;
+
+    // How much of this machine a tool call may take, sized to the machine
+    // rather than to the numbers `lib/chock-sandbox/linux/rlimits.zig`
+    // compiles in. Settled here, beside the network row, because `Started`
+    // holds the config after this point.
+    if (try resolveLimits(arena, io, project_root, config_dir, org_bundle)) |resolved| {
+        applyLimits(&sandbox_config, resolved);
+        // The program these numbers bound cannot read them: `/sys/fs/cgroup`
+        // is hidden inside the sandbox and `/proc/meminfo` reports the whole
+        // machine. So a session the org held lower is told here.
+        if (resolved.processes_from_org) {
+            tty.print(
+                .warn,
+                "chock run: the org policy bundle holds this session to {d} processes.\n",
+                .{resolved.processes},
+            );
+        }
+        if (resolved.memory_from_org) {
+            tty.print(
+                .warn,
+                "chock run: the org policy bundle holds this session to {d} MiB of memory.\n",
+                .{resolved.memory_bytes >> 20},
+            );
+        }
+    }
+
     try recordSandbox(gpa, io, storage, &attempt, write_execute);
 
     // This project's declared devices, from the `devices` block of
@@ -2918,6 +2944,213 @@ fn subagentsUnderOrg(
 ) chock_policy.subagents.Limits {
     const bundle = org_bundle orelse return from_file;
     return chock_policy.subagents.underCeiling(from_file, bundle.subagents);
+}
+
+/// How many processes and how much memory this session's sandbox may take:
+/// the `limits` block of `chock.zon`, over the operator's own `config.zon`,
+/// over a default sized to this machine, held last under the org policy
+/// bundle's ceiling. The numbers land in `sandbox_config.limits`, which
+/// `lib/chock-sandbox/linux/rlimits.zig` turns into `pids.max`, `memory.max`
+/// and `RLIMIT_NPROC`.
+///
+/// Null when this machine's cpu count and total memory could not be read. The
+/// session still runs, on the compiled in defaults: a machine fact Chock
+/// cannot read is a reason to size nothing and not a reason to refuse work.
+fn resolveLimits(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    config_dir: []const u8,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) StartError!?chock_policy.limits.Resolved {
+    var diag: ?chock_policy.limits.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    // One diagnostic slot serves both files: it carries which of the two it
+    // is about. See `chock_policy.limits.Diagnostic.source`.
+    const project = chock_policy.limits.load(arena, io, project_root, &diag) catch |err|
+        return reportLimits(err, &diag);
+    const operator = chock_policy.limits.loadOperator(arena, io, config_dir, &diag) catch |err|
+        return reportLimits(err, &diag);
+
+    const machine = chock_policy.limits.Machine.read() catch {
+        tty.print(
+            .warn,
+            "chock run: this machine's cpu count and memory could not be read, so the sandbox " ++
+                "keeps the built in limits rather than limits sized to it.\n",
+            .{},
+        );
+        return null;
+    };
+
+    const ceiling = if (org_bundle) |bundle| bundle.limits else null;
+    return chock_policy.limits.foldLayers(project, operator, ceiling, machine);
+}
+
+/// `resolved` written into the config this run's sandbox is built from.
+///
+/// Assigned, and not folded through `rlimits.Limits.narrow`: that is the
+/// ratchet for a caller which may only ask for less, and a large machine has
+/// to reach above `rlimits.default_processes`. The rows `chock_policy.limits`
+/// does not name keep their compiled in value.
+fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
+    config.limits.processes = resolved.processes;
+    config.limits.memory_bytes = resolved.memory_bytes;
+}
+
+/// The one message a refused `limits` block writes. The session does not
+/// start: a number that does not parse is one somebody wrote on purpose, and
+/// running under a different number is worse than saying so now.
+fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (diag.*) |*d| {
+        tty.print(.err, "chock run: the limits block could not be read: {f}\n", .{d});
+    } else {
+        tty.print(.err, "chock run: the limits block could not be read: {t}\n", .{err});
+    }
+    return error.Reported;
+}
+
+test "the limits a project and an operator name reach the sandbox this run builds" {
+    // The wiring, and not the fold: `chock_policy.limits` has its own tests
+    // for which layer wins. Drop either line of `applyLimits` and the
+    // matching expectation below reads what `rlimits.zig` compiles in.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .limits = .{ .processes = 300 } }");
+    }
+    {
+        var file = try config_tmp.dir.createFile(io, chock_policy.limits.operator_file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .limits = .{ .memory = \"1GiB\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    const resolved = (try resolveLimits(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    )).?;
+    try testing.expectEqual(@as(u64, 300), resolved.processes);
+    try testing.expectEqual(@as(u64, 1 << 30), resolved.memory_bytes);
+
+    var config = testConfig();
+    applyLimits(&config, resolved);
+    try testing.expectEqual(@as(?u64, 300), config.limits.processes);
+    try testing.expectEqual(@as(?u64, 1 << 30), config.limits.memory_bytes);
+}
+
+test "a machine nobody configured still gets a number sized to it, and never a smaller one" {
+    // This runs on whatever machine the tests run on, so it asks the part
+    // that holds for every machine: the default is never under the fixed
+    // floor `rlimits.zig` compiles in, and it is what the config carries.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No `chock.zon` and no `config.zon`: every layer saying nothing.
+    var project_tmp = testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    const resolved = (try resolveLimits(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    )).?;
+    try testing.expect(resolved.processes >= chock_policy.limits.default_processes);
+    try testing.expect(resolved.memory_bytes >= chock_policy.limits.default_memory_bytes);
+    try testing.expect(!resolved.processes_from_org);
+
+    var config = testConfig();
+    applyLimits(&config, resolved);
+    try testing.expectEqual(@as(?u64, resolved.processes), config.limits.processes);
+    try testing.expectEqual(@as(?u64, resolved.memory_bytes), config.limits.memory_bytes);
+}
+
+test "a limits block that does not parse stops the session rather than sizing it wrongly" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // A passing test may not let a line reach the real standard error.
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .limits = .{ .processes = \"200%\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    try testing.expectError(error.Reported, resolveLimits(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    ));
+
+    // The field, the text, and the file it is in. The error name alone
+    // carries none of the three.
+    try testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "processes") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "200%") != null);
+}
+
+/// The smallest `sandbox.Config` that holds together. Nothing here is spawned.
+fn testConfig() sandbox.Config {
+    return .{
+        .root = "/",
+        .mounts = &.{},
+        .rules = &.{},
+        .cwd = "/",
+        .env = &.{},
+    };
 }
 
 /// What this session may spend: the cap in `chock.zon`, the slice a parent

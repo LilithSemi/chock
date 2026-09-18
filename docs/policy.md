@@ -576,3 +576,9 @@ actually uses back to where it may have come from:
 A misspelled field inside a `limits` block, in either file, is refused rather
 than read as the default: `.{ .limits = .{ .procceses = "50%" } }` stops the
 file being read, the same rule every other block in `chock.zon` keeps.
+
+The numbers this fold answers are what every tool call of the session runs
+under: `chock run` reads the two files once, before the first call, and writes
+the result into the sandbox it builds. A session the org ceiling lowered says
+so on its own output, once, with the number it was held to, because the
+program the number bounds cannot read it from inside the sandbox.
