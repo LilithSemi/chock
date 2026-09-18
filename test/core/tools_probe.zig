@@ -506,7 +506,6 @@ fn parseEnvBlob(arena: std.mem.Allocator, blob: []const u8) ParseError![][]const
     return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 }
 
-
 /// A network seam that grants nothing, for the one property a tool call owns.
 ///
 /// **A tool call's job is to wire a router, not to route.** Whether a name

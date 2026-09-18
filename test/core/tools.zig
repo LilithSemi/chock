@@ -434,10 +434,10 @@ fn runToolCallWith(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
-        tools_probe_path,              tool,                         "probe-call",                    root_path,                   config.cwd,
-        mounts_blob,                   rules_blob,                   env_blob,                        host_path,                   arguments_json,
-        timeout_word,                  options.memory_dir orelse "", store_blob,                      options.cache_dir orelse "", cancel_word,
-        options.scratch_dir orelse "", scratch_bytes_word,           options.workspace_dir orelse "", floor_word,                  approval_wait_word,
+        tools_probe_path,                     tool,                         "probe-call",                    root_path,                   config.cwd,
+        mounts_blob,                          rules_blob,                   env_blob,                        host_path,                   arguments_json,
+        timeout_word,                         options.memory_dir orelse "", store_blob,                      options.cache_dir orelse "", cancel_word,
+        options.scratch_dir orelse "",        scratch_bytes_word,           options.workspace_dir orelse "", floor_word,                  approval_wait_word,
         // Any non empty word asks the probe for a router. See its own
         // `RefusingNetwork` for why a router that grants nothing is what this
         // measures with.
