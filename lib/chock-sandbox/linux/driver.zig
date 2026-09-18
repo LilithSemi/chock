@@ -3938,8 +3938,8 @@ const hosts_file =
     "127.0.0.1\tlocalhost\n" ++
     "::1\tlocalhost ip6-localhost ip6-loopback\n";
 
-/// The three files the sandbox writes for itself and the two directories it
-/// hides, applied by `applyLayers` for a routed call.
+/// The three files the sandbox writes for itself, the trust store link, and
+/// the two directories it hides, applied by `applyLayers` for a routed call.
 ///
 /// **The two hidden paths are not optional and are easy to leave out.**
 /// Measured on 2026-09-14: `/run/nscd/socket` is an `AF_UNIX` socket, so a
@@ -3952,6 +3952,16 @@ const hosts_file =
 /// to `/run` on most machines and a real directory on some, and glibc has used
 /// each of the two over time.
 ///
+/// Where a client that never heard of `SSL_CERT_FILE` looks for a trust
+/// store on its own. `lib/chock-core/tools.zig` stages the host's bundle at
+/// `iface.trust_store_inside`; the entry below is a symbolic link to that
+/// path and never a copy of its own, so the two always name the same bytes.
+///
+/// **Two directories under `/etc`, and not a direct child of it.** Nothing
+/// else this file places is nested this way, which is what the broadened
+/// `comptime` check below is for: see that check's own comment.
+const trust_store_link_target = "/etc/ssl/certs/ca-certificates.crt";
+
 /// **Public because `src/doctor.zig` reads the same list**, and says which of
 /// the two ways a routed sandbox on this host places these files: into an
 /// `/etc` it makes itself, or into one it takes from the host with
@@ -3960,12 +3970,22 @@ pub const resolver_substitutions = [_]namespace.Substitution{
     .{ .text = .{ .target = "/etc/resolv.conf", .contents = resolv_conf } },
     .{ .text = .{ .target = "/etc/nsswitch.conf", .contents = nsswitch_conf } },
     .{ .text = .{ .target = "/etc/hosts", .contents = hosts_file } },
+    .{ .link = .{ .target = trust_store_link_target, .link_to = iface.trust_store_inside } },
     .{ .hide = "/run/nscd" },
     .{ .hide = "/var/run/nscd" },
 };
 
 /// The `text` targets of `resolver_substitutions`, which is what
-/// `ownDirectory` takes away before `substitute` writes them again.
+/// `ownDirectory` takes away before `substitute` writes them again, and the
+/// list `applyLayers` grants a Landlock read rule to below.
+///
+/// **The `link` entry is not one of these, on purpose.** `ownDirectory`'s
+/// removal is for a name `substitute` is about to write straight over, and
+/// `placeLink` already clears whatever is at its own target itself. The
+/// Landlock rule the link needs is the one already granted on
+/// `iface.trust_store_inside`, the file it points at: Landlock checks the
+/// resolved file a read reaches and not the link's own name, so a second
+/// rule on the link would permit nothing a program could not already reach.
 ///
 /// Built from that list, so a file added to it is a file this removes, and
 /// neither list can be edited without the other following.
@@ -3973,19 +3993,20 @@ const resolver_text_targets = blk: {
     var targets: []const []const u8 = &.{};
     for (resolver_substitutions) |one| switch (one) {
         .text => |text| targets = targets ++ [_][]const u8{text.target},
+        .link => {},
         .hide => {},
     };
     break :blk targets;
 };
 
 /// The directory a routed sandbox takes for itself, so that it can write the
-/// three files above into it. See `namespace.ownDirectory` for what taking it
+/// files above into it. See `namespace.ownDirectory` for what taking it
 /// means and what it costs.
 ///
 /// **`/etc` and nothing else.** That is where glibc looks for a resolver, and
 /// it is the one directory a sandbox both needs to write and does not own on
 /// an ordinary Linux machine. The `comptime` block below is what keeps the two
-/// facts together: a `text` target added anywhere but `/etc` would be a file
+/// facts together: a target added anywhere outside `/etc` would be a file
 /// this sandbox still could not place, and the build stops rather than the
 /// session.
 const owned_etc = namespace.OwnedDirectory{
@@ -3994,12 +4015,20 @@ const owned_etc = namespace.OwnedDirectory{
 };
 
 comptime {
-    for (resolver_text_targets) |target| {
-        const parent = std.fs.path.dirname(target) orelse @compileError(
-            "sandbox: a resolver substitution target must be an absolute path",
-        );
-        if (!std.mem.eql(u8, parent, owned_etc.target)) @compileError(
-            "sandbox: every resolver substitution has to sit in the directory a routed " ++
+    for (resolver_substitutions) |one| {
+        // **Every target, not only the `text` ones, and inside `/etc`
+        // rather than directly in it.** `trust_store_link_target` sits two
+        // directories under `/etc`, not directly in it, so this checks a
+        // prefix and not the exact directory `owned_etc.target` names. A
+        // `hide` names no target of its own: there is nothing here to
+        // write, so nothing to check.
+        const target = switch (one) {
+            .text => |text| text.target,
+            .link => |link| link.target,
+            .hide => continue,
+        };
+        if (!std.mem.startsWith(u8, target, owned_etc.target ++ "/")) @compileError(
+            "sandbox: every resolver substitution has to sit inside the directory a routed " ++
                 "sandbox takes for itself. See ownDirectory and owned_etc.",
         );
     }

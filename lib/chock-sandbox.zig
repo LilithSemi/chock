@@ -119,6 +119,11 @@ pub const copyStrings = Sandbox.copyStrings;
 /// `chock-workspace` and `chock-core` place a path under it, and neither
 /// imports the other.
 pub const runtime_prefix = Sandbox.runtime_prefix;
+/// See `Sandbox.trust_store_inside`. Re-exported beside `runtime_prefix` for
+/// the same reason: `chock-core` stages a copy under it and the Linux
+/// driver names it as a symbolic link's own target, and neither imports the
+/// other.
+pub const trust_store_inside = Sandbox.trust_store_inside;
 /// See `Sandbox.expresses`. Re-exported beside `runtime_prefix`, because a
 /// caller that places a path under that prefix is exactly the caller that has
 /// to know whether this build can put it there.

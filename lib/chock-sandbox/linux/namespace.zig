@@ -839,6 +839,8 @@ pub const Diagnostic = struct {
         substitute_file,
         substitute_write,
         substitute_stat,
+        substitute_link_clear,
+        substitute_link,
         owned_stat,
         owned_remove,
         deny_target_stat,
@@ -873,6 +875,8 @@ pub const Diagnostic = struct {
                 .substitute_file => "open on a substituted file",
                 .substitute_write => "the write of a substituted file",
                 .substitute_stat => "statx on a substituted path",
+                .substitute_link_clear => "unlinkat on a substituted link's own name",
+                .substitute_link => "the symlink call for a substituted link",
                 .owned_stat => "statx on a directory the sandbox takes for itself",
                 .owned_remove => "unlinkat on a name the sandbox takes away",
                 .deny_target_stat => "statx on a denied path",
@@ -1520,6 +1524,9 @@ pub const Substitution = union(enum) {
     /// `contents` are what is at `target` inside the root, whatever the host
     /// has there.
     text: Text,
+    /// A symbolic link is placed at `target`, pointing at `link_to`. See
+    /// `Link`'s own doc comment.
+    link: Link,
     /// Nothing usable is at `target` inside the root, whatever the host has
     /// there. A path the sandbox does not hold already is left alone: there is
     /// nothing to hide.
@@ -1529,6 +1536,38 @@ pub const Substitution = union(enum) {
         /// An absolute path, read relative to the sandbox root.
         target: []const u8,
         contents: []const u8,
+    };
+
+    /// A symbolic link this driver places itself, rather than a bind mount.
+    ///
+    /// **The only way to put a link where an overlay would otherwise shadow
+    /// one.** A bind mount placed under a directory before `ownDirectory`
+    /// overlays it is invisible once the overlay goes on: overlayfs does not
+    /// traverse a mount in its own lower layer. A symbolic link written
+    /// after that overlay has no such problem, because it is a name inside
+    /// the writable upper layer and not a mount at all.
+    ///
+    /// **`link_to` is written exactly, unresolved and unchecked, and read
+    /// from inside the sandbox after it pivots into its own root.** It must
+    /// therefore be a path that makes sense there, such as one under
+    /// `Sandbox.runtime_prefix`, and never a path on the host.
+    ///
+    /// **No link is placed when nothing is at `link_to` yet.** A caller that
+    /// names this substitution but never put anything at `link_to`, such as
+    /// a sandbox built directly with no call through `lib/chock-core/tools.zig`
+    /// at all, gets exactly what it would have without this substitution:
+    /// whatever the mount tree already shows at `target`, the overlay's own
+    /// lower layer included. A link placed anyway would point at nothing,
+    /// and a name that used to reach the host's own file would answer
+    /// `ENOENT` instead.
+    pub const Link = struct {
+        /// An absolute path, read relative to the sandbox root, same as
+        /// `Text.target`.
+        target: []const u8,
+        /// What the link at `target` points to, read from inside the
+        /// sandbox once it has pivoted. Also read relative to the sandbox
+        /// root, before that pivot, to decide whether anything is there yet.
+        link_to: []const u8,
     };
 };
 
@@ -1570,6 +1609,7 @@ pub fn substitute(
     for (subs) |one| {
         switch (one) {
             .text => |text| try placeText(allocator, root, text, diag),
+            .link => |link| try placeLink(allocator, root, link, diag),
             .hide => |target| try hidePath(allocator, root, target, diag),
         }
     }
@@ -1628,6 +1668,82 @@ fn placeText(
             defer _ = linux.unlinkat(linux.AT.FDCWD, source_z.ptr, 0);
             // No `MS.REC`: one file, which has nothing under it.
             try mountCall(source_z, target_z, null, linux.MS.BIND, 0, diag);
+        },
+    }
+}
+
+/// Place one `Substitution.Link`. See its own doc comment for the whole
+/// contract, including the check below that skips a link to nothing.
+fn placeLink(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    link: Substitution.Link,
+    diag: ?*?Diagnostic,
+) MountError!void {
+    const link_to_full = try std.fs.path.join(allocator, &.{ root, link.link_to });
+    defer allocator.free(link_to_full);
+    const link_to_full_z = try allocator.dupeZ(u8, link_to_full);
+    defer allocator.free(link_to_full_z);
+
+    // See `Substitution.Link`'s own doc comment for why nothing here is a
+    // fault: this is the answer a caller that staged no copy gets, and it is
+    // the same answer the mount tree would have given without this
+    // substitution at all.
+    if (try existingPathKind(link_to_full_z.ptr, .substitute_stat, diag) == .missing) return;
+
+    const target = try std.fs.path.join(allocator, &.{ root, link.target });
+    defer allocator.free(target);
+    const target_z = try allocator.dupeZ(u8, target);
+    defer allocator.free(target_z);
+
+    // The directories above the leaf, made the same way `placeText`'s own
+    // "missing" branch makes them. `ownDirectory` gives the sandbox `/etc`
+    // itself and nothing below it, so a target such as
+    // `/etc/ssl/certs/ca-certificates.crt` needs `ssl` and `certs` made
+    // before the link can go in.
+    if (std.fs.path.dirname(target)) |parent| {
+        try makePath(allocator, parent, .directory, diag);
+    }
+
+    // **Whatever already answers to this name is gone before the new link
+    // goes in.** `unlinkat` acts on the name and never on what it leads to,
+    // the same rule `ownDirectory`'s own removal follows: on a machine that
+    // ships a real `ca-certificates.crt`, this takes the name inside the
+    // sandbox's own writable layer and leaves the host's file, which the
+    // overlay's lower layer still holds, untouched. `symlinkat` itself would
+    // refuse `EEXIST` on that name otherwise, and never follow it to decide
+    // what to do instead: a dangling link is a name like any other to it.
+    //
+    // A directory is the one shape `unlinkat` alone cannot remove, hence the
+    // second call with `AT.REMOVEDIR` below. Nothing this project places at
+    // `link.target` is ever a real directory, so this is defence and not a
+    // path any test exercises.
+    switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, target_z.ptr, 0))) {
+        .SUCCESS, .NOENT, .NOTDIR => {},
+        .ISDIR => switch (linux.errno(linux.unlinkat(linux.AT.FDCWD, target_z.ptr, linux.AT.REMOVEDIR))) {
+            .SUCCESS, .NOENT => {},
+            .PERM, .ACCES, .ROFS, .NOTEMPTY => return error.NotPermitted,
+            else => |err| {
+                note(diag, .substitute_link_clear, err);
+                return error.Unexpected;
+            },
+        },
+        .PERM, .ACCES, .ROFS => return error.NotPermitted,
+        else => |err| {
+            note(diag, .substitute_link_clear, err);
+            return error.Unexpected;
+        },
+    }
+
+    const link_to_z = try allocator.dupeZ(u8, link.link_to);
+    defer allocator.free(link_to_z);
+
+    switch (linux.errno(linux.symlinkat(link_to_z.ptr, linux.AT.FDCWD, target_z.ptr))) {
+        .SUCCESS => {},
+        .PERM, .ACCES, .ROFS => return error.NotPermitted,
+        else => |err| {
+            note(diag, .substitute_link, err);
+            return error.Unexpected;
         },
     }
 }

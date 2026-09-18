@@ -126,11 +126,12 @@ take is not a road to build.
 and takes the same three words. `.auto`, the default, is whatever the session
 itself has.
 
-**A session with a network is given a trust store.** Chock binds the host's
-own certificate bundle into the sandbox and points `SSL_CERT_FILE` at it, so
-an https host can be verified without every project remembering to put
-`cacert` in its dev shell. A project that sets `SSL_CERT_FILE` itself keeps
-its own.
+**A session with a network is given a trust store.** Chock copies the host's
+own certificate bundle into the sandbox, points `SSL_CERT_FILE` at that copy,
+and links the conventional path, `/etc/ssl/certs/ca-certificates.crt`, to it
+too, so an https host can be verified without every project remembering to
+put `cacert` in its dev shell. A project that sets `SSL_CERT_FILE` itself
+keeps its own.
 
 **A background command never asks you anything.** It runs after the tool call
 that started it has returned, and a question needs the session to be waiting

@@ -1912,8 +1912,11 @@ pub const NetSeam = struct {
 
 /// Where a routed call finds a trust store, inside the sandbox.
 ///
-/// **Under the runtime prefix and not in `/etc`.** See the caller for why.
-pub const trust_store_inside = sandbox.runtime_prefix ++ "/ca-bundle.crt";
+/// **Named once, in `chock-sandbox`, and re-exported here.** The Linux
+/// driver's own `resolver_substitutions` names the same path as a symbolic
+/// link's target, and neither library imports the other: see
+/// `sandbox.trust_store_inside`'s own doc comment.
+pub const trust_store_inside = sandbox.trust_store_inside;
 
 /// The host paths a trust store is kept at, most specific first.
 ///
@@ -1945,6 +1948,13 @@ fn hostTrustStore(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     }
     return null;
 }
+
+/// The most this call reads out of the host's own trust store, before it
+/// stages a copy of it. A real bundle is a few hundred kilobytes of PEM;
+/// `test/sandbox/probe.zig`'s own `max_host_file_bytes` names the same
+/// order of magnitude for the same reason, a size no genuine trust store
+/// approaches and a bound no read here should ever be unbounded.
+const max_trust_store_bytes = 4 << 20;
 
 /// `base` with `SSL_CERT_FILE` naming the trust store this call was given.
 ///
@@ -2706,6 +2716,12 @@ fn runCommand(
     defer if (scratch_source) |path| allocator.free(path);
     var tasks_source: ?[]u8 = null;
     defer if (tasks_source) |path| allocator.free(path);
+    // Holds the trust store's own staged copy, for the same reason
+    // `scratch_source` above is held here and not in the block that fills
+    // it: a mount borrows this, so it must outlive the mount tree
+    // `runInSandboxWith` builds and not merely the block below.
+    var trust_staged: ?Staged = null;
+    defer if (trust_staged) |*staged| staged.deinit(allocator, io);
 
     if (context.scratch_dir) |session_dir| {
         emptied = try boundScratchpad(allocator, io, session_dir);
@@ -2774,25 +2790,67 @@ fn runCommand(
     // is forgotten is to turn verification off. A sandbox that pushes a
     // person towards that has made them less safe by existing.
     //
+    // **A copy, staged the same way `stageContent` stages a write tool's own
+    // bytes, and never the host's own file bound in by its name.** A read
+    // only bind of the host's real trust store would work today, and it is
+    // what this used to be, but it leaves nothing for a later feature that
+    // lets a tool call add its own certificate to this bundle: writing
+    // through a bind of the host's own file would change the machine's real
+    // trust store, or simply refuse once the mount is read only. Staged, the
+    // bytes this call reads become Chock's own the moment they land on the
+    // host, and the mount that carries them names that copy and nothing the
+    // host still owns.
+    //
     // **Under the runtime prefix and never in `/etc`.** A routed sandbox
     // takes `/etc` for itself when it finds one, and a bind placed there
-    // before that would be taken with it. `SSL_CERT_FILE` is what makes a
-    // client look here, and it is what OpenSSL, and therefore libgit2 and
-    // curl, already reads.
+    // before that overlay goes on is shadowed the moment it does: overlayfs
+    // does not traverse a mount in its own lower layer. `linux/driver.zig`'s
+    // own `resolver_substitutions` puts the conventional path,
+    // `/etc/ssl/certs/ca-certificates.crt`, as a symbolic link to this one,
+    // in the routed step that runs after that overlay. `SSL_CERT_FILE` is
+    // what makes a client look here directly without probing that path, and
+    // it is what OpenSSL, and therefore libgit2 and curl, already reads.
     if (context.net != null) {
         if (hostTrustStore(allocator, io)) |host_bundle| {
-            try extra_mounts.append(allocator, .{ .bind = .{
-                .source = host_bundle,
-                .target = trust_store_inside,
-                .read_only = true,
-            } });
-            try extra_rules.append(allocator, .{
-                .path = trust_store_inside,
-                .access = .{ .read_file = true },
-            });
-            const with_trust = try trustEnvironment(allocator, config.env);
-            try owned_envs.append(allocator, with_trust);
-            config.env = with_trust;
+            defer allocator.free(host_bundle);
+
+            // Read through the path `hostTrustStore` already resolved, and
+            // never through the host's own name for it: see that function's
+            // own comment for the mount that once failed on a link it did
+            // not resolve. A plain read follows a link on its own, but the
+            // resolved path is kept anyway, so a change to the link between
+            // the two calls cannot hand this a different file than the one
+            // `hostTrustStore` reported finding.
+            if (std.Io.Dir.cwd().readFileAlloc(io, host_bundle, allocator, .limited(max_trust_store_bytes))) |bytes| {
+                defer allocator.free(bytes);
+
+                if (stageContent(allocator, io, env, bytes)) |staged| {
+                    trust_staged = staged;
+                    try extra_mounts.append(allocator, .{ .bind = .{
+                        .source = staged.host_path,
+                        .target = trust_store_inside,
+                        .read_only = true,
+                    } });
+                    try extra_rules.append(allocator, .{
+                        .path = trust_store_inside,
+                        .access = .{ .read_file = true },
+                    });
+                    const with_trust = try trustEnvironment(allocator, config.env);
+                    try owned_envs.append(allocator, with_trust);
+                    config.env = with_trust;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Best effort, the same answer a machine with no trust
+                    // store at all already gets: a call that cannot stage a
+                    // copy runs with no verified https, exactly as it would
+                    // have before this existed.
+                    error.StagingFailed => {},
+                }
+            } else |_| {
+                // The path `hostTrustStore` resolved could not be read after
+                // all, such as a permission this process does not have.
+                // Best effort, the same as a staging failure above.
+            }
         }
     }
 

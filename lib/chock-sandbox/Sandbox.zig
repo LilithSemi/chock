@@ -69,6 +69,23 @@ const grants = @import("grants.zig");
 /// `lib/chock-workspace/worktree.zig`'s own test for that.
 pub const runtime_prefix = "/run/chock";
 
+/// Where a routed sandbox keeps its own copy of the host's trust store,
+/// inside the sandbox.
+///
+/// **Under `runtime_prefix`, and never in `/etc`.** A routed sandbox takes
+/// `/etc` for itself when the host has one, and a bind placed there before
+/// that overlay goes on is shadowed the moment it does: overlayfs does not
+/// traverse a mount in its own lower layer. `lib/chock-core/tools.zig`
+/// stages a copy of the host's bundle here, bound in rather than the host's
+/// own file bound in by its name, so a later feature that lets a tool call
+/// add its own certificate to it writes to Chock's own copy and never to
+/// the machine's real trust store. `linux/driver.zig`'s own
+/// `resolver_substitutions` then puts a symbolic link to this path at the
+/// conventional one, `/etc/ssl/certs/ca-certificates.crt`, in the routed
+/// step that runs after that overlay: see `linux/namespace.zig`'s own
+/// `Substitution.Link`.
+pub const trust_store_inside = runtime_prefix ++ "/ca-bundle.crt";
+
 /// What this build's driver can express in a `Config`.
 ///
 /// **These are the questions `darwin/driver.zig`'s own `Inexpressible` answers

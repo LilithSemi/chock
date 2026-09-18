@@ -1920,6 +1920,10 @@ fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []cons
     for (sandbox.Sandbox.resolver_substitutions) |one| {
         const target = switch (one) {
             .text => |text| text.target,
+            // The trust store link answers nothing a `text` entry has not
+            // already answered: every build that has one also has the three
+            // `text` entries, and those are read first.
+            .link => continue,
             .hide => continue,
         };
         const parent = std.fs.path.dirname(target) orelse continue;

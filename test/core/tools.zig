@@ -933,6 +933,45 @@ test "a routed tool call can read the trust store it was given" {
     // NSS format bundle is a friendly name, so the header is what says this
     // is certificates rather than any file that happened to be placed.
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "BEGIN CERTIFICATE") != null);
+
+    // **The conventional path answers too, and not only `SSL_CERT_FILE`.** A
+    // client that never heard of that variable, or one that probes the
+    // compiled in default before it looks at any environment at all, still
+    // has to find a real bundle at `/etc/ssl/certs/ca-certificates.crt`.
+    // `linux/driver.zig`'s own `resolver_substitutions` puts a symbolic link
+    // there, to the very copy the first half of this test just read, in the
+    // routed step that runs after the `/etc` overlay: a link placed before
+    // that overlay would be shadowed and this would read as though nothing
+    // were there at all.
+    //
+    // Spelled here on purpose, and not read from `trust_store_link_target`:
+    // this is a test, and a constant imported from the driver under test
+    // would still name the same path after somebody changed it.
+    {
+        var conventional_root_tmp = std.testing.tmpDir(.{});
+        defer conventional_root_tmp.cleanup();
+
+        const conventional_arguments = try std.fmt.allocPrint(
+            allocator,
+            "{{\"argv\":[\"grep\",\"-m\",\"1\",\"BEGIN CERTIFICATE\",\"{s}\"]}}",
+            .{"/etc/ssl/certs/ca-certificates.crt"},
+        );
+        defer allocator.free(conventional_arguments);
+
+        var conventional_outcome = try runToolCallWith(
+            allocator,
+            &workspace,
+            conventional_root_tmp,
+            "run_command",
+            conventional_arguments,
+            .{ .routed = true },
+        );
+        defer conventional_outcome.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?u8, null), conventional_outcome.fault);
+        try std.testing.expect(!conventional_outcome.is_error);
+        try std.testing.expect(std.mem.indexOf(u8, conventional_outcome.output, "BEGIN CERTIFICATE") != null);
+    }
 }
 
 test "run_command cannot reach the home directory" {
