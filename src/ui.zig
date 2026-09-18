@@ -174,6 +174,7 @@ const approval = @import("approval.zig");
 const clock_mod = @import("clock.zig");
 const chock_broker = @import("chock-broker");
 const chock_policy = @import("chock-policy");
+const sandbox = @import("chock-sandbox");
 
 /// What bare `chock` draws on.
 pub const Plan = enum {
@@ -3199,6 +3200,29 @@ pub const Ui = struct {
     /// The session a person chose. `src/run.zig` reads it after the loop ends.
     taken: ?[]const u8 = null,
 
+    /// The background tasks of this session, or null for a run with none.
+    /// **Borrowed from `src/run.zig`**, which owns the table for as long as
+    /// the sandbox tool runner does: see `chock_core.tasks.Table`.
+    ///
+    /// **Read only, from here.** `pollFinishedTasks` is the one thing this
+    /// file does with it, and it calls `Table.peek` and never `Table.take`:
+    /// the drain still belongs to `recordFinishedTasks` in
+    /// `lib/chock-core/Loop.zig`, at the top of a turn, because that is the
+    /// one place a `message` may enter the model's context between two turns.
+    /// See `pollFinishedTasks` for the whole of the reasoning.
+    tasks: ?*chock_core.tasks.Table = null,
+    /// How many of `tasks`'s own finished tasks `pollFinishedTasks` has
+    /// already shown, in the order `Table.peek` answers them in.
+    ///
+    /// **What stops the same line appearing twice.** The idle wait shows a
+    /// line the moment `peek` reports it; the turn that follows drains the
+    /// very same completions and delivers a `task.complete` event for each
+    /// one, which `foldEvent`'s own `.task_complete` arm would otherwise show
+    /// again. Every completion counted here pays for exactly one of those
+    /// events: the count goes up by one line here and down by one event
+    /// there, and only once it is back at zero does an event print again.
+    tasks_shown_early: usize = 0,
+
     /// What the session has spent so far, folded from `usage` events. The
     /// currency is empty until one arrives that names a cost, which is what
     /// `/usage` reads as "not known": see `chock_proto.event.Cost`.
@@ -3847,6 +3871,13 @@ pub const Ui = struct {
                     };
                     if (read > 0) keys.session.feed(buffer[0..read]);
                 }
+
+                // **Once a tick, the same cadence the read above already
+                // runs at.** A person waiting at this field is the one moment
+                // nothing else in the loop polls the table, and it is exactly
+                // the moment a finished task would otherwise stay unannounced
+                // until the next turn started: see `pollFinishedTasks`.
+                self.pollFinishedTasks();
             }
 
             // **A command is answered here and never returned.** Nothing of it
@@ -3886,6 +3917,58 @@ pub const Ui = struct {
                 },
             }
         }
+    }
+
+    /// Show a background task that finished while `askForMessage` was
+    /// waiting for a person to type.
+    ///
+    /// **The person, and not the agent, is what was missing.** A finished
+    /// task is delivered to the agent only at the top of the next turn, by
+    /// `recordFinishedTasks` in `lib/chock-core/Loop.zig`, because that is the
+    /// one place a `message` may enter the model's context between two turns:
+    /// a turn already in flight chose its tool calls before any of them ran,
+    /// so a message inserted mid-turn would land where a provider demands an
+    /// exact shape. That reasoning is about when the AGENT is told, and it
+    /// says nothing about the PERSON: a session that waited at the field
+    /// stayed silent about a build that finished five minutes ago, until they
+    /// typed something, which could be a long wait or none at all if they
+    /// gave up and left. This is the fix, and it is display only: nothing
+    /// here appends to the log and nothing here reaches the model, both of
+    /// which stay exactly where `recordFinishedTasks` already puts them.
+    ///
+    /// **`Table.peek`, and never `Table.take`.** A drain here would be a
+    /// completion the next turn's own drain never sees, so the record and the
+    /// message the agent is told would both be lost for a task this only
+    /// shows a person. See `Table.peek`'s own doc for why two callers reading
+    /// in this order is safe.
+    ///
+    /// **Called from the idle read loop in `askForMessage`, roughly ten times
+    /// a second**, the same cadence that loop already reads the keyboard at:
+    /// see `look_ms`. A task that finishes while the person is mid-keystroke
+    /// is shown within a tenth of a second of it, the same as everything else
+    /// this file shows on a live tick.
+    fn pollFinishedTasks(self: *Ui) void {
+        const table = self.tasks orelse return;
+        const finished = table.peek(self.gpa) catch return;
+        defer chock_core.tasks.freeCompletions(self.gpa, finished);
+
+        // Only what `peek` had not already answered the last time this ran:
+        // see `tasks_shown_early` for why the count alone is enough to tell
+        // new from already shown.
+        if (finished.len <= self.tasks_shown_early) return;
+        for (finished[self.tasks_shown_early..]) |one| {
+            // **The same sentence the turn prints, number and all.** Two
+            // spellings of one line is how a person learns to read them as
+            // two different things: see the `.task_complete` arm of
+            // `foldEvent`, which this stands in for while the field is up.
+            self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
+                one.id,
+                one.status.wireName(),
+                one.code,
+            });
+        }
+        self.tasks_shown_early = finished.len;
+        self.draw();
     }
 
     /// The word a person's own rows are headed with.
@@ -5142,7 +5225,16 @@ pub const Ui = struct {
             // worked. Measured 2026-09-18, from a session where a build
             // failed and the line was indistinguishable from the one before
             // it.
-            .task_complete => |done| self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
+            //
+            // **Skipped once for every line `pollFinishedTasks` already
+            // printed.** That function shows this same sentence the moment a
+            // task finishes while a person is being waited for, and the turn
+            // that follows still drains the table and still appends this
+            // event. Without this count it would print a second time for a
+            // task the person already read about. See `tasks_shown_early`.
+            .task_complete => |done| if (self.tasks_shown_early > 0) {
+                self.tasks_shown_early -= 1;
+            } else self.sayFmt(.chock, "the background task {s} finished, {s} {d}", .{
                 done.task_id,
                 done.status.wireName(),
                 done.code,
@@ -8938,6 +9030,129 @@ test "the message is typed into the display, and Enter is what says it is the me
     h.screen.surface.terminal.feed("\r");
     try testing.expect(h.screen.paint());
     try testing.expect(h.screen.submitted);
+}
+
+/// A `chock_core.tasks.Runner` that answers at once, with no sandbox and no
+/// real command run. Mirrors `lib/chock-core/tasks.zig`'s own `FakeRunner`,
+/// rebuilt here because that one is private to its file and this test needs
+/// only the public seam every real runner answers through:
+/// `chock_core.tasks.Runner.VTable`.
+const FakeTaskRunner = struct {
+    fn runner(self: *FakeTaskRunner) chock_core.tasks.Runner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.tasks.Runner.VTable{ .run = runFn };
+
+    fn runFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        request: *const chock_core.tasks.Request,
+    ) chock_core.tasks.Outcome {
+        _ = ptr;
+        _ = io;
+        _ = request;
+        return .{
+            .status = .exited,
+            .code = 0,
+            .output = allocator.dupe(u8, "the build passed\n") catch &[_]u8{},
+        };
+    }
+};
+
+test "a task finished while the field is up is shown once, and not again when the turn drains it" {
+    // **The whole point of the change.** Before it, a task that finished
+    // while `askForMessage` waited was silent until a person typed something
+    // and the next turn's own drain printed the line, which could be a long
+    // wait or none at all if they gave up first. `pollFinishedTasks` is what
+    // shows it the moment `Table.peek` reports it true, and this pins that it
+    // does so exactly once, however the same completion later reaches the
+    // display a second time through the ordinary `task.complete` event.
+    //
+    // Mutation check, in three parts:
+    // 1. Comment out the call to `pollFinishedTasks` and the first
+    //    `expectEqual(1, ...)` below fails: nothing was shown at all.
+    // 2. Drop the `tasks_shown_early` guard from `foldEvent`'s own
+    //    `.task_complete` arm and the count after the live event reads two:
+    //    the exact duplicate this file exists to remove.
+    // 3. Answer `finished.items.len` from `Table.peek` with a drain instead
+    //    of a read (see that function's own mutation check) and the second
+    //    `pollFinishedTasks` call below reads zero rows instead of one,
+    //    because nothing would be left in the table to poll.
+    const gpa = testing.allocator;
+    const h = try Headless.open(gpa);
+    defer h.close();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(testing.io, &path_buffer);
+    const dir = try std.fmt.allocPrint(gpa, "{s}/tasks", .{path_buffer[0..path_len]});
+    defer gpa.free(dir);
+    try std.Io.Dir.createDirAbsolute(testing.io, dir, .default_dir);
+
+    var fake = FakeTaskRunner{};
+    var table = chock_core.tasks.Table{ .gpa = gpa, .dir = dir, .runner = fake.runner() };
+    defer table.deinit();
+
+    // Borrowed the same way `src/run.zig` borrows it, and read only from
+    // here: see `Ui.tasks`.
+    h.screen.tasks = &table;
+
+    const argv = [_][]const u8{"make"};
+    _ = try table.start(testing.io, .{
+        .config = .{ .root = "/root", .mounts = &.{}, .rules = &.{}, .cwd = "/project", .env = &.{} },
+        .argv = &argv,
+    });
+    // Waited for and not timed, the same as `lib/chock-core/tasks.zig`'s own
+    // suite: joining the thread is what makes the task over, not a wait on
+    // the clock.
+    table.waitAll();
+
+    // The idle wait's own poll, called exactly where `askForMessage`'s read
+    // loop calls it, shows the line the moment it is true.
+    h.screen.pollFinishedTasks();
+    try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.screen.lines.items[0].text, "the background task task-01 finished") != null);
+    try testing.expectEqual(@as(usize, 1), h.screen.tasks_shown_early);
+
+    // Another look before anything new happened adds no second row: nothing
+    // in `finished` is past `tasks_shown_early` yet.
+    h.screen.pollFinishedTasks();
+    try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
+
+    // The turn that follows drains the very same table and delivers the very
+    // same completion as a `task.complete` event, through the ordinary live
+    // path a real session sends it on. `recordFinishedTasks` is not run here;
+    // only the shape it produces is, which is enough to pin what `foldEvent`
+    // does with it.
+    h.screen.observer().onEvent(2, .{ .task_complete = .{
+        .task_id = "task-01",
+        .command = "make",
+        .status = .exited,
+        .code = 0,
+        .output_path = "/run/chock/tasks/task-01.out",
+        .output_bytes = 17,
+        .truncated = false,
+    } });
+    try testing.expectEqual(@as(usize, 1), h.screen.lines.items.len);
+    try testing.expectEqual(@as(usize, 0), h.screen.tasks_shown_early);
+
+    // A second task nobody polled for still prints in the ordinary way: the
+    // guard only ever pays off what it was told about, and never swallows
+    // what comes after it.
+    h.screen.observer().onEvent(3, .{ .task_complete = .{
+        .task_id = "task-02",
+        .command = "make check",
+        .status = .exited,
+        .code = 0,
+        .output_path = "/run/chock/tasks/task-02.out",
+        .output_bytes = 3,
+        .truncated = false,
+    } });
+    try testing.expectEqual(@as(usize, 2), h.screen.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.screen.lines.items[1].text, "task-02 finished") != null);
 }
 
 test "a second turn gets a field of its own, and carries nothing of the first one into it" {

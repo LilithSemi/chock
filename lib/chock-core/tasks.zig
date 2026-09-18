@@ -481,6 +481,48 @@ pub const Table = struct {
         return copies;
     }
 
+    /// Every task that has finished since the last `take`, read without taking
+    /// any of them out. The caller owns the result and frees it with
+    /// `freeCompletions`.
+    ///
+    /// **`take` still does the drain.** The record and the message that tells
+    /// the agent both belong to `recordFinishedTasks`, at a turn's own safe
+    /// point, and nothing else may empty `finished` out from under it: a
+    /// second drain between two calls to `take` would be a completion the
+    /// log never gets to hold. This exists for `src/ui.zig`'s
+    /// `Ui.pollFinishedTasks`, which shows a person that a task finished
+    /// while nobody was there to see it, between two turns, and must not
+    /// touch the record the next turn is about to write.
+    ///
+    /// **The order this answers in never changes underneath a caller that
+    /// only ever grows what it has already read.** A task's own thread only
+    /// appends to `finished`, and only `take` ever removes from it, so two
+    /// calls to `peek` with nothing drained between them answer the same
+    /// completions in the same order, with more on the end for whatever
+    /// finished since. That is what lets a caller show only the new tail of
+    /// the answer instead of the whole thing again.
+    pub fn peek(self: *Table, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Completion {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var copies = try allocator.alloc(Completion, self.finished.items.len);
+        var made: usize = 0;
+        errdefer freeCompletions(allocator, copies[0..made]);
+        for (self.finished.items, 0..) |one, index| {
+            copies[index] = .{
+                .id = try allocator.dupe(u8, one.id),
+                .command = try allocator.dupe(u8, one.command),
+                .status = one.status,
+                .code = one.code,
+                .output_path = try allocator.dupe(u8, one.output_path),
+                .output_bytes = one.output_bytes,
+                .truncated = one.truncated,
+            };
+            made = index + 1;
+        }
+        return copies;
+    }
+
     /// Called by a task's own thread once it has written its output file.
     fn record(self: *Table, completion: Completion) void {
         self.mutex.lock();
@@ -701,6 +743,44 @@ test "a finished task writes its output to the host and reports where and how la
     const again = try harness.table.take(gpa);
     defer freeCompletions(gpa, again);
     try testing.expectEqual(@as(usize, 0), again.len);
+}
+
+test "peek reads a finished task without taking it, so the turn still drains it" {
+    // `Ui.pollFinishedTasks` calls `peek` while a person is being waited for,
+    // between two turns, and the next turn still has to see the same
+    // completion through `take` so it can be recorded and told to the agent.
+    // A `peek` that drained would leave that turn believing nothing finished.
+    //
+    // Mutation check: have `peek` call `self.finished.toOwnedSlice` the way
+    // `take` does, instead of reading `self.finished.items`, and the `take`
+    // below answers zero instead of one.
+    const gpa = testing.allocator;
+    var fake = FakeRunner{ .output = "still building\n" };
+    var harness = try TestTable.init(gpa, &fake);
+    defer harness.deinit(gpa);
+
+    const argv = [_][]const u8{"make"};
+    _ = try harness.table.start(testing.io, .{ .config = fakeConfig(), .argv = &argv });
+    harness.table.waitAll();
+
+    const seen_first = try harness.table.peek(gpa);
+    defer freeCompletions(gpa, seen_first);
+    try testing.expectEqual(@as(usize, 1), seen_first.len);
+    try testing.expectEqualStrings("task-01", seen_first[0].id);
+
+    // A second look before anything is drained answers the very same task
+    // again, in the very same order: nothing about `peek` removes it.
+    const seen_again = try harness.table.peek(gpa);
+    defer freeCompletions(gpa, seen_again);
+    try testing.expectEqual(@as(usize, 1), seen_again.len);
+    try testing.expectEqualStrings("task-01", seen_again[0].id);
+
+    // And the turn that comes after still finds it, because `peek` took
+    // nothing out of the table.
+    const drained = try harness.table.take(gpa);
+    defer freeCompletions(gpa, drained);
+    try testing.expectEqual(@as(usize, 1), drained.len);
+    try testing.expectEqualStrings("task-01", drained[0].id);
 }
 
 test "a task that has finished stops being a running task, however the record is drained" {

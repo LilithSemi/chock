@@ -11837,6 +11837,12 @@ fn runSession(
         printer.paint = .off;
         printer.out = .{ .buffer = .{ .gpa = gpa, .bytes = &one.transcript } };
         one.wrap(printer.observer());
+        // The same table `context.tasks` above gives the tool runner and
+        // `deps.tasks` below gives the loop. **Borrowed, and read only from
+        // here**: `Ui.pollFinishedTasks` calls `Table.peek` while a person is
+        // being waited for, and the drain that records a completion and
+        // tells the agent about it stays with `chock_core.Loop.Deps.tasks`.
+        if (table) |*one_table| one.tasks = one_table;
         // What the header band says. **Only this file holds these**, which is
         // why they are handed over rather than read: see `ui.Facts`. Every one
         // of them lives in the arena for the whole run, so the display may
