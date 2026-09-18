@@ -362,6 +362,10 @@ const ProbeOptions = struct {
     /// call that carries no extension at all, which is every test but the one
     /// that proves this deadline can be widened.
     approval_wait_ms: ?u64 = null,
+    /// True when this call should be given a network router, which is what
+    /// makes it a routed call. False, the default, is every test that is not
+    /// about the network, and it is the sandbox those tests always had.
+    routed: bool = false,
 };
 
 /// Same as `runToolCall`, with the probe's own trailing two arguments named.
@@ -434,6 +438,10 @@ fn runToolCallWith(
         mounts_blob,                   rules_blob,                   env_blob,                        host_path,                   arguments_json,
         timeout_word,                  options.memory_dir orelse "", store_blob,                      options.cache_dir orelse "", cancel_word,
         options.scratch_dir orelse "", scratch_bytes_word,           options.workspace_dir orelse "", floor_word,                  approval_wait_word,
+        // Any non empty word asks the probe for a router. See its own
+        // `RefusingNetwork` for why a router that grants nothing is what this
+        // measures with.
+        if (options.routed) "routed" else "",
     });
 
     // **The probe's standard error goes nowhere, and that is deliberate.**
@@ -820,6 +828,59 @@ test "run_command runs in the workspace and returns what the program wrote" {
     try std.testing.expect(!outcome.truncated);
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "exit status: 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "workspace content") != null);
+}
+
+test "a routed tool call gives the program a resolver it can read" {
+    // **The one thing a tool call owns about the network, and nothing had
+    // measured it.** The escape suite proves the sandbox layer routes: a
+    // program that knows nothing about chock resolves a permitted host and
+    // reaches it. What no test covered is the step before that, whether a
+    // tool call wires a router at all and places what a routed sandbox owes
+    // the program.
+    //
+    // **`/etc/resolv.conf` is the whole of it for a name.** The router's
+    // resolver answers at a fixed address, and every ordinary program finds
+    // that address through this file and through nothing else. A routed call
+    // that leaves it unreadable gives a program a network it cannot name a
+    // host on, which fails as "failed to resolve address", several steps from
+    // its cause. Measured on 2026-09-18 in a real session: `cat
+    // /etc/resolv.conf` answered "Permission denied" and every name lookup
+    // failed, while the machine's own `chock doctor` reported the router and
+    // the resolver files all present.
+    //
+    // Mutation check: drop `Sandbox.resolver_substitutions` from the routed
+    // config and this fails on the read rather than on the content.
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    var outcome = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        "{\"argv\":[\"cat\",\"/etc/resolv.conf\"]}",
+        .{ .routed = true },
+    );
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    // **Readable first, and only then correct.** A refusal and a wrong file
+    // are different faults and a test that checked the content alone would
+    // report the same thing for both.
+    try std.testing.expect(!outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, outcome.output, "nameserver ") != null);
 }
 
 test "run_command cannot reach the home directory" {

@@ -124,6 +124,7 @@
 //!       `namespace.nothing_measured_exit_status`.
 
 const std = @import("std");
+
 const linux = std.os.linux;
 const sandbox = @import("chock-sandbox");
 const chock_core = @import("chock-core");
@@ -184,12 +185,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const arena = arena_state.allocator();
 
     const args = try init.args.toSlice(arena);
-    if (args.len != 20) {
+    if (args.len != 21) {
         std.debug.print(
             "usage: tools-probe <tool> <call_id> <root> <cwd> <mounts-blob> <rules-blob> " ++
                 "<sandbox-env-blob> <host-path> <arguments-json> <timeout-ms> <memory-dir> " ++
                 "<store-paths> <cache-dir> <cancel-after-ms> <scratch-dir> <scratch-bytes> " ++
-                "<workspace-dir> <workspace-floor-bytes> <approval-wait-ms>\n",
+                "<workspace-dir> <workspace-floor-bytes> <approval-wait-ms> <routed>\n",
             .{},
         );
         return 1;
@@ -244,6 +245,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }
     else
         null;
+    // **A router the call can be given, when the command line asks for one.**
+    // Any router at all makes the call a routed one, which is what writes the
+    // resolver files the sandboxed program reads. This one grants nothing:
+    // resolving a name and reaching a host are the escape suite's own tests,
+    // driven against the sandbox layer directly. What no test covered before
+    // this is that a tool call wires a router at all.
+    const routed = args[20].len != 0;
+
     if (args[14].len != 0) {
         const cancel_after_ms = std.fmt.parseInt(u64, args[14], 10) catch {
             std.debug.print("cancel-after-ms did not parse as an integer\n", .{});
@@ -313,6 +322,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .workspace_dir = workspace_dir,
         .session_id = "probe-session",
     };
+    if (routed) context.net = refusing_seam.seam();
     if (store_paths.len != 0) context.store_paths = store_paths;
     if (workspace_floor_bytes) |bytes| context.workspace_free_floor_bytes = bytes;
     if (approval_wait_ms) |ms| {
@@ -495,3 +505,36 @@ fn parseEnvBlob(arena: std.mem.Allocator, blob: []const u8) ParseError![][]const
     }
     return list.toOwnedSlice(arena) catch return error.OutOfMemory;
 }
+
+
+/// A network seam that grants nothing, for the one property a tool call owns.
+///
+/// **A tool call's job is to wire a router, not to route.** Whether a name
+/// resolves and whether an address can be reached are decided by the broker
+/// and by the kernel, and `test/sandbox/escape.zig` measures both against the
+/// sandbox layer directly. This seam answers `refused` to everything, so a
+/// test using it measures only what a routed call places for the program:
+/// see `chock_core.tools.Context.net` and `Sandbox.resolver_substitutions`.
+var refusing_seam: RefusingNetwork = .{};
+
+const RefusingNetwork = struct {
+    fn seam(self: *RefusingNetwork) chock_core.tools.NetSeam {
+        return .{ .ptr = self, .vtable = &seam_vtable };
+    }
+
+    const seam_vtable = chock_core.tools.NetSeam.VTable{ .router = routerFn };
+
+    fn routerFn(ptr: *anyopaque, _: []const u8, _: []const u8) sandbox.NetRouter {
+        return .{ .ptr = ptr, .vtable = &router_vtable };
+    }
+
+    const router_vtable = sandbox.NetRouter.VTable{ .resolve = resolveFn, .open = openFn };
+
+    fn resolveFn(_: *anyopaque, _: []const u8, _: sandbox.NetRouter.Family) sandbox.NetRouter.Resolution {
+        return .refused;
+    }
+
+    fn openFn(_: *anyopaque, _: sandbox.NetRouter.Address, _: u16) sandbox.NetBroker.Grant {
+        return .refused;
+    }
+};

@@ -4096,6 +4096,30 @@ fn applyLayers(
         ruleset.allowPath(rule.path, rule.access, &landlock_diag) catch |err|
             dieLandlock(write_fd, config.stderr_fd, .landlock_rule, err, landlock_diag);
     }
+
+    // **A routed sandbox grants read on the resolver it placed itself.**
+    // `substitute` above writes these files, this driver chooses their paths,
+    // and nothing in `config.rules` names them. A caller cannot be asked to
+    // grant access to files it does not place: it would have to know a path
+    // that is this driver's own, and every caller would have to remember.
+    //
+    // **Without this a routed sandbox has a working router that no program
+    // can use.** glibc finds the resolver's address in `/etc/resolv.conf` and
+    // nowhere else, so a name lookup fails for every ordinary program while
+    // the router, the ruleset and the netns are all fine. Measured
+    // 2026-09-18: `cat /etc/resolv.conf` answered `EACCES` inside a routed
+    // tool call, and a real session read that as "failed to resolve address",
+    // which is several steps from its cause.
+    //
+    // **Read and nothing else.** The sandboxed program has no business
+    // writing what the router told it, and `read_only` would add the execute
+    // right to three text files for no reason.
+    if (config.net_router != null) {
+        for (resolver_text_targets) |target| {
+            ruleset.allowPath(target, .{ .read_file = true }, &landlock_diag) catch |err|
+                dieLandlock(write_fd, config.stderr_fd, .landlock_rule, err, landlock_diag);
+        }
+    }
     ruleset.restrictSelf(&landlock_diag) catch |err|
         dieLandlock(write_fd, config.stderr_fd, .landlock_restrict, err, landlock_diag);
 
