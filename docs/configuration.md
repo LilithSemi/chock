@@ -76,6 +76,27 @@ are left behind.
 See [credentials.md](credentials.md) for where a lookup goes and what
 `chock login` writes.
 
+## The machine's own resource limits
+
+`config.zon` also takes a `limits` block, in the same shape a project's own
+`chock.zon` takes one:
+
+```zon
+.{
+    .limits = .{
+        .processes = "50%",
+        .memory = "4GiB",
+    },
+}
+```
+
+This is the machine's own default: every project run from this machine which
+names no `limits` field of its own gets the number here instead of Chock's
+own machine sized default. A project's own `chock.zon` still wins over it, the
+same way a project's own choices win over everything this file sets. See
+[Sandbox resource limits](policy.md#sandbox-resource-limits) for the field
+syntax and the full order the layers fold in.
+
 ## The project's own file
 
 `config.zon` is yours and it is about providers. `chock.zon`, in the project

@@ -2186,7 +2186,60 @@ fn measureOrgCeilings(
         found.append(arena, line) catch return found.items;
     }
 
+    // **Resolved against this machine, not printed as raw text.** A ceiling
+    // may name a percentage, and "50%" means nothing on its own: a person
+    // reading `chock doctor` on the machine a session will actually run on
+    // needs the number that percentage becomes here. A machine whose own
+    // facts cannot be read gains no row, the same as an installation with no
+    // bundle: a ceiling that cannot be sized is not reported as though it
+    // caps nothing.
+    if (bundle.limits) |ceiling| limits: {
+        const machine = chock_policy.limits.Machine.read() catch break :limits;
+        const processes = resolveCeilingField(ceiling.processes, machine.cpu_count);
+        const memory_mib = if (resolveCeilingField(ceiling.memory, machine.memory_bytes)) |bytes|
+            bytes / (1024 * 1024)
+        else
+            null;
+
+        const line = if (processes != null and memory_mib != null)
+            std.fmt.allocPrint(
+                arena,
+                "a sandboxed program of this installation may use at most {d} processes and " ++
+                    "threads and {d} MiB of memory, and a project that asks for more is held to " ++
+                    "that number",
+                .{ processes.?, memory_mib.? },
+            ) catch break :limits
+        else if (memory_mib) |mib|
+            std.fmt.allocPrint(
+                arena,
+                "a sandboxed program of this installation may use at most {d} MiB of memory, and " ++
+                    "a project that asks for more is held to that number",
+                .{mib},
+            ) catch break :limits
+        else
+            std.fmt.allocPrint(
+                arena,
+                "a sandboxed program of this installation may use at most {d} processes and " ++
+                    "threads, and a project that asks for more is held to that number",
+                .{processes.?},
+            ) catch break :limits;
+        found.append(arena, line) catch return found.items;
+    }
+
     return found.items;
+}
+
+/// One `limits_mod.Ceiling` field, resolved against `basis`, or null when the
+/// bundle named nothing for it or when its text could not be read.
+///
+/// **The second null case cannot happen on a path that went through
+/// `chock_policy.org.parse`**, which refuses a bundle whose limits ceiling
+/// does not parse before this can ever run. It can happen on a bundle read
+/// some other way, and this command's rule is to read and never trust: a
+/// ceiling this build cannot size gains no row rather than a wrong one.
+fn resolveCeilingField(text: ?[]const u8, basis: u64) ?u64 {
+    const setting = chock_policy.limits.parseSetting(text orelse return null) catch return null;
+    return setting.resolve(basis);
 }
 
 fn measureRequiredSinks(

@@ -41,6 +41,14 @@
 //! an approval may move a branch of the user's at all is a row on the table
 //! above it. See its own top comment for why the two are not written in one
 //! place.
+//!
+//! `lib/chock-policy/limits.zig` holds the sandbox's own resource limits: how
+//! many processes and how much memory one tool call may use. Three layers,
+//! all in the same block, spelled the same way: the operator's own
+//! `config.zon` sets the machine's default, `chock.zon` overrides it, and
+//! `org.zig`'s own `Bundle.limits` puts a ceiling over both that a project
+//! may go under and can never go over, the same rule `subagents` already
+//! keeps for the width of a spawn tree.
 
 pub const table = @import("chock-policy/table.zig");
 pub const devices = @import("chock-policy/devices.zig");
@@ -50,6 +58,7 @@ pub const org = @import("chock-policy/org.zig");
 pub const access = @import("chock-policy/access.zig");
 pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
+pub const limits = @import("chock-policy/limits.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

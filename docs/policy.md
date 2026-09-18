@@ -489,10 +489,10 @@ not the name: the server runs inside the same sandbox a tool call gets, and
 reaches nothing a tool call cannot. A program whose name cannot be one label of
 a rule does not start at all, and says so.
 
-### The two ceilings that are fields and not rules
+### The three ceilings that are fields and not rules
 
 Some things a project sets are numbers rather than decisions, and a rule cannot
-narrow a number. A bundle therefore carries two blocks of its own:
+narrow a number. A bundle therefore carries three blocks of its own:
 
 - `budget` sets the most a session of this installation may spend. A project
   that asks for more is **refused when it starts**, and both numbers are in
@@ -505,7 +505,74 @@ narrow a number. A bundle therefore carries two blocks of its own:
   spawn this stops says so at the moment it happens. The message names the
   bundle as the source, so nobody is sent to edit a `chock.zon` that does not
   hold that limit.
+- `limits` sets the most a sandboxed program of this installation may use: how
+  many processes and threads, and how much resident memory. See
+  [Sandbox resource limits](#sandbox-resource-limits) below for the block
+  itself. The same shape as `subagents`: a project above the bundle's number
+  is **held to it and is not refused**, because `/proc/meminfo` reports the
+  whole machine and `/sys/fs/cgroup` is hidden from the program the limit
+  bounds, so a project this narrows has no way to see the cap from inside its
+  own sandbox. `chock doctor` reports the ceiling, resolved against the
+  machine it runs on, so a person can read the number before a session ever
+  starts.
 
-The two differ on purpose. A refusal is right when the narrowing would
-otherwise be discovered late and without a reason, and a quiet minimum is right
-when the narrowing announces itself where it lands.
+The budget ceiling differs from the other two on purpose. A refusal is right
+when the narrowing would otherwise be discovered late and without a reason,
+and a quiet minimum is right when the narrowing announces itself where it
+lands: a spawn that is refused says so, and `chock doctor` says so for a
+sandbox held to a lower number than a project asked for.
+
+## Sandbox resource limits
+
+A `limits` block in `chock.zon` sets how many processes and threads, and how
+much resident memory, one tool call's sandbox may use:
+
+```zon
+.{
+    .limits = .{
+        .processes = "50%",
+        .memory = "4GiB",
+    },
+}
+```
+
+**Either field takes a percentage of what the machine has, or an absolute
+value.** `processes` resolves a percentage against this machine's own cpu
+count; `memory` resolves one against its total memory. A percentage above 100
+is refused when the file is read, with a message that names the field. An
+absolute value is a bare number, or a number with a unit this reader knows:
+`B`, `KiB`, `MiB`, `GiB`, `TiB`. `.processes = 300` and `.processes = "300"`
+say the same thing; `chock.zon` accepts both, and a bare number needs no
+quotes.
+
+**Chock's own default is sized to the machine, and not one fixed number for
+every machine.** The sandbox used to set a flat ceiling of 256 processes and
+2 GiB of memory everywhere. On a 128 cpu machine, `cargo` defaults to about
+128 parallel `rustc`, each wanting several threads of its own, and Linux
+counts threads against a process limit, so that budget was exhausted at once
+and every `rustc` died with `EAGAIN` on thread spawn. Two crates were also
+`SIGKILL`ed at the memory ceiling, and the sandboxed program could not see why:
+`/proc/meminfo` reported the whole machine's memory, because `/sys/fs/cgroup`
+is hidden from the program a limit bounds. So the built in default now scales
+with the machine: an ordinary 8 cpu, 16 GiB machine still gets exactly 256
+processes and 2 GiB, and a 128 cpu machine gets 1024 processes without a
+project configuring anything at all.
+
+**A project's own block wins over that default, and an operator's own default
+wins over Chock's.** `~/.config/chock/config.zon` takes the same `limits`
+block, in the same shape, and sets the machine's own default: every project on
+that machine which names no `limits` field of its own gets the operator's
+number instead of Chock's built in one. The order, from the number a session
+actually uses back to where it may have come from:
+
+1. The project's own `chock.zon`, if it names the field.
+2. The operator's own `config.zon`, if it names the field and the project did
+   not.
+3. Chock's own machine sized default, if neither did.
+4. The org policy bundle's own `limits` ceiling, over whichever of the above
+   won, if the bundle sets one. See
+   [The three ceilings that are fields and not rules](#the-three-ceilings-that-are-fields-and-not-rules).
+
+A misspelled field inside a `limits` block, in either file, is refused rather
+than read as the default: `.{ .limits = .{ .procceses = "50%" } }` stops the
+file being read, the same rule every other block in `chock.zon` keeps.

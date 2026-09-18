@@ -186,6 +186,7 @@
 const std = @import("std");
 const table = @import("table.zig");
 const subagent = @import("subagents.zig");
+const limits_mod = @import("limits.zig");
 
 /// The name of the bundle file. It lives in the data directory
 /// `lib/chock-auth/paths.zig` names, beside the credential store, because the
@@ -337,6 +338,18 @@ pub const Bundle = struct {
     /// the budget ceiling refuses. **An org can now cap fan-out**, which for a
     /// runaway spawn tree is the more expensive of the two.
     subagents: ?subagent.Ceiling = null,
+    /// The most a sandboxed program of this installation may use: how many
+    /// processes and threads, and how much resident memory. Null for a
+    /// bundle that caps neither, which is every bundle that predates this
+    /// field, and then `limits_mod.foldLayers`'s first two layers are the
+    /// only limit there is.
+    ///
+    /// **A field and not a rule, and a minimum and not a refusal**, the same
+    /// shape `subagents` has above: see `limits_mod.underCeiling`, which also
+    /// says why a session that is held to a lower number has to say so where
+    /// a person can read it, and `src/doctor.zig`'s own `measureOrgCeilings`,
+    /// which is where that happens.
+    limits: ?limits_mod.Ceiling = null,
     /// Files every project of this installation must keep out of the sandbox,
     /// on top of whatever its own `deny_read` block names. Empty for a bundle
     /// that hides nothing, which is every bundle that predates this field.
@@ -411,6 +424,14 @@ pub const ParseError = error{
     /// reading it as "no ceiling" would hide the mistake for as long as the
     /// bundle lives.
     InvalidSubagentCeiling,
+    /// The limits ceiling names neither `processes` nor `memory`. The same
+    /// rule `InvalidSubagentCeiling` keeps, for the same reason.
+    InvalidLimitsCeilingEmpty,
+    /// The limits ceiling names a `processes` or a `memory` field whose text
+    /// is not a percentage or an absolute value `limits_mod.parseSetting`
+    /// can read. A ceiling that cannot parse is refused when the bundle is
+    /// read, and never at the moment it would have bound a session.
+    InvalidLimitsCeilingSetting,
 };
 
 /// What can go wrong while reading a bundle from a path.
@@ -467,6 +488,16 @@ pub const Diagnostic = union(enum) {
     budget_max_cost_not_positive: f64,
     /// The subagent ceiling names neither limit.
     subagent_ceiling_names_nothing,
+    /// The limits ceiling names neither `processes` nor `memory`.
+    limits_ceiling_names_nothing,
+    /// A limits ceiling field's text does not parse. The field name is a
+    /// literal of `lib/chock-policy/limits.zig`, so this owns nothing.
+    invalid_limits_ceiling: InvalidLimitsCeiling,
+
+    pub const InvalidLimitsCeiling = struct {
+        field: []const u8,
+        reason: limits_mod.SettingError,
+    };
 
     pub const NameTooLong = struct {
         field: []const u8,
@@ -539,6 +570,14 @@ pub const Diagnostic = union(enum) {
             .subagent_ceiling_names_nothing => try writer.writeAll(
                 "the org policy bundle's subagent ceiling names neither max_depth nor " ++
                     "max_width, so it caps nothing. Name at least one, or remove the block.",
+            ),
+            .limits_ceiling_names_nothing => try writer.writeAll(
+                "the org policy bundle's limits ceiling names neither processes nor " ++
+                    "memory, so it caps nothing. Name at least one, or remove the block.",
+            ),
+            .invalid_limits_ceiling => |ceiling| try writer.print(
+                "the org policy bundle's limits ceiling names a {s} field that {s}",
+                .{ ceiling.field, limits_mod.reasonText(ceiling.reason) },
             ),
             .budget_max_cost_not_positive => |value| try writer.print(
                 "the org policy bundle's budget ceiling must be a number above zero, and this " ++
@@ -713,6 +752,31 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         if (ceiling.max_depth == null and ceiling.max_width == null) {
             _ = note(diag, .subagent_ceiling_names_nothing);
             return error.InvalidSubagentCeiling;
+        }
+    }
+
+    // **The same two rules the subagent ceiling above already keeps.** A
+    // block that caps nothing is a mistake and not a ceiling, and a field
+    // whose text `limits_mod.parseSetting` cannot read is refused here,
+    // when the bundle is read, rather than the moment it would have sized a
+    // sandbox: see `limits_mod.Ceiling`'s own doc comment for why the field
+    // is text and not a `Setting` already.
+    if (bundle.limits) |ceiling| {
+        if (ceiling.processes == null and ceiling.memory == null) {
+            _ = note(diag, .limits_ceiling_names_nothing);
+            return error.InvalidLimitsCeilingEmpty;
+        }
+        if (ceiling.processes) |text| {
+            _ = limits_mod.parseSetting(text) catch |err| {
+                _ = note(diag, .{ .invalid_limits_ceiling = .{ .field = "processes", .reason = err } });
+                return error.InvalidLimitsCeilingSetting;
+            };
+        }
+        if (ceiling.memory) |text| {
+            _ = limits_mod.parseSetting(text) catch |err| {
+                _ = note(diag, .{ .invalid_limits_ceiling = .{ .field = "memory", .reason = err } });
+                return error.InvalidLimitsCeilingSetting;
+            };
         }
     }
 }
@@ -1268,4 +1332,70 @@ test "a bundle carries a subagent ceiling, and one that caps nothing is refused"
     defer gpa.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "max_depth") != null);
     try testing.expect(std.mem.indexOf(u8, text, "max_width") != null);
+}
+
+test "a bundle carries a limits ceiling, and one that caps nothing is refused" {
+    const gpa = testing.allocator;
+
+    // The shape an organisation writes. A bundle may cap one limit and leave
+    // the other to the project or the operator, so both are read back
+    // exactly as written, as text: see `limits_mod.Ceiling`'s own doc
+    // comment for why this field is a string and not a `Setting` already.
+    const both = try parse(gpa, ".{ .limits = .{ .processes = \"256\", .memory = \"8GiB\" } }", null);
+    defer destroy(gpa, both);
+    try testing.expectEqualStrings("256", both.limits.?.processes.?);
+    try testing.expectEqualStrings("8GiB", both.limits.?.memory.?);
+
+    const memory_only = try parse(gpa, ".{ .limits = .{ .memory = \"50%\" } }", null);
+    defer destroy(gpa, memory_only);
+    try testing.expectEqual(@as(?[]const u8, null), memory_only.limits.?.processes);
+    try testing.expectEqualStrings("50%", memory_only.limits.?.memory.?);
+
+    // Every bundle written before this field sets no ceiling at all.
+    const older = try parse(gpa, ".{ .rules = .{} }", null);
+    defer destroy(gpa, older);
+    try testing.expectEqual(@as(?limits_mod.Ceiling, null), older.limits);
+
+    // A block that names neither limit caps nothing, the same rule the
+    // subagent ceiling above keeps, refused when the file is read rather
+    // than silently treated as "no ceiling".
+    var empty_diag: ?Diagnostic = null;
+    defer if (empty_diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidLimitsCeilingEmpty,
+        parse(gpa, ".{ .limits = .{} }", &empty_diag),
+    );
+    const empty_text = try std.fmt.allocPrint(gpa, "{f}", .{empty_diag.?});
+    defer gpa.free(empty_text);
+    try testing.expect(std.mem.indexOf(u8, empty_text, "processes") != null);
+    try testing.expect(std.mem.indexOf(u8, empty_text, "memory") != null);
+}
+
+test "a limits ceiling that cannot parse is refused when the bundle is read" {
+    // **Read time and not the moment it would have sized a sandbox.** The
+    // same reason `InvalidBudgetCeiling` and `InvalidSubagentCeiling` are
+    // both checked here rather than at the call site that would hit them.
+    //
+    // Mutation check: skip this validation and a bundle with
+    // `.processes = "200%"` parses cleanly, and `underCeiling`'s own
+    // defensive branch (see `limits_mod`'s own tests) silently drops the
+    // ceiling instead of a person ever hearing that their bundle is wrong.
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidLimitsCeilingSetting,
+        parse(gpa, ".{ .limits = .{ .processes = \"200%\" } }", &diag),
+    );
+    try testing.expectEqualStrings("processes", diag.?.invalid_limits_ceiling.field);
+    try testing.expectEqual(limits_mod.SettingError.PercentOverHundred, diag.?.invalid_limits_ceiling.reason);
+
+    var other_diag: ?Diagnostic = null;
+    defer if (other_diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidLimitsCeilingSetting,
+        parse(gpa, ".{ .limits = .{ .memory = \"not a number\" } }", &other_diag),
+    );
+    try testing.expectEqualStrings("memory", other_diag.?.invalid_limits_ceiling.field);
 }
