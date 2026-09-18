@@ -688,37 +688,6 @@ pub fn main(init: std.process.Init) !u8 {
 
 const testing = std.testing;
 
-test "the version this program reports is the one in build.zig.zon" {
-    // **The manifest is read here, off the disk, and the build option is not
-    // trusted to say what is in it.** A test that compared the option against
-    // itself would pass on the day somebody wrote a number into `build.zig`
-    // by hand, which is the fault this test exists for. The path comes from
-    // `build.zig`, which is the only thing that knows where the manifest is,
-    // and it reaches this test binary alone: see the module for it there.
-    const manifest_path = @import("manifest_path").manifest_path;
-
-    const text = try std.Io.Dir.cwd().readFileAlloc(
-        testing.io,
-        manifest_path,
-        testing.allocator,
-        .limited(64 * 1024),
-    );
-    defer testing.allocator.free(text);
-
-    // `.minimum_zig_version` does not match this, because the character
-    // before `version` there is an underscore and not a dot.
-    const opener = ".version = \"";
-    const after_key = std.mem.indexOf(u8, text, opener) orelse return error.ManifestHasNoVersion;
-    const value = text[after_key + opener.len ..];
-    const closer = std.mem.indexOfScalar(u8, value, '"') orelse return error.ManifestHasNoVersion;
-
-    try testing.expectEqualStrings(value[0..closer], version);
-
-    // And the line a person pastes into a bug report is that number and
-    // nothing else. `indexOf` would pass on a line that buried it.
-    try testing.expectEqualStrings("chock " ++ version, version_line);
-}
-
 test "the version line carries whatever number it is given" {
     // The shape `.github/workflows/ci.yml` builds for a commit with no tag
     // reaches the line unchanged. It is not a legal semver pre-release

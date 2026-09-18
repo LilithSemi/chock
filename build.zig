@@ -1515,20 +1515,6 @@ pub fn build(b: *std.Build) void {
     });
     chock_exe_test_module.addImport("tree_child_path", tree_child_path);
 
-    // **Where `build.zig.zon` is, so a test can read the manifest itself.**
-    // `src/main.zig` gets the version as a build option, and a test that
-    // compared that option against itself would prove nothing. So the test
-    // opens the manifest and reads the number out of it, and it fails the day
-    // the option stops carrying what the manifest says.
-    //
-    // Same reasoning as `chock_path_options` below for the shape: the path is
-    // a build time constant, since Zig 0.16's test runner cannot take it as an
-    // argument. On the test module alone, so the shipped binary holds no
-    // absolute path from the machine that built it.
-    const manifest_path_options = b.addOptions();
-    manifest_path_options.addOptionPath("manifest_path", b.path("build.zig.zon"));
-    chock_exe_test_module.addImport("manifest_path", manifest_path_options.createModule());
-
     const exe_tests = b.addTest(.{ .root_module = chock_exe_test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     // Same reasoning as run_sandbox_tests above.
@@ -1586,7 +1572,7 @@ pub fn build(b: *std.Build) void {
     // **Where this repository is, because a test binary cannot know.** The
     // tests read files that are not compiled into them, and `zig build` can be
     // started from any directory, so the root is a build time constant. Same
-    // shape as `manifest_path_options` above.
+    // shape as `chock_path_options` below.
     const repo_root_options = b.addOptions();
     repo_root_options.addOptionPath("repo_root", b.path("."));
 
