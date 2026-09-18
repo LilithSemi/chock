@@ -1830,6 +1830,15 @@ fn start(
         model,
     );
     sandbox_config.seccomp_options.strict_wx = write_execute.rule == .strict;
+
+    // **What this session's network is, decided once and written down.**
+    // Before this the field was left at its default and every session's
+    // header said `net none`, whatever its tool calls actually got. A header
+    // that says the same thing about every session says nothing, and this one
+    // told a model that the sandbox had no network at all while it had a
+    // router: see `chock_policy.table.Table.wantsRouter` for what decides it
+    // and why a router is a mechanism rather than a permission.
+    sandbox_config.network = if (policy.wantsRouter()) .filtered else .none;
     try recordSandbox(gpa, io, storage, &attempt, write_execute);
 
     // This project's declared devices, from the `devices` block of
@@ -11901,7 +11910,13 @@ fn runSession(
     // `screen` and this were known, so the field is set on the copy directly:
     // the same pattern `tool_runner.context.idle` below already uses. See
     // `chock_core.tools.Context.net`.
-    tool_runner.context.net = tool_network.seam();
+    // **Only when this session is meant to have one.** A project that permits
+    // no host gets no network namespace, no kernel ruleset and no resolver,
+    // which is what `started.sandbox_config.network` above already says it
+    // gets. The two are read from one answer so they cannot disagree.
+    if (started.sandbox_config.network == .filtered) {
+        tool_runner.context.net = tool_network.seam();
+    }
     tool_runner.context.approval_wait_ns = &tool_network.approval_wait_ns;
 
     // **What makes a tool a third party supplies answerable at all.** Both

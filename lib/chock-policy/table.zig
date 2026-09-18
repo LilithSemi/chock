@@ -317,6 +317,34 @@ pub const Agent = struct {
 pub const Policy = struct {
     agents: []const Agent = &.{},
     rules: []const Rule = &.{},
+    net: Net = .{},
+};
+
+/// What this project wants of the network, beyond which hosts it permits.
+///
+/// **Which hosts is still `net.connect.*` and nothing here.** This says only
+/// whether a tool call is given a router at all, which is a mechanism and
+/// never a permission: a router with no permitted host reaches nothing. That
+/// is why an organisation's bundle needs no ceiling over this. It caps the
+/// `net.connect` rules, and a project that turns a router on without them has
+/// turned on a road to nowhere.
+pub const Net = struct {
+    router: Router = .auto,
+};
+
+/// Whether a tool call of this session is given a network router.
+pub const Router = enum {
+    /// Decided by the rules: a router when the policy permits something under
+    /// `net.connect`, and none when it does not. **The default**, because a
+    /// project that names no host has no use for a network namespace, a
+    /// ruleset and a resolver, and a project that names one always wants them.
+    auto,
+    /// Never, whatever the rules say. An off switch for a project that keeps
+    /// `net.connect` rules for its own reading and wants no network today.
+    none,
+    /// Always, even with no rule permitting a host yet. For a session where a
+    /// person is expected to answer for each host as it comes up.
+    filtered,
 };
 
 /// What can go wrong while reading a policy out of bytes that are already in
@@ -910,6 +938,38 @@ pub const Table = struct {
     /// direction for an existence question**: folding it here could only make
     /// a name resolve that this reading already refuses, and the connection
     /// itself is judged either way.
+    /// Whether a tool call of this session is given a network router.
+    ///
+    /// **A mechanism and never a permission.** A router grants no host by
+    /// itself: every connection is still decided at `net.connect.*`, and a
+    /// router with nothing permitted reaches nothing. What this decides is
+    /// whether the sandbox pays for a network namespace, a kernel ruleset and
+    /// a resolver at all, and therefore what `chock doctor` and the header
+    /// can honestly say about a session.
+    ///
+    /// **`.auto` reads the rules and not the defaults.** `defaults.zig` holds
+    /// no rule under `net.connect.*` or `net.fetch.*` on purpose, so nothing
+    /// shipped can make this true, and a project that names a host is the
+    /// only thing that does. A rule that only denies is not a reason to build
+    /// a network: `rulesReachBelow` skips a `deny`.
+    ///
+    /// **The whole `net` namespace, and not `net.connect` alone.** One seam
+    /// carries the router for every tool, so a project that permits only
+    /// `net.fetch.*` would otherwise have `fetch_url` lose the seam it asks
+    /// through.
+    ///
+    /// **No tool, model or agent kind is asked about here.** This is one
+    /// answer for the whole session, given before any call exists, so a rule
+    /// that permits a host for one tool is a reason to build the network for
+    /// the session. The narrower question is asked again per connection.
+    pub fn wantsRouter(self: *const Table) bool {
+        return switch (self.policy.net.router) {
+            .none => false,
+            .filtered => true,
+            .auto => rulesPermitBelow(self.policy.rules, "net"),
+        };
+    }
+
     pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
         return rulesReachBelow(self.policy.rules, key) or
             rulesReachBelow(defaults.rules, key);
@@ -1097,6 +1157,23 @@ fn winnerFor(rules: []const Rule, key: Key) ?Rule {
 
 /// True when any rule of `rules` could permit something under `key.action`.
 /// See `Table.permitsSomethingUnder`, which is the only reading of this.
+/// True when some rule that is not a `deny` names `prefix` itself or names
+/// something under it, whatever tool, model or agent kind it is written for.
+///
+/// **The action alone, unlike `rulesReachBelow`.** That one answers a
+/// question about one call, so it folds the other three patterns against that
+/// call's own key. This answers a question about a whole session, which has
+/// no key yet.
+fn rulesPermitBelow(rules: []const Rule, prefix: []const u8) bool {
+    std.debug.assert(prefix.len > 0);
+    for (rules) |rule| {
+        if (rule.decision == .deny) continue;
+        if (!actionReachesBelow(rule.action, prefix)) continue;
+        return true;
+    }
+    return false;
+}
+
 fn rulesReachBelow(rules: []const Rule, key: Key) bool {
     std.debug.assert(key.action.len > 0);
     for (rules) |rule| {
@@ -3318,4 +3395,85 @@ test "the corrected budget still reads a table under it and still refuses one cl
     const clearly_over = try wideSource(gpa, max_rules, 64);
     defer gpa.free(clearly_over);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, clearly_over, null));
+}
+
+test "a router is wanted when the policy permits a host, and not when it only denies one" {
+    const gpa = std.testing.allocator;
+
+    // **The default, and the case that matters most.** A project that names
+    // no host pays for no network at all.
+    const quiet = try Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
+    defer Table.destroy(gpa, quiet);
+    try std.testing.expect(!quiet.wantsRouter());
+
+    const permits = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, permits);
+    try std.testing.expect(permits.wantsRouter());
+
+    // An `ask` is a reason to build one: the person may say yes.
+    const asks = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .ask } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, asks);
+    try std.testing.expect(asks.wantsRouter());
+
+    // **A deny is not.** A road nobody may take is not a road to build.
+    const denies = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .deny } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, denies);
+    try std.testing.expect(!denies.wantsRouter());
+
+    // **`net.fetch` counts too**, because one seam carries the router for
+    // every tool and `fetch_url` asks through it.
+    const fetches = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.fetch.rs.docs\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, fetches);
+    try std.testing.expect(fetches.wantsRouter());
+
+    // A rule about something else entirely is not a reason either.
+    const elsewhere = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, elsewhere);
+    try std.testing.expect(!elsewhere.wantsRouter());
+}
+
+test "the router setting overrides what the rules would have decided, both ways" {
+    const gpa = std.testing.allocator;
+
+    // `.none` refuses a network the rules would have built.
+    const off = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .net = .{ .router = .none }, .rules = .{ " ++
+            ".{ .action = \"net.connect.com.github\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, off);
+    try std.testing.expect(!off.wantsRouter());
+
+    // `.filtered` builds one the rules would not have, which is what a
+    // session that expects to be asked host by host wants.
+    const on = try Table.parse(gpa, ".{ .policy = .{ .net = .{ .router = .filtered } } }", null);
+    defer Table.destroy(gpa, on);
+    try std.testing.expect(on.wantsRouter());
+
+    // And the default is `.auto`, stated here so a change to it fails a test
+    // rather than changing every session quietly.
+    const plain = try Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
+    defer Table.destroy(gpa, plain);
+    try std.testing.expectEqual(Router.auto, plain.policy.net.router);
 }

@@ -89,6 +89,39 @@ project that named nothing about a host still meets `ask` there, never
 `allow`. See [threat-model.md](threat-model.md) for what an `ask` on
 `net.connect.*` can now reach.
 
+## Whether a session has a network at all
+
+`net.connect` and `net.fetch` rules say **which hosts** a session may reach.
+What decides whether it is given a network namespace, a kernel ruleset and a
+resolver at all is `.policy.net.router`:
+
+```zon
+.{
+    .policy = .{
+        .net = .{ .router = .auto },
+        .rules = .{
+            .{ .action = "net.connect.com.github", .decision = .allow },
+        },
+    },
+}
+```
+
+* `.auto` is the default and reads the rules. A project that permits
+  something under `net` is given a router. A project that permits nothing
+  there is not, and pays for none of it.
+* `.none` refuses a router whatever the rules say.
+* `.filtered` gives one even when no rule permits a host yet, which suits a
+  session where a person answers for each host as it comes up.
+
+**A router is a mechanism and never a permission.** It grants no host by
+itself: every connection is still decided at `net.connect.*`, and a router
+with nothing permitted reaches nothing. That is why an organisation's bundle
+needs no ceiling over this field. The bundle caps the rules, and a project
+that turns a router on without them has turned on a road to nowhere.
+
+**A rule that only denies is not a reason to build one.** A road nobody may
+take is not a road to build.
+
 ## The actions
 
 | Action | What it does |
