@@ -330,6 +330,17 @@ pub const Policy = struct {
 /// turned on a road to nowhere.
 pub const Net = struct {
     router: Router = .auto,
+    /// What a call started in the background gets, which may be less than the
+    /// session has. `.auto` is whatever `router` decided.
+    ///
+    /// **A background call never asks a person.** It runs on a thread of its
+    /// own, after the dispatch that started it returned, and the handle a
+    /// question travels through belongs to the call the loop is inside of at
+    /// that moment. So a background call is given a router with no asker: it
+    /// reaches what this policy ALLOWS outright, and anything that would need
+    /// a person is refused rather than queued behind one. Set `.none` for a
+    /// project that wants a background command to reach nothing at all.
+    background: Router = .auto,
 };
 
 /// Whether a tool call of this session is given a network router.
@@ -967,6 +978,26 @@ pub const Table = struct {
             .none => false,
             .filtered => true,
             .auto => rulesPermitBelow(self.policy.rules, "net"),
+        };
+    }
+
+    /// Whether a call this session starts in the background is given a router.
+    ///
+    /// **Never more than the session itself has.** `.auto` follows
+    /// `wantsRouter`, and an explicit `.filtered` here cannot give a
+    /// background call a network a foreground call does not have: a session
+    /// with no router builds none, and there would be nothing for this to
+    /// attach.
+    ///
+    /// What it does NOT decide is whether a person can be asked. That is
+    /// always no for a background call, whatever this says: see
+    /// `Net.background`.
+    pub fn wantsBackgroundRouter(self: *const Table) bool {
+        if (!self.wantsRouter()) return false;
+        return switch (self.policy.net.background) {
+            .none => false,
+            .filtered => true,
+            .auto => true,
         };
     }
 
@@ -3476,4 +3507,38 @@ test "the router setting overrides what the rules would have decided, both ways"
     const plain = try Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
     defer Table.destroy(gpa, plain);
     try std.testing.expectEqual(Router.auto, plain.policy.net.router);
+}
+
+test "a background call follows the session's network, and can be refused one of its own" {
+    const gpa = std.testing.allocator;
+
+    const permits = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, permits);
+    try std.testing.expect(permits.wantsRouter());
+    try std.testing.expect(permits.wantsBackgroundRouter());
+
+    // Off for the background alone, with the session's own network untouched.
+    const foreground_only = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .net = .{ .background = .none }, .rules = .{ " ++
+            ".{ .action = \"net.connect.com.github\", .decision = .allow } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, foreground_only);
+    try std.testing.expect(foreground_only.wantsRouter());
+    try std.testing.expect(!foreground_only.wantsBackgroundRouter());
+
+    // **And never more than the session has.** A session with no router has
+    // nothing for a background call to be given, whatever this field says.
+    const nothing = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .net = .{ .router = .none, .background = .filtered } } }",
+        null,
+    );
+    defer Table.destroy(gpa, nothing);
+    try std.testing.expect(!nothing.wantsBackgroundRouter());
 }

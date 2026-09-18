@@ -5944,6 +5944,9 @@ const ToolNetwork = struct {
     /// each call: see `brokerFn`.
     network: chock_broker.network.Network,
     transport: chock_broker.network.System = .{},
+    /// See `backgroundRouterFn`.
+    background_nets: [chock_core.tasks.max_tasks]BackgroundNet = @splat(.{}),
+    background_used: usize = 0,
     /// The sending end of `chock_core.tools.Context.approval_wait_ns`. Reset
     /// to zero before every call this seam builds a broker for, and bumped by
     /// `chock_broker.network.Network.askPermits` while a person is asked
@@ -5972,7 +5975,61 @@ const ToolNetwork = struct {
         return .{ .ptr = self, .vtable = &seam_vtable };
     }
 
-    const seam_vtable = chock_core.tools.NetSeam.VTable{ .router = routerFn };
+    const seam_vtable = chock_core.tools.NetSeam.VTable{
+        .router = routerFn,
+        .background_router = backgroundRouterFn,
+    };
+
+    /// One network per background call, because that call reads it on a
+    /// thread of its own long after this returns, and `self.network` is
+    /// rewritten by the next foreground call. Bounded by the number of
+    /// background tasks a session may start at all, so this allocates
+    /// nothing and can run out only when tasks have.
+    const BackgroundNet = struct {
+        network: chock_broker.network.Network = undefined,
+        /// The call id, copied. The caller's own string belongs to a dispatch
+        /// that has returned by the time the task runs.
+        id: [64]u8 = undefined,
+        id_len: usize = 0,
+    };
+
+    /// See `chock_core.tools.NetSeam.VTable.background_router`.
+    ///
+    /// **Null when this project's policy says a background call gets no
+    /// network**, and null again when a session has already started as many
+    /// tasks as it may. The caller then builds the `.none` sandbox a
+    /// background call always used to get.
+    ///
+    /// **`asker` is left null on purpose, and that is the whole safety
+    /// argument.** A `Network` with no asker answers `allow` from the table
+    /// and refuses everything else outright: see `answerWith`. So a
+    /// background call reaches exactly what the policy permits and never
+    /// reaches for the session loop's locked handle, which is what kept
+    /// background calls off the network in the first place.
+    fn backgroundRouterFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+        const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
+        if (!self.started.policy.wantsBackgroundRouter()) return null;
+        if (self.background_used == self.background_nets.len) return null;
+
+        // Caught up before the copy, for the reason `routerFn` gives.
+        self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
+
+        const slot = &self.background_nets[self.background_used];
+        self.background_used += 1;
+
+        slot.id_len = @min(call_id.len, slot.id.len);
+        @memcpy(slot.id[0..slot.id_len], call_id[0..slot.id_len]);
+
+        slot.network = self.network;
+        slot.network.asker = null;
+        slot.network.tool = tool;
+        slot.network.tool_call_id = slot.id[0..slot.id_len];
+        // Its own counts, not a copy of the foreground call's.
+        slot.network.granted = 0;
+        slot.network.refused = 0;
+        slot.network.diagnostic = null;
+        return slot.network.netRouter();
+    }
 
     fn routerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));

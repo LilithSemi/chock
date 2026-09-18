@@ -122,6 +122,17 @@ that turns a router on without them has turned on a road to nowhere.
 **A rule that only denies is not a reason to build one.** A road nobody may
 take is not a road to build.
 
+`.policy.net.background` says what a command started in the background gets,
+and takes the same three words. `.auto`, the default, is whatever the session
+itself has.
+
+**A background command never asks you anything.** It runs after the tool call
+that started it has returned, and a question needs the session to be waiting
+on it. So a background command reaches what this policy **allows** outright,
+and a host that would have asked you is refused instead of queued. Set
+`.background = .none` for a project where a background command should reach
+nothing at all.
+
 ## The actions
 
 | Action | What it does |

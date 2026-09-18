@@ -1882,6 +1882,14 @@ pub const NetSeam = struct {
 
     pub const VTable = struct {
         router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter,
+        /// The router a call started in the background is given, or null when
+        /// this session gives one none. **Never the router `router` answers
+        /// with.** A background call runs on a thread of its own, after the
+        /// dispatch that started it returned, so a router whose state the
+        /// next foreground call rewrites would be read by two threads at
+        /// once. And it never asks a person: see
+        /// `chock_policy.table.Net.background`.
+        background_router: *const fn (ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter,
     };
 
     /// `call_id` is the `call_id` of the `tool.call` this broker is being
@@ -1894,6 +1902,11 @@ pub const NetSeam = struct {
     /// passing or failing it, so this is not a label the model reads.
     pub fn router(self: NetSeam, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
         return self.vtable.router(self.ptr, tool, call_id);
+    }
+
+    /// See `VTable.background_router`.
+    pub fn backgroundRouter(self: NetSeam, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+        return self.vtable.background_router(self.ptr, tool, call_id);
     }
 };
 
@@ -2520,24 +2533,54 @@ fn runCommand(
 
     var config = workspace_config;
 
-    // **A background call keeps `Network.none`, whatever this session gives
-    // its foreground calls.** The program this starts runs later, on a task's
-    // own thread, well after this dispatch returns: see `backgroundRun`. A
-    // network broker's own `ask` answers through this session's loop's own
-    // locked handle, and only the call the loop is inside of at that moment
-    // may hold it: see `chock_core.Loop.GiveLocked`'s own top comment. Two
-    // sandboxed programs asking through the same handle at once is not a
-    // question this project has an answer for yet, so a background call is
-    // kept out of it rather than raced against it.
+    // **A background call reaches what the policy allows, and asks nobody.**
+    // The program this starts runs later, on a task's own thread, well after
+    // this dispatch returns: see `backgroundRun`. A network broker's own
+    // `ask` answers through this session's loop's own locked handle, and only
+    // the call the loop is inside of at that moment may hold it: see
+    // `chock_core.Loop.GiveLocked`'s own top comment. Two sandboxed programs
+    // asking through the same handle at once is still not a question this
+    // project has an answer for.
+    //
+    // **So the question is never asked rather than the network taken away.**
+    // The seam answers with a router whose asker is null, which allows what
+    // the table allows outright and refuses everything else: see
+    // `chock_policy.table.Net.background` and this session's own
+    // `wantsBackgroundRouter`. A background call used to get `Network.none`
+    // whatever the policy said, which is why `cargo` could not fetch a
+    // dependency in a project whose policy names the host.
     if (in_background) {
-        config.network = .none;
-        // **Both seams, and not only the one this session happens to use.**
-        // `spawn` refuses a seam on a config that is not filtered, so a field
-        // left behind here would turn a background call into a setup failure
-        // rather than into the `.none` sandbox this branch is about. See
-        // `Sandbox.SpawnError.NetRouterNotFiltered`.
-        config.net_broker = null;
-        config.net_router = null;
+        // **A background call may still reach what the policy allows.** It
+        // used to get no network at all, because a broker's `ask` answers
+        // through the session loop's own locked handle and only the call the
+        // loop is inside of may hold it. That reason is kept exactly: the
+        // router below never asks anybody. It answers from the table and
+        // refuses everything the table does not allow outright, so nothing
+        // here races a person.
+        //
+        // **A router of its own, never the one a foreground call holds.**
+        // This config is copied and read on a task's own thread: see
+        // `NetSeam.VTable.background_router`.
+        const background: ?sandbox.NetRouter = if (context.net) |net|
+            net.backgroundRouter(call.tool, call.call_id)
+        else
+            null;
+
+        if (background) |router| {
+            config.network = .filtered;
+            config.net_router = router;
+            // **Never the broker seam**, which asks. See above.
+            config.net_broker = null;
+        } else {
+            config.network = .none;
+            // **Both seams, and not only the one this session happens to
+            // use.** `spawn` refuses a seam on a config that is not filtered,
+            // so a field left behind here would turn a background call into a
+            // setup failure rather than into the `.none` sandbox this branch
+            // is about. See `Sandbox.SpawnError.NetRouterNotFiltered`.
+            config.net_broker = null;
+            config.net_router = null;
+        }
     }
 
     // Every writable surface this call may carry, plus the read only one, each
@@ -7792,12 +7835,25 @@ const TestNetSeam = struct {
     last_tool_len: usize = 0,
     last_call_id: [64]u8 = undefined,
     last_call_id_len: usize = 0,
+    /// How many times a router was asked for on behalf of a background call.
+    background_calls: usize = 0,
 
     fn seam(self: *TestNetSeam) NetSeam {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = NetSeam.VTable{ .router = routerFn };
+    const vtable = NetSeam.VTable{
+        .router = routerFn,
+        .background_router = backgroundRouterFn,
+    };
+
+    /// Counted separately from `routerFn`, so a test can tell a background
+    /// call's router apart from a foreground one's.
+    fn backgroundRouterFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) ?sandbox.NetRouter {
+        const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
+        self.background_calls += 1;
+        return routerFn(ptr, name, call_id);
+    }
 
     fn routerFn(ptr: *anyopaque, name: []const u8, call_id: []const u8) sandbox.NetRouter {
         const self: *TestNetSeam = @ptrCast(@alignCast(ptr));
@@ -9018,4 +9074,27 @@ test "the refusal for a denied path names the file, the block, and says not to r
     try std.testing.expect(std.mem.indexOf(u8, result.output, "deny_read") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "chock.zon") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "cannot change it") != null);
+}
+
+test "a background call is given its own router, and a foreground call's is untouched" {
+    // **Two routers and never one.** A background call reads its router on a
+    // thread of its own, long after this dispatch returned, while the next
+    // foreground call rewrites the seam's own. A seam that answered with the
+    // same one for both would be handing two threads one mutable object.
+    var seam_state = TestNetSeam{};
+    const seam = seam_state.seam();
+
+    const foreground = seam.router("run_command", "call-1");
+    try std.testing.expectEqual(@as(usize, 1), seam_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), seam_state.background_calls);
+
+    const background = seam.backgroundRouter("run_command", "call-2");
+    try std.testing.expect(background != null);
+    try std.testing.expectEqual(@as(usize, 1), seam_state.background_calls);
+
+    // The test seam answers with one object either way, which is what makes
+    // this test about the seam's own shape rather than about run.zig's pool.
+    // What it pins is that a background call goes through its own entry: a
+    // caller that reached for `router` instead would leave this at zero.
+    _ = foreground;
 }

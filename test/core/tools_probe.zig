@@ -522,9 +522,18 @@ const RefusingNetwork = struct {
         return .{ .ptr = self, .vtable = &seam_vtable };
     }
 
-    const seam_vtable = chock_core.tools.NetSeam.VTable{ .router = routerFn };
+    const seam_vtable = chock_core.tools.NetSeam.VTable{
+        .router = routerFn,
+        .background_router = backgroundRouterFn,
+    };
 
     fn routerFn(ptr: *anyopaque, _: []const u8, _: []const u8) sandbox.NetRouter {
+        return .{ .ptr = ptr, .vtable = &router_vtable };
+    }
+
+    /// The same router, because this one grants nothing either way and a
+    /// probe has no second thread to keep it away from.
+    fn backgroundRouterFn(ptr: *anyopaque, _: []const u8, _: []const u8) ?sandbox.NetRouter {
         return .{ .ptr = ptr, .vtable = &router_vtable };
     }
 
