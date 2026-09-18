@@ -3639,12 +3639,12 @@ fn hostSearchPath(
 /// files come from an image: what the workspace already needs, plus what the
 /// image states.
 ///
-/// The same two rules `sandboxEnvironment` keeps for a dev shell, for the same
-/// reasons. **The workspace's own variables win**, because the workspace's git
+/// The same rule `sandboxEnvironment` keeps for a dev shell, for the same
+/// reason. **The workspace's own variables win**, because the workspace's git
 /// variables are what make git work at all against a read only object store.
-/// **`PATH` is left out**, because a tool call binds the one program it names
-/// at an absolute path; the image's `PATH` is honoured one step earlier, in
-/// `imageToolEnvironment`.
+/// **The image's `PATH` is given**, because the image's own files are what the
+/// sandbox is built from, so a `PATH` naming them reaches nothing that is not
+/// there already. See `sandboxEnvironment` for what leaving it out cost.
 fn imageSandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -3657,7 +3657,6 @@ fn imageSandboxEnvironment(
         const equals = std.mem.indexOfScalar(u8, record, '=') orelse continue;
         const key = record[0..equals];
         if (key.len == 0) continue;
-        if (std.mem.eql(u8, key, "PATH")) continue;
         if (namesKey(workspace_env, key)) continue;
         try entries.append(arena, record);
     }
@@ -3971,7 +3970,7 @@ test "an image entry above a mount the sandbox makes itself is left out and said
     try std.testing.expect(!isAboveAMount("/home/somebody/project", &sandbox_mounts));
 }
 
-test "an image session keeps the workspace's own variables and leaves PATH out" {
+test "an image session keeps the workspace's own variables and carries the image's PATH" {
     // The same two rules the dev shell half keeps. `GIT_OBJECT_DIRECTORY` is
     // what makes git work against a read only object store, and an image that
     // happened to state that name would otherwise break every git call.
@@ -4003,11 +4002,14 @@ test "an image session keeps the workspace's own variables and leaves PATH out" 
     };
 
     const built = try imageSandboxEnvironment(arena, &workspace_env, &image);
-    try std.testing.expectEqual(@as(usize, 3), built.len);
+    try std.testing.expectEqual(@as(usize, 4), built.len);
     try std.testing.expectEqualStrings("GIT_OBJECT_DIRECTORY=/run/chock/git/objects", built[0]);
     try std.testing.expectEqualStrings("KEEP=me", built[1]);
-    try std.testing.expectEqualStrings("LANG=C.UTF-8", built[2]);
-    try std.testing.expect(!namesKey(built, "PATH"));
+    // **The image's own `PATH`, and never the host prefixed one below.** The
+    // rootfs is the sandbox's own root, so a program inside looks for
+    // `/usr/bin` and not for the `/tree/usr/bin` the host reads it at.
+    try std.testing.expectEqualStrings("PATH=/usr/local/bin:/usr/bin:/bin", built[2]);
+    try std.testing.expectEqualStrings("LANG=C.UTF-8", built[3]);
 
     // And the tool environment is the other half: `PATH` is the one name it
     // rewrites, and every other variable is the image's own.
@@ -4688,12 +4690,27 @@ fn toolEnvironment(
 /// two entries with one name is undefined in POSIX and "whichever libc reads
 /// first" is not a rule to rely on.
 ///
-/// **`PATH` is left out on purpose.** The sandbox has never had one: a tool
-/// call binds exactly the one program it names, at an absolute path, which
-/// is the per call argv boundary `lib/chock-core/tools.zig`'s own top
-/// comment calls the point of `run_command`. The dev shell's `PATH` is still
-/// honoured, one step earlier, where `argv[0]` is resolved against it: see
-/// `toolEnvironment`.
+/// **`PATH` is given, and it used to be left out.** The old reason was that a
+/// tool call binds exactly the one program it names, at an absolute path, so
+/// the sandbox needed no `PATH` at all. That stopped being true once the dev
+/// shell's whole closure became the mount set: the program is bound on its
+/// own only when no mount already carries it, and for a flake project every
+/// tool in the toolchain is already there. So the missing `PATH` hid nothing
+/// and only stopped honest programs finding what was mounted beside them.
+///
+/// **What it cost, measured 2026-09-18.** `cargo build` answered "could not
+/// execute process `rustc -vV` (never executed)" with `ENOENT`, while `rustc`
+/// run as a tool call worked, because `argv[0]` is resolved against the dev
+/// shell's `PATH` on the host and a child's own lookup had none. Every
+/// toolchain has this shape: cargo runs rustc, make runs cc, npm runs node.
+/// The model reading that error concluded the sandbox forbids a program that
+/// runs a program, which it does not.
+///
+/// **And it was never a boundary.** The same session got a real build by
+/// passing `--config env.PATH=...` on the command line, because everything it
+/// named was mounted already. **The mount set is the boundary**: a `PATH` that
+/// names store paths reaches nothing that is not bound, and a program that
+/// wants something outside the closure still finds nothing there.
 fn sandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -4706,7 +4723,6 @@ fn sandboxEnvironment(
         const equals = std.mem.indexOfScalar(u8, record, '=') orelse continue;
         const key = record[0..equals];
         if (key.len == 0) continue;
-        if (std.mem.eql(u8, key, "PATH")) continue;
         if (namesKey(workspace_env, key)) continue;
         try entries.append(arena, record);
     }
@@ -4723,7 +4739,7 @@ fn namesKey(entries: []const []const u8, key: []const u8) bool {
     return false;
 }
 
-test "the sandbox environment keeps the workspace's own variables and leaves PATH out" {
+test "the sandbox environment keeps the workspace's own variables and carries the dev shell's PATH" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4744,11 +4760,17 @@ test "the sandbox environment keeps the workspace's own variables and leaves PAT
 
     const built = try sandboxEnvironment(arena, &workspace_env, shell);
 
-    try std.testing.expectEqual(@as(usize, 3), built.len);
+    try std.testing.expectEqual(@as(usize, 4), built.len);
     try std.testing.expectEqualStrings("GIT_OBJECT_DIRECTORY=/run/chock/git/objects", built[0]);
     try std.testing.expectEqualStrings("KEEP=me", built[1]);
-    try std.testing.expectEqualStrings("ZIG_GLOBAL_CACHE_DIR=/nix/store/bbb-cache", built[2]);
-    try std.testing.expect(!namesKey(built, "PATH"));
+    try std.testing.expectEqualStrings("PATH=/nix/store/aaa/bin", built[2]);
+    try std.testing.expectEqualStrings("ZIG_GLOBAL_CACHE_DIR=/nix/store/bbb-cache", built[3]);
+
+    // **The dev shell's own, and never the host's.** A program that spawns a
+    // sibling by name finds it only if this names the directory it is in, and
+    // the whole point is that the directory is one the mount set already
+    // carries.
+    try std.testing.expect(namesKey(built, "PATH"));
 }
 
 test "the tool environment is the dev shell's own, and the host's when there is none" {
