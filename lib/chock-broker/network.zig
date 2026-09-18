@@ -1033,6 +1033,11 @@ pub const System = struct {
     /// How long one connection may take to open. A connection that never
     /// answers must not hold the sandboxed call, and the call's own deadline
     /// is a long way above this.
+    /// How long a dial may take, in milliseconds. **Nothing reads this
+    /// today**, and it is kept rather than deleted because it is the value
+    /// the bound wants the moment one can be written: see `dialFn` for why
+    /// there is no deadline on a connection yet. A field nobody reads is
+    /// normally a fault in this project, so this one says why it is here.
     timeout_ms: u64 = 10_000,
 
     pub fn transport(self: *System) Transport {
@@ -1078,18 +1083,39 @@ pub const System = struct {
         return found orelse error.NotResolved;
     }
 
+    /// Open a connection to `address`.
+    ///
+    /// **There is no deadline on this, and there should be.** A host the
+    /// policy permits may simply not answer, and a connection with no bound
+    /// holds this loop for as long as the kernel retries a SYN, which is
+    /// over two minutes on Linux. A sandboxed program can ask for that on
+    /// purpose by naming a permitted host that drops packets.
+    ///
+    /// **It is missing because asking for one aborts the process.** This
+    /// used to pass `.timeout` to `address.connect`, and Zig 0.16's threaded
+    /// implementation answers:
+    ///
+    /// ```
+    /// if (options.timeout != .none) @panic("TODO implement netConnectIpPosix with timeout");
+    /// ```
+    ///
+    /// **Measured 2026-09-18, from the core dump of a real session**: a
+    /// person approved `net.connect.io.crates.index.443`, the router dialled
+    /// it, and chock died with `SIGABRT` inside `netConnectIpPosix`. Every
+    /// connection this broker ever opened would have. It stayed invisible
+    /// because nothing had reached a dial before: the resolver files were
+    /// unreadable, so every name failed first.
+    ///
+    /// **And `std.Io` in 0.16 cannot express the bound another way.** There
+    /// is `Future.cancel` and there is `sleep`, and no way to await a future
+    /// with a deadline. Writing the bound by hand means a non blocking
+    /// connect and a `poll` through `std.posix.system`, because `std.posix`
+    /// no longer carries `socket`, `connect` or `fcntl` at all. That is the
+    /// fix when the standard library grows the timeout, and a plain call is
+    /// what stands until then.
     fn dialFn(ptr: *anyopaque, io: std.Io, address: Transport.Address) Transport.DialError!std.posix.fd_t {
-        const self: *System = @ptrCast(@alignCast(ptr));
-        const stream = address.connect(io, .{
-            .mode = .stream,
-            // `.awake` and not `.real`: a deadline must not move when NTP
-            // steps the wall clock, or it fires early or never fires at all.
-            // The same choice `chock_core.helper.Channel.deadlineIn` makes.
-            .timeout = .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(self.timeout_ms)),
-                .clock = .awake,
-            } },
-        }) catch return error.NotConnected;
+        _ = ptr;
+        const stream = address.connect(io, .{ .mode = .stream }) catch return error.NotConnected;
         return stream.socket.handle;
     }
 };
