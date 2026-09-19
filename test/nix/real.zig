@@ -98,10 +98,15 @@ const RecordingGate = struct {
     gpa: std.mem.Allocator,
     permitted: bool,
     asked: std.ArrayList([]const u8) = .empty,
+    /// The derivations a fetch with no URL was asked about, one entry per
+    /// question, so a test reads how often that question was put.
+    opaque_asked: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *RecordingGate) void {
         for (self.asked.items) |one| self.gpa.free(one);
         self.asked.deinit(self.gpa);
+        for (self.opaque_asked.items) |one| self.gpa.free(one);
+        self.opaque_asked.deinit(self.gpa);
     }
 
     fn gate(self: *RecordingGate) chock_nix.fetch.Gate {
@@ -110,8 +115,20 @@ const RecordingGate = struct {
 
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit = permitFn,
+        .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsNothing,
     };
+
+    fn permitOpaqueFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        subjects: []const []const u8,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *RecordingGate = @ptrCast(@alignCast(ptr));
+        try self.opaque_asked.append(self.gpa, try self.gpa.dupe(u8, subjects[0]));
+        if (self.permitted) return .permitted;
+        return .{ .refused = try allocator.dupe(u8, "no rule allows a fetch with no url") };
+    }
 
     /// This gate reads no rule, so every host it is given is asked about.
     fn allowsNothing(_: *anyopaque, _: chock_nix.fetch.Fetch) bool {
@@ -489,6 +506,99 @@ test "a real mirrors list of this store turns the gnu site into one host, and a 
     try testing.expect(answer == .refused);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "gnu") != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, found.first_gnu_host) != null);
+}
+
+/// A real nixpkgs `fetchurl` derivation of this machine's store, found by the
+/// name a fetched source takes and confirmed by the mirrors file it names.
+/// Null when the store holds none, which is a reason to skip.
+///
+/// **One whose mirrors list is absent is preferred**, because that is the case
+/// the reader used to fail on and the only one that makes it realise anything.
+/// Any of them will do when every mirrors list is already there.
+fn findFetchDerivation(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
+    const endings = [_][]const u8{
+        ".tar.gz.drv",
+        ".tar.xz.drv",
+        ".tar.bz2.drv",
+        ".cabal.drv",
+        ".zip.drv",
+    };
+
+    var store = std.Io.Dir.cwd().openDir(io, "/nix/store", .{ .iterate = true }) catch return null;
+    defer store.close(io);
+
+    var any: ?[]const u8 = null;
+    var walk = store.iterate();
+    while (walk.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const named = for (endings) |ending| {
+            if (std.mem.endsWith(u8, entry.name, ending)) break true;
+        } else false;
+        if (!named) continue;
+
+        const path = try std.fmt.allocPrint(arena, "/nix/store/{s}", .{entry.name});
+        const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch
+            continue;
+        if (std.mem.indexOf(u8, text, "mirrorsFile") == null and
+            std.mem.indexOf(u8, text, "mirrorsListFile") == null) continue;
+
+        const mirrors = mirrorsPathIn(text) orelse {
+            if (any == null) any = path;
+            continue;
+        };
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        _ = std.Io.Dir.cwd().realPathFile(io, mirrors, &buffer) catch return path;
+        if (any == null) any = path;
+    }
+    return any;
+}
+
+/// The store path of the mirrors list `text` names, read out of the ATerm the
+/// `.drv` file is written in.
+fn mirrorsPathIn(text: []const u8) ?[]const u8 {
+    const ending = "-mirrors-list";
+    const at = std.mem.indexOf(u8, text, ending) orelse return null;
+    const before = std.mem.lastIndexOf(u8, text[0..at], "/nix/store/") orelse return null;
+    return text[before .. at + ending.len];
+}
+
+test "a real fetchurl derivation has its mirrors list read, realised first when it is absent" {
+    // **The fault this closes.** The closure a derivation names is `.drv`
+    // files, and a mirrors list is itself a derivation, so on an ordinary
+    // store its output is simply not there. Reading it as a file and stopping
+    // refused every real build.
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const drv = (try findFetchDerivation(arena, io)) orelse return error.SkipZigTest;
+
+    // The host's own environment is not reachable from a test, so `nix` gets
+    // an empty one. It still finds the store and the daemon.
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+
+    const closure = chock_nix.fetch.fetchesOf(arena, io, host.runner(), drv) catch |err| switch (err) {
+        error.RunnerFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    if (closure == .nix_said) return error.SkipZigTest;
+
+    // **What a table cannot pin.** The path came from the real derivation, the
+    // producer came from the real closure, and the file was read whether the
+    // store already held it or `nix` had to take it from a substituter.
+    try testing.expect(closure == .reached);
+    try testing.expect(closure.reached.reads_mirrors);
+    try testing.expect(closure.reached.hashed.len != 0);
+    try testing.expect(closure.reached.hashed[0].target != null);
 }
 
 /// Run `nix` with these arguments on this machine and answer what it wrote on

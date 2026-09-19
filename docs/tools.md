@@ -227,14 +227,20 @@ answer.
 A host nobody allowed refuses the build before `nix` is told to build anything,
 and the refusal names the host and the derivation, so the agent can ask you for
 that host rather than try the same attribute again. A URL whose scheme is not
-`http` or `https`, and one with no host in it, are both refusals too: Chock
-will not guess a port, and a fetch nobody can name is a fetch nobody can rule
-on.
+`http`, `https` or `ftp`, and one with no host in it, are both refusals too:
+Chock will not guess a port, and a fetch nobody can name is a fetch nobody can
+rule on. An `ftp://` URL is named at port 21, so a rule for it looks like any
+other: `net.connect.org.gmplib.ftp.21`.
 
 A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
 them. The derivation also names its own mirrors file, a store path that holds
 the mirrors of every site, so Chock reads that file and turns the site into the
-hosts it really names. One site is one question: the mirrors are taken in the
+hosts it really names. That file is itself a derivation output, so it is often
+not in your store yet. Chock realises it first, with local and remote builds
+both turned off, so Nix either takes it from a substituter or refuses: no
+builder runs for it, and a derivation that named a path of its own cannot be
+built before a rule has answered. A mirrors file no substituter has is a
+refusal that says so. One site is one question: the mirrors are taken in the
 file's own order, one your rules already allow is taken with nothing asked, and
 otherwise you are asked about the first of them. A site the file does not name,
 and a derivation with no mirrors file, stay refusals.
@@ -246,11 +252,28 @@ nixpkgs fetcher tries a hashed mirror for every fetch and would otherwise reach
 a host that appears in no URL of the derivation. Only a rule can turn that one
 on, and it is off for every other build.
 
-A fixed output derivation that says nowhere it fetches from is a refusal for
-the same reason. Some fetchers read their URLs out of a lock file at build
-time, `fetchCargoVendor` and `npmDeps` among them, and those hold no URL
-anywhere in the derivation. The network is open to them and no rule can cover
-them, so Chock refuses rather than lets them run.
+A fixed output derivation that says nowhere it fetches from is a different
+question, `nix.fetch.opaque`. Some fetchers read their URLs out of a lock file
+at build time, `zig.fetchDeps`, npm deps and `fetchCargoVendor` among them, and
+those hold no URL anywhere in the derivation. There is no host, so there is
+nothing `net.connect` can name.
+
+**Chock ships that one as `allow`**, because that is how every vendored
+dependency fetch works: refusing them refuses nearly every Rust, Node and Zig
+package. The question is one per build and never one per derivation, and the
+derivation names go in the words you read, never in the action, so one answer
+covers a session.
+
+What you give up is stated plainly: the output hash proves the bytes are the
+ones the derivation expected, and proves nothing about where the request went.
+If you want the question back, write it in your own `chock.zon`:
+
+```zon
+.{ .action = "nix.fetch.opaque", .decision = .ask },
+```
+
+`.deny` refuses such a build outright. Every derivation that does name a URL is
+unaffected either way and still goes to `net.connect` per host.
 
 **The rule is all of it, and there is no backstop under it.** Nix has no flag
 that keeps a fixed output builder off the network. `--offline` turns your

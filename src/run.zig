@@ -4976,8 +4976,20 @@ const StartupFetchGate = struct {
 
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit = permitFn,
+        .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsByRuleFn,
     };
+
+    /// A flake input names a host or it is not fetched at all, so nothing
+    /// here ever reaches this question. Refused rather than permitted, for the
+    /// reason every unwired seam in this file is.
+    fn permitOpaqueFn(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const []const u8,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        return .{ .refused = "a flake input is fetched by host and never without one" };
+    }
 
     fn permitFn(
         ptr: *anyopaque,
@@ -11378,6 +11390,11 @@ fn nixBuildFor(
 /// action name cannot ask the table, and fetching anyway would reach a host no
 /// rule could ever have named.
 const NixFetchGate = struct {
+    /// What a build that fetches with no URL is asked under. **Two fixed
+    /// segments**, so nothing a model chose is ever part of the key and one
+    /// answer covers a session rather than one package.
+    const opaque_action = "nix.fetch.opaque";
+
     /// This tool call's own, for the question and for nothing that outlives
     /// it. A refusal comes from the allocator `permit` is given, which is the
     /// session's, because the build reads it after this call is over.
@@ -11428,8 +11445,70 @@ const NixFetchGate = struct {
 
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit = permitFn,
+        .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsByRuleFn,
     };
+
+    /// Whether this build may fetch without saying where it goes.
+    ///
+    /// **Two fixed segments and nothing a model chose.** `opaque_action` can
+    /// never collide with an attribute path the way a name built out of one
+    /// could, and one answer covers the whole build: the derivation names go
+    /// in the words a person reads and never in the key.
+    ///
+    /// The question states the whole of the decision. A fixed output
+    /// derivation's hash still proves the bytes are what the derivation
+    /// expected. What it cannot prove is where the request went.
+    fn permitOpaqueFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        subjects: []const []const u8,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+        std.debug.assert(subjects.len != 0);
+
+        const summary = if (subjects.len == 1) try std.fmt.allocPrint(
+            self.gpa,
+            "a Nix build fetches without saying where from",
+            .{},
+        ) else try std.fmt.allocPrint(
+            self.gpa,
+            "{d} parts of a Nix build fetch without saying where from",
+            .{subjects.len},
+        );
+        defer self.gpa.free(summary);
+
+        const others = if (subjects.len == 1) try self.gpa.dupe(u8, "") else try std.fmt.allocPrint(
+            self.gpa,
+            " There are {d} of them in this closure, and this answer covers all of them.",
+            .{subjects.len},
+        );
+        defer self.gpa.free(others);
+
+        const detail = try std.fmt.allocPrint(
+            self.gpa,
+            "{s} fetches while it builds and names no URL anywhere, so no host of it can be " ++
+                "put to a rule. Its output hash still proves the bytes are the ones the " ++
+                "derivation expected. What nothing proves is where the request went.{s} The " ++
+                "build is {s}.",
+            .{ subjects[0], others, self.installable },
+        );
+        defer self.gpa.free(detail);
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, self.gpa, self.io, .{
+            .action = opaque_action,
+            .summary = summary,
+            .detail = detail,
+            .reason = "",
+            .tool = self.call.tool,
+            .tool_call_id = self.call.call_id,
+        });
+        if (answer.permitted) return .permitted;
+
+        const said = try chock_core.arbiter.refusalText(self.gpa, opaque_action, answer);
+        defer self.gpa.free(said);
+        return .{ .refused = try allocator.dupe(u8, said) };
+    }
 
     fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
         const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
@@ -18151,6 +18230,34 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
     })).refused;
     try std.testing.expect(std.mem.indexOf(u8, unnameable, "net.connect") == null);
     try std.testing.expect(std.mem.indexOf(u8, unnameable, "d-src.drv") != null);
+}
+
+test "a build that fetches with no url is asked under two fixed segments, and the words name it" {
+    // **Nothing a model chose is in the key.** An action built out of a
+    // derivation name could collide with an attribute path, and it would put
+    // one question per package where one covers the build.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.aarch64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+    };
+
+    const said = (try gate.gate().permitOpaque(arena, &.{
+        "chock-0.1.0-zig-deps.drv",
+        "furo-web-2025.12.19-npm-deps.drv",
+    })).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "nix.fetch.opaque") != null);
+    // Two segments and nothing else: no derivation name ever reaches the key.
+    try std.testing.expect(std.mem.indexOf(u8, said, "zig-deps") == null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect") == null);
+    try std.testing.expectEqualStrings("nix.fetch.opaque", NixFetchGate.opaque_action);
 }
 
 test "a flake input host is asked of the policy table at startup, and ask is off there" {

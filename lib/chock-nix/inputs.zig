@@ -645,8 +645,19 @@ const AnsweringGate = struct {
 
     const vtable: fetch.Gate.VTable = .{
         .permit = permitFn,
+        .permit_opaque = permitNothing,
         .allows_by_rule = allowsNothing,
     };
+
+    /// A lock node names a host or it is refused, so nothing here reaches the
+    /// question a build with no URL puts.
+    fn permitNothing(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const []const u8,
+    ) std.mem.Allocator.Error!fetch.Verdict {
+        return .{ .refused = "a flake input is fetched by host and never without one" };
+    }
 
     /// No rule here at all, so no mirror of a site is taken without a
     /// question. A flake input names a host and never a site.

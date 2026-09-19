@@ -64,6 +64,24 @@
 //! off gives every builder the network, not only a fixed output one, and
 //! nothing here reads that setting.
 //!
+//! **A fetch nobody named is allowed by default, and that is the widest thing
+//! in this list.** A fixed output derivation that says nowhere it fetches from
+//! has no host any rule could cover, and `zig.fetchDeps`, npm deps and
+//! `fetchCargoVendor` are all that shape. `nix.fetch.opaque` is the one
+//! question about them, and `lib/chock-policy/defaults.zig` ships it as
+//! `allow`, because a default that refused them refuses nearly every Rust,
+//! Node and Zig package. So the output hash proves the bytes are the ones the
+//! derivation expected, nothing proves where the request went, and a build
+//! allowed by that default can reach a host nobody named. A project takes it
+//! back with one rule of its own.
+//!
+//! **A mirrors file is realised before any rule has answered.** It is a
+//! derivation output, so on an ordinary store it is not there yet. The realise
+//! runs with local and remote builds both off, so Nix substitutes the output
+//! or refuses and no builder runs, which is what keeps a path an expression
+//! named from being built here. A substituter answers over the network, and
+//! that is the same channel a build's own substitution already uses.
+//!
 //! **A mirror pin holds because the builder reads it, and for no other
 //! reason.** `NIX_MIRRORS_<site>` and `NIX_HASHED_MIRRORS` are what the two
 //! nixpkgs `fetchurl` builders read, and both variables are in the
@@ -517,6 +535,24 @@ pub const Host = struct {
             }
         }
 
+        // **One question for the whole build, and only when there is one to
+        // ask.** A closure with no such derivation never reaches this, so a
+        // project that wrote a rule for it is never asked about a build that
+        // has none.
+        if (reached.opaque_subjects.len != 0) {
+            switch (try self.gate.permitOpaque(self.allocator, reached.opaque_subjects)) {
+                .permitted => {},
+                .refused => |why| {
+                    self.refusal = try fetch.opaqueRefusal(
+                        self.allocator,
+                        reached.opaque_subjects,
+                        why,
+                    );
+                    return FetchRefused.FetchNotPermitted;
+                },
+            }
+        }
+
         var pins: std.ArrayList(provision.Variable) = .empty;
         for (reached.sites) |one| {
             const allowed = try self.chooseMirror(one);
@@ -877,6 +913,10 @@ const AnsweringGate = struct {
     /// How many of the questions reached somebody, which is every one a rule
     /// did not already answer.
     prompted: usize = 0,
+    /// Whether a build may fetch with no URL, and how often that was asked.
+    opaque_permitted: bool = true,
+    opaque_asks: usize = 0,
+    opaque_count: usize = 0,
 
     fn deinit(self: *AnsweringGate) void {
         for (self.asked.items) |one| self.gpa.free(one);
@@ -889,8 +929,21 @@ const AnsweringGate = struct {
 
     const vtable: fetch.Gate.VTable = .{
         .permit = permitFn,
+        .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsByRuleFn,
     };
+
+    fn permitOpaqueFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        subjects: []const []const u8,
+    ) std.mem.Allocator.Error!fetch.Verdict {
+        const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
+        self.opaque_asks += 1;
+        self.opaque_count = subjects.len;
+        if (self.opaque_permitted) return .permitted;
+        return .{ .refused = try allocator.dupe(u8, "this project answers deny for it") };
+    }
 
     fn permitFn(
         ptr: *anyopaque,
@@ -1447,7 +1500,7 @@ test "a fixed output derivation with a scheme nothing can name refuses the build
     var fake = FakeRunner{ .gpa = gpa, .replies = &.{
         .{
             .stdout =
-            \\{"derivations":{"b-src.drv":{"env":{"url":"ftp://files.example.com/src.tar.gz"},
+            \\{"derivations":{"b-src.drv":{"env":{"url":"s3://files.example.com/src.tar.gz"},
             \\ "outputs":{"out":{"hash":"sha256-A"}}}}}
             ,
         },
@@ -1461,7 +1514,7 @@ test "a fixed output derivation with a scheme nothing can name refuses the build
     });
 
     try testing.expect(answer == .refused);
-    try testing.expect(std.mem.indexOf(u8, answer.refused, "ftp://files.example.com") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "s3://files.example.com") != null);
     try testing.expectEqual(@as(usize, 1), fake.calls);
     try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
 }
@@ -1729,4 +1782,132 @@ test "a closure that reads no mirrors file pins nothing at all" {
 
     try testing.expect(answer == .built);
     try testing.expectEqual(@as(usize, 0), fake.seen_pins.items.len);
+}
+
+/// A closure whose one fixed output derivation says nowhere it fetches from,
+/// which is the shape `zig.fetchDeps` and npm deps take, and one that holds
+/// three of them.
+const closure_that_fetches_opaquely =
+    \\{"derivations":{"b-zig-deps.drv":{"env":{"name":"b"},
+    \\ "outputs":{"out":{"hash":"sha256-A","method":"recursive"}}}}}
+;
+const closure_with_three_opaque_fetches =
+    \\{"derivations":{
+    \\ "b-zig-deps.drv":{"env":{"name":"b"},"outputs":{"out":{"hash":"sha256-A"}}},
+    \\ "c-npm-deps.drv":{"env":{"name":"c"},"outputs":{"out":{"hash":"sha256-B"}}},
+    \\ "d-cargo-vendor.drv":{"env":{"name":"d"},"outputs":{"out":{"hash":"sha256-C"}}}
+    \\}}
+;
+
+/// Everything `realise` needs for a closure a test supplies: an evaluated
+/// derivation this session produced, and the replies `nix` gives.
+fn realiseClosure(
+    arena: std.mem.Allocator,
+    fake: *FakeRunner,
+    gate: *AnsweringGate,
+    driver: *backend.Driver,
+) !Answer {
+    return realise(arena, testing.io, fake.runner(), driver, gate.gate(), .{
+        .derivation_path = drvPathOf(driver).?,
+        .installable = "/work#packages.x86_64-linux.default",
+    });
+}
+
+test "a build that fetches with no url asks once, and a no names a derivation" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+    try evaluateDerivation(gpa, &driver);
+
+    var gate = AnsweringGate{ .gpa = gpa, .opaque_permitted = false };
+    defer gate.deinit();
+
+    var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+        .{ .stdout = closure_with_three_opaque_fetches },
+        .{ .stdout = example_out ++ "\n" },
+    } };
+    defer fake.deinit();
+
+    const answer = try realiseClosure(arena, &fake, &gate, &driver);
+
+    try testing.expect(answer == .refused);
+    // One question for the three, because there is no host to tell them apart
+    // by and three questions with one answer is a person trained to say yes.
+    try testing.expectEqual(@as(usize, 1), gate.opaque_asks);
+    try testing.expectEqual(@as(usize, 3), gate.opaque_count);
+    // A derivation and the count, which is the only handle a person has here.
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "deps.drv") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "3 derivations") != null);
+    // Nothing was built: one call, and it is the closure read.
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("derivation", fake.seen.items[0][0]);
+    // No host was ever put to `net.connect`: there was none to put.
+    try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
+}
+
+test "a yes to a fetch with no url builds, and a closure with none never asks it" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var budget: Budget = .{};
+        var recording: RecordingWriter = .{ .gpa = gpa };
+        var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+        var driver = backend.Driver.init(gpa, writing.seam());
+        defer driver.deinit();
+        try evaluateDerivation(gpa, &driver);
+
+        var gate = AnsweringGate{ .gpa = gpa, .opaque_permitted = true };
+        defer gate.deinit();
+
+        var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+            .{ .stdout = closure_that_fetches_opaquely },
+            .{ .stdout = example_out ++ "\n" },
+            .{ .stdout = example_out ++ "\n" },
+        } };
+        defer fake.deinit();
+
+        const answer = try realiseClosure(arena, &fake, &gate, &driver);
+        try testing.expect(answer == .built);
+        try testing.expectEqual(@as(usize, 1), gate.opaque_asks);
+    }
+
+    // **A closure with no such derivation never reaches the question.** A
+    // project that wrote a rule for it is not asked about a build that has
+    // none.
+    {
+        var budget: Budget = .{};
+        var recording: RecordingWriter = .{ .gpa = gpa };
+        var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+        var driver = backend.Driver.init(gpa, writing.seam());
+        defer driver.deinit();
+        try evaluateDerivation(gpa, &driver);
+
+        var gate = AnsweringGate{ .gpa = gpa, .opaque_permitted = false };
+        defer gate.deinit();
+
+        var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+            .{ .stdout = closure_that_fetches },
+            .{ .stdout = example_out ++ "\n" },
+            .{ .stdout = example_out ++ "\n" },
+        } };
+        defer fake.deinit();
+
+        const answer = try realiseClosure(arena, &fake, &gate, &driver);
+        try testing.expect(answer == .built);
+        try testing.expectEqual(@as(usize, 0), gate.opaque_asks);
+        // And the one that does name a url went to `net.connect` as before.
+        try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+        try testing.expectEqualStrings("files.example.com", gate.asked.items[0]);
+    }
 }
