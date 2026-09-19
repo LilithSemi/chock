@@ -260,6 +260,11 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
+    // **An evaluation reads and never builds.** It runs in the harness, in
+    // pure mode, and the one tree it may read is the workspace the reading
+    // tools above already read, so it is the same class as `call.read_file`.
+    // A build is a separate act under `nix.build`, which is not this row.
+    .{ .action = "call.nix_eval", .decision = .allow },
     // **A language server, which every project that has one already runs.**
     // Shipped `allow` so that giving this act a name changes nothing for
     // anybody: a project with a `language_servers` block behaves exactly as it
@@ -391,6 +396,7 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
         "call.read_memory",
         "call.write_memory",
         "call.provide_tool",
+        "call.nix_eval",
     };
     for (call_actions) |action| {
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key(action)));

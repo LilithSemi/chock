@@ -333,6 +333,14 @@ pub const Support = struct {
     /// `nix.build`. All three hold for the whole session, which is what makes
     /// a static tool list able to carry the answer. See `src/run.zig`.
     provisioning: bool = false,
+    /// This session can evaluate a Nix expression, so `nix_eval` has
+    /// somewhere to work.
+    ///
+    /// **Not a wire format question and not a provider question**, the same
+    /// as `provisioning` above. An evaluation runs in Chock's own process,
+    /// so a caller says true when it holds the evaluator and knows the one
+    /// directory a pure evaluation may read. See `src/run.zig`.
+    nix_eval: bool = false,
     /// What kind of agent this session runs as. **Not a wire format question
     /// and not a provider question**, the same as the two fields above: it
     /// asks what this agent is for. An `arbitrator` is offered no tool at all,
@@ -689,6 +697,7 @@ pub const Tool = enum {
     spawn_agent,
     update_plan,
     provide_tool,
+    nix_eval,
     restrict_self,
     fetch_url,
     ask_user,
@@ -717,6 +726,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .nix_eval,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -749,6 +759,10 @@ pub const Tool = enum {
             // denies `nix.build`, never hears this name. See
             // `Support.provisioning`.
             .provide_tool => support.provisioning,
+            // Gated for the same reason `provide_tool` is: whether this
+            // session can evaluate at all is a fact about the caller that
+            // holds for the whole session. See `Support.nix_eval`.
+            .nix_eval => support.nix_eval,
             .read_file,
             // Both of its gates were already read at the top of this
             // function, by `support.offers(self.needs())`. Nothing else holds
@@ -1261,6 +1275,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .nix_eval,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -1303,6 +1318,9 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            // It renders a value and never writes a byte anywhere. See
+            // `nix_eval_needs_a_session`.
+            .nix_eval,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -1351,6 +1369,10 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            // The store writes an evaluation could make are off, and the
+            // answer reaches the model rather than the disk. See
+            // `src/run.zig`'s own `NixEvalToolRunner`.
+            .nix_eval,
             .restrict_self,
             // The page reaches the model and never the disk. See
             // `lib/chock-core/fetch.zig`.
@@ -1489,6 +1511,17 @@ pub const Tool = enum {
                 "is the package \"ripgrep\". The program is there for every call after this one, " ++
                 "and for this session only. Resolving takes seconds and can take minutes, so ask " ++
                 "for a program you are going to use.",
+            .nix_eval => "Evaluate one Nix expression and read the answer. Use it to find out " ++
+                "what a package set or a flake really says: the value of an attribute, the " ++
+                "names in a set, the derivation path of a package. **Nothing is built.** A " ++
+                "derivation answers what it is and where its derivation file would be, and " ++
+                "that is the whole of it, so an expression that reads the result of a build, " ++
+                "such as an import of a derivation, is refused and says which derivation it " ++
+                "wanted. The evaluation is pure: the environment is empty, there is no " ++
+                "NIX_PATH and no channel, and it reads files inside the workspace and nothing " ++
+                "else on the machine. Give the expression alone, the way you would type it " ++
+                "into a repl. The answer is rendered the same way a repl renders it, up to " ++
+                max_nix_eval_text ++ " bytes.",
             .restrict_self => "Promise that you will not do something in this session. Use it " ++
                 "when you have worked out what the task needs and can see what it does not need: " ++
                 "\"net.fetch\" at \"deny\" for a task that reads local files, \"git.push\" at " ++
@@ -1576,6 +1609,7 @@ pub const Tool = enum {
             .spawn_agent => SpawnAgentArgs,
             .update_plan => UpdatePlanArgs,
             .provide_tool => ProvideToolArgs,
+            .nix_eval => NixEvalArgs,
             .restrict_self => RestrictSelfArgs,
             .fetch_url => FetchUrlArgs,
             .ask_user => AskUserArgs,
@@ -1584,6 +1618,14 @@ pub const Tool = enum {
         };
     }
 };
+
+/// The most bytes one `nix_eval` answer renders to. A rendered attribute set
+/// of a real package set is far larger than a model can use, and the answer
+/// travels into the context window, so this is where it stops.
+pub const max_nix_eval_bytes: usize = 16 << 10;
+
+/// `max_nix_eval_bytes` as text, for `Tool.description`.
+const max_nix_eval_text = std.fmt.comptimePrint("{d}", .{max_nix_eval_bytes});
 
 /// `max_directory_entries` as text, for `Tool.description`, which is built at
 /// comptime and cannot call a formatter.
@@ -1786,6 +1828,7 @@ pub const Registry = struct {
             .spawn_agent => toolErrorResult(allocator, call, try allocator.dupe(u8, spawn_needs_a_session)),
             .update_plan => toolErrorResult(allocator, call, try allocator.dupe(u8, plan_needs_a_session)),
             .provide_tool => toolErrorResult(allocator, call, try allocator.dupe(u8, provision_needs_a_session)),
+            .nix_eval => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_eval_needs_a_session)),
             .restrict_self => toolErrorResult(allocator, call, try allocator.dupe(u8, restrict_needs_a_session)),
             .fetch_url => toolErrorResult(allocator, call, try allocator.dupe(u8, fetch_needs_a_session)),
             .ask_user => toolErrorResult(allocator, call, try allocator.dupe(u8, ask_needs_a_session)),
@@ -1858,6 +1901,23 @@ pub const restrict_needs_a_session = "nothing was promised: a promise is kept in
 pub const provision_needs_a_session = "no program was provisioned: a program is added to the " ++
     "toolchain of a whole session, and this tool call was run without one. Do the work with a " ++
     "program the toolchain already has.";
+
+/// What a `nix_eval` call gets from `Registry.dispatchWith`.
+///
+/// **A `Registry` cannot evaluate, and the reason is the same one
+/// `provision_needs_a_session` gives.** An evaluation runs in Chock's own
+/// process, outside every sandbox, against an evaluator the caller holds and
+/// a store cap the caller read out of the project's own policy. A `Registry`
+/// builds one `sandbox.Config` per dispatch and holds neither. So the caller
+/// that owns the session answers this call, exactly as it answers
+/// `provide_tool`, and this is the answer for a dispatch with no session
+/// behind it.
+///
+/// It refuses rather than answering an empty value, because a model handed a
+/// value nobody computed would reason about it.
+pub const nix_eval_needs_a_session = "nothing was evaluated: a Nix evaluation runs in the " ++
+    "harness itself, outside every sandbox, and this tool call was run without the session " ++
+    "that owns it. Work from what is in the project instead.";
 
 /// What a `fetch_url` call gets from `Registry.dispatchWith`.
 ///
@@ -2497,6 +2557,19 @@ pub const ProvideToolArgs = struct {
         .program = "The package name, alone. Not a path, not a URL, and not a flake reference: " ++
             "\"ripgrep\", or \"python3Packages.requests\" for a package inside a set. Where the " ++
             "name is looked up is set by the project and you cannot change it.",
+    };
+};
+
+/// Public for the same reason `ProvideToolArgs` is: the caller that owns the
+/// session holds the evaluator, so it parses these arguments and this file
+/// never does. See `nix_eval_needs_a_session`.
+pub const NixEvalArgs = struct {
+    expression: []const u8,
+
+    pub const docs = .{
+        .expression = "The Nix expression, alone, the way you would type it into a repl. It is " ++
+            "evaluated in pure mode, so an impure builtin answers nothing and a path outside " ++
+            "the workspace is refused.",
     };
 };
 
@@ -7241,6 +7314,7 @@ const full_support = Support{
     .provider = .{ .images = true },
     .memory = true,
     .provisioning = true,
+    .nix_eval = true,
 };
 
 test "every tool in the enum is offered, and each one is named exactly once" {
@@ -7264,15 +7338,15 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
 
-    // The nineteen a session with everything gets, by name, so a tool that
+    // The twenty a session with everything gets, by name, so a tool that
     // quietly loses its entry is a test failure and not a smaller list
     // nobody notices.
     const expected = [_][]const u8{
         "read_file",     "read_image",   "list_directory", "glob",
         "grep",          "write_file",   "edit_file",      "run_command",
         "read_guidance", "read_memory",  "write_memory",   "spawn_agent",
-        "update_plan",   "provide_tool", "restrict_self",  "fetch_url",
-        "ask_user",      "set_title",    "request_action",
+        "update_plan",   "provide_tool", "nix_eval",       "restrict_self",
+        "fetch_url",     "ask_user",     "set_title",      "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -7350,12 +7424,12 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     try std.testing.expectEqual(Role.worker, (Context{}).role);
 }
 
-test "a session with no knowledgebase, no Nix and no vision is offered none of those four tools" {
+test "a session with no knowledgebase, no Nix and no vision is offered none of those five tools" {
     // A tool the model cannot use is worse than a tool that is missing: it
     // costs one turn to call and one to read the failure, and a small model
     // may never recover from the confusion. So a caller that could not make
     // the directory, cannot reach Nix, and talks to a provider that says
-    // nothing about images offers fifteen tools, not nineteen with four that
+    // nothing about images offers fifteen tools, not twenty with five that
     // always fail.
     //
     // `spawn_agent` is the one tool this reasoning does not reach, because
@@ -7366,18 +7440,21 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 4, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 5, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
-        // The fourth, and the only one of the four whose gate is the wire and
+        // A session that cannot evaluate never hears this name, the same
+        // rule `provide_tool` above keeps and for the same reason.
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
+        // The fifth, and the only one of the five whose gate is the wire and
         // the provider rather than something the caller built. See `Support`.
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_image"));
     }
 
-    // And the three gates are separate: a session that can provision and has
-    // no knowledgebase is offered the one and not the other two. A single
+    // And the four gates are separate: a session that can provision and has
+    // no knowledgebase is offered the one and not the other three. A single
     // flag standing for all of them would pass the check above and fail this.
     const nix_only = try Registry.definitions(arena, .{
         .adapter = .openai_compatible,
@@ -7387,8 +7464,24 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
     for (nix_only) |def| {
         if (std.mem.eql(u8, def.name, "provide_tool")) saw_provide = true;
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
     }
     try std.testing.expect(saw_provide);
+
+    // The other half of the same separation: evaluating and provisioning are
+    // two facts about a session, and a caller that has one may not have the
+    // other. A session on a machine with Nix but a policy that denies a
+    // build is exactly this shape.
+    const eval_only = try Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+        .nix_eval = true,
+    });
+    var saw_eval = false;
+    for (eval_only) |def| {
+        if (std.mem.eql(u8, def.name, "nix_eval")) saw_eval = true;
+        try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
+    }
+    try std.testing.expect(saw_eval);
 
     // And `read_guidance` is there either way: the shelf is compiled in, so
     // it needs no directory and cannot be missing.
@@ -9307,6 +9400,30 @@ test "a provide_tool call with no session behind it is refused, and never says t
     try std.testing.expectEqualStrings(provision_needs_a_session, result.output);
     // And it names what to do instead, rather than only what went wrong.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "already has") != null);
+}
+
+test "a nix_eval call with no session behind it is refused, and never answers a value" {
+    // A `Registry` cannot evaluate: the evaluator and the store cap both
+    // belong to the session, and a dispatch owns nothing that outlives one
+    // call. The caller that owns the session answers it, exactly as it
+    // answers `provide_tool`. What matters here is that the refusal is
+    // honest: a model handed an empty value would reason about it.
+    const allocator = std.testing.allocator;
+    var env = try std.testing.environ.createMap(allocator);
+    defer env.deinit();
+
+    const result = try Registry.dispatch(allocator, std.testing.io, &env, unreached_config, .{
+        .call_id = "call1",
+        .tool = "nix_eval",
+        .arguments = "{\"expression\":\"1 + 1\"}",
+    });
+    defer allocator.free(result.call_id);
+    defer allocator.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(nix_eval_needs_a_session, result.output);
+    // And it names what to do instead, rather than only what went wrong.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "in the project") != null);
 }
 
 test "a program that is not there names provide_tool only when this session really has it" {

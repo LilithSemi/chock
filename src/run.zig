@@ -880,6 +880,10 @@ const Started = struct {
     /// null when it cannot. See `provisioningFor`, which says out loud why a
     /// session has none.
     provisioning: ?Provisioning,
+    /// How much a Nix evaluation of this session may put in the store, from
+    /// the `nix` block of `chock.zon`, the operator's own `config.zon`, and
+    /// the org policy bundle's ceiling. See `resolveNixCaps`.
+    nix_caps: chock_policy.nix.Resolved,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
     /// The base URL and the credential of the instance this session talks to.
@@ -2094,11 +2098,22 @@ fn start(
         dev_shell_dir,
     );
 
+    // What a Nix evaluation of this session may put in the store. Read here,
+    // beside provisioning, because both are answers about Nix that the tool
+    // list depends on.
+    const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
+
     const support = chock_core.tools.Support{
         .adapter = adapter,
         .provider = .{ .images = instance.capabilities.images },
         .memory = memory_ready,
         .provisioning = provisioning != null,
+        // **Always true, and that is the whole of the gate.** An evaluation
+        // runs in this process, through fix, so it needs no `nix` binary, no
+        // daemon and no store: see `lib/chock-nix/eval.zig`. A session that
+        // cannot provision can still evaluate, which is the shape a project
+        // whose policy denies `nix.build` has.
+        .nix_eval = true,
         // A reviewer is offered no tool at all, so the list below comes back
         // empty and the prompt names none: see `agentRole`.
         .role = agentRole(options),
@@ -2178,6 +2193,7 @@ fn start(
         .toolchain = toolchain,
         .tool_env = tool_env,
         .provisioning = provisioning,
+        .nix_caps = nix_caps,
         .backing = backing,
         .storage = storage,
         .base_url = instance.base_url,
@@ -2996,6 +3012,54 @@ fn resolveLimits(
 fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
     config.limits.processes = resolved.processes;
     config.limits.memory_bytes = resolved.memory_bytes;
+}
+
+/// How much a Nix evaluation of this session may put in the store: the `nix`
+/// block of `chock.zon`, over the operator's own `config.zon`, over the built
+/// in default, held last under the org policy bundle's ceiling. The same
+/// shape `resolveLimits` above has, and the same three layers.
+///
+/// The number lands on `chock_nix.backend.Driver.max_object_bytes` through
+/// `applyNixCaps`. `max_session_bytes` is folded here and nothing reads it
+/// yet: see `chock_policy.nix`'s own top comment.
+fn resolveNixCaps(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    config_dir: []const u8,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) StartError!chock_policy.nix.Resolved {
+    var diag: ?chock_policy.nix.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    // One diagnostic slot serves both files, the same way `resolveLimits`
+    // uses one: it carries which of the two it is about.
+    const project = chock_policy.nix.load(arena, io, project_root, &diag) catch |err|
+        return reportNixCaps(err, &diag);
+    const operator = chock_policy.nix.loadOperator(arena, io, config_dir, &diag) catch |err|
+        return reportNixCaps(err, &diag);
+
+    const ceiling = if (org_bundle) |bundle| bundle.nix else null;
+    return chock_policy.nix.foldLayers(project, operator, ceiling);
+}
+
+/// `resolved` written into the driver an evaluation answers through.
+fn applyNixCaps(driver: *chock_nix.backend.Driver, resolved: chock_policy.nix.Resolved) void {
+    driver.max_object_bytes = std.math.cast(usize, resolved.max_object_bytes) orelse
+        std.math.maxInt(usize);
+}
+
+/// The one message a refused `nix` block writes. The session does not start,
+/// for the reason `reportLimits` gives: a number that does not parse is one
+/// somebody wrote on purpose.
+fn reportNixCaps(err: anyerror, diag: *?chock_policy.nix.Diagnostic) StartError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (diag.*) |*d| {
+        tty.print(.err, "chock run: the nix block could not be read: {f}\n", .{d});
+    } else {
+        tty.print(.err, "chock run: the nix block could not be read: {t}\n", .{err});
+    }
+    return error.Reported;
 }
 
 /// The one message a refused `limits` block writes. The session does not
@@ -10751,6 +10815,221 @@ const provisioning_is_off = "no program was provisioned: this session cannot add
     "work with a program the toolchain already has, and do not run apt, npm, pip, cargo or " ++
     "brew, because none of them can work in this sandbox.";
 
+/// Answers `nix_eval` and passes every other call straight through.
+///
+/// ## Why this is a wrapper and not a tool of the registry
+///
+/// The same reason `ProvisionToolRunner` above is one, from the other side.
+/// `chock_core.tools.Registry` runs one tool call inside a sandbox, and an
+/// evaluation runs in this process, outside every sandbox, against a store
+/// cap read out of the project's own policy at session start. A registry
+/// holds neither the evaluator nor the cap, so it refuses the call and says
+/// why, and this answers it. See
+/// `chock_core.tools.nix_eval_needs_a_session`.
+///
+/// ## Store writes stay off, and that is a decision
+///
+/// fix writes nothing to a store until a caller asks for it, and this caller
+/// does not ask. An evaluation that says what a derivation is computes the
+/// derivation path itself, with no daemon, no store mount and no object
+/// written anywhere: see `lib/chock-nix/eval.zig`'s own test. Turning writes
+/// on would buy nothing here and would put the bytes of every derivation an
+/// expression touches through this process.
+///
+/// **The driver is still installed, and `Seam.refusing` is what it is given.**
+/// An evaluation that reaches for a store then gets a refusal that names the
+/// path, which is what import from derivation needs: fix reports the store
+/// error text and nothing else about why the import stopped, so a model that
+/// read a subjectless failure would send the same expression again. See
+/// `nixEvalRefusal`.
+///
+/// ## One session per call
+///
+/// An engine holds every value it answered, so a session that lived for the
+/// whole run would grow with every call the agent made. A call is bounded in
+/// depth and in what it renders, and building an engine is cheap beside a
+/// sandbox, so each call gets its own and drops it.
+const NixEvalToolRunner = struct {
+    inner: chock_core.Loop.ToolRunner,
+    /// Null when this session cannot evaluate. The model is not offered the
+    /// tool then, so a call that arrives anyway is refused here.
+    settings: ?NixEval,
+
+    fn runner(self: *NixEvalToolRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *NixEvalToolRunner = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_eval))) {
+            return self.inner.dispatch(gpa, io, call);
+        }
+
+        const answer = try self.evaluate(gpa, io, call);
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = answer.text,
+            .is_error = answer.refused,
+            .truncated = false,
+        };
+    }
+
+    const Answer = struct { text: []u8, refused: bool };
+
+    fn evaluate(
+        self: *NixEvalToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!Answer {
+        const settings = self.settings orelse return .{
+            .text = try gpa.dupe(u8, nix_eval_is_off),
+            .refused = true,
+        };
+
+        const parsed = std.json.parseFromSlice(
+            chock_core.tools.NixEvalArgs,
+            gpa,
+            call.arguments,
+            .{ .ignore_unknown_fields = true },
+        ) catch return .{
+            .text = try gpa.dupe(u8, "the arguments of nix_eval did not parse. Send one field, " ++
+                "\"expression\", holding the expression alone."),
+            .refused = true,
+        };
+        defer parsed.deinit();
+
+        return settings.run(gpa, io, parsed.value.expression);
+    }
+};
+
+/// What one `nix_eval` call of this session may see and may take.
+const NixEval = struct {
+    /// The one directory a pure evaluation may read: the workspace this
+    /// session's tool calls already work in, and never the user's own
+    /// project. An expression that names any other path is refused by fix
+    /// itself: see `lib/chock-nix/eval.zig`.
+    workspace_root: []const u8,
+    /// What the project, the operator and the org bundle between them let an
+    /// evaluation put in the store. See `resolveNixCaps`.
+    caps: chock_policy.nix.Resolved,
+
+    /// The driver one call of this session answers through: nothing is
+    /// authorised, and the object cap is the one the policy folded.
+    fn driverFor(self: NixEval, gpa: std.mem.Allocator) chock_nix.backend.Driver {
+        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
+        applyNixCaps(&driver, self.caps);
+        return driver;
+    }
+
+    fn run(
+        self: NixEval,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        expression: []const u8,
+    ) std.mem.Allocator.Error!NixEvalToolRunner.Answer {
+        var driver = self.driverFor(gpa);
+        defer driver.deinit();
+
+        var session = chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{self.workspace_root},
+            .io = io,
+            .store_backend = driver.backend(),
+        }) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "the evaluator could not be started ({t}), so nothing was evaluated.",
+                .{err},
+            ),
+            .refused = true,
+        };
+        defer session.deinit();
+
+        const buffer = try gpa.alloc(u8, chock_core.tools.max_nix_eval_bytes);
+        defer gpa.free(buffer);
+
+        const answer = session.answer(buffer, expression) catch |err| return .{
+            .text = try nixEvalRefusal(gpa, &session, &driver, self.workspace_root, expression, err),
+            .refused = true,
+        };
+
+        if (answer.derivation_path) |path| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s}\n\nThat is a derivation, and {s} is its derivation file. Nothing was " ++
+                    "built: nix_eval evaluates and never builds.",
+                .{ answer.text, path },
+            ),
+            .refused = false,
+        };
+        return .{ .text = try gpa.dupe(u8, answer.text), .refused = false };
+    }
+};
+
+/// Why an evaluation did not answer, in words a model can act on.
+///
+/// **The store refusal is read first, and it is the one that names a path.**
+/// An expression that imports a derivation stops inside the store backend,
+/// and fix reports the store's own text and nothing else, so the driver's
+/// last refusal is the only place the derivation is named.
+fn nixEvalRefusal(
+    gpa: std.mem.Allocator,
+    session: *chock_nix.eval.Session,
+    driver: *chock_nix.backend.Driver,
+    workspace_root: []const u8,
+    expression: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error![]u8 {
+    if (driver.lastError()) |said| return std.fmt.allocPrint(
+        gpa,
+        "the expression asked a Nix store for something, and this session has none: {s}. " ++
+            "nix_eval works out what a derivation is and never builds one, so importing the " ++
+            "result of a build cannot work here. Ask about the derivation itself, such as its " ++
+            "drvPath, or do the work another way.",
+        .{said},
+    );
+
+    if (err == error.WriteFailed) return std.fmt.allocPrint(
+        gpa,
+        "the value is longer than {d} bytes rendered, so nothing came back. Ask for the part " ++
+            "of it you need, such as one attribute or builtins.attrNames of the set.",
+        .{chock_core.tools.max_nix_eval_bytes},
+    );
+
+    if (err == error.RestrictedInPureEval) return std.fmt.allocPrint(
+        gpa,
+        "the expression reads something a pure evaluation may not: a path outside the " ++
+            "workspace, the environment, or a channel. Only files under {s} can be read, and " ++
+            "the workspace is the only tree there is.",
+        .{workspace_root},
+    );
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.print(gpa, "the expression was not evaluated ({t}).", .{err});
+
+    var said: std.Io.Writer.Allocating = .init(gpa);
+    defer said.deinit();
+    session.writeDiagnostics(&said.writer, expression) catch {};
+    // Empty for a runtime fault, which is what the error name alone has to
+    // carry: see `chock_nix.eval.Session.writeDiagnostics`.
+    if (said.written().len != 0) try text.print(gpa, "\n{s}", .{said.written()});
+    return text.toOwnedSlice(gpa);
+}
+
+/// What a `nix_eval` call gets when the session cannot evaluate at all. The
+/// model is not offered the tool in that case, so this is for a model that
+/// named it out of nowhere.
+const nix_eval_is_off = "nothing was evaluated: this session cannot evaluate a Nix expression. " ++
+    "Work from what is in the project instead.";
+
 /// Starts a subagent: one `chock run` of its own, with the session, the
 /// scratchpad, the chain and the budget slice its parent decided. See
 /// `chock_core.subagent`, which owns everything about a child except the two
@@ -11877,8 +12156,19 @@ fn runSession(
     var provision_arena = std.heap.ArenaAllocator.init(gpa);
     defer provision_arena.deinit();
 
-    var provisioning = ProvisionToolRunner{
+    // Between the diagnostics and the provisioner, because it answers a call
+    // neither of them can and needs nothing either of them sets up. See
+    // `NixEvalToolRunner`.
+    var nix_eval = NixEvalToolRunner{
         .inner = diagnosing.runner(),
+        .settings = .{
+            .workspace_root = started.workspace.workPath(),
+            .caps = started.nix_caps,
+        },
+    };
+
+    var provisioning = ProvisionToolRunner{
+        .inner = nix_eval.runner(),
         .settings = started.provisioning,
         .arena = provision_arena.allocator(),
         .host_env = env,
@@ -16579,6 +16869,325 @@ test "a session that cannot provision refuses the call and names no package mana
     // And nothing was run below: a call this runner answers never reaches the
     // sandbox, so no `nix` was spawned to find out that there is no `nix`.
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+}
+
+/// A `NixEvalToolRunner` over `inner`, reading the workspace at `root` and
+/// holding an evaluation to `caps`.
+fn testNixEvalRunner(
+    inner: chock_core.Loop.ToolRunner,
+    root: []const u8,
+    caps: chock_policy.nix.Resolved,
+) NixEvalToolRunner {
+    return .{ .inner = inner, .settings = .{ .workspace_root = root, .caps = caps } };
+}
+
+/// The caps a project that named nothing gets, for a test about something
+/// other than the fold.
+const default_nix_caps = chock_policy.nix.Resolved{
+    .max_object_bytes = chock_policy.nix.default_max_object_bytes,
+    .max_session_bytes = chock_policy.nix.default_max_session_bytes,
+};
+
+/// One `nix_eval` call through a runner, for a test that asks about the
+/// answer. The caller owns both halves of the result.
+fn evaluateThrough(
+    gpa: std.mem.Allocator,
+    runner: *NixEvalToolRunner,
+    expression: []const u8,
+) !chock_proto.event.ToolResult {
+    const arguments = try std.json.Stringify.valueAlloc(
+        gpa,
+        .{ .expression = expression },
+        .{},
+    );
+    defer gpa.free(arguments);
+    return runner.runner().dispatch(gpa, std.testing.io, .{
+        .call_id = "c1",
+        .tool = "nix_eval",
+        .arguments = arguments,
+    });
+}
+
+test "an expression is evaluated in this process and the rendered value reaches the model" {
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval, "{ a = 1; b = \"two\"; }");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("{ a = 1; b = \"two\"; }", result.output);
+    // Nothing went to the sandbox: an evaluation runs here, and a call this
+    // runner answers never reaches the one below it.
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+}
+
+test "a derivation answers its derivation path, and says that nothing was built" {
+    // The fact the eval and build split rests on, read from the tool the
+    // model actually calls: a derivation path is computed with no daemon and
+    // no store, and it is the name a later build would use.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval,
+        \\derivation { name = "x"; builder = "/bin/sh"; system = "x86_64-linux"; }
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.output,
+        "/nix/store/97qlv6h78lxlm9zc8849ahsbcklhsi2y-x.drv",
+    ) != null);
+    // The model is told the answer is a derivation, because a derivation and
+    // a string of the same path render the same way.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "is a derivation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "never builds") != null);
+}
+
+test "import from derivation is refused, and the refusal names the derivation" {
+    // Nix says very little when a build does not happen, so the derivation
+    // has to be in the words: a model that reads a refusal with no subject
+    // sends the same expression again. The driver is the only thing that
+    // knows the name, which is why one is installed for an evaluation that
+    // needs no store at all.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval,
+        \\import (derivation { name = "y"; builder = "/bin/sh"; system = "x86_64-linux"; })
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "-y.drv") != null);
+    // And it says what to do instead, so the next turn is not the same turn.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "drvPath") != null);
+}
+
+test "an expression that reads a path outside the workspace is refused" {
+    // Pure evaluation plus one root is the whole of this, and the root is the
+    // workspace. Widen `roots` in `NixEval.run` and the second call below
+    // starts answering.
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "note.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello");
+    }
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), root, default_nix_caps);
+
+    const inside = try std.fmt.allocPrint(gpa, "builtins.readFile {s}/note.txt", .{root});
+    defer gpa.free(inside);
+    const read = try evaluateThrough(gpa, &nix_eval, inside);
+    defer gpa.free(read.call_id);
+    defer gpa.free(read.output);
+    try std.testing.expect(!read.is_error);
+    try std.testing.expectEqualStrings("\"hello\"", read.output);
+
+    const outside = try evaluateThrough(gpa, &nix_eval, "builtins.readFile /etc/hostname");
+    defer gpa.free(outside.call_id);
+    defer gpa.free(outside.output);
+    try std.testing.expect(outside.is_error);
+    // The refusal names the one tree that can be read, so the model can act
+    // on it rather than trying another path outside.
+    try std.testing.expect(std.mem.indexOf(u8, outside.output, root) != null);
+}
+
+test "the object cap a project names reaches the driver an evaluation answers through" {
+    // The wiring, and not the fold: `chock_policy.nix` has its own tests for
+    // which layer wins. Drop the `applyNixCaps` call in `NixEval.run` and the
+    // driver keeps `chock_nix.backend.default_max_object_bytes`.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = std.testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_object_bytes = \"4KiB\" } }");
+    }
+    {
+        var file = try config_tmp.dir.createFile(io, chock_policy.limits.operator_file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_session_bytes = \"8MiB\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    const resolved = try resolveNixCaps(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 4 << 10), resolved.max_object_bytes);
+    try std.testing.expectEqual(@as(u64, 8 << 20), resolved.max_session_bytes);
+
+    // Through the very call `NixEvalToolRunner` makes, so the number is
+    // followed from the file the user wrote to the driver the evaluation
+    // answers through.
+    const settings = NixEval{ .workspace_root = "/nowhere", .caps = resolved };
+    var driver = settings.driverFor(gpa);
+    defer driver.deinit();
+    try std.testing.expectEqual(@as(usize, 4 << 10), driver.max_object_bytes);
+
+    // And a session whose policy named nothing keeps the library's own bound,
+    // so the line above reads the file and not a constant.
+    const quiet = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
+    var quiet_driver = quiet.driverFor(gpa);
+    defer quiet_driver.deinit();
+    try std.testing.expectEqual(
+        chock_nix.backend.default_max_object_bytes,
+        quiet_driver.max_object_bytes,
+    );
+}
+
+test "a nix block that does not parse stops the session rather than evaluating under another number" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A passing test may not let a line reach the real standard error.
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = std.testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_object_bytes = \"50%\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    try std.testing.expectError(error.Reported, resolveNixCaps(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    ));
+
+    // The field, the text, and the file it is in. The error name alone
+    // carries none of the three.
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "max_object_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "50%") != null);
+}
+
+test "a session that cannot evaluate refuses the call and never says it evaluated" {
+    // The model is not offered the tool in that case, so this is a call it
+    // made out of nowhere. The refusal has to be honest for the same reason
+    // `provisioning_is_off` is.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = NixEvalToolRunner{ .inner = recorder.runner(), .settings = null };
+
+    const result = try evaluateThrough(gpa, &nix_eval, "1 + 1");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(nix_eval_is_off, result.output);
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+
+    // And every other tool still goes straight through, whatever this
+    // session can do about Nix.
+    const other = try nix_eval.runner().dispatch(gpa, std.testing.io, .{
+        .call_id = "c2",
+        .tool = "read_file",
+        .arguments = "{\"path\":\"a\"}",
+    });
+    defer gpa.free(other.call_id);
+    defer gpa.free(other.output);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+}
+
+test "the tool is offered only to a session that can evaluate" {
+    // The other half of the gate, from the side `src/run.zig` sets. A tool
+    // the model cannot use costs one turn to call and one to read the
+    // failure: see `chock_core.tools.Support`.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const without = try chock_core.tools.Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+    });
+    for (without) |def| try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
+
+    const with = try chock_core.tools.Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+        .nix_eval = true,
+    });
+    var saw = false;
+    for (with) |def| {
+        if (std.mem.eql(u8, def.name, "nix_eval")) saw = true;
+    }
+    try std.testing.expect(saw);
 }
 
 test "asking twice for the same program builds nothing the second time" {

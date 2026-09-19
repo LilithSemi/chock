@@ -57,3 +57,61 @@ set the very next tool call is built from and not the model. A line is printed
 before the wait so the terminal is not silent, and Ctrl-C reaches the `nix`
 child the same way it reaches a subagent. A build that never ends holds the
 session. See [status.md](status.md).
+
+# Asking Nix what something is
+
+`provide_tool` above puts a program in the session. `nix_eval` answers a
+different question: what does an expression say? The agent sends one Nix
+expression and reads the value back.
+
+```
+$ nix_eval {"expression":"(import <nixpkgs> {}).hello.version"}
+! the expression reads something a pure evaluation may not ...
+$ nix_eval {"expression":"builtins.attrNames { a = 1; b = 2; }"}
+  [ "a" "b" ]
+```
+
+## Nothing is built
+
+The expression is evaluated inside Chock, by the Nix evaluator it is built
+with, so no `nix` process starts and no store is opened. A derivation answers
+what it is and where its derivation file would be, because that path is
+computed from the derivation itself and is not looked up anywhere.
+
+A build is a different act, and this tool does none. An expression that needs
+the result of a build, such as an import of a derivation, is refused, and the
+refusal names the derivation it wanted, so the agent can ask about the
+derivation instead of sending the same expression again.
+
+## What it can read
+
+The evaluation is pure. The environment is empty, `NIX_PATH` and channels
+answer nothing, and a path outside the workspace is refused. The workspace is
+the throwaway copy of the project the agent already works in, so an expression
+reads the same tree every other tool call reads.
+
+## What bounds it
+
+An evaluation runs in Chock's own process and not in the sandbox, so it is
+bounded where it runs. A recursion deeper than the call depth stops with an
+error, the collector holds the memory an evaluation keeps, and the rendered
+answer stops at 16384 bytes. **Nothing bounds how long an evaluation runs**,
+so an expression that loops runs until the session is stopped with Ctrl-C.
+
+## The store caps
+
+A `nix` block in `chock.zon` bounds what an evaluation may put in a store.
+
+```zon
+.{
+    .nix = .{
+        .max_object_bytes = "16MiB",
+        .max_session_bytes = "256MiB",
+    },
+}
+```
+
+`max_object_bytes` bounds one object. The operator's own `config.zon` names
+the same block and the project wins over it, and an organisation's policy
+bundle is the last word over both. `max_session_bytes` is read and folded the
+same way, and nothing enforces it yet.
