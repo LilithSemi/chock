@@ -362,49 +362,38 @@ fn writeAt(io: std.Io, dir: std.Io.Dir, name: []const u8, text: []const u8) !voi
     try file.writeStreamingAll(io, text);
 }
 
-test "a flake input that is in the store already is evaluated with no fetcher at all" {
-    // **The whole of the input mechanism, against the real thing.** A tree is
-    // put in the host store, its NAR hash is read from the same `nix`, and a
-    // lock pins an input to that hash. The lock's forge coordinates are never
-    // reached: fix takes the store path the hash names, because the seam says
-    // that path is valid. The second half of the test takes the path off the
-    // seam and the same evaluation stops with no fetcher, which is what proves
-    // the store hit and not the network is what answered.
-    if (nix_path.len == 0) return error.SkipZigTest;
+/// A flake in a temporary directory whose one input is pinned by the NAR hash
+/// of a tree this test put in the host store itself.
+///
+/// **The lock is not invented.** The hash is read from the same `nix` that
+/// added the tree, so it really names that store path. The forge coordinates
+/// in it are never reached: everything here answers out of the store, which is
+/// what each test below proves in its own way.
+const Project = struct {
+    root: []const u8,
+    /// What the lock pins the input to.
+    input_path: []const u8,
 
-    const gpa = testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+    fn make(arena: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !?Project {
+        try tmp.dir.createDirPath(io, "dep");
+        try tmp.dir.createDirPath(io, "root");
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const base = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+        const dep_path = try std.fs.path.join(arena, &.{ base, "dep" });
+        const root_path = try std.fs.path.join(arena, &.{ base, "root" });
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "dep");
-    try tmp.dir.createDirPath(io, "root");
+        {
+            var dep = try tmp.dir.openDir(io, "dep", .{});
+            defer dep.close(io);
+            try writeAt(io, dep, "flake.nix", "{ outputs = { self }: { value = 7; }; }\n");
+        }
 
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const base = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
-    const dep_path = try std.fs.path.join(arena, &.{ base, "dep" });
-    const root_path = try std.fs.path.join(arena, &.{ base, "root" });
+        const store_path = nixSaid(arena, io, &.{ "store", "add", "--name", "source", "--mode", "nar", dep_path }) orelse
+            return null;
+        const nar_hash = nixSaid(arena, io, &.{ "hash", "path", "--type", "sha256", "--sri", dep_path }) orelse
+            return null;
 
-    {
-        var dep = try tmp.dir.openDir(io, "dep", .{});
-        defer dep.close(io);
-        try writeAt(io, dep, "flake.nix", "{ outputs = { self }: { value = 7; }; }\n");
-    }
-
-    // The store path and the hash come from the same `nix`, so the test never
-    // computes either of them itself.
-    const store_path = nixSaid(arena, io, &.{ "store", "add", "--name", "source", "--mode", "nar", dep_path }) orelse
-        return error.SkipZigTest;
-    const nar_hash = nixSaid(arena, io, &.{ "hash", "path", "--type", "sha256", "--sri", dep_path }) orelse
-        return error.SkipZigTest;
-
-    {
         var root = try tmp.dir.openDir(io, "root", .{});
         defer root.close(io);
         try writeAt(io, root, "flake.nix",
@@ -437,9 +426,49 @@ test "a flake input that is in the store already is evaluated with no fetcher at
             \\}}
             \\
         , .{nar_hash}));
+
+        return .{ .root = root_path, .input_path = store_path };
     }
 
-    const expression = try chock_nix.build.expressionFor(arena, root_path, &.{"drv"});
+    /// The lock, read back the way `chock run` reads a project's own.
+    fn lock(self: Project, arena: std.mem.Allocator, io: std.Io) ![]const u8 {
+        const path = try std.fs.path.join(arena, &.{ self.root, "flake.lock" });
+        return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+    }
+
+    /// The reference `nix` is given. **`path:` and not the bare path**: a
+    /// temporary directory of this suite sits inside this project's own git
+    /// tree, and a bare path would have `nix` read that tree instead. A real
+    /// project root is the root of its own tree, so `chock run` passes it bare.
+    fn reference(self: Project, arena: std.mem.Allocator) ![]const u8 {
+        return std.fmt.allocPrint(arena, "path:{s}", .{self.root});
+    }
+};
+
+test "a flake input that is in the store already is evaluated with no fetcher at all" {
+    // **The whole of the input mechanism, against the real thing.** A tree is
+    // put in the host store, its NAR hash is read from the same `nix`, and a
+    // lock pins an input to that hash. The lock's forge coordinates are never
+    // reached: fix takes the store path the hash names, because the seam says
+    // that path is valid. The second half of the test takes the path off the
+    // seam and the same evaluation stops with no fetcher, which is what proves
+    // the store hit and not the network is what answered.
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project = (try Project.make(arena, io, &tmp)) orelse return error.SkipZigTest;
+
+    const expression = try chock_nix.build.expressionFor(arena, project.root, &.{"drv"});
 
     var store_writer = chock_nix.build.DaemonWriter.connect(
         gpa,
@@ -453,13 +482,13 @@ test "a flake input that is in the store already is evaluated with no fetcher at
         var writing = chock_nix.build.Writing{
             .writer = store_writer.writer(),
             .budget = &budget,
-            .fetched_paths = &.{store_path},
+            .fetched_paths = &.{project.input_path},
         };
         var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
         defer driver.deinit();
 
         var session = try chock_nix.eval.Session.init(gpa, .{
-            .roots = &.{root_path},
+            .roots = &.{project.root},
             .io = io,
             .store_backend = driver.backend(),
             .store_writes = true,
@@ -485,7 +514,7 @@ test "a flake input that is in the store already is evaluated with no fetcher at
         defer driver.deinit();
 
         var session = try chock_nix.eval.Session.init(gpa, .{
-            .roots = &.{root_path},
+            .roots = &.{project.root},
             .io = io,
             .store_backend = driver.backend(),
             .store_writes = true,
@@ -496,4 +525,137 @@ test "a flake input that is in the store already is evaluated with no fetcher at
         var buffer: [512]u8 = undefined;
         try testing.expectError(error.FetchIoUnavailable, session.answer(&buffer, expression));
     }
+}
+
+test "an evaluation that wanted an input asks about its hosts, and evaluates after a yes" {
+    // **The retry, end to end, against a real `nix`.** The first evaluation
+    // has nothing on the seam, so it stops the way a session that could ask
+    // nobody at startup stops. The gate is then put every host the lock names,
+    // says yes, and `nix flake archive` answers out of the store. The same
+    // expression evaluates on the second pass with those paths on the seam.
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project = (try Project.make(arena, io, &tmp)) orelse return error.SkipZigTest;
+    const expression = try chock_nix.build.expressionFor(arena, project.root, &.{"drv"});
+    const lock_bytes = try project.lock(arena, io);
+
+    var store_writer = chock_nix.build.DaemonWriter.connect(
+        gpa,
+        io,
+        chock_nix.build.default_daemon_socket,
+    ) catch return error.SkipZigTest;
+    defer store_writer.deinit();
+
+    var budget: chock_nix.build.Budget = .{};
+    var writing = chock_nix.build.Writing{
+        .writer = store_writer.writer(),
+        .budget = &budget,
+    };
+    var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+
+    {
+        var session = try chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{project.root},
+            .io = io,
+            .store_backend = driver.backend(),
+            .store_writes = true,
+            .flakes = true,
+        });
+        defer session.deinit();
+        var buffer: [512]u8 = undefined;
+        try testing.expectError(error.FetchIoUnavailable, session.answer(&buffer, expression));
+    }
+
+    var env = std.process.Environ.Map.init(arena);
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+
+    var gate = RecordingGate{ .gpa = gpa, .permitted = true };
+    defer gate.deinit();
+
+    const answer = chock_nix.inputs.fetchAll(
+        arena,
+        io,
+        host.runner(),
+        gate.gate(),
+        try project.reference(arena),
+        lock_bytes,
+    ) catch return error.SkipZigTest;
+    if (answer != .fetched) return error.SkipZigTest;
+
+    // Every host the one forge input is really fetched from, asked once each.
+    try testing.expectEqual(@as(usize, 2), gate.asked.items.len);
+    try testing.expectEqualStrings("api.github.com", gate.asked.items[0]);
+    try testing.expectEqualStrings("codeload.github.com", gate.asked.items[1]);
+
+    var holds_input = false;
+    for (answer.fetched) |one| {
+        if (std.mem.eql(u8, one, project.input_path)) holds_input = true;
+    }
+    try testing.expect(holds_input);
+
+    // The second pass, with what the yes fetched on the seam.
+    writing.fetched_paths = answer.fetched;
+    var session = try chock_nix.eval.Session.init(gpa, .{
+        .roots = &.{project.root},
+        .io = io,
+        .store_backend = driver.backend(),
+        .store_writes = true,
+        .flakes = true,
+    });
+    defer session.deinit();
+    var buffer: [512]u8 = undefined;
+    const evaluated = try session.answer(&buffer, expression);
+    try testing.expect(evaluated.derivation_path != null);
+}
+
+test "a no refuses the fetch, and no second host is asked about" {
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const project = (try Project.make(arena, io, &tmp)) orelse return error.SkipZigTest;
+    const lock_bytes = try project.lock(arena, io);
+
+    var env = std.process.Environ.Map.init(arena);
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+
+    var gate = RecordingGate{ .gpa = gpa, .permitted = false };
+    defer gate.deinit();
+
+    const answer = try chock_nix.inputs.fetchAll(
+        arena,
+        io,
+        host.runner(),
+        gate.gate(),
+        try project.reference(arena),
+        lock_bytes,
+    );
+
+    // **The first no is the answer.** Nothing was fetched, and the second host
+    // of the same input is never put to anybody: a person who said no is not
+    // asked again inside one call.
+    try testing.expect(answer == .refused);
+    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "api.github.com") != null);
 }

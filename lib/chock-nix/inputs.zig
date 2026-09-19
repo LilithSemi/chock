@@ -400,11 +400,41 @@ pub fn unreadableRefusal(
     };
 }
 
-/// What a build reads when it wanted an input this session does not have.
+/// True when `text` already ends a sentence.
+///
+/// **A refusal is written by whoever refused**, so a caller that joins one to a
+/// sentence of its own cannot know how it ends. `endSentence` is what keeps the
+/// seam reading as prose rather than running one sentence into the next.
+fn endsSentence(text: []const u8) bool {
+    if (text.len == 0) return true;
+    return switch (text[text.len - 1]) {
+        '.', '!', '?' => true,
+        else => false,
+    };
+}
+
+/// Append `said` to `text` as a whole sentence, with the full stop it may not
+/// carry itself.
+fn endSentence(
+    allocator: std.mem.Allocator,
+    text: *std.ArrayList(u8),
+    said: []const u8,
+) std.mem.Allocator.Error!void {
+    try text.appendSlice(allocator, said);
+    if (!endsSentence(said)) try text.append(allocator, '.');
+}
+
+/// What a build reads when an input it needed is still not there.
 ///
 /// **It names the input and the host**, because a model that reads a refusal
 /// with no subject builds the same attribute again. `why` is what the fetch
 /// itself said, which is the part a person acts on.
+///
+/// **The advice is what is true by the time this is written.** A build fetches
+/// a missing input through the gate that can ask, so reaching here means
+/// somebody was asked and said no, or the fetch itself failed. Telling the
+/// model to ask for a host it has just been refused would send the same
+/// attribute back a second time.
 pub fn missingRefusal(
     allocator: std.mem.Allocator,
     installable: []const u8,
@@ -416,10 +446,10 @@ pub fn missingRefusal(
 
     try text.print(
         allocator,
-        "{s} was not built: evaluating it needs a flake input this session does not have, and " ++
-            "nothing here fetches one. {s}",
-        .{ installable, why },
+        "{s} was not built: evaluating it needs a flake input this session does not have. ",
+        .{installable},
     );
+    try endSentence(allocator, &text, why);
     if (wanted.len != 0) {
         try text.appendSlice(allocator, " The inputs it would have fetched are");
         for (wanted, 0..) |one, index| {
@@ -428,8 +458,8 @@ pub fn missingRefusal(
         }
         try text.append(allocator, '.');
     }
-    try text.appendSlice(allocator, " Build an attribute whose inputs are already there, or ask " ++
-        "the user to allow those hosts.");
+    try text.appendSlice(allocator, " Nothing was fetched and nothing connected. Build an " ++
+        "attribute whose inputs are already in the store, or do the work without a build.");
     return text.toOwnedSlice(allocator);
 }
 
@@ -703,15 +733,34 @@ test "a nix that would not archive answers one sentence and no path" {
     try testing.expect(std.mem.indexOf(u8, answer.refused, "daemon-socket") != null);
 }
 
-test "the sentence a later build reads names the input and the host" {
+test "the sentence a later build reads names the input and the host, and reads as prose" {
     const gpa = testing.allocator;
     const wanted = [_]fetch.Fetch{
         .{ .subject = "nixpkgs", .url = "https://api.github.com", .host = "api.github.com", .port = 443 },
     };
-    const said = try missingRefusal(gpa, "/work#packages.default", "this project allows no connection to it", &wanted);
+
+    // **The seam is the point.** A refusal is written by whoever refused, and
+    // one that ends on an action name ran straight into the next sentence.
+    const said = try missingRefusal(
+        gpa,
+        "/work#packages.default",
+        "the answer was no for net.connect.com.github.api.443",
+        &wanted,
+    );
     defer gpa.free(said);
 
     try testing.expect(std.mem.indexOf(u8, said, "/work#packages.default") != null);
     try testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
-    try testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "api.github.com.443 The") == null);
+    try testing.expect(std.mem.indexOf(u8, said, "api.github.api.443. The") != null or
+        std.mem.indexOf(u8, said, "net.connect.com.github.api.443. The") != null);
+
+    // A refusal that ends its own sentence keeps the one full stop it wrote.
+    const already = try missingRefusal(gpa, "/work#a", "no rule allows it.", &.{});
+    defer gpa.free(already);
+    try testing.expect(std.mem.indexOf(u8, already, "allows it.. ") == null);
+    try testing.expect(std.mem.indexOf(u8, already, "allows it. Nothing was fetched") != null);
+
+    // The model is never told to ask for a host it has just been refused.
+    try testing.expect(std.mem.indexOf(u8, said, "ask the user") == null);
 }

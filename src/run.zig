@@ -5004,7 +5004,7 @@ const StartupFetchGate = struct {
 
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
-            "the input {s} comes from {s}, and this project's policy answers {t} for {s}",
+            "the input {s} comes from {s}, and this project's policy answers {t} for {s}.",
             .{ one.subject, one.host, decision, action },
         ) };
     }
@@ -11369,6 +11369,20 @@ const NixFetchGate = struct {
     /// person reading the question wants to see.
     installable: []const u8,
     call: chock_proto.event.ToolCall,
+    /// What is being fetched, which is the whole of the difference between
+    /// the two questions this gate puts. The hosts, the namespace and the
+    /// rules are the same for both.
+    kind: Kind = .derivation,
+
+    /// Which of a build's two fetches this question is about.
+    const Kind = enum {
+        /// A fixed output derivation of the closure, which fetches while the
+        /// build runs.
+        derivation,
+        /// An input of the flake, which is fetched on the host before the
+        /// attribute can be evaluated at all.
+        flake_input,
+    };
 
     fn gate(self: *NixFetchGate) chock_nix.fetch.Gate {
         return .{ .ptr = self, .vtable = &vtable };
@@ -11385,24 +11399,47 @@ const NixFetchGate = struct {
 
         var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
         const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return .{ .refused = try std.fmt.allocPrint(
-                allocator,
-                "{s} fetches {s}, and \"{s}\" is not a host name a rule can be written for, so " ++
-                    "nothing was fetched. Use an input whose host is an ordinary name.",
-                .{ one.subject, one.url, one.host },
-            ) };
+            return .{ .refused = switch (self.kind) {
+                .derivation => try std.fmt.allocPrint(
+                    allocator,
+                    "{s} fetches {s}, and \"{s}\" is not a host name a rule can be written " ++
+                        "for, so nothing was fetched. Use an input whose host is an ordinary name.",
+                    .{ one.subject, one.url, one.host },
+                ),
+                .flake_input => try std.fmt.allocPrint(
+                    allocator,
+                    "the flake input {s} comes from \"{s}\", which is not a host name a rule " ++
+                        "can be written for, so nothing was fetched.",
+                    .{ one.subject, one.host },
+                ),
+            } };
 
-        const summary = try std.fmt.allocPrint(
-            self.gpa,
-            "a Nix build fetches from {s}",
-            .{one.host},
-        );
+        const summary = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                self.gpa,
+                "a Nix build fetches from {s}",
+                .{one.host},
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                self.gpa,
+                "a Nix build needs the flake input {s} from {s}",
+                .{ one.subject, one.host },
+            ),
+        };
         defer self.gpa.free(summary);
-        const detail = try std.fmt.allocPrint(
-            self.gpa,
-            "{s} fetches {s} while it builds, over port {d}. The build is {s}.",
-            .{ one.subject, one.url, one.port, self.installable },
-        );
+        const detail = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                self.gpa,
+                "{s} fetches {s} while it builds, over port {d}. The build is {s}.",
+                .{ one.subject, one.url, one.port, self.installable },
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                self.gpa,
+                "the flake input {s} is fetched from {s}, over port {d}, before {s} can be " ++
+                    "evaluated at all. This project's own flake.lock is what names it.",
+                .{ one.subject, one.host, one.port, self.installable },
+            ),
+        };
         defer self.gpa.free(detail);
 
         const answer = chock_core.arbiter.Asker.decide(self.asker, self.gpa, self.io, .{
@@ -11423,11 +11460,18 @@ const NixFetchGate = struct {
         // host is what it has to ask for instead.
         const said = try chock_core.arbiter.refusalText(self.gpa, action, answer);
         defer self.gpa.free(said);
-        return .{ .refused = try std.fmt.allocPrint(
-            allocator,
-            "{s} fetches {s} from {s} while it builds. {s}",
-            .{ one.subject, one.url, one.host, said },
-        ) };
+        return .{ .refused = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                allocator,
+                "{s} fetches {s} from {s} while it builds. {s}",
+                .{ one.subject, one.url, one.host, said },
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                allocator,
+                "the flake input {s} comes from {s}. {s}",
+                .{ one.subject, one.host, said },
+            ),
+        } };
     }
 };
 
@@ -11636,17 +11680,10 @@ const NixBuildToolRunner = struct {
         };
         driver.seam = writing.seam();
 
-        const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
-            .refused => |text| return .{ .text = text, .refused = true },
-            .found => |path| path,
-        };
-
-        // Before the wait, because a build can take minutes and a silent
-        // terminal looks like a session that has stopped.
-        tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
-
-        // What answers for every host the closure would fetch from, before
-        // `nix` is told to build anything. See `NixFetchGate`.
+        // What answers for every host this call would reach: the inputs of
+        // the flake before the evaluation, and the closure's own fixed output
+        // derivations before `nix` is told to build. One namespace and one
+        // arbiter for both, and `NixFetchGate.kind` is the only difference.
         var gate = NixFetchGate{
             .gpa = gpa,
             .io = host_io,
@@ -11654,6 +11691,61 @@ const NixBuildToolRunner = struct {
             .installable = installable,
             .call = call,
         };
+        var input_gate = NixFetchGate{
+            .gpa = gpa,
+            .io = host_io,
+            .asker = self.asker,
+            .installable = installable,
+            .call = call,
+            .kind = .flake_input,
+        };
+
+        const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
+            .refused => |text| return .{ .text = text, .refused = true },
+            .found => |path| path,
+            // **One retry, and never a loop.** The session start fetches an
+            // input only where the policy said `allow`, because there is
+            // nobody at the prompt then, so a project that wrote no rule
+            // arrives here with the inputs missing. This is the first moment a
+            // person can be asked, and a second failure is the answer.
+            .inputs_missing => blk: {
+                const now = try self.fetchInputs(host_io, settings, input_gate.gate(), installable);
+                if (now.store_paths.len == 0) return .{
+                    .text = try chock_nix.inputs.missingRefusal(
+                        gpa,
+                        installable,
+                        now.missing,
+                        now.wanted,
+                    ),
+                    .refused = true,
+                };
+
+                // Read by `is_valid_path` on the next evaluation, and kept for
+                // every later call of this session, so one answer serves the
+                // whole run.
+                writing.fetched_paths = now.store_paths;
+                if (self.settings) |*one| one.inputs = now;
+
+                break :blk switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
+                    .refused => |text| return .{ .text = text, .refused = true },
+                    .found => |path| path,
+                    .inputs_missing => return .{
+                        .text = try chock_nix.inputs.missingRefusal(
+                            gpa,
+                            installable,
+                            "the inputs this project's lock names were fetched and the " ++
+                                "evaluation still wanted one that is not among them.",
+                            now.wanted,
+                        ),
+                        .refused = true,
+                    },
+                };
+            },
+        };
+
+        // Before the wait, because a build can take minutes and a silent
+        // terminal looks like a session that has stopped.
+        tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
 
         const answer = self.realiseWithNix(host_io, settings, &driver, gate.gate(), .{
             .derivation_path = drv_path,
@@ -11687,7 +11779,82 @@ const NixBuildToolRunner = struct {
         return .{ .text = try builtText(gpa, installable, built), .refused = false };
     }
 
-    const Derivation = union(enum) { found: []const u8, refused: []u8 };
+    const Derivation = union(enum) {
+        found: []const u8,
+        refused: []u8,
+        /// The evaluation wanted a flake input that is not in the store. The
+        /// evaluator has no fetcher, so this is the one fault it cannot name
+        /// itself: the caller fetches and evaluates again. See
+        /// `chock_nix.inputs`.
+        inputs_missing,
+    };
+
+    /// Fetch this project's flake inputs now, through the gate that can ask a
+    /// person, and answer what is in the store afterwards.
+    ///
+    /// **This is where a startup `ask` stops being a permanent no.**
+    /// `fetchFlakeInputs` fetches only on `allow`, because a session that is
+    /// starting up has nobody at the prompt. A build is a turn the model took,
+    /// so there is somebody to ask, and the question is the ordinary
+    /// `net.connect` one under the same namespace and the same arbiter as the
+    /// build's own fetches. One question per host, a host that cannot be named
+    /// is a refusal, and the fetch still happens on the host through `nix
+    /// flake archive`: fix never reaches the network itself.
+    ///
+    /// **The workspace's own lock and not the project's.** The agent works in
+    /// the workspace and may have edited the lock there, and that lock is what
+    /// the evaluation about to run reads.
+    fn fetchInputs(
+        self: *NixBuildToolRunner,
+        io: std.Io,
+        settings: NixBuild,
+        gate: chock_nix.fetch.Gate,
+        installable: []const u8,
+    ) std.mem.Allocator.Error!FlakeInputs {
+        const lock_bytes = readProjectLock(self.arena, io, settings.workspace_root) orelse return .{
+            .missing = "there is no flake.lock in the workspace, so nothing says where its " ++
+                "inputs come from.",
+        };
+
+        const wanted = switch (try chock_nix.inputs.wantsOf(self.arena, lock_bytes)) {
+            .hosts => |list| list,
+            else => &.{},
+        };
+
+        tty.print(
+            .plain,
+            "chock: {s} needs a flake input that is not in the store yet\n",
+            .{installable},
+        );
+
+        var diag: ?chock_nix.Diagnostic = null;
+        defer if (diag) |*one| one.deinit(self.arena);
+        var host = chock_nix.provision.Host{
+            .nix_program = settings.nix_program,
+            .env = self.host_env,
+            .diag = &diag,
+        };
+
+        const answer = chock_nix.inputs.fetchAll(
+            self.arena,
+            io,
+            host.runner(),
+            gate,
+            settings.workspace_root,
+            lock_bytes,
+        ) catch {
+            if (diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+            return .{
+                .wanted = wanted,
+                .missing = "nix could not be run, so the inputs were not fetched.",
+            };
+        };
+
+        return switch (answer) {
+            .fetched => |paths| .{ .store_paths = paths, .wanted = wanted },
+            .refused => |why| .{ .wanted = wanted, .missing = why },
+        };
+    }
 
     /// Evaluate `expression` and answer the derivation it is, with the driver
     /// left holding that derivation in its produced set.
@@ -11725,8 +11892,11 @@ const NixBuildToolRunner = struct {
         const buffer = try gpa.alloc(u8, chock_core.tools.max_nix_eval_bytes);
         defer gpa.free(buffer);
 
-        const answer = session.answer(buffer, expression) catch |err| return .{
-            .refused = try nixBuildRefusal(gpa, &session, driver, settings, installable, expression, err),
+        const answer = session.answer(buffer, expression) catch |err| {
+            if (err == error.FetchIoUnavailable) return .inputs_missing;
+            return .{
+                .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            };
         };
 
         const drv_path = answer.derivation_path orelse return .{ .refused = try std.fmt.allocPrint(
@@ -11736,8 +11906,11 @@ const NixBuildToolRunner = struct {
             .{ installable, answer.text },
         ) };
 
-        session.ensureDerivation(drv_path) catch |err| return .{
-            .refused = try nixBuildRefusal(gpa, &session, driver, settings, installable, expression, err),
+        session.ensureDerivation(drv_path) catch |err| {
+            if (err == error.FetchIoUnavailable) return .inputs_missing;
+            return .{
+                .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            };
         };
 
         return .{ .found = try self.arena.dupe(u8, drv_path) };
@@ -11902,7 +12075,6 @@ fn nixBuildRefusal(
     gpa: std.mem.Allocator,
     session: *chock_nix.eval.Session,
     driver: *chock_nix.backend.Driver,
-    settings: NixBuild,
     installable: []const u8,
     expression: []const u8,
     err: anyerror,
@@ -11910,21 +12082,6 @@ fn nixBuildRefusal(
     // The store faults are the evaluation's own and the driver records none
     // of them, so they are read before its last refusal rather than after.
     if (try chock_nix.build.writeRefusal(gpa, installable, err)) |said| return said;
-
-    // **The one fault that names nothing by itself.** The evaluator has no
-    // fetcher, so an input that is not in the store stops here with an error
-    // that says only that. What the session knows is why the inputs are not
-    // there and where they would have come from, so that is what the model
-    // reads. See `chock_nix.inputs`.
-    if (err == error.FetchIoUnavailable) return chock_nix.inputs.missingRefusal(
-        gpa,
-        installable,
-        if (settings.inputs.missing.len != 0)
-            settings.inputs.missing
-        else
-            "this project's flake.lock does not pin it, so it was never fetched",
-        settings.inputs.wanted,
-    );
 
     if (driver.lastError()) |said| return std.fmt.allocPrint(
         gpa,
@@ -17973,52 +18130,92 @@ test "a flake input host is asked of the policy table at startup, and ask is off
     try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
 }
 
-test "a session whose inputs never arrived still builds, and the refusal names the input and the host" {
-    // **A session start refuses nothing because an optional thing was
-    // missing**, so what is owed instead is a later failure somebody can act
-    // on. The evaluator has no fetcher, so a missing input stops with
-    // `FetchIoUnavailable`, which names nothing by itself.
+test "a startup refusal is not a permanent no, and a build asks about the input it wanted" {
+    // **The fault this replaced.** `fetchFlakeInputs` fetches only on `allow`,
+    // because a session start has nobody at the prompt, so a project that
+    // wrote no `net.connect` rule reached every build with its inputs
+    // missing and could never build anything. A build is a turn the model
+    // took, so there is somebody to ask.
     const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const wanted = [_]chock_nix.fetch.Fetch{.{
-        .subject = "nixpkgs",
+    var input_gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.aarch64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .kind = .flake_input,
+    };
+    const wanted = chock_nix.fetch.Fetch{
+        .subject = "flakever",
         .url = "https://api.github.com",
         .host = "api.github.com",
         .port = 443,
-    }};
-    const settings = NixBuild{
-        .workspace_root = "/work",
-        .caps = .{ .max_object_bytes = 1 << 20, .max_session_bytes = 1 << 20 },
-        .nix_program = "/nix/store/aaa-nix/bin/nix",
-        .nix_store_program = null,
-        .root_dir = null,
-        .store_endpoint = chock_nix.build.default_daemon_socket,
-        .inputs = .{
-            .missing = "this project's policy answers ask for net.connect.com.github.api.443",
-            .wanted = &wanted,
-        },
     };
 
-    var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
-    defer driver.deinit();
-    var session = try chock_nix.eval.Session.init(gpa, .{});
-    defer session.deinit();
-
-    const said = try nixBuildRefusal(
-        gpa,
-        &session,
-        &driver,
-        settings,
-        "/work#packages.x86_64-linux.default",
-        "(builtins.getFlake \"/work\")",
-        error.FetchIoUnavailable,
-    );
-    defer gpa.free(said);
-
-    try std.testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
+    // No asker at all, so nothing is permitted. The words are the input's and
+    // never a derivation's, and the action is the ordinary one.
+    const said = (try input_gate.gate().permit(arena, wanted)).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "flake input flakever") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "while it builds") == null);
+
+    // The sentence the model finally reads, joined to that refusal. **The
+    // seam has to read as prose**: the refusal ends on an action name, so
+    // without a full stop the next sentence ran straight into the port.
+    const refusal = try chock_nix.inputs.missingRefusal(
+        gpa,
+        "/work#packages.aarch64-linux.default",
+        said,
+        &.{wanted},
+    );
+    defer gpa.free(refusal);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "443 The inputs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "flakever from api.github.com") != null);
+    // Nobody is told to ask for a host they have just been refused.
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "ask the user") == null);
 }
+
+test "a build whose inputs arrived at startup never reaches the question" {
+    // **What a project that wrote its rules pays at build time: nothing.** The
+    // question is put from one branch only, the one a missing input takes, and
+    // an input the session start fetched is one the seam calls valid, so the
+    // evaluation takes it out of the store and that branch is never entered.
+    // `test/nix/real.zig` pins the other half against a real store.
+    var budget: chock_nix.build.Budget = .{};
+    var nowhere = NowhereWriter{};
+    var writing = chock_nix.build.Writing{
+        .writer = nowhere.writer(),
+        .budget = &budget,
+        .fetched_paths = &.{"/nix/store/aaaa-source"},
+    };
+    const seam = writing.seam();
+
+    try std.testing.expect(try seam.vtable.is_valid_path.?(seam.context, "/nix/store/aaaa-source"));
+    try std.testing.expect(!try seam.vtable.is_valid_path.?(seam.context, "/nix/store/bbbb-source"));
+}
+
+/// A `chock_nix.build.StoreWriter` that writes nowhere, for a test that asks
+/// the seam a question and never writes an object.
+const NowhereWriter = struct {
+    fn writer(self: *NowhereWriter) chock_nix.build.StoreWriter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: chock_nix.build.StoreWriter.VTable = .{ .add_object = addObject };
+
+    fn addObject(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        object: chock_nix.backend.AddObject,
+    ) anyerror![]u8 {
+        return allocator.dupe(u8, object.expectedPath());
+    }
+};
 
 test "nix_build builds this project and refuses a flake reference that is not it" {
     const gpa = std.testing.allocator;

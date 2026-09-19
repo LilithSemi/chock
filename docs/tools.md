@@ -263,8 +263,8 @@ input with no host of its own is fetched from `api.github.com`, which redirects
 to `codeload.github.com`, so both are named. A lock file sits in your project
 directory beside `chock.zon`, and Chock reads a file there as something an
 attacker may have written, which is why the hosts in it are asked about at all.
-Only `allow` fetches: a session is starting up, so there is nobody to prompt,
-and `ask` is off there the same way it is for a language server.
+Only `allow` fetches at startup: a session is starting up, so there is nobody
+to prompt, and `ask` is off there the same way it is for a language server.
 
 Everything it fetched goes in your store, and the evaluation takes each input
 from there, by the hash the lock pins. A node Chock cannot turn into a host is
@@ -272,11 +272,20 @@ a refusal rather than a guess: an `indirect` input names a registry entry and
 not a host, and an `ssh://` URL is not a scheme that can be named as a host and
 a port.
 
+**A startup `ask` is not a permanent no.** A build is a turn the agent took, so
+there is somebody at the prompt. When the evaluation for a build finds an input
+missing, Chock puts that input's hosts to you under the same `net.connect`
+rules, fetches what you allow, and evaluates once more. One retry, never a
+loop: a second miss is the answer. That is why a project that has written no
+`net.connect` rule can still build, and why one that has written its rules pays
+nothing at build time, because its inputs arrived at startup and the build never
+asks.
+
 **A session whose inputs did not arrive still starts.** A project with no flake
 at all is the ordinary case, and nothing else a session start does refuses the
-session because an optional thing was missing. What you get instead is a build
-that says which input it wanted and where it would have come from, so the
-answer is a rule you can write rather than a fault nobody can act on.
+session because an optional thing was missing. A build that then wants an input
+you said no to says which input and which host, and tells the agent to work with
+what is there rather than to ask you again for the host you just refused.
 
 Import from derivation stays refused, here as in `nix_eval`. A build the agent
 asked for is not the same act as an evaluation that quietly needs one.
