@@ -1,18 +1,8 @@
-//! `chock doctor`: ask, **before** a session starts, whether this machine can
-//! contain one.
-//!
-//! The header of a running session already names the sandbox layers. That is
-//! too late for a person deciding whether to trust the box at all, and it says
-//! nothing on a machine where a session cannot start. This command answers the
-//! same question with no session, no workspace, and no provider call.
-//!
-//! ## The state that had no producer until now
-//!
-//! `src/ui.zig`'s own `Layer.State.unavailable` means "the machine could give
-//! this layer and this process was not permitted". Nothing in a session
-//! produces it, because the Linux driver refuses to spawn rather than degrade,
-//! so a running session never has an available but unapplied layer. **Before a
-//! session, that answer is the useful one**, and this command is its home.
+//! `chock doctor`: ask, before a session starts, whether this machine can
+//! contain one, with no session, no workspace and no provider call. It is the
+//! one producer of `src/ui.zig`'s `Layer.State.unavailable`, which a running
+//! session never has because the Linux driver refuses to spawn rather than
+//! degrade.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -27,14 +17,8 @@ const chock_proto = @import("chock-proto");
 const sandbox = @import("chock-sandbox");
 
 const session_paths = @import("session.zig");
-/// **One list of host system directories, read by both.** A report that
-/// counted a different set from the one a session binds would be a second
-/// answer to keep true. See `run.host_toolchain_candidates`.
 const run = @import("run.zig");
 const Exit = @import("main.zig").Exit;
-/// What `chock --version` prints, printed here too. **Read from `src/main.zig`
-/// and never spelled again**: a second copy of the line is a second thing to
-/// keep true, and the number itself comes from `build.zig.zon` alone.
 const version_line = @import("main.zig").version_line;
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
@@ -64,24 +48,11 @@ const Options = struct {
     project: ?[]const u8 = null,
 };
 
-/// What one probe found.
-///
-/// **Three answers and no fourth.** A row can never be built from something
-/// nobody measured, which is the fault this whole command exists to avoid: a
-/// column of `unsupported` that was guessed from the platform reads like a
-/// report and says nothing.
 pub const Probe = union(enum) {
-    /// The layer went on when this command asked for it.
     ok,
-    /// This machine does not have the layer at all, so there is nothing to
-    /// configure. The text says how that was learned.
     absent: []const u8,
-    /// The machine has the layer and this process was not permitted to use
-    /// it. The text says what refused.
     refused: []const u8,
 
-    /// The same four state record `src/ui.zig` uses for the session header.
-    /// `off` is never produced here: nothing in a report gives a layer up.
     pub fn state(self: Probe) ui.Layer.State {
         return switch (self) {
             .ok => .on,
@@ -90,7 +61,6 @@ pub const Probe = union(enum) {
         };
     }
 
-    /// Why, in a person's words. Empty for a layer that is on.
     pub fn why(self: Probe) []const u8 {
         return switch (self) {
             .ok => "",
@@ -99,186 +69,63 @@ pub const Probe = union(enum) {
     }
 };
 
-/// What `chock_sandbox`'s cgroup layer answered. Named through the field it
-/// fills in on a real `spawn`, so this file states no second copy of the type.
 pub const CgroupSupport = @FieldType(sandbox.Sandbox.LimitsReport, "cgroup");
 
-/// Which machine the cgroup answer is about. See `cgroup.Vantage`: the path
-/// that answer is derived from is relative to a cgroup namespace, so a process
-/// inside one can be refused by a machine that delegates.
 pub const CgroupVantage = sandbox.cgroup.Vantage;
 
-/// What this project's Nix dev shell did.
 pub const DevShellState = union(enum) {
-    /// The project states no `flake.nix`. Tool calls then use whatever the
-    /// `toolchain` row says, which is the answer for a project that states
-    /// nothing.
     no_flake,
-    /// The dev shell was read. True when this command evaluated it, false
-    /// when it read the cache a session would read.
     read: bool,
-    /// `nix` could not read it. A session still runs: a broken `flake.nix` is
-    /// often the very thing somebody starts a session to fix.
     failed: []const u8,
-    /// There is a `flake.nix` and no `nix` to read it with.
     no_nix,
 };
 
-/// What a container runtime on this machine answered.
-///
-/// **This row adds nothing to the guarantee columns and must never appear to.**
-/// `Measured.driver` stays `sandbox.Sandbox.guarantees` whatever this says: a
-/// tool call gets the same boundary whether its files came from a Nix closure,
-/// from a rootless Podman or from a root Docker daemon. What this says is a
-/// different fact on a different axis, which is who put the files on the disk.
-/// See `chock_container.Runtime.Trust`.
 pub const ContainerState = union(enum) {
-    /// No runtime is on this machine's `PATH`. **Not a gap**: only a project
-    /// that names an image needs one.
     not_installed,
-    /// A runtime is installed and did not answer. The sentence is the
-    /// runtime's own, through `chock_container.Runtime`.
     unreachable_runtime: []const u8,
     ready: Ready,
 
     pub const Ready = struct {
         kind: chock_container.Runtime.Kind,
-        /// The absolute path of the program, from `Runtime.detect`.
-        ///
-        /// **Absolute, and this is not decoration.** `chock_container.proc.run`
-        /// asserts that `argv[0]` is absolute, so a row that kept only the
-        /// kind and rebuilt a bare program name aborted the whole command in a
-        /// debug build. Measured on 2026-08-25 with a real podman.
         program: []const u8,
-        /// What privilege the program that unpacks an image holds.
-        /// **`Trust.isPrivileged` reads as a warning and never as a failed
-        /// layer.** A root daemon is a weaker trust position, not a broken
-        /// sandbox.
         trust: chock_container.Runtime.Trust,
     };
 };
 
-/// Where the files a tool call would run come from, if a session started now.
-///
-/// **This is the row that stops `chock doctor` saying a session can start on a
-/// machine where no tool call can work.** Measured on 2026-08-25 on a bare
-/// Debian with no Nix: every row of the report passed, the session started,
-/// the model answered, and the first tool call died in the mount tree. Seven of
-/// the seventeen rows blocked a first run and the dev shell row was not one of
-/// them, because a dev shell really is optional. What is not optional is that
-/// something has to be mounted.
 pub const ToolchainState = union(enum) {
-    /// The project's own Nix dev shell answered. The narrowest of the three.
     dev_shell,
-    /// The project names this image and it is on this machine.
     image: []const u8,
-    /// The project names this image and a session could not read it. The text
-    /// says why and what to run. **This blocks.**
     image_unusable: []const u8,
-    /// The project states neither, so a session mounts this many of the host's
-    /// own system directories. See `src/run.zig`'s own `Toolchain`.
     host: usize,
-    /// Not one of the host's system directories is there either. **This
-    /// blocks**: a session would start and every tool call in it would fail.
     none,
 };
 
-/// Which of the two ways a routed sandbox on this host places the three files
-/// it writes for itself.
-///
-/// **A host property and not a namespace probe.** A sandbox with a network of
-/// its own has a resolver of its own, and glibc only finds it through
-/// `/etc/resolv.conf`, so `namespace.substitute` puts that file and two more
-/// inside the sandbox. Where the sandbox holds no `/etc` at all it simply
-/// makes them. Where it binds the host's own, it takes that directory for
-/// itself first, with `namespace.ownDirectory`, and what the host keeps at
-/// those paths stops mattering: a link into `/run/systemd/resolve` and an
-/// `nsswitch.conf` that is not there both answer the same way.
-///
-/// **So no answer here blocks on its own.** The one machine that is still
-/// refused is one that has to take the directory and whose kernel has no
-/// rootless overlayfs, and `resolverFilesRow` reads the `overlayfs` probe to
-/// say that.
-///
-/// See `measureResolverFiles` for how each answer is reached, and
-/// `Sandbox.resolver_substitutions` for the list this reads.
 pub const ResolverFiles = union(enum) {
-    /// Nothing read this host. **Never printed on a real run**: the row is
-    /// only built for a driver that routes, and the answer is measured before
-    /// `rowsFor` is called.
     not_read,
-    /// A routed sandbox holds no host `/etc`, so it makes all three files
-    /// itself. Every machine with a Nix store, and every project with a dev
-    /// shell.
     made_inside,
-    /// A routed sandbox binds this host's own `/etc` and takes it for itself
-    /// with an overlay, so the files are made in a directory the sandbox owns
-    /// and the host's own is read through it and never written.
     owned,
-    /// The `/etc` a routed sandbox holds comes from this project's container
-    /// image, so this host's own says nothing about it. The text names the
-    /// image. **Nothing here unpacked one to read it**, and the row says so:
-    /// the same shape `vantageNote` uses for a cgroup answer that is about a
-    /// view and not about the machine.
     from_image: []const u8,
 };
 
-/// One audit sink this installation's org policy bundle requires, and whether
-/// this machine can reach it. See `reachSink`.
 pub const SinkProbe = struct {
-    /// Which transport, as the bundle named it.
     kind: chock_policy.org.RequiredSink.Kind,
-    /// What the bundle named: the directory for a drop, the socket for
-    /// syslog. **Never the probe file opened inside a directory**, because the
-    /// path a person has to act on is the one their organisation wrote.
     path: []const u8,
     reached: Probe,
 };
 
-/// Whether this machine has a credential for the provider a session would
-/// use.
 pub const CredentialState = union(enum) {
-    /// One was found. The text names which of the three sources answered.
     found: []const u8,
-    /// The provider asks for none, which is what a local endpoint is. See
-    /// `chock_auth.lookup.Source.none`.
     not_needed,
-    /// The provider needs one and none was found, so no session against it
-    /// can work. The text names the instance, never any part of a value.
-    /// See `chock_auth.lookup.credentialIsMissing`.
     missing: []const u8,
-    /// There is no configuration, or it names no provider or no model. A
-    /// session cannot start.
     unconfigured: []const u8,
-    /// The configuration is there and the credential could not be read.
     unreadable: []const u8,
 };
 
-/// Which set of layers this build's driver applies, and so which rows the
-/// report has.
-///
-/// **Read from the driver's own guarantees and never from `builtin.os.tag`.**
-/// Two platforms with two mechanisms answer the same questions in two
-/// vocabularies, and a column of Linux rows on a Mac would name six things that
-/// machine has never heard of.
 pub const LayerFamily = enum {
-    /// No layer at all. `Sandbox.spawn` refuses before it forks, and the report
-    /// is one sentence: see `refuses_outright`.
     none,
-    /// Namespaces, Landlock, seccomp, a cgroup and a capped tmpfs. The Linux
-    /// driver.
     namespaces,
-    /// Seatbelt and Darwin's own resource limits. The Darwin driver.
     seatbelt,
 
-    /// The family a driver with these guarantees belongs to.
-    ///
-    /// **`workspace_mounted` is what tells the two families apart**, and it is
-    /// the honest question: a driver that can put the workspace at the
-    /// project's own path has a mount namespace, and every other Linux layer
-    /// stands beside that one. A driver that gives layers without it is the
-    /// Darwin driver, where the workspace stays where it is: see
-    /// `lib/chock-workspace/layout.zig`.
     pub fn forDriver(given: sandbox.Sandbox.Guarantees) LayerFamily {
         if (given.count() == 0) return .none;
         return if (given.contains(.workspace_mounted)) .namespaces else .seatbelt;
@@ -286,25 +133,11 @@ pub const LayerFamily = enum {
 };
 
 pub const Measured = struct {
-    /// What this build's sandbox driver says it gives. **Read from the driver
-    /// and never from `builtin.os.tag`.** An empty set is what makes
-    /// `Sandbox.spawn` refuse before it does anything.
     driver: sandbox.Sandbox.Guarantees = sandbox.Sandbox.guarantees,
-    /// Which rows this report has. Follows `driver` for a real run, and a test
-    /// sets both together to state a machine this one is not.
     family: LayerFamily = LayerFamily.forDriver(sandbox.Sandbox.guarantees),
 
-    /// Whether a Seatbelt profile really confined a child of this process.
-    /// **Darwin only**, and measured by spawning a real sandbox that tries to
-    /// read a path outside itself: see `measureSeatbelt`.
     seatbelt: Probe = .{ .absent = layer_not_measured },
-    /// Whether the three resource limits Darwin honours went on. **Darwin
-    /// only.** The other four have no Darwin mechanism at all and are stated,
-    /// not measured: see `lib/chock-sandbox/darwin/limits.zig`.
     rlimits: Probe = .{ .absent = layer_not_measured },
-    /// Why a whole tool call is still refused on this build, or null when one
-    /// runs. **Darwin only**, and the one row that decides the exit code
-    /// there: see `toolCallRow`.
     tool_call_refused: ?[]const u8 = null,
 
     user_namespace: Probe = .{ .absent = driver_gives_nothing },
@@ -312,187 +145,66 @@ pub const Measured = struct {
     pid_namespace: Probe = .{ .absent = driver_gives_nothing },
     ipc_namespace: Probe = .{ .absent = driver_gives_nothing },
     network_namespace: Probe = .{ .absent = driver_gives_nothing },
-    /// Whether this kernel built the sandbox's own network when this command
-    /// asked it to. **Measured by calling `netns.Session.configure` for real**
-    /// in a network namespace of its own, the same call a routed tool call
-    /// makes: see `probeNetwork`.
     router_network: Probe = .{ .absent = layer_not_measured },
-    /// Whether this kernel took the ruleset that filters that network.
-    /// **Measured by calling `nftables.Session.install` for real**, in the same
-    /// child and on the network the row above built.
     router_filter: Probe = .{ .absent = layer_not_measured },
-    /// What a routed sandbox would find at the three files it writes for
-    /// itself. See `ResolverFiles`.
     resolver_files: ResolverFiles = .not_read,
     landlock: Probe = .{ .absent = driver_gives_nothing },
-    /// The Landlock ABI version the kernel answered, or null when it has
-    /// none. Shown beside the row, because a kernel with Landlock and an old
-    /// ABI silently gives a smaller ruleset than the design asks for.
     landlock_abi: ?i32 = null,
     seccomp: Probe = .{ .absent = driver_gives_nothing },
-    /// Whether a page could be writable and executable at the same time in a
-    /// session of this project. **Read from the project's own policy and not
-    /// from the machine**: every machine can hold this rule, and the only
-    /// question is whether the project asked to give it up. See
-    /// `chock_policy.hardening`, and `measureHardening` below.
     write_execute: chock_policy.hardening.WriteExecute = .strict,
-    /// What `cgroup.Cgroup.create` answered, or null when no driver asked.
     cgroup: ?CgroupSupport = null,
-    /// Which machine that answer is about, or null when no driver asked.
     cgroup_vantage: ?CgroupVantage = null,
     overlayfs: Probe = .{ .absent = driver_gives_nothing },
     pidfd: Probe = .{ .absent = driver_gives_nothing },
     tmpfs: Probe = .{ .absent = driver_gives_nothing },
 
-    /// Whether this build's driver can bind a device node into the sandbox at
-    /// all. **Read from `chock_sandbox.Sandbox.expresses.device_passthrough`**,
-    /// true only on Linux: Darwin's driver reads `Config.device_tree` and
-    /// `Config.device_source` and applies neither, so a session there never
-    /// opens `/dev`. See `deviceRow`'s own doc comment for why a build that
-    /// answers false gets no row here at all, rather than one that reads
-    /// `unsupported`.
     device_passthrough: bool = sandbox.Sandbox.expresses.device_passthrough,
 
-    /// Where `git` is, or null when it is not on this machine's PATH.
-    ///
-    /// **A session needs it, and the report had no row for it.** Measured on
-    /// 2026-08-25: with no git, `chock run` answers "the workspace for /proj
-    /// could not be built: NotFound" and never says the word git.
     git_program: ?[]const u8 = null,
-    /// Where `nix` is, or null when it is not on this machine's PATH.
     nix_program: ?[]const u8 = null,
     dev_shell: DevShellState = .no_flake,
-    /// What a container runtime on this machine answered. See
-    /// `ContainerState`.
     container: ContainerState = .not_installed,
-    /// Where the files a tool call would run come from. See `ToolchainState`.
-    ///
-    /// **The default is the answer a report that measured nothing must give**:
-    /// no dev shell, no image, and no host directory found, which blocks. A
-    /// test that states a healthy machine states this too.
     toolchain: ToolchainState = .none,
     credential: CredentialState = .{ .unconfigured = "the configuration was not read" },
-    /// Whether the toolchain cache directory could be made.
     cache: Probe = .{ .refused = "the toolchain cache was not read" },
-    /// Free bytes on the filesystem the workspace lives on, or null when that
-    /// could not be read. **Null is never a zero**: an unreadable filesystem
-    /// is not a full one, the same rule `chock_io.Io.freeBytes` keeps.
     free_bytes: ?u64 = null,
 
-    /// Whether this machine can reach a PC/SC daemon, and how many readers it
-    /// said are attached.
-    ///
-    /// **Reached for, and never worked out from the platform.** The probe is
-    /// `chock_pcsc.Driver`, the transport a card seal is signed over, so this
-    /// command states no second connect and no second handshake.
-    ///
-    /// **This row says what a card seal would find, and never that one was
-    /// made.** `chock sessions seal` reaches the same transport on every run
-    /// and reports which key really signed: see `sessions.sealMain` and
-    /// `chock_pcsc.attempt`. A daemon that names a reader here does not mean
-    /// that card holds a key. See `measureCardSeal`.
     card_seal: Probe = .{ .absent = "the PC/SC transport was not read" },
-    /// How many readers the daemon named, or null when it was never asked.
-    /// **Null is never a zero**: a daemon that refused this client said nothing
-    /// about what is plugged into the machine.
     card_readers: ?usize = null,
 
-    /// Every sink this installation's org policy bundle requires, one entry
-    /// each, in the order the bundle names them.
-    ///
-    /// **Empty is the ordinary answer**, and it is the answer for an
-    /// installation nobody gave a bundle, for a bundle that requires no sink,
-    /// and for a build that measured nothing. So a machine with no bundle
-    /// gains no row and reads exactly as it did before export was a control.
     required_sinks: []const SinkProbe = &.{},
-    /// Every ceiling this installation's org policy bundle sets, one sentence
-    /// each, in a fixed order. Empty for an installation nobody gave a bundle
-    /// and for a bundle that sets none, so a machine with no organisation over
-    /// it reports nothing here at all. See `measureOrgCeilings`.
     org_ceilings: []const []const u8 = &.{},
 };
 
-/// The reason every layer carries on a build whose driver gives no layer at
-/// all. **One sentence about the driver, not six sentences about a kernel
-/// nobody asked.**
 pub const driver_gives_nothing =
     "this build's sandbox driver applies no layer, so it refuses to run a tool call at all";
 
-/// The reason a layer of a family this build is not in carries. **Never
-/// printed on a real run**: a row is only built for the family the driver is
-/// in, and every layer of that family is measured before `rowsFor` is called.
 pub const layer_not_measured = "this build's sandbox driver was never asked about it";
 
-/// One line of the report.
 pub const Row = struct {
-    /// What the row is called. Short, because it is a column.
     name: []const u8,
     state: ui.Layer.State,
-    /// What this machine answered, in a person's words. **Never empty for a
-    /// row that is not on**: a fault a report states without a reason is a
-    /// report a person has to already understand.
-    ///
-    /// **Empty is allowed for a row that is on**, and it is the ordinary case.
-    /// A layer that works has nothing to report but the word `OK`. A row that
-    /// measured a value keeps it here, because a number is an answer and not a
-    /// lesson: the Landlock ABI, the path of `nix`, the free space.
     means: []const u8,
-    /// What this row gives when it is on, for a reader who has not met it
-    /// before. **Printed only when the row is on and only with `--verbose`.**
-    ///
-    /// This is a teaching and not an answer. It is the same sentence on every
-    /// machine and on every run, so a person who has read it once gets nothing
-    /// from the second time. A row that is not on says what is lost in `means`
-    /// and what to do in `fix`, and both of those are printed always.
     why: []const u8 = "",
-    /// What to do about it. Empty when the row is on, and empty when nothing
-    /// can be done, which is itself said in `means`.
     fix: []const u8 = "",
-    /// True when a first run fails **because of this row, as measured**.
-    /// The exit code is built from this and from nothing else: see
-    /// `verdictFor`.
-    ///
-    /// **A property of the measurement and not only of the row's name.** Two
-    /// rows can carry the same name, the same state and different answers
-    /// here: free space that could not be read refuses no tool call, and free
-    /// space that was read and is under the floor refuses every writing one.
     blocks: bool = false,
 };
 
-/// The heading each half of the report carries.
 pub const layers_heading = "Sandbox layers";
 pub const first_run_heading = "Before a first run";
 
-/// The one sentence a build whose driver gives no layer answers with.
-///
-/// **A different fact deserves a different sentence.** A column of
-/// `unsupported` rows reads as a machine that is nearly ready and needs a
-/// setting changed. This is a build that refuses outright, and no row of a
-/// table says that. Linux and macOS each have a driver and each get rows: see
-/// `LayerFamily`.
 pub const refuses_outright =
     "chock doctor: no session can start with this build. Its sandbox driver applies no layer, " ++
     "and Sandbox.spawn refuses before it forks rather than run a tool call unprotected. " ++
     "This is a build for a target Chock has no sandbox driver for. There is nothing to " ++
     "configure and no layer below to turn on.";
 
-/// What the whole report says, in one word.
 pub const Verdict = enum {
-    /// Every row is on.
     ready,
-    /// A row is not on and no row that is not on stops a first run.
     degraded,
-    /// A first run fails on this machine.
     blocked,
 };
 
-/// The verdict `rows` carry.
-///
-/// **`blocked` is decided by `Row.blocks` alone.** A machine with no cgroup
-/// delegation is degraded and works; a machine with no Landlock is blocked,
-/// because `Sandbox.spawn` refuses without it. Grading those the same way
-/// would make this command useless as a gate, which is the whole reason a
-/// script would run it.
 pub fn verdictFor(rows: []const Row) Verdict {
     var verdict: Verdict = .ready;
     for (rows) |row| {
@@ -503,67 +215,26 @@ pub fn verdictFor(rows: []const Row) Verdict {
     return verdict;
 }
 
-/// The exit code for a verdict.
-///
-/// **Zero means a first run can work here, and nothing else.** `faulted` is
-/// the refusal, and it is deliberately not `usage`: that code already means
-/// the command line was wrong, and a script that read the two the same way
-/// would answer a broken machine by printing its own help.
 pub fn exitFor(verdict: Verdict) Exit {
     return switch (verdict) {
-        // A degraded machine runs. Saying so is the report's job, not the
-        // exit code's.
         .ready, .degraded => .finished,
         .blocked => .faulted,
     };
 }
 
-/// The word beside the glyph.
-///
-/// **The word follows `Row.blocks` and never the state alone.** A row carries
-/// two facts: whether this machine has the layer, and whether a first run
-/// stops here. The column is what a person scans, so it answers the second,
-/// and `BLOCKED` stands beside exactly the rows the footer counts. Measured on
-/// a Mac on 2026-08-25: two rows said `BLOCKED` and the footer said one row
-/// stops a first run, because the word came from the state. **A report that
-/// disagrees with itself teaches a reader to trust neither half**, and a
-/// `BLOCKED` on a machine that runs is the same fault as an `OK` on a machine
-/// that does not, pointing the other way.
-///
-/// **Not `ui.Layer.State.word`, and that is on purpose.** The session header
-/// leaves a layer that is on with no word at all, because a row of layers
-/// reads as healthy when nothing is said. A report is a table, and a blank
-/// cell in a table reads as a measurement nobody took.
 pub fn wordFor(row: Row) []const u8 {
     if (row.state == .on) return "OK";
     if (row.blocks) return "BLOCKED";
     return switch (row.state) {
-        // A row that is on and blocks is not a state this file builds: a first
-        // run cannot fail on a layer that went on.
         .on => unreachable,
-        // The header's own two words for a machine and never for a verdict.
-        // `OFF` is a layer that was given up and `NONE` is a machine with
-        // nothing to configure, and neither was ever read as a refusal.
         .off, .unsupported => row.state.word(),
-        // The state whose header word is `BLOCKED`. Here the machine has the
-        // layer, this process may not use it, and the session still starts. So
-        // the word says what the run loses, which is what the footer says too.
         .unavailable => "DEGRADED",
     };
 }
 
-/// Every row, in the order a person reads them. Caller owns the slice, which
-/// for a real caller is an arena.
-///
-/// **Nothing here reaches the kernel.** Every fact is already in `m`, which is
-/// what lets a test state a machine that this one is not.
 pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]const Row {
     var rows: std.ArrayList(Row) = .empty;
 
-    // A driver that applies no layer gets no layer rows. See
-    // `refuses_outright` for the sentence it gets instead. A driver that
-    // applies Seatbelt gets Darwin's own rows and none of the eleven below,
-    // because that machine has none of the eleven mechanisms.
     if (m.family == .seatbelt) try appendSeatbeltRows(arena, m, &rows);
     if (m.family == .namespaces) {
         try rows.append(arena, .{
@@ -577,8 +248,7 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                 }),
             .why = "this process can make one, so a tool call runs as a user id of its own",
             .fix = if (m.user_namespace == .ok) "" else
-            // The one setting an administrator really can change, named
-            // exactly, because "check your kernel" costs a person an hour.
+            // The one setting an administrator can change, named exactly.
             "Every other layer is built on this one. Set kernel.unprivileged_userns_clone to 1, " ++
                 "or remove the container or policy that turns it off.",
             .blocks = true,
@@ -637,14 +307,6 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
             .blocks = true,
         });
 
-        // **The three rows the network router needs, and they sit here**, right
-        // under the namespace they are built inside, so a person reads the
-        // whole network answer in one place.
-        //
-        // **Gated on the driver's own guarantee and never on the platform**,
-        // the rule the whole file keeps. A driver that gives a tool call no
-        // network of its own builds no router, so it gets no row at all rather
-        // than three rows about a mechanism it never reaches.
         if (m.driver.contains(.network_isolated)) {
             try rows.append(arena, try routerRow(
                 arena,
@@ -666,10 +328,6 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
         try rows.append(arena, .{
             .name = "landlock",
             .state = m.landlock.state(),
-            // **The ABI number stays on the row that is on.** It is a
-            // measurement and it differs between machines: an old kernel gives
-            // a smaller ruleset than the design asks for, and only the number
-            // says so.
             .means = if (m.landlock == .ok)
                 (if (m.landlock_abi) |abi| try std.fmt.allocPrint(arena, "ABI {d}", .{abi}) else "")
             else
@@ -694,22 +352,6 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
             .blocks = true,
         });
 
-        // **A row of its own, because a session that gave this up must not read
-        // the same as one that kept it.** It sits under `seccomp` because it is
-        // one rule of that filter, and it is the only sandbox row here that is a
-        // question about the project rather than about the machine: see
-        // `measureHardening`.
-        //
-        // `off` and never `unsupported` or `unavailable`. Those two say the
-        // machine cannot give the layer, or would not let this process have it,
-        // and neither is true. This session can have it and the project asked
-        // for it to be given up, which is exactly what `ui.Layer.State.off`
-        // means.
-        //
-        // **It does not block a first run.** W^X is documented hardening and it
-        // is not a boundary: `test/redteam/scope.zig` retires it by name, and
-        // `lib/chock-sandbox/linux/seccomp.zig` gives three measured ways past
-        // it. A project that asked for this gets a session, and gets told.
         try rows.append(arena, .{
             .name = "write^execute",
             .state = switch (m.write_execute) {
@@ -773,31 +415,16 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
                     "a project with no git of its own has no workspace: {s}",
                     .{m.overlayfs.why()},
                 ),
-            // **Two users, and the second one is easy to miss.** A routed
-            // sandbox that binds this host's own `/etc` takes that directory
-            // for itself with an overlay, so on such a machine this mechanism
-            // gates every foreground tool call. The `resolver files` row is
-            // where that reads as BLOCKED, because only that row knows which
-            // `/etc` this host's sandbox holds.
             .why = "a project with no git of its own still gets a workspace, and a routed sandbox " ++
                 "takes a host /etc for itself",
             .fix = if (m.overlayfs == .ok) "" else "A git project is unaffected: it gets a worktree. " ++
                 "Rootless overlayfs needs kernel 5.11 or later.",
-            // Deliberately not blocking on its own. Only a project with no git
-            // of its own needs an overlay for a workspace, and this command
-            // does not run `git` to find out. The machine where this really
-            // does stop every tool call is named by the `resolver files` row,
-            // which reads this answer.
             .blocks = false,
         });
 
         try rows.append(arena, try cgroupRow(arena, m.cgroup, m.cgroup_vantage));
     }
 
-    // **Gated on `device_passthrough` alone, and never on `m.family`.** The
-    // two agree on every real build today, but this row states its own fact
-    // and reads its own field, the rule the whole file keeps: see
-    // `Measured.device_passthrough`'s own doc comment.
     if (m.device_passthrough) try rows.append(arena, deviceRow());
 
     try rows.append(arena, gitRow(m));
@@ -809,11 +436,7 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
     try rows.append(arena, try cacheRow(arena, m.cache));
     try rows.append(arena, try freeSpaceRow(arena, m.free_bytes));
     try rows.append(arena, try cardSealRow(arena, m.card_seal, m.card_readers));
-    // One row each, and none at all for an installation with no bundle. See
-    // `Measured.required_sinks`.
     for (m.required_sinks) |one| try rows.append(arena, try requiredSinkRow(arena, one));
-    // One row each, and none at all for an installation with no bundle. See
-    // `Measured.org_ceilings`.
     for (m.org_ceilings) |means| try rows.append(arena, .{
         .name = org_ceiling_name,
         .state = .on,
@@ -825,20 +448,6 @@ pub fn rowsFor(arena: std.mem.Allocator, m: Measured) std.mem.Allocator.Error![]
     return rows.toOwnedSlice(arena);
 }
 
-/// One of the two rows that say whether this kernel can give a tool call the
-/// network a routed call gets. See `probeNetwork`, which measures both by
-/// making the real calls in a namespace of its own.
-///
-/// **Both rows block, and the rule is the same one every other row follows:**
-/// `Row.blocks` is true when a first run fails because of this row, as
-/// measured. Every foreground tool call of a `chock run` session takes
-/// `Network.filtered`, whatever this project's policy says, because
-/// `src/run.zig` gives the tool runner a network seam on every session and
-/// `chock_core.tools` moves the call to `.filtered` wherever that seam is set.
-/// So a kernel that answers no here refuses the first tool call and every one
-/// after it. `.none` and `.host` use no router, and neither is reachable from
-/// the command line: a background `run_command`, a language server and an
-/// unnamed MCP server get `.none`, and none of those is a session.
 fn routerRow(
     arena: std.mem.Allocator,
     name: []const u8,
@@ -863,40 +472,18 @@ fn routerRow(
     };
 }
 
-/// What to do about a kernel with no `dummy` link kind. **The module is named,
-/// because `modprobe` needs a name and no other message on this machine says
-/// which one.** Read from `Sandbox.network_modules`, so this file states no
-/// second copy of the list.
 const router_network_fix = "Load it on the host and run again: modprobe " ++ sandbox.Sandbox.network_modules ++
     ". A sandbox cannot make the kernel load a module, and every foreground tool call takes a " ++
     "filtered network, so no tool call runs until this is loaded.";
 
-/// What to do about a kernel that has no nftables. The list is
-/// `Sandbox.filter_modules`, for the reason above.
 const router_filter_fix = "Load them on the host and run again: modprobe " ++ sandbox.Sandbox.filter_modules ++
     ". A sandbox with a network and no ruleset on it would reach whatever the host can reach, " ++
     "so Chock refuses to start rather than run without the filter.";
 
-/// What to do about a kernel that has the mechanism and refused this process.
-///
-/// **There is nothing on the machine to change, and saying so is the answer.**
-/// A routed call builds its network inside a network namespace it made a
-/// moment earlier, where it is root and holds `CAP_NET_ADMIN`. A refusal there
-/// is this program sending something the kernel does not accept.
 const router_refusal_fix = "The sandbox builds this inside a network namespace of its own, where it holds " ++
     "CAP_NET_ADMIN, so a refusal here is a fault in Chock and not a setting on this machine. " ++
     "It is worth reporting.";
 
-/// Whether this host lets a routed sandbox write the three files it needs.
-///
-/// **The one row here that is a question about the host and not about a
-/// namespace.** See `ResolverFiles`.
-///
-/// `overlayfs` is read as well, and only for the one answer it can change. A
-/// sandbox that binds the host's own `/etc` takes that directory for itself
-/// with an overlay, so a kernel that refuses a rootless overlay refuses every
-/// foreground tool call on such a machine. A sandbox that holds no host `/etc`
-/// takes nothing and is not affected.
 fn resolverFilesRow(
     arena: std.mem.Allocator,
     files: ResolverFiles,
@@ -916,9 +503,6 @@ fn resolverFilesRow(
             .means = "",
             .why = why,
         },
-        // **`unavailable` and not `unsupported`.** The machine has a kernel
-        // that is too old for one mechanism and a person can change that.
-        // `NONE` would read as nothing to configure.
         .owned => if (overlayfs == .ok) .{
             .name = resolver_files_name,
             .state = .on,
@@ -938,11 +522,6 @@ fn resolverFilesRow(
             .fix = "Rootless overlayfs needs kernel 5.11 or later. " ++ resolver_files_fix,
             .blocks = true,
         },
-        // **On, and the sentence says which /etc the answer is about.** What
-        // was measured is that this host's own /etc is not what a routed
-        // sandbox holds here. What the image holds was not read, because
-        // nothing unpacked one. The same shape `vantageNote` gives a cgroup
-        // answer that is true of a view and not of the machine.
         .from_image => |reference| .{
             .name = resolver_files_name,
             .state = .on,
@@ -957,29 +536,13 @@ fn resolverFilesRow(
     };
 }
 
-/// The other answer, and the one this project can really state: both
-/// toolchains put a sandbox together out of paths that hold no `/etc`, so
-/// neither takes one from this host and neither needs an overlay to do it.
 const resolver_files_fix = "The other answer is to give this project a flake.nix dev shell or a " ++
     "chock.zon container image, and the sandbox holds no host /etc at all.";
 
-/// The name of the row `resolverFilesRow` writes. Named once, because a test
-/// reads it and that function writes it.
 pub const resolver_files_name = "resolver files";
 
-/// The name of the row that says whether a whole tool call can run on a
-/// Seatbelt build. Named once, because a test reads it and `rowsFor` writes it.
 pub const tool_call_name = "tool call";
 
-/// Every row a Seatbelt build has, in the order a person reads them.
-///
-/// **Two halves, and the second one is the point.** The first four rows are
-/// layers this driver really applies, each one measured or proved by a test
-/// that tried to break it on a real Mac. The rest are the layers Linux has and
-/// macOS has not, one row each, every one `NONE` rather than `BLOCKED`: there
-/// is no setting to change and no version of macOS that closes any of them. A
-/// person reading this column should be able to see, without reading any other
-/// file, exactly what a session on this machine is and is not bounded by.
 fn appendSeatbeltRows(
     arena: std.mem.Allocator,
     m: Measured,
@@ -998,10 +561,6 @@ fn appendSeatbeltRows(
         .blocks = true,
     });
 
-    // The network, the signals and the IPC ride on the same profile the row
-    // above measured, so they carry its state rather than a second answer
-    // nobody asked for. Saying `OK` for these while `seatbelt` is off would be
-    // three claims resting on a layer that is not there.
     try rows.append(arena, .{
         .name = "network",
         .state = m.seatbelt.state(),
@@ -1035,9 +594,6 @@ fn appendSeatbeltRows(
         .blocks = true,
     });
 
-    // The four limits with no Darwin mechanism, one row each. Every sentence
-    // holds the measurement from `lib/chock-sandbox/darwin/limits.zig`, so a
-    // person reads what was tried and not only what is missing.
     try rows.append(arena, .{
         .name = "memory ceiling",
         .state = .unsupported,
@@ -1083,15 +639,6 @@ fn appendSeatbeltRows(
     try rows.append(arena, toolCallRow(m));
 }
 
-/// Whether a whole tool call can run on this build.
-///
-/// **The row that decides the exit code on a Seatbelt build.** Every layer
-/// above it can be on and a session still start nothing, because a tool call is
-/// assembled from more than the workspace: `chock-core` adds its own scratch
-/// area, its cache and its tool directory, and each of those asks for a path to
-/// appear somewhere else. So this row is measured against the driver's own
-/// `expressibleOn`, with the config a real session would hand it, rather than
-/// worked out from the rows above.
 fn toolCallRow(m: Measured) Row {
     if (m.tool_call_refused) |why| return .{
         .name = tool_call_name,
@@ -1109,34 +656,10 @@ fn toolCallRow(m: Measured) Row {
     };
 }
 
-/// What every required sink row is called. One name for all of them, so
-/// `isFirstRunRow` needs no list of paths and a bundle that requires three
-/// sinks reads as three rows of one kind.
 pub const required_sink_name = "audit sink";
 
-/// The name every org ceiling row carries. See `measureOrgCeilings`.
 pub const org_ceiling_name = "org ceiling";
 
-/// The device passthrough row. **A fact about this build, and never a
-/// fault.** `Measured.device_passthrough` is a compile time constant, so
-/// there is no partial or refused state a kernel could hand back the way a
-/// dialled probe can: it is always exactly `.on` when this row exists at
-/// all. A build that answers false gets no row: `unsupported` would read as
-/// a setting a person could change, and there is none to change. See
-/// `rowsFor`'s own guard.
-///
-/// **On says nothing about whether any device reaches a sandbox today.**
-/// That still needs a project's own `devices` block naming the device, and a
-/// `policy` rule answering `allow` for the same action: a session on a
-/// machine with this row on and neither of those still exposes no device at
-/// all. See `docs/policy.md` and `docs/running.md`.
-///
-/// **A grant this row reports on is coarse by nature, and never narrower
-/// than the whole device.** A device node is a direct channel to a kernel
-/// driver, and seccomp filters `ioctl` by request number and cannot tell
-/// which descriptor it was called on, so "these ioctls on the programmer and
-/// not on the disk" is not a rule this row, or anything else in Chock, can
-/// express. See `docs/sandbox.md`.
 fn deviceRow() Row {
     return .{
         .name = "device passthrough",
@@ -1150,21 +673,6 @@ fn deviceRow() Row {
     };
 }
 
-/// One sink this installation requires.
-///
-/// **Never blocking, and that is a decision and not an oversight.** A machine
-/// that cannot reach its audit sink still runs sessions, and
-/// `lib/chock-policy/org.zig` weighed the alternative and refused it: a doctor
-/// that exited 2 here would put the refuse-to-start answer back through the
-/// back door. Refusing to start turns an organisation's control into an
-/// outage, and a developer who cannot work reaches for a tool that is not
-/// Chock, so the organisation gets **no** record of that work rather than a
-/// late one. The session runs, the log on disk keeps every line the sink
-/// missed, and a gap that is still open at the end is `Exit.audit_gap`.
-///
-/// So the worst this row makes the whole report is `degraded`, and the meaning
-/// says both halves out loud: the session runs, and what it costs when the gap
-/// stays open.
 fn requiredSinkRow(arena: std.mem.Allocator, one: SinkProbe) std.mem.Allocator.Error!Row {
     const what = switch (one.kind) {
         .directory => "directory",
@@ -1189,19 +697,12 @@ fn requiredSinkRow(arena: std.mem.Allocator, one: SinkProbe) std.mem.Allocator.E
                 "exits {d} when that tail is still on this machine at the end",
             .{ what, one.path, one.reached.why(), Exit.audit_gap.code() },
         ),
-        // **The installation and never a flag.** Nobody at this keyboard asked
-        // for this sink, so a reader sent to a command line would look through
-        // one that does not hold it.
         .fix = "Nobody typed this sink: an org policy bundle requires it. Start the collector " ++
             "that reads it, or ask whoever installed this Chock.",
         .blocks = false,
     };
 }
 
-/// The cgroup row. **Degraded and never blocking**, which is
-/// `chock-sandbox/linux/cgroup.zig`'s own decision: a machine with no cgroup
-/// v2 tree still gets the rlimit floor, and a sandbox must not rearrange the
-/// machine it runs on to protect one tool call.
 fn cgroupRow(
     arena: std.mem.Allocator,
     support: ?CgroupSupport,
@@ -1215,12 +716,6 @@ fn cgroupRow(
     const view = vantageNote(vantage);
     return .{
         .name = "cgroup v2",
-        // **`supplied` cannot come from the measurement this row reads.**
-        // `cgroupRow` is given what `cgroup.Cgroup.create` answered, and that
-        // call makes chock's own cgroup and never takes one from a caller. The
-        // arm is here so the switch stays exhaustive, and it reads `on`
-        // because a supplied cgroup really does hold the program. The sentence
-        // beside it says who wrote the numbers in it.
         .state = switch (found) {
             .ok, .supplied => .on,
             .off => .off,
@@ -1240,30 +735,14 @@ fn cgroupRow(
     };
 }
 
-/// What every fix on this row starts with. The controllers are named by the
-/// library's own reason text, so this file states no second copy of the list.
 const cgroup_floor = "A tool call still gets the rlimit floor, so a session runs. What it loses is the " ++
     "resident memory bound and the per sandbox process count. ";
 
-/// What a row that is not on adds, and what it tells a person to do, once the
-/// vantage is known.
 const VantageNote = struct {
-    /// What the row says after the reason. Empty for an answer about this
-    /// machine, which needs no second sentence.
     means: []const u8,
-    /// What to do, when the vantage alone decides it. Null when the answer's
-    /// own reason decides it, which `fixFor` reads.
     fix: ?[]const u8,
 };
 
-/// The sentences for one vantage.
-///
-/// **A refusal measured from inside a namespace is not a refusal by the
-/// machine, and the two need different words.** `chock doctor` exists to say
-/// whether a session can run, and the old row said "ask your init system to
-/// delegate" for a machine whose init system already delegates. Somebody then
-/// reads a kernel that works. See `cgroup.Vantage` for what a cgroup namespace
-/// does to the path the answer is derived from.
 fn vantageNote(vantage: ?CgroupVantage) VantageNote {
     const ask_here = cgroup_floor ++ "This chock is inside the container, so the controllers have to be " ++
         "delegated there. Run chock doctor outside it to measure the machine itself.";
@@ -1289,16 +768,6 @@ fn vantageNote(vantage: ?CgroupVantage) VantageNote {
     };
 }
 
-/// What to do about an answer that was measured on this machine's own tree.
-///
-/// **`create_refused` is not a machine that delegates nothing.**
-/// `cgroup.Support.Reason` only answers it after an ancestor was found that
-/// already lists every controller, and `mkdirat` was refused under every one
-/// of them. Measured on 2026-08-24 on a systemd box: of the cgroups above a
-/// user's own, only `user@1000.service` is owned by that user, so a chock
-/// started outside their user manager finds the delegation and may not write
-/// there. Telling that person to ask for delegation is advice for a fault
-/// they do not have.
 fn fixFor(found: CgroupSupport) []const u8 {
     const ask_init = cgroup_floor ++ "Ask the machine's init system to delegate the controllers to your user slice.";
     const ask_where = cgroup_floor ++ "The controllers are already delegated above this process and no directory " ++
@@ -1306,9 +775,6 @@ fn fixFor(found: CgroupSupport) []const u8 {
         "your own user manager owns.";
 
     return switch (found) {
-        // A supplied cgroup names nothing to fix on this machine: the caller
-        // made it and the caller holds it. See `cgroupRow` for why this row
-        // never reads that answer at all.
         .ok, .off, .supplied => "",
         .unsupported, .unavailable => |reason| switch (reason) {
             .no_cgroup2_tree,
@@ -1323,13 +789,6 @@ fn fixFor(found: CgroupSupport) []const u8 {
     };
 }
 
-/// Whether this machine has `git`.
-///
-/// **It blocks, and the report had no row for it at all.** Every session
-/// builds a workspace, and a worktree is what a workspace is on a project with
-/// git of its own. Measured on 2026-08-25 on a machine with no git: `chock run`
-/// answered "the workspace for /proj could not be built: NotFound", which
-/// names neither git nor anything a person could act on.
 fn gitRow(m: Measured) Row {
     if (m.git_program) |path| return .{
         .name = "git",
@@ -1339,10 +798,6 @@ fn gitRow(m: Measured) Row {
     };
     return .{
         .name = "git",
-        // `unavailable` and not `off`: `off` is a layer this session gave up,
-        // and a machine with no git is a machine somebody can install git on.
-        // The word beside it reads `BLOCKED` because the row stops a first
-        // run, which `wordFor` reads from `blocks` and not from here.
         .state = .unavailable,
         .means = "not on this machine's PATH, so no session can build a workspace and no session can start",
         .fix = "Install git. Chock runs it to make the worktree a session works in and to apply the work back.",
@@ -1370,19 +825,12 @@ fn devShellRow(arena: std.mem.Allocator, state: DevShellState) std.mem.Allocator
         .no_flake => .{
             .name = "dev shell",
             .state = .off,
-            // **What a session really mounts is the toolchain row's to say.**
-            // This used to end "and the sandbox mounts the whole Nix store",
-            // which is false on a machine with no Nix store, and it was
-            // printed on the very machine where every tool call then died in
-            // the mount tree.
             .means = "this project states no flake.nix, so tool calls do not get a toolchain of the project's own",
             .fix = "Write a flake.nix with a dev shell to narrow what a session mounts.",
         },
         .read => |evaluated| .{
             .name = "dev shell",
             .state = .on,
-            // Which of the two is a measurement: an evaluation took seconds and
-            // a cache read took none.
             .means = if (evaluated) "evaluated with nix" else "read from the cache",
             .why = "every tool call gets this project's own toolchain",
         },
@@ -1390,10 +838,6 @@ fn devShellRow(arena: std.mem.Allocator, state: DevShellState) std.mem.Allocator
             .name = "dev shell",
             .state = .unavailable,
             .means = try std.fmt.allocPrint(arena, "nix could not read it: {s}", .{reason}),
-            // Stated rather than blocking, and this is `src/run.zig`'s own
-            // rule: a broken flake is often the very thing somebody starts a
-            // session to fix, and refusing would leave them with no agent and
-            // a broken flake instead of one of the two.
             .fix = "A session still runs. The toolchain row says what it mounts instead.",
         },
         .no_nix => .{
@@ -1405,16 +849,6 @@ fn devShellRow(arena: std.mem.Allocator, state: DevShellState) std.mem.Allocator
     };
 }
 
-/// What a container runtime on this machine answered, or null when this
-/// machine needs no row.
-///
-/// **A machine that needs no runtime gains no row**, the same rule an
-/// installation with no policy bundle already gets for its audit sinks. Most
-/// machines have no container runtime and most projects name no image, and a
-/// yellow row about a thing nobody asked for teaches a person to stop reading
-/// the report. So a row appears when a runtime really answered, which is a
-/// fact worth stating, or when the project names an image, which is when a
-/// runtime that is absent or silent matters.
 fn containerRow(
     arena: std.mem.Allocator,
     state: ContainerState,
@@ -1437,8 +871,6 @@ fn containerRow(
             .name = "container runtime",
             .state = .unavailable,
             .means = try std.fmt.allocPrint(arena, "it is installed and did not answer: {s}", .{text}),
-            // Stated and not blocking. The toolchain row carries the refusal,
-            // because that is the row that says a session cannot start.
             .fix = "Start the runtime's daemon, or install podman, which has none.",
         },
         .ready => |ready| .{
@@ -1446,10 +878,6 @@ fn containerRow(
             .state = .on,
             .means = try std.fmt.allocPrint(arena, "{s}", .{ready.kind.displayName()}),
             .why = "a project with no Nix can name a container image, and its files become the toolchain",
-            // **The trust position is its own line and never a state.** A
-            // caller that reads this row as a layer would be reading a fact
-            // about who unpacked a file as a fact about the sandbox, and the
-            // sandbox is unchanged either way.
             .fix = if (ready.trust.isPrivileged())
                 try std.fmt.allocPrint(
                     arena,
@@ -1463,12 +891,6 @@ fn containerRow(
     };
 }
 
-/// Where the files a tool call would run come from.
-///
-/// **The row that makes a first run honest.** Every other row of this report
-/// can pass on a machine where no tool call can work: the sandbox is whole,
-/// the credential is there, and there is nothing to mount. See
-/// `ToolchainState` for the measurement that produced this row.
 fn toolchainRow(arena: std.mem.Allocator, state: ToolchainState) std.mem.Allocator.Error!Row {
     return switch (state) {
         .dev_shell => .{
@@ -1488,10 +910,6 @@ fn toolchainRow(arena: std.mem.Allocator, state: ToolchainState) std.mem.Allocat
             .name = "toolchain",
             .state = .unavailable,
             .means = try std.fmt.allocPrint(arena, "no session can start: {s}", .{why}),
-            // **The sentence a person acts on is in `means`**, because it
-            // differs: an image nobody pulled, a runtime that is not there,
-            // and a block that does not parse are three different repairs.
-            // This line says the one thing that is true of all three.
             .fix = "Chock reads the image before the session starts and never during one, because " ++
                 "a tool call has no network and no daemon socket.",
             .blocks = true,
@@ -1505,9 +923,6 @@ fn toolchainRow(arena: std.mem.Allocator, state: ToolchainState) std.mem.Allocat
                 .{count},
             ),
             .why = "a tool call can run what this machine has",
-            // Not a fault and worth a line every time, because it is the
-            // widest of the three answers and the person may not know they
-            // are on it.
             .fix = "This is the widest answer. Narrow it with a flake.nix dev shell, or with " ++
                 ".container = .{ .image = \"...\" } in chock.zon.",
         },
@@ -1530,15 +945,11 @@ fn credentialRow(arena: std.mem.Allocator, state: CredentialState) std.mem.Alloc
             .state = .on,
             .means = try std.fmt.allocPrint(arena, "found: {s}", .{source}),
         },
-        // Not an error and not a gap. A local endpoint asks for nothing, and
-        // `chock_auth.lookup.Source.none` is how that is said.
         .not_needed => .{
             .name = "credential",
             .state = .off,
             .means = "this provider asks for none, which is what a local endpoint is",
         },
-        // A gap, and it blocks. `chock run` refuses this one before it builds
-        // anything, so the report and the command agree.
         .missing => |reason| .{
             .name = "credential",
             .state = .unavailable,
@@ -1572,24 +983,12 @@ fn cacheRow(arena: std.mem.Allocator, probe: Probe) std.mem.Allocator.Error!Row 
         else
             try std.fmt.allocPrint(arena, "it could not be made: {s}", .{probe.why()}),
         .why = "the directory a compiler writes into is there and writable",
-        // A warning in `src/run.zig` and not a refusal, so it is one here too.
         .fix = if (probe == .ok) "" else "A session still runs. A compiler in it has nowhere but the workspace to write, " ++
             "so every session recompiles from nothing.",
         .blocks = false,
     };
 }
 
-/// What `chock sessions seal` can sign a log's chain head with.
-///
-/// **Never blocking.** `seal.Level` has three values and the third is a
-/// software key, so a machine with no reader signs and records that it used the
-/// weaker key. A doctor that exited 2 here would refuse to start a session over
-/// a fallback the design already made and already records.
-///
-/// The three states are the ones `Probe` already has, and they mean here what
-/// they mean everywhere else in this report: `unsupported` is a machine with
-/// nothing to configure, `unavailable` is a machine that has the thing and
-/// would not let this process use it.
 fn cardSealRow(
     arena: std.mem.Allocator,
     probe: Probe,
@@ -1600,9 +999,6 @@ fn cardSealRow(
         .state = probe.state(),
         .means = if (probe == .ok) try std.fmt.allocPrint(
             arena,
-            // **The reader count and not a card.** Whether a card is in the
-            // reader is not read here: finding out means connecting to it, and
-            // a report must not take a reader another program is using.
             "a PC/SC daemon answered and named {d} reader(s)",
             .{readers orelse 0},
         ) else try std.fmt.allocPrint(arena, "no card key on this machine: {s}", .{probe.why()}),
@@ -1618,9 +1014,6 @@ fn freeSpaceRow(arena: std.mem.Allocator, free: ?u64) std.mem.Allocator.Error!Ro
     const bytes = free orelse return .{
         .name = "workspace space",
         .state = .unavailable,
-        // Never read as a full disk. The same rule `chock_io.Io.freeBytes`
-        // keeps: an unreadable filesystem is not an empty one, and a caller
-        // that read the two the same way would refuse every call.
         .means = "the free space could not be read, which is not the same as no room",
         .fix = "A session still runs. A writing tool call is refused only when the reading works and answers too little.",
         .blocks = false,
@@ -1641,42 +1034,19 @@ fn freeSpaceRow(arena: std.mem.Allocator, free: ?u64) std.mem.Allocator.Error!Ro
             floor / (1024 * 1024),
         }),
         .fix = "Every writing tool call is refused under the floor, so a session starts and gets nothing done. Free some space.",
-        // A session that can write nothing is a first run that fails.
         .blocks = true,
     };
 }
 
-/// How wide the name column is, as `printRow`'s own format string spells it.
-/// Wide enough for the longest name above; a name that overflows this pushes
-/// its own sentence out of the column and makes the whole report read as
-/// ragged.
 const name_width = 17;
 
-/// Print the report on standard output, and the refusal, when there is one,
-/// on standard error.
-///
-/// **The rows are the answer a person asked for, so they go to standard
-/// output.** The one line that says a machine cannot run a session is a
-/// diagnostic, so it goes to standard error, which is the rule the rest of
-/// this program keeps.
 fn printReport(project_root: []const u8, m: Measured, rows: []const Row, verdict: Verdict) void {
-    // **The build, on the first line, on every run.** This is the report a
-    // person pastes into a bug, and it is worth more here than `chock
-    // --version` is: nobody runs that before reporting a fault, and everybody
-    // runs this. One line that answers "which Chock" is an answer and not a
-    // teaching, so it is not held back for `--verbose` the way the rationale
-    // rows are.
     tty.out(.plain, "{s}\n", .{version_line});
 
-    // **The project is a `--verbose` line.** A person who typed the command in
-    // a directory knows which directory they typed it in, and `--project` is
-    // read back from the command line they typed. It is still here for a report
-    // pasted into a bug, which is what `--verbose` is for.
     tty.detail("{s}\n", .{project_root});
     tty.out(.plain, "\n", .{});
 
     if (m.family == .none) {
-        // The one sentence. Never a column of layers: see `refuses_outright`.
         tty.print(.err, "{s}\n\n", .{refuses_outright});
     } else {
         tty.out(.plain, "{s}\n", .{layers_heading});
@@ -1694,23 +1064,10 @@ fn printReport(project_root: []const u8, m: Measured, rows: []const Row, verdict
     }
     tty.out(.plain, "\n", .{});
 
-    // **A sentence and never a row.** Redaction has nothing to measure here:
-    // no state a machine can be in, no fix, and no answer that differs from
-    // one box to the next. A row would carry a glyph and a word over a
-    // measurement nobody took, which is the fault this whole command exists to
-    // avoid, and it would read as a layer somebody could turn on.
-    //
-    // **Printed byte for byte**, and never a summary of it.
-    // `chock_core.redact.not_a_boundary` is held beside the mechanism for
-    // exactly this: a command that shows it to a person must show the words
-    // that module argued for, and not a paraphrase that got friendlier.
     if (tty.verbose()) tty.out(.plain, "{s}\n\n", .{chock_core.redact.not_a_boundary});
 
     switch (verdict) {
         .ready => tty.out(.plain, "chock doctor: a session can start here, with every row on.\n", .{}),
-        // The counts read as "{d} of {d}" rather than as a sentence with a
-        // verb in it, because a sentence that says "1 rows" reads as a bug in
-        // the report and makes a person doubt the rest of it.
         .degraded => tty.out(
             .plain,
             "chock doctor: a session can start here. Rows that are not on: {d} of {d}. None of them stops a first run.\n",
@@ -1724,9 +1081,6 @@ fn printReport(project_root: []const u8, m: Measured, rows: []const Row, verdict
     }
 }
 
-/// Whether a row belongs under `first_run_heading` rather than under
-/// `layers_heading`. Read from the name, so the two loops above and the order
-/// in `rowsFor` can never disagree about which half a row is in.
 fn isFirstRunRow(row: Row) bool {
     for ([_][]const u8{
         "git",
@@ -1745,23 +1099,7 @@ fn isFirstRunRow(row: Row) bool {
     return false;
 }
 
-/// One row, and what a person needs to read it.
-///
-/// **A row that is on is a glyph, a name and a word.** The sentence that says
-/// what the layer gives is the same on every machine and on every run, so it is
-/// a lesson and not an answer: it waits for `--verbose`. A number the machine
-/// really gave stays, because that differs from one box to the next.
-///
-/// **A row that is not on keeps every word it had.** What is lost is in
-/// `means` and what to do is in `fix`, and neither of those is decoration. That
-/// is the whole reason this report is worth running.
 fn printRow(row: Row) void {
-    // The glyph and the word both, and never colour alone. No fact may rest on
-    // colour, and this report is read in a pipe more often than on a screen.
-    //
-    // A row with nothing to report stops after the word. Padding the word out
-    // to its column and then writing nothing would leave trailing blanks on
-    // most lines of the report, which `grep` and a diff both read as content.
     if (row.means.len == 0) {
         tty.out(.plain, "  {s} {s: <17}  {s}\n", .{
             row.state.glyph(),
@@ -1798,13 +1136,6 @@ fn countBlocking(rows: []const Row) usize {
     return count;
 }
 
-/// Read this machine.
-///
-/// **A build whose driver applies no layer measures no layer.** It does not
-/// ask a kernel about a mechanism its own driver would never reach, which is
-/// the difference between a measurement and a guess. The host half below is
-/// measured either way, because it is true of the machine whatever the driver
-/// does with it.
 fn measure(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -1813,9 +1144,8 @@ fn measure(
     project_root: []const u8,
 ) Measured {
     var m = Measured{};
-    // **Comptime, so a branch this build's driver never takes is never
-    // analysed.** `measureLayers` names Linux mechanisms and `measureSeatbelt`
-    // names Darwin ones, and neither compiles for the other target.
+    // Comptime, so a branch this build's driver never takes is never analysed:
+    // the two measure functions name mechanisms of different targets.
     switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
         .none => {},
         .namespaces => measureLayers(arena, io, env, project_root, &m),
@@ -1848,11 +1178,6 @@ fn measureHost(
         break :cache .ok;
     };
 
-    // The filesystem the workspace will live on, which is not the project's
-    // own: a workspace is built under Chock's state directory. The deepest
-    // ancestor that exists is what is read, because `freeBytes` answers null
-    // for a path that is not there and a project that has never run a session
-    // has no directory of its own yet.
     if (session_paths.projectDir(arena, env, project_root) catch null) |dir| {
         m.free_bytes = freeBytesNear(dir);
     }
@@ -1864,65 +1189,26 @@ fn measureHost(
 
     m.write_execute = measureHardening(arena, io, env, project_root, defaultModel(arena, io, env));
 
-    // **After the toolchain, because the answer depends on it**, and only for
-    // a driver that routes: a driver that gives a tool call no network of its
-    // own writes no resolver files and gets no row. See `ResolverFiles`.
     if (m.driver.contains(.network_isolated)) {
         m.resolver_files = measureResolverFiles(io, m.toolchain, "");
     }
 }
 
-/// Which of the two ways a routed sandbox on this host places the three files
-/// it writes for itself.
-///
-/// **One question, and the toolchain answers most of it.** A Nix closure and a
-/// dev shell hold no `/etc`, so the files are made inside a root the sandbox
-/// already owns and nothing on the host is read. A host toolchain binds the
-/// host's own `/etc`, because that is where the CA certificates are, and a
-/// routed call then takes that directory for itself.
-///
-/// **What is at those paths on the host is no longer read, and that is the
-/// point.** It used to be: a link into `/run/systemd/resolve` refused the
-/// session, and so did a missing `nsswitch.conf`. `namespace.ownDirectory`
-/// removed both, so the only thing left worth measuring is which directory the
-/// files land in.
-///
-/// **The `hide` entries are left out on purpose.** They name `/run`, not the
-/// directory a substitution writes into, so they say nothing about this
-/// question.
-///
-/// `host_root` is empty for the real host. A test states a tree of its own
-/// there, so this can be measured on a machine whose own shape is different.
-/// Every path below is read under that prefix, the Nix store included, so a
-/// stated tree is a whole host and never half of one.
 fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []const u8) ResolverFiles {
     switch (toolchain) {
         .image => |reference| return .{ .from_image = reference },
-        // A dev shell is a Nix closure and holds no `/etc`. The other two name
-        // a session that does not start at all, and the toolchain row already
-        // says so: there is no mount set to read.
         .dev_shell, .image_unusable, .none => return .made_inside,
         .host => {},
     }
 
-    // The one rule `run.hostToolchainPaths` states in full: a machine with a
-    // Nix store mounts that and nothing else, so its sandbox holds no host
-    // `/etc`. Read from that list, so a report and a session cannot disagree.
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (under(&buffer, host_root, run.host_toolchain_candidates[0])) |store| {
         if (pathIsDirectory(io, store)) return .made_inside;
     }
 
-    // **The directory each file belongs in, read from the list itself.** A
-    // host that has it is a host whose sandbox binds it, because
-    // `hostToolchainPaths` keeps every candidate that really exists, and a
-    // host that has not is one where the sandbox makes the directory too.
     for (sandbox.Sandbox.resolver_substitutions) |one| {
         const target = switch (one) {
             .text => |text| text.target,
-            // The trust store link answers nothing a `text` entry has not
-            // already answered: every build that has one also has the three
-            // `text` entries, and those are read first.
             .link => continue,
             .hide => continue,
         };
@@ -1934,42 +1220,15 @@ fn measureResolverFiles(io: std.Io, toolchain: ToolchainState, host_root: []cons
     return .made_inside;
 }
 
-/// True when `path` is a directory, or a link that leads to one. The same
-/// question `src/run.zig`'s own `pathIsDirectory` asks, and the same answer for
-/// a path this process may not read: a source it cannot stat is a source the
-/// sandbox cannot bind either.
 fn pathIsDirectory(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
 }
 
-/// `root ++ path` in `buffer`, or null when it does not fit. Null for a path
-/// too long to name is the same answer as a path that is not there: neither
-/// can be read, and neither refuses a routed sandbox.
 fn under(buffer: []u8, root: []const u8, path: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buffer, "{s}{s}", .{ root, path }) catch null;
 }
 
-/// Whether a session of this project would run with the write and execute rule
-/// off. **The one sandbox row that is a question about the project and not
-/// about the machine**: every machine this driver runs on can hold the rule,
-/// and `chock_policy.hardening` is the row a project writes to give it up.
-///
-/// **The org bundle is read first, and leaving it out would be a lie in the
-/// dangerous direction.** A rule in the bundle can only lower the answer, so a
-/// report that read only `chock.zon` would say a session gives up hardening
-/// that the organisation has already forbidden. The same rules, in the same
-/// order, that `src/run.zig` folds.
-///
-/// **This asks the question the way a root session asks it**: the agent kind
-/// `chock run` starts with, and the model the configuration names by default,
-/// which together are what a `chock run` with no flags carries. A project whose
-/// rule names another agent kind, or a model the command line would have to
-/// pick, reads `strict` here and is answered by the session itself. That is the
-/// safe direction: this row never says the hardening is off when it is on.
-///
-/// A `chock.zon` this cannot read answers `strict`, which is what a session
-/// gets too: `chock run` refuses to start on a policy it cannot parse.
 fn measureHardening(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1996,29 +1255,15 @@ fn measureHardening(
     return chock_policy.hardening.writeExecuteFor(policy.evaluateChain(&.{doctor_agent_kind}, .{
         .agent_kind = doctor_agent_kind,
         .model = model,
-        // No tool call asked for this and none ever can: the filter is built
-        // before the first turn. See `chock_broker.actions.self_asked_tool`.
         .tool = chock_broker.actions.self_asked_tool,
         .action = chock_policy.hardening.jit_action,
     }, null));
 }
 
-/// The agent kind this command asks the policy about. `chock run`'s own
-/// default, so the answer here is the answer a session started with no
-/// `--agent-kind` gets.
 const doctor_agent_kind = "main";
 
-/// The model this command asks the policy about when the configuration names
-/// no default. **A name no provider issues**, because `table.Key` refuses an
-/// empty model and any real spelling here could match a rule an author wrote
-/// for a real model. It matches only a rule that names no model at all, which
-/// is the reading that keeps the hardening.
 const no_default_model = "(no default model)";
 
-/// The model a `chock run` with no `--model` would use, or `no_default_model`
-/// when this machine has no configuration to read one from. **The same reader
-/// `measureCredential` uses**, so the two rows cannot disagree about what the
-/// configuration says.
 fn defaultModel(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2030,12 +1275,6 @@ fn defaultModel(
     return if (named.len == 0) no_default_model else named;
 }
 
-/// Reach for a PC/SC daemon with the transport `chock sessions seal` uses.
-///
-/// **A platform with no transport measures nothing.** On Darwin the driver
-/// answers `error.Unavailable` for every call, and asking it would produce a
-/// row that says the machine is missing something an administrator could
-/// install. It is the build that is missing it.
 fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
     if (comptime !@hasDecl(chock_pcsc.platform, "Failure")) {
         m.card_seal = .{ .absent = "this build has no PC/SC transport: macOS reaches a card " ++
@@ -2046,22 +1285,12 @@ fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
         defer driver.deinit();
 
         driver.establish() catch |err| {
-            // The driver's own sentence, which carries the two version numbers
-            // and the socket path an error name cannot. Only the error name
-            // when there is somehow no sentence, so a row is never empty.
             const why = if (driver.failure) |failure|
                 std.fmt.allocPrint(arena, "{f}", .{failure}) catch @errorName(err)
             else
                 @errorName(err);
             m.card_seal = switch (err) {
-                // **A daemon that is there and said no.** An administrator can
-                // change a polkit rule, which is what `unavailable` means in
-                // every other row of this report. A protocol this build does
-                // not speak is the same shape of answer: the machine has the
-                // daemon and this build cannot use it.
                 error.NotAuthorized, error.ProtocolMismatch => .{ .refused = why },
-                // No socket, no listener, or a transport that failed. There is
-                // nothing here to permit.
                 else => .{ .absent = why },
             };
             return;
@@ -2078,9 +1307,6 @@ fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
         while (list.next()) |_| counted += 1;
         m.card_readers = counted;
 
-        // **A daemon with no reader is not a daemon that refused.** Nothing is
-        // wrong with the machine and nothing can be configured: somebody has to
-        // plug a reader in, which is what `absent` says.
         m.card_seal = if (counted == 0)
             .{ .absent = "a PC/SC daemon answered and no reader is attached" }
         else
@@ -2088,50 +1314,8 @@ fn measureCardSeal(arena: std.mem.Allocator, io: std.Io, m: *Measured) void {
     }
 }
 
-/// What the probe file inside a required drop directory is called.
-///
-/// **Not a `.jsonl`, and it starts with a dot.** A collector watches that
-/// directory for the one file a session leaves, which is `<session>.jsonl`, and
-/// a probe that looked like a session's own drop would be picked up as an empty
-/// session. This one is removed before the command returns whatever happens,
-/// and it is named so that a file somebody finds after a crash says what made
-/// it.
-///
-/// **A constant name, unlike the probe tree beside it, and that is measured
-/// rather than assumed.** An organisation names one drop directory for every
-/// project, so two `chock doctor` runs do meet in it. Neither can spoil the
-/// other: the probe is `FileDrop.reach`, which creates the file and reads its
-/// length through the descriptor, so a second run that removes the file
-/// changes nothing either run reads, and both report the sink as reached. The
-/// constant name is what makes the file a crash left get removed by the next
-/// run, which a name of one run's own would end. See `probeDirName` for the
-/// tree, where a second run really did spoil the first one's measurement.
 const probe_drop_name = ".chock-doctor.probe";
 
-/// Reach for every sink this installation's org policy bundle requires.
-///
-/// **Doctor reads the bundle itself**, out of the data directory
-/// `lib/chock-auth/paths.zig` names, which is the same file `chock run` reads
-/// and the same reader. A session is not started to find out.
-///
-/// **An installation with no bundle measures nothing and gains no row.** So
-/// does one whose bundle cannot be read: that file makes `chock run` refuse
-/// with the bundle reader's own diagnostic, which names the line and the
-/// reason, and a row here would be a second, shorter answer to keep true. What
-/// this command has to add is the part no reader can know, which is whether the
-/// machine can reach the places the bundle names.
-/// Every ceiling this installation's org policy bundle sets, as sentences.
-///
-/// **A person can see the effect and never the cause.** A session that stops at
-/// a number nobody wrote in `chock.zon`, or a spawn refused by a limit the
-/// project did not set, reads as a fault until you know an organisation set it.
-/// `doctor` reported the bundle's required sinks and nothing else it imposes,
-/// so the three caps below were invisible on the machine they bound.
-///
-/// **Read and never reached.** This opens no socket and starts nothing: it
-/// reads the same bundle a session reads and reports what it says. So a row
-/// here is never a fault and never blocks a first run, which is why each is
-/// `.on` with a value in `means`: a number is an answer and not a lesson.
 fn measureOrgCeilings(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2186,13 +1370,6 @@ fn measureOrgCeilings(
         found.append(arena, line) catch return found.items;
     }
 
-    // **Resolved against this machine, not printed as raw text.** A ceiling
-    // may name a percentage, and "50%" means nothing on its own: a person
-    // reading `chock doctor` on the machine a session will actually run on
-    // needs the number that percentage becomes here. A machine whose own
-    // facts cannot be read gains no row, the same as an installation with no
-    // bundle: a ceiling that cannot be sized is not reported as though it
-    // caps nothing.
     if (bundle.limits) |ceiling| limits: {
         const machine = chock_policy.limits.Machine.read() catch break :limits;
         const processes = resolveCeilingField(ceiling.processes, machine.cpu_count);
@@ -2229,14 +1406,6 @@ fn measureOrgCeilings(
     return found.items;
 }
 
-/// One `limits_mod.Ceiling` field, resolved against `basis`, or null when the
-/// bundle named nothing for it or when its text could not be read.
-///
-/// **The second null case cannot happen on a path that went through
-/// `chock_policy.org.parse`**, which refuses a bundle whose limits ceiling
-/// does not parse before this can ever run. It can happen on a bundle read
-/// some other way, and this command's rule is to read and never trust: a
-/// ceiling this build cannot size gains no row rather than a wrong one.
 fn resolveCeilingField(text: ?[]const u8, basis: u64) ?u64 {
     const setting = chock_policy.limits.parseSetting(text orelse return null) catch return null;
     return setting.resolve(basis);
@@ -2263,13 +1432,6 @@ fn measureRequiredSinks(
     return probes;
 }
 
-/// Whether one required sink can be reached from this machine, now.
-///
-/// **Through `chock_proto.ship`'s own transports and nothing else.** This
-/// command's rule is that a second way to ask would be a second answer to keep
-/// true, so it does not make a socket, connect it, or open a drop of its own:
-/// `Sink.reach` exists for this caller, and it sends nothing, so no record of a
-/// probe lands in an organisation's audit trail.
 fn reachSink(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2283,28 +1445,10 @@ fn reachSink(
             return .ok;
         },
         .directory => {
-            // **The directory is made and never required**, which is what
-            // `src/run.zig` does before it opens a drop: an operator names a
-            // directory a collector will watch, and one that is not there yet
-            // is not a machine that cannot reach it. A directory that could
-            // not be made shows up below as a drop that could not be opened.
-            //
-            // **`makeDirAll` and not `std.Io.Dir.createDirPath`**, and the
-            // difference is a hang. `createDirPath` walks back to a component
-            // it can make and then walks forward again, so a directory whose
-            // creation answers `ENOENT` while its parent exists sends it
-            // between the two for ever. A bundle naming a path under `/proc`
-            // is exactly that, because `mkdir` there answers `ENOENT` and not
-            // `EACCES`, and `chock doctor` then spun at 96 percent of a core
-            // instead of reporting anything. Measured on 2026-08-24.
-            // `makeDirAll` walks up once and stops.
             makeDirAll(io, required.path) catch {};
             const path = std.fs.path.join(arena, &.{ required.path, probe_drop_name }) catch
                 return .{ .refused = "the probe path could not be built" };
             var drop = chock_proto.ship.FileDrop{ .path = path };
-            // **Removed again, whatever happens**, and closed first. Nothing
-            // this command makes may outlive it, which is the rule the probe
-            // tree above keeps as well.
             defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
             defer drop.close(io);
             drop.sink().reach(io) catch |err| return .{ .refused = @errorName(err) };
@@ -2313,13 +1457,9 @@ fn reachSink(
     }
 }
 
-/// Free bytes on the filesystem `path` is on, or on the filesystem of its
-/// deepest ancestor that exists. Null when nothing above it could be read.
 fn freeBytesNear(path: []const u8) ?u64 {
     const driver = chock_io.default();
     var here: []const u8 = path;
-    // Bounded, and the bound is the path itself: every step drops one
-    // component, so this ends at the root whatever it is given.
     while (here.len != 0) {
         if (driver.freeBytes(here)) |bytes| return bytes;
         here = std.fs.path.dirname(here) orelse return null;
@@ -2341,9 +1481,6 @@ fn measureDevShell(
     var diag: ?chock_nix.Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
 
-    // The same call a session makes, against the same cache, so a warm
-    // machine answers at once and a cold one waits exactly as long as its
-    // first run would.
     const loaded = chock_nix.DevShell.load(gpa, io, .{
         .project_root = project_root,
         .cache_dir = dir,
@@ -2361,11 +1498,6 @@ fn measureDevShell(
     return .{ .read = shell.evaluated };
 }
 
-/// Ask a container runtime what it is, the same way a session would.
-///
-/// **The same `detect` a session makes**, so this report states no second
-/// answer to keep true. It runs one `info`, which is a runtime call and never
-/// a fetch and never an extraction.
 fn measureContainer(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2383,17 +1515,6 @@ fn measureContainer(
     };
 }
 
-/// Where the files a tool call would run come from, decided the same way
-/// `src/run.zig` decides it.
-///
-/// **The image half inspects and never extracts.** A report must not spend the
-/// minutes a first extraction takes, and it does not have to: the question is
-/// whether a session would start, and `Image.present` answers that with one
-/// `image inspect`. See `chock_container.Image.present`.
-///
-/// **The host half asks the filesystem and never a list.** It counts the same
-/// candidates `src/run.zig`'s own `hostToolchainPaths` binds, so a report and a
-/// session cannot disagree about how wide the fallback is.
 fn measureToolchain(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2425,18 +1546,15 @@ fn measureToolchain(
             .unreachable_runtime => |text| return .{ .image_unusable = text },
         };
 
-        // **The resolved path and never the bare name.** `proc.run` asserts
-        // that `argv[0]` is absolute, and a bare name aborted this whole
-        // command in a debug build: measured on 2026-08-25 with a real podman.
+        // The resolved path and never the bare name. `proc.run` asserts that
+        // `argv[0]` is absolute, and a bare name aborted the whole command in a
+        // debug build against a real podman.
         var host = chock_container.Runtime.Host{
             .program = ready.program,
             .env = env,
         };
         const present = chock_container.Image.present(arena, io, .{
             .reference = reference,
-            // Not read by `present`, and a path all the same: a field with a
-            // value that would be wrong if it were read is worse than one that
-            // is right and ignored.
             .cache_dir = project_root,
             .kind = ready.kind,
             .trust = ready.trust,
@@ -2458,8 +1576,6 @@ fn measureToolchain(
     for (run.host_toolchain_candidates) |path| {
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch continue;
         if (stat.kind != .directory) continue;
-        // A machine with a Nix store mounts that and nothing else, which is
-        // the one rule `hostToolchainPaths` states in full.
         if (std.mem.eql(u8, path, run.host_toolchain_candidates[0])) return .{ .host = 1 };
         count += 1;
     }
@@ -2533,134 +1649,52 @@ fn measureCredential(
     return .{ .found = resolved.source.describe() };
 }
 
-/// One step a probe child runs, and the byte it reports itself with.
-///
-/// **Sent over a pipe and read back as untrusted bytes.** A child that dies
-/// halfway writes fewer records, and the parent then knows exactly how far it
-/// got instead of guessing.
 const Step = enum(u8) {
     namespaces = 1,
     tmpfs = 2,
     overlayfs = 3,
     seccomp = 4,
-    /// `netns.Session.configure`, for real. The detail byte is the `netns.Step`
-    /// the kernel refused.
     router_network = 5,
-    /// `nftables.Session.install`, for real, on the network the step above
-    /// built. The detail byte is the `nftables.Step` the kernel refused.
     router_filter = 6,
 };
 
-/// What one step answered.
 const Answer = enum(u8) {
     ok = 0,
-    /// This machine does not have the mechanism at all.
     absent = 1,
-    /// It has it and the child was refused.
     refused = 2,
-    /// **The namespaces step only.** The user namespace was made, and the id
-    /// map inside it could not be written, so every process in it would be
-    /// the overflow user and could own no file. See `runProbes`.
     refused_id_map = 3,
 };
 
-/// One record on the pipe: which step, what it answered, and one byte of
-/// detail.
-///
-/// **The third byte carries which call inside a step the kernel refused**, as
-/// that step's own `Step` ordinal. Both router steps need it: `netns` and
-/// `nftables` each answer `KernelModuleMissing` for several calls, and which
-/// call it was is the difference between a `modprobe` line a person can run
-/// and a row that only says it did not work. Every other step writes a zero
-/// there and nothing reads it.
 const record_bytes = 3;
 
-/// What a probe child is asked to do. **Every field narrows**, so a plan that
-/// asks for less can never measure more than the machine gave.
 const Plan = struct {
     network: sandbox.namespace.Network,
     mount: bool,
-    /// Mount a capped tmpfs and an overlay once the namespaces are up. Only
-    /// ever true with `mount`, because a mount made without a mount namespace
-    /// is a mount on the machine a person is using.
     filesystems: bool,
-    /// Install the seccomp filter. Last, because it cannot be removed.
     seccomp: bool,
-    /// Build the sandbox's own network and put the ruleset on it. **Only ever
-    /// true for a plan whose `network` takes a namespace**, because the calls
-    /// below make a device and a ruleset, and made outside a network namespace
-    /// they are a device and a ruleset on the machine a person is using.
     router: bool,
 };
 
-/// What one child reported, one slot per step, null for a step it never
-/// reached.
 const ChildReport = struct {
     namespaces: ?Answer = null,
     tmpfs: ?Answer = null,
     overlayfs: ?Answer = null,
     seccomp: ?Answer = null,
     router_network: ?Answer = null,
-    /// Which `netns.Step` the kernel refused, as its own ordinal. Meaningless
-    /// for an answer of `ok` and for a step that was never reached.
     router_network_step: u8 = 0,
     router_filter: ?Answer = null,
-    /// Which `nftables.Step` the kernel refused, as its own ordinal.
     router_filter_step: u8 = 0,
-    /// True when the child left by anything but `exit(0)`.
-    ///
-    /// **A crash is not a measurement, and the tests below are where that has
-    /// to be loud.** Every path the child takes ends in `std.process.exit(0)`,
-    /// so any other status is a signal, a panic or an abort, and a slot left
-    /// null by one of those reads exactly like a machine that answered no. A
-    /// test that took the second for the first would turn a broken probe into
-    /// a green suite: measured while building `linux/netns.zig`, where an
-    /// assertion inside the child turned four failures into four skips. Both
-    /// that file and `linux/nftables.zig` carry the same fix.
     crashed: bool = false,
 };
 
-/// The size the tmpfs probe asks for. Small: this asks whether a capped area
-/// can be mounted at all, not how large one may be.
 const probe_tmpfs_bytes: u64 = 1 << 20;
 
-/// What every probe directory under this project's own session directory
-/// starts with. `probeDirName` puts this run's own process id after it.
-/// Removed before this command returns, and named so that a directory
-/// somebody finds after a crash says what made it.
 const probe_dir_prefix = "doctor.probe";
 
-/// The probe directory of **this** run, written into `buffer`.
-///
-/// **The process id is part of the name, and it is not decoration.** The
-/// session directory is keyed by project, so two `chock doctor` runs on one
-/// project used to build the same tree, mount an overlay in it, and then each
-/// remove the other's. The report then said the kernel refused an overlay
-/// mount when the kernel had refused nothing, which is a wrong measurement a
-/// person cannot tell from a real one. Measured at 31 failures in 100 with
-/// four runs at a time, and 68 in 160 with eight. `linux/cgroup.zig` names a
-/// cgroup this way for the same reason.
 fn probeDirName(buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, probe_dir_prefix ++ "-{d}", .{std.posix.system.getpid()});
 }
 
-/// Remove the probe tree of every run that is gone, under `project_dir`.
-///
-/// **This is what the process id in the name costs, and it is paid here.** A
-/// constant name meant the next run reused the tree a crash left and removed
-/// it at the end. A name of this run's own cannot do that, so a crash would
-/// leave a directory nobody can explain, which is the very thing
-/// `removeProbeRoot` exists to prevent.
-///
-/// **A tree is removed only when its own process is gone.** Signal 0 asks the
-/// kernel whether a process id is in use and sends nothing. `EPERM` says the
-/// id belongs to somebody else, which is still a live id, so the tree stays:
-/// removing a tree a running `chock doctor` has an overlay mounted in is the
-/// fault this whole change is about.
-///
-/// `remove` is the caller's own remover, because the two platforms unmake
-/// different trees. See `removeProbeRoot` for the chmod a Linux overlay needs
-/// and `std.os.linux` has, which is a call that does not compile for Darwin.
 fn removeDeadProbeRoots(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2676,9 +1710,7 @@ fn removeDeadProbeRoots(
         const digits = entry.name[probe_dir_prefix.len + 1 ..];
         const pid = std.fmt.parseInt(std.posix.pid_t, digits, 10) catch continue;
         // Signal 0 is not a member of `std.posix.SIG` and the enum is open, so
-        // it is written this way. `lib/chock-sandbox/linux/cgroup.zig` asks
-        // the same question of a cgroup name and says the same thing about the
-        // safe direction: a leak, never a live tree removed.
+        // it is written this way.
         std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => {
                 const path = std.fs.path.join(arena, &.{ project_dir, entry.name }) catch continue;
@@ -2689,22 +1721,11 @@ fn removeDeadProbeRoots(
     }
 }
 
-/// Unmake a Seatbelt probe tree, which is one directory holding two files and
-/// needs nothing `deleteTree` cannot do on its own.
 fn removeSeatbeltProbeRoot(arena: std.mem.Allocator, io: std.Io, root: []const u8) void {
     _ = arena;
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
 }
 
-/// Measure every sandbox layer.
-///
-/// **Every row here answers "may this process do it", which is the question a
-/// `spawn` asks from this same process.** So a machine that refuses one of
-/// them refuses a tool call, whatever a machine outside a container would say,
-/// and no other row needs a vantage. The cgroup row is the one exception, and
-/// not by choice: its answer is derived from a path that a cgroup namespace
-/// rewrites, so the refusal it reports can be a refusal of a cgroup this
-/// process is not in. See `cgroup.Vantage`.
 fn measureLayers(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2712,8 +1733,6 @@ fn measureLayers(
     project_root: []const u8,
     m: *Measured,
 ) void {
-    // Landlock is the one mechanism with a probe that changes nothing, so it
-    // is read here and not in a child.
     if (sandbox.landlock.probeAbi()) |abi| {
         m.landlock = .ok;
         m.landlock_abi = abi;
@@ -2725,28 +1744,19 @@ fn measureLayers(
     }
 
     m.pidfd = probePidfd();
-    // The vantage first, because it is the question the answer below is only
-    // true of. Order changes nothing: reading it makes no cgroup and moves
-    // nothing.
     m.cgroup_vantage = sandbox.cgroup.readVantage();
     m.cgroup = probeCgroup();
 
-    // Somewhere to mount things. Removed again below, whatever happens.
     const probe_root = probeRoot(arena, io, env, project_root);
     defer if (probe_root) |root| removeProbeRoot(arena, io, root);
 
     const filter = sandbox.seccomp.build(arena, .{}) catch null;
 
-    // The whole sandbox at once. A machine that gives it gives every layer,
-    // and one fork is the whole measurement.
     const whole = runChild(.{
         .network = .none,
         .mount = true,
         .filesystems = probe_root != null,
         .seccomp = filter != null,
-        // `Network.none` takes a network namespace, the same one `.filtered`
-        // takes: see `namespace.Network`. So this child holds one of its own
-        // and nothing it builds reaches the machine.
         .router = true,
     }, probe_root, filter);
 
@@ -2766,26 +1776,9 @@ fn measureLayers(
     narrowNamespaces(arena, m, whole, filter);
 }
 
-/// The probe file a Seatbelt run may read, and the one it may not.
 const seatbelt_inside_name = "inside.txt";
 const seatbelt_outside_name = "outside.txt";
 
-/// Measure the Darwin layers.
-///
-/// **Through `Sandbox.spawn` itself, and never through a profile this command
-/// built for the occasion.** The whole failure this file exists to avoid is a
-/// report of a boundary nobody tried to cross, and a Seatbelt profile is
-/// exactly the shape of thing that fools a stand-in: it compiles, it applies,
-/// and it can deny nothing at all. So the measurement is two real sandboxes
-/// running two real programs: one reads a file the config permits and must
-/// succeed, and one reads a file beside it that the config does not permit and
-/// must be refused. **Both halves, because a sandbox that denied everything
-/// would pass a check that only ever looked for a refusal.**
-///
-/// The resource limits are measured by the same two calls. The Darwin driver
-/// refuses the spawn when a limit the caller asked for could not be set, so a
-/// run that reached the program at all proves the three Darwin honours went on.
-/// The other four have no mechanism, and their rows say so without asking.
 fn measureSeatbelt(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2793,10 +1786,9 @@ fn measureSeatbelt(
     project_root: []const u8,
     m: *Measured,
 ) void {
-    // **Not `probeRoot` and not `removeProbeRoot`.** Those two make and unmake
-    // the four directories an overlay mount needs, and the removal chmods a
-    // work directory the kernel left behind with mode 0, through a Linux only
-    // call. Nothing here mounts anything, so the tree is one directory.
+    // Not `probeRoot`: `removeProbeRoot` chmods a work directory the kernel
+    // leaves behind with mode 0, through a Linux only call. Nothing here mounts
+    // anything, so the tree is one directory.
     const root = seatbeltProbeRoot(arena, io, env, project_root) orelse {
         m.seatbelt = .{ .refused = "no directory could be made to measure it in" };
         m.rlimits = .{ .refused = "no directory could be made to measure it in" };
@@ -2822,8 +1814,6 @@ fn measureSeatbelt(
         file.writeStreamingAll(io, "probe\n") catch {};
     }
 
-    // One directory permitted, at its own path, which is the only shape this
-    // platform can express: see `darwin/driver.zig`'s own `expressibleOn`.
     const mounts = [_]sandbox.namespace.Mount{.{ .bind = .{
         .source = inside_dir,
         .target = inside_dir,
@@ -2841,14 +1831,9 @@ fn measureSeatbelt(
     };
     defer quiet.close(io);
 
-    // **Null is never a refusal**, on either call. A program the system killed
-    // says nothing about the boundary, and reading it as a refusal would report
-    // a layer that was never measured.
+    // Null is never a refusal, on either call. A program the system killed says
+    // nothing about the boundary.
     const permitted = seatbeltProbeRan(arena, &mounts, &rules, inside_dir, inside, quiet.handle) orelse {
-        // The sandbox never came up, so nothing was measured and nothing may be
-        // claimed. The limits ride on the same call for the same reason: the
-        // Darwin driver refuses a spawn when a limit it was asked for could not
-        // be set, so a run that reached the program proves the three went on.
         m.seatbelt = .{ .refused = "a sandboxed program could not be started at all" };
         m.rlimits = .{ .refused = "a sandboxed program could not be started at all" };
         return;
@@ -2868,20 +1853,9 @@ fn measureSeatbelt(
         m.seatbelt = .ok;
     }
 
-    // A tool call needs more than the workspace, and each of the rest still
-    // asks for a path to appear somewhere else. Asked of the driver's own
-    // function rather than assumed: see `toolCallRow`.
     m.tool_call_refused = seatbeltToolCallRefusal(arena, root);
 }
 
-/// One directory under this project's own session directory, for the Seatbelt
-/// measurement to run in. Removed before this command returns.
-///
-/// **The session directory and never a temporary one.** Seatbelt matches the
-/// path the kernel resolved, and on macOS `/tmp` is a symbolic link to
-/// `/private/tmp`: a rule naming a path through that link matches nothing at
-/// all, so the whole measurement would read as a sandbox that denies
-/// everything. Measured on 2026-08-25.
 fn seatbeltProbeRoot(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2897,9 +1871,6 @@ fn seatbeltProbeRoot(
     return root;
 }
 
-/// Run one program inside a real sandbox and say whether it read `target`.
-/// Null when the sandbox never came up at all, which is a different fact from
-/// a program that was refused.
 fn seatbeltProbeRan(
     arena: std.mem.Allocator,
     mounts: []const sandbox.namespace.Mount,
@@ -2926,15 +1897,6 @@ fn seatbeltProbeRan(
     };
 }
 
-/// Why a whole tool call is still refused, or null when one runs.
-///
-/// **The driver's own answer, about the paths a session really mounts.** Each
-/// target is asked of the library that owns it, through the same
-/// `sandboxDirFor` call `lib/chock-core/tools.zig` makes when it assembles a
-/// real tool call. So this row measures the config a session would hand the
-/// driver and not a constant beside it: a build that moves a path is told the
-/// runtime prefix and a build that moves none is told the host path itself,
-/// and the row follows the library rather than going stale behind it.
 fn seatbeltToolCallRefusal(arena: std.mem.Allocator, root: []const u8) ?[]const u8 {
     const also_mounted = [_][]const u8{
         chock_core.scratchpad.sandboxDirFor(root),
@@ -2956,16 +1918,6 @@ fn seatbeltToolCallRefusal(arena: std.mem.Allocator, root: []const u8) ?[]const 
     return null;
 }
 
-/// Tell apart which namespace was refused, with the only two narrower plans
-/// `namespace.enter` offers.
-///
-/// **The user, pid and ipc namespaces are one answer and always will be.**
-/// `enter` takes all three unconditionally and has no field for any of them,
-/// on purpose: without the pid namespace every process the user owns is a
-/// legal signal target, and without the ipc namespace shared memory crosses
-/// the boundary. So a machine that refuses one refuses the sandbox, and this
-/// reports them together rather than inventing a distinction the library does
-/// not make.
 fn narrowNamespaces(
     arena: std.mem.Allocator,
     m: *Measured,
@@ -2977,11 +1929,7 @@ fn narrowNamespaces(
         .network = .host,
         .mount = false,
         .filesystems = false,
-        // Already measured by the whole plan when it got that far.
         .seccomp = whole.seccomp == null and filter != null,
-        // **Never here.** This plan keeps the host's own network namespace, so
-        // a device and a ruleset made in it would be made on the machine a
-        // person is using. See `Plan.router`.
         .router = false,
     }, null, filter);
     applySeccomp(m, bare, filter);
@@ -2991,9 +1939,6 @@ fn narrowNamespaces(
         m.user_namespace = why;
         m.pid_namespace = why;
         m.ipc_namespace = why;
-        // Both are built on the user namespace, so neither could be reached.
-        // Said as a refusal of this process and not as a machine that lacks
-        // them, because that is what was measured.
         m.mount_namespace = .{ .refused = "the user namespace it is built on was refused" };
         m.network_namespace = .{ .refused = "the user namespace it is built on was refused" };
         return;
@@ -3047,11 +1992,6 @@ fn applyFilesystems(m: *Measured, report: ChildReport, probe_root: ?[]const u8) 
     }
 }
 
-/// What the child said about the sandbox's own network and the filter on it.
-///
-/// **A step the child never reached is said as one it never reached, and never
-/// as a kernel that answered no.** The same rule `applyFilesystems` keeps: a
-/// null slot is silence, and nothing here turns silence into a measurement.
 fn applyRouter(arena: std.mem.Allocator, m: *Measured, report: ChildReport) void {
     const network = report.router_network orelse {
         m.router_network = .{ .refused = router_not_reached };
@@ -3075,19 +2015,8 @@ fn applyRouter(arena: std.mem.Allocator, m: *Measured, report: ChildReport) void
     );
 }
 
-/// The reason both router rows carry when the namespaces they are built inside
-/// never came up. **Not a measurement of the network**, and the rows above it
-/// already say what really failed.
 const router_not_reached = "the sandbox's own namespaces did not come up, so nothing asked the kernel for a network";
 
-/// What a router step answered, with the call the kernel refused named where
-/// the child could name it.
-///
-/// **Naming the call is the whole worth of the row.** `nf_tables`, `nf_nat`,
-/// `nft_chain_nat`, `nft_redir`, `nft_reject` and `nf_conntrack` are six
-/// modules and one refusal, and a row that only said "it did not work" would
-/// leave a person reading kernel configuration. See `nftables.Step`, whose own
-/// comment says the same thing.
 fn routerProbe(arena: std.mem.Allocator, answer: Answer, step: ?[]const u8) Probe {
     return switch (answer) {
         .ok => .ok,
@@ -3097,8 +2026,6 @@ fn routerProbe(arena: std.mem.Allocator, answer: Answer, step: ?[]const u8) Prob
                 "the kernel load one",
             .{named},
         ) catch router_absent_text else router_absent_text },
-        // `refused_id_map` names the user namespace and no router step can
-        // carry it, so it reads as the plain refusal it would be.
         .refused, .refused_id_map => .{ .refused = if (step) |named| std.fmt.allocPrint(
             arena,
             "the kernel refused the {s} step",
@@ -3107,53 +2034,23 @@ fn routerProbe(arena: std.mem.Allocator, answer: Answer, step: ?[]const u8) Prob
     };
 }
 
-/// What a router row says when the child could not name the call. Both are the
-/// same sentence with the step left out.
 const router_absent_text = "a kernel module it needs is not loaded, and a sandbox cannot make the kernel load one";
 const router_refused_text = "the kernel refused it";
 
-/// The name of the call a router step reported, or null when it named none.
-///
-/// **Read with `fromInt` and never with `@enumFromInt`.** The byte came over a
-/// pipe from another process, and a byte that names no step is dropped rather
-/// than turned into an invalid tag. See `record_bytes` for the one added.
 fn routerStepName(comptime Named: type, byte: u8) ?[]const u8 {
     if (byte == 0) return null;
     const step = std.enums.fromInt(Named, byte - 1) orelse return null;
     return @tagName(step);
 }
 
-/// One answer, as a probe. `refused_text` is what a refusal says; an absence
-/// always says the same thing, because a kernel that answers "no such
-/// mechanism" is a fact about the machine and not about this process.
 fn whyFor(answer: Answer, refused_text: []const u8) Probe {
     return switch (answer) {
         .ok => .ok,
         .absent => .{ .absent = "the kernel answered that it does not have it" },
-        // The two refusals read the same text on purpose. Which one it was is
-        // already in the words the caller built: see `namespaceRefusalText`,
-        // the one caller that can ever be handed `refused_id_map`.
         .refused, .refused_id_map => .{ .refused = refused_text },
     };
 }
 
-/// Why the namespaces were refused, in the words a person acts on.
-///
-/// **Two facts, and the second one is the file to change.** `answer` is what
-/// the probe child measured, and it can say that the user namespace was made
-/// and the id map inside it was not, which is what Ubuntu's
-/// `kernel.apparmor_restrict_unprivileged_userns` does; a report that called
-/// that a refused user namespace would send a person to `max_user_namespaces`,
-/// which is not the file to change. The call and the errno come from
-/// `probeAvailability`, which the child could not carry back: it answers over
-/// a two byte pipe, and this runs in the parent, where there is an allocator
-/// and a terminal.
-///
-/// **One more fork, and it is worth it.** `chock doctor` is the command a
-/// person runs when the sandbox will not come up, and the errno is the whole
-/// diagnosis. A probe that answers anything but a refusal is left out rather
-/// than argued with: the measurement above is the one that really ran, and a
-/// second opinion that disagrees says nothing about which is right.
 fn namespaceRefusalText(arena: std.mem.Allocator, answer: Answer) []const u8 {
     const measured = switch (answer) {
         .refused_id_map => "the kernel made the user namespace and refused the id map write inside it",
@@ -3164,13 +2061,6 @@ fn namespaceRefusalText(arena: std.mem.Allocator, answer: Answer) []const u8 {
     return std.fmt.allocPrint(arena, "{s}, and {f}", .{ measured, detail.unavailable }) catch measured;
 }
 
-/// Ask the kernel for a handle on this process, and give it straight back.
-///
-/// The Linux driver opens one of these for every sandboxed process and
-/// refuses rather than run a call it could not cancel, so a machine that says
-/// no here is a machine `spawn` refuses on. Its own comment records that any
-/// kernel with Landlock already has this call; measuring it anyway is what
-/// makes the row a measurement.
 fn probePidfd() Probe {
     const rc = linux.pidfd_open(linux.getpid(), 0);
     return switch (linux.errno(rc)) {
@@ -3183,17 +2073,10 @@ fn probePidfd() Probe {
     };
 }
 
-/// Make a cgroup exactly the way a `spawn` would, read what it answered, and
-/// remove it again.
-///
-/// **This is the only way to learn cgroup support**, because everything that
-/// walks the delegated parents is private to `chock-sandbox`. It creates one
-/// directory and removes it, and it never moves this process into it: `join`
-/// is a separate call and nothing here makes it.
 fn probeCgroup() CgroupSupport {
     const limits = sandbox.Sandbox.Limits{};
-    // `create` asserts that at least one bound is asked for, so the defaults
-    // are read from the same type a session uses rather than invented here.
+    // `create` asserts that at least one bound is asked for, so the defaults are
+    // read from the same type a session uses.
     var made = sandbox.cgroup.Cgroup.create(
         limits.memory_bytes orelse probe_tmpfs_bytes,
         limits.processes orelse 1,
@@ -3203,9 +2086,6 @@ fn probeCgroup() CgroupSupport {
     return made.support;
 }
 
-/// Chock's own directory for this project, plus one directory to mount
-/// things under. Null when it could not be made, which the caller reports as
-/// a reason rather than as a kernel refusal.
 fn probeRoot(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3224,15 +2104,6 @@ fn probeRoot(
     return root;
 }
 
-/// Remove the probe tree. **Nothing this command makes may outlive it**: a
-/// directory somebody finds a month later under their own session directory
-/// is a directory nobody can explain.
-///
-/// **The chmod is not optional.** An overlay mount makes `workdir/work` for
-/// itself, with mode 0, and it stays on disk after the child's mount
-/// namespace goes away. `deleteTree` cannot walk into a directory it may not
-/// open, so without this the tree is half removed and `work/work` is left
-/// behind. Measured on 2026-08-24.
 fn removeProbeRoot(arena: std.mem.Allocator, io: std.Io, root: []const u8) void {
     if (std.fmt.allocPrintSentinel(arena, "{s}/work/work", .{root}, 0)) |path| {
         _ = linux.fchmodat(linux.AT.FDCWD, path.ptr, 0o755);
@@ -3240,11 +2111,6 @@ fn removeProbeRoot(arena: std.mem.Allocator, io: std.Io, root: []const u8) void 
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
 }
 
-/// `mkdir -p`, for the one tree this command builds and removes again.
-///
-/// `src/session.zig`'s own is private and makes the directories a session
-/// reads. This makes a directory nothing reads, and removes it before the
-/// command returns.
 fn makeDirAll(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
@@ -3261,13 +2127,6 @@ fn makeDirAll(io: std.Io, path: []const u8) !void {
     };
 }
 
-/// Run one plan in a forked child and read what it reported.
-///
-/// **A child, and not this process.** A user namespace cannot be left once it
-/// is entered, a seccomp filter cannot be removed, and the kernel refuses
-/// `CLONE_NEWUSER` from a process with more than one thread. A fork carries
-/// only the calling thread, so the child is single threaded whatever this
-/// process is.
 fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) ChildReport {
     var fds: [2]i32 = undefined;
     if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return .{};
@@ -3296,10 +2155,6 @@ fn runChild(plan: Plan, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) Ch
     var wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
     while (linux.errno(wait_rc) == .INTR) wait_rc = linux.waitpid(@intCast(fork_rc), &status, 0);
 
-    // A child that died before it wrote anything measured nothing, and a slot
-    // left null is exactly that. Nothing here turns silence into an answer.
-    // **How it died is carried, and never folded into the slots**: see
-    // `ChildReport.crashed`.
     report.crashed = status != 0;
     return report;
 }
@@ -3322,9 +2177,8 @@ fn readReport(read_fd: i32) ChildReport {
 
     var index: usize = 0;
     while (index + record_bytes <= held) : (index += record_bytes) {
-        // The bytes came over a pipe, so they are read with `fromInt` and
-        // never with `@enumFromInt`: a byte that names no step is dropped
-        // rather than turned into an invalid tag.
+        // The bytes came over a pipe, so they are read with `fromInt` and never
+        // with `@enumFromInt`, which is undefined behaviour on an invalid tag.
         const step = std.enums.fromInt(Step, buffer[index]) orelse continue;
         const answer = std.enums.fromInt(Answer, buffer[index + 1]) orelse continue;
         switch (step) {
@@ -3345,42 +2199,20 @@ fn readReport(read_fd: i32) ChildReport {
     return report;
 }
 
-/// The child. **Allocates nothing from the caller's allocator**, because a
-/// fork may have happened while another thread held its lock. The one call
-/// that needs an allocator gets a fixed buffer of its own.
 fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sandbox.bpf.Insn) void {
-    // **No diagnostic, and that is not an oversight.** This child answers over
-    // a two byte pipe and cannot print: see this function's own comment. So it
-    // carries the state and never the errno, and the two states below are the
-    // most it can say. `Sandbox.spawn` is where the errno reaches a caller, in
-    // `SetupFailureRecord`.
     const entered = sandbox.namespace.enter(.{ .network = plan.network, .mount = plan.mount }, null);
     if (entered) |_| {
         say(write_fd, .namespaces, .ok);
     } else |err| {
         say(write_fd, .namespaces, switch (err) {
-            // **The namespace was made and it is unusable, which is not the
-            // same fact as a refusal.** Measured on 2026-08-25: Ubuntu 24.04
-            // sets `kernel.apparmor_restrict_unprivileged_userns=1`, and a
-            // process inside a nested user namespace there is given the
-            // namespace and refused the id map. A report that called that a
-            // refused user namespace would send a person to
-            // `max_user_namespaces`, which is not the file to change.
             error.MapFailed => .refused_id_map,
-            // Every one of these is this process being refused, and none of
-            // them says the kernel has no namespaces. A kernel built without
-            // them cannot run the machine this is measuring.
             error.NotPermitted, error.MultiThreaded, error.Unexpected => .refused,
         });
-        // Nothing below can be measured without them, and a mount made with
-        // no mount namespace is a mount on the machine a person is using.
         if (plan.seccomp) sayFilter(write_fd, filter);
         return;
     }
 
-    // **Before the mounts, so a mount fault cannot hide a network fault.**
-    // Neither touches the other, and the order a routed `spawn` really uses
-    // puts the network first as well.
+    // Before the mounts, so a mount fault cannot hide a network fault.
     if (plan.router) probeNetwork(write_fd);
 
     if (plan.filesystems and plan.mount) {
@@ -3392,18 +2224,6 @@ fn runProbes(plan: Plan, write_fd: i32, probe_root: ?[]const u8, filter: ?[]sand
     if (plan.seccomp) sayFilter(write_fd, filter);
 }
 
-/// Build the sandbox's own network and put the ruleset on it, for real, in the
-/// network namespace this child already holds.
-///
-/// **The real calls and never a version number.** `Session.configure` and
-/// `Session.install` are the two a routed tool call makes, in the order it
-/// makes them, so a kernel that answers yes here is a kernel that answers yes
-/// to a session. See `linux/driver.zig`'s own `buildNetwork`, which is the
-/// same two calls with the same order and the same reasoning.
-///
-/// **Nothing here reaches the host.** The device, the addresses, the routes
-/// and the ruleset all belong to a network namespace this child made and the
-/// kernel frees when it leaves.
 fn probeNetwork(write_fd: i32) void {
     var route_diag: ?sandbox.netns.Diagnostic = null;
     var route = sandbox.netns.Session.open(&route_diag) catch |err| {
@@ -3430,12 +2250,6 @@ fn probeNetwork(write_fd: i32) void {
     say(write_fd, .router_filter, .ok);
 }
 
-/// A refusal of the network, as one of the three answers this file has.
-///
-/// **`KernelModuleMissing` is the one that is about the machine.** A process in
-/// a user namespace cannot make the kernel load a module, so a host with no
-/// `dummy` link kind really does not have the mechanism. Every other member is
-/// this process being refused something the kernel does have.
 fn networkAnswer(err: sandbox.netns.Error) Answer {
     return switch (err) {
         error.KernelModuleMissing => .absent,
@@ -3443,7 +2257,6 @@ fn networkAnswer(err: sandbox.netns.Error) Answer {
     };
 }
 
-/// The same reading for the ruleset. See `networkAnswer`.
 fn filterAnswer(err: sandbox.nftables.Error) Answer {
     return switch (err) {
         error.KernelModuleMissing => .absent,
@@ -3451,13 +2264,6 @@ fn filterAnswer(err: sandbox.nftables.Error) Answer {
     };
 }
 
-/// Which call the kernel refused, as one byte.
-///
-/// **One more than the ordinal, and zero means no diagnostic.** The first
-/// member of both step enums is `open_socket` and its ordinal is zero, so a
-/// plain ordinal could not be told from a library that filled nothing in, and
-/// the row would name the wrong call on the one host that hits it.
-/// `routerStepName` is the only reader.
 fn netnsStepByte(diag: ?sandbox.netns.Diagnostic) u8 {
     const one = diag orelse return 0;
     return @intFromEnum(one.step) + 1;
@@ -3477,10 +2283,6 @@ fn probeMounts(write_fd: i32, root: []const u8) void {
         say(write_fd, .tmpfs, mountAnswer(err));
     }
 
-    // One buffer for the four paths and the option string `mountOverlay`
-    // builds. Large enough for four paths and the options that name three of
-    // them, and a shortfall answers `OutOfMemory`, which reads as this
-    // program's own fault rather than the machine's.
     var scratch_bytes: [6 * std.fs.max_path_bytes]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch_bytes);
 
@@ -3512,21 +2314,8 @@ fn mountAnswer(err: sandbox.namespace.MountError) Answer {
         error.NotPermitted,
         error.SourceMissing,
         error.OutOfMemory,
-        // This probe passes no `Mount.deny` at all, so a denied path that is
-        // a directory, or a symbolic link, can never be what it hits: both
-        // are refused by `applyDenyMounts`, which this probe never calls.
-        // Named here rather than left to an `else`, so a later mount fault
-        // still has to be read and classified by whoever adds one.
         error.DenyTargetIsDirectory,
         error.DenyTargetIsSymlink,
-        // This probe calls `mountScratch` and `mountOverlay` only, never
-        // `buildBindMount`, so a symlinked bind source or bind target can
-        // never be what it hits either. Named here for the same reason the
-        // two above are: a person adding a real bind mount to this probe
-        // later has to read this list and decide, not fall through an
-        // `else`. The message a project author actually needs for either
-        // fault is in `dieNamespace`, in `chock-sandbox/linux/driver.zig`,
-        // which is what prints when a real `Sandbox.spawn` hits one.
         error.BindSourceIsSymlink,
         error.BindTargetIsSymlink,
         error.Unexpected,
@@ -3534,7 +2323,6 @@ fn mountAnswer(err: sandbox.namespace.MountError) Answer {
     };
 }
 
-/// `a/b` in `buffer`, with no allocation. Null when it does not fit.
 fn joinLeaf(buffer: []u8, a: []const u8, b: []const u8) ?[]const u8 {
     if (a.len + 1 + b.len > buffer.len) return null;
     @memcpy(buffer[0..a.len], a);
@@ -3543,8 +2331,6 @@ fn joinLeaf(buffer: []u8, a: []const u8, b: []const u8) ?[]const u8 {
     return buffer[0 .. a.len + 1 + b.len];
 }
 
-/// Install the filter, and say what happened. **Last of the steps**, because
-/// the filter cannot be removed and it refuses `unshare`.
 fn sayFilter(write_fd: i32, filter: ?[]sandbox.bpf.Insn) void {
     const insns = filter orelse return;
     if (sandbox.seccomp.install(sandbox.bpf.Prog.init(insns))) {
@@ -3557,14 +2343,10 @@ fn sayFilter(write_fd: i32, filter: ?[]sandbox.bpf.Insn) void {
     }
 }
 
-/// Write one record. A failed write is dropped: the parent reads a slot that
-/// stayed null, which is "this step was never reported" and is the truth.
 fn say(write_fd: i32, step: Step, answer: Answer) void {
     sayDetail(write_fd, step, answer, 0);
 }
 
-/// Write one record with the third byte filled. **Only the two router steps
-/// use it**, and only they read it back: see `record_bytes`.
 fn sayDetail(write_fd: i32, step: Step, answer: Answer, detail: u8) void {
     const record = [record_bytes]u8{ @intFromEnum(step), @intFromEnum(answer), detail };
     _ = linux.write(write_fd, &record, record.len);
@@ -3625,12 +2407,6 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
     return options;
 }
 
-/// The project this command is about, as an absolute path.
-///
-/// **The same two calls every other command's own `resolveProject` makes.**
-/// Chock's own directories are keyed by the project's real path, so a
-/// spelling this command resolved differently would read a different
-/// directory from the one a session writes.
 fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]const u8 {
     if (given) |path| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3644,16 +2420,9 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
 
 const testing = std.testing;
 
-/// A machine on which everything works, as a starting point a test mutates
-/// one field of. **Not a default**: `Measured`'s own defaults are the honest
-/// answer for a build that measured nothing, and a test that started from
-/// those would be asserting on absence everywhere.
 fn healthy() Measured {
     return .{
         .driver = sandbox.Sandbox.Guarantees.initFull(),
-        // **Stated, and never read from this build's own driver.** These are
-        // the Linux rows, and a test that let the host choose the family would
-        // ask for a `landlock` row on a Mac and find none.
         .family = .namespaces,
         .user_namespace = .ok,
         .mount_namespace = .ok,
@@ -3662,8 +2431,6 @@ fn healthy() Measured {
         .network_namespace = .ok,
         .router_network = .ok,
         .router_filter = .ok,
-        // A machine with a Nix store, which is the machine these tests run on
-        // and the one every other field above states.
         .resolver_files = .made_inside,
         .landlock = .ok,
         .landlock_abi = 6,
@@ -3677,17 +2444,11 @@ fn healthy() Measured {
         .git_program = "/run/current-system/sw/bin/git",
         .nix_program = "/run/current-system/sw/bin/nix",
         .dev_shell = .{ .read = false },
-        // A machine with no container runtime, which is the ordinary healthy
-        // machine: only a project that names an image needs one, so this row
-        // stops nothing.
         .container = .not_installed,
         .toolchain = .dev_shell,
         .credential = .{ .found = "chock login" },
         .cache = .ok,
         .free_bytes = 8 * 1024 * 1024 * 1024,
-        // A machine with a reader plugged in. **Not the machine these tests run
-        // on**, which is the point: every row here is stated, so a report that
-        // read the host instead of the measurement fails.
         .card_seal = .ok,
         .card_readers = 1,
     };
@@ -3701,15 +2462,6 @@ fn rowNamed(rows: []const Row, name: []const u8) ?Row {
 }
 
 test "a layer this machine has is still reported absent when the measurement says absent" {
-    // **The fact this whole command exists for.** These tests run on a Linux
-    // box with Landlock, a tmpfs and overlayfs. The report must come from what
-    // was measured and never from what the platform usually has, so a
-    // measurement that says "absent" gives an absent row here, on a machine
-    // where the layer is present.
-    //
-    // Mutation check: make `rowsFor` read `builtin.os.tag` or
-    // `sandbox.Sandbox.guarantees` for any of these three rows and every
-    // expectation below flips.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3726,20 +2478,11 @@ test "a layer this machine has is still reported absent when the measurement say
     try testing.expectEqual(ui.Layer.State.unsupported, rowNamed(rows, "overlayfs").?.state);
     try testing.expectEqual(ui.Layer.State.unsupported, rowNamed(rows, "disk cap tmpfs").?.state);
 
-    // And the layers that were not touched are still on, so this is a report
-    // over the measurement and not a report that gave up.
     try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "user namespace").?.state);
     try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "seccomp").?.state);
 }
 
 test "a layer the machine has and this process may not use is BLOCKED, not NONE" {
-    // The state `src/ui.zig` names and the header rarely draws. `unsupported`
-    // says there is nothing to configure; `unavailable` says an administrator
-    // can change something. A report that spelled the two the same way would
-    // have a person looking for a kernel fault that is not there.
-    //
-    // Mutation check: map `Probe.refused` to `.unsupported` and the word on
-    // this row becomes NONE, which tells a person to give up.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3750,24 +2493,13 @@ test "a layer the machine has and this process may not use is BLOCKED, not NONE"
 
     const row = rowNamed(rows, "user namespace").?;
     try testing.expectEqual(ui.Layer.State.unavailable, row.state);
-    // And the word is `BLOCKED` because this row stops a first run, which is
-    // the other half of the same sentence: see `wordFor`.
     try testing.expect(row.blocks);
     try testing.expectEqualStrings("BLOCKED", wordFor(row));
     try testing.expect(row.state != .unsupported);
-    // And it says what to do, which is the difference between a report and a
-    // complaint.
     try testing.expect(std.mem.indexOf(u8, row.fix, "unprivileged_userns_clone") != null);
 }
 
 test "a project that gave up the write and execute rule does not read like one that kept it" {
-    // **The whole reason this row exists.** A session that gave up a piece of
-    // hardening has to be visible before it starts, not only in the log
-    // afterwards. Two reports off the same machine, differing in nothing but
-    // the project's own policy, must not print the same line.
-    //
-    // Mutation check: answer `.on` for `.relaxed` and the two rows below are
-    // identical, which is the failure this test is written against.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3784,32 +2516,16 @@ test "a project that gave up the write and execute rule does not read like one t
     try testing.expectEqual(ui.Layer.State.off, relaxed.state);
     try testing.expectEqualStrings("OFF", wordFor(relaxed));
 
-    // **`off` and never `unsupported` or `unavailable`.** Those two say the
-    // machine cannot give the layer, or would not let this process have it, and
-    // this machine can and would. A report that spelled it either way would
-    // send a person looking for a kernel fault that is not there.
     try testing.expect(relaxed.state != .unsupported);
     try testing.expect(relaxed.state != .unavailable);
 
-    // And the line names the rule a person has to find to change it.
     try testing.expect(std.mem.indexOf(u8, relaxed.means, chock_policy.hardening.jit_action) != null);
 
-    // It does not stop a first run, in either form. W^X is hardening and not a
-    // boundary: see the row's own comment in `rowsFor`.
     try testing.expect(!strict.blocks);
     try testing.expect(!relaxed.blocks);
 }
 
 test "the report reads the same rules a session reads, and an org bundle can take the row back" {
-    // **`chock doctor` and `chock run` must not answer differently.** The
-    // report reads `chock.zon` under the installation's own bundle, the same
-    // fold `src/run.zig` makes, so a report that said a session would give up
-    // hardening an organisation has already forbidden would be a lie in the
-    // dangerous direction.
-    //
-    // This states the fold itself rather than spawning a session, because
-    // `measureHardening` reads a real data directory and a real project root.
-    // The two halves it joins are each proven in `lib/chock-policy/hardening.zig`.
     const allocator = testing.allocator;
     const source =
         \\.{ .policy = .{ .rules = .{
@@ -3842,16 +2558,6 @@ test "the report reads the same rules a session reads, and an org bundle can tak
 }
 
 test "a cgroup refusal measured inside a namespace says so, and never blames a working init system" {
-    // The false negative this row was reported for. A process in a cgroup
-    // namespace reads `0::/` for a cgroup deep in the machine's tree, so
-    // `cgroup.Cgroup.create` walks a tree it is not in and is refused there.
-    // Measured on 2026-08-24 on a systemd box whose user slice delegates
-    // `memory` and `pids`: `chock doctor` said BLOCKED from inside
-    // `unshare --user --cgroup` and OK outside it.
-    //
-    // Mutation check: pass the vantage no further than `Measured`, or answer
-    // `own` for every process, and the two rows below become one sentence.
-    // Then a person is sent to an init system that already delegates.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3866,18 +2572,12 @@ test "a cgroup refusal measured inside a namespace says so, and never blames a w
 
     m.cgroup_vantage = .foreign;
     const in_a_container = rowNamed(try rowsFor(arena, m), "cgroup v2").?;
-    // It says which question it answered, and it stops telling a person to
-    // configure a machine this measurement never reached.
     try testing.expect(std.mem.indexOf(u8, in_a_container.means, "cgroup namespace") != null);
     try testing.expect(std.mem.indexOf(u8, in_a_container.means, "not for the machine outside it") != null);
     try testing.expect(std.mem.indexOf(u8, in_a_container.fix, "init system") == null);
     try testing.expect(std.mem.indexOf(u8, in_a_container.fix, "outside it") != null);
     try testing.expect(!std.mem.eql(u8, on_the_machine.means, in_a_container.means));
 
-    // A tree the kernel has and this mount namespace hides reads the same way,
-    // and it is not NONE: NONE says there is nothing to configure, which is
-    // false of a machine that delegates. It is not BLOCKED either, because a
-    // machine with no cgroup still runs a session on the rlimit floor.
     m.cgroup = .{ .unavailable = .no_cgroup2_mount };
     m.cgroup_vantage = .not_mounted;
     const hidden = rowNamed(try rowsFor(arena, m), "cgroup v2").?;
@@ -3886,17 +2586,12 @@ test "a cgroup refusal measured inside a namespace says so, and never blames a w
     try testing.expectEqualStrings("DEGRADED", wordFor(hidden));
     try testing.expect(std.mem.indexOf(u8, hidden.means, "not for the machine outside it") != null);
 
-    // And a vantage that could not be read never claims to be this machine's.
     m.cgroup = .{ .unavailable = .no_delegated_parent };
     m.cgroup_vantage = .unknown;
     const unproven = rowNamed(try rowsFor(arena, m), "cgroup v2").?;
     try testing.expect(std.mem.indexOf(u8, unproven.means, "may be") != null);
     try testing.expect(!std.mem.eql(u8, unproven.means, on_the_machine.means));
 
-    // A directory that could not be made under a parent that does delegate is
-    // a fault in where chock was started, and the row says that instead of
-    // sending a person to an init system that is already doing its part. See
-    // `fixFor`.
     m.cgroup = .{ .unavailable = .create_refused };
     m.cgroup_vantage = .own;
     const refused = rowNamed(try rowsFor(arena, m), "cgroup v2").?;
@@ -3906,13 +2601,6 @@ test "a cgroup refusal measured inside a namespace says so, and never blames a w
 }
 
 test "the report is readable with no colour: every row carries a glyph, a word, and a sentence when something is wrong" {
-    // No fact may rest on colour alone, and this report is read in a pipe more
-    // often than on a screen. So every row must be legible as plain text: a
-    // glyph, a word, and, for a row that is not on, a sentence saying what this
-    // machine answered.
-    //
-    // Mutation check: return an empty string from `wordFor` for `.on`, the way
-    // the session header does, and the word assertion below fails.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3930,30 +2618,19 @@ test "the report is readable with no colour: every row carries a glyph, a word, 
         try testing.expect(row.state.glyph().len != 0);
         try testing.expect(wordFor(row).len != 0);
         if (row.state == .on) {
-            // Either a measurement worth keeping or a lesson for `--verbose`.
-            // A row with neither says nothing at all with `--verbose` on.
             try testing.expect(row.means.len != 0 or row.why.len != 0);
             continue;
         }
         not_on += 1;
-        // The rows this command is for. Never quiet.
         try testing.expect(row.means.len != 0);
     }
-    // The machine above really does have rows that are not on, so the
-    // assertion in the loop is not vacuous.
     try testing.expect(not_on >= 2);
 
-    // The states that are not on carry different words, so a reader can tell
-    // "nothing to configure" from "you were refused", and a row that stops a
-    // first run from a row that only costs the run something.
     const stated: Row = .{ .name = "stated", .state = .on, .means = "" };
     try testing.expectEqualStrings("OK", wordFor(stated));
     try testing.expectEqualStrings("OFF", wordFor(.{ .name = "x", .state = .off, .means = "y" }));
     try testing.expectEqualStrings("NONE", wordFor(.{ .name = "x", .state = .unsupported, .means = "y" }));
     try testing.expectEqualStrings("DEGRADED", wordFor(.{ .name = "x", .state = .unavailable, .means = "y" }));
-    // Every state that is not on says `BLOCKED` when the row stops a first
-    // run, so a kernel with no Landlock is not read as a machine with nothing
-    // to configure while the footer counts it.
     for ([_]ui.Layer.State{ .off, .unsupported, .unavailable }) |state| {
         try testing.expectEqualStrings("BLOCKED", wordFor(.{
             .name = "x",
@@ -3963,29 +2640,17 @@ test "the report is readable with no colour: every row carries a glyph, a word, 
         }));
     }
 
-    // And a row that is not on says what to do, or says in its sentence that
-    // nothing can be done.
     const cgroup_row = rowNamed(rows, "cgroup v2").?;
     try testing.expect(cgroup_row.fix.len != 0);
     try testing.expect(std.mem.indexOf(u8, cgroup_row.means, "rlimit floor") != null);
 }
 
 test "the word BLOCKED stands beside exactly the rows the footer counts" {
-    // The contradiction this word was changed for, read on a Mac on
-    // 2026-08-25: `dev shell` and `credential` both said `BLOCKED` and the
-    // footer said "Rows that stop a first run: 1 of 21". A person counts the
-    // column and the report argues with itself, which costs the reader every
-    // other row as well.
-    //
-    // Mutation check: make `wordFor` ignore `blocks` and answer from the state
-    // alone, and this fails on the dev shell row.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var m = healthy();
-    // Two rows in the same state, and only one of them stops a first run.
-    // That pair is what the state alone cannot tell apart.
     m.dev_shell = .{ .failed = "nix could not evaluate it" };
     m.credential = .{ .unconfigured = "no provider is named in config.zon" };
     const rows = try rowsFor(arena, m);
@@ -4003,13 +2668,8 @@ test "the word BLOCKED stands beside exactly the rows the footer counts" {
     try testing.expectEqual(ui.Layer.State.unavailable, dev.state);
     try testing.expect(!dev.blocks);
     try testing.expectEqualStrings("DEGRADED", wordFor(dev));
-    // And the row that really stops the run keeps the word, so this is not a
-    // report that gave up saying `BLOCKED` at all.
     try testing.expectEqualStrings("BLOCKED", wordFor(rowNamed(rows, "credential").?));
 
-    // A layer the machine does not have and a session cannot start without is
-    // the same fault pointing the other way: the column said `NONE`, which
-    // reads as nothing to configure, while the footer counted the row.
     var no_landlock = healthy();
     no_landlock.landlock = .{ .absent = "the kernel answered that it has no Landlock" };
     no_landlock.landlock_abi = null;
@@ -4021,12 +2681,6 @@ test "the word BLOCKED stands beside exactly the rows the footer counts" {
 }
 
 test "the printed report says BLOCKED as many times as its own footer counts" {
-    // The whole point, read the way a person reads it: the column and the last
-    // line of the report, in one capture. The rows are Darwin's, because that
-    // is the machine the two answers were seen to disagree on.
-    //
-    // Mutation check: make `wordFor` ignore `blocks` and the count below is
-    // two while the footer still says one.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4059,23 +2713,13 @@ test "the printed report says BLOCKED as many times as its own footer counts" {
     printReport("/some/project", m, rows, verdict);
     tty.flushOut();
 
-    // The word appears in no sentence of this report, so counting it counts
-    // the column.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, said.out(), "BLOCKED"));
     try testing.expectEqual(countBlocking(rows), std.mem.count(u8, said.out(), "BLOCKED"));
     try testing.expect(std.mem.indexOf(u8, said.err(), "Rows that stop a first run: 1 of") != null);
-    // And the row that does not stop the run is still in the column, saying
-    // what the session loses.
     try testing.expect(std.mem.indexOf(u8, said.out(), "DEGRADED") != null);
 }
 
 test "a machine where no tool call could work does not read as a machine a session can start on" {
-    // The fault this row exists for. Measured on 2026-08-25 on a bare Debian
-    // with no Nix: every row passed, the session started, and the first tool
-    // call died in the mount tree because the one thing to bind was not there.
-    //
-    // Mutation check: set `blocks` to false on the `toolchain` row and the
-    // verdict below reads `degraded`, which is the report that lied.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4086,8 +2730,6 @@ test "a machine where no tool call could work does not read as a machine a sessi
     try testing.expect(rowNamed(rows, "toolchain").?.blocks);
     try testing.expectEqual(Verdict.blocked, verdictFor(rows));
 
-    // The fallback is not a fault. A machine that mounts its own system
-    // directories runs, and the row says so and says how to narrow it.
     m.toolchain = .{ .host = 6 };
     const wide = try rowsFor(arena, m);
     const row = rowNamed(wide, "toolchain").?;
@@ -4096,8 +2738,6 @@ test "a machine where no tool call could work does not read as a machine a sessi
     try testing.expect(std.mem.indexOf(u8, row.fix, "flake.nix") != null);
     try testing.expectEqual(Verdict.ready, verdictFor(wide));
 
-    // An image the project names and this machine does not have is a refusal
-    // before a session starts, never a fault at the first tool call.
     m.toolchain = .{ .image_unusable = "run `docker pull debian:stable-slim` first" };
     const missing = try rowsFor(arena, m);
     try testing.expect(rowNamed(missing, "toolchain").?.blocks);
@@ -4105,12 +2745,6 @@ test "a machine where no tool call could work does not read as a machine a sessi
 }
 
 test "the container row appears only where it matters, and its trust position is never a layer" {
-    // **The row must add nothing to the guarantee columns.** A root daemon is
-    // a weaker trust position and not a broken sandbox, so it reads `OK` with
-    // a warning line beside it.
-    //
-    // Mutation check: give the `.ready` arm `.state = .unavailable` for a
-    // privileged trust and the first verdict below reads `degraded`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4123,26 +2757,12 @@ test "the container row appears only where it matters, and its trust position is
     try testing.expect(!row.blocks);
     try testing.expect(std.mem.indexOf(u8, row.fix, "Warning") != null);
     try testing.expectEqual(Verdict.ready, verdictFor(with_docker));
-    // And the guarantee set is untouched by any of it: the fixture still states
-    // the machine whose rows this test read.
-    //
-    // **Stated, and never `sandbox.Sandbox.guarantees`.** `healthy()` is a
-    // Linux machine on every host, and the Darwin driver gives four of the six
-    // guarantees, so reading this build's own driver here asked a Mac to answer
-    // for a Linux row and failed there and only there.
-    //
-    // Mutation check: give `healthy()` the Darwin driver's own guarantees, or a
-    // `.family` of `.seatbelt`, and this fails on either half.
     try testing.expectEqual(healthy().family, LayerFamily.forDriver(healthy().driver));
 
-    // A rootless runtime gets no warning line at all.
     m.container = .{ .ready = .{ .kind = .podman, .program = "/usr/bin/podman", .trust = .user_only } };
     const rootless = try rowsFor(arena, m);
     try testing.expectEqual(@as(usize, 0), rowNamed(rootless, "container runtime").?.fix.len);
 
-    // **A machine that needs no runtime gains no row.** Most machines have
-    // none and most projects name no image, and a yellow row about a thing
-    // nobody asked for teaches a person to stop reading the report.
     m.container = .not_installed;
     const quiet = try rowsFor(arena, m);
     try testing.expectEqual(@as(?Row, null), rowNamed(quiet, "container runtime"));
@@ -4151,23 +2771,15 @@ test "the container row appears only where it matters, and its trust position is
     const silent = try rowsFor(arena, m);
     try testing.expectEqual(@as(?Row, null), rowNamed(silent, "container runtime"));
 
-    // Until the project names an image, and then both of those matter.
     m.toolchain = .{ .image_unusable = "no container runtime is installed" };
     m.container = .not_installed;
     const wanted = try rowsFor(arena, m);
     try testing.expectEqual(ui.Layer.State.off, rowNamed(wanted, "container runtime").?.state);
-    // The toolchain row is what refuses. The runtime row states a fact.
     try testing.expect(!rowNamed(wanted, "container runtime").?.blocks);
     try testing.expect(rowNamed(wanted, "toolchain").?.blocks);
 }
 
 test "a build whose driver applies no layer gets one sentence and no layer rows" {
-    // A build with no driver at all. A column of six `unsupported` rows reads
-    // as a machine that is nearly ready and needs a setting changed. Such a
-    // build refuses outright, and no row of a table says that.
-    //
-    // Mutation check: drop the `m.family` guard in `rowsFor` and the layer rows
-    // come back, which is exactly the column this test forbids.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4186,13 +2798,8 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
         "pid namespace",
         "ipc namespace",
         "net namespace",
-        // Every foreground tool call of a session takes `Network.filtered`,
-        // so a kernel that cannot build or filter that network refuses the
-        // first tool call and every one after it. See `routerRow`.
         "router network",
         "router filter",
-        // `namespace.substitute` answers `BindTargetIsSymlink` and
-        // `applyLayers` ends the call, so a routed sandbox does not start.
         resolver_files_name,
         "landlock",
         "seccomp",
@@ -4204,40 +2811,23 @@ test "a build whose driver applies no layer gets one sentence and no layer rows"
         try testing.expectEqual(@as(?Row, null), rowNamed(rows, name));
     }
 
-    // The rows that are true of the machine whatever the driver does are still
-    // there, because a person on such a build still wants to know them.
     try testing.expect(rowNamed(rows, "credential") != null);
     try testing.expect(rowNamed(rows, "workspace space") != null);
 
-    // The sentence names the call that refuses and says there is no setting,
-    // so nobody spends an afternoon looking for one.
     try testing.expect(std.mem.indexOf(u8, refuses_outright, "Sandbox.spawn refuses") != null);
     try testing.expect(std.mem.indexOf(u8, refuses_outright, "no sandbox driver") != null);
     try testing.expect(std.mem.indexOf(u8, refuses_outright, "nothing to configure") != null);
 }
 
 test "the real Darwin driver gives four layers, and still refuses a root of its own" {
-    // **The gate on what this command tells a person about a Mac.** The Darwin
-    // driver applies Seatbelt for paths, the network, signals and IPC, and each
-    // of the four is broken against on a real Mac by a test in
-    // `test/sandbox/darwin_escape.zig`. `chock-sandbox.zig` exports that driver
-    // on every host for exactly this kind of check.
-    //
-    // Mutation check: add `.syscall_restricted` to the Darwin driver's own
-    // `guarantees` and this fails on the count, which is the layer measured on
-    // 2026-08-25 to compile, apply and do nothing.
     const darwin = sandbox.darwin_driver_for_testing;
     try testing.expectEqual(@as(usize, 4), darwin.guarantees.count());
     for ([_]sandbox.Sandbox.Guarantee{ .network_isolated, .signal_isolated, .ipc_isolated, .path_restricted }) |one| {
         try testing.expect(darwin.guarantees.contains(one));
     }
-    // The two that stay off, because nothing enforces either.
     try testing.expect(!darwin.guarantees.contains(.syscall_restricted));
     try testing.expect(!darwin.guarantees.contains(.workspace_mounted));
 
-    // And the refusal is unchanged: macOS cannot pivot into a root of its own,
-    // so a config that asks for one gets nothing rather than a tree that was
-    // never built.
     try testing.expectError(error.NoMountNamespace, darwin.spawn(
         testing.allocator,
         .{ .root = "/nonexistent", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} },
@@ -4246,15 +2836,10 @@ test "the real Darwin driver gives four layers, and still refuses a root of its 
         null,
     ));
 
-    // That driver belongs to the Seatbelt family, which is what gives a Mac its
-    // own rows rather than a column of Linux mechanisms it has never had.
     try testing.expectEqual(LayerFamily.seatbelt, LayerFamily.forDriver(darwin.guarantees));
 }
 
 test "a seatbelt build gets darwin's own rows, and none of the eleven linux ones" {
-    // Mutation check: change the `m.family == .seatbelt` guard in `rowsFor` to
-    // `.namespaces` and the loop below finds `landlock`, which is a mechanism
-    // no Mac has ever had.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4269,9 +2854,6 @@ test "a seatbelt build gets darwin's own rows, and none of the eleven linux ones
     m.cache = .ok;
     m.free_bytes = 8 * 1024 * 1024 * 1024;
     m.dev_shell = .no_flake;
-    // A Mac with git and with the host's own system directories, which is
-    // every Mac. Neither row belongs to a layer family, so both are here to
-    // keep this test about the Darwin rows and about nothing else.
     m.git_program = "/usr/bin/git";
     m.toolchain = .{ .host = 4 };
     m.tool_call_refused = "a tool call needs a path to appear somewhere else";
@@ -4281,28 +2863,21 @@ test "a seatbelt build gets darwin's own rows, and none of the eleven linux ones
     for ([_][]const u8{ "user namespace", "mount namespace", "landlock", "seccomp", "pidfd", "cgroup v2", "overlayfs" }) |name| {
         try testing.expectEqual(@as(?Row, null), rowNamed(rows, name));
     }
-    // The four this driver really applies, all on.
     for ([_][]const u8{ "seatbelt", "network", "signal reach", "ipc" }) |name| {
         try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, name).?.state);
     }
-    // The four limits with no Darwin mechanism read `NONE`, never `BLOCKED`:
-    // there is nothing to configure and no version of macOS closes any of them.
     for ([_][]const u8{ "memory ceiling", "mapped memory", "process count", "disk cap tmpfs" }) |name| {
         const row = rowNamed(rows, name).?;
         try testing.expectEqual(ui.Layer.State.unsupported, row.state);
         try testing.expect(!row.blocks);
         try testing.expect(row.means.len != 0);
     }
-    // The three limits Darwin does honour are one row, and it is on.
     try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "rlimit floor").?.state);
 
-    // The row that decides the answer. Every layer above is on and a session
-    // still starts nothing, so the verdict is blocked and not degraded.
     const tool_call = rowNamed(rows, tool_call_name).?;
     try testing.expect(tool_call.blocks);
     try testing.expectEqual(Verdict.blocked, verdictFor(rows));
 
-    // And when a tool call really runs, the same rows read ready.
     m.tool_call_refused = null;
     const runs = try rowsFor(arena, m);
     try testing.expectEqual(ui.Layer.State.on, rowNamed(runs, tool_call_name).?.state);
@@ -4310,16 +2885,6 @@ test "a seatbelt build gets darwin's own rows, and none of the eleven linux ones
 }
 
 test "the tool call row asks the libraries where they really put their paths" {
-    // **Two answers, one per build, and both are read from `chock-core` rather
-    // than spelled here.** A build that moves a path still asks for the runtime
-    // prefix, so the row is still refused and still names the path. A build
-    // that moves none leaves the scratch area, the cache and the task list
-    // where they are, so the config binds each source to itself, the driver
-    // expresses it, and the row is on.
-    //
-    // Mutation check on Darwin: put the bare `sandbox_dir` values back in
-    // `seatbeltToolCallRefusal` and the null below is a refusal instead, which
-    // is `chock doctor` telling every Mac a session cannot start.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4331,9 +2896,6 @@ test "the tool call row asks the libraries where they really put their paths" {
         try testing.expect(std.mem.indexOf(u8, why, chock_core.scratchpad.sandbox_dir) != null);
     } else {
         try testing.expectEqual(@as(?[]const u8, null), seatbeltToolCallRefusal(arena, root));
-        // The three really are the host path on this build, so the line above
-        // is about what the libraries answer and not about a probe that asked
-        // for nothing.
         for ([_][]const u8{
             chock_core.scratchpad.sandboxDirFor(root),
             chock_core.cache.sandboxDirFor(root),
@@ -4341,8 +2903,6 @@ test "the tool call row asks the libraries where they really put their paths" {
         }) |target| try testing.expectEqualStrings(root, target);
     }
 
-    // A config that asks for no moved path is not refused, so the checks above
-    // are about the paths and not about the platform.
     try testing.expectEqual(
         @as(?sandbox.darwin_driver_for_testing.Inexpressible, null),
         sandbox.darwin_driver_for_testing.expressibleOn(.{
@@ -4353,8 +2913,6 @@ test "the tool call row asks the libraries where they really put their paths" {
             .env = &.{},
         }),
     );
-    // And one that does is refused, so a Darwin build's null above is a real
-    // measurement and not a driver that accepts everything.
     try testing.expectEqual(
         @as(?sandbox.darwin_driver_for_testing.Inexpressible, .bind_moves_a_path),
         sandbox.darwin_driver_for_testing.expressibleOn(.{
@@ -4368,9 +2926,6 @@ test "the tool call row asks the libraries where they really put their paths" {
 }
 
 test "the exit code says whether a first run can work here, and degraded is not a failure" {
-    // Mutation check: return `.blocked` for any row that is not on and the
-    // degraded case below exits 2, which fails every healthy NixOS machine
-    // whose init system delegates nothing.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4394,14 +2949,9 @@ test "the exit code says whether a first run can work here, and degraded is not 
     try testing.expectEqual(Verdict.blocked, verdictFor(blocked_rows));
     try testing.expectEqual(Exit.faulted, exitFor(verdictFor(blocked_rows)));
     try testing.expect(exitFor(verdictFor(blocked_rows)).code() != 0);
-    // Never `usage`: that code already means the command line was wrong, and
-    // a script that read the two the same way would answer a broken machine
-    // by printing its own help.
     try testing.expect(exitFor(verdictFor(blocked_rows)) != .usage);
 }
 
-/// A machine on which every row is in its failing form, so `Row.blocks` is a
-/// decision on every row rather than a default nobody set.
 fn broken() Measured {
     var m = healthy();
     const refused = Probe{ .refused = "the kernel refused it to this process" };
@@ -4423,37 +2973,19 @@ fn broken() Measured {
     m.git_program = null;
     m.nix_program = null;
     m.dev_shell = .{ .failed = "flake.nix does not evaluate" };
-    // A runtime that is there and did not answer, so the row exists and is
-    // not on. A machine with none gets no row at all: see `containerRow`.
     m.container = .{ .unreachable_runtime = "the daemon is not running" };
     m.toolchain = .none;
     m.credential = .{ .unconfigured = "there is no configuration" };
     m.cache = .{ .refused = "CacheDirectoryUnwritable" };
-    // Read, and under the floor. The reading that failed is a different fact
-    // and the test below states it separately.
     m.free_bytes = 1024;
     m.card_seal = .{ .absent = "there is no pcscd socket at /run/pcscd/pcscd.comm" };
     m.card_readers = null;
-    // The project asked to give up the write and execute rule. The failing
-    // form of this row is not a machine that cannot hold it: every machine can,
-    // and only a project's own policy takes it away. See `measureHardening`.
     m.write_execute = .relaxed;
-    // `device_passthrough` is a compile time fact and never a probe: nothing
-    // above is a kernel mechanism that could refuse it. Stated false here so
-    // this machine carries no row for it at all, the same as a real Darwin
-    // build would, rather than the one row on this whole struct that could
-    // never read anything but `.on`. See `deviceRow`'s own doc comment.
     m.device_passthrough = false;
     return m;
 }
 
 test "every row that stops a first run is one Sandbox.spawn or chock run really refuses on" {
-    // The list is a claim about other files, so it is written out here where
-    // somebody changing one of them will meet it. Measured on a machine where
-    // every row failed, so `blocks` is a decision on each one.
-    //
-    // Mutation check: mark the cgroup row blocking and this fails, which is
-    // what stops a best effort layer quietly becoming a requirement.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4462,60 +2994,30 @@ test "every row that stops a first run is one Sandbox.spawn or chock run really 
     for (rows) |row| try testing.expect(row.state != .on);
 
     const blocking = [_][]const u8{
-        // Every one of these is a `SetupError` or a `SpawnError` member.
         "user namespace",
         "mount namespace",
         "pid namespace",
         "ipc namespace",
         "net namespace",
-        // **Every foreground tool call of a session takes `Network.filtered`.**
-        // `src/run.zig` gives its tool runner a network seam on every session,
-        // with no flag and no policy question, and `chock_core.tools` moves a
-        // call to `.filtered` wherever that seam is set. So a kernel that
-        // cannot build that network, or cannot filter it, refuses the first
-        // tool call and every one after it, and `Sandbox.spawn` answers
-        // `SpawnError.NetRouterUnavailable`.
         "router network",
         "router filter",
-        // A sandbox that binds this host's own `/etc` takes that directory
-        // for itself with an overlay, and `applyLayers` ends the call when
-        // the kernel refuses one, so no routed sandbox starts at all. See
-        // `resolverFilesRow`, which reads the `overlayfs` answer for this.
         resolver_files_name,
         "landlock",
         "seccomp",
         "pidfd",
         "disk cap tmpfs",
-        // `chock run` reports and returns before a session starts.
         "credential",
-        // The workspace of every session is a worktree, and `git` is what
-        // makes one. Measured: with no git, `chock run` answers "the
-        // workspace for /proj could not be built: NotFound".
         "git",
-        // There is nothing for a tool call to run a program from, so the
-        // session would start and every call in it would fail in the mount
-        // tree. `toolchainFor` refuses at session start instead.
         "toolchain",
-        // Every writing tool call is refused under the floor, so the session
-        // starts and gets nothing done.
         "workspace space",
     };
     const not_blocking = [_][]const u8{
-        // Only a project with no git of its own needs an overlay.
         "overlayfs",
-        // The rlimit floor still applies, by `chock-sandbox`'s own decision.
         "cgroup v2",
-        // Both are a warning in `src/run.zig` and not a refusal.
         "nix",
         "dev shell",
         "toolchain cache",
-        // `seal.Level` has a software key for exactly this, and it records
-        // which level it used inside the bytes the signature covers.
         "card seal",
-        // W^X is documented hardening and it is not a boundary, so a project
-        // that gave it up gets a session and gets told. `test/redteam/scope.zig`
-        // retires it by name, and `lib/chock-sandbox/linux/seccomp.zig` names
-        // three measured ways past it.
         "write^execute",
     };
     for (blocking) |name| try testing.expect(rowNamed(rows, name).?.blocks);
@@ -4524,12 +3026,6 @@ test "every row that stops a first run is one Sandbox.spawn or chock run really 
 }
 
 test "a provider that asks for no credential is not a machine that cannot run" {
-    // `chock_auth.lookup.Source.none` is not an error: a local llama.cpp asks
-    // for nothing. A report that read an absent credential as a fault would
-    // refuse every local endpoint.
-    //
-    // Mutation check: treat `.not_needed` as `.unconfigured` and this exits 2
-    // on a working local setup.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4543,11 +3039,6 @@ test "a provider that asks for no credential is not a machine that cannot run" {
 }
 
 test "free space that could not be read is never reported as no room" {
-    // The direction of the error matters: an unreadable filesystem refuses
-    // nothing, and a report that read null as zero would tell every user in a
-    // container that their disk is full.
-    //
-    // Mutation check: read `free_bytes orelse 0` and this row starts blocking.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4559,8 +3050,6 @@ test "free space that could not be read is never reported as no room" {
     try testing.expect(!unknown_row.blocks);
     try testing.expect(std.mem.indexOf(u8, unknown_row.means, "not the same as no room") != null);
 
-    // And a real reading under the floor does block, so the branch above is a
-    // decision and not a row that can never fail.
     var full = healthy();
     full.free_bytes = 1024;
     const full_rows = try rowsFor(arena, full);
@@ -4569,17 +3058,6 @@ test "free space that could not be read is never reported as no room" {
 }
 
 test "an audit sink this installation requires and cannot reach is reported and stops nothing" {
-    // **The whole point of the row.** A machine that cannot reach the sink its
-    // installation requires is exactly the thing somebody wants to know before
-    // a session, and it is not a reason to refuse one:
-    // `lib/chock-policy/org.zig` weighed refusing to start and rejected it,
-    // because an organisation's control that becomes an outage sends the
-    // developer to a tool that is not Chock, and then the organisation gets no
-    // record at all rather than a late one.
-    //
-    // Mutation check: set `blocks` on this row and the verdict below becomes
-    // `blocked` and the exit code 2, which is the refuse-to-start answer coming
-    // back through the exit status.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4595,40 +3073,20 @@ test "an audit sink this installation requires and cannot reach is reported and 
     const row = rowNamed(rows, required_sink_name).?;
     try testing.expect(!row.blocks);
     try testing.expectEqual(ui.Layer.State.unavailable, row.state);
-    // The path an organisation wrote, so a reader knows which place is out of
-    // reach, and the fault, so they know what to fix.
     try testing.expect(std.mem.indexOf(u8, row.means, "/var/audit/chock") != null);
     try testing.expect(std.mem.indexOf(u8, row.means, "AccessDenied") != null);
-    // And both halves of what it costs: the session runs, and the exit code it
-    // ends with when the tail never leaves. The number comes from `Exit`, so it
-    // cannot drift away from the code a script reads.
     try testing.expect(std.mem.indexOf(u8, row.means, "still starts") != null);
     const code = try std.fmt.allocPrint(arena, "exits {d}", .{Exit.audit_gap.code()});
     try testing.expect(std.mem.indexOf(u8, row.means, code) != null);
-    // Nobody typed this sink, so the fix must not send a reader to a command
-    // line that does not hold it.
     try testing.expect(std.mem.indexOf(u8, row.fix, "org policy bundle") != null);
 
-    // Degraded at worst, and a script still reads zero.
     try testing.expectEqual(Verdict.degraded, verdictFor(rows));
     try testing.expectEqual(@as(u8, 0), exitFor(verdictFor(rows)).code());
 
-    // It belongs under the first run heading, because that is the half about
-    // whether a session can start well here rather than about the sandbox.
     try testing.expect(isFirstRunRow(row));
 }
 
 test "a required sink that was reached says so, and an installation with no bundle adds no row" {
-    // Two facts one measurement each. A sink that answered has to read as on,
-    // or the row would be a warning that fires on every managed installation
-    // and nobody would read it by the second week. And an installation nobody
-    // gave a bundle must gain nothing at all, which is what keeps every machine
-    // that predates required sinks reading exactly as it did.
-    //
-    // Mutation check: build a row for an installation with no required sink and
-    // the second half fails. Drop the reached branch of `requiredSinkRow` and
-    // the first half fails, because a sink that answered would then carry a fix
-    // and a reason, which is the warning on every managed machine.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4640,7 +3098,6 @@ test "a required sink that was reached says so, and an installation with no bund
     };
     const reached_rows = try rowsFor(arena, reached);
 
-    // One row each, in the order the bundle names them, and both on.
     var found: usize = 0;
     for (reached_rows) |row| {
         if (!std.mem.eql(u8, row.name, required_sink_name)) continue;
@@ -4651,28 +3108,14 @@ test "a required sink that was reached says so, and an installation with no bund
     try testing.expectEqual(@as(usize, 2), found);
     try testing.expect(std.mem.indexOf(u8, reached_rows[reached_rows.len - 2].means, "/var/audit/chock") != null);
     try testing.expect(std.mem.indexOf(u8, reached_rows[reached_rows.len - 1].means, "/dev/log") != null);
-    // Every row on, so a managed machine that is well is ready and not
-    // degraded.
     try testing.expectEqual(Verdict.ready, verdictFor(reached_rows));
 
-    // And the installation nobody gave a bundle. `Measured.required_sinks`
-    // defaults to empty, which is the same value a bundle requiring none gives.
     const plain = try rowsFor(arena, healthy());
     try testing.expectEqual(@as(?Row, null), rowNamed(plain, required_sink_name));
     try testing.expectEqual(reached_rows.len - 2, plain.len);
 }
 
 test "a daemon that refused is DEGRADED and a machine with no reader is NONE" {
-    // The two ends of the card seal row, and the pair `chock-pcsc` was given
-    // two errors for. A daemon that accepted the connection and said no is a
-    // polkit rule an administrator can change, which is what `unavailable`
-    // means everywhere else in this report. A daemon that answered and named no
-    // reader is a reader somebody has to plug in, and there is nothing to
-    // configure.
-    //
-    // Mutation check: map `Probe.refused` to `.unsupported` in `cardSealRow`
-    // and the first expectation flips, which would tell a person with a
-    // reachable daemon to go and install one.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4684,8 +3127,6 @@ test "a daemon that refused is DEGRADED and a machine with no reader is NONE" {
     const refused_row = rowNamed(refused_rows, "card seal").?;
     try testing.expectEqual(ui.Layer.State.unavailable, refused_row.state);
     try testing.expect(std.mem.indexOf(u8, refused_row.means, "closed it without answering") != null);
-    // The word says what the session loses and never that it stops, because
-    // this row stops nothing: see the two assertions at the end.
     try testing.expectEqualStrings("DEGRADED", wordFor(refused_row));
 
     var empty = healthy();
@@ -4696,10 +3137,6 @@ test "a daemon that refused is DEGRADED and a machine with no reader is NONE" {
     try testing.expectEqual(ui.Layer.State.unsupported, empty_row.state);
     try testing.expectEqualStrings("NONE", wordFor(empty_row));
 
-    // **Neither stops a first run.** `seal.Level` already has a software key
-    // for exactly this, and it records that it used one. A doctor that exited 2
-    // over a missing reader would refuse to start a session over a fallback the
-    // design made on purpose.
     try testing.expect(!refused_row.blocks);
     try testing.expect(!empty_row.blocks);
     try testing.expectEqual(Verdict.degraded, verdictFor(refused_rows));
@@ -4707,9 +3144,6 @@ test "a daemon that refused is DEGRADED and a machine with no reader is NONE" {
 }
 
 test "a card seal row that is on says how many readers were named" {
-    // The count comes from the measurement and not from the state. A row that
-    // said "a reader is attached" without the number would read the same on a
-    // machine with one reader and on a machine with five.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4720,14 +3154,10 @@ test "a card seal row that is on says how many readers were named" {
     const row = rowNamed(rows, "card seal").?;
     try testing.expectEqual(ui.Layer.State.on, row.state);
     try testing.expect(std.mem.indexOf(u8, row.means, "3 reader") != null);
-    // Nothing to do about a row that is on.
     try testing.expectEqualStrings("", row.fix);
 }
 
 test "the card seal is reported before a first run, not as a sandbox layer" {
-    // It is not a layer: it protects nothing about a tool call, and a column of
-    // sandbox layers with a smart card in it reads as a boundary that is not
-    // there.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4737,14 +3167,6 @@ test "the card seal is reported before a first run, not as a sandbox layer" {
 }
 
 test "the report opens with the version, on an ordinary run and not only with --verbose" {
-    // **The one line that makes a pasted report answerable.** A person reports
-    // a fault by pasting this command's output, and a report with no build in
-    // it costs a round trip every time. The verbosity pass moved every
-    // rationale to `--verbose`; this is an answer rather than a teaching, so it
-    // stays on the default output.
-    //
-    // Mutation check: send the line through `tty.detail` and the default run
-    // below loses it; drop it altogether and both halves fail.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4762,27 +3184,13 @@ test "the report opens with the version, on an ordinary run and not only with --
     printReport("/some/project", m, rows, verdictFor(rows));
     tty.flushOut();
 
-    // The whole line, and the first line: `indexOf` would pass for a version
-    // buried beside the last row, where nobody pastes from.
     const first = std.mem.sliceTo(said.out(), '\n');
     try testing.expectEqualStrings(version_line, first);
-    // On standard output with the rows, because `chock doctor > report.txt` is
-    // how a report is kept, and a version on the other stream would not be in
-    // the file.
     try testing.expect(std.mem.indexOf(u8, said.err(), version_line) == null);
-    // And it is above every row.
     try testing.expect(std.mem.indexOf(u8, said.out(), first_run_heading).? > first.len);
 }
 
 test "the report says what redaction is not, with --verbose, in the words the module argued for" {
-    // **Byte for byte, and this is why the constant exists.**
-    // `chock_core.redact.not_a_boundary` is held beside the mechanism so that a
-    // command showing it to a person shows what that module argued for, and not
-    // a paraphrase that got friendlier over time. This project has watched
-    // prose expire five times.
-    //
-    // Mutation check: reword one character of the sentence in `printReport`,
-    // or summarise it, and this fails.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4790,7 +3198,6 @@ test "the report says what redaction is not, with --verbose, in the words the mo
     const m = healthy();
     const rows = try rowsFor(arena, m);
 
-    // An ordinary run says nothing about redaction at all.
     {
         tty.configure(.{});
         defer tty.configure(.{});
@@ -4808,8 +3215,6 @@ test "the report says what redaction is not, with --verbose, in the words the mo
     tty.configure(.{ .verbose = true });
     defer tty.configure(.{});
 
-    // Captured rather than let through, so the report is read here instead of
-    // scrolling past in a build log: see `tty.Capture` and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
@@ -4818,30 +3223,14 @@ test "the report says what redaction is not, with --verbose, in the words the mo
     tty.flushOut();
 
     try testing.expect(std.mem.indexOf(u8, said.out(), chock_core.redact.not_a_boundary) != null);
-    // On standard output with the rows, because it is part of the answer once a
-    // person asks for it, and not a diagnostic.
-    //
-    // The project path is on standard error, because `tty.detail` is where
-    // every other `--verbose` line goes, so the rows a pipe reads are rows.
     try testing.expect(std.mem.indexOf(u8, said.err(), "/some/project") != null);
-    // After both headings, so a reader meets it once they have the report and
-    // not before they have read a single row.
     const at = std.mem.indexOf(u8, said.out(), chock_core.redact.not_a_boundary).?;
     try testing.expect(at > std.mem.indexOf(u8, said.out(), layers_heading).?);
     try testing.expect(at > std.mem.indexOf(u8, said.out(), first_run_heading).?);
-    // And it is not a row: no glyph, no word, and no name column beside it.
     try testing.expect(std.mem.indexOf(u8, said.out(), "redaction   ") == null);
 }
 
 test "a required sink is reached through the shipper's own transport, and the probe is removed" {
-    // **Measured, never worked out.** The reach is
-    // `chock_proto.ship.Sink.reach`, the transport a session ships through, so
-    // this command states no second open and no second connect. Driven against
-    // a real directory and a real path with no socket at it.
-    //
-    // Mutation check: drop the `deleteFile` in `reachSink` and the directory
-    // below is left holding a file this command made, which a collector
-    // watching it would read.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4852,23 +3241,15 @@ test "a required sink is reached through the shipper's own transport, and the pr
     const len = try tmp.dir.realPath(testing.io, &buffer);
     const root = buffer[0..len];
 
-    // A directory a collector would watch, which this command makes rather than
-    // requires, exactly as a session does.
     const drop_dir = try std.fmt.allocPrint(arena, "{s}/audit", .{root});
     const reached = reachSink(arena, testing.io, .{ .kind = .directory, .path = drop_dir });
     try testing.expectEqual(ui.Layer.State.on, reached.state());
 
-    // The directory is there and holds nothing at all: the probe opened a file
-    // and removed it, and it sent no record, so a collector reads no session
-    // that never ran.
     var opened = try std.Io.Dir.openDirAbsolute(testing.io, drop_dir, .{ .iterate = true });
     defer opened.close(testing.io);
     var it = opened.iterate();
     try testing.expectEqual(@as(?std.Io.Dir.Entry, null), try it.next(testing.io));
 
-    // A syslog path with nothing at it is the answer a required sink that is
-    // down gives, and it is `unavailable` and not `unsupported`: a daemon that
-    // is not running is something an administrator changes.
     const missing = try std.fmt.allocPrint(arena, "{s}/no-such-socket", .{root});
     const down = reachSink(arena, testing.io, .{ .kind = .syslog, .path = missing });
     try testing.expectEqual(ui.Layer.State.unavailable, down.state());
@@ -4885,9 +3266,6 @@ test "the command line takes a project and nothing else" {
 }
 
 test "the probe answers map to the three states and never invent a fourth" {
-    // A kernel that says "no such mechanism" is a fact about the machine; a
-    // kernel that refuses this process is a fact about this process. Reading
-    // both as the same thing is what makes a report useless.
     try testing.expectEqual(ui.Layer.State.on, whyFor(.ok, "x").state());
     try testing.expectEqual(ui.Layer.State.unsupported, whyFor(.absent, "x").state());
     try testing.expectEqual(ui.Layer.State.unavailable, whyFor(.refused, "x").state());
@@ -4896,19 +3274,7 @@ test "the probe answers map to the three states and never invent a fourth" {
 }
 
 test "the router rows are built by really building a network and really filtering it" {
-    // **The measurement, and not a version number.** `measureLayers` forks a
-    // child and does the real thing for every other layer, and these two are no
-    // different: the child calls `netns.Session.configure` and then
-    // `nftables.Session.install`, which are the two calls a routed tool call
-    // makes, in the order it makes them. A row built any other way would say
-    // yes on a host that has never loaded nftables.
-    //
-    // Mutation check: write `if (false) probeNetwork(write_fd);` in `runProbes`
-    // and the first expectation below fails, because the child then says
-    // nothing about either step.
     switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
-        // A build with no namespace driver has no network to build and no row
-        // for one. Nothing here to measure.
         .none, .seatbelt => return error.SkipZigTest,
         .namespaces => {},
     }
@@ -4925,21 +3291,12 @@ test "the router rows are built by really building a network and really filterin
         .router = true,
     }, null, null);
 
-    // **A child that crashed is a failure and never a skip.** A crash writes a
-    // short pipe, which is byte for byte what a machine with no namespace
-    // writes, and the two are told apart by the exit status and nothing else.
-    // See `ChildReport.crashed`.
     try testing.expect(!report.crashed);
 
-    // A machine that gives no namespace at all measured nothing here, and that
-    // is not a pass. Every other answer below is a real one.
     if (report.namespaces != Answer.ok) return error.SkipZigTest;
 
     const network = report.router_network orelse return error.TestUnexpectedResult;
     if (network != Answer.ok) {
-        // A host with no `dummy` link kind is a real host and this test must
-        // not fail on it. What it must still do is name the call, because that
-        // is the whole worth of the row.
         try testing.expect(routerStepName(sandbox.netns.Step, report.router_network_step) != null);
         return;
     }
@@ -4950,7 +3307,6 @@ test "the router rows are built by really building a network and really filterin
         return;
     }
 
-    // This machine built both, so the rows say so.
     var m = healthy();
     m.router_network = .{ .absent = "stated, and overwritten by the measurement below" };
     m.router_filter = .{ .absent = "stated, and overwritten by the measurement below" };
@@ -4961,20 +3317,6 @@ test "the router rows are built by really building a network and really filterin
 }
 
 test "a plan that asks for no network builds none, so nothing is ever made on the machine a person is using" {
-    // **The field is load bearing and this is what proves it.** A device and a
-    // ruleset made outside a network namespace are a device and a ruleset on
-    // the host. `narrowNamespaces` runs its children with `Network.host`, which
-    // keeps the host's own namespace, so `Plan.router` has to be off there and
-    // on for the whole plan.
-    //
-    // Mutation check: ignore `plan.router` in `runProbes` and call
-    // `probeNetwork` always. The first expectation below then reads `refused`
-    // rather than null, because a process that is root in a user namespace of
-    // its own is not `ns_capable` over the host's own network namespace and
-    // the kernel answers `EPERM` at the very first message. **That refusal is
-    // what this test rests on and it is not what makes the field necessary**:
-    // a caller who gave such a child `CAP_NET_ADMIN` over the host would make
-    // a `chock0` device on the machine a person is using.
     switch (comptime LayerFamily.forDriver(sandbox.Sandbox.guarantees)) {
         .none, .seatbelt => return error.SkipZigTest,
         .namespaces => {},
@@ -5004,23 +3346,10 @@ test "a plan that asks for no network builds none, so nothing is ever made on th
 }
 
 test "a kernel that has no module names the call and the modprobe line, and one that refused does not" {
-    // The two are different facts and need different words. A missing module
-    // is the host's, and a person fixes it with one command. A refusal inside
-    // a namespace this process is root in is a fault in Chock, and telling a
-    // person to load a module for that is an hour wasted.
-    //
-    // Mutation check: answer `.refused` for `error.KernelModuleMissing` in
-    // `networkAnswer` or in `filterAnswer` and the first pair of expectations
-    // below fails, which is the row telling a person to report a bug when what
-    // they have to do is load a module.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // **The one error name that is about the machine.** A process in a user
-    // namespace cannot make the kernel load a module, so a host with none
-    // really does not have the mechanism. Every other member of both error
-    // sets is this process being refused something the kernel does have.
     try testing.expectEqual(Answer.absent, networkAnswer(error.KernelModuleMissing));
     try testing.expectEqual(Answer.absent, filterAnswer(error.KernelModuleMissing));
     for ([_]sandbox.netns.Error{ error.NotPermitted, error.Refused, error.ExchangeFailed }) |err| {
@@ -5041,17 +3370,9 @@ test "a kernel that has no module names the call and the modprobe line, and one 
 
     const filter = rowNamed(rows, "router filter").?;
     try testing.expectEqual(ui.Layer.State.unsupported, filter.state);
-    // A row that stops a first run says `BLOCKED`, whatever its state is.
     try testing.expectEqualStrings("BLOCKED", wordFor(filter));
     try testing.expect(filter.blocks);
-    // The call the kernel refused, by name.
     try testing.expect(std.mem.indexOf(u8, filter.means, "relay_rule") != null);
-    // And the command a person runs, with every module in it.
-    // **Guarded on the module list and not on the platform.** `filter_modules`
-    // is empty off Linux, because nftables is a Linux filter, so there is no
-    // module for a fix line to name and this loop would assert the presence of
-    // an empty string. Reading the constant rather than `os.tag` keeps the test
-    // measuring the mechanism.
     if (sandbox.Sandbox.filter_modules.len != 0) {
         try testing.expect(std.mem.indexOf(u8, filter.fix, "modprobe") != null);
         try testing.expect(std.mem.indexOf(u8, filter.fix, sandbox.Sandbox.filter_modules) != null);
@@ -5066,12 +3387,8 @@ test "a kernel that has no module names the call and the modprobe line, and one 
             try testing.expect(std.mem.indexOf(u8, filter.fix, module) != null);
         }
     }
-    // The network above it came up, so its row is still on and says nothing.
     try testing.expectEqual(ui.Layer.State.on, rowNamed(rows, "router network").?.state);
 
-    // The `dummy` module is the one the network row names, and it is the only
-    // one on that line: a person told to load six modules for a missing link
-    // kind learns nothing about which of them mattered.
     var no_dummy = healthy();
     applyRouter(arena, &no_dummy, .{
         .namespaces = .ok,
@@ -5081,9 +3398,6 @@ test "a kernel that has no module names the call and the modprobe line, and one 
     const dummy_rows = try rowsFor(arena, no_dummy);
     const network = rowNamed(dummy_rows, "router network").?;
     try testing.expect(std.mem.indexOf(u8, network.means, "dummy_create") != null);
-    // **Guarded on the module list, for the reason the filter row above is.**
-    // `network_modules` is empty off Linux, so the fix line names no module
-    // there and this assertion would look for an empty string inside it.
     if (sandbox.Sandbox.network_modules.len != 0) {
         try testing.expect(std.mem.indexOf(u8, network.fix, "modprobe") != null);
         try testing.expect(std.mem.indexOf(
@@ -5093,13 +3407,10 @@ test "a kernel that has no module names the call and the modprobe line, and one 
         ) != null);
         try testing.expect(std.mem.indexOf(u8, network.fix, "nft_redir") == null);
     }
-    // And the ruleset was never reached, so it is not reported as a kernel
-    // that answered no to anything.
     const never = rowNamed(dummy_rows, "router filter").?;
     try testing.expect(std.mem.indexOf(u8, never.means, "did not come up") != null);
     try testing.expect(std.mem.indexOf(u8, never.fix, "modprobe") == null);
 
-    // A refusal names the call and tells nobody to load anything.
     var refused = healthy();
     applyRouter(arena, &refused, .{
         .namespaces = .ok,
@@ -5115,12 +3426,6 @@ test "a kernel that has no module names the call and the modprobe line, and one 
 }
 
 test "a child that never reached the network says so, and is never read as a kernel that answered no" {
-    // Silence is not an answer. A child whose namespaces did not come up never
-    // asked the kernel anything about a network, and a row that called that a
-    // refused network would send a person after a fault that is not there.
-    //
-    // Mutation check: read a null `router_network` as `Answer.refused` and the
-    // sentence below stops naming the namespaces.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5131,9 +3436,6 @@ test "a child that never reached the network says so, and is never read as a ker
     try testing.expectEqualStrings(router_not_reached, m.router_filter.why());
     try testing.expect(std.mem.indexOf(u8, router_not_reached, "namespaces") != null);
 
-    // A step byte the child never filled in names no call, and the row then
-    // says the same sentence without one rather than naming the first member
-    // of the enum. `open_socket` is that member and its ordinal is zero.
     try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 0));
     try testing.expectEqualStrings(
         "open_socket",
@@ -5143,8 +3445,6 @@ test "a child that never reached the network says so, and is never read as a ker
         "open_socket",
         routerStepName(sandbox.nftables.Step, @intFromEnum(sandbox.nftables.Step.open_socket) + 1).?,
     );
-    // A byte that names no step is dropped, the same as every other byte that
-    // came over the pipe.
     try testing.expectEqual(@as(?[]const u8, null), routerStepName(sandbox.netns.Step, 250));
 
     var unnamed = healthy();
@@ -5153,17 +3453,6 @@ test "a child that never reached the network says so, and is never read as a ker
 }
 
 test "a host whose resolv.conf is a link starts a routed sandbox, and the row says the sandbox owns /etc" {
-    // **The blocker most Linux machines outside NixOS used to have.** `/etc` is
-    // bound from the host, `/etc/resolv.conf` there is a link into
-    // `/run/systemd/resolve`, and `namespace.substitute` refuses a link rather
-    // than following it. `namespace.ownDirectory` puts the sandbox somewhere
-    // else: it takes `/etc` for the sandbox with an overlay and removes the
-    // three names from it, so what the host keeps there is never touched.
-    //
-    // Mutation check: have `measureResolverFiles` answer `made_inside` for a
-    // host toolchain whose `/etc` really is there, and the row stops saying
-    // which `/etc` a session gets and stops reading the `overlayfs` answer, so
-    // the machine below that cannot overlay reads as ready.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5173,21 +3462,11 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
 
-    // **A host with no `/etc` of its own is not a host whose sandbox takes
-    // one**, and this is the half that is easy to lose. The sandbox binds no
-    // such directory, so it makes one in its own writable root and writes the
-    // three files there, with no overlay involved at all.
-    //
-    // Mutation check: drop the directory test in `measureResolverFiles` and
-    // this reads `owned`, which makes a machine with no `/etc` depend on a
-    // mechanism its session never uses.
     try testing.expectEqual(
         ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
-    // A host with no Nix store, an `/etc` of its own, and a resolver file that
-    // is a link. That is a systemd machine.
     try tmp.dir.createDir(testing.io, "etc", .default_dir);
     try tmp.dir.symLink(
         testing.io,
@@ -5195,11 +3474,6 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
         "etc/resolv.conf",
         .{},
     );
-    // **Both answers asserted, and the platform decides which.**
-    // `Sandbox.resolver_substitutions` is empty off Linux, so the loop in
-    // `measureResolverFiles` has nothing to walk and the only honest answer is
-    // that the sandbox makes its own. Asserting `owned` everywhere failed on
-    // the CI Mac for a reason that was never a fault.
     try testing.expectEqual(
         if (sandbox.Sandbox.resolver_substitutions.len != 0)
             ResolverFiles.owned
@@ -5208,8 +3482,6 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
-    // **And it is not a blocked machine.** The link is still a link on the
-    // host, and the sandbox writes its own file in a directory it owns.
     var linked = healthy();
     linked.toolchain = .{ .host = 9 };
     linked.resolver_files = .owned;
@@ -5218,13 +3490,7 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
     try testing.expect(!row.blocks);
     try testing.expect(std.mem.indexOf(u8, row.means, "overlay") != null);
 
-    // **The same host with no `nsswitch.conf` at all**, which is Alpine. It
-    // used to be the same fault pointing the other way: the directory is bound
-    // read only, so a file that is not already there could not be made there.
-    // The answer does not depend on what is at the three paths any more, which
-    // is exactly why this machine now works.
     try tmp.dir.deleteFile(testing.io, "etc/resolv.conf");
-    // The same platform split as above, and for the same reason.
     try testing.expectEqual(
         if (sandbox.Sandbox.resolver_substitutions.len != 0)
             ResolverFiles.owned
@@ -5233,27 +3499,15 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
         measureResolverFiles(testing.io, .{ .host = 9 }, root),
     );
 
-    // **The one machine that is still refused**, and the row names the
-    // mechanism rather than a file. A sandbox that has to take `/etc` needs a
-    // rootless overlay, and a kernel before 5.11 has none.
-    //
-    // Mutation check: ignore the `overlayfs` answer in `resolverFilesRow` and
-    // this machine reads as ready, which tells a script that a box where no
-    // tool call can start is fine.
     const refused = rowNamed(try rowsFor(arena, noOverlayHost()), resolver_files_name).?;
     try testing.expectEqual(ui.Layer.State.unavailable, refused.state);
     try testing.expect(refused.blocks);
     try testing.expectEqualStrings("BLOCKED", wordFor(refused));
     try testing.expect(std.mem.indexOf(u8, refused.means, "overlay") != null);
     try testing.expect(std.mem.indexOf(u8, refused.fix, "5.11") != null);
-    // And the two ways out, both of which are true: either of the two
-    // toolchains puts no host `/etc` in the sandbox at all.
     try testing.expect(std.mem.indexOf(u8, refused.fix, "dev shell") != null);
     try testing.expect(std.mem.indexOf(u8, refused.fix, "container image") != null);
 
-    // And the same machine with a Nix store mounts that and nothing else, so
-    // there is no host `/etc` to take: the sandbox makes its own. The link is
-    // still there, which is what makes this the interesting half.
     try tmp.dir.symLink(testing.io, "../run/systemd/resolve/stub-resolv.conf", "etc/resolv.conf", .{});
     try tmp.dir.createDir(testing.io, "nix", .default_dir);
     try tmp.dir.createDir(testing.io, "nix/store", .default_dir);
@@ -5264,12 +3518,6 @@ test "a host whose resolv.conf is a link starts a routed sandbox, and the row sa
 }
 
 test "a toolchain that puts no host /etc in the sandbox is never blocked by the host's own" {
-    // A dev shell is a Nix closure and holds no `/etc`, so the three files are
-    // made inside the sandbox whatever this host has. A report that read the
-    // host anyway would refuse to start on a machine where a session works.
-    //
-    // Mutation check: measure the host for a `dev_shell` toolchain too, and
-    // this fails on the machine every systemd user has.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5285,15 +3533,11 @@ test "a toolchain that puts no host /etc in the sandbox is never blocked by the 
         ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .dev_shell, root),
     );
-    // A session that does not start at all has no mount set to reason about,
-    // and the toolchain row is what says so.
     try testing.expectEqual(
         ResolverFiles.made_inside,
         measureResolverFiles(testing.io, .none, root),
     );
 
-    // An image brings its own `/etc`, so this host's says nothing about it and
-    // the row says exactly that rather than answering for a tree nobody read.
     const measured = measureResolverFiles(testing.io, .{ .image = "docker.io/library/alpine:3.20" }, root);
     try testing.expectEqualStrings("docker.io/library/alpine:3.20", measured.from_image);
 
@@ -5301,10 +3545,6 @@ test "a toolchain that puts no host /etc in the sandbox is never blocked by the 
     m.resolver_files = measured;
     const rows = try rowsFor(arena, m);
     const row = rowNamed(rows, resolver_files_name).?;
-    // On, because what was measured is that this host does not stop it, and
-    // the sentence names the tree the rest of the answer is about. The same
-    // shape `vantageNote` gives a cgroup answer measured from inside a
-    // namespace.
     try testing.expectEqual(ui.Layer.State.on, row.state);
     try testing.expect(!row.blocks);
     try testing.expect(std.mem.indexOf(u8, row.means, "alpine:3.20") != null);
@@ -5312,13 +3552,6 @@ test "a toolchain that puts no host /etc in the sandbox is never blocked by the 
 }
 
 test "a build whose driver isolates no network gets none of the three router rows" {
-    // **Read from the driver and never from the platform**, the rule the whole
-    // file keeps. A driver that gives a tool call no network of its own builds
-    // no router, so three rows about one would name mechanisms that build never
-    // reaches.
-    //
-    // Mutation check: drop the `network_isolated` guard in `rowsFor` and the
-    // three rows come back on a driver that has no router at all.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5331,15 +3564,10 @@ test "a build whose driver isolates no network gets none of the three router row
     for ([_][]const u8{ "router network", "router filter", resolver_files_name }) |name| {
         try testing.expectEqual(@as(?Row, null), rowNamed(rows, name));
     }
-    // And the rest of the column is untouched, so this removed three rows and
-    // not a family.
     try testing.expect(rowNamed(rows, "landlock") != null);
     try testing.expect(rowNamed(rows, "net namespace") != null);
 }
 
-/// A machine whose sandbox binds the host's own `/etc`, on a kernel with no
-/// rootless overlayfs. The one shape that is still refused: the sandbox has to
-/// take that directory for itself and the kernel will not let it.
 fn noOverlayHost() Measured {
     var m = healthy();
     m.toolchain = .{ .host = 9 };
@@ -5349,18 +3577,6 @@ fn noOverlayHost() Measured {
 }
 
 test "a machine that cannot route says so in its exit code, because every tool call takes a filtered network" {
-    // **The decision, written where somebody changing it will meet it.**
-    // `Row.blocks` means a first run fails because of this row, and it is what
-    // the exit code is built from. `src/run.zig` gives its tool runner a
-    // network seam on every session, with no flag and no policy question, and
-    // `chock_core.tools` moves every foreground call to `Network.filtered`
-    // wherever that seam is set. So a host that cannot build or filter that
-    // network refuses the first tool call and every one after it, and there is
-    // no lesser mode to fall back to: `.none` and `.host` are for a background
-    // command, a language server and an MCP server nobody let out.
-    //
-    // Mutation check: set `.blocks = false` on either router row and this
-    // machine exits 0, which tells a script a broken box is ready.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5377,26 +3593,15 @@ test "a machine that cannot route says so in its exit code, because every tool c
     try testing.expectEqual(@as(u8, 2), exitFor(verdictFor(rows)).code());
     try testing.expectEqual(@as(usize, 1), countBlocking(rows));
 
-    // The same for a host whose resolver file is a link, which is a different
-    // fault with the same consequence.
     const linked_rows = try rowsFor(arena, noOverlayHost());
     try testing.expectEqual(Verdict.blocked, verdictFor(linked_rows));
     try testing.expectEqual(@as(u8, 2), exitFor(verdictFor(linked_rows)).code());
 
-    // And a machine that really can route exits 0, so this is a gate and not a
-    // refusal to start anywhere.
     try testing.expectEqual(Verdict.ready, verdictFor(try rowsFor(arena, healthy())));
     try testing.expectEqual(@as(u8, 0), exitFor(.ready).code());
 }
 
 test "the three router rows are sandbox layers and are printed under that heading" {
-    // They are layers of the same sandbox every row above them is about, and a
-    // person reading the column reads the whole network answer in one place:
-    // the namespace, the network in it, the filter on that network, and the
-    // files that make a program use it.
-    //
-    // Mutation check: add either name to `isFirstRunRow` and the rows move
-    // under the wrong heading, which this fails on.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5406,8 +3611,6 @@ test "the three router rows are sandbox layers and are printed under that headin
         try testing.expect(!isFirstRunRow(rowNamed(rows, name).?));
     }
 
-    // And they sit with the namespace they are built inside, between it and
-    // the paths layer, rather than at the end of the column.
     var seen: usize = 0;
     var net_namespace: usize = 0;
     var landlock: usize = 0;
@@ -5428,9 +3631,6 @@ test "the three router rows are sandbox layers and are printed under that headin
 }
 
 test "a record from the probe pipe with a byte that names no step is dropped" {
-    // The bytes come from another process, so they are read with `fromInt`
-    // and never with `@enumFromInt`, which is undefined behaviour on an
-    // invalid tag.
     try testing.expectEqual(@as(?Step, null), std.enums.fromInt(Step, 0));
     try testing.expectEqual(@as(?Step, null), std.enums.fromInt(Step, 200));
     try testing.expectEqual(Step.namespaces, std.enums.fromInt(Step, 1).?);
@@ -5439,20 +3639,6 @@ test "a record from the probe pipe with a byte that names no step is dropped" {
 }
 
 test "an org ceiling is reported, and an installation with no bundle adds no row" {
-    // **A person can see the effect and never the cause.** A session that stops
-    // at a number nobody wrote in `chock.zon`, or a spawn refused by a limit the
-    // project did not set, reads as a fault until you know an organisation set
-    // it. `doctor` reported the bundle's required sinks and nothing else it
-    // imposes, so every cap below was invisible on the machine it bound.
-    //
-    // **On, and blocking nothing.** A cap is a fact about this installation and
-    // not a fault, so a managed machine that is well still reads ready. A row
-    // that warned would fire on every managed machine and nobody would read it
-    // by the second week, which is the same argument the required sink row
-    // already makes.
-    //
-    // Mutation check: give the ceiling rows `.blocks = true` and the verdict
-    // below stops being `ready`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -5475,8 +3661,6 @@ test "an org ceiling is reported, and an installation with no bundle adds no row
     try testing.expectEqual(@as(usize, 2), found);
     try testing.expectEqual(Verdict.ready, verdictFor(rows));
 
-    // **An installation nobody gave a bundle gains nothing at all**, which is
-    // what keeps every machine that predates this reading exactly as it did.
     const plain = try rowsFor(arena, healthy());
     for (plain) |row| {
         try testing.expect(!std.mem.eql(u8, row.name, org_ceiling_name));
@@ -5484,15 +3668,6 @@ test "an org ceiling is reported, and an installation with no bundle adds no row
 }
 
 test "device passthrough is a fact this build's driver can act on, and a build with none gets no row" {
-    // **A fact and never a fault.** `device_passthrough` is a compile time
-    // constant, so a build that has it always reads `.on` here: there is no
-    // measurement that could come back partial or refused. A build that
-    // answers false gets no row at all, the same as an installation with no
-    // org bundle gets no ceiling row: `unsupported` would read as a setting
-    // a person could change, and there is none.
-    //
-    // Mutation check: give this row `.blocks = true` and the verdict below
-    // stops being `ready`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
