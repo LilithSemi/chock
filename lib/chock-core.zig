@@ -70,6 +70,9 @@ pub const mcp_driver = @import("chock-core/mcp_driver.zig");
 /// that has to hold before the model is offered one. A seam, and
 /// `plugin_module` below is what is on the other side of it.
 pub const plugin = @import("chock-core/plugin.zig");
+/// Policy action names for the Nix tool: what a build or a run is called in
+/// the table, ahead of the tool itself.
+pub const nix = @import("chock-core/nix.zig");
 /// Reading a plugin out of a WebAssembly module, with no engine at all. The
 /// host side of `chock-plugin-core`, and the reason discovery runs no guest
 /// code.

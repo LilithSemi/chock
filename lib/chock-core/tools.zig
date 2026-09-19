@@ -928,14 +928,18 @@ pub const Tool = enum {
     /// share a built name, because the one character that marks a boundary
     /// is a character no segment's own bytes can ever produce.
     ///
-    /// **No bound check on `buffer` here, on purpose.** `runCommandActionInto`
-    /// already checked `buffer.len` against `max_action_bytes` and `argv0`
-    /// against `max_raw_path_bytes` before calling this, and `max_action_bytes`
-    /// is sized for the worst path either bound allows. A check here could
+    /// **Public because `chock_core.nix` needs the same escape for the same
+    /// reason.** An attribute path and a flake reference are dotted paths
+    /// too, so building a Nix action out of them reuses this rather than
+    /// carrying a second encoder for the one hazard.
+    ///
+    /// **No bound check on `buffer` here, on purpose.** Every caller checks
+    /// `buffer.len` against its own `max_action_bytes`, sized for the worst
+    /// input its own bounds allow, before calling this. A check here could
     /// never fire for a real caller, and the "too long" test at the end of
     /// this file proves the refusal happens earlier, at the buffer check,
     /// rather than never at all.
-    fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
+    pub fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
         var at = cursor;
         for (segment) |byte| {
             switch (byte) {
