@@ -1,129 +1,6 @@
-//! The agent loop: the thing that joins a model client, a session log, and a
-//! tool runner into a session that actually goes back and forth.
-//!
-//! **The log is the truth, and the context is a view of it.** Every turn,
-//! `Loop.run` builds the request the model sees by folding the log so far,
-//! through `context.zig`, never by keeping its own separate copy of "the
-//! conversation." A resume replays the same log through the same fold and
-//! gets the same context back: see `lib/chock-proto/state.zig`.
-//!
-//! **An event is written before the action it describes happens.** A model's
-//! reply is appended as a `message` event, and each tool call inside it is
-//! appended as its own `tool.call` event, before `deps.tool_runner.dispatch`
-//! ever runs. A crash between the model answering and the tool running is then
-//! replayable: the call is already on disk, even if the result never
-//! arrives. Writing the call after running the tool, because it reads
-//! simpler, is the mistake this ordering exists to rule out.
-//!
-//! **The API key never reaches here.** `deps.client` is the neutral
-//! `chock_provider.Client.Client` interface: `Loop.run` never sees a
-//! credential, only a value that can send a request and stream a reply. See
-//! `Client.zig`'s own top comment.
-//!
-//! ## The tool runner seam
-//!
-//! `deps.tools` is `ToolRunner`, a `ptr`/`vtable` interface in the same
-//! style `chock_provider.Client.Client` already uses, not a bare call to
-//! `chock_core.tools.Registry.dispatch`. Two reasons:
-//!
-//! * `Registry.dispatch` must run from a single threaded process: see
-//!   `tools.zig`'s own top comment. A caller that wants to drive `Loop.run`
-//!   from the ordinary, multi threaded test binary, the way every test in
-//!   this file does, cannot call it directly, the same reason
-//!   `test/core/tools.zig` runs every real tool call through a dedicated
-//!   probe process instead of inside its own test binary.
-//! * `Registry.dispatch` needs an `env` and a built `sandbox.Config`, which
-//!   in turn comes from a `chock_workspace.Workspace`. `lib/chock-core/tools.zig`'s
-//!   own top comment is explicit that this library does not import
-//!   `chock-workspace`: `dispatch` takes an already built `sandbox.Config`,
-//!   never a `Workspace` itself. `Loop.zig` sits beside `tools.zig` in the
-//!   same library and keeps the same rule.
-//!
-//! ## The approval seam
-//!
-//! **A call bound for `deps.tool_runner` is asked about, between appending
-//! the `tool.call` event, step 4a below, and calling `deps.tool_runner.dispatch`,
-//! step 4b.** `runTool` turns the call into a policy action name with
-//! `tools.Tool.actionInto` and asks `deps.arbiter`, exactly the seam
-//! `runRestrictSelf` already used for a widening: see `gateToolCall`. A
-//! refusal there builds a `tool.result` directly and `deps.tool_runner.dispatch`
-//! is never called. This file still never holds the policy table: the broker
-//! answers, through the same seam, and this file only asks.
-//!
-//! **The seven names this file answers itself are not asked about here a
-//! second time.** `spawn_agent`, `update_plan`, `restrict_self`, `fetch_url`,
-//! `ask_user`, `set_title` and `request_action` either carry their own gate
-//! already, scoped to the actual privileged act rather than to the call that
-//! names it, or are bounded by some other means entirely: see
-//! `gateToolCall`'s own top comment for the full accounting, one name at a
-//! time.
-//!
-//! **A decision reaches the log for every one of the calls that are asked
-//! about, `allow` included**, because `chock_broker.Broker.request` writes an
-//! `approval.response` for every outcome and this file's own gate is one more
-//! caller of it. Measured against a real session, that is one more line, a
-//! few hundred bytes, for every ordinary sandboxed tool call: see the commit
-//! that added this paragraph for the number. **Kept, not routed around.** A
-//! per call record is `Broker.request`'s own deliberate design, written so a
-//! decision can later be signed, and a cache in this file that skipped asking
-//! would skip that record too, on top of going stale the moment a session
-//! narrowed itself with `restrict_self` after the first call of some action
-//! had already been let through. Growing the log is the honest cost of an
-//! audit trail that covers every call and not only the ones that needed a
-//! person. A project that finds the growth too much narrows `chock.zon` or
-//! waits for a session scoped grant, built properly, with its own replay
-//! rules, rather than an ad hoc guess here.
-//!
-//! The broker also runs for one act outside this file: `src/run.zig` asks it
-//! for `workspace.apply` after `run` returns, so the session's own commit can
-//! reach the user's repository. That is the same rule read from the other
-//! side: the agent never holds the capability, and nothing about the sandbox
-//! it ran in changes because an approval happened.
-//!
-//! ## The spawn seam
-//!
-//! **A `spawn_agent` call never reaches `deps.tool_runner`.** A spawn is
-//! measured against how deep this agent already is and how many subagents it
-//! has already started, and a tool runner holds neither number, so `runTool`
-//! answers it here and `tools.Registry` refuses it outright. See `runSpawn`.
-//!
-//! **The child itself is a process, and this library does not start one.**
-//! `deps.spawner` is the seam, for the same reasons `deps.tool_runner` is one:
-//! a child needs a session directory, a credential, and a single threaded
-//! caller, and `Sandbox.spawn` forks, so a tree built from threads would
-//! deadlock the first time a child ran a tool. See
-//! `lib/chock-core/subagent.zig`, which owns everything about a child except
-//! the two events this loop appends around one.
-//!
-//! ## A full context is not a way for a session to stop
-//!
-//! **A context overflow is not a failure. It is the condition compaction
-//! exists to answer.** This loop used to read the provider's 400 the same way
-//! it read every other refusal and end the session, throwing away work that
-//! nothing was wrong with. Two triggers now, and both are wanted:
-//!
-//! * **A threshold Chock chooses**, from the model's own context limit, read
-//!   at the top of a turn from `chock_proto.state.Session.last_input_tokens`.
-//!   Compacting only when a provider refuses means always compacting at the
-//!   worst moment, on the providers that happen to say so, and never on one
-//!   that truncates in silence.
-//! * **The overflow itself**, as a backstop: catch it, compact, and take the
-//!   same turn again.
-//!
-//! **A transport fault is a different thing and must not reach either.** A 429
-//! and a 5xx look identical to an overflow at this call site and they want the
-//! opposite answer, which is to send the same request again after a wait. See
-//! `chock_provider.failure.classify`, which is what keeps the two apart, and
-//! `chock_provider.retry`, which is the wait. `sendWithRetry` below is where
-//! the two meet: a refusal is classified once, and either compaction answers
-//! it, or a wait does, or the session ends. **Neither path ever becomes the
-//! other**: compacting because of a rate limit would throw away turns nothing
-//! was wrong with, and waiting for a full context would wait forever.
-//!
-//! **Only a refused response is retried, not a broken connection.** A dropped
-//! or stalled stream is `AssembledReply.failed`, it carries whatever text
-//! already arrived, and repeating a turn that half happened is a larger change
-//! than this one. It ends the session exactly as it always did.
+//! The agent loop: it joins a model client, a session log, and a tool runner
+//! into a session that goes back and forth. The log is the truth, and the
+//! context the model sees is a fold of it that each turn rebuilds.
 
 const std = @import("std");
 const chock_cost = @import("chock-cost");
@@ -151,17 +28,10 @@ const retry = chock_provider.retry;
 const subagents = chock_policy.subagents;
 const ratchet = chock_policy.ratchet;
 
-/// What `ToolRunner.dispatch` can fail with. Named after `tools.Error`
-/// itself: see that file's own `Error` for why it is
-/// `sandbox.Sandbox.SpawnError`, the set of faults a retry cannot fix, never
-/// the ordinary "the command exited 1" or "the tool name does not exist"
-/// facts, which travel back as an `is_error` `ToolResult` instead. `Loop.run`
-/// still does not propagate this: see `runTool` below.
+/// What `ToolRunner.dispatch` can fail with. A command that exited 1, or a
+/// tool name that does not exist, is an `is_error` `ToolResult` and not this.
 pub const DispatchError = tools.Error;
 
-/// The interface `Loop.run` calls to run one tool call. See this file's own
-/// top comment for why this is an interface and not a direct call to
-/// `tools.Registry.dispatch`.
 pub const ToolRunner = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -185,18 +55,9 @@ pub const ToolRunner = struct {
     }
 };
 
-/// The real `ToolRunner`: forwards straight into `tools.Registry.dispatch`.
-/// `env` and `sandbox_config` are not owned: the caller keeps both alive for
-/// as long as this value is in use, the same borrowing `Registry.dispatch`
-/// itself already asks of its own caller.
 pub const SandboxToolRunner = struct {
     env: *const std.process.Environ.Map,
     sandbox_config: sandbox.Config,
-    /// Everything about this session a tool needs beyond the workspace: the
-    /// knowledgebase directory, the session identifier a note records as its
-    /// provenance, and the per call deadline. See `tools.Context`. Not owned:
-    /// the caller keeps every string in it alive for as long as this value is
-    /// in use, the same borrowing `env` and `sandbox_config` already ask for.
     context: tools.Context = .{},
 
     pub fn runner(self: *const SandboxToolRunner) ToolRunner {
@@ -217,24 +78,7 @@ pub const SandboxToolRunner = struct {
 };
 
 /// Hands over the session's own locked handle, once, right after `run` takes
-/// it and before the first turn starts. Null, the default, is every caller
-/// that opens no filtered connection from inside a tool call: see
-/// `tools.Context.net` and `lib/chock-broker/network.zig`'s own `Network.asker`.
-///
-/// **Once, and never per call.** `run` holds this handle from here until the
-/// session ends, at the same address the whole time, so a tool call's own
-/// network broker needs it exactly once to answer every question a session
-/// asks through it: see this file's own top comment on the seam
-/// `Deps.arbiter` already threads per call, and why this one does not have
-/// to. A vtable that ran on every dispatch would hand over the same pointer
-/// every time for no reason, and it would ask every implementation of
-/// `ToolRunner` to grow a parameter that only one of them reads.
-///
-/// **This is not a second owner of the log.** The pointer this hands out is
-/// the very one `run` already holds. Nothing here opens the log again or
-/// locks it a second time, and the caller that stores this pointer must
-/// never call `unlock` on it. See `arbiter_mod.Locked`'s own top comment for
-/// why the type has to be reached this way.
+/// it. The caller that stores the pointer must never call `unlock` on it.
 pub const GiveLocked = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -248,42 +92,8 @@ pub const GiveLocked = struct {
     }
 };
 
-/// Told about each event as `Loop.run` appends it. Optional: `Loop.run`
-/// behaves the same with none, and every test in this file except the one
-/// that pins this behaviour uses none.
-///
-/// **This exists because the log is the only output a caller has, and a
-/// caller cannot read it while `run` holds the exclusive lock on it.** A
-/// session of ten turns is minutes of a silent terminal otherwise, and a
-/// caller that wants to show what is happening has nowhere else to look. It
-/// is also the seam an interface needs: a client that renders a turn as it
-/// lands attaches here, and nothing else about `run` changes.
-///
-/// **`onEvent` returns nothing, and that is deliberate.** An observer is
-/// watching, never deciding. A printer that fails, for example because
-/// standard output is a closed pipe, must not end a session that is doing
-/// real work, and an observer that could refuse an event would be a second
-/// place where a session can be stopped, which is the broker's job and not
-/// this one's. The seam a decision belongs at is named in this file's own
-/// top comment, and it is not here.
-///
-/// `id` is the event's own byte offset in the log, the same value a replay
-/// reports. `ev` is borrowed and is valid only for the duration of the call.
-///
-/// ## `onPiece`, and why an event is not enough
-///
-/// **A turn produces one `message` event, at the end, and a turn takes
-/// minutes.** Measured: a real session ran 5.3 minutes over about 57 model
-/// calls and showed nothing at all while any of them was in flight, because
-/// `onEvent` is only reached once the whole reply is assembled and appended.
-/// The provider was streaming the entire time. `chock_provider.Client` hands
-/// over each piece the moment one read of the connection produces it, and
-/// `test/core/client.zig` pins that an early piece arrives before a later one
-/// is even sent. That stream stopped here.
-///
-/// So an observer is told two different things. `onEvent` is the log, and
-/// nothing about it changes. `onPiece` is the model's own words, in the order
-/// it produced them, at the time it produced them.
+/// Told about each event as `Loop.run` appends it, and about each piece of a
+/// reply as it arrives. An observer watches and never decides.
 pub const Observer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -298,69 +108,22 @@ pub const Observer = struct {
         self.vtable.onEvent(self.ptr, id, ev);
     }
 
-    /// Told what the harness itself is about to do, in one sentence, when it
-    /// is something a person watching would otherwise read as a hang.
-    ///
-    /// **A wait is the case this exists for.** A session that is refused by a
-    /// rate limit waits, and the wait can be a minute long. Without this the
-    /// terminal shows nothing for that minute, which is exactly the silence
-    /// `onPiece` was added to end, and a user who cannot tell a wait from a
-    /// hang presses Ctrl-C on a session that was about to carry on.
-    ///
-    /// **Not an event, and deliberately not in the log.** This says what the
-    /// harness is doing now, not what the session is. The facts a replay needs
-    /// are already events: every attempt appends its own `usage`, and a
-    /// session that gives up appends a `session.end` that says how many
-    /// attempts were made.
-    ///
-    /// `text` is borrowed and is valid only for the duration of the call.
     pub fn onNotice(self: Observer, text: []const u8) void {
         self.vtable.onNotice(self.ptr, text);
     }
 
-    /// Told about one piece of the model's reply as it arrives, before the
-    /// turn is finished and long before anything is appended to the log.
-    ///
-    /// **What is shown here is not yet in the log, and that is the one
-    /// difference from `onEvent`.** Every piece of a turn that completes is in
-    /// the `message` event that closes the turn, so the two agree in the
-    /// ordinary case. A turn the provider cuts off partway is the case where
-    /// they do not: `run` appends a `session.end` naming the fault, and the
-    /// partial reply is not appended, so a person saw words that no replay
-    /// will produce. An observer that must not show a word the log may never
-    /// hold uses `onEvent` alone.
-    ///
-    /// `piece` is borrowed and is valid only for the duration of the call.
+    /// What this shows is not yet in the log. A turn the provider cuts off part
+    /// way is never appended, so a person can see words that no replay produces.
     pub fn onPiece(self: Observer, piece: Piece) void {
         self.vtable.onPiece(self.ptr, piece);
     }
 };
 
-/// One piece of a model's reply, as the provider produced it. See
-/// `Observer.onPiece`.
-///
-/// **Two members, and a tool call is deliberately not one of them.** A tool
-/// call arrives as fragments of a JSON argument list, so the early ones are
-/// half an object and say nothing a person can read, and the `tool.call` event
-/// already carries the whole call the moment it is known. Usage is not one
-/// either: it is a number the `usage` event records, not a word the model
-/// said.
 pub const Piece = union(enum) {
-    /// A piece of the model's answer text.
     text: []const u8,
-    /// A piece of the model's reasoning. **Kept apart from `text` rather than
-    /// folded into it**, because an observer that shows the two the same way
-    /// would put the model's private working out in the middle of its answer,
-    /// and only the observer can decide what to do about that.
     reasoning: []const u8,
 };
 
-/// Forwards each streamed delta to an `Observer` as a `Piece`. One per turn,
-/// on `runTurn`'s own stack: it holds a borrowed observer and nothing else.
-///
-/// **The translation is here and not in the observer** so that no implementer
-/// of `Observer` has to import `chock-provider` to be told what the model
-/// said. See `Piece` for the two deltas that are dropped.
 const PieceWatcher = struct {
     observer: Observer,
 
@@ -379,507 +142,142 @@ const PieceWatcher = struct {
 };
 
 /// How many times the model may ask for the same tool, with the same
-/// arguments, one call after another, before `Loop.run` stops the session
-/// with `no_progress`.
-///
-/// **A turn count is the wrong stop condition and this is the right one.**
-/// `Loop.run` used to stop at 50 turns, and the red team run of 2026-08-21
-/// showed both faults of that in one session: it stopped a session that was
-/// still working, at an arbitrary number, and it took 50 turns to notice a
-/// loop that was already plain by turn 3, where the model called the same
-/// read on the same four paths sixteen times. A turn count conflates "this
-/// is taking a while", which is fine, with "this has stopped making
-/// progress", which is not. So there is no turn limit by default: a session
-/// ends when the model answers with no tool call, and this is what catches
-/// the model that never will.
-///
-/// **Three, chosen with the retry in mind.** A tool call can fail for a
-/// reason that is gone a moment later, and a model that repeats the call
-/// once is doing the right thing, so a limit of 2 would stop a healthy
-/// session. By the third identical call the same question has already been
-/// answered the same way twice, and a fourth answer cannot be new.
-///
-/// **Counted inside a window, not over consecutive calls.** See
-/// `no_progress_window`: the run of identical calls this used to count is
-/// only the simplest loop, and the red team run of 2026-08-21 showed the
-/// other one.
+/// arguments, before the session ends with `no_progress`. Three, because a
+/// tool call can fail for a reason that is gone a moment later.
 pub const no_progress_repeats: usize = 3;
 
-/// How many of the most recent tool calls `Progress` looks at when it decides
-/// whether the session is looping.
-///
-/// **Five, because that is the smallest window a two call cycle fits in.**
-/// The detector used to hold one previous call and count identical calls in a
-/// row, so any different call reset the count. The red team run of
-/// 2026-08-21 walked straight through it: the model alternated two `bash`
-/// calls, A B A B A, which never reaches two identical calls in a row and so
-/// never fired, while being a model plainly making no progress. A B A B A
-/// needs five slots. Four cannot hold it, and a larger window would only let
-/// a longer cycle in, which the second condition below already handles
-/// better than a wider window does.
+/// How many of the most recent tool calls `Progress` weighs. Five, the
+/// smallest window an A B A B A cycle fits in.
 pub const no_progress_window: usize = 5;
 
 /// How many different calls the window may hold and still count as a loop.
-///
-/// **Two, and this is the condition that keeps real work alive.** "Three
-/// identical calls within the last five" on its own stops the most ordinary
-/// thing a coding agent does: build, edit, build, edit, build, where the two
-/// edits differ and the build is identical every time. That is a model
-/// fixing one compile error at a time, which is exactly the session nobody
-/// may interrupt. The loop and the fix differ in what sits between the
-/// repeats: a loop returns to the same other call, and work does not.
-///
-/// So a session is stopped only when the window holds at most this many
-/// different calls **and** one of them was asked `no_progress_repeats` times.
-/// A B A B A has two, and is stopped. A B A C A has three, and runs on. A
-/// read, then an edit, then the same read again has two different calls and
-/// only two of either, so it is not stopped either, and it is the pattern the
-/// window was picked around.
-///
-/// **A longer cycle still gets through**, A B A C A B A C A and so on, and
-/// that is the deliberate limit of this detector: past a two call cycle,
-/// looping and working stop being separable by counting alone, and a
-/// detector that guesses would stop healthy sessions. The budget, section
-/// 10.2, is what bounds those.
+/// Two, because build, edit, build, edit, build is three identical builds
+/// inside five and is healthy work. A longer cycle still gets through.
 pub const no_progress_distinct: usize = 2;
 
-/// What a session still holds at a turn boundary that its log does not.
-///
-/// **Only the loop can count this**, because the two tables live beside the
-/// loop and nothing outside the process can read them. It is handed to
-/// `Deps.handover` so a caller can hold off giving away a session that would
-/// lose work by moving. See `chock_broker.handover`, which names the counts to
-/// the asking client and then waits for them, and `src/detach.zig` for the
-/// table of everything a running session holds and what becomes of each part.
-///
-/// Counts and not a boolean, so the session can say how many and a person
-/// knows what is being waited for.
 pub const InFlight = struct {
-    /// Background commands started and not yet recorded in the log.
     tasks: usize = 0,
-    /// Subagents started in the background and not yet recorded in the log.
     children: usize = 0,
 };
 
-/// Everything one call to `Loop.run` needs.
 pub const Deps = struct {
-    /// The model backend. See `chock_provider.Client.Client`'s own top
-    /// comment: a caller cannot tell which implementation this is, and it
-    /// never carries a credential.
     client: chock_provider.Client.Client,
-    /// The session log. `Loop.run` takes the exclusive lock on it for the
-    /// whole call: the process holding this lock is the owner.
     storage: chock_proto.storage.Storage,
-    /// Runs one tool call. See this file's own top comment.
     tool_runner: ToolRunner,
-    /// Told the session's own locked handle once, right after `run` takes it.
-    /// Null, the default, is a session whose tool calls open no filtered
-    /// connection, which is every caller before this field existed. See
-    /// `GiveLocked`.
     give_locked: ?GiveLocked = null,
-    /// The tools the model is offered, in the shape
-    /// `chock_provider.message.Request.tools` wants. A caller ordinarily
-    /// builds this with `tools.Registry.definitions` and also passes it to
-    /// `lib/chock-core/prompt.zig`'s own `build`, so the prompt's tool list
-    /// and the request's own tool list can never drift apart from each
-    /// other.
     tool_definitions: []const message.ToolDefinition,
-    /// The model name on the wire, for example "glm4.7-flash:A3B".
     model: []const u8,
-    /// The alias of `model` on the roster. A session can mix models across
-    /// turns, so every `message` event this loop appends carries this, and a
-    /// later reader can say which alias produced which turn.
     model_alias: []const u8,
-    /// The agent kind that selects the policy. **This loop never evaluates the
-    /// policy table**, which stays the broker's job: see this file's own top
-    /// comment. The value reaches the `session.start` event and the
-    /// `approval.request` this loop writes for a budget, and
-    /// `lib/chock-policy/table.zig` is what keys a rule on it when a caller
-    /// asks that table a question.
+    /// The agent kind that selects the policy. This loop never evaluates the
+    /// policy table, which stays the broker's job.
     agent_kind: []const u8,
-    /// What kind of agent this is, for the one question the policy table does
-    /// not answer: whether this agent holds any tool at all. See
-    /// `tools.Role`.
-    ///
-    /// **The loop reads it because two tool calls never reach the tool
-    /// runner.** `spawn_agent`, `update_plan` and `restrict_self` are answered
-    /// here, so a gate that lived only in `tools.Registry.dispatchWith` would
-    /// leave an arbitrator able to start a subagent. See `runTool`.
-    ///
-    /// **The name of the kind is not read here.** Which kinds are arbitrators
-    /// is `lib/chock-broker/review.zig`'s question, and this library imports
-    /// no `chock-broker`: the caller answers it and passes the answer.
+    /// What kind of agent this is. The loop reads it because some tool calls never
+    /// reach the tool runner, so a gate in `tools.Registry.dispatchWith` alone
+    /// would leave an arbitrator able to start a subagent.
     role: tools.Role = .worker,
-    /// Every parent between the root of the spawn tree and this agent, root
-    /// first, and this agent itself left out. See `event.SpawnLink`. Empty
-    /// for a session a person started.
-    ///
-    /// **Every parent, and not the nearest one.** A caller that passed one link
-    /// would leave a grandchild folding two kinds, neither of them the root's,
-    /// and would report depth 2 at every depth, so `max_depth` would bound
-    /// nothing. `src/run.zig`'s own `spawnChain` reads the whole chain off the
-    /// command line its parent wrote, and `test/core/tree.zig` is what runs a
-    /// tree deep enough to tell.
-    ///
-    /// Two things read it: the `approval.request` this loop writes, which
-    /// carries the whole chain, and the depth half of `deps.subagents`,
-    /// because the length of this chain is how deep this agent is.
+    /// Every parent between the root of the spawn tree and this agent. Every
+    /// parent, and not the nearest one: one link would report depth 2 at every
+    /// depth and `max_depth` would bound nothing.
     spawn_chain: []const event.SpawnLink = &.{},
-    /// The session that started this one, or empty for a session a person
-    /// started. It reaches the `session.start` event, which is the child's own
-    /// half of the two way link a subagent tree is rebuilt from: the parent
-    /// appends `session.spawn` naming the child, and this names the parent.
-    ///
-    /// **Nothing in this loop reads it back.** A parent is a fact about where
-    /// this session came from, not a thing it can ask anything of: the parent
-    /// process holds the exclusive lock on its own log for its whole session.
     parent_session: []const u8 = "",
-    /// What starts a subagent, or null for a session that can start none. See
-    /// `lib/chock-core/subagent.zig`, and `runSpawn`, which is the only thing
-    /// that calls it.
-    ///
-    /// **A seam, for the same reason `tool_runner` is one.** A child is a
-    /// process, and a process needs a session directory, a credential, and a
-    /// single threaded caller, none of which this library has or wants. A
-    /// caller with none of that passes null, and a spawn the limits allow then
-    /// says so: see `spawn_has_no_spawner_detail`.
     spawner: ?subagent.Spawner = null,
-    /// The children this session started and did not wait for, or null for a
-    /// session that can start none that way. See
-    /// `lib/chock-core/subagent.zig`'s own `Table`.
-    ///
-    /// **Null is the wait shape and nothing else**, which is every caller that
-    /// existed before this: a spawn that asks to carry on is then refused and
-    /// says so, rather than quietly waiting instead. See
-    /// `spawn_cannot_carry_on_detail`.
+    /// The children this session started and did not wait for. Null is the wait
+    /// shape, and a spawn that asks to carry on is then refused and says so.
     children: ?*subagent.Table = null,
-    /// How deep and how wide the spawn tree of this project may grow, read
-    /// from `chock.zon` by the caller. See `lib/chock-policy/subagents.zig`.
-    /// The default is a 6 by 6 tree.
-    ///
-    /// **A `max_width` of zero refuses every spawn**, which is how a project
-    /// turns subagents off, and it is the case this loop was tested at
-    /// first: see `runSpawn`.
     subagents: subagents.Limits = .{},
-    /// The system prompt. Built once by the caller, ordinarily with
-    /// `lib/chock-core/prompt.zig`'s own `build`, and sent unchanged on
-    /// every turn.
     system_prompt: []const u8,
-    /// Stop after this many turns, whatever the session is doing. **Null,
-    /// which is no limit, is the default**: nobody knows in advance how many
-    /// turns a task needs, and a limit that stops a healthy session is a
-    /// limit that makes the tool untrustworthy. `no_progress_repeats` is what
-    /// stops a session that has stopped working, and a budget is what bounds
-    /// what one costs. This stays for a caller that genuinely wants a turn
-    /// count, and ends the session `turn_limit`.
     max_turns: ?usize = null,
-    /// Told about each event as it is appended. See `Observer`. Null for a
-    /// caller that only wants the log.
     observer: ?Observer = null,
-    /// Asked at every safe point whether this session should stop now. Null,
-    /// the default, is a session nothing can interrupt.
-    ///
-    /// **A function and not a flag, because the caller owns how it is set.**
-    /// `src/interrupt.zig` sets its own flag from a signal handler and passes
-    /// `requested` here. A client with a cancel button would pass something
-    /// else. Neither shape reaches this file.
-    ///
-    /// **It must be safe to call from anywhere and must not fail.** It is read
-    /// while `run` holds the exclusive lock on the session log, so anything
-    /// that took a lock of its own, or allocated, could deadlock the session
-    /// it was asked about.
-    ///
-    /// See `run` for where it is read and what is written when it says yes.
+    /// Asked at every safe point whether this session should stop now. It must be
+    /// safe to call from anywhere and must not fail: it is read while `run` holds
+    /// the exclusive lock, so a call that takes a lock of its own can deadlock.
     canceled: ?*const fn () bool = null,
-    /// Asked at every **turn boundary**, and nowhere else, whether another
-    /// process should become the owner of this session now. Null, the default,
-    /// is a session nothing else can take.
-    ///
-    /// **The turn boundary alone, and this is the whole difference from
-    /// `canceled`.** `canceled` is read at three safe points, and one of them
-    /// is the gap between two tool calls of one turn. A session that stopped
-    /// there leaves an assistant message whose `tool_use` parts have no
-    /// matching `tool.result`, which a person pressing Ctrl-C has accepted and
-    /// a handover must not produce: the next owner has to send that context to
-    /// a provider, and a provider refuses it. At the top of a turn every tool
-    /// result of the last turn is already in the log, so the next owner sends
-    /// what this one would have sent.
-    ///
-    /// It is given what this session still holds that the log does not, because
-    /// only the loop can count it: see `InFlight`. The answer is the caller's,
-    /// and `src/handover.zig` is what turns it into a socket exchange. Nothing
-    /// about a socket reaches this file.
-    ///
-    /// **It may wait, and `canceled` may not.** This is called once per turn
-    /// with the lock held and nothing half written, and the caller is expected
-    /// to answer at once unless a client is really asking.
+    /// Asked at every turn boundary, and nowhere else, whether another process
+    /// should take this session. The turn boundary alone, because a session
+    /// stopped between two tool calls leaves an assistant message whose `tool_use`
+    /// parts have no result, which a provider refuses.
     handover: ?*const fn (io: std.Io, in_flight: InFlight) bool = null,
-    /// Every background task of this session, or null for a session that runs
-    /// none. See `lib/chock-core/tasks.zig`.
-    ///
-    /// **The loop drains it and the tool runner fills it.** The same table is
-    /// in `tools.Context`, where a `run_command` call starts a task, and here,
-    /// where a finished one is recorded and delivered. It is the caller that
-    /// owns it, because it outlives every tool call and every turn.
     tasks: ?*task_table.Table = null,
-    /// What this session may spend, read from `chock.zon` by the caller. Null
-    /// for a project that set no cap. That file stays beyond the agent's reach,
-    /// so **the model cannot raise its own budget**, and
-    /// `test/workspace/escape.zig` proves it.
+    /// What this session may spend, read from `chock.zon` by the caller. That
+    /// file stays beyond the agent's reach, so the model cannot raise its own cap.
     budget: ?chock_cost.budget.Budget = null,
-    /// Whether the endpoint behind `client` bills anybody. A caller builds
-    /// this from the provider instance, ordinarily with
-    /// `chock_cost.prices.billingFor`. See `chock_cost.prices.Billing`: free
-    /// and unknown are different, and a local model is free.
     billing: chock_cost.prices.Billing = .billed,
-    /// When to fold the context into a summary, and what to keep. See
-    /// `lib/chock-core/compaction.zig`. **The default knows no context limit**,
-    /// so a caller that says nothing gets the overflow backstop and no
-    /// threshold: a guessed limit would compact a session that had room.
     compaction: compaction.Policy = .{},
-    /// How many times a refused request is sent again, and how long to wait
-    /// first. See `lib/chock-provider/retry.zig`. **This is not compaction**,
-    /// and the two answer different refusals: see this file's own top comment.
-    ///
-    /// The default retries. A caller that wants a refusal to end the session
-    /// at once asks for `max_attempts` of 1.
     retry: retry.Policy = .{},
     /// What the harness tells the agent that the agent cannot work out for
-    /// itself. See `lib/chock-core/notices.zig`.
-    ///
-    /// **This never touches `system_prompt`**, and a test in this file pins
-    /// that the prompt is byte identical across two turns carrying different
-    /// notices. A value that changes every turn, put at the front of a
-    /// request, invalidates the provider's cache on every turn, and the bill
-    /// lands on exactly the long sessions notices exist to help.
+    /// itself. This never touches `system_prompt`: a value that changes every
+    /// turn, put at the front of a request, loses the provider's cache.
     notices: notices.Policy = .{},
-    /// How many files in the user's own project are not committed, and so are
-    /// not in the workspace the agent sees. Measured by the caller before the
-    /// session starts, because only the caller can see the user's real
-    /// repository: see `src/run.zig`'s own `handleUncommitted`, which already
-    /// prints this number for the user and, before this existed, told the
-    /// agent nothing.
-    ///
-    /// Zero for a clean tree, and zero for an overlay workspace, which copies
-    /// the whole project directory and hides nothing.
     uncommitted_files: usize = 0,
-    /// What performs the wait between two attempts. Null, the default, is the
-    /// machine's own clock.
-    ///
-    /// **A seam, so that no test of the backoff measures elapsed time.** A
-    /// test that slept for real would be slow and would still prove nothing
-    /// about the number it was given: see `retry.Sleeper`, and
-    /// `chock_broker.Broker.Waiter`, which is the same seam for the same
-    /// reason.
     sleeper: ?retry.Sleeper = null,
-    /// Who decides an act this loop is not allowed to decide for itself, or
-    /// null for a session that can ask nobody. See `lib/chock-core/arbiter.zig`.
-    ///
-    /// **Two acts reach it.** A request to widen a promise the session
-    /// already made, see `runRestrictSelf`, and, since this file learned to
-    /// gate a tool call, a call bound for `deps.tool_runner` as well: see
-    /// `runTool` and `gateToolCall`. The policy table stays the broker's, and
-    /// nothing in this file ever reads one. It asks through this seam both
-    /// times.
-    ///
-    /// **Null is a refusal that says so.** `arbiter.not_asked` is what a
-    /// session with none answers, and the words a model gets back then say
-    /// nobody could be asked rather than implying the request was weighed,
-    /// and those two are kept apart. A session with no arbiter at all can
-    /// therefore run no sandboxed tool, though it can still narrow itself,
-    /// spawn a child, keep a plan and the rest of the seven `gateToolCall`
-    /// leaves to their own gate: see that function's own top comment for why
-    /// this is the safe direction and not an accident.
+    /// Who decides an act this loop may not decide for itself. Null answers
+    /// `arbiter.not_asked`, so a session with no arbiter runs no sandboxed tool,
+    /// and the model is told nobody could be asked.
     arbiter: ?arbiter_mod.Arbiter = null,
-    /// The workspace's own absolute root, or empty for a caller that does not
-    /// know one. Read only by `gateToolCall`, which hands it straight to
-    /// `tools.Tool.actionInto` as `project_root`: see that function's own doc
-    /// for why an in-project absolute path needs it to name the same action
-    /// as its relative spelling.
-    ///
-    /// **Empty is safe and not a bypass.** `actionInto` only strips this
-    /// prefix off an absolute `argv0` when both it and `project_root` are
-    /// absolute paths. An empty `project_root` fails that check and the path
-    /// is read exactly as written, which still names a real, if less
-    /// specific, action. Nothing here ever falls back to `allow`.
+    /// The workspace's own absolute root, handed to `tools.Tool.actionInto`.
+    /// Empty is safe: the path is then read as written, which still names a real
+    /// if less specific action, and nothing falls back to `allow`.
     project_root: []const u8 = "",
-    /// The store paths this session mounted when it started, or empty for a
-    /// caller that knows none. Read only by `gateToolCall`, which hands it
-    /// straight to `tools.Tool.actionInto` as the closure.
-    ///
-    /// **The same list `tools.Context.store_paths` was given at startup, and
-    /// never the list as it stands now.** `src/run.zig` grows that one when
-    /// `provide_tool` realises a package, and a program the session itself
-    /// put in the store is exactly what must keep asking. See
-    /// `tools.Tool` and its `devshell_class`.
-    ///
-    /// **Empty is safe and not a bypass.** Every store path then names
-    /// `exec.nix.store.*`, which Chock ships as `ask`.
+    /// The store paths this session mounted when it started, and never the list as
+    /// it stands now, so a program the session put in the store keeps asking.
+    /// Empty is safe: every store path then names `exec.nix.store.*`, which is `ask`.
     store_closure: []const []const u8 = &.{},
-    /// What reads a URL for the agent, or null for a session that can read
-    /// none. See `lib/chock-core/fetch.zig`.
-    ///
-    /// **A seam for the reason `arbiter` is one.** Which host may be read is a
-    /// row of the policy table, the table is the broker's, and nothing in this
-    /// file reads one.
-    ///
-    /// **Null is a refusal that says so.** `fetch_mod.has_no_fetcher` is what a
-    /// session with none answers, because a tool that came back with an empty
-    /// page would have a model reason about a page nobody read.
+    /// What reads a URL for the agent. Null refuses and says so, because a tool
+    /// that answered with an empty page would have a model reason about it.
     fetcher: ?fetch_mod.Fetcher = null,
-    /// What puts a question to the person, or null for a session that can ask
-    /// nobody. See `lib/chock-core/ask.zig`.
-    ///
-    /// **A seam for the reason `arbiter` is one**, and for one more of its own:
-    /// what asks a person is a terminal or a display, and nothing under `lib/`
-    /// writes to a device.
-    ///
-    /// **This is not the arbiter and must never become it.** An arbiter decides
-    /// whether an act may happen. This asks a person for a fact and grants
-    /// nothing whatever they type. Read `ask.zig`'s own top comment before
-    /// joining the two.
-    ///
-    /// **Null is a refusal that says so.** `ask_mod.has_no_asker` is what a
-    /// session with none answers, and it tells the model to decide for itself
-    /// rather than to ask again.
+    /// What puts a question to the person. This is not the arbiter and must never
+    /// become it: it asks for a fact and grants nothing, whatever the person types.
     asker: ?ask_mod.Asker = null,
-    /// What carries the session's own work back into the user's repository, or
-    /// null for a session that cannot carry any. See
-    /// `lib/chock-core/handback.zig`.
-    ///
-    /// **A seam for the reason `arbiter` is one, and it is not the arbiter.**
-    /// An arbiter decides and stops there. This one asks the broker to decide
-    /// and then carries the act out, which is why it is a second seam and not a
-    /// second call on the first.
-    ///
-    /// **One act reaches it, `handback.apply_action`**, and the tool that asks
-    /// refuses every other name. A general request-for-any-action seam would
-    /// need every act's own parameters to come from the model, which is a much
-    /// larger thing to get right, and it would be built with one customer.
-    ///
-    /// **Null is a refusal that says so.** `handback_mod.not_offered` is what a
-    /// session with none answers, and it says nobody was asked rather than
-    /// implying somebody weighed the work and declined it.
+    /// What carries the session's own work back into the user's repository. One
+    /// act reaches it, `handback.apply_action`, and the tool refuses every other name.
     handback: ?handback_mod.Handback = null,
-    /// What must not reach the provider. See `lib/chock-core/redact.zig`,
-    /// and read its top comment before trusting this for anything: it is
-    /// protection against an accident and it is not a boundary.
-    ///
-    /// **The default is inert**, so a project that declared nothing sends
-    /// exactly the bytes it sent before this field existed. The caller builds
-    /// a live one, because only the caller can see the credential store and
-    /// the project's own declarations: `chock-core` imports no `chock-auth`,
-    /// and this file's own top comment keeps it that way.
-    ///
-    /// **It reaches the log and the request, at two seams.**
-    /// `appendAndApply` is where a record is cleaned, which is the seam that
-    /// matters: the log is append only and hash chained, so a credential
-    /// written there cannot be taken out again. `sendOnce` is where the request
-    /// is cleaned, which catches the one part of a request the log does not
-    /// hold, the system prompt. See `redact.zig`'s own top comment.
+    /// What must not reach the provider. Read `lib/chock-core/redact.zig` first:
+    /// it is protection against an accident and it is not a boundary. The default
+    /// is inert, so a project that declared nothing sends the same bytes as before.
     redact: redact.Policy = .{},
 };
 
-/// How the `session.end` this loop writes for a session stopped by its budget
-/// starts. Exported so a caller that shows this to a person, or a test that
-/// pins it, does not carry a copy of a sentence written here.
-///
-/// **Nothing reads this to decide anything.** `event.SessionEndReason` has a
-/// member for the budget, and `src/main.zig` reads that member and never the
-/// text: a code inferred from a message is a code a reword can change, which
-/// is the fault the turn limit's own detail prefix used to carry.
 pub const budget_detail_prefix = "the session budget was reached";
 
-/// The action name the budget's `approval.request` carries. Hitting a cap is
-/// an approval rather than a crash: **a session that dies at a cap with no
-/// chance to answer loses work the user already paid for.**
 pub const budget_action = "budget.raise";
 
 pub const Error =
     std.mem.Allocator.Error ||
     chock_provider.Client.SendError ||
-    // ReplayError, not the narrower StorageError alone: foldExisting below
-    // reads the log back through Storage.replay before run's own first
-    // append, and a stored line that fails to parse, event.DecodeError, is
-    // as real a fault there as a storage fault is.
+    // ReplayError and not StorageError alone: `foldExisting` reads the log back
+    // before the first append, where a line that does not parse is a real fault.
     chock_proto.storage.ReplayError;
 
-/// Run a session to completion: repeat a turn until the model answers with
-/// no tool call.
+/// Run a session to completion: repeat a turn until the model answers with no
+/// tool call.
 ///
-/// First folds whatever `deps.storage` already holds, the same replay a resume
-/// or a `/daemonize` handover would do. A caller that wants the very first turn
-/// to answer a prompt appends that prompt as a `message` event, with its own
-/// lock/append/unlock, before calling `run`. `run` itself starts from whatever
-/// is already there, nothing more.
-///
-/// Appends `session.start` only when the fold found none already, so
-/// calling `run` again on a session that has already started, to continue
-/// it after a reconnect, does not write a second one on top of the first.
-/// Appends `session.end` before returning in every case, so a caller reading
-/// the log back always sees a session that ended, never one that stops mid
-/// conversation with nothing saying why. See `Error` for what can still
-/// escape without it: only an allocation failure or a storage fault, neither
-/// of which leaves anything more to say into the very log that failed.
-///
-/// **An interrupt is part of "in every case", and it used to be the hole in
-/// it.** A signal does not run a deferred append, so a session somebody
-/// stopped with Ctrl-C left a log ending on whatever event happened to be
-/// last, and "the user stopped it" and "the process died mid write" read
-/// identically to anything replaying that log. `deps.canceled` closes that:
-/// it is read at every safe point, and a session that is asked to stop
-/// appends a `session.end` with reason `canceled_by_user` like any other
-/// ending. The safe points are the top of each turn and the gap between two
-/// tool calls of one turn, which are the two places `run` holds the lock
-/// legitimately and has nothing half written. A model call already in flight
-/// is read to its end first: see `src/interrupt.zig` on the second press,
-/// which is what a user with no patience for that has instead.
-///
-/// **The person at the keyboard is asked first.** Both are read at the top of
-/// the same turn, and a Ctrl-C recorded as a handover would tell the person who
-/// pressed it that their session moved somewhere.
+/// Appends `session.start` only when the fold found none, and `session.end`
+/// before returning in every case. A signal runs no deferred append, which is
+/// why `deps.canceled` is read at the top of each turn and between two tool
+/// calls of one turn.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
     var locked = try deps.storage.lock(io);
     defer locked.unlock(io) catch {};
 
-    // Once, here, and nowhere else: see `GiveLocked`'s own top comment on why
-    // a tool call's own network broker needs this pointer exactly once and
-    // never per call.
     if (deps.give_locked) |give| give.give(&locked);
 
     var session = chock_proto.state.Session.init(allocator);
     defer session.deinit();
 
-    // What the harness knows and the model cannot. Held here, beside
-    // `Progress`, because both are memory of the session that the context
-    // itself does not carry. See `lib/chock-core/notices.zig`.
     var telling = notices.State{};
     defer telling.deinit(allocator);
 
     try foldExisting(allocator, io, deps.storage, &session, &telling);
-    // A log with nothing in it is a session that starts now. Every other case
-    // reads the start out of the log, so a resumed session says how old it
-    // really is rather than how long this process has been running.
     if (telling.started_ms == null) telling.started_ms = nowMs(io, deps);
 
-    // session_start is the only event that ever sets agent_kind, so an
-    // empty one here means the fold found none: either the log was empty,
-    // or it held only events, such as a seeded prompt, appended before this
-    // session was ever marked started.
+    // `session_start` is the only event that sets `agent_kind`, so an empty one
+    // here means the fold found no start.
     if (session.agent_kind.len == 0) {
         _ = try appendAndApply(allocator, io, &locked, &session, deps, .{
             .session_start = .{
                 .agent_kind = deps.agent_kind,
                 .model_alias = deps.model_alias,
-                // The child's own half of the two way link. See
-                // `Deps.parent_session`.
                 .parent_session = deps.parent_session,
-                // The kinds the policy table folds, written into the log the
-                // session starts. `parent_session` names one identifier, and
-                // the answer the table gives depends on every kind from the
-                // root down to this agent, so a reader with this log alone
-                // could not re-derive a decision without it. See
-                // `event.SessionStart.spawn_chain`.
                 .spawn_chain = deps.spawn_chain,
             },
         });
@@ -906,33 +304,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
         .reason = .turn_limit,
         .detail = detail,
     } });
-    // The turn limit is a way for a session to stop like any other, so the same
-    // last records are written here: see `recordAtTheEnd`.
     try recordAtTheEnd(allocator, io, &locked, &session, deps);
 }
 
-/// The last thing a session writes, after `session.end` and after the last
-/// turn, whichever way the session stopped.
-///
-/// **Every way a session stops comes through here.** A final answer, a turn
-/// limit, a budget that refused the next turn, and a user who canceled are four
-/// stop reasons and one ending, so what the log holds at the end of a session
-/// does not depend on which of them happened.
-///
-/// **The record only, and never a message.** The conversation is over by here,
-/// and words written into a log that nothing will read are words put into a
-/// conversation that ended: see `TaskDelivery`.
-///
-/// **A child is waited for and a background command is not**, and the
-/// difference is not a preference. `subagent.Table.deinit` has to wait in any
-/// case, because a child writes into a session directory below this session's
-/// own scratchpad, which the caller is about to remove, so the wait happens
-/// either way. Doing it here is what stops the parent's log losing the answer.
-/// Then every `session.spawn` in the log has an `agent.complete` after it,
-/// which is a property a replay can rely on. A background command has no such
-/// forced wait and no log of its own, and a session that is over must not sit
-/// for half an hour on a build whose output nobody will read: `src/run.zig`
-/// ends those instead.
+/// The last thing a session writes, whichever way the session stopped. A child
+/// is waited for and a background command is not: `subagent.Table.deinit` has
+/// to wait in any case, because a child writes into a directory the caller is
+/// about to remove.
 fn recordAtTheEnd(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -940,36 +318,18 @@ fn recordAtTheEnd(
     session: *chock_proto.state.Session,
     deps: Deps,
 ) Error!void {
-    // A background task that finished while the last turn ran still ran, and
-    // the log is the truth about what happened in a session.
     try recordFinishedTasks(allocator, io, locked, session, deps, .record_only);
     if (deps.children) |table| table.waitAll();
     try recordFinishedChildren(allocator, io, locked, session, deps, .record_only);
 }
 
-/// What the compaction watch remembers between turns, which is one thing:
-/// whether the agent has already been told a compaction is coming since the
-/// last one happened.
-///
-/// **Everything else it needs is folded from the log.** How full the context
-/// is comes from `chock_proto.state.Session.last_input_tokens`, so a resumed
-/// session knows it before it sends anything, and a compaction resets it there
-/// rather than here.
 const ContextWatch = struct {
     warned: bool = false,
 };
 
-/// What the last `no_progress_window` tool calls of the session look like.
-/// `Progress.observe` builds one per call, and `isLoop` is the whole stop
-/// condition. See `no_progress_repeats`, `no_progress_window` and
-/// `no_progress_distinct` for why it takes both numbers and not one.
 const Observation = struct {
-    /// How many tool calls the window holds. Below `no_progress_window` only
-    /// for the first few calls of a session.
     seen: usize,
-    /// How many of those are the call just made.
     repeats: usize,
-    /// How many different calls the window holds altogether.
     distinct: usize,
 
     fn isLoop(self: Observation) bool {
@@ -977,21 +337,8 @@ const Observation = struct {
     }
 };
 
-/// The last `no_progress_window` tool calls of the session. See
-/// `no_progress_repeats` for why this, and not a turn count, is what stops a
-/// session that has stopped working, and `no_progress_window` for why one
-/// previous call was not enough to see a loop.
-///
-/// Owns its copy of every call's tool name and arguments: the values
-/// `runTurn` reads them from belong to one turn's own reply and are freed
-/// with it, and these have to outlive that.
 const Progress = struct {
-    /// The window, as a ring. Each entry is one call's tool and arguments,
-    /// joined. Null for a slot no call has reached yet, which only happens in
-    /// the first `no_progress_window` calls of a session.
     calls: [no_progress_window]?[]u8 = @splat(null),
-    /// Which slot the next call overwrites, so the oldest call is the one
-    /// that leaves.
     next: usize = 0,
 
     fn deinit(self: *Progress, allocator: std.mem.Allocator) void {
@@ -1001,16 +348,14 @@ const Progress = struct {
         self.* = undefined;
     }
 
-    /// Record one tool call and say what the window looks like with it in.
     fn observe(
         self: *Progress,
         allocator: std.mem.Allocator,
         tool: []const u8,
         arguments: []const u8,
     ) std.mem.Allocator.Error!Observation {
-        // The tool and the arguments are joined with a byte no tool name
-        // holds, so "read" with arguments "x" and "read x" with no arguments
-        // cannot be mistaken for each other.
+        // Joined with a byte no tool name holds, so "read" with arguments "x" and
+        // "read x" with no arguments cannot be mistaken for each other.
         const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ tool, arguments });
         if (self.calls[self.next]) |leaving| allocator.free(leaving);
         self.calls[self.next] = key;
@@ -1023,8 +368,6 @@ const Progress = struct {
             const call = entry orelse continue;
             seen += 1;
             if (std.mem.eql(u8, call, key)) repeats += 1;
-            // The first slot holding this text is the one that counts it, so
-            // a call in the window three times is one different call.
             var first = true;
             for (self.calls[0..index]) |earlier| {
                 const before = earlier orelse continue;
@@ -1036,11 +379,6 @@ const Progress = struct {
     }
 };
 
-/// Run one turn: build the request from the current fold, send it, log the
-/// reply, and run every tool call the reply asked for. Returns `true` when
-/// this turn was the session's last one, because the model answered with no
-/// tool call: `run`'s own loop stops there. Returns `false` to ask for
-/// another turn.
 fn runTurn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1056,49 +394,26 @@ fn runTurn(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Before anything this turn does, and before the budget check, because a
-    // session the user has already stopped must not spend another turn's
-    // money to find that out.
     if (try endIfCanceled(allocator, io, locked, session, deps)) return true;
 
-    // A background command that finished since the last turn. Here, and not
-    // between two tool calls of one turn, which is the other place this loop
-    // reads the interrupt flag. Two reasons, and either one alone is enough:
-    // a turn already in flight cannot act on what it is told, because the
-    // model chose its tool calls before any of them ran, and the messages
-    // between an assistant turn and its own tool results are the one place a
-    // provider requires an exact shape, which a message from the harness
-    // inserted in the middle would break. See `deliverFinishedTasks`.
+    // At the top of a turn, and never between two tool calls of one: a provider
+    // requires an exact shape between an assistant turn and its own tool results.
     try recordFinishedTasks(allocator, io, locked, session, deps, .tell_the_agent);
 
-    // A subagent that finished since the last turn, at the same point and for
-    // the same reasons. See `recordFinishedChildren`.
     try recordFinishedChildren(allocator, io, locked, session, deps, .tell_the_agent);
 
-    // **After both drains, and before the request.** After, because what is
-    // still running is what a handover would lose, and a task that finished
-    // one moment ago is already in the log and loses nothing: asking first
-    // would refuse handovers over work that was already safe. Before, because
-    // a session about to change hands must not spend a turn's money, and must
-    // not compact a context the next owner would compact again.
+    // After both drains, so work that already finished refuses no handover, and
+    // before the request, so a session about to change hands pays for no turn.
     if (try endIfHandedOver(allocator, io, locked, session, deps)) return true;
 
-    // **Before the request, because money cannot be un-spent.** Section
-    // 10.2. A turn refused here sends nothing at all, which is the fact the
-    // test named for it pins.
+    // Before the request, because money cannot be un-spent.
     if (try refuseForBudget(allocator, io, locked, session, deps)) return true;
 
-    // **Before the request, and from a threshold Chock chose**, so a session
-    // compacts at a moment it picked rather than at the one a provider forces
-    // on it. This is the trigger that also covers a provider which truncates
-    // in silence and never refuses at all. See `watchContext`.
     try watchContext(allocator, io, locked, session, deps, watch, telling);
 
     const messages = try context.build(arena, session);
     const request = message.Request{
         .model = deps.model,
-        // Never touched by a notice, and this is the whole reason notices sit
-        // at the end of the context instead. See `Deps.notices`.
         .system = deps.system_prompt,
         .messages = try withNotice(allocator, arena, io, session, deps, telling, turn_index, messages),
         .tools = deps.tool_definitions,
@@ -1125,19 +440,11 @@ fn runTurn(
             defer allocator.free(status_error.body);
             const class = chock_provider.failure.classify(status_error.status, status_error.body);
 
-            // **The backstop.** A refusal that says the request was too large
-            // is the one refusal that answers itself: fold the context and
-            // take the same turn again. A transport fault never reaches here,
-            // because `classify` names it something else. See this file's own
-            // top comment.
             if (class == .context_overflow) {
                 if (try compactNow(allocator, io, locked, session, deps, telling)) {
                     watch.warned = false;
                     return false;
                 }
-                // Nothing left to fold: the kept tail alone is larger than
-                // this model can take. Ending here is what stops a session
-                // compacting in a circle, and every turn it did is in the log.
                 const detail = try std.fmt.allocPrint(
                     allocator,
                     "the request was larger than the model can take, and the context cannot be made " ++
@@ -1164,11 +471,6 @@ fn runTurn(
         },
         .failed => |failed| {
             defer chock_provider.Client.freeAssembledMessage(allocator, failed.partial);
-            // A stall gets a sentence of its own, because the fault is not
-            // that something broke. The connection is open and the provider
-            // simply stopped saying anything, which is the one case a person
-            // watching cannot tell apart from a model still working. See
-            // `chock_provider.Client.default_gap_ns`.
             const detail = if (failed.err == error.StreamStalled) try std.fmt.allocPrint(
                 allocator,
                 "the model backend went quiet partway through its reply: nothing at all arrived " ++
@@ -1188,29 +490,15 @@ fn runTurn(
         .message => |reply_message| {
             defer chock_provider.Client.freeAssembledMessage(allocator, reply_message);
 
-            // The event before the action: the whole reply, tool_use parts
-            // included, is durable in the log before any of those tool
-            // calls run. See this file's own top comment.
             _ = try appendAndApply(allocator, io, locked, session, deps, .{ .message = .{
                 .role = .assistant,
                 .content = reply_message.content,
                 .model_alias = deps.model_alias,
             } });
-            // The agent has just spoken, which is one of the three times the
-            // clock notice reports. See `notices.State.observeEvent`.
             telling.observeEvent(nowMs(io, deps), true);
 
-            // **After the message and before everything else.** The
-            // provider declined the request, and a classifier that fires part
-            // way through a turn leaves real text behind it, so the words the
-            // model did write are already durable above and the session ends
-            // here. Before the empty check, because a refusal and an absence
-            // arrive looking alike and the advice on them is opposite: ask an
-            // empty turn again, and a refusal asked again is refused again.
-            // See `chock_proto.event.SessionEndReason.refused_by_model`.
-            //
-            // **Nothing retries, switches model, resets the context, or
-            // rewords this.** Chock says what the provider said and stops.
+            // Before the empty check: a refusal and an absence arrive looking alike, and
+            // the advice is opposite. Nothing retries, switches model, or rewords this.
             if (reply.stop().isRefusal()) {
                 const detail = try refusalDetail(allocator, reply.stop(), whichTurn(turn_index));
                 defer allocator.free(detail);
@@ -1220,10 +508,6 @@ fn runTurn(
                 return true;
             }
 
-            // **Before the tool loop, because a turn that said nothing asked
-            // for nothing.** See `saidSomething` for what counts, and
-            // `chock_proto.event.SessionEndReason.empty_response` for the
-            // measured session that made this necessary.
             if (!saidSomething(reply_message)) {
                 const detail = try emptyReplyDetail(allocator, reply.stop(), turn_index);
                 defer allocator.free(detail);
@@ -1236,10 +520,6 @@ fn runTurn(
             var ran_a_tool = false;
             for (reply_message.content) |part| {
                 if (part != .tool_use) continue;
-                // Before the call runs, not after: the whole point is that a
-                // call which has already been answered the same way twice
-                // has nothing left to tell anybody. See
-                // `no_progress_repeats`.
                 const observed = try progress.observe(
                     allocator,
                     part.tool_use.tool,
@@ -1258,9 +538,6 @@ fn runTurn(
                     });
                     return true;
                 }
-                // Kept for the next turn, not for this one: a turn already in
-                // flight cannot act on what it is doing. See
-                // `notices.State.observeCall`.
                 try telling.observeCall(
                     allocator,
                     part.tool_use.tool,
@@ -1269,11 +546,6 @@ fn runTurn(
                 );
                 ran_a_tool = true;
                 try runTool(allocator, io, locked, session, deps, telling, part.tool_use);
-                // Between two tool calls of one turn, and after the result of
-                // the one just run is in the log. A turn that asked for six
-                // tool calls is minutes of work, and a user who pressed
-                // Ctrl-C in the middle of it should not have to sit through
-                // the other five.
                 if (try endIfCanceled(allocator, io, locked, session, deps)) return true;
             }
 
@@ -1288,17 +560,8 @@ fn runTurn(
     }
 }
 
-/// Whether one model turn carried anything the session can use.
-///
-/// **A tool call, or text with a character in it, and nothing else counts.**
-/// Those are the only two things a turn can carry that go anywhere: a tool call
-/// is work to do, and text is the answer a person reads. A reply that holds
-/// only a reasoning block is a model that thought and then said nothing, which
-/// leaves the loop with nothing to run and the person with nothing to read, so
-/// it is empty by this measure even though its content list is not.
-///
-/// Whitespace alone is not an answer. A turn of one newline reads as `finished`
-/// with an empty answer, which is the same false OK as no content at all.
+/// Whether one model turn carried anything the session can use. A reply of
+/// reasoning alone, or of whitespace alone, carries nothing.
 fn saidSomething(reply: chock_provider.message.Message) bool {
     for (reply.content) |part| switch (part) {
         .tool_use => return true,
@@ -1308,30 +571,10 @@ fn saidSomething(reply: chock_provider.message.Message) bool {
     return false;
 }
 
-/// Which turn of the session this is, in the words both end sentences use.
-///
-/// **The turn number, because the first turn and a later one are different
-/// facts.** A session whose first turn ended did no work at all. A session
-/// whose fifth turn ended did four turns of work that is still in the log and
-/// still in the workspace. The number is what tells a person which of the two
-/// they are reading.
 fn whichTurn(turn_index: usize) []const u8 {
     return if (turn_index == 0) "the first turn of the session" else "a turn of the session";
 }
 
-/// What the provider said beyond its one word stop reason, as a clause to put
-/// on the end of a sentence, or an empty string when it said nothing. Caller
-/// owns the result.
-///
-/// **One clause, written once, for every sentence that reports a stop.** The
-/// category and the explanation are the same fact wherever they are read, and
-/// two renderings of one fact drift.
-///
-/// **An empty category or explanation stays out of the clause.** Both are
-/// nullable on the wire even on a real refusal, so empty means the provider
-/// said nothing, and a clause that named a category the provider never sent
-/// would be an invented reason, which is the fault this whole path exists to
-/// stop. See `chock_provider.Client.Stop`.
 fn stopWords(
     allocator: std.mem.Allocator,
     stop: chock_provider.Client.Stop,
@@ -1352,22 +595,8 @@ fn stopWords(
     return allocator.dupe(u8, "");
 }
 
-/// What the log says about something the provider refused. `what` names it,
-/// for example `whichTurn(turn_index)` for the agent's own turn or "the
-/// compaction call" for the one this loop makes on its own account. Caller owns
-/// the result.
-///
-/// **The provider's own words, and only those.** It sends a category and a
-/// sentence of prose beside the word `refusal`, and a log holding only the
-/// word tells the person reading it nothing they can act on while the sentence
-/// that says why sits one field away. Both of those fields can still be null,
-/// and a refusal that arrives with neither says so plainly rather than
-/// borrowing a reason from anywhere else.
-///
-/// **Nothing here works around the refusal**, and nothing anywhere else does
-/// either. Chock records what happened and the session ends. No retry, no
-/// second model, no reset of the context, no softer wording: a harness that
-/// quietly routed around a safety decision would be answering it.
+/// What the log says about something the provider refused. Caller owns the
+/// result. Nothing here or anywhere else works around the refusal.
 fn refusalDetail(
     allocator: std.mem.Allocator,
     stop: chock_provider.Client.Stop,
@@ -1385,19 +614,6 @@ fn refusalDetail(
     return std.fmt.allocPrint(allocator, "the model backend refused {s}{s}", .{ what, words });
 }
 
-/// What the log says about a turn that carried nothing. Caller owns the result.
-///
-/// **The provider's own word first, when it sent one.** `stop.reason` is
-/// `end_turn`, `max_tokens`, or whatever else the provider said, and a Chock
-/// that invented a reason of its own while holding that word would be throwing
-/// away the only explanation anybody has. See
-/// `chock_provider.Client.Delta.stop_reason`.
-///
-/// **A refusal never reaches here**, because `runTurn` ends the session with
-/// `refused_by_model` before it asks whether the turn was empty: the two
-/// arrive looking alike, one turn with nothing to act on, and the advice on
-/// them is opposite. `stopWords` is still used, so a wire that one day sends
-/// a category or an explanation with some other stop reason keeps them.
 fn emptyReplyDetail(
     allocator: std.mem.Allocator,
     stop: chock_provider.Client.Stop,
@@ -1417,40 +633,10 @@ fn emptyReplyDetail(
     );
 }
 
-/// Send one turn's request, and send it again after a wait when the provider
-/// refused it for a reason a wait fixes.
-///
-/// Returns the reply the turn acts on, or null when the session was ended
-/// here, which tells `runTurn` this turn was the last one.
-///
-/// **A 429 is the most recoverable error there is.** It names its own limit,
-/// and it often names how long to wait as well. Before this existed a session
-/// measured on 2026-08-22 ended on one, with 105 changed files in its
-/// workspace and a `Retry-After` in the response nothing read. See
-/// `chock_provider.retry` for the wait itself, and this file's own top comment
-/// for why this is separate from compaction and must stay separate.
-///
-/// Hand one request to the provider, once.
-///
-/// **This is the only place in `chock-core` that calls a
-/// `chock_provider.Client`**, which is what makes it the only place secret
-/// redaction has to be. A second call to `Client.sendAndAssemble` or
-/// `Client.sendAndAssembleWatching` anywhere in this library would be a way
-/// past `deps.redact`, so there is not one, and the two tests named for the
-/// two paths through this function are what keep it that way: one goes
-/// through `sendWithRetry` for an ordinary turn, the other through
-/// `askForSummary` for a compaction.
-///
-/// **This seam is the smaller of the two, and it is not the important one.**
-/// Nearly all of a request is built out of the log by `context.build`, and
-/// `appendAndApply` already cleaned every record the log holds. What this
-/// catches is the part of a request that was never a record: the system
-/// prompt, which the caller hands to this loop directly. See
-/// `lib/chock-core/redact.zig`'s own top comment.
-///
-/// `arena` is the turn's arena, so the rewritten request lives exactly as
-/// long as the turn that sent it. An inert `deps.redact`, which is the
-/// default, allocates nothing at all.
+/// Hand one request to the provider, once. The only place in `chock-core` that
+/// calls a `chock_provider.Client`, which makes it the only place redaction
+/// has to be: a second call to `Client.sendAndAssemble` in this library would
+/// be a way past `deps.redact`.
 fn sendOnce(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1478,11 +664,8 @@ fn sendWithRetry(
     while (true) {
         attempts += 1;
         const answer = try sendOnce(allocator, arena, deps, request, watcher);
-        // This iteration owns `answer` until it either hands it back to the
-        // caller or frees it below. The flag is what keeps a fault between
-        // here and one of those two, an allocation failure or a log that
-        // cannot be written, from leaking a refusal body of several kilobytes
-        // on every attempt.
+        // This iteration owns `answer` until it hands it back or frees it. The flag
+        // keeps a fault in between from leaking a refusal body of several kilobytes.
         var held = true;
         errdefer if (held) freeReply(allocator, answer);
 
@@ -1490,9 +673,6 @@ fn sendWithRetry(
 
         const refusal = switch (answer.outcome) {
             .status_error => |status_error| status_error,
-            // A reply, or a broken stream. Neither is this function's
-            // business: see this file's own top comment on why a broken
-            // connection is not retried here.
             .message, .failed => return answer,
         };
 
@@ -1507,8 +687,6 @@ fn sendWithRetry(
 
         switch (decision) {
             .stop => |why| switch (why) {
-                // Compaction answers the overflow and the caller answers the
-                // rest. Both already read `status_error` themselves.
                 .not_retryable => return answer,
                 .attempts_spent, .wait_too_long => {
                     const detail = try givingUpDetail(allocator, why, attempts, refusal);
@@ -1527,26 +705,17 @@ fn sendWithRetry(
                     defer allocator.free(notice);
                     watching.onNotice(notice);
                 }
-                // Freed before the wait, not after: the wait can be a minute
-                // long, and a body of several kilobytes held across every
-                // attempt of every turn is a leak with a slow fuse.
                 held = false;
                 freeReply(allocator, answer);
 
                 sleeper.sleep(io, wait_ms);
 
-                // A safe point, and the one this function adds. A user who
-                // pressed Ctrl-C during a minute of waiting must not then sit
-                // through the request the wait was for.
                 if (try endIfCanceled(allocator, io, locked, session, deps)) return null;
             },
         }
     }
 }
 
-/// Free everything one `AssembledReply` owns, whichever outcome it carried.
-/// `sendWithRetry` calls this for a reply it is done with, and the caller of
-/// `sendWithRetry` frees the one it is handed the same way it always did.
 fn freeReply(allocator: std.mem.Allocator, reply: chock_provider.Client.AssembledReply) void {
     chock_provider.Client.freeUsage(allocator, reply.usage);
     switch (reply.outcome) {
@@ -1556,9 +725,6 @@ fn freeReply(allocator: std.mem.Allocator, reply: chock_provider.Client.Assemble
     }
 }
 
-/// What the `session.end` says when the retry gives up. **Both numbers are
-/// here on purpose**: how many attempts were made, so a user knows the wait
-/// happened at all, and what the provider last said, so they know what to fix.
 fn givingUpDetail(
     allocator: std.mem.Allocator,
     why: retry.Stop,
@@ -1583,27 +749,12 @@ fn givingUpDetail(
                 refusal.body,
             },
         ),
-        // `decide` never returns this one with a wait or a give up of its
-        // own: the caller answers it. A message here would be a message
-        // nobody reads.
+        // The caller answers this class itself, so `decide` never reaches here with
+        // a wait or a give up of its own.
         .not_retryable => unreachable,
     };
 }
 
-/// How a session ends when the retry has nothing left to try.
-///
-/// **A rate limit is not a fault, and this is the one place that distinction
-/// can still be made.** By the time the retry gives up, the class of the
-/// failure is the only thing that separates "the backend was busy for longer
-/// than we waited" from "something broke". Writing `errored` for both threw
-/// that away, and a parent reading its subagent's log could then not tell a
-/// busy backend from a broken agent: see
-/// `chock_proto.event.SessionEndReason.rate_limited`.
-///
-/// `context_overflow` and `permanent` answer `not_retryable` and never reach
-/// the caller of this function. They are named here because the switch is
-/// exhaustive, which is what makes a class added later a compile error rather
-/// than a silent `errored`.
 fn endReasonFor(class: chock_provider.failure.Class) chock_proto.event.SessionEndReason {
     return switch (class) {
         .rate_limited => .rate_limited,
@@ -1611,8 +762,6 @@ fn endReasonFor(class: chock_provider.failure.Class) chock_proto.event.SessionEn
     };
 }
 
-/// The one line a person watching sees while the session waits. See
-/// `Observer.onNotice` for why a wait that says nothing is worse than no wait.
 fn waitingNotice(
     allocator: std.mem.Allocator,
     policy: retry.Policy,
@@ -1628,9 +777,6 @@ fn waitingNotice(
     );
 }
 
-/// Stop the session cleanly when the caller has asked it to. Returns true
-/// when the session was stopped, which is what tells `runTurn` to say this
-/// turn was the last one.
 fn endIfCanceled(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1648,24 +794,9 @@ fn endIfCanceled(
     return true;
 }
 
-/// Give this session to another process, when one has asked for it and the
-/// caller has agreed. Returns true when the session was stopped, which is what
-/// tells `runTurn` this turn was the last one.
-///
-/// **The event is what makes this a handover and not a stop.** A log that
-/// ended with `canceled_by_user` would tell the next reader that a person said
-/// no, and the fold is the truth about a session, so the next owner reads this
-/// reason and the tools that report on a session read it too. `src/main.zig`
-/// gives it an exit code of its own for the same reason.
-///
-/// **This appends nothing else**, and in particular it writes nothing about the
-/// workspace. The workspace is named by the `workspace.open` event that the
-/// caller already wrote when it built one, so the next owner finds it by
-/// folding the log and not by reading a note this function left.
-///
-/// The counts come from the two tables the caller owns. A caller with neither
-/// says nothing is in flight, which is true: a session with no table cannot
-/// have started a background task or a background child.
+/// Give this session to another process. The reason on the event is what makes
+/// this a handover and not a stop: `canceled_by_user` would tell the next
+/// reader that a person said no.
 fn endIfHandedOver(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1687,41 +818,14 @@ fn endIfHandedOver(
     return true;
 }
 
-/// Whether a finished task is only recorded, or recorded and told to the agent.
 const TaskDelivery = enum {
-    /// Both events: the record, and the message that carries it into the
-    /// model's context. What the top of every turn does.
     tell_the_agent,
-    /// The record alone. What the end of a session does: there is no turn left
-    /// to read a message, and appending one after `session.end` would put words
-    /// in a conversation that is over.
     record_only,
 };
 
-/// Record every background task that finished since the last turn, and tell
-/// the agent about it.
-///
-/// **Two events per task, and neither one replaces the other.** The
-/// `task.complete` event is the record: that the task ran, how it ended, where
-/// the output is, and how large it was, and a replay reads those from a typed
-/// event rather than from a sentence. The `message` event is the delivery: only
-/// a message re-enters the model's context, per
-/// `lib/chock-proto/state.zig`'s own fold, so a `task.complete` alone would be
-/// a fact the log holds and the agent never hears.
-///
-/// **The agent acting on a result therefore leaves a trace of having been
-/// told**, which is the property that makes a background result reviewable at
-/// all: without it, a turn that suddenly knows a build failed reads as a model
-/// that guessed.
-///
-/// **Neither event carries the output.** A build writes megabytes, and the log
-/// is the one file a session cannot afford to bloat.
-///
-/// **A task still running when the session ends is not recorded here**, and
-/// cannot be: the log is closed at that point and nothing will read a message
-/// written into it. The `tool.call` that started it is still in the log, so a
-/// reader sees that it was asked for, and `src/run.zig` ends it rather than
-/// waiting out its own bound for work nobody will read.
+/// Record every background task that finished since the last turn. Two events,
+/// because only a `message` re-enters the model's context. Neither carries the
+/// output, because a build writes megabytes.
 fn recordFinishedTasks(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1757,12 +861,6 @@ fn recordFinishedTasks(
     }
 }
 
-/// What the agent is told about one finished task. Caller owns the result.
-///
-/// It names the file rather than quoting it, and it says how to read it: the
-/// output is bounded at `tasks.max_output_bytes`, which is far past what a
-/// model may take in one result, so "here is the whole thing" is not an option
-/// this can offer.
 fn taskFinishedText(
     allocator: std.mem.Allocator,
     one: task_table.Completion,
@@ -1801,22 +899,8 @@ fn taskFinishedText(
 }
 
 /// Record every subagent that finished since the last turn, and tell the agent
-/// about it.
-///
-/// **The same two events, and the same reason for both**, as
-/// `recordFinishedTasks`: `agent.complete` is the record a replay reads, and
-/// only a `message` re-enters the model's context. A parent that acts on a
-/// child's answer therefore leaves a trace of having been told, which is what
-/// makes a subagent's answer reviewable at all.
-///
-/// **The parent appends both, because the child cannot write the parent's
-/// log.** The parent holds the exclusive lock on it for the whole session, and
-/// the parent is the process that started the child, so the parent is what sees
-/// it end. That rule holds whichever shape the spawn took: see `runSpawn`,
-/// which appends the very same event for a child it waited for.
-///
-/// **Neither event carries the child's turns.** The child has a log of its own,
-/// and `agent.complete` names it: see `lib/chock-core/subagent.zig`.
+/// about it. The parent appends both events, because the child cannot write
+/// the parent's log.
 fn recordFinishedChildren(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1850,13 +934,6 @@ fn recordFinishedChildren(
     }
 }
 
-/// What the agent is told about one subagent it did not wait for. Caller owns
-/// the result.
-///
-/// It carries the answer itself, which `subagent.readReport` already bounded at
-/// `subagent.max_result_bytes`, and names the scratchpad rather than reading
-/// it: a child answers with a verdict and a path, so a parent with several
-/// children does not spend its whole context reading.
 fn childFinishedText(
     allocator: std.mem.Allocator,
     one: subagent.Completion,
@@ -1880,15 +957,9 @@ fn childFinishedText(
     return text.toOwnedSlice(allocator);
 }
 
-/// Append the `usage` event for one turn: what the provider reported, plus
-/// the fields only this loop knows, plus a cost computed from the price table
-/// when the provider reported none.
-///
-/// Written for every turn, including one the provider refused, because the
-/// refusal still consumed tokens. A provider that reported nothing at all
-/// still gets an event, with `cost` unknown and every count zero: **that is
-/// the log saying the session is unmeasurable**, and it is a different record
-/// from a turn that was free.
+/// Append the `usage` event for one turn. A provider that reported nothing at
+/// all still gets one, with every count zero, which is the log saying the
+/// session cannot be priced rather than saying it was free.
 fn appendUsage(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1902,9 +973,8 @@ fn appendUsage(
     usage.model_alias = deps.model_alias;
 
     const cost = chock_cost.prices.costFor(deps.model, reported, deps.billing);
-    // The version is stamped only on a number this table produced. A cost
-    // the provider itself reported is the provider's, and claiming a table
-    // version for it would send somebody looking in the wrong place.
+    // Stamped only on a number this table produced. A cost the provider reported
+    // is the provider's.
     if (cost == .known and reported.cost == .unknown) {
         usage.price_table_version = chock_cost.prices.version;
     }
@@ -1913,20 +983,9 @@ fn appendUsage(
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .usage = usage });
 }
 
-/// Check the cap before a request goes out, and stop the session cleanly when
-/// this turn would pass it. Returns true when the session was stopped.
-///
-/// **Hitting a cap is an approval, not a crash**, and this needs no new
-/// mechanism: the broker already carries a decision to the user and back
-/// through `approval.request` and `approval.response`. So this appends the
-/// request, naming the cap, the total so far and what the next turn is
-/// projected to cost, and then ends the session.
-///
-/// **Nothing answers that request yet**, because `Loop.run` holds no broker:
-/// see this file's own top comment on the approval seam. An unanswered request
-/// is a refusal, and a refusal is the safe direction for a budget, so ending
-/// here is that refusal. Everything the session did so far is already in the
-/// log, which is what stops a cap from losing work the user already paid for.
+/// Check the cap before a request goes out, and stop the session when this turn
+/// would pass it. Nothing answers the `approval.request` this writes, and an
+/// unanswered request is a refusal, which is the safe direction for a budget.
 fn refuseForBudget(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1936,24 +995,13 @@ fn refuseForBudget(
 ) Error!bool {
     const cap = deps.budget orelse return false;
     const spend = session.spend;
-    // Decided by the project owner: a cap over an unknown cost cannot be
-    // enforced. The session was warned about that once at the start, by the
-    // caller, and then runs. Refusing here instead would block work to protect
-    // a number Chock cannot measure.
     if (!spend.enforceable()) return false;
     if (spend.turns == 0) return false;
-    // A cap written in one currency and turns billed in another cannot be
-    // compared at all, and inventing an exchange rate here would be worse
-    // than not enforcing: the same rule as an unknown cost, one level up.
     if (spend.currency.len != 0 and !std.mem.eql(u8, spend.currency, cap.currency)) return false;
 
-    // The projection is the mean of the turns so far. A turn's cost depends
-    // on how much context it carries, which grows through a session, so the
-    // mean under estimates the next turn slightly and the cap can be passed
-    // by that much. The alternative, projecting the largest turn so far,
-    // stops a session early every time one turn was unusually big. Chock
-    // takes the small overshoot: the total is updated after the reply lands
-    // anyway, so the cap was never going to be exact to the cent.
+    // The mean of the turns so far. A turn's cost grows with the context it
+    // carries, so the mean under estimates the next turn and the cap can be passed
+    // by that much.
     const projected = spend.amount / @as(f64, @floatFromInt(spend.turns));
     if (spend.amount + projected <= cap.max_cost) return false;
 
@@ -1972,21 +1020,13 @@ fn refuseForBudget(
             .detail = summary,
             .reason = "the next turn would take the session past the budget in chock.zon",
             .agent_kind = deps.agent_kind,
-            // The whole chain, root first, because "a subagent three levels
-            // down reached its budget" is the fact the user needs before
-            // answering.
             .spawn_chain = deps.spawn_chain,
-            // Already past: nothing here waits, so the request is expired the
-            // moment it is written. A reader that folds this log sees a refusal
-            // and not a question still open.
             .timeout_at_ms = std.Io.Timestamp.now(io, .real).toMilliseconds(),
             .tool_call_id = "",
         },
     });
-    // **The id of the request written just above, and not zero.** An
-    // `Envelope.id` of zero means an event not yet written, so a zero here
-    // leaves the answer naming no question, and a reader that folds this log
-    // cannot join the two. `Broker.answer` has always carried the real id.
+    // An `Envelope.id` of zero means an event not yet written, so a zero here
+    // would leave the answer naming no question.
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .approval_response = .{
         .request_id = request_id,
         .decision = .expired,
@@ -2005,19 +1045,8 @@ fn refuseForBudget(
 }
 
 /// Look at how full the context is, and either tell the agent a compaction is
-/// coming or do one.
-///
-/// **The notice comes first and it comes on an earlier turn**, because an
-/// agent told at the moment of the compaction has no turn left to act on it.
-/// `Policy.warn_at` is below `Policy.compact_at` for exactly that. What the
-/// notice asks for is a knowledgebase entry, because **memory survives a
-/// compaction and context does not**, and the dead ends matter most: an agent
-/// that ruled something out, was compacted, and tried it again pays the whole
-/// detour a second time.
-///
-/// Does nothing at all when the context limit is unknown. A guessed limit
-/// would compact a session that had plenty of room, and the backstop in
-/// `runTurn` already covers a provider that refuses.
+/// coming or do one. Does nothing when the context limit is unknown, because a
+/// guessed limit would compact a session that had room.
 fn watchContext(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2028,8 +1057,7 @@ fn watchContext(
     telling: *notices.State,
 ) Error!void {
     const used = session.last_input_tokens;
-    // Zero is "nobody has measured this yet", never "the context is empty":
-    // see `Session.last_input_tokens`.
+    // Zero is "nobody has counted this yet", never "the context is empty".
     if (used == 0) return;
 
     if (compaction.shouldCompact(deps.compaction, used)) {
@@ -2044,10 +1072,6 @@ fn watchContext(
     const text = try compaction.noticeText(allocator, used, at, limit, offersMemory(deps));
     defer allocator.free(text);
 
-    // A `system` role message, because the harness is the one speaking. It is
-    // an ordinary event in the log, so it reaches the model through the same
-    // fold every other turn does, and the compaction that follows folds it
-    // away with the rest.
     const parts = [_]event.ContentPart{.{ .text = text }};
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .message = .{
         .role = .system,
@@ -2056,11 +1080,8 @@ fn watchContext(
     watch.warned = true;
 }
 
-/// Whether this session offers the tool that writes a note. **A tool that is
-/// not offered is never named**, the same rule the prompt keeps: naming one
-/// costs the agent a turn to find out it does not exist. Read from the
-/// definitions the request itself carries, and matched against the enum, so a
-/// renamed tool fails the build rather than the session.
+/// Whether this session offers the tool that writes a note. A tool that is not
+/// offered is never named: naming one costs the agent a turn to find out.
 fn offersMemory(deps: Deps) bool {
     for (deps.tool_definitions) |definition| {
         if (std.mem.eql(u8, definition.name, @tagName(tools.Tool.write_memory))) return true;
@@ -2068,20 +1089,9 @@ fn offersMemory(deps: Deps) bool {
     return false;
 }
 
-/// Fold the middle of the context into one summary and append the
-/// `compaction` event. Returns false when there was nothing worth folding,
-/// which the caller must handle: see `compaction.plan`.
-///
-/// **The log loses nothing.** This appends one event and `Session.apply`
-/// builds the shorter view from it, so a replay of the same log reaches the
-/// same context and the user can still read every turn that was folded.
-///
-/// **The model writes the summary, and the harness stands in when it cannot.**
-/// A model produces a far better summary, because it knows which of the last
-/// thirty turns mattered, and it costs one call. The harness one is free and
-/// says only what happened. The event records which of the two answered:
-/// `model_alias` is the alias when a model wrote it and empty when Chock did,
-/// so a thin summary is never left ambiguous.
+/// Fold the middle of the context into one summary and append the `compaction`
+/// event. The log loses nothing, and `model_alias` is empty when the harness
+/// wrote the summary instead of the model.
 fn compactNow(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2094,11 +1104,8 @@ fn compactNow(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // `folding.folded` borrows `session.context`, so the transcript and the
-    // fallback summary are both built from it before anything appends an
-    // event that would fold the context again. The `usage` event
-    // `askForSummary` writes does not touch the context, which is why it can
-    // sit between them.
+    // `folding.folded` borrows `session.context`, so both texts are built from it
+    // before anything appends an event that would fold the context again.
     const folding = try compaction.plan(arena, session, deps.compaction) orelse return false;
     const rendered = try compaction.transcript(arena, folding.folded, deps.compaction);
 
@@ -2119,58 +1126,24 @@ fn compactNow(
             .through_id = folding.through_id,
             .kept_ranges = folding.kept_ranges,
             .model_alias = wrote_it,
-            // **The compaction happens either way, so this is the only trace the
-            // model call leaves when it gave nothing.** See
-            // `chock_proto.event.Compaction.stand_in_reason`.
             .stand_in_reason = asked.stand_in_reason,
         },
     });
 
-    // **Here and not at either caller**, because both of them fold for
-    // different reasons and a second author would arm one and forget the
-    // other. What the notice does with this depends on the session: one whose
-    // agent keeps no task list is told nothing at all. See
-    // `notices.State.observeCompaction`.
     telling.observeCompaction();
     return true;
 }
 
-/// What one compaction call came back with. `text` is the model's summary, and
-/// both fields are borrowed from the `arena` the caller passed in.
-///
-/// **Exactly one of the two is ever set.** A call that gave a summary has
-/// nothing to explain, and a call that gave none must say why: see
-/// `chock_proto.event.Compaction.stand_in_reason` for what that answers.
+/// What one compaction call came back with. Exactly one of the two is ever set.
 const CompactionAnswer = struct {
     text: []const u8 = "",
     stand_in_reason: []const u8 = "",
 };
 
-/// Ask the model for the summary. See `CompactionAnswer`.
-///
-/// **The request carries one user message and no tools.** The folded span
-/// cannot be replayed as real messages: a `tool` role message needs the
-/// `tool_use` part it answers beside it, and a span cut anywhere breaks that
-/// pairing, which providers refuse outright. So the span is rendered to text
-/// and bounded. See `compaction.transcript`.
-///
-/// **The call's own usage is recorded like any other turn's.** It is a real
-/// model call and it costs real money, so a budget checked against a total
-/// that skipped it would under count exactly the sessions that compact most.
-///
-/// **No summary on every refusal and every empty reply, never an error**: a
-/// compaction that could not reach the model still has to happen, and the
-/// harness summary in `compactNow` is what happens instead. An allocation
-/// failure is the one thing that still escapes, because at that point there is
-/// nothing left to build a summary with either.
-///
-/// **A refusal here does not end the session, and it is recorded all the same.**
-/// This is the loop's own call and not the agent's turn, and a summary the
-/// harness wrote is a real answer, so the work carries on. What must not
-/// happen is a person seeing an ordinary looking compaction and never learning
-/// the model declined: the words go in `stand_in_reason`. A turn the agent
-/// itself asked for is the other case, and that one does end the session. See
-/// `chock_proto.event.SessionEndReason.refused_by_model`.
+/// Ask the model for the summary. The request carries one user message and no
+/// tools: the folded span cannot be replayed as real messages, because a `tool`
+/// role message needs the `tool_use` part it answers beside it and a span cut
+/// anywhere breaks that pairing.
 fn askForSummary(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -2189,10 +1162,8 @@ fn askForSummary(
         .messages = &messages,
     };
 
-    // Through `sendOnce`, and not through `Client.sendAndAssemble` directly:
-    // the text a compaction sends is the context itself, rendered, so it
-    // carries whatever a tool result carried. A second road to the provider
-    // is how a redactor is bypassed. See `sendOnce`.
+    // Through `sendOnce`, and never through `Client.sendAndAssemble`: a compaction
+    // sends the context itself, so a second road out would be past the redactor.
     const reply = sendOnce(allocator, arena, deps, request, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .stand_in_reason = try std.fmt.allocPrint(
@@ -2223,10 +1194,8 @@ fn askForSummary(
         },
         .message => |reply_message| {
             defer chock_provider.Client.freeAssembledMessage(allocator, reply_message);
-            // **Before the text is read, because a refusal is never a
-            // summary.** A classifier fires part way through, so a refused
-            // call can carry half a summary, and folding thirty turns into
-            // words the provider declined would be using what it said no to.
+            // Before the text is read: a classifier fires part way through, so a refused
+            // call can carry half a summary.
             if (reply.stop().isRefusal()) {
                 const said = try refusalDetail(arena, reply.stop(), "the compaction call");
                 return .{ .stand_in_reason = said };
@@ -2236,9 +1205,6 @@ fn askForSummary(
                 if (part == .text) try out.appendSlice(arena, part.text);
             }
             const joined = try out.toOwnedSlice(arena);
-            // A reply of only whitespace, or of nothing but reasoning, is a
-            // reply with no summary in it. The harness one is better than an
-            // empty summary standing in for thirty turns.
             if (std.mem.trim(u8, joined, " \t\r\n").len == 0) {
                 return .{ .stand_in_reason = try arena.dupe(
                     u8,
@@ -2250,56 +1216,10 @@ fn askForSummary(
     }
 }
 
-/// The policy gate a call bound for `deps.tool_runner` passes through before
-/// `runTool` ever calls it. Null means the call may run. A `ToolResult` means
-/// it may not, and `runTool` uses it in place of calling
-/// `deps.tool_runner.dispatch`.
-///
-/// **Only the calls the tool runner would otherwise just run.** The seven
-/// names `runTool` answers itself, `spawn_agent`, `update_plan`,
-/// `restrict_self`, `fetch_url`, `ask_user`, `set_title` and
-/// `request_action`, are skipped here on purpose: see the switch below for
-/// why each already has its own gate, scoped narrower than the coarse call
-/// name this function would otherwise ask about. Everything else, `read_file`
-/// through `provide_tool`, had no gate at all before this function existed,
-/// which is the gap this whole task closes.
-///
-/// **A session with no arbiter can run none of those.** `deps.arbiter`'s own
-/// doc says null answers `arbiter_mod.not_asked`, so an ordinary sandboxed
-/// call is refused rather than let through by default. This is a real
-/// behaviour change for a caller that built a `Loop.Deps` with no arbiter and
-/// expected such a call to run. `src/run.zig` sets one for every session it
-/// starts, and a test that wants the old behaviour now says so by giving one
-/// that always permits.
-///
-/// **A tool name this build does not recognise is not gated here, and that is
-/// not always because the name is unknown.** `std.meta.stringToEnum` answers
-/// null for two different callers. One is a genuinely unknown tool, which
-/// `deps.tool_runner.dispatch` is about to refuse with its own "unknown tool"
-/// message. The other is an admitted MCP or plugin tool: `chock_core.mcp`'s
-/// `Session.admit` refuses to admit a server tool whose name collides with a
-/// built-in, so by construction every legitimate MCP or plugin tool name is
-/// one this enum cannot name. `src/run.zig`'s `McpToolRunner.dispatchFn` does
-/// `self.state.session.dispatch(...) orelse return self.inner.dispatch(...)`,
-/// and `chock_core.mcp.Session.dispatch` answers a real outcome for any
-/// admitted name without ever falling through, so the call runs. This
-/// function does not tell the two cases apart, and it does not need to.
-///
-/// **An MCP or plugin tool is gated at its own door instead, and that door is
-/// the one this file cannot reach.** The gate used to be the session start
-/// admission alone, which had two faults. It never consulted an arbiter, so a
-/// row of `.ask` was a permanent refusal that no person or reviewer ever saw.
-/// And it ran once, before the loop, so a mid session `restrict_self` could
-/// not bind a tool that was admitted before the promise was made. Both are
-/// fixed where the call reaches the third party process:
-/// `chock_core.mcp.Session.dispatch` and `chock_core.plugin.Session.dispatch`
-/// now ask through `chock_core.arbiter.Asker` on every call, with the same
-/// broker and the same `Answer` this function reads, and they refuse with the
-/// same `arbiter_mod.refusalText`. Admission still refuses a `.deny` outright,
-/// so a tool nobody may call is never offered and costs no context. The gate
-/// is at the door and not here because the action name belongs to the session
-/// that admitted the tool, and because `Session.dispatch` is the only route to
-/// the process at all.
+/// The policy gate a call bound for `deps.tool_runner` passes through. Null
+/// means the call may run. A session with no arbiter can run none of these,
+/// because null answers `arbiter_mod.not_asked`. A name this enum cannot spell
+/// is gated at its own door instead, in `chock_core.mcp.Session.dispatch`.
 fn gateToolCall(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2309,20 +1229,9 @@ fn gateToolCall(
 ) Error!?event.ToolResult {
     const tool = std.meta.stringToEnum(tools.Tool, call.tool) orelse return null;
 
-    // **The seven names `runTool` answers itself are not asked about here.**
-    // Each already carries its own gate, scoped to the actual privileged act
-    // rather than to the call that names it: `restrict_self` asks about
-    // `ratchet.widen_action` only when it would widen, `fetch_url` asks about
-    // `net.fetch.*` once a host is known, and `request_action` asks about the
-    // act it names, never about itself. `spawn_agent`, `update_plan`,
-    // `set_title` and `ask_user` are bounded by other means entirely: a
-    // subagent by `deps.subagents`, a plan step by `max_plan_steps`, and
-    // asking a question grants nothing. Gating the coarse call name on top of
-    // any of these would ask twice about what a person experiences as one
-    // act, and for `restrict_self` it would ask the wrong question first:
-    // `Deps.arbiter` being null must refuse a widening specifically, not
-    // every ordinary promise this session is free to narrow with no arbiter
-    // at all. See `runWiden`.
+    // The seven names `runTool` answers itself already carry their own gate,
+    // scoped to the privileged act. Gating the coarse name here as well would ask
+    // twice, and for `restrict_self` a null arbiter must refuse only a widening.
     switch (tool) {
         .spawn_agent,
         .update_plan,
@@ -2335,22 +1244,15 @@ fn gateToolCall(
         else => {},
     }
 
-    // Only `run_command` reads its own arguments for this: see
-    // `Tool.actionInto`'s own doc on why every other tool is named after
-    // itself alone.
     var argv0_owned: ?[]u8 = null;
     defer if (argv0_owned) |owned| allocator.free(owned);
     if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
 
     var action_buffer: [gate_action_bytes]u8 = undefined;
 
-    // **The one call named after what it asks for and not after itself, and
-    // the one that can ask twice.** A build is named after the attribute path
-    // it wants, so a rule reads `nix.build.packages.*`, and a call that names
-    // a flake asks a second time for the reference itself. Both must pass, so
-    // a rule a project wrote for its own attribute does not authorise the
-    // same attribute of anybody else's flake. See
-    // `chock_core.nix.buildActionsFor`.
+    // The one call named after what it asks for, and the one that can ask twice.
+    // Both questions must pass, so a rule a project wrote for its own attribute
+    // does not authorise the same attribute of anybody else's flake.
     if (tool == .nix_build) {
         var flake_buffer: [gate_action_bytes]u8 = undefined;
         const actions = try nix_action.buildActionsFor(
@@ -2389,25 +1291,11 @@ fn gateToolCall(
     const answer = try decideAction(allocator, io, locked, deps, call, action);
     if (answer.permitted) return null;
 
-    // **One sentence, written once.** `arbiter_mod.refusalText` is the same
-    // text `chock_core.mcp.Session.dispatch` and
-    // `chock_core.plugin.Session.dispatch` refuse a third party tool with, and
-    // it carries the rule and the alternative and never the reason: a model
-    // told why a wall exists is a model handed the same map a red team session
-    // already used once.
+    // The refusal carries the rule and the alternative and never the reason: a
+    // model told why a wall exists is a model handed a map.
     return try gateRefusal(allocator, call, try arbiter_mod.refusalText(allocator, call.tool, answer));
 }
 
-/// Put one action of `call` to the arbiter, and answer what it decided. A
-/// session with no arbiter can ask nobody, so it refuses and says so.
-///
-/// **Its own function because one call can ask twice**: a build that names a
-/// flake is asked about the attribute path and about the reference, and both
-/// have to travel the same road to the same reviewer.
-///
-/// `Ask.detail` is the whole effect and never a command string: `action` is
-/// exactly that, already built to describe the call without repeating raw
-/// arguments back.
 fn decideAction(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2429,25 +1317,14 @@ fn decideAction(
     });
 }
 
-/// The buffer `gateToolCall` builds an action name in. Wide enough for both
-/// builders that write into it: a tool's own name, and the attribute path of
-/// a build, which is the longer of the two.
 const gate_action_bytes = @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes);
 
-/// What `gateToolCall` answers when `Tool.actionInto` itself could not name
-/// the call. Sized buffers make this unreachable for a real caller, the same
-/// as `runCommandActionInto`'s own doc says of its null branch, and this
-/// exists so a future caller that shrank the buffer fails safely rather than
-/// with a crash.
+/// What `gateToolCall` answers when `Tool.actionInto` could not name the call.
+/// The sized buffers make this unreachable, so a caller that shrinks one fails
+/// safely.
 const gate_unnamed_detail = "nothing ran: this call could not be named for a policy check, " ++
     "so it was not run. Try something else.";
 
-/// A tool call the policy gate refused. `detail` is already owned by the
-/// allocator and is handed straight on.
-///
-/// **Always an error result**, for the reason `spawnRefusal` and
-/// `restrictRefusal` are: nothing ran, whichever branch answered, and a model
-/// that read this as success would carry on as though it had.
 fn gateRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -2461,13 +1338,6 @@ fn gateRefusal(
     };
 }
 
-/// Append the `tool.call` event, run the call, then append the `tool.result`
-/// event and the `message` event that feeds the result back into the
-/// context for the next turn. See this file's own top comment for the
-/// ordering this exists to guarantee, and for why `deps.tool_runner`
-/// failing outright, `DispatchError`, still does not end the session: it
-/// becomes an `is_error` result the model can read and try something else
-/// with, the same as an ordinary failed command already does.
 fn runTool(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2482,27 +1352,11 @@ fn runTool(
         .tool = tool_use.tool,
         .arguments = tool_use.arguments,
     };
-    // Written before dispatch runs: a crash here still leaves proof in the
-    // log that the model asked for this call, even if it never finishes.
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_call = call });
 
-    // **An arbitrator holds no tools, and this is where that is enforced for
-    // the ones the tool runner never sees.** `spawn_agent`, `update_plan`,
-    // `restrict_self`, `set_title` and `request_action` are answered by this
-    // file, so a gate that sat only in
-    // `tools.Registry.dispatchWith` would leave an arbitrator able to start a
-    // subagent with a tool set of its own. See `Deps.role`.
-    //
-    // The call and its result are still appended, like every other, so the log
-    // of a reviewer that tried shows what it tried.
-    //
-    // **The policy gate comes second, only once an arbitrator is already
-    // ruled out.** An arbitrator is refused on `Deps.role` alone, the same
-    // whichever name it asked for, and asking the policy about a call that
-    // never runs either way would spend an `approval.response` on nothing.
-    // `gateToolCall` itself answers null at once for the seven names below
-    // it, which are answered by this file and carry their own, narrower
-    // gate: see its own top comment.
+    // An arbitrator holds no tools, enforced here for the calls the tool runner
+    // never sees. The policy gate comes second, once an arbitrator is ruled out,
+    // so no `approval.response` is spent on a call that cannot run either way.
     const dispatched = if (!deps.role.holdsTools())
         event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -2535,30 +1389,16 @@ fn runTool(
         };
     defer allocator.free(dispatched.call_id);
     defer allocator.free(dispatched.output);
-    // **Only when there is one**, because the empty default is a constant and
-    // not an allocation. See `event.ToolResult.note`.
     defer if (dispatched.note.len != 0) allocator.free(dispatched.note);
-    // Only `read_image` ever sets this, and only when it succeeded. Every
-    // field of it is owned, `media_type` included, so the ownership rule is
-    // the same for all three and a reader has one thing to remember.
     defer if (dispatched.image) |image| {
         allocator.free(image.media_type);
         allocator.free(image.content_hash);
         allocator.free(image.data);
     };
 
-    // **The one place output that is not text is stood in for.** See
-    // `tools.outputForModel`: bytes that are not valid UTF-8 serialize as a
-    // JSON array rather than a JSON string, which changes the shape of a
-    // content part and ends the session with a provider 400, and which a
-    // replay of the same log cannot parse back either. The check belongs
-    // here and not in an adapter, because every adapter would need its own
-    // copy and the second one would be forgotten. It belongs after
-    // `deps.tool_runner`, and not only inside `tools.Registry.dispatch`,
-    // for the same reason one level down: `ToolRunner` is an interface, and a
-    // runner in its own process comes later, so a check that only ran inside
-    // today's one implementation would be a check the next implementation has
-    // to remember.
+    // Bytes that are not valid UTF-8 serialize as a JSON array and not a JSON
+    // string, which ends the session with a provider 400 and cannot be parsed back
+    // by a replay. After the runner, because `ToolRunner` is an interface.
     const note = try tools.outputForModel(allocator, dispatched.output);
     defer if (note) |owned| allocator.free(owned);
     var result = dispatched;
@@ -2566,23 +1406,10 @@ fn runTool(
 
     _ = try appendAndApply(allocator, io, locked, session, deps, .{ .tool_result = result });
 
-    // What this read found, so that the next turn can be told when a read
-    // found nothing new. After the result is in the log and before anything
-    // else, because the fact is about this result and not about the turn.
     try noteRead(allocator, telling, result, call);
 
-    // The turn that actually re-enters the context: tool.result itself does
-    // not, per lib/chock-proto/state.zig's own fold, only a message event
-    // does. Role .tool is the shape an OpenAI compatible history expects
-    // for a tool's own answer: see lib/chock-proto/event.zig's own doc
-    // comment on Role.tool.
-    //
-    // **`result.note` is not here, and that is the whole guarantee behind
-    // it.** Only these three fields become a content part, so Chock's own
-    // sentence to the person never reaches the model. See
-    // `event.ToolResult.note`.
-    // Two at most, on the stack: the result, and the picture when there is
-    // one. `parts` is how many of them this call filled in.
+    // Only these three fields become a content part, so `result.note`, which is
+    // written for the person, never reaches the model.
     var feedback: [2]event.ContentPart = undefined;
     var parts: usize = 1;
     feedback[0] = .{ .tool_result = .{
@@ -2591,17 +1418,9 @@ fn runTool(
         .is_error = result.is_error,
     } };
 
-    // **The picture, and the one copy of it the log keeps.** The
-    // `tool.result` event above holds the description of the image and none
-    // of its bytes, because the fold that builds the context reads `message`
-    // events and nothing else: see `chock_proto.event.ImageRef`. So the bytes
-    // have to be here, and putting them here as well as there would put two
-    // copies of every picture in the log.
-    //
-    // **After the tool result and never before it.** The Anthropic wire
-    // refuses a `tool_result` block that comes after anything else in the
-    // same turn, and `chock_provider.anthropic.toWireMessages` reorders on
-    // that rule, so this order is what both wires already expect.
+    // The one copy of the picture the log keeps: the fold reads `message` events
+    // alone. After the tool result and never before it, because the Anthropic wire
+    // refuses a `tool_result` block that follows anything else in the same turn.
     if (result.image) |image| {
         feedback[parts] = .{ .image = .{
             .call_id = result.call_id,
@@ -2617,31 +1436,11 @@ fn runTool(
     } });
 }
 
-/// The name of the tool a model calls to start a subagent. Read from the
-/// `tools.Tool` enum itself, so the name the loop matches on and the name the
-/// model is offered cannot drift apart.
 pub const spawn_tool_name = @tagName(tools.Tool.spawn_agent);
 
-/// What a `spawn_agent` call gets when the limits allow a subagent and this
-/// caller gave `Loop.run` no way to start one.
-///
-/// **A session with no spawner is a real case, not a stub.** Every test of
-/// this loop drives one, and so does any caller that runs a session without
-/// the session directories, the credential, and the single threaded process a
-/// child needs. The model is told exactly that, because a tool that answered
-/// "done" would have the model wait for work nobody is doing.
 pub const spawn_has_no_spawner_detail = "no subagent was started: the limits in chock.zon allow " ++
     "one, and this session was started with no way to run a child process. Do the work yourself.";
 
-/// What a `spawn_agent` call gets when the parent has already promised every
-/// last unit of its own budget. See `chock_core.subagent.budgetSlice`: a slice
-/// of nothing is not a session, it is a child that would be refused on its
-/// first turn.
-/// What a `spawn_agent` call that asked to carry on gets when this session was
-/// started with no way to run a child beside its own work. See `Deps.children`.
-///
-/// **It names the other shape**, because the work can still be done: a spawn
-/// that waits needs nothing this session lacks.
 pub const spawn_cannot_carry_on_detail = "no subagent was started: this session cannot run a " ++
     "subagent while it works. Ask again without \"background\", and the subagent's answer comes " ++
     "back in that call.";
@@ -2650,31 +1449,9 @@ pub const spawn_no_budget_detail = "no subagent was started: this session has sp
     "the whole budget in chock.zon, so there is nothing left to give a subagent. Do the work " ++
     "yourself, or stop and say what is left.";
 
-/// Answer a `spawn_agent` call, in place of the tool runner.
-///
-/// **A spawn is not a sandboxed tool call and must not be one.** It is
-/// measured against two numbers that only the session holds: how deep this
-/// agent is in the spawn tree, which is the length of `deps.spawn_chain`, and
-/// how many subagents this agent has already started, which is the number of
-/// `session.spawn` events `session` has folded. A `tools.Registry` holds
-/// neither, so it refuses a spawn outright: see `tools.spawn_needs_a_session`.
-///
-/// The width comes from the folded log and never from a counter of this
-/// call's own, so a session that is resumed, or handed over to the daemon,
-/// counts the children it really has rather than starting again at zero.
-///
-/// **The limits are answered before the arguments are read.** A refusal that
-/// first complained about a missing field would hide the limit that is the
-/// real answer, and the limit is true whatever the call said.
-///
-/// ## Two events, and the order they are in is the point
-///
-/// `session.spawn` is appended **before** the child runs, and `agent.complete`
-/// after it ends. That is the rule the whole log keeps: an event is written
-/// before the act it describes happens, so a crash in between still leaves
-/// proof that the child was asked for. It is also what makes the width count
-/// right: a parent that died mid spawn resumes with that child already
-/// counted.
+/// Answer a `spawn_agent` call, in place of the tool runner. The width comes
+/// from the folded log and never from a counter of this call's own, so a
+/// resumed session counts the children it really has.
 fn runSpawn(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2720,10 +1497,6 @@ fn runSpawn(
         ));
     }
 
-    // What is left of this session's cap, divided by the children the limits
-    // still allow. A slice and not the whole remainder: see
-    // `chock_core.subagent.budgetSlice`. The cap covers the tree and not each
-    // agent in it.
     const committed = subagent.committedToChildren(session.children.items, deps.budget);
     const children_left = deps.subagents.max_width - standing.width;
     const slice = subagent.budgetSlice(deps.budget, session.spend, committed, children_left);
@@ -2742,11 +1515,8 @@ fn runSpawn(
         .budget = slice,
     };
 
-    // **Which shape the spawn asked for, answered before anything is built.** A
-    // caller with no table cannot run a child beside the parent's own work, and
-    // a spawn that asked to carry on is told so rather than quietly waiting
-    // instead: a model that thought its turn would continue and found it had
-    // not is a model that planned the wrong next step.
+    // A caller with no table cannot run a child beside the parent's own work, and
+    // a spawn that asked to carry on is told so rather than quietly waiting.
     const mode: subagent.Mode = if (parsed.value.background orelse false) .carry_on else .wait;
     if (mode == .carry_on and deps.children == null) {
         return spawnRefusal(allocator, call, try allocator.dupe(u8, spawn_cannot_carry_on_detail));
@@ -2770,19 +1540,13 @@ fn runSpawn(
         .budget_currency = if (slice) |one| one.currency else "",
     } });
 
-    // **The turn carries on from here, and the answer arrives later.** No
-    // `agent.complete` is appended now: the child has not finished, and an event
-    // written for an act that has not happened is the one thing the log never
-    // does. `recordFinishedChildren` appends it at the top of the turn after the
-    // child ends, which is the same safe point a background command's own
-    // completion is delivered at and for the same reason.
+    // No `agent.complete` now: the child has not finished, and the log never
+    // writes an event for an act that has not happened.
     if (mode == .carry_on) {
         try deps.children.?.start(io, request, prepared);
         return .{
             .call_id = try allocator.dupe(u8, call.call_id),
             .output = try spawnStartedText(allocator, prepared, request),
-            // Not an error: the spawn did what it was asked to do. The outcome
-            // is a separate fact that arrives on a later turn.
             .is_error = false,
             .truncated = false,
         };
@@ -2790,9 +1554,6 @@ fn runSpawn(
 
     const report = spawner.run(allocator, io, request, prepared) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // The child was recorded as spawned and could not be run. That is a
-        // child that never said anything, which is exactly what `died` means,
-        // and it reaches the log as one rather than as a gap.
         error.ChildNotStarted => subagent.Report{
             .outcome = .died,
             .result = try allocator.dupe(u8, "the subagent's process could not be started"),
@@ -2811,20 +1572,11 @@ fn runSpawn(
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),
         .output = try spawnResultText(allocator, prepared, request, report),
-        // Anything but a finished child is an error the model has to act on:
-        // it did not get the answer it asked for, and a result it read as
-        // success would have it carry on as though it had.
         .is_error = report.outcome != .finished,
         .truncated = false,
     };
 }
 
-/// A `spawn_agent` call that started nothing. `output` is already owned by the
-/// allocator and is handed straight on.
-///
-/// **Always an error result.** No subagent exists, whichever branch answered,
-/// so a model that read one of these as success would wait for an answer that
-/// never comes.
 fn spawnRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -2838,55 +1590,17 @@ fn spawnRefusal(
     };
 }
 
-/// The name of the tool a model calls to keep a task list.
 pub const plan_tool_name = @tagName(tools.Tool.update_plan);
 
-/// How many steps one session's task list may hold.
-///
-/// **Sixty four, which is far more than a plan a person can read and far less
-/// than a model can generate.** The list is in the log and a reader has to be
-/// able to take it in at a glance, so a bound is what stops a model turning
-/// its whole reasoning into steps. A call that would pass the bound changes
-/// nothing and says the number, rather than keeping the front of a list the
-/// agent did not write.
 pub const max_plan_steps: usize = 64;
 
-/// How long one step's identifier, subject, and blocker may be.
-///
-/// The subject is a few words: it is read in a terminal, one step per line.
-/// A model that wants to say more has its own answer to say it in, and the
-/// session log to say it in permanently.
 pub const max_plan_id_bytes: usize = 32;
 pub const max_plan_subject_bytes: usize = 200;
 pub const max_plan_blocked_by_bytes: usize = 200;
 
-/// Answer an `update_plan` call, in place of the tool runner.
-///
-/// **A task list is an event in the session log, and a tool runner has no
-/// log.** `Loop.run` holds the exclusive lock on it for the whole session, so
-/// this call is answered here for exactly the reason a spawn is: see
-/// `runSpawn`, and `tools.plan_needs_a_session`, which is what a caller driving
-/// a dispatch with no loop around it gets instead.
-///
-/// ## Only what changed is appended
-///
-/// The steps the model sends are compared against the plan the fold already
-/// holds, and the event carries the ones that are new or different. Three
-/// things follow, and all three matter:
-///
-/// * **A call that changes nothing appends nothing.** A model that repeats its
-///   whole list every turn does not fill the log with copies of it.
-/// * A person watching sees one line per step that really moved, which is what
-///   makes a crossed off step readable at all.
-/// * The fold merges by identifier, so the whole list is still rebuilt by
-///   replaying the log from the start. See `chock_proto.state.Plan`.
-///
-/// ## Nothing here is enforced against the agent
-///
-/// The list is the agent's own statement of intent. An agent that discovers
-/// the task was wrong should change the list, and the value is that the change
-/// is visible, not that the plan binds anything. So this refuses a call it
-/// cannot record, and it never refuses a plan it disagrees with.
+/// Answer an `update_plan` call, in place of the tool runner. Nothing here is
+/// enforced against the agent: the list is its own statement of intent, so this
+/// refuses a call it cannot record and never a plan it disagrees with.
 fn runPlanUpdate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2895,8 +1609,6 @@ fn runPlanUpdate(
     deps: Deps,
     call: event.ToolCall,
 ) Error!event.ToolResult {
-    // A scratch arena for the parse and for the steps this builds. Only the
-    // result the caller frees comes out of `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2921,8 +1633,8 @@ fn runPlanUpdate(
         ));
     }
 
-    // **Every step is checked before any of them is written.** A call half
-    // applied would leave a list the agent did not ask for and cannot see.
+    // Every step is checked before any is written: a call half applied would
+    // leave a list the agent did not ask for.
     var changed: std.ArrayList(event.PlanStep) = .empty;
     var added: usize = 0;
     for (given) |step| {
@@ -2960,8 +1672,6 @@ fn runPlanUpdate(
         ));
     }
 
-    // **Nothing changed, so nothing is appended.** The `tool.call` beside this
-    // already records that the agent asked, which is the fact a replay needs.
     if (changed.items.len == 0) {
         return .{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -2977,9 +1687,6 @@ fn runPlanUpdate(
 
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),
-        // The whole list, and not only what changed. The model reads this on
-        // its next turn, and a list it can see in full is a list it does not
-        // have to hold in its attention.
         .output = try planText(allocator, session.plan, "The task list is now:"),
         .is_error = false,
         .truncated = false,
@@ -2987,8 +1694,7 @@ fn runPlanUpdate(
 }
 
 /// Why this step cannot be recorded, or null when it can. The bounds are here
-/// and not in the fold, because the fold reads logs that are already written
-/// and this is the one place that decides what gets written.
+/// and not in the fold, because the fold reads logs that are already written.
 fn planFieldRefusal(step: tools.PlanStepArgs) ?[]const u8 {
     if (step.id.len == 0) {
         return "the task list was not changed: every step needs an \"id\", which is the short " ++
@@ -3006,10 +1712,8 @@ fn planFieldRefusal(step: tools.PlanStepArgs) ?[]const u8 {
     if (blocked_by.len > max_plan_blocked_by_bytes) {
         return "the task list was not changed: \"blocked_by\" is a few words.";
     }
-    // **A step is read one to a line**, on the terminal while the session runs
-    // and in `chock plan` afterwards. A line break inside a step would put one
-    // step on two lines and the next reader would take the second half for a
-    // step of its own.
+    // A step is read one to a line, so a line break in one would make the next
+    // reader take the second half for a step of its own.
     if (hasALineBreak(step.id) or hasALineBreak(step.subject) or hasALineBreak(blocked_by)) {
         return "the task list was not changed: a step is read one to a line, so no part of one " ++
             "may hold a line break. Say the detail in your answer instead.";
@@ -3021,11 +1725,8 @@ fn hasALineBreak(text: []const u8) bool {
     return std.mem.indexOfAny(u8, text, "\n\r") != null;
 }
 
-/// Whether this step says anything the folded plan does not already hold.
-///
-/// **An empty subject is not a change.** `chock_proto.state.Plan.apply` reads
-/// it as "keep the words you have", so a call that only moves a status must
-/// not count as a reword.
+/// Whether this step says anything the folded plan does not hold. An empty
+/// subject is not a change: `Plan.apply` reads it as "keep the words you have".
 fn planStepMoved(
     known: ?*chock_proto.state.Plan.Step,
     subject: []const u8,
@@ -3038,9 +1739,6 @@ fn planStepMoved(
     return subject.len != 0 and !std.mem.eql(u8, step.subject, subject);
 }
 
-/// An `update_plan` call that recorded nothing. Always an error result: a
-/// model that read one of these as success would believe the user could watch
-/// a list nobody kept.
 fn planRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3054,8 +1752,6 @@ fn planRefusal(
     };
 }
 
-/// The whole task list as the model reads it back, one step to a line, under
-/// `heading`. Caller owns the result.
 fn planText(
     allocator: std.mem.Allocator,
     plan: chock_proto.state.Plan,
@@ -3081,50 +1777,12 @@ fn planText(
     return text.toOwnedSlice(allocator);
 }
 
-/// The name of the tool a model calls to bind itself.
 pub const restrict_tool_name = @tagName(tools.Tool.restrict_self);
 
-/// Answer a `restrict_self` call, in place of the tool runner.
-///
-/// **Narrowing is free, and widening needs authorisation.**
-/// `lib/chock-policy/ratchet.zig` holds the rule and the reasoning. This is the
-/// caller.
-///
-/// **A promise is an event in the session log, and a tool runner has no log.**
-/// Answered here for exactly the reason a spawn and a task list are: see
-/// `runSpawn`, and `tools.restrict_needs_a_session`, which is what a caller
-/// driving a dispatch with no loop around it gets instead.
-///
-/// ## What this loop decides, and what it does not
-///
-/// It decides whether the proposal narrows what this session already promised,
-/// which is a comparison against the session's own folded log and nothing else.
-/// **It never reads the policy table**: the table is the broker's, and
-/// `chock-core` holds none. So a promise that repeats a rule the project
-/// already has is recorded like any other, and a promise is never measured
-/// against what the project allows.
-///
-/// **Nothing here enforces a promise either.** The record is what binds, and
-/// `lib/chock-broker/Broker.zig` is what reads it, in the one process the
-/// agent cannot reach. A check the agent's own loop performed would be a check
-/// inside the thing being checked.
-///
-/// ## A widening nobody permits writes nothing at all
-///
-/// The `tool.call` beside this already records that the agent asked, which is
-/// the fact a replay needs and the one a person wants in the morning: an agent
-/// asking to widen its own promise is saying it was wrong about the task when
-/// it planned it. What is not written is a `policy.self` event, so the fold
-/// cannot come back with a wider ceiling however the request was worded.
-///
-/// **A widening is put to somebody**, and `runWiden` is where. It is measured
-/// against `chock_policy.ratchet.widen_action` like any other act, by the
-/// acceptance modes the policy names, and `deps.arbiter` is the seam onto the
-/// broker that answers. A session that can reach nobody says so rather than
-/// implying the answer was weighed.
-///
-/// A widening that is permitted is the one thing that writes a `policy.self`
-/// event which lifts rather than adds. See `runWiden`.
+/// Answer a `restrict_self` call, in place of the tool runner. Narrowing is
+/// free and widening needs authorisation. This never reads the policy table and
+/// enforces no promise: the record binds and the broker reads it. A widening
+/// nobody permits writes no `policy.self` event at all.
 fn runRestrictSelf(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3133,8 +1791,6 @@ fn runRestrictSelf(
     deps: Deps,
     call: event.ToolCall,
 ) Error!event.ToolResult {
-    // A scratch arena for the parse and for the promises this reads. Only the
-    // result the caller frees comes out of `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3168,8 +1824,6 @@ fn runRestrictSelf(
     if (ratchet.refusalFor(proposal)) |detail| {
         return restrictRefusal(allocator, call, try allocator.dupe(u8, detail));
     }
-    // A promise is read one to a line, on the terminal and in the log, so no
-    // part of one may hold a line break. The same rule a plan step keeps.
     if (hasALineBreak(proposal.action) or hasALineBreak(proposal.reason)) {
         return restrictRefusal(allocator, call, try allocator.dupe(
             u8,
@@ -3181,12 +1835,8 @@ fn runRestrictSelf(
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     switch (ratchet.classify(ratchet.ceilingFor(held, proposal.action), ceiling)) {
         .narrows => {},
-        // **A ceiling of `allow` promises nothing at all**, so a call that
-        // reaches here with one was asking to be let out of something rather
-        // than to give something up, and it named a pattern no promise of this
-        // session covers. Told apart from the case below because the two want
-        // different next steps, and a model that read "nothing changed" would
-        // think its own narrower promise had gone.
+        // A ceiling of `allow` promises nothing, so a call that reaches here with one
+        // was asking to be let out rather than to give something up.
         .no_change => if (ceiling == .allow) return restrictRefusal(
             allocator,
             call,
@@ -3205,8 +1855,6 @@ fn runRestrictSelf(
                 held,
                 "Nothing changed: you already hold this, or something narrower. You have promised:",
             ),
-            // Not an error. What the agent asked for is true of this session
-            // already, so there is nothing for it to do differently.
             .is_error = false,
             .truncated = false,
         },
@@ -3244,45 +1892,11 @@ fn runRestrictSelf(
     };
 }
 
-/// A `restrict_self` call that asks to be let out of a promise this session
-/// already made.
-///
-/// **This is the release valve, and it is one action name and nothing more.**
-/// See `chock_policy.ratchet`'s own top comment: a widening is the archetypal
-/// thing an arbitrator should judge rather than a table, because it is an agent
-/// saying in the log that it was wrong about the task when it planned it. The
-/// policy already has the two review decisions for that, and `Broker.request`
-/// already runs them, so there is no second approval path here.
-/// `ratchet.widen_action` is the key a project writes a rule for in
-/// `chock.zon`, which stays beyond the agent's reach.
-///
-/// **The agent does not decide this, and this loop does not either.**
-/// `deps.arbiter` is a seam onto the process that holds the policy table, and a
-/// session with none refuses and says nobody could be asked, which is a
-/// different fact from being told no.
-///
-/// ## Two things have to be true before anybody is asked
-///
-/// * **The proposal names exactly a promise this session holds.** A session
-///   that promised `git.*` and asks to be let out of `git.push` is asking about
-///   something it never promised as such, and `ratchet.ceilingFor` would still
-///   hold `git.*` against it afterwards, so the lift would be recorded and
-///   change nothing. Refusing here is what stops an authorised yes from being
-///   worth nothing.
-/// * **There is somebody to ask.** Paying for a review, or writing a question,
-///   for a session that can reach nobody spends something for an answer that is
-///   already decided. That is the same rule `Broker.reviewed` keeps for
-///   `agent_then_human` with no time to wait.
-///
-/// ## What an authorised widening writes
-///
-/// One `policy.self` with `authorised` set, which
-/// `chock_proto.state.SelfPolicy.apply` folds as a replacement by exact name
-/// rather than as one more term of the minimum. **That flag is the only thing
-/// that can lift a promise, and this is the only place it is written**, after
-/// an answer from a process the agent cannot reach. See
-/// `event.PolicySelf.authorised` for why it is on the event and not on a
-/// restriction, and for what an older reader does with it.
+/// A `restrict_self` call that asks to be let out of a promise it made. The
+/// proposal has to name exactly a promise this session holds, or
+/// `ratchet.ceilingFor` would hold a wider one against it afterwards and an
+/// authorised yes would change nothing. An authorised widening writes the one
+/// `policy.self` event with `authorised` set, which alone can lift a promise.
 fn runWiden(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3356,8 +1970,7 @@ fn runWiden(
 
     _ = try appendAndApply(allocator, io, locked, session, deps, .{
         .policy_self = .{
-            // The one place this flag is ever set. See this function's own doc
-            // comment.
+            // The one place this flag is ever set.
             .authorised = true,
             .restrictions = &.{.{
                 .action = proposal.action,
@@ -3386,13 +1999,9 @@ fn runWiden(
     };
 }
 
-/// Whether this session holds a promise written under exactly this name.
-///
-/// **Exact and never a pattern**, which is the rule `ratchet.ceilingFor`
-/// already keeps for the question it answers, and the rule
-/// `chock_proto.state.SelfPolicy.apply` folds an authorised lift by. The three
-/// have to agree, or a lift is authorised, recorded, and then still held down
-/// by a promise under a wider name.
+/// Whether this session holds a promise written under exactly this name. Exact
+/// and never a pattern, the rule `ratchet.ceilingFor` and `SelfPolicy.apply`
+/// also keep. The three have to agree, or a lift is recorded and changes nothing.
 fn promisedExactly(session: *const chock_proto.state.Session, action: []const u8) bool {
     for (session.self_policy.restrictions.items) |one| {
         if (std.mem.eql(u8, one.action, action)) return true;
@@ -3400,12 +2009,6 @@ fn promisedExactly(session: *const chock_proto.state.Session, action: []const u8
     return false;
 }
 
-/// A `restrict_self` call that promised nothing. `output` is already owned by
-/// the allocator and is handed straight on.
-///
-/// **Always an error result.** Nothing was written, whichever branch answered,
-/// so a model that read one of these as success would believe a wall was there
-/// and would plan around one that is not.
 fn restrictRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3419,25 +2022,11 @@ fn restrictRefusal(
     };
 }
 
-/// The name of the tool a model calls to read a page.
 pub const fetch_tool_name = @tagName(tools.Tool.fetch_url);
 
-/// Answer a `fetch_url` call, in place of the tool runner.
-///
-/// **Answered here for one reason: a promise binds it.** `restrict_self` offers
-/// `"net.fetch"` at `"deny"` in its own description, and the promises of a
-/// session live in the fold of its log, which only this loop holds. A tool
-/// runner is handed one call and knows nothing about the session around it, so
-/// a fetch that went there would run under the project's policy and past the
-/// session's own word. See `tools.fetch_needs_a_session`, which is what a
-/// dispatch with no loop around it gets instead.
-///
-/// **This loop still decides nothing.** It parses the call, folds the promises
-/// out of the log, and hands both across `deps.fetcher`, which is a seam onto
-/// the process that holds the policy table. Nothing here reads a table, and
-/// nothing here opens a socket. `lib/chock-policy/ratchet.zig` states why the
-/// narrowing happens on the far side and not here: a check an agent's own loop
-/// performs on itself is worth nothing.
+/// Answer a `fetch_url` call, in place of the tool runner. Answered here
+/// because a promise binds it, and the promises of a session live in the fold
+/// of its log. This loop still decides nothing: `deps.fetcher` does.
 fn runFetch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3445,8 +2034,6 @@ fn runFetch(
     deps: Deps,
     call: event.ToolCall,
 ) Error!event.ToolResult {
-    // A scratch arena for the parse and for the promises this reads. Only the
-    // result the caller frees comes out of `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3478,19 +2065,10 @@ fn runFetch(
         .output = answer.text,
         .is_error = answer.is_error,
         .truncated = false,
-        // Carried straight through. The seam wrote it for the person, this
-        // file has nothing to add to it, and `runTool` frees it with the
-        // output it belongs to.
         .note = answer.note,
     };
 }
 
-/// A `fetch_url` call that read nothing. `output` is already owned by the
-/// allocator and is handed straight on.
-///
-/// **Always an error result.** No page arrived, whichever branch answered, and
-/// a model that read one of these as success would go on to quote a page it
-/// never saw.
 fn fetchRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3504,34 +2082,17 @@ fn fetchRefusal(
     };
 }
 
-/// The name of the tool a model calls to ask the person a question.
 pub const ask_tool_name = @tagName(tools.Tool.ask_user);
 
-/// Answer an `ask_user` call, in place of the tool runner.
-///
-/// **Answered here because a tool runner has nobody to ask.** A `Registry` runs
-/// one call inside a sandbox that holds no terminal, and it is built to know
-/// nothing that outlives the call. The session is what has a person attached to
-/// it, so the loop carries the question across `deps.asker` and `src/run.zig` is
-/// what puts it on a screen. See `tools.ask_needs_a_session`, which is what a
-/// dispatch with no loop around it gets instead.
-///
-/// **This is not an approval and it writes no `approval.request`.** It grants
-/// nothing, whatever the person types. `lib/chock-core/ask.zig`'s own top
-/// comment says at length why the two paths stay apart, and why a later reader
-/// must not join them.
-///
-/// **Nothing here writes to the log either.** The question is already in the
-/// `tool.call` this loop appended, and the answer goes into the `tool.result` it
-/// appends next, both through the handle it already holds: see `runTool`.
+/// Answer an `ask_user` call, in place of the tool runner. This is not an
+/// approval and writes no `approval.request`: it grants nothing, whatever the
+/// person types.
 fn runAskUser(
     allocator: std.mem.Allocator,
     io: std.Io,
     deps: Deps,
     call: event.ToolCall,
 ) Error!event.ToolResult {
-    // A scratch arena for the parse alone. Only the result the caller frees
-    // comes out of `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3551,9 +2112,6 @@ fn runAskUser(
         .text = parsed.value.question,
         .options = parsed.value.options orelse &.{},
     };
-    // **Checked before anybody is disturbed.** Every one of these is the model's
-    // own to fix, so no person's attention is spent on a question they cannot
-    // read: see `ask.check`.
     if (ask_mod.check(question)) |why| {
         return askRefusal(allocator, call, try allocator.dupe(u8, why));
     }
@@ -3577,12 +2135,6 @@ fn runAskUser(
     };
 }
 
-/// An `ask_user` call that reached nobody. `output` is already owned by the
-/// allocator and is handed straight on.
-///
-/// **Always an error result.** No answer arrived, whichever branch answered, and
-/// a model that read one of these as success would go on to quote an answer
-/// nobody gave.
 fn askRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3596,59 +2148,14 @@ fn askRefusal(
     };
 }
 
-/// The name of the tool a model calls to name this session.
 pub const title_tool_name = @tagName(tools.Tool.set_title);
 
-/// The longest title one session may be given.
-///
-/// **One hundred and twenty bytes, and it is narrower than a plan step's
-/// subject on purpose.** A step is read on a line of its own. A title is read at
-/// the end of a `chock sessions` row that already carries an identifier, a
-/// timestamp, a state, a turn count and a model name. A title that ran past the
-/// width of a terminal would push the one thing on the row a reader is scanning
-/// for off the screen.
-///
-/// **Refused and never cut.** A cut title says something the agent did not say,
-/// and the sentence that stops is exactly the sentence that named the thing. The
-/// model is the one thing here that can fix it, so it is told the bound and
-/// writes a shorter one. The same rule `chock_core.ask.max_question_bytes`
-/// keeps, for the same reason.
 pub const max_title_bytes: usize = 120;
 
-/// Answer a `set_title` call, in place of the tool runner.
-///
-/// **A title is an event in the session log, and a tool runner has no log.**
-/// `Loop.run` holds the exclusive lock on it for the whole session, so this
-/// call is answered here for exactly the reason `runPlanUpdate` is. See
-/// `tools.title_needs_a_session`, which is what a caller driving a dispatch
-/// with no loop around it gets instead.
-///
-/// ## The log cannot edit a title, so a later one supersedes it
-///
-/// The log is append only and hash chained, so there is no writing over the
-/// title a session already has. A second call appends a second event and the
-/// fold takes the last, which is the same shape `chock_core.memory` keeps for a
-/// note: writing a name that exists adds a version rather than replacing one,
-/// and every name the session went by stays in the record.
-///
-/// **This is what makes "name it early" safe advice.** A title written at the
-/// end is a title about work that is understood, and a session that is
-/// interrupted or runs out of budget never reaches the end: 15 of the 23
-/// sessions on the machine this was written on have no end event at all. So the
-/// model is told to name the session as soon as it knows what the work is, and
-/// to say so again if the work turns out to be something else.
-///
-/// ## What is refused, and what a reader still has to do
-///
-/// A title is put in front of a person in a listing, so this refuses one that is
-/// not one line of text: empty, longer than `max_title_bytes`, carrying a line
-/// break, carrying any other control character, or not valid UTF-8. Every one of
-/// those is the model's own to fix and the answer says so.
-///
-/// **A reader must not rely on any of it.** A log is a file on disk that another
-/// build, or a person with an editor, can write, so `src/sessions.zig` filters
-/// what it prints as well. This stops a bad title being written. That stops a
-/// bad title being obeyed.
+/// Answer a `set_title` call, in place of the tool runner. The log is append
+/// only, so a second call appends a second event and the fold takes the last.
+/// A reader must not rely on what this refuses: a log is a file a person with
+/// an editor can write, so `src/sessions.zig` filters what it prints as well.
 fn runSetTitle(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3657,8 +2164,6 @@ fn runSetTitle(
     deps: Deps,
     call: event.ToolCall,
 ) Error!event.ToolResult {
-    // A scratch arena for the parse alone. Only the result the caller frees
-    // comes out of `allocator`.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3674,8 +2179,6 @@ fn runSetTitle(
             "on one line.",
     ));
 
-    // Trimmed before it is measured and before it is written, so a title with a
-    // trailing space is not a different title from the same words without one.
     const title = std.mem.trim(u8, parsed.value.title, " \t");
     if (titleRefusalText(title)) |why| {
         return titleRefusal(allocator, call, try allocator.dupe(u8, why));
@@ -3687,8 +2190,6 @@ fn runSetTitle(
 
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),
-        // The name is read back, so a model that shortened a long one can see
-        // which of its attempts is the one a person will read.
         .output = try std.fmt.allocPrint(
             allocator,
             "This session is now called: {s}\nCall " ++ title_tool_name ++ " again if the work " ++
@@ -3700,11 +2201,6 @@ fn runSetTitle(
     };
 }
 
-/// Why this title cannot be recorded, or null when it can.
-///
-/// **Every one of these is the model's own to fix**, so each sentence says what
-/// to send instead. Here and not in the fold, because the fold reads logs that
-/// are already written and this is the one place that decides what gets written.
 pub fn titleRefusalText(title: []const u8) ?[]const u8 {
     if (title.len == 0) return "this session was not named: \"title\" was empty. Write what the " ++
         "session is about, in a few words.";
@@ -3712,24 +2208,18 @@ pub fn titleRefusalText(title: []const u8) ?[]const u8 {
         max_title_text ++ " bytes. It is read at the end of a row beside the session's " ++
         "identifier and its time, so name the work in a few words and say the detail in your " ++
         "answer.";
-    // **A title is one line, and a line break is refused rather than replaced.**
-    // A listing puts one title on one row, so text after a line break is text
-    // the agent wrote and nobody reads. Every other control character goes with
-    // it: a title is shown on a terminal, and an escape sequence in one would
-    // drive the terminal of whoever ran `chock sessions`.
+    // A title is shown on a terminal, so an escape sequence in one would drive
+    // the terminal of whoever ran `chock sessions`.
     for (title) |byte| {
-        // Only ASCII control characters are checked byte by byte, which is safe
-        // over UTF-8: every byte of a multi byte character is 0x80 or above, so
-        // none of them can be mistaken for one.
+        // Checking ASCII control characters byte by byte is safe over UTF-8: every
+        // byte of a multi byte character is 0x80 or above.
         if (byte == '\n' or byte == '\r') return "this session was not named: a title is one " ++
             "line, and this one has a line break in it. Put the whole name on one line.";
         if (byte < 0x20 or byte == 0x7F) return "this session was not named: a title is plain " ++
             "text, and this one has a control character in it. Send the words alone.";
     }
-    // Bytes that are not valid UTF-8 serialize as an array of integers rather
-    // than a string, which is a log line no replay of this build can read back.
-    // The same fault `tools.outputForModel` stands in for on a tool result, and
-    // a title is short enough to simply refuse.
+    // Bytes that are not valid UTF-8 serialize as an array of integers and not a
+    // string, which is a log line no replay of this build can read back.
     if (!std.unicode.utf8ValidateSlice(title)) return "this session was not named: a title has " ++
         "to be text, and these bytes are not valid UTF-8. Send the words alone.";
     return null;
@@ -3737,8 +2227,6 @@ pub fn titleRefusalText(title: []const u8) ?[]const u8 {
 
 const max_title_text = std.fmt.comptimePrint("{d}", .{max_title_bytes});
 
-/// A `set_title` call that named nothing. `output` is already owned by the
-/// allocator and is handed straight on.
 fn titleRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3752,37 +2240,11 @@ fn titleRefusal(
     };
 }
 
-/// The name of the tool a model calls to ask for its work to be carried back.
-/// Read from the `tools.Tool` enum itself, so the name the loop matches on and
-/// the name the model is offered cannot drift apart.
 pub const request_tool_name = @tagName(tools.Tool.request_action);
 
-/// Answer a `request_action` call, in place of the tool runner.
-///
-/// **This is the first thing an agent may ask for by name, and it is one
-/// thing.** `handback.apply_action` carries the session's own commit into the
-/// user's repository. Every other name is refused here, before anybody is
-/// asked, and the refusal says which name was given. A general
-/// request-for-any-action tool would need every act's own parameters to come
-/// from the model, and it would have been built with one customer to test it
-/// against. When there is a second customer, this widens with it.
-///
-/// ## The agent asks and never decides
-///
-/// Nothing in this function decides anything. `RequestActionArgs` has one
-/// action name and one reason in it, and a reason is an argument rather than an
-/// answer. The decision is the project's policy table, which is the broker's and
-/// which this file never reads, and where that table says `ask` it is a
-/// person's. See `lib/chock-core/handback.zig`.
-///
-/// ## Asking is not committing
-///
-/// An agent that calls this having made no commit is told so, and **nobody is
-/// asked**: there is nothing to put in front of a person, and a question about
-/// an empty change is a decision spent on nothing. That answer comes from the
-/// implementation of the seam, which is the only thing that can count what is
-/// in the workspace. It is an error result, because nothing was carried and a
-/// model that read it as success would stop.
+/// Answer a `request_action` call, in place of the tool runner. One action name
+/// is offered and every other is refused before anybody is asked. Nothing here
+/// decides: a reason is an argument rather than an answer.
 fn runRequestAction(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -3804,9 +2266,6 @@ fn runRequestAction(
             "fields, \"action\" and \"reason\".",
     ));
 
-    // **By name, and before anything else.** A request the harness cannot
-    // honour is refused rather than approximated, and the one honest way to
-    // refuse it is to say which name was asked for and which one exists.
     if (!std.mem.eql(u8, parsed.value.action, handback_mod.apply_action)) {
         return requestRefusal(allocator, call, try std.fmt.allocPrint(
             allocator,
@@ -3817,9 +2276,6 @@ fn runRequestAction(
         ));
     }
 
-    // A reason is what a person reads beside the diff, so a request with none
-    // is refused rather than put to somebody with a blank where the argument
-    // should be. The same rule a promise keeps: see `runRestrictSelf`.
     if (std.mem.trim(u8, parsed.value.reason, " \t\r\n").len == 0) {
         return requestRefusal(allocator, call, try allocator.dupe(
             u8,
@@ -3841,21 +2297,11 @@ fn runRequestAction(
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),
         .output = result.output,
-        // **Everything but a yes is an error result**, including the endings
-        // nobody is at fault for. Nothing was carried, and a model that read
-        // "nobody could be asked" as success would end the session believing
-        // its work was in the user's repository.
         .is_error = !result.carried,
         .truncated = false,
     };
 }
 
-/// A `request_action` call that carried nothing. `output` is already owned by
-/// the allocator and is handed straight on.
-///
-/// **Always an error result**, for the reason `restrictRefusal` is: nothing
-/// happened, whichever branch answered, and an agent told otherwise would stop
-/// working on a task whose result never left the workspace.
 fn requestRefusal(
     allocator: std.mem.Allocator,
     call: event.ToolCall,
@@ -3869,13 +2315,6 @@ fn requestRefusal(
     };
 }
 
-/// Every promise this session holds, as the model reads it back, one to a
-/// line, under `heading`. Caller owns the result.
-///
-/// **The whole list, and not only what changed.** A model that has just bound
-/// itself is a model about to plan around the binding, and a list it can see
-/// in full is one it does not have to hold in its attention. The same reason
-/// `planText` prints the whole task list.
 fn promiseText(
     allocator: std.mem.Allocator,
     held: []const ratchet.Restriction,
@@ -3893,13 +2332,6 @@ fn promiseText(
     return text.toOwnedSlice(allocator);
 }
 
-/// What the parent's model reads about the child that just ended. Caller owns
-/// the result.
-///
-/// **The answer and a path, never the child's transcript.** Six children each
-/// returning a page of prose is a parent that spends its whole context
-/// reading. The child's own log holds every turn, and the scratchpad holds
-/// whatever the child wrote down.
 fn spawnResultText(
     allocator: std.mem.Allocator,
     prepared: subagent.Prepared,
@@ -3926,12 +2358,6 @@ fn spawnResultText(
     return text.toOwnedSlice(allocator);
 }
 
-/// What the parent's model reads about a child that has only just started.
-/// Caller owns the result.
-///
-/// **It says plainly that there is no answer yet and how the answer arrives**,
-/// because a model that read this as the child's verdict would carry on as
-/// though it had one.
 fn spawnStartedText(
     allocator: std.mem.Allocator,
     prepared: subagent.Prepared,
@@ -3946,33 +2372,16 @@ fn spawnStartedText(
     );
 }
 
-/// The real world time now, from the clock the caller injected or from the
-/// machine's own when it injected none.
-///
-/// **Separate from the timestamp `appendAndApply` writes on an event.** An
-/// event's time is a fact about the log and must be the real one whatever a
-/// test wants. This is what a notice says about the world, and a test that
-/// pins a notice names the time itself rather than measuring the one it got.
 fn nowMs(io: std.Io, deps: Deps) i64 {
     const clock = deps.notices.clock orelse
         return std.Io.Timestamp.now(io, .real).toMilliseconds();
     return clock.now();
 }
 
-/// The messages this turn sends, with this turn's notice on the end when one
-/// applies, and the messages themselves when none does.
-///
-/// **On the end, and as its own message.** The system prompt is not rebuilt,
-/// so the provider's cache keeps the same prefix it had last turn: see
-/// `Deps.notices`. The role is `user` and not `system` because
-/// `chock_provider.anthropic.buildRequest` folds a `system` role message into
-/// the top level `system` field, which is the one place this must never reach.
-///
-/// **Two allocators, and mixing them is a leak.** `telling` owns its memory
-/// from `allocator`, the one that lives as long as the session, so `render`
-/// gets that one and its result is freed with it. The message the request
-/// carries has to outlive the call and is copied into `arena`, which is the
-/// turn's own and frees the copy with everything else the turn built.
+/// The messages this turn sends, with this turn's notice on the end so the
+/// provider's cache keeps the prefix it had. The role is `user` and not
+/// `system` because `chock_provider.anthropic.buildRequest` folds a `system`
+/// role message into the top level `system` field.
 fn withNotice(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -3989,8 +2398,6 @@ fn withNotice(
         .goal = firstUserText(session),
         .spent_percent = spentPercent(session, deps),
         .uncommitted_files = deps.uncommitted_files,
-        // Built into the turn's own arena, and empty for the sessions that
-        // keep no list at all. See `unfinishedPlan`.
         .unfinished_plan = try unfinishedPlan(arena, session),
     }) orelse return messages;
     defer allocator.free(rendered);
@@ -4007,21 +2414,9 @@ fn withNotice(
     return grown;
 }
 
-/// The steps of the agent's own task list that are neither done nor abandoned,
-/// in the order the fold holds them.
-///
-/// **Empty for every session whose agent never wrote a list**, and empty for
-/// one whose steps are all finished or given up. That is what keeps the notice
-/// which reads it from firing on a session with nothing to be reminded of: see
-/// `notices.renderCompactedPlan`.
-///
-/// **An unrecognized status counts as unfinished.** `Plan.Counts.left` already
-/// makes that choice and for the same reason: a status this build has no member
-/// for is not finished work, and a step dropped from the list because a newer
-/// writer named it something else is a step that vanished in silence.
-///
-/// Every string is borrowed from `session`'s own arena, so the slice this
-/// builds in `arena` is valid for as long as the turn that reads it.
+/// The steps of the agent's own task list that are neither done nor abandoned.
+/// An unrecognized status counts as unfinished, so a step a newer writer named
+/// something else does not vanish in silence.
 fn unfinishedPlan(
     arena: std.mem.Allocator,
     session: *const chock_proto.state.Session,
@@ -4041,13 +2436,6 @@ fn unfinishedPlan(
     return left.toOwnedSlice(arena);
 }
 
-/// The task, word for word: the text of the first `user` message the fold
-/// holds. Empty when the session has none, and empty after a compaction folded
-/// it away, which cannot happen while `compaction.Policy.protect_head_entries`
-/// is at least one.
-///
-/// Borrowed from `session`'s own arena, so it is valid for as long as the turn
-/// that read it.
 fn firstUserText(session: *const chock_proto.state.Session) []const u8 {
     for (session.context.items) |entry| {
         const said = switch (entry.data) {
@@ -4062,14 +2450,9 @@ fn firstUserText(session: *const chock_proto.state.Session) []const u8 {
     return "";
 }
 
-/// How much of the budget is spent, in whole percent, or null when there is no
-/// number a percentage could honestly be taken of.
-///
-/// **Null in every case `refuseForBudget` refuses to enforce**, and for the
-/// same reasons: a total with an unpriced turn in it is not a total, and a cap
-/// in one currency cannot be compared with turns billed in another. A
-/// percentage of a number Chock cannot measure is a made up number, and a made
-/// up number told to a model is worse than silence.
+/// How much of the budget is spent, in whole percent, or null wherever
+/// `refuseForBudget` also refuses to enforce: a percentage of a number Chock
+/// cannot price is a made up number.
 fn spentPercent(session: *const chock_proto.state.Session, deps: Deps) ?u8 {
     const cap = deps.budget orelse return null;
     if (cap.max_cost <= 0) return null;
@@ -4079,23 +2462,14 @@ fn spentPercent(session: *const chock_proto.state.Session, deps: Deps) ?u8 {
     if (spend.currency.len != 0 and !std.mem.eql(u8, spend.currency, cap.currency)) return null;
 
     const fraction = spend.amount / cap.max_cost * 100;
-    // A total that is not a number is a total Chock cannot measure, which is
-    // the same answer as an unpriced turn. It is also the one value
-    // `@intFromFloat` below has no defined answer for, so the check earns its
-    // place twice.
+    // A total that is not a number is one Chock cannot price, and it is the value
+    // `@intFromFloat` below has no defined answer for.
     if (std.math.isNan(fraction)) return null;
     if (fraction <= 0) return 0;
     if (fraction >= 100) return 100;
     return @intFromFloat(fraction);
 }
 
-/// Record what a `read_file` call found, so the next turn can be told when a
-/// read found nothing new.
-///
-/// **Nothing is recorded unless both halves are certain.** A call whose path
-/// this library cannot read, and a result with no `file_hash` in it, both
-/// leave the record untouched: see `tools.fileHashIn`. A failed read is not a
-/// read at all.
 fn noteRead(
     allocator: std.mem.Allocator,
     telling: *notices.State,
@@ -4112,33 +2486,11 @@ fn noteRead(
     try telling.observeRead(allocator, path, hash);
 }
 
-/// Append `ev` to the log through `locked`, then fold it into `session`
-/// right away, so the next turn's `context.build` sees it with no extra
-/// read of storage. `locked` is `anytype` because `chock_proto.storage.Locked`
-/// is not `pub`: see that type's own doc comment on why a runtime generation
-/// check, not the type system, is what actually proves a caller holds a real
-/// lock. Every real caller of this function already holds one, from
-/// `deps.storage.lock` in `run`, so the check always passes here. `anytype`
-/// only works around the type being unnameable, not around the check
-/// itself.
-///
-/// **This is where a secret is taken out, and it is the only place it can
-/// be.** The log is append only and hash chained, so a credential written here
-/// cannot be taken out later without breaking the chain: there is no cleanup
-/// after the fact and only prevention is left. Every record this loop writes
-/// goes through this one function, so `deps.redact` covers a tool result, a
-/// diff, a compaction summary, an approval detail and the `session.end` detail
-/// of a provider refusal, without a list of the kinds that matter. See
-/// `lib/chock-core/redact.zig`.
-///
-/// **The redacted record is what is hashed and what is folded.** The
-/// replacement happens before `Locked.append`, so the chain runs over the bytes
-/// the file holds, and `session.apply` takes the same bytes, so the context the
-/// next turn renders is clean as well.
-///
-/// **The scratch arena is released here.** `Locked.append` serializes what it is
-/// given and `Session.apply` copies what it keeps, and `Observer.onEvent`
-/// borrows for the duration of the call alone.
+/// Append `ev` to the log through `locked`, then fold it into `session`.
+/// `locked` is `anytype` because `chock_proto.storage.Locked` is not `pub`, and
+/// a runtime generation check is what proves a caller holds a real lock. The
+/// redaction happens before `Locked.append`, so the chain runs over the bytes
+/// the file holds and a credential cannot be taken out later.
 fn appendAndApply(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4149,26 +2501,15 @@ fn appendAndApply(
 ) Error!u64 {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    // An inert policy, which is the default, gives back `ev` itself and
-    // allocates nothing at all.
     const clean = try redact.event(scratch.allocator(), deps.redact, ev);
 
     const time_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
     const offset = try locked.append(allocator, io, clean, time_ms);
     try session.apply(.{ .id = offset, .session = "", .time_ms = time_ms, .event = clean });
-    // After the append and after the fold, never before either: an observer
-    // that was told about an event the log does not hold would be showing a
-    // user something a replay of the same session will not produce. See
-    // `Observer`.
     if (deps.observer) |watching| watching.onEvent(offset, clean);
     return offset;
 }
 
-/// Fold every event `storage` already holds into `session`, from the start.
-/// Called once, at the top of `run`, before anything new is appended: see
-/// `run`'s own doc comment on why a call that continues an existing session
-/// must see it the same way a fresh replay would, session_start included,
-/// rather than starting from an empty `Session` every time.
 fn foldExisting(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4181,55 +2522,30 @@ fn foldExisting(
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         try session.apply(parsed.value);
-        // The log's own timestamps, so a resumed session says when it really
-        // started and when the agent really last spoke. See
-        // `notices.State.observeEvent`.
         const spoke = parsed.value.event == .message and
             std.meta.activeTag(parsed.value.event.message.role) == .assistant;
         telling.observeEvent(parsed.value.time_ms, spoke);
     }
 }
 
-// Every test here drives Loop.run against a Storage.Memory (no file, no
-// tmpDir) and a FakeClient and FakeToolRunner (no socket, no sandbox): see
-// this file's own top comment on why ToolRunner is an interface. The one
-// test that needs a real HTTP round trip, "the API key is in no event in
-// the log", needs test/core/fake_provider.zig, which this file cannot
-// import directly (Zig 0.16 refuses a relative @import outside a module's
-// own root), so it lives in test/core/loop.zig instead, the same reason
-// test/core/client.zig exists next to lib/chock-provider/Client.zig.
+// Zig 0.16 refuses a relative `@import` outside a module's own root, so the one
+// test that needs `test/core/fake_provider.zig` lives in `test/core/loop.zig`.
 
 const testing = std.testing;
 
-/// One `Client.send` call's worth of scripted deltas. `FakeClient` plays
-/// back one `FakeTurn` per call, in order, and never loops back to the
-/// start: a test that wants N turns gives exactly N entries.
 const FakeTurn = struct {
     deltas: []const chock_provider.Client.Delta = &.{},
-    /// When set, this call answers with a refusal instead of the deltas, the
-    /// same shape a real provider's non-2xx response reaches
-    /// `Client.sendAndAssemble` in. A test that wants a context overflow, or a
-    /// rate limit, scripts one of these.
     refusal: ?Refusal = null,
-    /// Run at the start of this call, before anything is answered. **A test
-    /// that needs something to happen partway through a session drives it from
-    /// here**, which is the same seam `RecordingSleeper.on_wait` gives for the
-    /// same reason. Null for a turn that only answers.
     before: ?*const fn () void = null,
 
     const Refusal = struct {
         status: std.http.Status = .bad_request,
         body: []const u8,
-        /// What this refusal's own `Retry-After` header said, in seconds. A
-        /// real provider sends one on a 429: see
-        /// `chock_provider.Client.StatusError.retry_after_s`.
         retry_after_s: ?u64 = null,
     };
 };
 
-/// The refusal a llama.cpp server sent on 2026-08-21, word for word, which is
-/// the session that made compaction the blocking gap. Used by the tests that
-/// pin the backstop, so they answer the real wire and not a paraphrase of it.
+/// The refusal a llama.cpp server really sent, word for word.
 const measured_overflow_body =
     \\{"error":{"code":400,"message":"request (77857 tokens) exceeds the available context size (65536 tokens)","type":"exceed_context_size_error"}}
 ;
@@ -4237,20 +2553,11 @@ const measured_overflow_body =
 const FakeClient = struct {
     turns: []const FakeTurn,
     calls: usize = 0,
-    /// When true, `send` serializes each request it is given through the
-    /// same adapter a real OpenAI compatible session uses, and keeps the
-    /// bytes of the last one. **The bytes, and not the `message.Request`
-    /// value**: a `[]const u8` that is valid UTF-8 and one that is not are
-    /// the same Zig type, and only the serializer tells them apart. A test
-    /// that read the value would pass either way. See
-    /// `tools.outputForModel`.
+    /// When true, `send` keeps the serialized bytes of the last request. The
+    /// bytes, and not the `message.Request` value: a `[]const u8` that is valid
+    /// UTF-8 and one that is not are the same Zig type.
     record_requests: bool = false,
-    /// Owned by whoever set `record_requests`, and freed with the same
-    /// allocator `run` was given.
     last_request_json: ?[]u8 = null,
-    /// When set, every request's system prompt and last message is kept, one
-    /// entry per model call. See `SeenRequests`, and the notice tests at the
-    /// bottom of this file.
     seen: ?*SeenRequests = null,
 
     fn send(
@@ -4291,19 +2598,9 @@ const FakeClient = struct {
     const vtable = chock_provider.Client.Client.VTable{ .send = send };
 };
 
-/// A `retry.Sleeper` that never sleeps and remembers every wait it was asked
-/// for.
-///
-/// **No test in this file measures elapsed time.** A test that slept for real
-/// would be slow, would be flaky on a loaded machine, and would still prove
-/// nothing about the number the policy computed. This records the number
-/// instead, which is the fact worth pinning: see `Deps.sleeper`.
 const RecordingSleeper = struct {
     allocator: std.mem.Allocator,
     waits: std.ArrayList(u64) = .empty,
-    /// Run at each wait, so a test can make something happen partway through
-    /// a retry, for example set the cancel flag. Null for a test that only
-    /// wants the numbers.
     on_wait: ?*const fn () void = null,
 
     fn deinit(self: *RecordingSleeper) void {
@@ -4324,21 +2621,13 @@ const RecordingSleeper = struct {
     }
 };
 
-/// A `ToolRunner` that always answers the same way, and counts its own
-/// calls. `storage_to_check`, when set, replays `storage` from the start
-/// inside `dispatch`, before returning, and records whether a `tool.call`
-/// event for this exact call is already there: see "an event is in the log
-/// before the action it describes happens" below.
 const FakeToolRunner = struct {
     output: []const u8,
     is_error: bool = false,
-    /// What the person is told, or empty. See `event.ToolResult.note`.
     note: []const u8 = "",
     storage_to_check: ?chock_proto.storage.Storage = null,
     saw_call_in_log: bool = false,
     calls: usize = 0,
-    /// The picture this runner answers with, or null for every test that
-    /// wants a plain text result. See `event.ImageRef`.
     image: ?event.ImageRef = null,
 
     fn dispatch(
@@ -4357,11 +2646,7 @@ const FakeToolRunner = struct {
             .output = try allocator.dupe(u8, self.output),
             .is_error = self.is_error,
             .truncated = false,
-            // Owned by the same allocator the output is, and empty when there
-            // is none: the loop frees it only when it holds something.
             .note = if (self.note.len == 0) "" else try allocator.dupe(u8, self.note),
-            // Every field owned by the same allocator, which is the rule
-            // `runTool` frees it under: see its own `defer`.
             .image = if (self.image) |image| .{
                 .media_type = try allocator.dupe(u8, image.media_type),
                 .byte_count = image.byte_count,
@@ -4378,9 +2663,6 @@ const FakeToolRunner = struct {
     const vtable = ToolRunner.VTable{ .dispatch = dispatch };
 };
 
-/// A `ToolRunner` whose first call fails and whose every later call
-/// succeeds. This is the transient fault a legitimate retry answers, and it
-/// is why `no_progress_repeats` is not 2.
 const FailsOnceToolRunner = struct {
     calls: usize = 0,
 
@@ -4409,10 +2691,6 @@ const FailsOnceToolRunner = struct {
     const vtable = ToolRunner.VTable{ .dispatch = dispatch };
 };
 
-/// True when `storage` already holds a `tool.call` event whose `call_id`
-/// matches `call_id`. A fresh replay from the start every time: cheap
-/// enough for a test, and it is exactly the read a resuming client would
-/// actually do.
 fn callIsInLog(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -4430,9 +2708,6 @@ fn callIsInLog(
     return false;
 }
 
-/// A folded `Session` built from a fresh replay of every event `storage`
-/// currently holds. Used only by tests that want to compare two folds of
-/// the same log: see "the context the model sees is a fold over the log".
 fn foldFromStart(allocator: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !chock_proto.state.Session {
     var session = chock_proto.state.Session.init(allocator);
     errdefer session.deinit();
@@ -4445,17 +2720,6 @@ fn foldFromStart(allocator: std.mem.Allocator, io: std.Io, storage: chock_proto.
     return session;
 }
 
-/// An `Arbiter` that permits every act, and keeps no state of its own: see
-/// `chock_broker.Broker.SystemWaiter` for the same shape and the same reason,
-/// an anchor address with nothing behind it.
-///
-/// **What every test in this file that does not measure the policy gate
-/// itself gets from `testDeps`.** `gateToolCall` asks an arbiter about every
-/// ordinary tool call now, and a suite written before that gate existed is
-/// entitled to keep behaving as it did: a tool call runs, because somebody,
-/// even if only this stand in, was there to be asked. A test that means to
-/// measure the gate overrides `deps.arbiter` itself afterwards, the same way
-/// the promise tests already override it to measure a widening.
 const AlwaysPermitArbiter = struct {
     var anchor: u8 = 0;
 
@@ -4578,20 +2842,12 @@ test "a turn with a tool call appends the call, runs it, and appends the result"
         }
     }
 
-    // Assert the order in the log. A result before its call is a log that
-    // cannot be folded back into a conversation.
     try testing.expect(call_id != null);
     try testing.expect(result_id != null);
     try testing.expect(call_id.? < result_id.?);
 }
 
 test "a tool call whose row the policy allows runs, with no reviewer weighed in" {
-    // The policy table itself lives in the broker and this file never reads
-    // one, so "the row says allow" is simulated the same way `Broker.request`
-    // would answer it: the arbiter permits at once, with the outcome an
-    // `allow` decision carries. What this test pins is the loop's own half:
-    // it asks, and a permit really does let the call through to
-    // `deps.tool_runner`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4673,7 +2929,6 @@ test "a tool call whose row asks, with an arbiter that refuses, does not run, an
     deps.arbiter = judge.arbiter();
     try run(allocator, io, deps);
 
-    // Refused, so the tool runner is never reached.
     try testing.expectEqual(@as(usize, 1), judge.calls);
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 
@@ -4692,9 +2947,6 @@ test "a tool call whose row asks, with an arbiter that refuses, does not run, an
                 );
                 saw_error_result = true;
             },
-            // The result reaches the model as a tool message, the same as any
-            // other tool result: this is what "the model gets a tool result
-            // saying so" means at the wire level.
             .message => |m| if (m.role == .tool) {
                 try testing.expect(m.content[0].tool_result.is_error);
                 saw_tool_message = true;
@@ -4707,9 +2959,6 @@ test "a tool call whose row asks, with an arbiter that refuses, does not run, an
 }
 
 test "a build is decided under the attribute path it named, and not under the call" {
-    // The whole of the policy design for `nix_build`: a person writes
-    // `nix.build.packages.*` and it decides this call. A rule on the call name
-    // would be one rule for every build a project ever makes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4733,17 +2982,11 @@ test "a build is decided under the attribute path it named, and not under the ca
     deps.arbiter = judge.arbiter();
     try run(allocator, io, deps);
 
-    // Exactly one question, and its name is the attribute path. A call that
-    // builds the workspace the agent is already in names no flake, so there
-    // is no second thing to ask about.
     try testing.expectEqual(@as(usize, 1), judge.calls);
     try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawDetail());
     try testing.expectEqual(@as(usize, 1), fake_tools.calls);
 }
 
-/// One turn that calls `nix_build` for an attribute of a foreign flake, then
-/// one turn of text. The three tests below differ only in what the arbiter
-/// says, so the call itself is written once.
 const foreign_flake_turns = [_]FakeTurn{
     .{ .deltas = &.{.{ .tool_call = .{
         .index = 0,
@@ -4772,8 +3015,6 @@ test "a build that names a flake asks about the attribute path and about the ref
     deps.arbiter = judge.arbiter();
     try run(allocator, io, deps);
 
-    // Two questions, in the order a reader of the policy would expect: what
-    // is being built, then where it comes from.
     try testing.expectEqual(@as(usize, 2), judge.calls);
     try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawAt(0));
     try testing.expectEqualStrings("nix.build.flake.github.evil.repo", judge.sawAt(1));
@@ -4781,9 +3022,6 @@ test "a build that names a flake asks about the attribute path and about the ref
 }
 
 test "a rule that allows the attribute does not authorise a foreign flake" {
-    // The hole this closes. The attribute name a project writes for its own
-    // flake is the same name a foreign one builds, so the reference has to be
-    // its own question or one rule grants both.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4793,7 +3031,6 @@ test "a rule that allows the attribute does not authorise a foreign flake" {
 
     var fake_client = FakeClient{ .turns = &foreign_flake_turns };
     var fake_tools = FakeToolRunner{ .output = "ok" };
-    // Every attribute allowed, and no rule for any reference.
     var judge = ActionArbiter{ .refuse_prefix = "nix.build.flake" };
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
@@ -4817,8 +3054,6 @@ test "a rule that allows the attribute does not authorise a foreign flake" {
 }
 
 test "a rule that allows the reference does not authorise an attribute the project denied" {
-    // The other half, so neither name is decoration: allowing where a build
-    // comes from says nothing about what may be built.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4828,15 +3063,12 @@ test "a rule that allows the reference does not authorise an attribute the proje
 
     var fake_client = FakeClient{ .turns = &foreign_flake_turns };
     var fake_tools = FakeToolRunner{ .output = "ok" };
-    // Every reference allowed, and the attribute path denied.
     var judge = ActionArbiter{ .refuse_prefix = "nix.build.packages" };
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
     deps.arbiter = judge.arbiter();
     try run(allocator, io, deps);
 
-    // Refused on the first question, so the second is never put: an act that
-    // may not happen costs a reviewer nothing further.
     try testing.expectEqual(@as(usize, 1), judge.calls);
     try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawAt(0));
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
@@ -4866,7 +3098,6 @@ test "a build whose action is denied does not run, and the model is told" {
     deps.arbiter = judge.arbiter();
     try run(allocator, io, deps);
 
-    // Refused before the dispatch, so nothing evaluated and nothing ran.
     try testing.expectEqual(@as(usize, 1), judge.calls);
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 
@@ -4884,9 +3115,6 @@ test "a build whose action is denied does not run, and the model is told" {
 }
 
 test "a build whose attribute path cannot be named is refused, and nobody is asked" {
-    // An act nobody can name is an act nobody can write a rule for. A dotted
-    // string is the shape a model reaches for, so this is the case that really
-    // arrives.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4915,9 +3143,6 @@ test "a build whose attribute path cannot be named is refused, and nobody is ask
 }
 
 test "a session with no arbiter refuses every ordinary tool call and does not run it" {
-    // `Deps.arbiter`'s own doc says null is a refusal that says so, and this
-    // pins that an ordinary tool call is not an exception: a session that can
-    // ask nobody runs no tool, the same as it lifts no promise.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -4969,22 +3194,12 @@ test "the context the model sees is a fold over the log, and a resume gives the 
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // Two independent folds of the same, now finished, log: a session built by
-    // replaying it once, and a second session built by replaying it again from
-    // the start. A resume must produce the same context, and this is exactly
-    // that guarantee, proven over a log Loop.run itself produced rather than
-    // one built by hand.
     var first = try foldFromStart(allocator, io, store);
     defer first.deinit();
     var second = try foldFromStart(allocator, io, store);
     defer second.deinit();
 
     try testing.expectEqual(first.context.items.len, second.context.items.len);
-    // Four entries: the assistant's tool_use turn, the tool's own answer fed
-    // back as a message, and the assistant's final plain answer. Pinning
-    // the count, not just that the two folds agree with each other, is what
-    // stops this test passing on two folds that equally threw everything
-    // away.
     try testing.expectEqual(@as(usize, 3), first.context.items.len);
     for (first.context.items, second.context.items) |a, b| {
         try testing.expectEqual(std.meta.activeTag(a.data), std.meta.activeTag(b.data));
@@ -5030,9 +3245,6 @@ test "a second run on a started session does not append a second session.start" 
     const store = backing.storage();
     defer store.close(io);
 
-    // One plain answer for each run. A reconnect calls `run` again on the log
-    // the first call left behind, which is the case `run`'s own doc comment
-    // describes.
     var fake_client = FakeClient{ .turns = &.{
         .{ .deltas = &.{.{ .text = "first" }} },
         .{ .deltas = &.{.{ .text = "second" }} },
@@ -5049,13 +3261,7 @@ test "a second run on a started session does not append a second session.start" 
         defer parsed.deinit();
         if (parsed.value.event == .session_start) starts += 1;
     }
-    // The log is the truth and the session is a fold of it. A second
-    // session.start makes the folded agent_kind depend on which of the two the
-    // replay read last, so the count is the fact to pin.
     try testing.expectEqual(@as(usize, 1), starts);
-    // Both calls must have done a turn. Without this, a `run` that returned
-    // early on an already started session would pass the count above while
-    // doing nothing at all.
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
 }
 
@@ -5075,22 +3281,11 @@ test "an event is in the log before the action it describes happens" {
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // The check ran inside dispatch, before dispatch itself returned: a
-    // crash right there would still leave the tool.call event replayable.
     try testing.expect(fake_tools.saw_call_in_log);
 }
 
 test "the API key is in no event in the log" {
-    // The strongest structural guarantee this file can give without a real
-    // socket: nothing on Deps, and nothing this file builds from it, ever
-    // holds a credential. The stronger, end to end version of this fact,
-    // driven through a real HttpClient and a real key over the wire, lives
-    // in test/core/loop.zig: see this file's own top comment for why that
-    // one test needs fake_provider.zig and cannot live here.
     comptime {
-        // Four substring searches per field, at comptime, and `Deps` grows
-        // with every milestone. The default quota runs out well before the
-        // check is wrong.
         @setEvalBranchQuota(10_000);
         for (@typeInfo(Deps).@"struct".fields) |field| {
             const suspect = std.mem.indexOf(u8, field.name, "key") != null or
@@ -5142,8 +3337,6 @@ test "a tool that fails does not end the session" {
     try testing.expect(saw_finished_end);
 }
 
-/// The one `session.end` a finished log holds. Fails when a log holds none,
-/// which is a session that stopped with nothing saying why.
 fn endReasonOf(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5155,8 +3348,6 @@ fn endReasonOf(
     while (try replay.next(io)) |parsed| {
         defer parsed.deinit();
         if (parsed.value.event != .session_end) continue;
-        // A tag copy only: the parsed value's own strings die with `parsed`,
-        // and no caller of this reads `unknown`'s name.
         found = switch (parsed.value.event.session_end.reason) {
             .unknown => .{ .unknown = "" },
             inline else => |_, tag| @unionInit(event.SessionEndReason, @tagName(tag), {}),
@@ -5165,10 +3356,6 @@ fn endReasonOf(
     return found orelse error.NoSessionEnd;
 }
 
-/// The `detail` of the one `session.end` a finished log holds. Caller owns the
-/// result. Used by the tests that pin what a user is told when a session gives
-/// up: a reason alone says a session ended, and only the detail says what to
-/// act on.
 fn endDetailOf(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5187,9 +3374,6 @@ fn endDetailOf(
     return found orelse error.NoSessionEnd;
 }
 
-/// The text of the last assistant `message` event in the log. Caller owns the
-/// result. This is what a session actually produced, as opposed to the fact
-/// that it ended without an error.
 fn lastAssistantText(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5214,11 +3398,6 @@ fn lastAssistantText(
 }
 
 test "a first turn the provider answers with nothing ends the session empty_response" {
-    // The red team run of 2026-08-26 reported clean when nothing had happened.
-    // Its log held three lines: 7367 input tokens, 0 output tokens, an empty
-    // assistant message, and `session.end` saying `finished`. The process
-    // exited 0, so a run that got nothing back read exactly like a run that
-    // did the work. See `event.SessionEndReason.empty_response`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5226,21 +3405,17 @@ test "a first turn the provider answers with nothing ends the session empty_resp
     const store = backing.storage();
     defer store.close(io);
 
-    // One turn, no deltas at all: the provider was reached and said nothing.
     var fake_client = FakeClient{ .turns = &.{.{ .deltas = &.{} }} };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // Asked once and never again: there is nothing to carry into a second turn.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 
     const reason = try endReasonOf(allocator, io, store);
     try testing.expectEqual(event.SessionEndReason.empty_response, std.meta.activeTag(reason));
 
-    // **Never `finished`.** This is the whole fault: the two were the same
-    // word, and a script could not tell an answer from an absence.
     try testing.expect(std.meta.activeTag(reason) != event.SessionEndReason.finished);
 
     const detail = try endDetailOf(allocator, io, store);
@@ -5250,11 +3425,6 @@ test "a first turn the provider answers with nothing ends the session empty_resp
 }
 
 test "an empty turn carries the provider's own stop reason into the log" {
-    // `output_tokens: 0` beside a clean end says the provider explained itself
-    // and the reader threw the word away. Two earlier faults in this project
-    // had the same shape: `DenyBlockNotValid` swallowing Zoir's diagnostics,
-    // and std collapsing an unknown content encoding into `HttpHeadersInvalid`.
-    // See `chock_provider.Client.Delta.stop_reason`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5262,9 +3432,6 @@ test "an empty turn carries the provider's own stop reason into the log" {
     const store = backing.storage();
     defer store.close(io);
 
-    // `end_turn`, the word the measured session of 2026-08-26 carried. **Not
-    // `refusal`**, which no longer reaches this path at all: see
-    // `refused_by_model`, and the test below it.
     var fake_client = FakeClient{
         .turns = &.{.{ .deltas = &.{.{ .stop_reason = .{ .reason = "end_turn" } }} }},
     };
@@ -5277,16 +3444,10 @@ test "an empty turn carries the provider's own stop reason into the log" {
 
     const detail = try endDetailOf(allocator, io, store);
     defer allocator.free(detail);
-    // The provider's own word, and not a sentence Chock made up in its place.
     try testing.expect(std.mem.endsWith(u8, detail, "because of end_turn"));
 }
 
 test "a refusal that came with text ends the session and keeps the text" {
-    // **The ordinary refusal, not the edge case.** The classifier fires part
-    // way through a turn, so the model has usually written something by the
-    // time it lands. The words are real work and belong in the log, and the
-    // session still ends: see
-    // `chock_proto.event.SessionEndReason.refused_by_model`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5319,23 +3480,15 @@ test "a refusal that came with text ends the session and keeps the text" {
         detail,
     );
 
-    // **The text the model did write is still there.** A session that dropped
-    // it would leave the person reading the log unable to see what was said
-    // before the refusal landed.
     const said = try lastAssistantText(allocator, io, store);
     defer allocator.free(said);
     try testing.expectEqualStrings("Here is how the exploit works", said);
 
-    // **No retry, no second model, no reset.** One request, no tool, and the
-    // session ends.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 }
 
 test "a refusal with no text ends refused_by_model and never empty_response" {
-    // The two arrive looking alike, one turn with nothing to act on, and the
-    // advice on them is opposite: ask an empty turn again, and a refusal asked
-    // again is refused again.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5366,9 +3519,6 @@ test "a refusal with no text ends refused_by_model and never empty_response" {
 }
 
 test "a refusal with no category and no explanation still ends, and invents nothing" {
-    // Both fields of `stop_details` are nullable even on a real refusal. The
-    // session ends the same way, and the sentence says the provider gave no
-    // reason rather than naming one it never sent.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5393,16 +3543,11 @@ test "a refusal with no category and no explanation still ends, and invents noth
             "refusal",
         detail,
     );
-    // Nothing that names a class the provider never sent.
     try testing.expect(std.mem.indexOf(u8, detail, "category") == null);
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
 }
 
 test "every shape of a refusal gets its own sentence" {
-    // The four shapes the wire produces, side by side, because what separates
-    // them is what a person reading the log gets. A refusal with a sentence
-    // and a refusal without one must not read the same way, and neither may
-    // name anything the provider did not send. See `refusalDetail`.
     const allocator = testing.allocator;
     const opening = "the model backend refused a turn of the session";
 
@@ -5435,8 +3580,6 @@ test "every shape of a refusal gets its own sentence" {
         try testing.expectEqualStrings(case.want, detail);
     }
 
-    // The turn number is the other half of the sentence, and the first turn
-    // still reads as the first turn.
     const first = try refusalDetail(allocator, .{ .reason = "refusal" }, whichTurn(0));
     defer allocator.free(first);
     try testing.expectEqualStrings(
@@ -5447,9 +3590,6 @@ test "every shape of a refusal gets its own sentence" {
 }
 
 test "an empty turn reports the word the provider sent, or that it sent none" {
-    // A refusal never reaches this sentence: `runTurn` ends the session before
-    // it asks whether the turn was empty. What is left is a provider that
-    // stopped for some other reason, and one that named no reason at all.
     const allocator = testing.allocator;
     const opening = "the model backend answered a turn of the session with no text and no tool call";
 
@@ -5469,9 +3609,6 @@ test "an empty turn reports the word the provider sent, or that it sent none" {
         first,
     );
 
-    // A wire that one day sends a category or an explanation with some other
-    // stop reason keeps them, because both sentences render that clause
-    // through `stopWords`.
     const with_words = try emptyReplyDetail(
         allocator,
         .{ .reason = "max_tokens", .explanation = "The answer was cut short." },
@@ -5485,9 +3622,6 @@ test "an empty turn reports the word the provider sent, or that it sent none" {
 }
 
 test "a turn that carries only reasoning is empty, because nothing runs and nobody reads it" {
-    // A model that thought and then said nothing leaves the loop with no tool
-    // to run and the person with no answer, so a content list that is not
-    // empty is still an empty turn. See `saidSomething`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5510,8 +3644,6 @@ test "a turn that carries only reasoning is empty, because nothing runs and nobo
 }
 
 test "a turn of nothing but whitespace is an empty turn" {
-    // A newline is not an answer, and a session that ended `finished` with one
-    // is the same false OK as one that ended `finished` with nothing.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5531,11 +3663,6 @@ test "a turn of nothing but whitespace is an empty turn" {
 }
 
 test "an empty turn after real work ends empty_response, and says it was not the first turn" {
-    // The other half of the decision. The loop has one signal for "this turn
-    // was the last one", which is "it asked for no tool", so a later empty turn
-    // reaches the same place a first one does and produced no answer in the
-    // same way. The work it did before is in the log and in the workspace, and
-    // the detail is what tells a person the two apart.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5568,9 +3695,6 @@ test "an empty turn after real work ends empty_response, and says it was not the
 }
 
 test "a final turn with text and no tool call still ends the session finished" {
-    // The regression this pins: the empty turn check must not turn an ordinary
-    // completion into a fault. A model that answers and asks for nothing more
-    // is a session that finished.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5590,9 +3714,6 @@ test "a final turn with text and no tool call still ends the session finished" {
 }
 
 test "the same tool with the same arguments, three times in a row, ends the session no_progress" {
-    // The red team run of 2026-08-21: the model called the same read on the
-    // same paths sixteen times, and a 50 turn limit took 50 turns to notice
-    // what was plain by turn 3. See `no_progress_repeats`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5600,9 +3721,6 @@ test "the same tool with the same arguments, three times in a row, ends the sess
     const store = backing.storage();
     defer store.close(io);
 
-    // Ten identical turns are offered. The detector must stop long before
-    // the tenth, and nothing else here can stop this loop at all: no turn
-    // limit, no budget, and never a turn with plain text.
     const looping_turns = [_]FakeTurn{
         .{ .deltas = &.{.{ .tool_call = .{
             .index = 0,
@@ -5619,8 +3737,6 @@ test "the same tool with the same arguments, three times in a row, ends the sess
 
     try run(allocator, io, deps);
 
-    // Three turns asked, and the third call never ran: a call already
-    // answered the same way twice has nothing left to say.
     try testing.expectEqual(@as(usize, 3), fake_client.calls);
     try testing.expectEqual(@as(usize, 2), fake_tools.calls);
 
@@ -5629,9 +3745,6 @@ test "the same tool with the same arguments, three times in a row, ends the sess
 }
 
 test "a legitimate retry does not trip the no progress detector" {
-    // A tool call can fail for a reason that is gone a moment later, and a
-    // model that repeats the call once is doing the right thing. A detector
-    // that fired on the second identical call would stop a healthy session.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5664,11 +3777,6 @@ test "a legitimate retry does not trip the no progress detector" {
 }
 
 test "an alternation of two calls ends the session no_progress" {
-    // The red team run of 2026-08-21 walked straight through the old rule.
-    // The model alternated two `bash` calls, A B A B A, and a detector that
-    // held one previous call reset its count on every turn and never fired,
-    // while the model plainly made no progress. This test used to pin that
-    // behaviour as correct. See `no_progress_window`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5688,11 +3796,6 @@ test "an alternation of two calls ends the session no_progress" {
         .name = "read_file",
         .arguments = "{\"path\":\"b\"}",
     } }} };
-    // More alternation than the detector may need, and one plain text turn
-    // at the end. The text turn is not there to end the session: it is there
-    // so that a detector which never fires ends this test on the reason
-    // check below, rather than running the fake client out of turns and
-    // failing as a crash nobody can read.
     var fake_client = FakeClient{ .turns = &.{
         read_a,
         read_b,
@@ -5710,9 +3813,6 @@ test "an alternation of two calls ends the session no_progress" {
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // The fifth turn is the first that can hold A B A B A, and the fifth
-    // call never ran: the window is full of two calls the session already
-    // has both answers to.
     try testing.expectEqual(@as(usize, 5), fake_client.calls);
     try testing.expectEqual(@as(usize, 4), fake_tools.calls);
 
@@ -5721,12 +3821,6 @@ test "an alternation of two calls ends the session no_progress" {
 }
 
 test "build, edit, build, edit, build is work and is not stopped" {
-    // The false positive the window alone would cause, and the reason for
-    // `no_progress_distinct`. A model fixing one compile error at a time
-    // repeats the identical build call every time, and the edits between are
-    // different from each other. Three identical calls inside five, and it
-    // is the healthiest session a coding agent has. Without the second
-    // condition this test fails and the tool becomes untrustworthy.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5772,10 +3866,6 @@ test "build, edit, build, edit, build is work and is not stopped" {
 }
 
 test "read, edit, read of one file is not a loop" {
-    // The pattern the window was picked around. A model reads a file, edits
-    // it, and reads it back to see what it wrote. The two reads are
-    // identical calls with different answers, and there are only two of
-    // them, so nothing here may stop the session.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5813,18 +3903,11 @@ test "read, edit, read of one file is not a loop" {
 }
 
 test "the window holds the last calls only, so an old repeat leaves it" {
-    // `Progress` is a ring of `no_progress_window` calls, not a tally that
-    // grows forever. A call that has fallen out of the window must not still
-    // be counted, or a long session would end on repeats that are twenty
-    // turns apart. Read straight off `observe`, which is where the counting
-    // lives.
     const allocator = testing.allocator;
 
     var progress = Progress{};
     defer progress.deinit(allocator);
 
-    // Two of the same call, then a full window of different ones, then the
-    // same call again. The first two are gone by then.
     _ = try progress.observe(allocator, "read_file", "{\"path\":\"a\"}");
     _ = try progress.observe(allocator, "read_file", "{\"path\":\"a\"}");
     for (0..no_progress_window) |index| {
@@ -5840,9 +3923,6 @@ test "the window holds the last calls only, so an old repeat leaves it" {
 }
 
 test "the same call twice is not a loop, and the third time inside the window is" {
-    // The two numbers `isLoop` reads, pinned directly. A detector that fired
-    // on the second identical call would stop a legitimate retry, and one
-    // that needed the calls to be next to each other would miss a cycle.
     const allocator = testing.allocator;
 
     var straight = Progress{};
@@ -5865,7 +3945,6 @@ test "the same call twice is not a loop, and the third time inside the window is
     _ = try cycle.observe(allocator, "run_command", b);
     _ = try cycle.observe(allocator, "run_command", a);
     const fourth = try cycle.observe(allocator, "run_command", b);
-    // Four calls in, neither has been asked three times, so nothing fires.
     try testing.expect(!fourth.isLoop());
     const fifth = try cycle.observe(allocator, "run_command", a);
     try testing.expectEqual(@as(usize, 3), fifth.repeats);
@@ -5874,9 +3953,6 @@ test "the same call twice is not a loop, and the third time inside the window is
 }
 
 test "a session of more than fifty turns runs to completion" {
-    // Fifty was the old limit, and it stopped sessions that were still
-    // working. Pinned above that number on purpose: without this, removing
-    // the limit would be untested and a later change could put one back.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5889,9 +3965,6 @@ test "a session of more than fifty turns runs to completion" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Each turn asks for something different, which is what a session doing
-    // real work looks like, and is what keeps the no progress detector out
-    // of this test.
     const turns = try arena.alloc(FakeTurn, working_turns + 1);
     for (turns[0..working_turns], 0..) |*turn, index| {
         const deltas = try arena.alloc(chock_provider.Client.Delta, 1);
@@ -5920,9 +3993,6 @@ test "a session of more than fifty turns runs to completion" {
 }
 
 test "a caller that asks for a turn limit gets one, and the session ends turn_limit" {
-    // `--max-turns` stays for a caller that wants it, and it ends the
-    // session with a reason of its own rather than an `errored` end told
-    // apart by a sentence.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -5930,8 +4000,6 @@ test "a caller that asks for a turn limit gets one, and the session ends turn_li
     const store = backing.storage();
     defer store.close(io);
 
-    // Three different calls, so the no progress detector cannot be what
-    // stops this: only the limit can.
     var fake_client = FakeClient{ .turns = &.{
         .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "c1", .name = "read_file", .arguments = "{\"path\":\"a\"}" } }} },
         .{ .deltas = &.{.{ .tool_call = .{ .index = 0, .id = "c2", .name = "read_file", .arguments = "{\"path\":\"b\"}" } }} },
@@ -5951,31 +4019,17 @@ test "a caller that asks for a turn limit gets one, and the session ends turn_li
     try testing.expectEqual(event.SessionEndReason.turn_limit, std.meta.activeTag(reason));
 }
 
-/// Records every event it is told about, so a test can compare what an
-/// observer saw against what the log holds.
 const RecordingObserver = struct {
     allocator: std.mem.Allocator,
     ids: std.ArrayList(u64) = .empty,
     kinds: std.ArrayList(event.Kind) = .empty,
-    /// The number of events the log held at the moment each `onEvent` call
-    /// arrived. See the test below.
     log_lengths: std.ArrayList(usize) = .empty,
-    /// When set, read after each call, so the test can prove the event was
-    /// already durable before the observer heard about it.
     log_to_measure: ?*const chock_proto.storage.Memory = null,
-    /// Everything this observer was told, pieces and events in one list, in
-    /// the order it was told. **The order is the whole point**: a test that
-    /// only counted pieces would pass on an implementation that replayed them
-    /// all after the turn finished, which is the silence this seam exists to
-    /// end. See the test named for it.
     trace: std.ArrayList(Step) = .empty,
-    /// One entry per `Observer.onNotice` call, copied: the text is borrowed
-    /// for the call.
     notices: std.ArrayList([]u8) = .empty,
 
     const Step = union(enum) {
         event: event.Kind,
-        /// The text of one piece, copied: `Piece` is borrowed for the call.
         piece: []u8,
     };
 
@@ -6019,9 +4073,6 @@ const RecordingObserver = struct {
         };
     }
 
-    /// Every notice this observer was told, in order. See `Observer.onNotice`:
-    /// the test named for the rate limit reads this to prove a person watching
-    /// was told the session was waiting and not hung.
     fn onNoticeFn(ptr: *anyopaque, text: []const u8) void {
         const self: *RecordingObserver = @ptrCast(@alignCast(ptr));
         const owned = self.allocator.dupe(u8, text) catch return;
@@ -6031,7 +4082,6 @@ const RecordingObserver = struct {
         };
     }
 
-    /// Where the first piece is in `trace`, or null when none arrived.
     fn firstPiece(self: *const RecordingObserver) ?usize {
         for (self.trace.items, 0..) |step, index| {
             if (step == .piece) return index;
@@ -6039,7 +4089,6 @@ const RecordingObserver = struct {
         return null;
     }
 
-    /// Where the first event of `kind` is in `trace`, or null when none is.
     fn firstEvent(self: *const RecordingObserver, kind: event.Kind) ?usize {
         for (self.trace.items, 0..) |step, index| {
             if (step == .event and step.event == kind) return index;
@@ -6055,10 +4104,6 @@ const RecordingObserver = struct {
 };
 
 test "an observer is told about every event, in order, and never about one the log does not hold" {
-    // The seam `chock run` needs. `run` holds the exclusive lock for the
-    // whole session, so nothing outside this process can read the log while
-    // it works: without this, a caller has no way at all to show a user what
-    // is happening until the session is over.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6078,10 +4123,6 @@ test "an observer is told about every event, in order, and never about one the l
     deps.observer = watcher.observer();
     try run(allocator, io, deps);
 
-    // Every event the log holds, in the same order and with the same
-    // identifiers. Comparing against the log rather than against a list
-    // written by hand is what keeps this test honest when the loop's own
-    // sequence of events changes.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var index: usize = 0;
@@ -6092,33 +4133,15 @@ test "an observer is told about every event, in order, and never about one the l
         try testing.expectEqual(std.meta.activeTag(parsed.value.event), watcher.kinds.items[index]);
         index += 1;
     }
-    // The observer heard about exactly as many events as the log holds, so it
-    // was told about none the log does not have.
     try testing.expectEqual(index, watcher.ids.items.len);
-    // Nine: session.start, this turn's usage, the assistant's tool_use turn,
-    // tool.call, tool.result, the tool's answer fed back as a message, the
-    // second turn's usage, the assistant's final answer, and session.end.
-    // Pinning the count, and not only that the two agree, is what stops this
-    // passing on an observer that saw nothing against a log that held
-    // nothing.
     try testing.expectEqual(@as(usize, 9), index);
 
-    // Each call arrived after its own event was already in the log: the
-    // length the observer measured is past the offset it was given every
-    // time. An observer told before the append would show a user something a
-    // replay will not produce.
     for (watcher.ids.items, watcher.log_lengths.items) |id, length| {
         try testing.expect(length > id);
     }
 }
 
 test "a piece of the model's answer reaches the observer before the turn that holds it is over" {
-    // **The fact this whole seam exists for.** A test that only asked whether
-    // any output appeared would pass on the loop as it was: the answer already
-    // appears, as one block, at the end of the turn. What was missing is that
-    // it appears while the turn is still running, and a turn is minutes. So
-    // what is pinned here is the order: a piece reached the observer before
-    // the `message` event that closes the turn was appended.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6145,16 +4168,12 @@ test "a piece of the model's answer reaches the observer before the turn that ho
     const message_event = watcher.firstEvent(.message) orelse return error.NoMessageEvent;
     try testing.expect(first_piece < message_event);
 
-    // And every piece of the answer, not only the first one, was on the screen
-    // before the turn ended. A stream that delivered one piece early and the
-    // rest at the end would be the same silence in a thinner disguise.
     var pieces_before: usize = 0;
     for (watcher.trace.items[0..message_event]) |step| {
         if (step == .piece) pieces_before += 1;
     }
     try testing.expectEqual(@as(usize, 3), pieces_before);
 
-    // In the order the model produced them, and byte for byte.
     const expected = [_][]const u8{ "I will ", "read the file ", "first." };
     var seen: usize = 0;
     for (watcher.trace.items[0..message_event]) |step| {
@@ -6165,10 +4184,6 @@ test "a piece of the model's answer reaches the observer before the turn that ho
 }
 
 test "streaming the pieces changes nothing about the log, which still gains one message event per turn" {
-    // The other half of the seam, and the one a reader of a session depends
-    // on: this changes what a person sees, never what is recorded. Two runs of
-    // the same script, one watched and one not, and the logs must be the same
-    // shape with the same words in them.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6205,7 +4220,6 @@ test "streaming the pieces changes nothing about the log, which still gains one 
         try watched_kinds.append(allocator, std.meta.activeTag(parsed.value.event));
         if (parsed.value.event != .message) continue;
         messages += 1;
-        // Copied out of the parsed value, which is freed with it.
         answer = try allocator.dupe(u8, parsed.value.event.message.content[0].text);
     }
     defer allocator.free(answer);
@@ -6221,17 +4235,11 @@ test "streaming the pieces changes nothing about the log, which still gains one 
     }
     try testing.expectEqual(index, watched_kinds.items.len);
 
-    // One `message` event for the turn, holding the whole answer joined, and
-    // not one event per piece.
     try testing.expectEqual(@as(usize, 1), messages);
     try testing.expectEqualStrings("one two three", answer);
 }
 
 test "the model's reasoning reaches the observer as reasoning, and never as answer text" {
-    // The two are different things to show, and only the observer can decide
-    // what to do with each: see `Piece`. A loop that folded them together
-    // would put the model's private working out in the middle of its answer
-    // with no way for a printer to separate them again.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6244,8 +4252,6 @@ test "the model's reasoning reaches the observer as reasoning, and never as answ
             .{
                 .deltas = &.{
                     .{ .reasoning = "weighing the approach" },
-                    // Neither of these is a word the model said, so neither reaches
-                    // the observer as a piece: see `Piece`.
                     .{ .reasoning_signature = "SIG==" },
                     .{ .usage = .{ .input_tokens = 10, .output_tokens = 2 } },
                     .{ .text = "the answer" },
@@ -6266,8 +4272,6 @@ test "the model's reasoning reaches the observer as reasoning, and never as answ
     try testing.expectEqual(Piece.text, kinds.pieces.items[1]);
 }
 
-/// Records which kind each piece was, and nothing else. Only the reasoning
-/// test above uses it.
 const KindRecordingObserver = struct {
     allocator: std.mem.Allocator,
     pieces: std.ArrayList(std.meta.Tag(Piece)) = .empty,
@@ -6303,26 +4307,16 @@ const KindRecordingObserver = struct {
     };
 };
 
-/// The flag the cancel tests below read through a function pointer, which is
-/// the shape `Deps.canceled` takes. A file scope variable, because a function
-/// pointer carries no context of its own: the real one is a signal handler's
-/// flag in `src/interrupt.zig`, which is the same shape for the same reason.
 var test_cancel_asked: bool = false;
 
 fn testCanceled() bool {
     return test_cancel_asked;
 }
 
-/// A user pressing Ctrl-C while the session is waiting out a rate limit. Given
-/// to `RecordingSleeper.on_wait` by the test named for it.
 fn askForCancelDuringWait() void {
     test_cancel_asked = true;
 }
 
-/// A `ToolRunner` that asks for the session to stop as soon as it has run
-/// `after` calls. This is a user pressing Ctrl-C in the middle of a turn: the
-/// stop arrives while `run` holds the log's exclusive lock and is partway
-/// through a turn of several tool calls.
 const CancelingToolRunner = struct {
     after: usize,
     calls: usize = 0,
@@ -6352,11 +4346,7 @@ const CancelingToolRunner = struct {
     const vtable = ToolRunner.VTable{ .dispatch = dispatch };
 };
 
-/// What the handover tests below answer, and what the loop told them. File
-/// scope for the reason `test_cancel_asked` is: `Deps.handover` is a function
-/// pointer and carries no context of its own.
 var test_handover_agree: bool = false;
-/// How many times the loop asked, and what it said was in flight the last time.
 var test_handover_asks: usize = 0;
 var test_handover_seen: InFlight = .{};
 
@@ -6367,10 +4357,6 @@ fn testHandover(io: std.Io, in_flight: InFlight) bool {
     return test_handover_agree;
 }
 
-/// A `ToolRunner` that agrees to a handover as soon as it has run `after`
-/// calls. **This is what pins that the loop does not stop in the middle of a
-/// turn**: the answer turns true while a turn is already running, and the loop
-/// still has to finish that turn's tool calls before it stops.
 const HandingOverToolRunner = struct {
     after: usize,
     calls: usize = 0,
@@ -6401,15 +4387,6 @@ const HandingOverToolRunner = struct {
 };
 
 test "a session handed over ends its log saying so, and not saying a person canceled it" {
-    // **The reason is what makes this a handover and not a stop.** The fold is
-    // the truth about a session, so the process taking over reads this reason,
-    // `chock sessions` reads it, and `src/main.zig` turns it into an exit code
-    // of its own. A log that said `canceled_by_user` would tell every one of
-    // them that a person said no.
-    //
-    // Mutation check: write `canceled_by_user` in `endIfHandedOver` and the
-    // last two lines stop holding, which is a handover a script reads as a
-    // refusal.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6427,8 +4404,6 @@ test "a session handed over ends its log saying so, and not saying a person canc
     var fake_tools = FakeToolRunner{ .output = "ok" };
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
-    // Two real tables, both empty, so what reaches the hook is what these
-    // answer and not a value this test made up.
     var tasks = task_table.Table{ .gpa = allocator, .dir = "/tmp", .runner = undefined };
     var children = subagent.Table{ .gpa = allocator, .spawner = undefined };
     deps.tasks = &tasks;
@@ -6436,17 +4411,9 @@ test "a session handed over ends its log saying so, and not saying a person canc
     deps.handover = testHandover;
     try run(allocator, io, deps);
 
-    // **Nothing was spent.** The ask is answered before the request is built,
-    // so a session that changes hands does not pay for a turn the next owner
-    // will send again.
     try testing.expectEqual(@as(usize, 0), fake_client.calls);
     try testing.expectEqual(@as(usize, 1), test_handover_asks);
 
-    // **And what the hook was told came from the two tables.** Nothing here
-    // ever started a task or a child, so both counts are zero, which is the one
-    // state that permits a handover. Mutation check: read `startedCount`
-    // instead of `runningCount`, or read one table twice, and a session with a
-    // finished task would refuse every handover for the rest of its life.
     try testing.expectEqual(@as(usize, 0), test_handover_seen.tasks);
     try testing.expectEqual(@as(usize, 0), test_handover_seen.children);
 
@@ -6469,12 +4436,6 @@ test "a session handed over ends its log saying so, and not saying a person canc
 }
 
 test "a session nobody asked for runs exactly as one with no handover hook at all" {
-    // The other half, and the one that would break every session if it were
-    // wrong. `Deps.handover` is read on every turn, so an answer of no has to
-    // cost nothing and change nothing.
-    //
-    // Mutation check: make `endIfHandedOver` stop when the hook answers false,
-    // and every session ends on its first turn.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6502,7 +4463,6 @@ test "a session nobody asked for runs exactly as one with no handover hook at al
 
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
     try testing.expectEqual(@as(usize, 1), fake_tools.calls);
-    // Asked once per turn, and never inside one.
     try testing.expectEqual(@as(usize, 2), test_handover_asks);
 
     var replay = try store.replay(allocator, io, 0);
@@ -6517,18 +4477,6 @@ test "a session nobody asked for runs exactly as one with no handover hook at al
 }
 
 test "a handover agreed to mid turn waits for the turn to end, so no tool call is left unanswered" {
-    // **The whole reason this is not `Deps.canceled`.** `canceled` is read
-    // between two tool calls of one turn, and a session stopped there leaves an
-    // assistant message whose `tool_use` parts have no matching `tool.result`.
-    // A person pressing Ctrl-C has accepted that. A handover must not produce
-    // it, because the next owner has to send that context to a provider, and a
-    // provider refuses a `tool_use` with no result.
-    //
-    // The runner below agrees while the first of two tool calls is running.
-    //
-    // Mutation check: call `endIfHandedOver` from the tool call loop as well,
-    // beside `endIfCanceled`, and the second call below never runs, so the log
-    // holds a `tool.call` the next owner can never answer.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6547,7 +4495,6 @@ test "a handover agreed to mid turn waits for the turn to end, so no tool call i
     var fake_client = FakeClient{
         .turns = &.{
             .{ .deltas = &two_calls },
-            // Never sent: the next turn boundary is where the session stops.
             .{ .deltas = &.{.{ .text = "unreachable" }} },
         },
     };
@@ -6557,14 +4504,9 @@ test "a handover agreed to mid turn waits for the turn to end, so no tool call i
     deps.handover = testHandover;
     try run(allocator, io, deps);
 
-    // **Both calls ran**, even though the answer turned to yes during the
-    // first. That is the difference from a Ctrl-C, which stops after one.
     try testing.expectEqual(@as(usize, 2), fake_tools.calls);
-    // And the turn after it was never sent.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
 
-    // Every tool call in the log has its result, which is what a provider needs
-    // and what the next owner is about to send.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var calls: usize = 0;
@@ -6585,13 +4527,6 @@ test "a handover agreed to mid turn waits for the turn to end, so no tool call i
 }
 
 test "a person at the keyboard beats another process asking for the session" {
-    // Both answers are read at the top of the same turn, so the order decides
-    // what the log says. A Ctrl-C recorded as a handover would tell the person
-    // who pressed it that their session moved somewhere, and would tell a
-    // script that a task carries on when the person stopped it.
-    //
-    // Mutation check: read `endIfHandedOver` before `endIfCanceled` and the
-    // reason below becomes `handed_over`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6624,11 +4559,6 @@ test "a person at the keyboard beats another process asking for the session" {
 }
 
 test "a session that is stopped still ends its log, and says it was the user who stopped it" {
-    // **The hole this closes.** A signal does not run a deferred append, so a
-    // killed session left a log ending on whatever event happened to be last,
-    // and a reader could not tell that apart from a process that died mid
-    // write. A real log from a killed session ended on a `tool.result` with no
-    // `session.end` at all.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6639,9 +4569,6 @@ test "a session that is stopped still ends its log, and says it was the user who
     const store = backing.storage();
     defer store.close(io);
 
-    // Two tool calls in one turn. The first one asks for the stop, so the
-    // session is interrupted partway through a turn, which is the moment a
-    // person actually presses the key.
     const two_calls = [_]chock_provider.Client.Delta{
         .{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } },
         .{ .tool_call = .{ .index = 1, .id = "call2", .name = "run_command", .arguments = "{\"x\":1}" } },
@@ -6649,7 +4576,6 @@ test "a session that is stopped still ends its log, and says it was the user who
     var fake_client = FakeClient{
         .turns = &.{
             .{ .deltas = &two_calls },
-            // Never reached: the session stops before it asks for another turn.
             .{ .deltas = &.{.{ .text = "unreachable" }} },
         },
     };
@@ -6659,13 +4585,9 @@ test "a session that is stopped still ends its log, and says it was the user who
     deps.canceled = testCanceled;
     try run(allocator, io, deps);
 
-    // The second tool call of the same turn never ran: the stop is read
-    // between two calls, not only between two turns.
     try testing.expectEqual(@as(usize, 1), fake_tools.calls);
-    // And no second turn was ever sent.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
 
-    // The log ends, and it ends saying who ended it.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var last_kind: ?event.Kind = null;
@@ -6678,8 +4600,6 @@ test "a session that is stopped still ends its log, and says it was the user who
         ends += 1;
         reason = parsed.value.event.session_end.reason;
     }
-    // The last event, and not merely one somewhere in the middle: a reader
-    // walking the log to its end is the one this is for.
     try testing.expectEqual(event.Kind.session_end, last_kind.?);
     try testing.expectEqual(@as(usize, 1), ends);
     try testing.expectEqual(
@@ -6689,10 +4609,6 @@ test "a session that is stopped still ends its log, and says it was the user who
 }
 
 test "a session stopped before its first turn spends nothing at all" {
-    // The other safe point, and the order that matters at it: a session the
-    // user has already stopped must not send one more model call, and must not
-    // be refused for a budget either, because neither of those is what
-    // happened to it.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6717,11 +4633,6 @@ test "a session stopped before its first turn spends nothing at all" {
 }
 
 test "a session nobody stops runs to the end, so the check costs a healthy session nothing" {
-    // The other half. `canceled` says no for the whole session here, and the
-    // session must behave exactly as it does with no `canceled` at all: the
-    // reason a stop is read at two points per turn is that it is cheap, and a
-    // check that ended healthy sessions would be worse than the silence it
-    // replaced.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6749,9 +4660,6 @@ test "a session nobody stops runs to the end, so the check costs a healthy sessi
 }
 
 test "a session with no observer behaves exactly as it did before there was one" {
-    // The field is optional, and the default must change nothing. Without
-    // this, adding the seam could quietly change the log every other test in
-    // this file reads.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6773,14 +4681,9 @@ test "a session with no observer behaves exactly as it did before there was one"
         defer parsed.deinit();
         events += 1;
     }
-    // session.start, the turn's usage, the assistant's message, session.end.
     try testing.expectEqual(@as(usize, 4), events);
 }
 
-/// Append one event to `store` outside `run`, the way `src/run.zig` seeds a
-/// session's first message. The budget tests below use it to put a session's
-/// earlier spending in the log before `run` folds it, and the spawn tests use
-/// it to put a session's earlier children there.
 fn seedEvent(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -6792,8 +4695,6 @@ fn seedEvent(
     _ = try locked.append(allocator, io, ev, 0);
 }
 
-/// Fold every event `store` holds and give back the spend. Two calls on the
-/// same log must agree: see the replay test below.
 fn foldSpend(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -6811,10 +4712,6 @@ fn foldSpend(
 }
 
 test "a cap is checked before the request, and a refused turn sends nothing at all" {
-    // Money cannot be un-spent, so the check happens before the request goes
-    // out and not after the reply lands. Counting the client's calls is what
-    // makes that visible: a check placed after the send would leave this at
-    // one, with the money already gone.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6822,8 +4719,6 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
     const store = backing.storage();
     defer store.close(io);
 
-    // A turn that already spent the whole budget. The projection for the
-    // next turn is the same amount again, so the next turn cannot fit.
     try seedEvent(allocator, io, store, .{ .usage = .{
         .input_tokens = 1000,
         .output_tokens = 500,
@@ -6842,7 +4737,6 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
 
     var saw_request = false;
     var saw_response = false;
-    // The id the request was written at, so the answer can be joined to it.
     var request_id: u64 = 0;
     var end_detail: []const u8 = "";
     var replay = try store.replay(allocator, io, 0);
@@ -6857,25 +4751,14 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
             },
             .approval_response => |response| {
                 saw_response = true;
-                // No answer before the timeout is a refusal, and a refusal is
-                // the safe direction for a budget. Nothing answers this one, so
-                // it is expired.
                 try testing.expectEqual(
                     event.ApprovalDecision.expired,
                     std.meta.activeTag(response.decision),
                 );
-                // **The answer names the question.** A zero here reads as an
-                // event not yet written, which would leave this answer
-                // attached to nothing and unjoinable by a reader that folds
-                // the log. The request is written first, so its id is known.
                 try testing.expect(request_id != 0);
                 try testing.expectEqual(request_id, response.request_id);
             },
             .session_end => |ended| {
-                // A reason of its own, not `errored`: reaching a cap the user
-                // wrote is not a fault, and a reader that had to match on a
-                // sentence to tell the two apart would drift the first time
-                // the sentence was reworded.
                 try testing.expectEqual(
                     event.SessionEndReason.budget_reached,
                     std.meta.activeTag(ended.reason),
@@ -6887,9 +4770,6 @@ test "a cap is checked before the request, and a refused turn sends nothing at a
     }
     defer allocator.free(end_detail);
 
-    // Hitting a cap is an approval, not a crash: the record of the question
-    // and of its refusal is in the log, which is what lets a user raise the
-    // cap and continue instead of losing the work.
     try testing.expect(saw_request);
     try testing.expect(saw_response);
     try testing.expect(std.mem.startsWith(u8, end_detail, budget_detail_prefix));
@@ -6924,19 +4804,11 @@ test "a session under a cap it has not reached runs, and its usage lands in the 
     try testing.expectEqual(@as(u64, 2), spend.turns);
     try testing.expectEqual(@as(u64, 1300), spend.input_tokens);
     try testing.expectEqual(@as(u64, 150), spend.output_tokens);
-    // "test-model" is in no price table, so this turn could not be priced and
-    // the total is no longer one a cap may be enforced against. That is the
-    // honest answer, and it is why the loop stops enforcing rather than
-    // guessing.
     try testing.expectEqual(@as(u64, 1), spend.unpriced_turns);
     try testing.expect(!spend.enforceable());
 }
 
 test "a provider that reports no usage still gets a usage event, saying the cost is unknown" {
-    // A provider with no usage capability reports its cost as unknown. That is
-    // the whole behaviour. The session runs, and the log says plainly that it
-    // could not be measured, which is what a reader needs to tell an unmeasured
-    // session apart from a free one.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6960,16 +4832,12 @@ test "a provider that reports no usage still gets a usage event, saying the cost
         try testing.expect(usage.cost != .free);
         try testing.expectEqualStrings("test-model", usage.model);
         try testing.expectEqualStrings("main", usage.model_alias);
-        // Nothing computed this, so no table version is claimed for it.
         try testing.expectEqualStrings("", usage.price_table_version);
     }
     try testing.expect(saw_usage);
 }
 
 test "a free provider under a cap runs to completion, because free is not unknown" {
-    // The other half of the three states. A local llama.cpp server costs
-    // nothing, and a session against it must run under a cap without
-    // trouble, however many turns it takes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -6988,8 +4856,6 @@ test "a free provider under a cap runs to completion, because free is not unknow
     deps.billing = .free;
     try run(allocator, io, deps);
 
-    // Both turns ran: a cap that stopped a free session would be reading
-    // "cost nothing" as "cost unknown".
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
 
     const spend = try foldSpend(allocator, io, store);
@@ -7000,10 +4866,6 @@ test "a free provider under a cap runs to completion, because free is not unknow
 }
 
 test "the cost of a session survives a replay: two folds of one log agree" {
-    // The log is the truth, and a total that lives only in the running process
-    // is lost on a /daemonize, on a reconnect, and on a replay. Folding twice
-    // is how this project already pins that for the context, and the total gets
-    // the same test.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7034,18 +4896,12 @@ test "the cost of a session survives a replay: two folds of one log agree" {
     try testing.expectEqual(first.output_tokens, second.output_tokens);
     try testing.expectEqual(first.amount, second.amount);
     try testing.expectEqual(first.unpriced_turns, second.unpriced_turns);
-    // And the numbers are the ones the two turns actually reported, so this
-    // is not two folds agreeing on nothing.
     try testing.expectEqual(@as(u64, 2), first.turns);
     try testing.expectEqual(@as(u64, 3000), first.input_tokens);
     try testing.expectEqual(@as(u64, 130), first.output_tokens);
 }
 
 test "a cap in one currency and turns billed in another is not enforced" {
-    // Inventing an exchange rate here would be worse than not enforcing: the
-    // number it produced would look like a real total and stop a session for
-    // a reason nobody could check. The same answer an unknown cost gets, one
-    // level up.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7064,18 +4920,10 @@ test "a cap in one currency and turns billed in another is not enforced" {
     deps.budget = .{ .max_cost = 5.00, .currency = "USD" };
     try run(allocator, io, deps);
 
-    // The turn went out: 99 EUR against a 5 USD cap is not 99 > 5, it is two
-    // numbers that cannot be compared.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
 }
 
 test "an image answer puts the bytes in the message event and the description in the tool result" {
-    // The decision, measured end to end: one copy of a picture in the log,
-    // and it is the copy the context is folded from.
-    //
-    // **Mutation check:** drop the `.image` branch that appends the second
-    // content part in `runTool`. The message event then holds one part, the
-    // request holds no image, and the first three assertions fail.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7106,12 +4954,9 @@ test "an image answer puts the bytes in the message event and the description in
 
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
 
-    // The picture reached the provider, in the request the second turn made.
     const json = fake_client.last_request_json.?;
     try testing.expect(std.mem.indexOf(u8, json, data) != null);
 
-    // And in the log: the message event carries the bytes, and it is the only
-    // event that does.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var image_parts: usize = 0;
@@ -7134,7 +4979,6 @@ test "an image answer puts the bytes in the message event and the description in
                 try testing.expectEqualStrings("image/png", image.media_type);
                 try testing.expectEqual(@as(u64, 69), image.byte_count);
                 try testing.expectEqualStrings("0123456789abcdef", image.content_hash);
-                // The bytes are not here, and that is the whole point.
                 try testing.expectEqualStrings("", image.data);
             },
             else => {},
@@ -7146,13 +4990,6 @@ test "an image answer puts the bytes in the message event and the description in
 }
 
 test "a tool that answers with bytes that are not UTF-8 leaves a JSON string in the request, never an array" {
-    // The fault this pins ended every session that read any binary file: a
-    // git object, an image, an archive, a compiled program. See
-    // `tools.outputForModel` for the measurement.
-    //
-    // **The assertion is on the serialized request and not on the Zig
-    // value.** Both shapes are a valid `[]const u8`, so a test that read
-    // `messages[n].content[0].tool_result.output` would pass either way.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7174,18 +5011,12 @@ test "a tool that answers with bytes that are not UTF-8 leaves a JSON string in 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
     defer if (fake_client.last_request_json) |json| allocator.free(json);
 
-    // The session ran its second turn, so it survived the tool result.
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
 
     const json = fake_client.last_request_json.?;
     try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"[chock: binary output, 10 bytes, not shown]\"") != null);
-    // The exact shape that made the provider answer 400. Written out rather
-    // than described, because this is the thing that must never appear.
     try testing.expect(std.mem.indexOf(u8, json, "[120,156,75,202,201,255,254,128,129,0]") == null);
 
-    // And the log holds the stand in too, so a replay of this session can
-    // still be parsed back. A log line with an array where a string belongs
-    // is a session that cannot be resumed.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var saw_result = false;
@@ -7199,20 +5030,6 @@ test "a tool that answers with bytes that are not UTF-8 leaves a JSON string in 
 }
 
 test "a result's note reaches the log and never the model" {
-    // **A tool result has two readers.** `output` is written for the model and
-    // says what the agent may do next. The note is written for the person and
-    // says what the person may do, and the split exists because one string
-    // cannot do both: the project owner read a refusal addressed to the model
-    // as a message addressed to him and reported a working refusal as a fault.
-    //
-    // **The guarantee is that only three fields become a content part.** So
-    // this is asserted on the serialized request, not on a Zig value: a test
-    // that read the neutral message would pass even if the note were folded
-    // into the output on the way out.
-    //
-    // Mutation check: add `note` to the `feedback` part in `runTool` and the
-    // request assertion fails. Drop `.note` from the event `runFetch` and
-    // `runTool` build and the log assertion fails.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7236,13 +5053,10 @@ test "a result's note reaches the log and never the model" {
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
     defer if (fake_client.last_request_json) |json| allocator.free(json);
 
-    // The bytes the model really got. The output is there and the note is not.
     const json = fake_client.last_request_json.?;
     try testing.expect(std.mem.indexOf(u8, json, "SOCK_RAW") != null);
     try testing.expect(std.mem.indexOf(u8, json, "no network at all") == null);
 
-    // And the log kept it, so a replay shows the person what the person was
-    // shown at the time.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var saw_result = false;
@@ -7259,9 +5073,6 @@ test "a result's note reaches the log and never the model" {
 }
 
 test "ordinary text output reaches the request unchanged, multi byte characters included" {
-    // The other half of the check above: it must not mangle what it was not
-    // written for. Every character past the first here is more than one
-    // byte.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7287,10 +5098,6 @@ test "ordinary text output reaches the request unchanged, multi byte characters 
 }
 
 test "a megabyte with no newline survives the turn as a JSON string" {
-    // Long is not the same fact as binary, and a plausible thing a real
-    // command prints. `tools.max_output_bytes` is what bounds a real tool
-    // call. This runner is not the sandbox one, so it carries the whole
-    // megabyte and the point is that the turn still goes out as a string.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7320,41 +5127,13 @@ test "a megabyte with no newline survives the turn as a JSON string" {
     try testing.expect(std.mem.indexOf(u8, json, "binary output") == null);
 }
 
-// `lib/chock-core/redact.zig` holds the mechanism and the honest framing.
-// These pin what only a whole session can show: that the one chokepoint really
-// is on every road out, that the log's own bytes never hold the value, that a
-// log written this way still verifies, and that a project which declared
-// nothing is untouched.
-//
-// **No assertion below prints the value.** Every check is a boolean over a
-// haystack, because `expectEqualStrings` prints both sides and one of those
-// sides is the thing this whole feature exists to keep out of print. The
-// storage is `chock_proto.storage.Memory`, so nothing here reaches a disk
-// either.
-
-/// An invented value with no meaning anywhere. The only value in this file
-/// that stands in for a credential.
 const fake_key = "sk-loop-test-000000000000000000";
 
-/// Every byte the log holds, in the shape another client would be served.
 fn logBytes(backing: *const chock_proto.storage.Memory) []const u8 {
     return backing.bytes.items;
 }
 
 test "a credential in a tool result is in none of the log's own bytes" {
-    // **The half that cannot be undone later.** The log is append only and
-    // hash chained, so a credential written here stays here: taking it out
-    // afterwards breaks the chain of every record that follows. So there is no
-    // cleanup, only prevention, and this is the test that says prevention
-    // happened.
-    //
-    // The realistic accident: a program printed the key back inside its own
-    // error message, twice, once in the command it echoed and once in the
-    // failure. Both go, and the words around them stay, so the model can
-    // still act on the error.
-    //
-    // Mutation check: append `ev` instead of `clean` in `appendAndApply` and
-    // the raw byte search below fails.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7378,27 +5157,17 @@ test "a credential in a tool result is in none of the log's own bytes" {
     try run(allocator, io, deps);
     defer if (fake_client.last_request_json) |json| allocator.free(json);
 
-    // **The log's own bytes, and not a parsed field.** This is what `chockd`
-    // serves and what an export ships, so it is the only search that answers
-    // the question.
     try testing.expect(std.mem.indexOf(u8, logBytes(&backing), fake_key) == null);
 
     const json = fake_client.last_request_json.?;
-    // Every appearance, and not the first one.
     try testing.expect(std.mem.indexOf(u8, json, fake_key) == null);
     try testing.expectEqual(
         @as(usize, 2),
         std.mem.count(u8, json, redact.Source.credential.marker()),
     );
-    // **A marker and not silence.** A model handed a gap retries the read and
-    // burns turns on a value it will never see. A model handed this stops
-    // asking. The rest of the message is still there for it to act on.
     try testing.expect(std.mem.indexOf(u8, json, "401 for key ") != null);
     try testing.expect(std.mem.indexOf(u8, json, ", check it") != null);
 
-    // **The record still says what happened.** A marker stands where the value
-    // was, so a reader learns a secret was there and which layer caught it.
-    // What is lost is the value alone.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var saw_result = false;
@@ -7415,19 +5184,11 @@ test "a credential in a tool result is in none of the log's own bytes" {
     }
     try testing.expect(saw_result);
 
-    // **And the chain still holds over it.** Redaction rewrites bytes that are
-    // about to be hashed, so the record that is hashed has to be the redacted
-    // one. It is: the replacement happens before `Locked.append`.
     const report = try chock_proto.storage.verify(store, allocator, io);
     try testing.expectEqual(chock_proto.chain.Verdict.intact, report.verdict);
     try testing.expect(report.events > 0);
     try testing.expectEqual(report.events, report.chained);
 
-    // **And this is why prevention is all there is.** The record after this one
-    // carries the hash of these bytes, so one byte changed inside the marker is
-    // found. A session that wrote the value and tried to take it out later would
-    // leave exactly this verdict behind, which is the reason the replacement has
-    // to happen before the append. Last, because it spoils the log.
     const marker_at = std.mem.indexOf(u8, logBytes(&backing), redact.Source.credential.marker()).?;
     backing.bytes.items[marker_at + 1] = 'X';
     const forged = try chock_proto.storage.verify(store, allocator, io);
@@ -7435,16 +5196,6 @@ test "a credential in a tool result is in none of the log's own bytes" {
 }
 
 test "the funnel is the append, so a kind nobody listed is covered too" {
-    // **Why `appendAndApply` is the seam and `Broker.appendToolResult` is
-    // not.** A tool result is not the only record that carries bytes a
-    // workspace supplied: a `session.end` written from a provider refusal
-    // carries the body that provider sent back, and that body is where a
-    // credential most often echoes. `chock-core` imports no `chock-broker` at
-    // all, so a redactor over one event kind in the broker could never have
-    // been on this road.
-    //
-    // Mutation check: redact only `.tool_result` in `appendAndApply` and this
-    // fails while the test above still passes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7452,8 +5203,6 @@ test "the funnel is the append, so a kind nobody listed is covered too" {
     const store = backing.storage();
     defer store.close(io);
 
-    // A refusal the retry policy gives up on, so `sendWithRetry` writes a
-    // `session.end` holding the provider's own words.
     const refused = "rate limited for key " ++ fake_key;
     var fake_client = FakeClient{ .turns = &.{
         .{ .refusal = .{ .status = .too_many_requests, .body = refused } },
@@ -7471,8 +5220,6 @@ test "the funnel is the append, so a kind nobody listed is covered too" {
 
     try testing.expect(std.mem.indexOf(u8, logBytes(&backing), fake_key) == null);
 
-    // The `session.end` really was written with the provider's words in it, so
-    // this is not a test that passed because nothing was recorded.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var saw_end = false;
@@ -7488,12 +5235,6 @@ test "the funnel is the append, so a kind nobody listed is covered too" {
 }
 
 test "a project that declared nothing sends byte for byte what it sent before" {
-    // The property that lets this ship at all. The output below is exactly
-    // the shape the best effort patterns look for, and none of them runs,
-    // because `redact.Policy` is inert until somebody fills it in.
-    //
-    // Mutation check: give `redact.Policy.heuristics` a default of true and
-    // both assertions fail.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7512,8 +5253,6 @@ test "a project that declared nothing sends byte for byte what it sent before" {
     };
     var fake_tools = FakeToolRunner{ .output = shaped };
 
-    // No `deps.redact` at all, which is what a caller that never heard of it
-    // passes.
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
     defer if (fake_client.last_request_json) |json| allocator.free(json);
 
@@ -7523,14 +5262,6 @@ test "a project that declared nothing sends byte for byte what it sent before" {
 }
 
 test "the compaction call is redacted too, so the second road out is not a way past" {
-    // **The whole reason `sendOnce` exists.** A compaction sends the rendered
-    // context to the provider through a request this loop builds by hand, so
-    // a redactor that sat in the ordinary turn alone would let every secret
-    // in the context out on the turn the session got long.
-    //
-    // Mutation check: call `Client.sendAndAssemble` directly in
-    // `askForSummary` and this fails while every other test in this file
-    // still passes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7566,8 +5297,6 @@ test "the compaction call is redacted too, so the second road out is not a way p
     deps.redact = .{ .secrets = &.{.{ .value = fake_key, .source = .credential }} };
     try run(allocator, io, deps);
 
-    // The compaction really happened, so this is not a test that passed
-    // because nothing was sent.
     var found = (try firstCompaction(allocator, io, store)).?;
     defer found.deinit(allocator);
 
@@ -7577,26 +5306,11 @@ test "the compaction call is redacted too, so the second road out is not a way p
         try testing.expect(std.mem.indexOf(u8, one.tail, fake_key) == null);
         if (!std.mem.eql(u8, one.system, compaction.summary_system)) continue;
         saw_summary_call = true;
-        // The context it rendered really did carry the value, so the marker
-        // is what stands where it was.
         try testing.expect(std.mem.indexOf(u8, one.tail, redact.Source.credential.marker()) != null);
     }
     try testing.expect(saw_summary_call);
 }
 
-// The two sessions measured on 2026-08-21: one grew from 2323 to 19534 input
-// tokens and slowed by four times with it, and the next died outright on
-// `request (77857 tokens) exceeds the available context size (65536 tokens)`.
-// `compaction` was already an event kind and this loop never wrote one.
-//
-// **A compaction test that only says the context got smaller is vacuous.**
-// Each of these names the fact it pins: that the summary is there, that what
-// `kept_ranges` named survived word for word, that the user's own task was
-// never folded, and that a second fold of the same log builds the same
-// context.
-
-/// Put `count` assistant messages in `store`, each holding `text` with its
-/// own number, so a test starts with a context long enough to fold.
 fn seedMessages(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -7612,9 +5326,6 @@ fn seedMessages(
     }
 }
 
-/// Every `compaction` event in `store`, as the ids and the fields a test
-/// wants to talk about. The summary text is copied, because the parsed value
-/// it came from dies with the replay.
 const FoundCompaction = struct {
     id: u64,
     summary: []u8,
@@ -7656,9 +5367,6 @@ fn firstCompaction(
     return null;
 }
 
-/// Every text part of every `.message` context entry of a folded session,
-/// joined, plus every `.summary` entry. What a test reads to say a turn
-/// survived a compaction word for word, or did not.
 fn contextText(allocator: std.mem.Allocator, session: *const chock_proto.state.Session) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -7677,9 +5385,6 @@ fn contextText(allocator: std.mem.Allocator, session: *const chock_proto.state.S
 }
 
 test "a session that overflows its context compacts, takes the turn again, and does not end errored" {
-    // **The whole point.** Before this, the measured 400 below ended the
-    // session and threw away every turn it had already done. A context
-    // overflow is not a failure: it is the condition compaction answers.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7694,11 +5399,8 @@ test "a session that overflows its context compacts, takes the turn again, and d
 
     var fake_client = FakeClient{
         .turns = &.{
-            // The turn the provider refuses, because the request is too large.
             .{ .refusal = .{ .body = measured_overflow_body } },
-            // The summary call the compaction makes.
             .{ .deltas = &.{.{ .text = "the parser work is half done and the tab case is open" }} },
-            // The same turn, taken again with the shorter context.
             .{ .deltas = &.{.{ .text = "all done" }} },
         },
     };
@@ -7706,7 +5408,6 @@ test "a session that overflows its context compacts, takes the turn again, and d
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // The session finished. It used to end `errored` on exactly this body.
     try testing.expectEqual(
         event.SessionEndReason.finished,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
@@ -7716,17 +5417,11 @@ test "a session that overflows its context compacts, takes the turn again, and d
     var found = (try firstCompaction(allocator, io, store)).?;
     defer found.deinit(allocator);
     try testing.expectEqualStrings("the parser work is half done and the tab case is open", found.summary);
-    // A model wrote it, and the event says which alias did.
     try testing.expectEqualStrings("main", found.model_alias);
     try testing.expectEqual(@as(usize, 1), found.kept_ranges.len);
 }
 
 test "a compaction folds the middle and leaves the task and the recent turns word for word" {
-    // **Not "the context got smaller".** The task the user gave is protected
-    // out of the folded span altogether, because a session that forgets what
-    // it was asked is worse than one that runs out of context. The recent
-    // turns are inside the span and named in `kept_ranges`, which is what
-    // that field is for.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7752,14 +5447,8 @@ test "a compaction folds the middle and leaves the task and the recent turns wor
     const text = try contextText(allocator, &session);
     defer allocator.free(text);
 
-    // The task, word for word, and it comes before the summary: the fold
-    // leaves the protected head where it was.
-    // **Each failure carries the whole context.** Control reaches a block
-    // below only when the text is not in `text` at all, so the comparison
-    // cannot hold, and `expectEqualStrings` prints both sides: a reader sees
-    // the context the fold really left. A write to the terminal would put the
-    // same words into every passing run of this suite as well, and `zig
-    // build` reads any run step that wrote to standard error as a failure.
+    // Nothing writes to the terminal on a pass: `zig build` reads a run step that
+    // wrote to standard error as a failure.
     const task_at = std.mem.indexOf(u8, text, "TASK: make the parser accept tabs") orelse {
         try testing.expectEqualStrings("TASK: make the parser accept tabs", text);
         return error.TheUsersOwnTaskWasFoldedAway;
@@ -7770,21 +5459,16 @@ test "a compaction folds the middle and leaves the task and the recent turns wor
     };
     try testing.expect(task_at < summary_at);
 
-    // Every kept turn, word for word, and after the summary.
     for (0..6) |i| {
         const recent = try std.fmt.allocPrint(allocator, "RECENT-{d}", .{i});
         defer allocator.free(recent);
         const at = std.mem.indexOf(u8, text, recent) orelse {
-            // The same shape as the two above: the failure names the turn
-            // that did not survive and prints the context beside it.
             try testing.expectEqualStrings(recent, text);
             return error.AKeptTurnDidNotSurviveTheCompaction;
         };
         try testing.expect(summary_at < at);
     }
 
-    // And the folded middle is gone from the context, while the log still
-    // holds every one of those events.
     try testing.expect(std.mem.indexOf(u8, text, "MIDDLE-0") == null);
     try testing.expect(std.mem.indexOf(u8, text, "MIDDLE-4") == null);
 
@@ -7802,11 +5486,6 @@ test "a compaction folds the middle and leaves the task and the recent turns wor
 }
 
 test "two folds of a log holding a compaction build the same context, entry for entry" {
-    // **The guarantee that matters most.** The log is the truth and the
-    // context is a view of it, and a compaction changes the view and nothing
-    // else. A resume, a `/daemonize` handover and a phone attaching to the
-    // session all replay the same events, so a fold that was not a function of
-    // the log would show three readers three different conversations.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7827,8 +5506,6 @@ test "two folds of a log holding a compaction build the same context, entry for 
     var fake_tools = FakeToolRunner{ .output = "unused" };
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // The log must actually hold a compaction, or this test pins the
-    // ordinary case a second time and pins nothing new.
     var found = (try firstCompaction(allocator, io, store)).?;
     defer found.deinit(allocator);
 
@@ -7848,17 +5525,10 @@ test "two folds of a log holding a compaction build the same context, entry for 
         }
     }
 
-    // And the fold really did shorten the view: twelve seeded entries plus
-    // the two turns of the session cannot still all be there.
     try testing.expect(first.context.items.len < 12);
 }
 
 test "a rate limit ends the session and never compacts, however much its body says about tokens" {
-    // **The two failure classes must not be folded together.** A 429 and a
-    // context overflow look identical at this call site and want opposite
-    // answers: one is the same request sent again after a wait, the other is
-    // a smaller request. A loop that compacted on a 429 would throw away
-    // turns that had nothing wrong with them and then meet the same limit.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7878,14 +5548,9 @@ test "a rate limit ends the session and never compacts, however much its body sa
     } };
     var fake_tools = FakeToolRunner{ .output = "unused" };
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
-    // One attempt, so this test is about the classification alone. The wait
-    // that a 429 now gets is the subject of its own tests below, and a policy
-    // that retried here would only make this one slower without making it say
-    // anything more about compaction.
     deps.retry.max_attempts = 1;
     try run(allocator, io, deps);
 
-    // One call, so no summary was ever asked for, and no compaction happened.
     try testing.expectEqual(@as(usize, 1), fake_client.calls);
     try testing.expect(try firstCompaction(allocator, io, store) == null);
     try testing.expectEqual(
@@ -7894,19 +5559,11 @@ test "a rate limit ends the session and never compacts, however much its body sa
     );
 }
 
-/// The body a 429 carried in the session that ended on 2026-08-22 and took
-/// 105 changed files with it, in the provider's own words. The retry tests use
-/// it so they answer the real wire and not a paraphrase of it.
 const measured_rate_limit_body =
     \\{"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your rate limit of 500,000 input tokens per minute"}}
 ;
 
 test "a rate limit is waited out, and the reply after the wait is the session's real answer" {
-    // **The whole point of the retry.** A session that ends on a 429 loses
-    // everything it had done. A session that waits gets the answer. So this
-    // pins the answer itself and not merely that a second attempt happened: a
-    // retry that came back with an error would satisfy "it retried" and would
-    // still have lost the session.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7929,15 +5586,10 @@ test "a rate limit is waited out, and the reply after the wait is the session's 
     deps.observer = watching.observer();
     try run(allocator, io, deps);
 
-    // Exactly two sends, and exactly one wait between them.
     try testing.expectEqual(@as(usize, 2), fake_client.calls);
     try testing.expectEqual(@as(usize, 1), sleeper.waits.items.len);
-    // **The wait is never zero.** A retry that came straight back would meet
-    // the same per minute limit and spend the attempt for nothing.
     try testing.expect(sleeper.waits.items[0] > 0);
 
-    // The session finished, and what it finished with is the model's real
-    // reply.
     try testing.expectEqual(
         event.SessionEndReason.finished,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
@@ -7946,17 +5598,11 @@ test "a rate limit is waited out, and the reply after the wait is the session's 
     defer allocator.free(said);
     try testing.expectEqualStrings("the answer the session was for", said);
 
-    // And a person watching was told, so a minute of silence does not read as
-    // a hang. See `Observer.onNotice`.
     try testing.expectEqual(@as(usize, 1), watching.notices.items.len);
     try testing.expect(std.mem.indexOf(u8, watching.notices.items[0], "rate_limited") != null);
 }
 
 test "the wait is exactly what the provider's Retry-After asked for" {
-    // ai& sends `Retry-After` on a 429, and the provider knows its own window
-    // when this loop does not. The number is pinned, not the fact that
-    // something was waited: a wait built from the wrong number either hammers
-    // or hangs.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -7978,26 +5624,16 @@ test "the wait is exactly what the provider's Retry-After asked for" {
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
     deps.sleeper = sleeper.sleeper();
-    // No spread, so the number below is the header's own and nothing else.
-    // The spread's own arithmetic is pinned in `chock_provider.retry`, and it
-    // only ever adds: see `retry.waitMs`.
     deps.retry.retry_after_spread_ms = 0;
     try run(allocator, io, deps);
 
     try testing.expectEqual(@as(usize, 1), sleeper.waits.items.len);
     try testing.expectEqual(@as(u64, 37_000), sleeper.waits.items[0]);
 
-    // **Not the backoff's own number.** The default first step is 2 seconds,
-    // so a loop that ignored the header would have waited about one, and this
-    // test would pass on it if it only asserted that a wait happened.
     try testing.expect(sleeper.waits.items[0] != retry.waitMs(deps.retry, 1, null, 0));
 }
 
 test "the attempts run out, and the session says how many were made and what the provider last said" {
-    // A retry with no bound is a session that never ends. When the bound is
-    // reached the user has to be able to tell "it waited and the provider kept
-    // refusing" from "it gave up at once", which is the count, and they need
-    // the provider's own words to know what to fix.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8019,11 +5655,8 @@ test "the attempts run out, and the session says how many were made and what the
     deps.retry.max_attempts = 3;
     try run(allocator, io, deps);
 
-    // Three sends, which is the bound, and two waits, which is one fewer:
-    // nothing waits after the attempt it has decided not to make.
     try testing.expectEqual(@as(usize, 3), fake_client.calls);
     try testing.expectEqual(@as(usize, 2), sleeper.waits.items.len);
-    // And the backoff grew rather than repeating one wait.
     try testing.expect(sleeper.waits.items[1] > sleeper.waits.items[0]);
 
     try testing.expectEqual(
@@ -8037,9 +5670,6 @@ test "the attempts run out, and the session says how many were made and what the
 }
 
 test "a Retry-After longer than the session waits ends it at once instead of retrying blind" {
-    // Clamping the wait would send the request again inside a window the
-    // provider said was still shut. Ending and saying so is the honest answer,
-    // and the log keeps everything the session did first.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8070,10 +5700,6 @@ test "a Retry-After longer than the session waits ends it at once instead of ret
 }
 
 test "a bad request is never waited on, because no wait makes it succeed" {
-    // The other half of the classification. A retry that fired on every
-    // refusal would sit for a minute in front of an unknown model name, and
-    // then again, and then end with the same message it could have given at
-    // once.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8106,11 +5732,6 @@ test "a bad request is never waited on, because no wait makes it succeed" {
 }
 
 test "a full context still compacts and is never waited on, and a rate limit never compacts" {
-    // **The pair the classification exists for, in one test.** A limit on
-    // input tokens per minute is partly a context size problem, which makes
-    // joining the two paths tempting. Joined, a rate limit would throw away
-    // turns nothing was wrong with, and a full context would wait forever for
-    // a window that is not going to open.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8123,7 +5744,6 @@ test "a full context still compacts and is never waited on, and a rate limit nev
     var fake_client = FakeClient{
         .turns = &.{
             .{ .refusal = .{ .body = measured_overflow_body } },
-            // The summary `compactNow` asks the model for.
             .{ .deltas = &.{.{ .text = "a summary of the work so far" }} },
             .{ .deltas = &.{.{ .text = "the turn, taken again on a smaller context" }} },
         },
@@ -8136,7 +5756,6 @@ test "a full context still compacts and is never waited on, and a rate limit nev
     deps.sleeper = sleeper.sleeper();
     try run(allocator, io, deps);
 
-    // The overflow compacted, and nothing waited for it.
     var folded = (try firstCompaction(allocator, io, store)).?;
     defer folded.deinit(allocator);
     try testing.expectEqual(@as(usize, 0), sleeper.waits.items.len);
@@ -8147,9 +5766,6 @@ test "a full context still compacts and is never waited on, and a rate limit nev
 }
 
 test "a session canceled during a wait ends as canceled, and never sends the request the wait was for" {
-    // A wait can be a minute long, so it is a safe point of its own. Without
-    // this, Ctrl-C during a wait was answered only after the request the wait
-    // was for had already been sent and answered.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8160,8 +5776,6 @@ test "a session canceled during a wait ends as canceled, and never sends the req
     var fake_client = FakeClient{
         .turns = &.{
             .{ .refusal = .{ .status = .too_many_requests, .body = measured_rate_limit_body } },
-            // Scripted, and never reached: reaching it is the failure this test
-            // is named for.
             .{ .deltas = &.{.{ .text = "should never be sent" }} },
         },
     };
@@ -8185,9 +5799,6 @@ test "a session canceled during a wait ends as canceled, and never sends the req
 }
 
 test "a context that cannot be made shorter ends the session instead of compacting in a circle" {
-    // A task and one turn cannot be folded into anything smaller. Ending
-    // here, with the log intact, is what stops a session compacting forever
-    // on a model whose limit the kept tail alone already passes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8213,11 +5824,6 @@ test "a context that cannot be made shorter ends the session instead of compacti
 }
 
 test "a threshold Chock chose compacts before any provider refuses anything" {
-    // **Compacting only when a provider refuses is compacting at the worst
-    // moment.** It also never fires on a provider that truncates in silence
-    // and says nothing. This client refuses nothing at all, and the session
-    // compacts anyway, from the model's own limit and the token count the
-    // last reply reported.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8232,13 +5838,10 @@ test "a threshold Chock chose compacts before any provider refuses anything" {
 
     var fake_client = FakeClient{
         .turns = &.{
-            // A turn that works, and reports a context past three quarters of
-            // 65536, which is 49152.
             .{ .deltas = &.{
                 .{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } },
                 .{ .usage = .{ .input_tokens = 60000, .output_tokens = 10 } },
             } },
-            // The summary call the threshold makes, before the next turn is sent.
             .{ .deltas = &.{.{ .text = "SUMMARY WRITTEN AT THE THRESHOLD" }} },
             .{ .deltas = &.{.{ .text = "all done" }} },
         },
@@ -8259,11 +5862,6 @@ test "a threshold Chock chose compacts before any provider refuses anything" {
 }
 
 test "an approaching compaction asks the agent to save what it learned, and asks before it folds" {
-    // **Memory survives a compaction and context does not**, so the moment
-    // before one is the best moment to write a note. The ordering is the part
-    // that makes it work at all: a notice that arrived with the compaction
-    // would give the agent no turn to act on it, and this pins that the
-    // notice event is in the log before the compaction event.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8278,12 +5876,10 @@ test "an approaching compaction asks the agent to save what it learned, and asks
 
     var fake_client = FakeClient{
         .turns = &.{
-            // Past 60 per cent of 65536, which is 39321, and short of 49152.
             .{ .deltas = &.{
                 .{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } },
                 .{ .usage = .{ .input_tokens = 40000 } },
             } },
-            // Now past the compaction threshold.
             .{ .deltas = &.{
                 .{ .tool_call = .{ .index = 0, .id = "call2", .name = "run_command", .arguments = "{}" } },
                 .{ .usage = .{ .input_tokens = 60000 } },
@@ -8314,8 +5910,6 @@ test "an approaching compaction asks the agent to save what it learned, and asks
         if (m.role != .system) continue;
         for (m.content) |part| {
             if (part != .text) continue;
-            // The threshold is named, in tokens, because a warning with no
-            // number is a warning nobody can act on.
             try testing.expect(std.mem.indexOf(u8, part.text, "49152") != null);
             try testing.expect(std.mem.indexOf(u8, part.text, "65536") != null);
             try testing.expect(std.mem.indexOf(u8, part.text, "write_memory") != null);
@@ -8324,8 +5918,6 @@ test "an approaching compaction asks the agent to save what it learned, and asks
             if (notice_id == null) notice_id = parsed.value.id;
         }
     }
-    // Once, not once a turn: an agent told the same thing every turn stops
-    // reading it.
     try testing.expectEqual(@as(usize, 1), warnings);
 
     var found = (try firstCompaction(allocator, io, store)).?;
@@ -8334,8 +5926,6 @@ test "an approaching compaction asks the agent to save what it learned, and asks
 }
 
 test "a session with no write_memory is never told to call it as a compaction approaches" {
-    // The same rule the prompt keeps. A tool that is not offered is not
-    // named, because naming one costs the agent a turn to find out.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8377,10 +5967,6 @@ test "a session with no write_memory is never told to call it as a compaction ap
 }
 
 test "a compaction whose summary call is refused still folds, and the event says no model wrote it" {
-    // A summary call that fails must not end a session that was only out of
-    // room. The harness one says what happened rather than what was learned,
-    // and the empty `model_alias` is what tells a reader which of the two
-    // they are looking at, so a thin summary is never left ambiguous.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8396,7 +5982,6 @@ test "a compaction whose summary call is refused still folds, and the event says
     var fake_client = FakeClient{
         .turns = &.{
             .{ .refusal = .{ .body = measured_overflow_body } },
-            // The summary call itself fails, with a fault that is not an overflow.
             .{ .refusal = .{ .status = .internal_server_error, .body = "the summariser fell over" } },
             .{ .deltas = &.{.{ .text = "all done" }} },
         },
@@ -8408,8 +5993,6 @@ test "a compaction whose summary call is refused still folds, and the event says
     defer found.deinit(allocator);
     try testing.expectEqualStrings("", found.model_alias);
     try testing.expect(std.mem.startsWith(u8, found.summary, compaction.harness_summary_first_line));
-    // **And why**, because an empty `model_alias` says the harness wrote the
-    // summary and nothing used to say what happened to the model's own.
     try testing.expectEqualStrings(
         "the model backend answered the compaction call with status 500: the summariser fell over",
         found.stand_in_reason,
@@ -8421,12 +6004,6 @@ test "a compaction whose summary call is refused still folds, and the event says
 }
 
 test "a refused compaction call is written into the log, and the session carries on" {
-    // **Recorded, never acted on.** This is the loop's own call and not the
-    // agent's turn: a harness written summary is a real answer, so the session
-    // keeps going. What must not happen is a person seeing an ordinary looking
-    // compaction and never learning the model declined. A refused turn of the
-    // agent's own is the other case, and that one ends the session: see
-    // `chock_proto.event.SessionEndReason.refused_by_model`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8442,8 +6019,6 @@ test "a refused compaction call is written into the log, and the session carries
     var fake_client = FakeClient{
         .turns = &.{
             .{ .refusal = .{ .body = measured_overflow_body } },
-            // The summary call is refused by the model itself, with half a
-            // summary already written: a classifier fires part way through.
             .{ .deltas = &.{
                 .{ .text = "The session was about" },
                 .{ .stop_reason = .{
@@ -8466,14 +6041,10 @@ test "a refused compaction call is written into the log, and the session carries
         found.stand_in_reason,
     );
 
-    // **The refused words are not the summary.** Half a summary the provider
-    // said no to must not stand in for thirty turns, so the harness one does.
     try testing.expectEqualStrings("", found.model_alias);
     try testing.expect(std.mem.startsWith(u8, found.summary, compaction.harness_summary_first_line));
     try testing.expect(std.mem.indexOf(u8, found.summary, "The session was about") == null);
 
-    // The session carried on and finished: a refusal on this call is not the
-    // agent's turn being refused.
     try testing.expectEqual(
         event.SessionEndReason.finished,
         std.meta.activeTag(try endReasonOf(allocator, io, store)),
@@ -8483,36 +6054,16 @@ test "a refused compaction call is written into the log, and the session carries
     try testing.expectEqualStrings("all done", said);
 }
 
-// Every test here drives a real `run` and reads the answer out of the log,
-// rather than calling `subagents.check` a second time: what the limits say on
-// their own is already tested in `lib/chock-policy/subagents.zig`, and what
-// these pin is that the loop measures the right two numbers and that nothing
-// starts when it refuses.
-
-/// A `subagent.Spawner` that starts no process at all.
-///
-/// **The seam earns its keep here.** A real child is `chock run`, which needs
-/// a project, a credential, a session directory and a single threaded caller,
-/// and this test binary is none of those. What these tests pin is what the
-/// loop does around a child: which events it writes, in which order, what it
-/// asks for, and what it tells the model afterwards. A real child process is
-/// pinned in `test/core/subagent.zig`, against a real log on disk.
 const FakeSpawner = struct {
     child_session: []const u8 = "01CHILDAA",
     scratchpad_path: []const u8 = "/tmp/chock/01SPAWN/agents/01CHILDAA/scratch",
     outcome: event.AgentOutcome = .finished,
     result: []const u8 = "the diff is safe to apply",
-    /// True to answer `prepare` with a fault, the way a session directory that
-    /// cannot be made would.
     prepare_fails: bool = false,
-    /// True to answer `run` with a fault, which is a child that was already
-    /// recorded as spawned and never started.
     run_fails: bool = false,
 
     prepared: usize = 0,
     ran: usize = 0,
-    /// What the loop asked for, copied into buffers of this value's own so
-    /// nothing here borrows a turn's arena.
     seen_budget: ?f64 = null,
     seen_kind: [64]u8 = @splat(0),
     seen_kind_len: usize = 0,
@@ -8559,9 +6110,6 @@ const FakeSpawner = struct {
         self.seen_kind_len = keep(&self.seen_kind, request.agent_kind);
         self.seen_reason_len = keep(&self.seen_reason, request.reason);
         self.seen_budget = if (request.budget) |one| one.max_cost else null;
-        // The task as the child would really read it, schema requirement and
-        // all: a spawner is what hands the task over, so this is where the
-        // real one would carry the same text.
         const written = try subagent.taskFor(allocator, request.task, request.shape);
         defer allocator.free(written);
         self.seen_task_len = keep(&self.seen_task, written);
@@ -8590,58 +6138,29 @@ const FakeSpawner = struct {
     }
 };
 
-/// What one `spawn_agent` call left behind. `output` is owned by the caller.
 const SpawnAttempt = struct {
     output: []u8,
     is_error: bool,
-    /// How many times the tool runner was asked to run anything. **Zero is
-    /// the assertion**: a spawn that reached a runner is a spawn that reached
-    /// a sandbox.
     runner_calls: usize,
-    /// How many `session.spawn` events the log holds afterwards. A refused
-    /// spawn must add none.
     spawn_events: usize,
-    /// How many `agent.complete` events the log holds afterwards. A spawn that
-    /// started nothing must add none of these either.
     complete_events: usize,
-    /// The slice of the budget the child was given, or null when it was given
-    /// no cap.
     child_budget: f64,
-    /// The currency that slice is written in, borrowed from the log's own copy
-    /// only for the length of the replay, so this keeps the length alone.
     child_budget_named_currency: bool,
-    /// True when the refusal reached the model's own context, and not only
-    /// the log.
     reached_the_model: bool,
-    /// How many turns in the parent's own voice the parent's log holds. **Two
-    /// is the assertion**, whatever the child did: a subagent's turns are in
-    /// the subagent's log, and a parent that took a child's transcript into
-    /// its own context would have more.
     assistant_turns: usize,
 };
 
-/// What one call to `attemptSpawn` sets up.
 const SpawnCase = struct {
     limits: subagents.Limits = .{},
-    /// The parents of the agent that asks, so its depth is one more than this.
     chain: []const event.SpawnLink = &.{},
-    /// How many children it has already started.
     already_started: usize = 0,
-    /// The slice each of those children was given, which is money the parent
-    /// has promised and cannot promise again.
     committed_each: f64 = 0,
-    /// What starts the child, or null for a session that can start none.
     spawner: ?subagent.Spawner = null,
-    /// The arguments the model's own `spawn_agent` call carries.
     arguments: []const u8 = "{\"agent_kind\":\"reviewer\",\"task\":\"read the diff\"}",
     budget: ?chock_cost.budget.Budget = null,
-    /// What this session has already spent, as a `usage` event seeded before
-    /// the first turn.
     spent: f64 = 0,
 };
 
-/// Run one session whose only turn calls `spawn_agent`. The caller frees
-/// `SpawnAttempt.output`.
 fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !SpawnAttempt {
     var backing = try chock_proto.storage.Memory.init(allocator, "01SPAWN");
     const store = backing.storage();
@@ -8656,8 +6175,6 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
         } });
     }
 
-    // The children this agent already has. Only the count and the slices they
-    // were given are read, so the names are there to make the log readable.
     for (0..case.already_started) |index| {
         var id_buffer: [32]u8 = undefined;
         const child = try std.fmt.bufPrint(&id_buffer, "01CHILD{d}", .{index});
@@ -8722,13 +6239,7 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
                 attempt.output = try allocator.dupe(u8, result.output);
                 attempt.is_error = result.is_error;
             },
-            // The turn that re-enters the context. A refusal the model never
-            // reads is a refusal that changes nothing about what it does
-            // next.
             .message => |written| {
-                // Every turn in the parent's own voice. The parent's model
-                // took two turns, whatever the child did, and a loop that
-                // folded a child's transcript into its parent would have more.
                 if (written.role == .assistant) attempt.assistant_turns += 1;
                 if (written.role != .tool) continue;
                 for (written.content) |part| {
@@ -8746,14 +6257,9 @@ fn attemptSpawn(allocator: std.mem.Allocator, io: std.Io, case: SpawnCase) !Spaw
 }
 
 test "a spawn under a limit of zero is refused, names the limit, and starts nothing" {
-    // The degenerate case, built and proven before anything spawns at all.
-    // A maximum of zero subagents disables subagents entirely, which is a
-    // real setting a project can want, and it is the boundary of the limit.
     const allocator = testing.allocator;
     const io = testing.io;
 
-    // With a spawner, so a refusal cannot pass for want of one: the limits are
-    // what must refuse, and there is a real way to start a child right there.
     var spawner = FakeSpawner{};
     const attempt = try attemptSpawn(allocator, io, .{
         .limits = .{ .max_depth = 6, .max_width = 0 },
@@ -8761,25 +6267,17 @@ test "a spawn under a limit of zero is refused, names the limit, and starts noth
     });
     defer allocator.free(attempt.output);
 
-    // The refusal names the field of chock.zon and the value it holds, so a
-    // person reading the log knows what to change.
     try testing.expect(std.mem.indexOf(u8, attempt.output, "max_width to 0") != null);
     try testing.expect(std.mem.indexOf(u8, attempt.output, "chock.zon") != null);
     try testing.expect(attempt.is_error);
     try testing.expect(attempt.reached_the_model);
 
-    // No tree, and no child process. The tool runner is what reaches a
-    // sandbox, and it was never asked for anything. The spawner was not asked
-    // to prepare a session either, so nothing was made on disk for a child
-    // that is never going to exist.
     try testing.expectEqual(@as(usize, 0), attempt.runner_calls);
     try testing.expectEqual(@as(usize, 0), attempt.spawn_events);
     try testing.expectEqual(@as(usize, 0), attempt.complete_events);
     try testing.expectEqual(@as(usize, 0), spawner.prepared);
     try testing.expectEqual(@as(usize, 0), spawner.ran);
 
-    // The other limit at zero refuses the same call and says depth, so
-    // neither limit is a spelling of the other.
     const by_depth = try attemptSpawn(allocator, io, .{
         .limits = .{ .max_depth = 0, .max_width = 6 },
         .spawner = spawner.spawner(),
@@ -8791,9 +6289,6 @@ test "a spawn under a limit of zero is refused, names the limit, and starts noth
 }
 
 test "a limit of one lets the first spawn past the limits and refuses the second" {
-    // The step above zero, and the first place an off by one lives. The
-    // width comes from the `session.spawn` events the log holds, so an agent
-    // with one child already is at its limit and an agent with none is not.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8803,13 +6298,10 @@ test "a limit of one lets the first spawn past the limits and refuses the second
         .spawner = spawner.spawner(),
     });
     defer allocator.free(first.output);
-    // Past the limits, so a child really ran, and the parent was told.
     try testing.expectEqual(@as(usize, 1), spawner.ran);
     try testing.expectEqual(@as(usize, 1), first.spawn_events);
     try testing.expectEqual(@as(usize, 1), first.complete_events);
     try testing.expect(!first.is_error);
-    // A spawn never reaches the tool runner, whether it is refused or not: it
-    // is measured against numbers only the session holds.
     try testing.expectEqual(@as(usize, 0), first.runner_calls);
 
     const second = try attemptSpawn(allocator, io, .{
@@ -8820,18 +6312,12 @@ test "a limit of one lets the first spawn past the limits and refuses the second
     defer allocator.free(second.output);
     try testing.expect(std.mem.indexOf(u8, second.output, "max_width to 1") != null);
     try testing.expect(std.mem.indexOf(u8, second.output, "already started 1 subagent") != null);
-    // The one child it already had, and no second one.
     try testing.expectEqual(@as(usize, 1), second.spawn_events);
     try testing.expectEqual(@as(usize, 0), second.complete_events);
-    // And the spawner was not asked to run anything for the refused call.
     try testing.expectEqual(@as(usize, 1), spawner.ran);
 }
 
 test "the width the loop measures is the number of session.spawn events in the log" {
-    // Every value on both sides of the boundary, not one point of it. The
-    // seventh child of an agent at the default width is refused, and so is
-    // every one after it: a check that stopped refusing again after the
-    // first time would pass a test that only asked once.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8844,7 +6330,6 @@ test "the width the loop measures is the number of session.spawn events in the l
         defer allocator.free(attempt.output);
 
         if (already_started < subagents.default_max_width) {
-            // One more child, so the log holds the ones it had and this one.
             try testing.expectEqual(already_started + 1, attempt.spawn_events);
             try testing.expectEqual(@as(usize, 1), attempt.complete_events);
         } else {
@@ -8852,14 +6337,11 @@ test "the width the loop measures is the number of session.spawn events in the l
             try testing.expectEqual(already_started, attempt.spawn_events);
             try testing.expectEqual(@as(usize, 0), attempt.complete_events);
         }
-        // Whichever way it went, no tool runner was asked for anything.
         try testing.expectEqual(@as(usize, 0), attempt.runner_calls);
     }
 }
 
 test "the depth the loop measures is the length of the spawn chain" {
-    // The chain names every parent and leaves the asking agent out, so an
-    // agent with five parents is the sixth level and starts no seventh.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8881,7 +6363,6 @@ test "the depth the loop measures is the length of the spawn chain" {
         });
         defer allocator.free(attempt.output);
 
-        // The agent itself is one more than the number of its parents.
         if (links + 1 < subagents.default_max_depth) {
             try testing.expectEqual(@as(usize, 1), attempt.spawn_events);
             try testing.expectEqual(@as(usize, 1), attempt.complete_events);
@@ -8895,9 +6376,6 @@ test "the depth the loop measures is the length of the spawn chain" {
 }
 
 test "a spawn the limits allow writes the spawn before the child runs and the completion after" {
-    // The order is the point. An event is written before the act it describes,
-    // so a parent that died mid spawn leaves proof that the child was asked
-    // for, and the width count is right when it resumes.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8932,9 +6410,6 @@ test "a spawn the limits allow writes the spawn before the child runs and the co
                 try order.append(allocator, .session_spawn);
                 try testing.expectEqualStrings("01CHILDAA", spawn.child_session);
                 try testing.expectEqualStrings("reviewer", spawn.child_agent_kind);
-                // The reason is one short line of the task, so a person
-                // reading the log, or a user answering an approval a subagent
-                // raised, knows what the child was for.
                 try testing.expectEqualStrings("read the diff", spawn.reason);
             },
             .agent_complete => |done| {
@@ -8942,8 +6417,6 @@ test "a spawn the limits allow writes the spawn before the child runs and the co
                 try testing.expectEqualStrings("01CHILDAA", done.child_session);
                 try testing.expectEqual(event.AgentOutcome.finished, done.outcome);
                 try testing.expectEqualStrings("the diff is safe to apply", done.result);
-                // The third place the event points at, and the one the bulk of
-                // a child's work is in.
                 try testing.expectEqualStrings(spawner.scratchpad_path, done.scratchpad_path);
             },
             else => {},
@@ -8954,21 +6427,13 @@ test "a spawn the limits allow writes the spawn before the child runs and the co
     try testing.expectEqual(event.Kind.session_spawn, order.items[0]);
     try testing.expectEqual(event.Kind.agent_complete, order.items[1]);
 
-    // And the child really was prepared before it was run, which is what makes
-    // the identifier in `session.spawn` the identifier of the child that ran.
     try testing.expectEqual(@as(usize, 1), spawner.prepared);
     try testing.expectEqual(@as(usize, 1), spawner.ran);
     try testing.expectEqualStrings("reviewer", spawner.kind());
-    // The whole task, not the one line reason: the child reads this and
-    // nothing else.
     try testing.expectEqualStrings("read the diff\nand say what is wrong", spawner.task());
 }
 
 test "a subagent's turns are not in its parent's log, whatever the child said" {
-    // Each session stays independently replayable, which is what `chockd`
-    // serves and what a resume reads. A parent that folded a child's
-    // transcript into its own context would have the child's turns twice, in
-    // two logs, and a resume of the parent would replay them again.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -8976,14 +6441,10 @@ test "a subagent's turns are not in its parent's log, whatever the child said" {
     const attempt = try attemptSpawn(allocator, io, .{ .spawner = spawner.spawner() });
     defer allocator.free(attempt.output);
 
-    // Two turns in the parent's own voice: the one that called the tool, and
-    // the one that answered afterwards.
     try testing.expectEqual(@as(usize, 2), attempt.assistant_turns);
     try testing.expectEqual(@as(usize, 1), attempt.spawn_events);
     try testing.expectEqual(@as(usize, 1), attempt.complete_events);
 
-    // What the parent does get is the answer and where the rest of it is, in
-    // the result of the call it made.
     try testing.expect(std.mem.indexOf(u8, attempt.output, "the parser refuses an empty file") != null);
     try testing.expect(std.mem.indexOf(u8, attempt.output, spawner.scratchpad_path) != null);
     try testing.expect(attempt.reached_the_model);
@@ -8991,9 +6452,6 @@ test "a subagent's turns are not in its parent's log, whatever the child said" {
 }
 
 test "a child that did not finish is an error result, and the reason reaches the model" {
-    // A model that read "the child died" as success would carry on as though
-    // it had an answer. Each outcome that is not `finished` therefore comes
-    // back as an error result, and names itself.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9006,15 +6464,10 @@ test "a child that did not finish is an error result, and the reason reaches the
         try testing.expect(attempt.is_error);
         try testing.expect(std.mem.indexOf(u8, attempt.output, outcome.wireName()) != null);
         try testing.expect(attempt.reached_the_model);
-        // The child is still recorded, both halves: it was started, and it
-        // ended. A child that vanished from the log would be a child nobody
-        // could account for.
         try testing.expectEqual(@as(usize, 1), attempt.spawn_events);
         try testing.expectEqual(@as(usize, 1), attempt.complete_events);
     }
 
-    // A child that was recorded and could not be started at all is `died` too,
-    // because a child that never said anything is exactly what that means.
     var broken = FakeSpawner{ .run_fails = true };
     const attempt = try attemptSpawn(allocator, io, .{ .spawner = broken.spawner() });
     defer allocator.free(attempt.output);
@@ -9025,10 +6478,6 @@ test "a child that did not finish is an error result, and the reason reaches the
 }
 
 test "the child is given a slice of the budget, and the slice is in the parent's own log" {
-    // The cap covers the whole tree, and the processes of a tree share no
-    // memory. So the parent divides what it has left, and records what it gave
-    // away: a parent that resumed and counted from zero could hand the same
-    // money out twice.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9041,13 +6490,10 @@ test "the child is given a slice of the budget, and the slice is in the parent's
     });
     defer allocator.free(first.output);
 
-    // Four left, four children still allowed, so one each.
     try testing.expectEqual(@as(f64, 1.0), spawner.seen_budget.?);
     try testing.expectEqual(@as(f64, 1.0), first.child_budget);
     try testing.expect(first.child_budget_named_currency);
 
-    // A session with no cap of its own gives no cap, because there is nothing
-    // to divide. That is the same answer the parent runs under.
     var uncapped = FakeSpawner{};
     const no_cap = try attemptSpawn(allocator, io, .{ .spawner = uncapped.spawner() });
     defer allocator.free(no_cap.output);
@@ -9055,10 +6501,6 @@ test "the child is given a slice of the budget, and the slice is in the parent's
     try testing.expectEqual(@as(f64, 0), no_cap.child_budget);
     try testing.expect(!no_cap.child_budget_named_currency);
 
-    // A session that has promised the rest of its cap to earlier children
-    // starts no more. **This is the half a cap measured against spending alone
-    // would miss**: the parent has spent very little and has nothing left to
-    // give, because a child's spending never reaches the parent's own log.
     var refused = FakeSpawner{};
     const nothing_left = try attemptSpawn(allocator, io, .{
         .limits = .{ .max_depth = 6, .max_width = 4 },
@@ -9071,15 +6513,11 @@ test "the child is given a slice of the budget, and the slice is in the parent's
     defer allocator.free(nothing_left.output);
     try testing.expectEqualStrings(spawn_no_budget_detail, nothing_left.output);
     try testing.expectEqual(@as(usize, 0), refused.prepared);
-    // The three it already had, and no fourth.
     try testing.expectEqual(@as(usize, 3), nothing_left.spawn_events);
     try testing.expectEqual(@as(usize, 0), nothing_left.complete_events);
 }
 
 test "the shape the spawn asked for is what the child is told to produce" {
-    // The caller chooses, not the child. `result_fields` names what the parent
-    // will branch on, and the requirement reaches the child in the one place
-    // it reads: the task.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9097,7 +6535,6 @@ test "the shape the spawn asked for is what the child is told to produce" {
     try testing.expect(std.mem.indexOf(u8, spawner.task(), "\"verdict\"") != null);
     try testing.expect(std.mem.indexOf(u8, spawner.task(), "\"notes_path\"") != null);
 
-    // With no fields named, the child is asked for nothing but the work.
     var plain = FakeSpawner{};
     const prose = try attemptSpawn(allocator, io, .{ .spawner = plain.spawner() });
     defer allocator.free(prose.output);
@@ -9105,8 +6542,6 @@ test "the shape the spawn asked for is what the child is told to produce" {
 }
 
 test "a spawn with no spawner, and one with arguments that say nothing, both start nothing" {
-    // Two different refusals, and neither may read as a child at work: a model
-    // told "done" would wait for an answer nobody is producing.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9126,8 +6561,6 @@ test "a spawn with no spawner, and one with arguments that say nothing, both sta
     try testing.expect(empty.is_error);
     try testing.expectEqual(@as(usize, 0), spawner.prepared);
 
-    // Arguments that are not an object at all say which fields are needed,
-    // rather than failing the turn.
     const broken = try attemptSpawn(allocator, io, .{
         .spawner = spawner.spawner(),
         .arguments = "not json",
@@ -9136,8 +6569,6 @@ test "a spawn with no spawner, and one with arguments that say nothing, both sta
     try testing.expect(std.mem.indexOf(u8, broken.output, "agent_kind") != null);
     try testing.expectEqual(@as(usize, 0), spawner.prepared);
 
-    // And a child whose session could not even be prepared is recorded
-    // nowhere: nothing was started, so nothing is in the log.
     var unbuildable = FakeSpawner{ .prepare_fails = true };
     const failed = try attemptSpawn(allocator, io, .{ .spawner = unbuildable.spawner() });
     defer allocator.free(failed.output);
@@ -9147,14 +6578,6 @@ test "a spawn with no spawner, and one with arguments that say nothing, both sta
 }
 
 test "the child's session.start names the parent, and the kinds above it" {
-    // The tree is rebuilt from two links: the parent's `session.spawn` names
-    // the child, and this names the parent. A child log with an empty
-    // `parent_session` is a root, and a subagent is not one.
-    //
-    // **The kinds go in beside the identifier.** The policy table answers a
-    // child's key by folding every kind from the root down, so a reader who
-    // holds this log and not the parent's can re-derive the answer only if
-    // the kinds are here. See `event.SessionStart.spawn_chain`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9190,14 +6613,9 @@ test "the child's session.start names the parent, and the kinds above it" {
     try testing.expect(found);
 }
 
-/// Holds a subagent inside its own `run` until a test lets it out, so a test
-/// drives the order the parent's work and the child's ending happen in.
-///
-/// **Plain atomics and a yield**, the same shape `subagent.Table`'s own `Lock`
-/// takes, because `std.Io.Mutex` needs an `Io` and this waits on a thread of
-/// the table's own. Nothing here measures a length of time: **the bound is a
-/// count of yields**, and it exists only so that a build which never lets the
-/// child out fails rather than hangs.
+/// Holds a subagent inside its own `run` until a test lets it out. Plain
+/// atomics and a yield, because `std.Io.Mutex` needs an `Io`. The bound is a
+/// count of yields, so a build that never lets the child out fails, not hangs.
 const ChildGate = struct {
     open: std.atomic.Value(bool) = .init(false),
 
@@ -9216,34 +6634,14 @@ const ChildGate = struct {
     }
 };
 
-/// The one gate the tests below drive. File scope values, because
-/// `FakeTurn.before` is a plain function pointer with no context of its own,
-/// the same shape `RecordingSleeper.on_wait` already uses.
 var carry_on_gate = ChildGate{};
-/// The table the child of the moment runs on, when a test wants the child
-/// finished before the turn goes on. Null leaves the child running.
 var carry_on_table: ?*subagent.Table = null;
 
-/// Let the child out, and, when a test asked for it, do not come back until the
-/// child has ended and its completion is recorded.
-///
-/// **The wait is a join and never a pause.** A test that let the child out and
-/// carried on would be racing the child's own thread: measured, that race is
-/// lost about as often as it is won, and it was lost first on a Darwin box. A
-/// join has no such margin.
-///
-/// **It does not weaken what the test pins, it sharpens it.** The child being
-/// finished changes nothing about the log, because a finished child appends
-/// nothing: only the drain at the top of the next turn does. So a completion
-/// that still lands after this turn's own tool call is the delivery point being
-/// the top of a turn, proven against a child that was ready long before.
 fn releaseCarryOnChild() void {
     carry_on_gate.release();
     if (carry_on_table) |table| table.waitAll();
 }
 
-/// A `subagent.Spawner` whose child does not end until `carry_on_gate` is
-/// opened. Everything else about it is `FakeSpawner`'s behaviour.
 const GatedSpawner = struct {
     child_session: []const u8 = "01CHILDAA",
     result: []const u8 = "the tests pass",
@@ -9287,17 +6685,6 @@ const GatedSpawner = struct {
 };
 
 test "a spawn that carries on lets the parent work between the spawn and the answer" {
-    // **The fact that makes a tree worth having.** Six children waited on one
-    // at a time is a sequence with extra processes, so what has to be pinned is
-    // not that a spawn and a completion both happened, which a waiting spawn
-    // does too. It is that **work of the parent's own landed in the parent's
-    // log between them**: a `tool.call` the parent made and a `tool.result` it
-    // read, both after `session.spawn` and both before `agent.complete`.
-    //
-    // The order is driven and never timed. The child is held inside its own
-    // `run` until the parent's second turn starts, and the completion is
-    // delivered at the top of a turn, so the parent's tool call cannot land on
-    // either side of the two events by luck. See `ChildGate`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9310,24 +6697,17 @@ test "a spawn that carries on lets the parent work between the spawn and the ans
     var gated = GatedSpawner{};
     var table = subagent.Table{ .gpa = allocator, .spawner = gated.spawner() };
     defer table.deinit();
-    // The child is finished before the parent's own tool call runs, and the
-    // completion still lands after it: see `releaseCarryOnChild`.
     carry_on_table = &table;
     defer carry_on_table = null;
 
     var fake_client = FakeClient{
         .turns = &.{
-            // Turn one: start the child and do not wait for it.
             .{ .deltas = &.{.{ .tool_call = .{
                 .index = 0,
                 .id = "spawn1",
                 .name = spawn_tool_name,
                 .arguments = "{\"agent_kind\":\"reviewer\",\"task\":\"run the tests\",\"background\":true}",
             } }} },
-            // Turn two: the parent's own work. The child is let out, and finishes,
-            // as this turn begins, which is after the drain at the top of it. So
-            // its answer cannot reach the log before this turn's own tool call
-            // however quickly the child ends.
             .{
                 .deltas = &.{.{ .tool_call = .{
                     .index = 0,
@@ -9337,7 +6717,6 @@ test "a spawn that carries on lets the parent work between the spawn and the ans
                 } }},
                 .before = releaseCarryOnChild,
             },
-            // Turn three: the top of it is where the child's answer arrives.
             .{ .deltas = &.{.{ .text = "the child says the tests pass and I read the file" }} },
         },
     };
@@ -9398,36 +6777,21 @@ test "a spawn that carries on lets the parent work between the spawn and the ans
     try testing.expect(complete_id != null);
     try testing.expect(told_id != null);
 
-    // **The whole test.** The parent asked for the child, then did a piece of
-    // its own work and read the answer to it, and only then was told what the
-    // child said. A waiting spawn puts `agent.complete` immediately after
-    // `session.spawn` with nothing of the parent's between them, so this order
-    // is what the two shapes differ by.
     try testing.expect(spawn_id.? < own_call_id.?);
     try testing.expect(own_call_id.? < own_result_id.?);
     try testing.expect(own_result_id.? < complete_id.?);
-    // And the record is written before the parent is told, so a replay never
-    // shows an agent hearing about a child that is not yet recorded as ended.
     try testing.expect(complete_id.? < told_id.?);
 
-    // The call that started it came straight back, said there was no answer
-    // yet, and was not an error: a spawn that did what it was asked to do.
     try testing.expect(!spawn_was_error);
     try testing.expect(std.mem.indexOf(u8, spawn_result, "01CHILDAA") != null);
     try testing.expect(std.mem.indexOf(u8, spawn_result, "has not answered yet") != null);
 
-    // Drained once. A loop that polled at every safe point and did not clear
-    // the table would tell the parent about the same child on every turn.
     const again = try table.take(allocator);
     defer subagent.freeCompletions(allocator, again);
     try testing.expectEqual(@as(usize, 0), again.len);
 }
 
 test "a spawn that waits still answers in its own call, and nothing is drained afterwards" {
-    // The other shape, unchanged. **Both are needed and the spawn says which**:
-    // "review this and tell me" has nothing for the parent to do meanwhile, and
-    // an answer that arrived a turn later would be a parent that had to be told
-    // to wait for it.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9452,8 +6816,6 @@ test "a spawn that waits still answers in its own call, and nothing is drained a
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
     deps.spawner = spawner.spawner();
-    // The table is there and is simply not used, so this cannot pass for want
-    // of one: a spawn that said nothing about carrying on waits.
     deps.children = &table;
     try run(allocator, io, deps);
 
@@ -9480,19 +6842,12 @@ test "a spawn that waits still answers in its own call, and nothing is drained a
     try testing.expect(spawn_id != null);
     try testing.expect(complete_id != null);
     try testing.expect(result_id != null);
-    // The completion is inside the call: nothing of the parent's own can land
-    // between the two, which is exactly what the other shape allows.
     try testing.expect(spawn_id.? < complete_id.?);
     try testing.expect(complete_id.? < result_id.?);
-    // And the table was never given a child, so the drain had nothing to find.
     try testing.expectEqual(@as(usize, 0), table.startedCount());
 }
 
 test "a spawn that asks to carry on with no table for it is refused, and names the other shape" {
-    // **Never a quiet fall back to waiting.** A model that asked to carry on
-    // and was silently made to wait planned its next step around a turn that
-    // did not happen. The refusal says what to ask for instead, because the
-    // work can still be done.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9506,8 +6861,6 @@ test "a spawn that asks to carry on with no table for it is refused, and names t
     try testing.expect(attempt.is_error);
     try testing.expectEqualStrings(spawn_cannot_carry_on_detail, attempt.output);
     try testing.expect(attempt.reached_the_model);
-    // Nothing was started and nothing was recorded: the refusal is before
-    // `prepare`, so no child was ever named.
     try testing.expectEqual(@as(usize, 0), spawner.prepared);
     try testing.expectEqual(@as(usize, 0), spawner.ran);
     try testing.expectEqual(@as(usize, 0), attempt.spawn_events);
@@ -9515,22 +6868,10 @@ test "a spawn that asks to carry on with no table for it is refused, and names t
 }
 
 test "a child still running when the session ends is waited for and recorded, not lost" {
-    // **A `session.spawn` with no `agent.complete` after it would be a log that
-    // lies**, because the child did answer. The wait has to happen in any case:
-    // `subagent.Table.deinit` cannot let a child outlive the scratchpad it
-    // writes into. So the loop waits before it stops, and the record costs
-    // nothing on top of a wait that was already forced.
-    //
-    // **Every way a session stops reaches these same lines**: a final answer, a
-    // turn limit, a budget that refused the next turn, and a user who canceled
-    // all end at `recordAtTheEnd`. So one test covers all four rather than four
-    // tests covering one path.
     const allocator = testing.allocator;
     const io = testing.io;
 
     carry_on_gate = .{};
-    // Left running when the turn goes on, which is the case this pins: the
-    // wait that records it is `recordAtTheEnd`'s own.
     carry_on_table = null;
 
     var backing = try chock_proto.storage.Memory.init(allocator, "01LATE");
@@ -9549,9 +6890,6 @@ test "a child still running when the session ends is waited for and recorded, no
                 .name = spawn_tool_name,
                 .arguments = "{\"agent_kind\":\"reviewer\",\"task\":\"run the tests\",\"background\":true}",
             } }} },
-            // The session ends here, with the child still held inside its own run.
-            // It is let out as this last turn begins, so it can only be recorded
-            // after the session has already decided to stop.
             .{ .deltas = &.{.{ .text = "I am done" }}, .before = releaseCarryOnChild },
         },
     };
@@ -9587,16 +6925,11 @@ test "a child still running when the session ends is waited for and recorded, no
 
     try testing.expect(end_id != null);
     try testing.expect(complete_id != null);
-    // Recorded, and recorded after the end, which is where the fact belongs: a
-    // record written before `session.end` would say the child ended before the
-    // session did, and it did not.
     try testing.expect(end_id.? < complete_id.?);
     try testing.expect(!told_after_the_end);
 }
 
 test "a session with no children table runs exactly as it did before a spawn could carry on" {
-    // The default, and the one every caller before this took. `Deps.children`
-    // is null, so nothing is drained and nothing is appended.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9622,9 +6955,6 @@ test "a session with no children table runs exactly as it did before a spawn cou
 }
 
 test "an approval request names every parent of the agent that asked" {
-    // "A subagent three levels down wants to raise its budget" is the fact the
-    // user most needs before answering, so the request carries the whole chain,
-    // root first, and not only the kind that asked.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9632,8 +6962,6 @@ test "an approval request names every parent of the agent that asked" {
     const store = backing.storage();
     defer store.close(io);
 
-    // A session that has already spent its whole budget, so the next turn
-    // raises the request. The same shape the budget tests below use.
     try seedEvent(allocator, io, store, .{ .usage = .{
         .model_alias = "main",
         .model = "test-model",
@@ -9667,31 +6995,17 @@ test "an approval request names every parent of the agent that asked" {
         try testing.expectEqualStrings("main", request.spawn_chain[0].agent_kind);
         try testing.expectEqualStrings("split the work", request.spawn_chain[0].reason);
         try testing.expectEqualStrings("planner", request.spawn_chain[1].agent_kind);
-        // The agent that asked is not a link of its own: the request already
-        // names it in `agent_kind`.
         try testing.expectEqualStrings("coder", request.agent_kind);
     }
     try testing.expect(found);
 }
 
-// See `lib/chock-core/notices.zig` for the notices themselves and for the
-// tests of each trigger. What is pinned here is the wiring: what actually
-// reaches the model, where in the request it lands, what it does to the system
-// prompt, and what the log holds afterwards.
-
-/// One model call's request, as much of it as a notice test needs.
 const SeenRequest = struct {
-    /// The system prompt, byte for byte. **The whole point of the test that
-    /// reads it**: a notice must never change this.
     system: []u8,
-    /// Every text part of the last message, joined. A notice is the last
-    /// message when there is one.
     tail: []u8,
-    /// How many messages the request carried.
     messages: usize,
 };
 
-/// Every request a `FakeClient` was given, kept in order.
 const SeenRequests = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(SeenRequest) = .empty,
@@ -9721,7 +7035,6 @@ const SeenRequests = struct {
         });
     }
 
-    /// True when any request carried this text at the end of it.
     fn anyTailHolds(self: SeenRequests, needle: []const u8) bool {
         for (self.items.items) |seen| {
             if (std.mem.indexOf(u8, seen.tail, needle) != null) return true;
@@ -9730,8 +7043,6 @@ const SeenRequests = struct {
     }
 };
 
-/// A `ToolRunner` that answers with a different scripted output per call, so a
-/// test can make a file change between two reads of it.
 const ScriptedToolRunner = struct {
     outputs: []const []const u8,
     calls: usize = 0,
@@ -9761,9 +7072,6 @@ const ScriptedToolRunner = struct {
     const vtable = ToolRunner.VTable{ .dispatch = dispatch };
 };
 
-/// A `read_file` result for `content`, with the header that tool really
-/// writes. Built through `tools.contentHash`, so a test never states a hash by
-/// hand and the loop reads back exactly what the tool would have written.
 fn readResult(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "[chock: {d} bytes, file_hash {s}]\n{s}", .{
         content.len,
@@ -9772,7 +7080,6 @@ fn readResult(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
     });
 }
 
-/// One turn of a model that asks to read `path`.
 fn readCall(id: []const u8, arguments: []const u8) chock_provider.Client.Delta {
     return .{ .tool_call = .{
         .index = 0,
@@ -9783,12 +7090,6 @@ fn readCall(id: []const u8, arguments: []const u8) chock_provider.Client.Delta {
 }
 
 test "the system prompt is byte identical on every turn, whatever the notices say" {
-    // **The cache trap, pinned.** A provider's cache keys on a stable prefix,
-    // so a fact that changes every turn belongs at the end of the context and
-    // never at the front. A version that built the notice into the prompt
-    // would pass every other test in this file: the words would all be there,
-    // and only `cache_read_input_tokens` on a real provider would show it,
-    // which is a number no test here can see.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9814,8 +7115,6 @@ test "the system prompt is byte identical on every turn, whatever the notices sa
     };
 
     var deps = testDeps(fake_client.client(), store, scripted.runner());
-    // Two different notices across the run: the uncommitted files on the first
-    // turn, and the unchanged re-read on the last one.
     deps.uncommitted_files = 5;
     try run(allocator, io, deps);
 
@@ -9824,15 +7123,12 @@ test "the system prompt is byte identical on every turn, whatever the notices sa
         try testing.expectEqualStrings(deps.system_prompt, request.system);
     }
 
-    // And the notices really did differ, or the test above proves nothing.
     try testing.expect(std.mem.indexOf(u8, seen.items.items[0].tail, "5 files") != null);
     try testing.expect(std.mem.indexOf(u8, seen.items.items[2].tail, "did not change") != null);
     try testing.expect(!std.mem.eql(u8, seen.items.items[0].tail, seen.items.items[2].tail));
 }
 
 test "a notice reaches the model on the turn it applies and on no other turn" {
-    // The failure this pins is the one that turns notices into a long prompt
-    // by another route: a block on the end of every single request.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9858,10 +7154,7 @@ test "a notice reaches the model on the turn it applies and on no other turn" {
     try run(allocator, io, deps);
 
     try testing.expectEqual(@as(usize, 3), seen.items.items.len);
-    // Said once, on the first turn.
     try testing.expect(std.mem.indexOf(u8, seen.items.items[0].tail, "7 files") != null);
-    // And never again: the count did not change, so repeating it would be
-    // noise a model learns to skip.
     for (seen.items.items[1..]) |request| {
         try testing.expect(std.mem.indexOf(u8, request.tail, notices.prefix) == null);
     }
@@ -9894,19 +7187,13 @@ test "a file read again unchanged is reported to the model" {
 
     try run(allocator, io, testDeps(fake_client.client(), store, scripted.runner()));
 
-    // Nothing on the turn after the first read: one read is not a re-read.
     try testing.expect(std.mem.indexOf(u8, seen.items.items[1].tail, notices.prefix) == null);
-    // And the file, by name, on the turn after the second one.
     const told = seen.items.items[2].tail;
     try testing.expect(std.mem.indexOf(u8, told, "src/main.zig") != null);
     try testing.expect(std.mem.indexOf(u8, told, "did not change") != null);
 }
 
 test "a file that changed between two reads is never reported as unchanged" {
-    // **This is the half that makes the notice trustworthy**, and it is the
-    // reason the file is changed between the two reads rather than read twice.
-    // A notice that said "unchanged" here would send the model on with a stale
-    // copy, which is a worse fault than the re-read the notice exists to stop.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -9950,8 +7237,6 @@ test "the repeated call notice names the tool and the arguments, and one call al
     var seen = SeenRequests{ .allocator = allocator };
     defer seen.deinit();
 
-    // The red team run of 2026-08-21, in miniature: the same read of the same
-    // path, over and over, with nothing telling the model.
     const repeated = "{\"command\":\"readlink -f .\"}";
     var fake_client = FakeClient{
         .seen = &seen,
@@ -9964,12 +7249,8 @@ test "the repeated call notice names the tool and the arguments, and one call al
 
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
 
-    // One call is ordinary work and gets nothing at all. The notice that fired
-    // there would fire on every healthy session.
     try testing.expect(std.mem.indexOf(u8, seen.items.items[1].tail, notices.prefix) == null);
 
-    // The second identical call is the last moment a notice can still prevent
-    // a third, which is what `Loop.no_progress_repeats` stops the session on.
     const told = seen.items.items[2].tail;
     try testing.expect(std.mem.indexOf(u8, told, "run_command") != null);
     try testing.expect(std.mem.indexOf(u8, told, "readlink -f .") != null);
@@ -9977,10 +7258,6 @@ test "the repeated call notice names the tool and the arguments, and one call al
 }
 
 test "a notice is in no event in the log, so a replay never sees one" {
-    // A notice says what the harness knows now. It is not a turn anybody took,
-    // it is recomputed from the log every time, and a copy of it in the log
-    // would grow the context by one message per turn forever. The same rule
-    // `Observer.onNotice` already keeps: see its own doc comment.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10011,8 +7288,6 @@ test "a notice is in no event in the log, so a replay never sees one" {
 }
 
 test "notices turned off leave the request exactly as the fold built it" {
-    // The off side of the measurement, at the wiring. Every fact this session
-    // holds would produce a line with notices on.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10046,8 +7321,6 @@ test "notices turned off leave the request exactly as the fold built it" {
         try testing.expect(std.mem.indexOf(u8, request.tail, notices.prefix) == null);
     }
 
-    // The same session with notices on, so the difference is the switch and
-    // not the script.
     var other_backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
     const other_store = other_backing.storage();
     defer other_store.close(io);
@@ -10060,8 +7333,6 @@ test "notices turned off leave the request exactly as the fold built it" {
 
     try testing.expect(on_seen.anyTailHolds(notices.prefix));
 
-    // And the message counts differ by exactly the notices, which is the only
-    // thing the switch changes.
     try testing.expectEqual(off_seen.items.items.len, on_seen.items.items.len);
     for (off_seen.items.items, on_seen.items.items) |off, on| {
         try testing.expect(on.messages == off.messages or on.messages == off.messages + 1);
@@ -10069,9 +7340,6 @@ test "notices turned off leave the request exactly as the fold built it" {
 }
 
 test "the notice the model is given is the notice a watching person is shown" {
-    // A user who cannot see what the harness put in front of the model cannot
-    // judge whether it helped, which is the whole of the measurement. See
-    // `Observer.onNotice`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10096,11 +7364,6 @@ test "the notice the model is given is the notice a watching person is shown" {
 }
 
 test "the budget notice reaches the model, and a spend Chock cannot measure is never given a percent" {
-    // **The negative half is the one that matters.** A percentage of a total
-    // with an unpriced turn in it is a made up number, and a model told a made
-    // up number about its own money is worse off than one told nothing. The
-    // same rule `refuseForBudget` already keeps, read from the other side: see
-    // `spentPercent`.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10108,7 +7371,6 @@ test "the budget notice reaches the model, and a spend Chock cannot measure is n
     const store = backing.storage();
     defer store.close(io);
 
-    // Half the cap, spent on a turn that could be priced.
     try seedEvent(allocator, io, store, .{ .usage = .{
         .input_tokens = 1000,
         .output_tokens = 500,
@@ -10127,8 +7389,6 @@ test "the budget notice reaches the model, and a spend Chock cannot measure is n
 
     try testing.expect(seen.anyTailHolds("50 percent"));
 
-    // The same session over a total that cannot be enforced: one turn whose
-    // cost nobody knows, and the whole percentage goes away with it.
     var other_backing = try chock_proto.storage.Memory.init(allocator, "01LOOP");
     const other_store = other_backing.storage();
     defer other_store.close(io);
@@ -10160,9 +7420,6 @@ test "the budget notice reaches the model, and a spend Chock cannot measure is n
 }
 
 test "a session with no cap at all is never told about a budget" {
-    // A project that set no cap has no number to be a percentage of, and a
-    // notice that appeared anyway would be the whole feature firing on a
-    // session it does not apply to.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10182,15 +7439,11 @@ test "a session with no cap at all is never told about a budget" {
     var fake_client = FakeClient{ .seen = &seen, .turns = &.{.{ .deltas = &.{.{ .text = "done" }} }} };
     var fake_tools = FakeToolRunner{ .output = "unused" };
 
-    // `budget` left null, which is what a project with no cap gets.
     try run(allocator, io, testDeps(fake_client.client(), store, fake_tools.runner()));
     try testing.expect(!seen.anyTailHolds("percent"));
 }
 
 test "the task is put back in front of the agent in a long session, and not in a short one" {
-    // A small model's attention decays across a long conversation, and the
-    // first message is the one it can least afford to lose. It is also the one
-    // that is already there on turn two, which is why this waits.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10202,9 +7455,6 @@ test "the task is put back in front of the agent in a long session, and not in a
     const said = [_]event.ContentPart{.{ .text = task }};
     try seedEvent(allocator, io, store, .{ .message = .{ .role = .user, .content = &said } });
 
-    // Enough turns to pass `notices.Policy.goal_every_turns`, each one a tool
-    // call so the session keeps going, and each with different arguments so
-    // the no progress detector never fires.
     const turn_count = 12;
     var script: [turn_count]FakeTurn = undefined;
     var arguments: [turn_count][]u8 = undefined;
@@ -10230,17 +7480,10 @@ test "the task is put back in front of the agent in a long session, and not in a
     deps.max_turns = turn_count;
     try run(allocator, io, deps);
 
-    // Not on any of the early turns: the task is the first message and it is
-    // still close enough to read. Read from the mechanism itself, so a trigger
-    // that changes changes this with it.
     const triggers = notices.Policy{};
     for (seen.items.items[0..triggers.goal_every_turns]) |request| {
         try testing.expect(std.mem.indexOf(u8, request.tail, notices.prefix) == null);
     }
-    // And there once the session is long, in a line the harness signed. Not
-    // merely "the task text appears somewhere": the very first request ends
-    // with the user message itself, so that would have passed with the notice
-    // never built at all.
     var restated = false;
     for (seen.items.items) |request| {
         if (std.mem.indexOf(u8, request.tail, notices.prefix) == null) continue;
@@ -10249,9 +7492,6 @@ test "the task is put back in front of the agent in a long session, and not in a
     try testing.expect(restated);
 }
 
-/// A `tasks.Runner` that runs nothing. The loop's job is to record and deliver
-/// a completion, and neither of those needs a sandbox: see
-/// `lib/chock-core/tasks.zig`'s own `Runner` for why that seam exists.
 const FakeTaskRunner = struct {
     output: []const u8,
 
@@ -10317,9 +7557,6 @@ test "a finished background task is recorded as an event and delivered as a mess
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
 
-    // Named from the directory the table really writes to, so this reads the
-    // same fact on a build that moves a path and on one that does not: see
-    // `chock_core.tasks.sandboxDirFor`.
     const output_path = try task_table.sandboxPathFor(allocator, tasks_dir, "task-01");
     defer allocator.free(output_path);
 
@@ -10336,9 +7573,6 @@ test "a finished background task is recorded as an event and delivered as a mess
                 try testing.expectEqual(@as(i64, 2), done.code);
                 try testing.expectEqualStrings(output_path, done.output_path);
                 try testing.expectEqual(@as(u64, "the build failed\n".len), done.output_bytes);
-                // The record names the file and never quotes it: a build
-                // writes megabytes, and the log is the one file a session
-                // cannot afford to bloat.
                 record_id = parsed.value.id;
             },
             .message => |m| switch (m.role) {
@@ -10358,27 +7592,16 @@ test "a finished background task is recorded as an event and delivered as a mess
 
     try testing.expect(record_id != null);
     try testing.expect(delivery_id != null);
-    // The record is written before the delivery, so a log a replay reads in
-    // order never shows an agent being told about a task that has not been
-    // recorded as finished.
     try testing.expect(record_id.? < delivery_id.?);
-    // And both land before the model speaks, which is what "the agent acted on
-    // a background result" has to mean: the turn that read it can be tied to
-    // the turn it was told.
     try testing.expect(assistant_id != null);
     try testing.expect(delivery_id.? < assistant_id.?);
 
-    // Drained once. A loop that polled at every safe point and did not clear
-    // the table would tell the agent about one task on every turn.
     const again = try table.take(allocator);
     defer task_table.freeCompletions(allocator, again);
     try testing.expectEqual(@as(usize, 0), again.len);
 }
 
 test "a session with no task table runs exactly as it did before background tasks existed" {
-    // The default, and the one every existing caller takes. `Deps.tasks` is
-    // null, so nothing is drained, nothing is appended, and the log holds the
-    // same events it always did.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -10403,27 +7626,14 @@ test "a session with no task table runs exactly as it did before background task
     }
 }
 
-/// What one session's `update_plan` calls left behind. Every string is in the
-/// arena the caller passed to `runPlanSession`.
 const PlanRun = struct {
-    /// One entry per `update_plan` call, in order: what the model read back.
     outputs: []const []const u8,
-    /// One entry per call: whether that call was refused.
     refused: []const bool,
-    /// How many `plan.update` events the log holds. **A call that changed
-    /// nothing must add none.**
     events: usize,
-    /// How many steps those events carry between them, so a test can see that
-    /// only what changed was written down.
     written_steps: usize,
-    /// How many times the tool runner was asked to run anything. Zero is the
-    /// assertion: a task list is never a sandboxed tool call.
     runner_calls: usize,
 };
 
-/// Run one session that makes one `update_plan` call per entry of `calls`,
-/// then answers. `session` is folded from a fresh replay of the log afterwards,
-/// so what it holds came out of the file and not out of the running loop.
 fn runPlanSession(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -10489,34 +7699,14 @@ fn runPlanSession(
     return out;
 }
 
-/// What one session's `restrict_self` calls left behind. Every string is in
-/// the arena the caller passed to `runPromiseSession`.
 const PromiseRun = struct {
-    /// One entry per call, in order: what the model read back.
     outputs: []const []const u8,
-    /// One entry per call: whether that call was refused.
     refused: []const bool,
-    /// How many `policy.self` events the log holds. **A call that was refused,
-    /// and a call that changed nothing, must add none.**
     events: usize,
-    /// How many times the tool runner was asked to run anything. Zero is the
-    /// assertion: a promise is never a sandboxed tool call.
     runner_calls: usize,
 };
 
-/// Run one session that makes one `restrict_self` call per entry of `calls`,
-/// then answers. `session` is folded from a fresh replay of the log afterwards,
-/// so what it holds came out of the file and not out of the running loop.
-/// An `Arbiter` that answers by action name, for the one call that can ask
-/// more than once.
-///
-/// **It keeps a copy of every action it was asked about.** The names are built
-/// in a buffer on `gateToolCall`'s own stack, so a double that kept the slices
-/// would be reading a frame that is gone a moment later, which is the same
-/// reason `TestArbiter` copies its summary and its detail.
 const ActionArbiter = struct {
-    /// Every action whose name starts with this is refused. An empty prefix
-    /// refuses nothing, which is how a test says "both were allowed".
     refuse_prefix: []const u8 = "",
     calls: usize = 0,
     seen: [4][256]u8 = undefined,
@@ -10554,18 +7744,9 @@ const ActionArbiter = struct {
     }
 };
 
-/// An `Arbiter` a test drives. **It counts its calls**, because a test that
-/// only read the outcome could not tell a widening that was weighed and refused
-/// from one that was never asked about, and several facts below are exactly
-/// about which of those happened.
 const TestArbiter = struct {
     answer: arbiter_mod.Answer = .{ .permitted = false, .outcome = "refused_by_user" },
     calls: usize = 0,
-    /// What the last call was asked about. **Copied and not kept**: `runWiden`
-    /// builds the summary and the detail for the length of the call and frees
-    /// them again, the same way `Broker.Request` borrows everything it is
-    /// given, so a double that held the slices would be reading freed memory a
-    /// moment later.
     saw_action: []const u8 = "",
     saw_tool: []const u8 = "",
     summary_buffer: [512]u8 = undefined,
@@ -10599,8 +7780,6 @@ const TestArbiter = struct {
         _ = locked;
         const self: *TestArbiter = @ptrCast(@alignCast(ptr));
         self.calls += 1;
-        // The action name and the tool name are static text a caller does not
-        // build, so those are safe to keep as they are.
         self.saw_action = ask.action;
         self.saw_tool = ask.tool;
         self.summary_len = @min(ask.summary.len, self.summary_buffer.len);
@@ -10621,7 +7800,6 @@ fn runPromiseSession(
     return runPromiseSessionWith(allocator, arena, io, calls, session, null);
 }
 
-/// Same, for a session that can ask somebody about a widening.
 fn runPromiseSessionWith(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -10686,10 +7864,6 @@ fn runPromiseSessionWith(
 }
 
 test "an agent cannot lift a promise it made, and the refusal writes nothing" {
-    // A self imposed constraint the self can relax is not a constraint, so
-    // this drives the whole shape: the agent binds itself, forgets, and asks
-    // for the permission back. The request is refused, no event is written, and
-    // the promise the session holds afterwards is exactly the one it made.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10702,43 +7876,28 @@ test "an agent cannot lift a promise it made, and the refusal writes nothing" {
     const outcome = try runPromiseSession(allocator, arena, io, &.{
         \\{"action":"net.fetch","ceiling":"deny","reason":"this task reads local files only"}
         ,
-        // The same act, asked for back. This is the call the whole design
-        // exists to refuse.
         \\{"action":"net.fetch","ceiling":"allow","reason":"I have changed my mind"}
         ,
-        // And the smaller version of it: not all the way back to `allow`, only
-        // one step up. A ratchet that only caught the obvious case would pass
-        // the line above and fail this one.
         \\{"action":"net.fetch","ceiling":"ask","reason":"a person could decide"}
         ,
     }, &session);
 
-    // A promise is never a sandboxed tool call: it is an event in a log the
-    // loop holds the only lock on.
     try testing.expectEqual(@as(usize, 0), outcome.runner_calls);
 
-    // One promise written, and neither request to lift it wrote anything.
     try testing.expectEqual(@as(usize, 1), outcome.events);
     try testing.expect(!outcome.refused[0]);
     try testing.expect(outcome.refused[1]);
     try testing.expect(outcome.refused[2]);
 
-    // The model is told what it holds, that it cannot take it back, and what
-    // to do instead. A bare no costs the next five turns.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "cannot take it back") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "net.fetch at most deny") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "nothing was lifted") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "authorised by somebody other than you") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "stop and say what is left") != null);
 
-    // And the session, folded out of its own file, still holds the promise it
-    // made. This is the fact the broker reads: see
-    // `lib/chock-broker/Broker.zig`.
     try testing.expectEqual(@as(usize, 1), session.self_policy.restrictions.items.len);
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     try testing.expectEqual(chock_policy.table.Decision.deny, ratchet.ceilingFor(held, "net.fetch"));
-    // A table that allowed the act outright still ends at `deny` once the
-    // promise is folded in, which is what makes the promise worth making.
     try testing.expectEqual(
         chock_policy.table.Decision.deny,
         ratchet.narrow(.allow, held, "net.fetch"),
@@ -10746,15 +7905,6 @@ test "an agent cannot lift a promise it made, and the refusal writes nothing" {
 }
 
 test "a widening proposal is put to somebody, and the refusal says it was weighed" {
-    // The ratchet, and `chock_policy.ratchet.widen_action`. Before this, a
-    // widening was refused with nobody asked, and the refusal had to say so.
-    // Now there is somebody to ask, so two facts: the request really does reach
-    // them, under the action name given to it, and the answer that comes back
-    // is what the model is told.
-    //
-    // **The call count is what separates weighed from never asked**, which a
-    // test reading only the outcome could not tell apart, and those are the two
-    // facts an approval keeps separate.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10778,40 +7928,25 @@ test "a widening proposal is put to somebody, and the refusal says it was weighe
     }, &session, judge.arbiter());
 
     try testing.expectEqual(@as(usize, 1), judge.calls);
-    // The key it was measured against, which is what a project writes a rule
-    // for in `chock.zon`.
     try testing.expectEqualStrings(ratchet.widen_action, judge.saw_action);
     try testing.expectEqualStrings(restrict_tool_name, judge.saw_tool);
-    // The effect, and never a command string. Both ceilings are in it, because
-    // "from deny to ask" is what somebody is deciding about.
     try testing.expect(std.mem.indexOf(u8, judge.sawDetail(), "net.fetch") != null);
     try testing.expect(std.mem.indexOf(u8, judge.sawDetail(), "deny") != null);
     try testing.expect(std.mem.indexOf(u8, judge.sawDetail(), "ask") != null);
     try testing.expect(std.mem.indexOf(u8, judge.sawDetail(), "the task turned out to need one fetch") != null);
     try testing.expect(std.mem.indexOf(u8, judge.sawSummary(), "net.fetch") != null);
 
-    // Refused, so nothing was written and the promise still stands.
     try testing.expect(outcome.refused[1]);
     try testing.expectEqual(@as(usize, 1), outcome.events);
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     try testing.expectEqual(chock_policy.table.Decision.deny, ratchet.ceilingFor(held, "net.fetch"));
 
-    // And the model is told which answer it got, not a generic no. This is the
-    // production caller `chock_broker.review.requesterText` did not have.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "refused_by_review") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "A reviewer read this request") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "nothing was lifted") != null);
 }
 
 test "a widening somebody authorised is the one thing that lifts a promise" {
-    // The release valve actually opening. An agent binds itself, the task turns
-    // out to need the thing it gave up, somebody who is not the agent says yes,
-    // and **the ceiling the broker reads afterwards has really moved**. Without
-    // this the whole path is a question with no consequence.
-    //
-    // The check is over a session folded from a fresh replay of its own log, so
-    // what is read came out of the file: an authorised lift that only lived in
-    // the running loop would be lost to a resume, a compaction, or a handover.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10833,23 +7968,13 @@ test "a widening somebody authorised is the one thing that lifts a promise" {
     try testing.expectEqual(@as(usize, 1), judge.calls);
     try testing.expect(!outcome.refused[1]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "Lifted") != null);
-    // The words say who decided, because an agent that read "lifted" and
-    // thought it had lifted it would have learned the wrong lesson.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "Somebody other than you") != null);
 
-    // Two `policy.self` events: the promise and the lift. The lift is a record
-    // like any other, so a person reading the log the next morning sees both
-    // the promise and who let the session out of it.
     try testing.expectEqual(@as(usize, 2), outcome.events);
 
-    // **One promise left, at the new ceiling.** The fold replaced by exact name
-    // rather than adding one more term to the minimum: see
-    // `chock_proto.state.SelfPolicy.apply`.
     try testing.expectEqual(@as(usize, 1), session.self_policy.restrictions.items.len);
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     try testing.expectEqual(chock_policy.table.Decision.ask, ratchet.ceilingFor(held, "net.fetch"));
-    // And the promise still binds: a lift to `ask` is not a lift to `allow`, so
-    // a table that would have allowed the act outright still ends at `ask`.
     try testing.expectEqual(
         chock_policy.table.Decision.ask,
         ratchet.narrow(.allow, held, "net.fetch"),
@@ -10857,16 +7982,6 @@ test "a widening somebody authorised is the one thing that lifts a promise" {
 }
 
 test "a lift that names a wider pattern than the promise is refused before anybody is asked" {
-    // A session that promised `git.*` and asks to be let out of `git.push` is
-    // asking about something it never promised under that name.
-    // `ratchet.ceilingFor` would still hold `git.*` against it afterwards, so an
-    // authorised yes would be recorded and would change nothing, which is the
-    // worst of the three outcomes: a person spends a decision and the agent
-    // believes a wall came down that is still there.
-    //
-    // **Nobody is asked at all**, which the call count is what proves: paying
-    // for a review, or waking a person, for an answer that cannot take effect
-    // is the same waste `Broker.reviewed` already refuses to spend.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10888,8 +8003,6 @@ test "a lift that names a wider pattern than the promise is refused before anybo
     try testing.expectEqual(@as(usize, 0), judge.calls);
     try testing.expect(outcome.refused[1]);
     try testing.expectEqual(@as(usize, 1), outcome.events);
-    // The message names what to write instead, which is the whole difference
-    // between a refusal a model can act on and one that costs five turns.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "under a different name") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "git.*") != null);
 
@@ -10898,9 +8011,6 @@ test "a lift that names a wider pattern than the promise is refused before anybo
 }
 
 test "a promise applies at once when it narrows, and a session may narrow twice" {
-    // Narrowing is free: no reviewer, no person, no question in the log. And
-    // free more than once, because an agent that learns more about the task
-    // should be able to give up more.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10913,43 +8023,28 @@ test "a promise applies at once when it narrows, and a session may narrow twice"
     const outcome = try runPromiseSession(allocator, arena, io, &.{
         \\{"action":"git.*","ceiling":"ask","reason":"no git without a person"}
         ,
-        // Narrower than the class above, and about one act inside it.
         \\{"action":"git.push","ceiling":"deny","reason":"and nothing leaves this machine"}
         ,
-        // Already covered by the class: the same ceiling it already holds.
         \\{"action":"git.commit","ceiling":"ask","reason":"saying it again"}
         ,
     }, &session);
 
     try testing.expectEqual(@as(usize, 0), outcome.runner_calls);
-    // Two written, and the third changed nothing so it wrote nothing.
     try testing.expectEqual(@as(usize, 2), outcome.events);
     try testing.expect(!outcome.refused[0]);
     try testing.expect(!outcome.refused[1]);
-    // A call that changed nothing is not a failure: what it asked for is
-    // already true of this session.
     try testing.expect(!outcome.refused[2]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[2], "Nothing changed") != null);
 
-    // No approval was ever asked for, which is what "narrowing is free" means
-    // in the log.
     try testing.expectEqual(@as(usize, 2), session.self_policy.restrictions.items.len);
 
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
-    // The narrowest promise that covers the act answers, so the class binds
-    // every act under it and the one named act is narrower still.
     try testing.expectEqual(chock_policy.table.Decision.deny, ratchet.ceilingFor(held, "git.push"));
     try testing.expectEqual(chock_policy.table.Decision.ask, ratchet.ceilingFor(held, "git.commit"));
-    // And an act nobody promised anything about is untouched.
     try testing.expectEqual(chock_policy.table.Decision.allow, ratchet.ceilingFor(held, "net.fetch"));
 }
 
 test "a promise cannot be lifted by naming a wider pattern than the one it was made about" {
-    // The near miss the classification has to get right. An agent that
-    // promised `git.push` and then asks about `git.*` is asking about a class
-    // this session promised nothing about **as a class**, so nothing it says
-    // about that class can reach the narrower promise inside it. Without this
-    // the ratchet has a way round it that reads like an ordinary call.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -10962,8 +8057,6 @@ test "a promise cannot be lifted by naming a wider pattern than the one it was m
     const outcome = try runPromiseSession(allocator, arena, io, &.{
         \\{"action":"git.push","ceiling":"deny","reason":"nothing leaves this machine"}
         ,
-        // The wider pattern, at the widest ceiling. This is the call that would
-        // be a way out if a class could answer for the acts inside it.
         \\{"action":"git.*","ceiling":"allow","reason":"git should be fine after all"}
         ,
     }, &session);
@@ -10972,29 +8065,16 @@ test "a promise cannot be lifted by naming a wider pattern than the one it was m
     try testing.expect(outcome.refused[1]);
     try testing.expectEqual(@as(usize, 1), outcome.events);
 
-    // The refusal says what a ceiling of "allow" is worth and what lifting a
-    // promise would actually take, so the model is not left guessing at a
-    // wording.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "gives up nothing") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "name exactly the action") != null);
-    // And it prints what is still held, which is the promise that was not
-    // lifted.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "git.push at most deny") != null);
 
-    // The act itself is still denied, folded out of the log.
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     try testing.expectEqual(chock_policy.table.Decision.deny, ratchet.ceilingFor(held, "git.push"));
-    // And nothing under that class was quietly promised either, so the refusal
-    // wrote nothing at all rather than writing something narrower.
     try testing.expectEqual(chock_policy.table.Decision.allow, ratchet.ceilingFor(held, "git.commit"));
 }
 
 test "a promise that binds nothing is refused, and nothing reaches the log" {
-    // Every way a proposal can be one a reader could not act on. The bounds
-    // live in `chock_policy.ratchet` and the loop is what applies them, so
-    // this is the proof that a refused proposal writes no event at all: a
-    // promise in the log that nobody can measure would be a wall the agent
-    // believes in and the broker cannot find.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11022,8 +8102,6 @@ test "a promise that binds nothing is refused, and nothing reaches the log" {
     try testing.expectEqual(@as(usize, 0), outcome.events);
     try testing.expectEqual(@as(usize, 0), session.self_policy.restrictions.items.len);
 
-    // Each refusal says which of them it was, so the model can fix the call
-    // rather than guess at it.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "JSON object") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "is not a ceiling") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[2], "name the action") != null);
@@ -11031,17 +8109,11 @@ test "a promise that binds nothing is refused, and nothing reaches the log" {
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[4], "say why") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[5], "one to a line") != null);
 
-    // A misspelled ceiling is refused rather than read as the nearest one this
-    // build knows. The five names are in the message, so the next call can be
-    // right.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"deny\"") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"allow\"") != null);
 }
 
 test "a session that never calls restrict_self promises nothing at all" {
-    // **Never pushed, proven at the log.** Nearly every session has no use for
-    // a promise, and nothing in this loop writes one on the agent's behalf, so
-    // a session that made none holds none. The same rule the task list keeps.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -11073,29 +8145,16 @@ test "a session that never calls restrict_self promises nothing at all" {
     }
     try testing.expectEqual(@as(usize, 0), session.self_policy.restrictions.items.len);
 
-    // And a session that promised nothing narrows nothing, so the policy
-    // table answers exactly as it would for a session with no promises in it.
     const held = try self_policy.restrictionsFrom(allocator, session.self_policy.restrictions.items);
     defer allocator.free(held);
     try testing.expectEqual(chock_policy.table.Decision.allow, ratchet.narrow(.allow, held, "git.push"));
 }
 
-// **The loop decides nothing about a fetch**, so these prove the two things
-// only the loop can be wrong about: that the call reaches the seam at all, and
-// that the promises of this session travel across it. What the seam then does
-// with them is `lib/chock-broker/fetch.zig`'s question, and
-// `test/broker/fetch.zig` answers it against a real HTTP server.
-
-/// A `fetch_mod.Fetcher` that answers a fixed page and keeps what it was asked.
 const FakeFetcher = struct {
     allocator: std.mem.Allocator,
     page: []const u8 = "the page",
     calls: usize = 0,
-    /// The URL of the last call, owned by `allocator`.
     url: []u8 = &.{},
-    /// What the last call was told this session had promised about `net.fetch`.
-    /// **The fact these tests are about**: a loop that folded no promises would
-    /// hand over an empty list and every refusal downstream would vanish.
     ceiling: chock_policy.table.Decision = .allow,
     promises: usize = 0,
 
@@ -11126,8 +8185,6 @@ const FakeFetcher = struct {
     }
 };
 
-/// Run one session whose turns are the tool calls in `calls`, each of them a
-/// `fetch_url` or a `restrict_self`, and give back what each one read.
 const FetchRun = struct {
     outputs: []const []const u8,
     refused: []const bool,
@@ -11165,9 +8222,6 @@ fn runFetchSession(
     deps.fetcher = fetcher;
     try run(allocator, io, deps);
 
-    // **A fetch must never reach the tool runner.** The loop answers it, the
-    // same way it answers a spawn and a promise, so a runner that saw one would
-    // mean the seam had been bypassed.
     if (fake_tools.calls != 0) return error.FetchReachedTheToolRunner;
 
     const outputs = try arena.alloc([]const u8, calls.len);
@@ -11193,9 +8247,6 @@ fn runFetchSession(
 }
 
 test "a fetch_url call reaches the fetcher and the page comes back as the tool result" {
-    // The one thing a unit test of the broker cannot prove: that the name in
-    // `tools.Tool` is really wired to the seam, so a model that calls it gets a
-    // page rather than "unknown tool".
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11218,11 +8269,6 @@ test "a fetch_url call reaches the fetcher and the page comes back as the tool r
 }
 
 test "a promise made earlier in the session reaches the fetcher" {
-    // **The reason this call is answered by the loop at all.** The promises of
-    // a session live in the fold of its log, a tool runner holds no log, and
-    // `restrict_self` offers "net.fetch" at "deny" in its own description. A
-    // loop that handed over an empty list would leave that promise binding
-    // nothing.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11243,15 +8289,10 @@ test "a promise made earlier in the session reaches the fetcher" {
 
     try testing.expect(!outcome.refused[0]);
     try testing.expectEqual(@as(usize, 1), fake.promises);
-    // Mutation check: hand `&.{}` to `fetcher.fetch` in `runFetch` instead of
-    // `held`, and this line is what fails.
     try testing.expectEqual(chock_policy.table.Decision.deny, fake.ceiling);
 }
 
 test "a session with no fetcher reads nothing and says so" {
-    // A session started without one is the ordinary case for a caller that has
-    // no policy table, and every test above this line runs as one. The model
-    // must be told, or it reasons about a page nobody read.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11262,8 +8303,6 @@ test "a session with no fetcher reads nothing and says so" {
         .{ .tool = fetch_tool_name, .arguments =
         \\{"url":"https://example.com/manual"}
         },
-        // And a call this cannot even read is a refusal of its own, not a
-        // fetch of an empty URL.
         .{ .tool = fetch_tool_name, .arguments = "not json at all" },
     }, null);
 
@@ -11273,24 +8312,13 @@ test "a session with no fetcher reads nothing and says so" {
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"url\"") != null);
 }
 
-/// A `handback.Handback` that records what it was asked for and answers a
-/// fixed result.
-///
-/// **What it stands in for is the whole of `src/run.zig`'s
-/// `SessionHandback`**: the worktree, the broker, the policy table and the act
-/// itself. What these tests are about is the route between the model's own tool
-/// call and that seam, which is the one thing no test of the broker can see.
 const FakeHandback = struct {
     allocator: std.mem.Allocator,
-    /// What the seam answers. **A test never sets this from the agent's own
-    /// words**, which is the point: the agent asks and something else decides.
     result: handback_mod.Result = .{ .carried = false, .output = &.{} },
     text: []const u8 = "nothing was carried back",
     carried: bool = false,
     calls: usize = 0,
-    /// The reason the agent gave, as the seam saw it.
     reason: []u8 = &.{},
-    /// The call that asked, so a reader of the log can join the question to it.
     call_id: []u8 = &.{},
 
     fn deinit(self: *FakeHandback) void {
@@ -11323,9 +8351,6 @@ const FakeHandback = struct {
     }
 };
 
-/// Run one session whose turns are the tool calls in `calls`, and give back
-/// what each one was told. The same shape `runFetchSession` has, and for the
-/// same reason.
 fn runRequestSession(
     allocator: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -11358,9 +8383,6 @@ fn runRequestSession(
     deps.handback = seam;
     try run(allocator, io, deps);
 
-    // **A request must never reach the tool runner.** The loop answers it, the
-    // same way it answers a fetch and a promise, so a runner that saw one would
-    // mean the seam had been bypassed and the act had run without the table.
     if (fake_tools.calls != 0) return error.RequestReachedTheToolRunner;
 
     const outputs = try arena.alloc([]const u8, calls.len);
@@ -11386,11 +8408,6 @@ fn runRequestSession(
 }
 
 test "a request_action call for workspace.apply reaches the seam, and the answer comes back" {
-    // The one thing a unit test of the broker cannot prove: that the name in
-    // `tools.Tool` is really wired to the seam, so a model that calls it gets
-    // an answer rather than "unknown tool". The reason it wrote and the call it
-    // asked on both reach the seam, because both go in the `approval.request` a
-    // person reads.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11418,11 +8435,6 @@ test "a request_action call for workspace.apply reaches the seam, and the answer
 }
 
 test "an agent cannot answer its own request, whatever it writes in one" {
-    // **The rule this whole tool is built around.** The agent fills in a reason
-    // and nothing else, and a reason is an argument rather than an answer. Here
-    // the model writes the most persuasive request it can, including words that
-    // look like a decision, and the seam still answers no, and the model is
-    // told no.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11446,9 +8458,6 @@ test "an agent cannot answer its own request, whatever it writes in one" {
     try testing.expect(outcome.refused[0]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "refused_by_user") != null);
 
-    // The fields the model invented were not read at all. Mutation check: give
-    // `RequestActionArgs` a field an agent could answer with, and this is what
-    // fails.
     inline for (@typeInfo(tools.RequestActionArgs).@"struct".fields) |field| {
         try testing.expect(field.type == []const u8);
     }
@@ -11456,10 +8465,6 @@ test "an agent cannot answer its own request, whatever it writes in one" {
 }
 
 test "a request for any other action is refused by name, and nothing is put to anybody" {
-    // **Narrow on purpose.** One act is offered, and a second one is not
-    // approximated as the first: a request the harness cannot honour is refused
-    // and says which name it was given. The seam is never called, so no
-    // question is written and nobody's attention is spent.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11476,7 +8481,6 @@ test "a request for any other action is refused by name, and nothing is put to a
         .{ .tool = request_tool_name, .arguments =
         \\{"action":"workspace","reason":"close enough to the real name"}
         },
-        // The empty string is a name too, and it is refused the same way.
         .{ .tool = request_tool_name, .arguments =
         \\{"action":"","reason":"no name at all"}
         },
@@ -11485,8 +8489,6 @@ test "a request for any other action is refused by name, and nothing is put to a
     try testing.expectEqual(@as(usize, 0), fake.calls);
     for (outcome.refused, outcome.outputs) |refused, output| {
         try testing.expect(refused);
-        // The name that was asked for, and the one that exists, so a model can
-        // fix the call from the answer alone.
         try testing.expect(std.mem.indexOf(u8, output, handback_mod.apply_action) != null);
     }
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "git.push") != null);
@@ -11494,8 +8496,6 @@ test "a request for any other action is refused by name, and nothing is put to a
 }
 
 test "a request with no reason is refused, because a person cannot weigh one" {
-    // A reason is what a person reads beside the diff. A request with none is
-    // one they cannot answer, so it never reaches them.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11509,8 +8509,6 @@ test "a request with no reason is refused, because a person cannot weigh one" {
         .{ .tool = request_tool_name, .arguments =
         \\{"action":"workspace.apply","reason":"   "}
         },
-        // And a call this cannot even read is a refusal of its own, not a
-        // request with an empty action in it.
         .{ .tool = request_tool_name, .arguments = "not json at all" },
     }, fake.handback());
 
@@ -11522,10 +8520,6 @@ test "a request with no reason is refused, because a person cannot weigh one" {
 }
 
 test "a session with no handback carries nothing and says nobody was asked" {
-    // A session started without one is the ordinary case for a caller with no
-    // policy table and no workspace, and every other test in this file runs as
-    // one. The model must be told it was not weighed and declined, or it goes
-    // looking for an argument that would change the answer.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11542,27 +8536,11 @@ test "a session with no handback carries nothing and says nobody was asked" {
     try testing.expectEqualStrings(handback_mod.not_offered, outcome.outputs[0]);
 }
 
-// **The loop decides nothing about a question**, so these prove the three
-// things only the loop can be wrong about: that the call reaches the seam at
-// all, that the person's own answer travels back as the tool result, and that a
-// session with nobody to ask comes straight back rather than waiting. What a
-// person actually reads and types is `lib/chock-core/ask.zig`'s question, and
-// its own tests answer it.
-
-/// An `ask_mod.Asker` that answers a scripted answer and keeps what it was
-/// asked.
 const FakeAsker = struct {
     allocator: std.mem.Allocator,
-    /// Which way the question ends. **The tag and not an `Answer`**, because the
-    /// answered case owns memory the caller frees, so it has to be built fresh
-    /// on every call.
     kind: std.meta.Tag(ask_mod.Answer) = .answered,
-    /// What the person "types", for the answered case.
     said: []const u8 = "use the staging database",
     calls: usize = 0,
-    /// The question of the last call, owned by `allocator`. **The fact these
-    /// tests are about**: a loop that dropped the model's words would ask a
-    /// person an empty question.
     question: []u8 = &.{},
     options: usize = 0,
 
@@ -11589,7 +8567,7 @@ const FakeAsker = struct {
         self.question = try self.allocator.dupe(u8, question.text);
         self.options = question.options.len;
         // No `else`: a way for a question to end that is added to `Answer` and
-        // forgotten here fails the build rather than being untested.
+        // forgotten here fails the build rather than going untested.
         return switch (self.kind) {
             .answered => .{ .answered = try gpa.dupe(u8, self.said) },
             .declined => .declined,
@@ -11603,8 +8581,6 @@ const FakeAsker = struct {
 const AskRun = struct {
     outputs: []const []const u8,
     refused: []const bool,
-    /// How many `approval.request` events the session wrote. **Always zero for
-    /// an ask**: see `lib/chock-core/ask.zig`'s own top comment.
     approvals: usize,
 };
 
@@ -11640,9 +8616,6 @@ fn runAskSession(
     deps.asker = asker;
     try run(allocator, io, deps);
 
-    // **A question must never reach the tool runner.** A `Registry` runs inside
-    // a sandbox that holds no terminal, so a runner that saw one would mean the
-    // seam had been bypassed.
     if (fake_tools.calls != 0) return error.AskReachedTheToolRunner;
 
     const outputs = try arena.alloc([]const u8, calls.len);
@@ -11670,10 +8643,6 @@ fn runAskSession(
 }
 
 test "an ask_user call reaches the person and the answer comes back as the tool result" {
-    // The one thing a unit test of `ask.zig` cannot prove: that the name in
-    // `tools.Tool` is really wired to the seam, so a model that calls it reaches
-    // a person rather than "unknown tool". This is the fault this project has
-    // shipped at least eight times.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11687,31 +8656,18 @@ test "an ask_user call reaches the person and the answer comes back as the tool 
         \\{"question":"which database should I write to?","options":["staging","production"]}
     }, fake.asker());
 
-    // The model's own words reached the seam, and so did its options.
     try testing.expectEqual(@as(usize, 1), fake.calls);
     try testing.expectEqualStrings("which database should I write to?", fake.question);
     try testing.expectEqual(@as(usize, 2), fake.options);
 
-    // And the person's own words reached the model, marked as theirs.
     try testing.expect(!outcome.refused[0]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "use the staging database") != null);
     try testing.expect(std.mem.startsWith(u8, outcome.outputs[0], "[chock: the user answered.]"));
 
-    // **And no approval was asked for.** An ask grants nothing, so it writes no
-    // `approval.request` and there is nothing for anybody to have permitted.
     try testing.expectEqual(@as(usize, 0), outcome.approvals);
-
-    // Mutation check: send `&.{}` instead of `question.options` in
-    // `runAskUser`, and the `fake.options` line fails. Drop the `ask_tool_name`
-    // branch in `runTool` and `runAskSession` fails with
-    // `AskReachedTheToolRunner`.
 }
 
 test "a session with nobody to ask says so at once and does not stall" {
-    // **The refusal path at the loop.** A subagent and a daemon session both run
-    // as this, and every other test of this loop runs as one too. A hang here
-    // holds the session lock for good, so what is pinned is that the call comes
-    // back and that the words tell the model to carry on by itself.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11721,11 +8677,7 @@ test "a session with nobody to ask says so at once and does not stall" {
     const outcome = try runAskSession(allocator, arena, io, &.{
         \\{"question":"which database should I write to?"}
         ,
-        // A call this cannot even read is a refusal of its own, and never a
-        // question with an empty body put in front of somebody.
         "not json at all",
-        // So is one with nothing in it. `ask.check` is what stops it, before
-        // any seam is reached.
         \\{"question":"   "}
         ,
     }, null);
@@ -11744,11 +8696,6 @@ test "a session with nobody to ask says so at once and does not stall" {
 }
 
 test "an ask that nobody answered is an error result the model can act on" {
-    // The three ways a question ends with no answer are kept apart from a person
-    // who answered, because a model told "no answer" and a model told "they said
-    // nothing" go different ways. What is pinned here is that each one arrives
-    // as an error result carrying its own words, so the model never mistakes one
-    // for a person's reply.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -11772,24 +8719,13 @@ test "an ask that nobody answered is an error result the model can act on" {
 
         try testing.expectEqual(@as(usize, 1), fake.calls);
         try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], case.says) != null);
-        // A person who deliberately said nothing has answered the question, so
-        // that one alone is not an error.
         try testing.expectEqual(case.kind != .declined, outcome.refused[0]);
     }
 }
 
-// **The title travels a road no unit test can check on its own**: the model
-// names a tool, the loop answers it in place of the tool runner, and the name
-// ends up as an event in the session log that `chock sessions` folds. These
-// drive the whole of that road, because every part of it has been built and left
-// unwired at least eight times in this project.
-
 const TitleRun = struct {
     outputs: []const []const u8,
     refused: []const bool,
-    /// Every title the log holds, in the order they were written. **The fact
-    /// these tests are about**: a title that never reached the log is a title no
-    /// listing will ever show.
     written: []const []const u8,
 };
 
@@ -11823,9 +8759,6 @@ fn runTitleSession(
     const deps = testDeps(fake_client.client(), store, fake_tools.runner());
     try run(allocator, io, deps);
 
-    // **A title must never reach the tool runner.** A `Registry` runs inside a
-    // sandbox and holds no log, so a runner that saw one would mean the loop had
-    // handed the session's own record to something that cannot write it.
     if (fake_tools.calls != 0) return error.TitleReachedTheToolRunner;
 
     const outputs = try arena.alloc([]const u8, calls.len);
@@ -11857,9 +8790,6 @@ fn runTitleSession(
 }
 
 test "a set_title call names the session, and the name is in the log the listing folds" {
-    // The one thing a unit test cannot prove: that `set_title` in `tools.Tool` is
-    // really wired to a loop that writes the event, so a model that calls it
-    // names the session rather than reading "unknown tool".
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11871,35 +8801,21 @@ test "a set_title call names the session, and the name is in the log the listing
     });
 
     try testing.expect(!outcome.refused[0]);
-    // The name reached the log, which is the only place a listing reads it from.
     try testing.expectEqual(@as(usize, 1), outcome.written.len);
     try testing.expectEqualStrings("port the parser to the new lexer", outcome.written[0]);
-    // And the model is told the name it gave, so it can see which of its
-    // attempts is the one a person will read.
     try testing.expect(std.mem.indexOf(
         u8,
         outcome.outputs[0],
         "This session is now called: port the parser to the new lexer",
     ) != null);
 
-    // A title with a space at either end is the same title as the one without,
-    // so a retitle that only added whitespace does not read as a rename.
     const trimmed = try runTitleSession(allocator, arena, io, &.{
         \\{"title":"  port the parser to the new lexer \t"}
     });
     try testing.expectEqualStrings("port the parser to the new lexer", trimmed.written[0]);
-
-    // Mutation check: drop the `title_tool_name` branch in `runTool`, and
-    // `runTitleSession` fails with `TitleReachedTheToolRunner`. Drop the
-    // `appendAndApply` call in `runSetTitle` and the `outcome.written` lines
-    // fail. Drop the `std.mem.trim` and the last line fails.
 }
 
 test "a later title supersedes an earlier one, and the log still holds both" {
-    // **The log is append only, so a rename cannot be a rewrite.** This is what
-    // makes "name the session early and correct it later" safe advice: an agent
-    // that finds out halfway through what the task really is says so, the fold
-    // takes the last, and the name the session went by first is still on record.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11916,20 +8832,10 @@ test "a later title supersedes an earlier one, and the log still holds both" {
     try testing.expectEqual(@as(usize, 2), outcome.written.len);
     try testing.expectEqualStrings("read the parser tests", outcome.written[0]);
     try testing.expectEqualStrings("port the parser to the new lexer", outcome.written[1]);
-    // And the answer says a later call is allowed, so a model that learns
-    // something is not left believing the first name is final.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "again") != null);
-
-    // Mutation check: keep only the first title, by returning early in
-    // `runSetTitle` when the log already holds one, and the second
-    // `expectEqualStrings` fails on a list of one.
 }
 
 test "a title that is not one short line of plain text is refused and nothing is written" {
-    // Every one of these is the model's own to fix, so it is told what to send
-    // instead and no bad title reaches the log at all. **The hostile ones matter
-    // most**: a title is printed in a list on somebody's terminal, so an escape
-    // sequence in one would drive it.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -11940,29 +8846,22 @@ test "a title that is not one short line of plain text is refused and nothing is
     const too_long = try std.fmt.allocPrint(arena, "{{\"title\":\"{s}\"}}", .{long});
 
     const cases = [_][]const u8{
-        // Nothing at all, and whitespace, which is the same fact.
         \\{"title":""}
         ,
         \\{"title":"   "}
         ,
-        // Not the shape the tool takes.
         \\{"steps":[]}
         ,
         too_long,
-        // Two lines, the second of which would reach column zero in a listing
-        // and read as a row of the table.
         \\{"title":"read the tests\n01M0TMATKB6M4H3GY35KYA68QR  finished"}
         ,
-        // An escape sequence that clears the screen, and a bell. Written as
-        // JSON escapes, so the real bytes reach the check and this source file
-        // stays plain text.
+        // Written as JSON escapes, so the real bytes reach the check and this source
+        // file stays plain text.
         \\{"title":"read \u001b[2J the tests \u0007"}
         ,
     };
     const outcome = try runTitleSession(allocator, arena, io, &cases);
 
-    // **Not one of them reached the log.** This is the line that matters: a
-    // refusal that still wrote the title would defend nothing.
     try testing.expectEqual(@as(usize, 0), outcome.written.len);
     for (outcome.refused) |one| try testing.expect(one);
 
@@ -11973,35 +8872,17 @@ test "a title that is not one short line of plain text is refused and nothing is
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[4], "one line") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[5], "control character") != null);
 
-    // A title exactly at the bound is allowed: the bound is what is allowed, and
-    // the one past it is what is refused.
     const at_bound = "e" ** max_title_bytes;
     const allowed = try std.fmt.allocPrint(arena, "{{\"title\":\"{s}\"}}", .{at_bound});
     const kept = try runTitleSession(allocator, arena, io, &.{allowed});
     try testing.expect(!kept.refused[0]);
     try testing.expectEqual(@as(usize, 1), kept.written.len);
 
-    // Bytes that are not text never get as far as a JSON document, so that one
-    // is answered at the check itself. A log line whose title is not a string is
-    // a line no replay of this build can read back.
     try testing.expect(titleRefusalText("\xff\xfe name") != null);
     try testing.expect(titleRefusalText("an ordinary name") == null);
-
-    // Mutation check: change `>` to `>=` on the length test in
-    // `titleRefusalText` and the `at_bound` case fails. Drop the control
-    // character loop and the last two outputs stop being refused, so the
-    // `outcome.written.len` line fails with a list of two.
 }
 
 test "a compaction puts the task list back in front of the model, and only when there is one" {
-    // The task list's own known gap, closed at the loop. The list survives a
-    // compaction for the reader, because `chock plan` folds the log, and it
-    // does not survive one for the model: the only place the model ever saw its
-    // list was the tool result of its own `update_plan` call, and that is
-    // exactly what a fold can take away.
-    //
-    // **Both halves in one test**, because the trigger never firing for a
-    // session that keeps no list is what makes this notice acceptable at all.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -12011,7 +8892,6 @@ test "a compaction puts the task list back in front of the model, and only when 
         "{\"id\":\"fix\",\"subject\":\"fix the width count\",\"status\":\"pending\"}," ++
         "{\"id\":\"old\",\"subject\":\"work that is finished\",\"status\":\"done\"}]}";
 
-    // A session that kept a list and then compacted.
     {
         var backing = try chock_proto.storage.Memory.init(allocator, "01PLANFOLD");
         const store = backing.storage();
@@ -12034,12 +8914,10 @@ test "a compaction puts the task list back in front of the model, and only when 
                     .name = plan_tool_name,
                     .arguments = plan_arguments,
                 } }} },
-                // Now past three quarters of 65536, which is 49152.
                 .{ .deltas = &.{
                     .{ .tool_call = .{ .index = 0, .id = "call1", .name = "run_command", .arguments = "{}" } },
                     .{ .usage = .{ .input_tokens = 60000 } },
                 } },
-                // The summary the compaction asks for, before the turn after it.
                 .{ .deltas = &.{.{ .text = "SUMMARY" }} },
                 .{ .deltas = &.{.{ .text = "all done" }} },
             },
@@ -12050,22 +8928,14 @@ test "a compaction puts the task list back in front of the model, and only when 
         deps.compaction = .{ .context_limit_tokens = 65536 };
         try run(allocator, io, deps);
 
-        // The compaction really happened, so what follows is about a folded
-        // session and not about a session that never reached the threshold.
         var found = (try firstCompaction(allocator, io, store)).?;
         defer found.deinit(allocator);
 
-        // The two steps that are left, by name, because a reminder that a list
-        // exists is not the list: an agent that lost its plan cannot fetch one.
         try testing.expect(seen.anyTailHolds("folded into a summary"));
         try testing.expect(seen.anyTailHolds("read the fold"));
         try testing.expect(seen.anyTailHolds("fix the width count"));
-        // And the step that is finished is not put back, because it is not
-        // work that is left.
         try testing.expect(!seen.anyTailHolds("work that is finished"));
 
-        // Nothing about the notice reaches the log, the same as every other
-        // notice: a replay of this session never sees one.
         var replay = try store.replay(allocator, io, 0);
         defer replay.deinit();
         while (try replay.next(io)) |parsed| {
@@ -12076,8 +8946,6 @@ test "a compaction puts the task list back in front of the model, and only when 
         }
     }
 
-    // The same compaction on a session whose agent never wrote a list. Nothing
-    // is said, which is the property that keeps this notice worth reading.
     {
         var backing = try chock_proto.storage.Memory.init(allocator, "01NOPLANFOLD");
         const store = backing.storage();
@@ -12112,12 +8980,6 @@ test "a compaction puts the task list back in front of the model, and only when 
 }
 
 test "an arbitrator runs no tool at all, and the three the loop answers itself are not exceptions" {
-    // `chock_core.tools` keeps an arbitrator out of the tool list and out of
-    // the dispatch, and **this file is the third place, because three tool
-    // calls never reach the tool runner**: `spawn_agent`, `update_plan` and
-    // `restrict_self` are answered here. A gate that lived only in the dispatch
-    // would leave an arbitrator able to start a subagent, which is the one
-    // thing that would give it a way to act.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -12153,8 +9015,6 @@ test "an arbitrator runs no tool at all, and the three the loop answers itself a
         .{ .deltas = &.{.{ .text = "{\"verdict\":\"refuse\",\"why\":\"the diff rewrites chock.zon\"}" }} },
     } };
     var fake_tools = FakeToolRunner{ .output = "a tool runner ran something" };
-    // With a spawner, so nothing here passes for want of one. A real way to
-    // start a child is right there and the role is what refuses.
     var spawner = FakeSpawner{};
 
     var deps = testDeps(fake_client.client(), store, fake_tools.runner());
@@ -12163,7 +9023,6 @@ test "an arbitrator runs no tool at all, and the three the loop answers itself a
     deps.subagents = .{ .max_depth = 6, .max_width = 6 };
     try run(allocator, io, deps);
 
-    // Nothing ran, nothing was started, and nothing about the session changed.
     try testing.expectEqual(@as(usize, 0), fake_tools.calls);
     try testing.expectEqual(@as(usize, 0), spawner.prepared);
     try testing.expectEqual(@as(usize, 0), spawner.ran);
@@ -12178,8 +9037,6 @@ test "an arbitrator runs no tool at all, and the three the loop answers itself a
         defer parsed.deinit();
         try session.apply(parsed.value);
         switch (parsed.value.event) {
-            // Not one of the three the loop answers itself reached the log as
-            // a thing that happened.
             .session_spawn,
             .plan_update,
             .policy_self,
@@ -12193,8 +9050,6 @@ test "an arbitrator runs no tool at all, and the three the loop answers itself a
             else => {},
         }
     }
-    // Every one of the four calls was refused, and the calls are still in the
-    // log: a reviewer that tried is a thing the record shows.
     try testing.expectEqual(@as(usize, 4), refusals);
     try testing.expect(session.plan.isEmpty());
     try testing.expectEqual(@as(usize, 0), session.self_policy.restrictions.items.len);
@@ -12202,8 +9057,6 @@ test "an arbitrator runs no tool at all, and the three the loop answers itself a
 }
 
 test "a worker with the same session runs every one of those four calls" {
-    // The other side of the test above, so each of its lines is a fact about
-    // the role and not about a loop that refuses these calls for everyone.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -12263,11 +9116,6 @@ test "a worker with the same session runs every one of those four calls" {
 }
 
 test "a session that never calls update_plan appends no plan.update at all" {
-    // **Not mandatory, proven at the log.** A one step task with a task list
-    // is noise, and this project has already learned that a notice which
-    // always fires stops being read. Nothing in the loop writes one of these
-    // on the agent's behalf, so a session that had no use for a list is a
-    // session whose log holds none.
     const allocator = testing.allocator;
     const io = testing.io;
 
@@ -12301,9 +9149,6 @@ test "a session that never calls update_plan appends no plan.update at all" {
 }
 
 test "the task list a session ends with is folded out of its own log, never held beside it" {
-    // The list is written as events, so a fresh replay of the file rebuilds
-    // exactly what the running session had. That is what makes it survive a
-    // compaction, a handover to the daemon, and a phone attaching partway.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12324,15 +9169,11 @@ test "the task list a session ends with is folded out of its own log, never held
         ,
     }, &session);
 
-    // A task list is never a sandboxed tool call: it is an event in a log the
-    // loop holds the only lock on.
     try testing.expectEqual(@as(usize, 0), outcome.runner_calls);
     try testing.expectEqual(@as(usize, 2), outcome.events);
     try testing.expect(!outcome.refused[0]);
     try testing.expect(!outcome.refused[1]);
 
-    // Three steps first, then only the two that moved: the second call
-    // repeated s3 nowhere, and the event carries only what changed.
     try testing.expectEqual(@as(usize, 5), outcome.written_steps);
 
     try testing.expectEqual(@as(usize, 3), session.plan.steps.items.len);
@@ -12341,17 +9182,11 @@ test "the task list a session ends with is folded out of its own log, never held
     try testing.expectEqual(event.PlanStatus.pending, std.meta.activeTag(session.plan.find("s3").?.status));
     try testing.expectEqualStrings("s2", session.plan.find("s3").?.blocked_by);
 
-    // The model reads the whole list back, so it never has to hold the list
-    // in its attention to know what is left.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "measure it on Darwin") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "2 of 3 left to do") != null);
 }
 
 test "a step the agent stops naming stays on the list, and only abandoned takes it off" {
-    // **The fault the whole design exists to stop.** An agent that drops a
-    // step leaves a list that reads as finished work, and the person reading
-    // the night's work in the morning cannot tell. The fold keeps every
-    // identifier, so the honest answer is the only one available.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12366,8 +9201,6 @@ test "a step the agent stops naming stays on the list, and only abandoned takes 
         \\{"id":"s2","subject":"write the escape test","status":"pending"},
         \\{"id":"s3","subject":"rewrite the build script","status":"pending"}]}
         ,
-        // The agent finishes one, gives one up, and simply stops mentioning
-        // the third.
         \\{"steps":[{"id":"s1","subject":"port the driver","status":"done"},
         \\{"id":"s3","subject":"rewrite the build script","status":"abandoned"}]}
         ,
@@ -12375,12 +9208,9 @@ test "a step the agent stops naming stays on the list, and only abandoned takes 
     try testing.expectEqual(@as(usize, 2), outcome.events);
 
     try testing.expectEqual(@as(usize, 3), session.plan.steps.items.len);
-    // Given up, and visible as given up. Not gone, and not done.
     const dropped = session.plan.find("s3").?;
     try testing.expectEqual(event.PlanStatus.abandoned, std.meta.activeTag(dropped.status));
     try testing.expect(dropped.status != .done);
-    // And the one nobody mentioned again is still waiting, which is the truth
-    // about it.
     try testing.expectEqual(event.PlanStatus.pending, std.meta.activeTag(session.plan.find("s2").?.status));
 
     const counts = session.plan.counts();
@@ -12390,9 +9220,6 @@ test "a step the agent stops naming stays on the list, and only abandoned takes 
 }
 
 test "a call that repeats the list unchanged appends nothing, and is not an error" {
-    // A model that resends its whole list every turn is doing the ordinary
-    // thing. The log must not fill with copies of a list that did not move,
-    // and the model must not read a refusal for a call that was correct.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12402,9 +9229,6 @@ test "a call that repeats the list unchanged appends nothing, and is not an erro
     var session = chock_proto.state.Session.init(allocator);
     defer session.deinit();
 
-    // Twice, and not three times: the third identical call in a row is what
-    // `no_progress_repeats` stops a session at, whatever tool it names, and
-    // this tool is not an exception to that.
     const same = "{\"steps\":[{\"id\":\"s1\",\"subject\":\"read the fold\",\"status\":\"pending\"}]}";
     const outcome = try runPlanSession(allocator, arena, io, &.{ same, same }, &session);
 
@@ -12416,9 +9240,6 @@ test "a call that repeats the list unchanged appends nothing, and is not an erro
 }
 
 test "a call this loop cannot record changes nothing, and says so as an error" {
-    // Four refusals, one test, because they share the one rule: a call that
-    // was not written down must never read as one that was. A model told its
-    // list was kept would believe the user could watch a list nobody has.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12429,30 +9250,18 @@ test "a call this loop cannot record changes nothing, and says so as an error" {
     defer session.deinit();
 
     const outcome = try runPlanSession(allocator, arena, io, &.{
-        // A status nobody wrote. It must not reach the log as a fourth one:
-        // `PlanStatus.unknown` is for a name a later Chock wrote, and a typo
-        // taking that path would be relayed onward as real.
         "{\"steps\":[{\"id\":\"s1\",\"subject\":\"ship it\",\"status\":\"dnoe\"}]}",
-        // A step nothing can ever name again, so nothing could ever cross it
-        // off.
         "{\"steps\":[{\"id\":\"\",\"subject\":\"ship it\",\"status\":\"pending\"}]}",
-        // An empty list says nothing at all.
         "{\"steps\":[]}",
-        // Arguments that are not the shape the tool takes.
         "{\"steps\":\"read the fold\"}",
-        // A step that would take two lines on the terminal, so the next line
-        // would read as a step of its own.
         "{\"steps\":[{\"id\":\"s1\",\"subject\":\"read the fold\\nand the log\",\"status\":\"pending\"}]}",
     }, &session);
 
     for (outcome.refused) |one| try testing.expect(one);
     try testing.expectEqual(@as(usize, 0), outcome.events);
     try testing.expect(session.plan.isEmpty());
-    // Refused or not, a task list never reaches a sandbox: it is an event in a
-    // log the loop holds the only lock on.
     try testing.expectEqual(@as(usize, 0), outcome.runner_calls);
 
-    // Each refusal names what to do instead, rather than only saying no.
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "\"pending\"") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[0], "dnoe") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"id\"") != null);
@@ -12461,10 +9270,6 @@ test "a call this loop cannot record changes nothing, and says so as an error" {
 }
 
 test "a plan longer than the bound is refused whole, and leaves the list it had" {
-    // The bound exists because the list is read by a person, one step to a
-    // line. A call that passed it used to have two honest answers: keep the
-    // front of a list the agent did not write, or keep none of it. It keeps
-    // none of it and says the number.
     const allocator = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -12490,7 +9295,6 @@ test "a plan longer than the bound is refused whole, and leaves the list it had"
     try testing.expect(!outcome.refused[0]);
     try testing.expect(outcome.refused[1]);
     try testing.expectEqual(@as(usize, 1), outcome.events);
-    // The list the agent really wrote is untouched, not half replaced.
     try testing.expectEqual(@as(usize, 1), session.plan.steps.items.len);
     try testing.expectEqualStrings("the one real step", session.plan.steps.items[0].subject);
 }
