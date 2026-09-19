@@ -132,6 +132,7 @@ const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
 const sandbox = @import("chock-sandbox");
 const tools = @import("tools.zig");
+const nix_action = @import("nix.zig");
 const context = @import("context.zig");
 const compaction = @import("compaction.zig");
 const notices = @import("notices.zig");
@@ -2341,7 +2342,42 @@ fn gateToolCall(
     defer if (argv0_owned) |owned| allocator.free(owned);
     if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
 
-    var action_buffer: [tools.Tool.max_action_bytes]u8 = undefined;
+    var action_buffer: [gate_action_bytes]u8 = undefined;
+
+    // **The one call named after what it asks for and not after itself, and
+    // the one that can ask twice.** A build is named after the attribute path
+    // it wants, so a rule reads `nix.build.packages.*`, and a call that names
+    // a flake asks a second time for the reference itself. Both must pass, so
+    // a rule a project wrote for its own attribute does not authorise the
+    // same attribute of anybody else's flake. See
+    // `chock_core.nix.buildActionsFor`.
+    if (tool == .nix_build) {
+        var flake_buffer: [gate_action_bytes]u8 = undefined;
+        const actions = try nix_action.buildActionsFor(
+            allocator,
+            &action_buffer,
+            &flake_buffer,
+            call.arguments,
+        ) orelse
+            return try gateRefusal(allocator, call, try allocator.dupe(u8, nix_action.unnamed_detail));
+
+        const on_attribute = try decideAction(allocator, io, locked, deps, call, actions.attribute);
+        if (!on_attribute.permitted) return try gateRefusal(
+            allocator,
+            call,
+            try arbiter_mod.refusalText(allocator, call.tool, on_attribute),
+        );
+
+        const flake_action = actions.flake orelse return null;
+        const on_flake = try decideAction(allocator, io, locked, deps, call, flake_action);
+        if (on_flake.permitted) return null;
+        return try gateRefusal(
+            allocator,
+            call,
+            try arbiter_mod.refusalText(allocator, call.tool, on_flake),
+        );
+    }
+
     const action = tool.actionInto(
         &action_buffer,
         argv0_owned,
@@ -2350,22 +2386,7 @@ fn gateToolCall(
     ) orelse
         return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
 
-    // `Ask.detail` is the whole effect and never a command string: `action`
-    // is exactly that, already built by `actionInto` to describe the call
-    // without repeating raw arguments back.
-    const answer = if (deps.arbiter) |arbiter| blk: {
-        const summary = try std.fmt.allocPrint(allocator, "run the tool \"{s}\"", .{call.tool});
-        defer allocator.free(summary);
-        break :blk arbiter.decide(allocator, io, locked, .{
-            .action = action,
-            .summary = summary,
-            .detail = action,
-            .reason = "",
-            .tool = call.tool,
-            .tool_call_id = call.call_id,
-        });
-    } else arbiter_mod.not_asked;
-
+    const answer = try decideAction(allocator, io, locked, deps, call, action);
     if (answer.permitted) return null;
 
     // **One sentence, written once.** `arbiter_mod.refusalText` is the same
@@ -2376,6 +2397,42 @@ fn gateToolCall(
     // already used once.
     return try gateRefusal(allocator, call, try arbiter_mod.refusalText(allocator, call.tool, answer));
 }
+
+/// Put one action of `call` to the arbiter, and answer what it decided. A
+/// session with no arbiter can ask nobody, so it refuses and says so.
+///
+/// **Its own function because one call can ask twice**: a build that names a
+/// flake is asked about the attribute path and about the reference, and both
+/// have to travel the same road to the same reviewer.
+///
+/// `Ask.detail` is the whole effect and never a command string: `action` is
+/// exactly that, already built to describe the call without repeating raw
+/// arguments back.
+fn decideAction(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    locked: anytype,
+    deps: Deps,
+    call: event.ToolCall,
+    action: []const u8,
+) std.mem.Allocator.Error!arbiter_mod.Answer {
+    const arbiter = deps.arbiter orelse return arbiter_mod.not_asked;
+    const summary = try std.fmt.allocPrint(allocator, "run the tool \"{s}\"", .{call.tool});
+    defer allocator.free(summary);
+    return arbiter.decide(allocator, io, locked, .{
+        .action = action,
+        .summary = summary,
+        .detail = action,
+        .reason = "",
+        .tool = call.tool,
+        .tool_call_id = call.call_id,
+    });
+}
+
+/// The buffer `gateToolCall` builds an action name in. Wide enough for both
+/// builders that write into it: a tool's own name, and the attribute path of
+/// a build, which is the longer of the two.
+const gate_action_bytes = @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes);
 
 /// What `gateToolCall` answers when `Tool.actionInto` itself could not name
 /// the call. Sized buffers make this unreachable for a real caller, the same
@@ -4647,6 +4704,214 @@ test "a tool call whose row asks, with an arbiter that refuses, does not run, an
     }
     try testing.expect(saw_error_result);
     try testing.expect(saw_tool_message);
+}
+
+test "a build is decided under the attribute path it named, and not under the call" {
+    // The whole of the policy design for `nix_build`: a person writes
+    // `nix.build.packages.*` and it decides this call. A rule on the call name
+    // would be one rule for every build a project ever makes.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDNAME");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = "nix_build",
+            .arguments = "{\"attribute\":[\"packages\",\"x86_64-linux\",\"default\"]}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "built" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{ .permitted = true, .outcome = "approved_by_user" } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Exactly one question, and its name is the attribute path. A call that
+    // builds the workspace the agent is already in names no flake, so there
+    // is no second thing to ask about.
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawDetail());
+    try testing.expectEqual(@as(usize, 1), fake_tools.calls);
+}
+
+/// One turn that calls `nix_build` for an attribute of a foreign flake, then
+/// one turn of text. The three tests below differ only in what the arbiter
+/// says, so the call itself is written once.
+const foreign_flake_turns = [_]FakeTurn{
+    .{ .deltas = &.{.{ .tool_call = .{
+        .index = 0,
+        .id = "call1",
+        .name = "nix_build",
+        .arguments =
+        \\{"attribute":["packages","x86_64-linux","default"],"flake":"github:evil/repo"}
+        ,
+    } }} },
+    .{ .deltas = &.{.{ .text = "done with that" }} },
+};
+
+test "a build that names a flake asks about the attribute path and about the reference" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDFLAKE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &foreign_flake_turns };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = ActionArbiter{};
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Two questions, in the order a reader of the policy would expect: what
+    // is being built, then where it comes from.
+    try testing.expectEqual(@as(usize, 2), judge.calls);
+    try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawAt(0));
+    try testing.expectEqualStrings("nix.build.flake.github.evil.repo", judge.sawAt(1));
+    try testing.expectEqual(@as(usize, 1), fake_tools.calls);
+}
+
+test "a rule that allows the attribute does not authorise a foreign flake" {
+    // The hole this closes. The attribute name a project writes for its own
+    // flake is the same name a foreign one builds, so the reference has to be
+    // its own question or one rule grants both.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDFOREIGN");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &foreign_flake_turns };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    // Every attribute allowed, and no rule for any reference.
+    var judge = ActionArbiter{ .refuse_prefix = "nix.build.flake" };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 2), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_error_result = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(parsed.value.event.tool_result.is_error);
+            saw_error_result = true;
+        }
+    }
+    try testing.expect(saw_error_result);
+}
+
+test "a rule that allows the reference does not authorise an attribute the project denied" {
+    // The other half, so neither name is decoration: allowing where a build
+    // comes from says nothing about what may be built.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDATTRDENY");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &foreign_flake_turns };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    // Every reference allowed, and the attribute path denied.
+    var judge = ActionArbiter{ .refuse_prefix = "nix.build.packages" };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Refused on the first question, so the second is never put: an act that
+    // may not happen costs a reviewer nothing further.
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", judge.sawAt(0));
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+}
+
+test "a build whose action is denied does not run, and the model is told" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDDENY");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = "nix_build",
+            .arguments = "{\"attribute\":[\"packages\",\"x86_64-linux\",\"default\"]}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "then I will not build it" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{ .permitted = false, .outcome = "refused_by_policy" } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    // Refused before the dispatch, so nothing evaluated and nothing ran.
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_error_result = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(parsed.value.event.tool_result.is_error);
+            saw_error_result = true;
+        }
+    }
+    try testing.expect(saw_error_result);
+}
+
+test "a build whose attribute path cannot be named is refused, and nobody is asked" {
+    // An act nobody can name is an act nobody can write a rule for. A dotted
+    // string is the shape a model reaches for, so this is the case that really
+    // arrives.
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01NIXBUILDUNNAMED");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = "nix_build",
+            .arguments = "{\"attribute\":\"packages.x86_64-linux.default\"}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "I will send a list" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "ok" };
+    var judge = TestArbiter{ .answer = .{ .permitted = true, .outcome = "allowed_by_policy" } };
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 0), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
 }
 
 test "a session with no arbiter refuses every ordinary tool call and does not run it" {
@@ -10242,6 +10507,53 @@ const PromiseRun = struct {
 /// Run one session that makes one `restrict_self` call per entry of `calls`,
 /// then answers. `session` is folded from a fresh replay of the log afterwards,
 /// so what it holds came out of the file and not out of the running loop.
+/// An `Arbiter` that answers by action name, for the one call that can ask
+/// more than once.
+///
+/// **It keeps a copy of every action it was asked about.** The names are built
+/// in a buffer on `gateToolCall`'s own stack, so a double that kept the slices
+/// would be reading a frame that is gone a moment later, which is the same
+/// reason `TestArbiter` copies its summary and its detail.
+const ActionArbiter = struct {
+    /// Every action whose name starts with this is refused. An empty prefix
+    /// refuses nothing, which is how a test says "both were allowed".
+    refuse_prefix: []const u8 = "",
+    calls: usize = 0,
+    seen: [4][256]u8 = undefined,
+    seen_len: [4]usize = .{0} ** 4,
+
+    fn sawAt(self: *const ActionArbiter, index: usize) []const u8 {
+        return self.seen[index][0..self.seen_len[index]];
+    }
+
+    fn arbiter(self: *ActionArbiter) arbiter_mod.Arbiter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = arbiter_mod.Arbiter.VTable{ .decide = decideFn };
+
+    fn decideFn(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: std.Io,
+        _: *arbiter_mod.Locked,
+        ask: arbiter_mod.Ask,
+    ) arbiter_mod.Answer {
+        const self: *ActionArbiter = @ptrCast(@alignCast(ptr));
+        if (self.calls < self.seen.len) {
+            const length = @min(ask.action.len, self.seen[self.calls].len);
+            @memcpy(self.seen[self.calls][0..length], ask.action[0..length]);
+            self.seen_len[self.calls] = length;
+        }
+        self.calls += 1;
+
+        if (self.refuse_prefix.len != 0 and std.mem.startsWith(u8, ask.action, self.refuse_prefix)) {
+            return .{ .permitted = false, .outcome = "refused_by_policy" };
+        }
+        return .{ .permitted = true, .outcome = "allowed_by_policy" };
+    }
+};
+
 /// An `Arbiter` a test drives. **It counts its calls**, because a test that
 /// only read the outcome could not tell a widening that was weighed and refused
 /// from one that was never asked about, and several facts below are exactly

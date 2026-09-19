@@ -56,6 +56,15 @@ pub const Options = struct {
     /// refusing seam answers every store question with a refusal that names
     /// the path, which is the answer a reader can act on.
     store_backend: ?store.backend.Driver = null,
+    /// Whether the evaluation may put an object in the store behind
+    /// `store_backend`.
+    ///
+    /// **Off, because an evaluation that only says what a value is needs no
+    /// store at all.** A caller turns it on when the derivation must be
+    /// registered through the driver, which is what makes
+    /// `chock-nix/backend.zig`'s produced set able to authorise a build of
+    /// it. Nothing is written when `store_backend` is null.
+    store_writes: bool = false,
 };
 
 /// The call depth this library keeps when a caller names none. fix's own
@@ -90,6 +99,7 @@ pub const Session = struct {
         engine.configureMemory(options.gc_budget_bytes, null, false);
         if (options.io) |io| engine.setFileIo(io);
         if (options.store_backend) |driver| try engine.setStoreBackend(driver);
+        if (options.store_writes) engine.enableStoreWrites();
         try engine.setPureEval(options.pure, options.roots);
         return .{ .engine = engine };
     }
@@ -119,6 +129,18 @@ pub const Session = struct {
             // not a derivation, which is an answer and not a fault.
             .derivation_path = self.engine.derivationDrvPath(value) catch null,
         };
+    }
+
+    /// Write the derivation at `drv_path`, and everything it is built from,
+    /// through the store backend.
+    ///
+    /// **This is what puts the derivation in the driver's produced set**, so
+    /// a build of it is one the driver can authorise. An evaluation alone
+    /// computes the path and writes nothing: see this file's own test.
+    /// `Options.store_writes` must be on, and the session must have a store
+    /// backend, or this refuses.
+    pub fn ensureDerivation(self: *Session, drv_path: []const u8) !void {
+        return self.engine.ensureDerivationClosure(drv_path);
     }
 
     /// Why the last evaluation failed, in fix's own words, written into

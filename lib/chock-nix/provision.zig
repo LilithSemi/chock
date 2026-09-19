@@ -298,6 +298,47 @@ pub fn resolve(
         ) };
     }
 
+    var said: []const u8 = "";
+    const mounts = try mountsFor(allocator, io, runner, out_paths, &said) orelse {
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} was built and what it needs could not be read, so it was not added to the " ++
+                "toolchain. Nix said: {s}",
+            .{ installable, said },
+        ) };
+    };
+
+    return .{ .provided = .{
+        .program = request.program,
+        .installable = installable,
+        .bin_dirs = mounts.bin_dirs,
+        .store_paths = mounts.store_paths,
+    } };
+}
+
+/// What a sandbox has to mount for a set of build outputs, and what goes on
+/// the `PATH` beside it.
+pub const Mounts = struct {
+    bin_dirs: []const []const u8,
+    store_paths: []const []const u8,
+};
+
+/// The transitive closure of `out_paths`, and one `bin` directory per output.
+///
+/// **The outputs alone are not a mount set**: a program needs its dynamic
+/// linker, its libc, and every library those pull in. `lib/chock-nix/store.zig`
+/// says this at length.
+///
+/// Null when `nix path-info` itself refused, with the line it wrote left in
+/// `said`, so the caller writes a sentence in the words of what it was asking
+/// for. Every string comes from `allocator`.
+pub fn mountsFor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runner: Runner,
+    out_paths: []const []const u8,
+    said: *[]const u8,
+) Error!?Mounts {
     var closure_args: std.ArrayList([]const u8) = .empty;
     defer closure_args.deinit(allocator);
     try closure_args.appendSlice(allocator, &.{ "path-info", "-r", "--" });
@@ -305,27 +346,19 @@ pub fn resolve(
 
     const listed = try runner.run(allocator, io, closure_args.items);
     if (!listed.succeeded()) {
-        return .{ .refused = try std.fmt.allocPrint(
-            allocator,
-            "{s} was built and what it needs could not be read, so it was not added to the " ++
-                "toolchain. Nix said: {s}",
-            .{ installable, lastLine(listed.stderr) },
-        ) };
+        said.* = lastLine(listed.stderr);
+        return null;
     }
-
-    const closure = try store.parsePathList(allocator, listed.stdout);
 
     const bin_dirs = try allocator.alloc([]const u8, out_paths.len);
     for (out_paths, bin_dirs) |path, *slot| {
         slot.* = try std.fmt.allocPrint(allocator, "{s}/bin", .{path});
     }
 
-    return .{ .provided = .{
-        .program = request.program,
-        .installable = installable,
+    return .{
         .bin_dirs = bin_dirs,
-        .store_paths = closure,
-    } };
+        .store_paths = try store.parsePathList(allocator, listed.stdout),
+    };
 }
 
 /// One sentence for a name this file refuses before it builds anything.
@@ -453,7 +486,7 @@ fn suggestionIn(stderr: []const u8) []const u8 {
 }
 
 /// True when Nix could not reach its daemon.
-fn saysNoDaemon(stderr: []const u8) bool {
+pub fn saysNoDaemon(stderr: []const u8) bool {
     const spellings = [_][]const u8{
         "cannot connect to socket",
         "cannot open connection to remote store",
@@ -467,7 +500,7 @@ fn saysNoDaemon(stderr: []const u8) bool {
 }
 
 /// True when Nix could not fetch what it needed.
-fn saysNoNetwork(stderr: []const u8) bool {
+pub fn saysNoNetwork(stderr: []const u8) bool {
     const spellings = [_][]const u8{
         "unable to download",
         "Temporary failure in name resolution",
@@ -487,7 +520,7 @@ pub const max_raw_bytes: usize = 400;
 /// The last line that says anything, bounded at `max_raw_bytes`. Nix writes
 /// its own message last and its trace before it, so this is the line a person
 /// reads first.
-fn lastLine(stderr: []const u8) []const u8 {
+pub fn lastLine(stderr: []const u8) []const u8 {
     var found: []const u8 = "nothing";
     var lines = std.mem.splitScalar(u8, stderr, '\n');
     while (lines.next()) |raw| {

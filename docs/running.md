@@ -36,7 +36,7 @@ copies your uncommitted work into the workspace as well.
 
 ## The tools
 
-The agent has twenty tools, and every one that touches the machine goes
+The agent has 21 tools, and every one that touches the machine goes
 through that sandbox: `read_file`, `list_directory`, `glob`, `grep`,
 `write_file`, `edit_file`, `run_command`, `read_memory` and `write_memory`.
 Only `run_command` takes a command. The rest name a path, a pattern, or the
@@ -56,12 +56,13 @@ name, so a text file called `plot.png` is refused. At most 3145728 bytes.
 the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names
 the session, so `chock sessions` reads as more than a list of identifiers. The
-last seven are described on pages of their own:
+last eight are described on pages of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
 | `provide_tool` | a program the session has not got | [tools.md](tools.md) |
 | `nix_eval` | what one Nix expression says | [tools.md](tools.md) |
+| `nix_build` | one attribute of a flake, built | [tools.md](tools.md) |
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
 | `restrict_self` | a promise the agent cannot take back | [policy.md](policy.md) |
 | `fetch_url` | one page over http or https | [policy.md](policy.md) |

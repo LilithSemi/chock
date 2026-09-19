@@ -12,7 +12,9 @@
 //! and a cache keyed on the flake.
 //!
 //! `provision.zig` is the same operation with a different input: one package
-//! name instead of a project's dev shell.
+//! name instead of a project's dev shell. `build.zig` is the same operation
+//! again, for one attribute of a flake, after a person or the policy has
+//! answered.
 //! It answers with store paths and `bin` directories, which is what
 //! `DevShell` already answers with, so a provisioned program joins the
 //! session's toolchain by the road that is already there.
@@ -36,6 +38,7 @@ const std = @import("std");
 pub const Diagnostic = @import("chock-nix/diagnostic.zig").Diagnostic;
 
 pub const backend = @import("chock-nix/backend.zig");
+pub const build = @import("chock-nix/build.zig");
 pub const DevShell = @import("chock-nix/DevShell.zig");
 pub const dev_env = @import("chock-nix/dev_env.zig");
 pub const eval = @import("chock-nix/eval.zig");
@@ -46,6 +49,7 @@ pub const store = @import("chock-nix/store.zig");
 test {
     std.testing.refAllDecls(@This());
     _ = backend;
+    _ = build;
     _ = DevShell;
     _ = dev_env;
     _ = eval;

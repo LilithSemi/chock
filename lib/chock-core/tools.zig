@@ -341,6 +341,18 @@ pub const Support = struct {
     /// so a caller says true when it holds the evaluator and knows the one
     /// directory a pure evaluation may read. See `src/run.zig`.
     nix_eval: bool = false,
+    /// This session can build a Nix attribute on the host, so `nix_build` has
+    /// somewhere to work.
+    ///
+    /// **The machinery only, and never the answer.** `provisioning` above
+    /// folds the policy in, because a `provide_tool` request is decided once
+    /// at the start and an `ask` there reaches nobody. A build is decided per
+    /// call, under the attribute path it names and under the flake it names
+    /// when it names one, so the rows are read on the turn the model asks and
+    /// a person can answer them. A caller says true when `nix` is on the host
+    /// and it holds the evaluator, and reads no policy at all. See
+    /// `src/run.zig`.
+    nix_build: bool = false,
     /// What kind of agent this session runs as. **Not a wire format question
     /// and not a provider question**, the same as the two fields above: it
     /// asks what this agent is for. An `arbitrator` is offered no tool at all,
@@ -698,6 +710,7 @@ pub const Tool = enum {
     update_plan,
     provide_tool,
     nix_eval,
+    nix_build,
     restrict_self,
     fetch_url,
     ask_user,
@@ -727,6 +740,7 @@ pub const Tool = enum {
             .update_plan,
             .provide_tool,
             .nix_eval,
+            .nix_build,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -763,6 +777,10 @@ pub const Tool = enum {
             // session can evaluate at all is a fact about the caller that
             // holds for the whole session. See `Support.nix_eval`.
             .nix_eval => support.nix_eval,
+            // Gated on the machinery and not on the answer, which is what
+            // makes it different from `provide_tool` above. See
+            // `Support.nix_build`.
+            .nix_build => support.nix_build,
             .read_file,
             // Both of its gates were already read at the top of this
             // function, by `support.offers(self.needs())`. Nothing else holds
@@ -1262,6 +1280,14 @@ pub const Tool = enum {
     ) ?[]const u8 {
         return switch (self) {
             .run_command => runCommandActionInto(buffer, argv0, project_root, closure),
+            // **The one tool whose action is not its own name.** A build is
+            // named after the attribute path it asks for, so a rule reads
+            // `nix.build.packages.*` and not the call. That name is built by
+            // `chock_core.nix.buildActionFor`, which needs the arguments and
+            // a buffer of its own, and `Loop.gateToolCall` asks it before it
+            // reaches here. Null is the safe direction for a caller that
+            // forgot: the call is refused for having no name.
+            .nix_build => null,
             .read_file,
             .read_image,
             .list_directory,
@@ -1321,6 +1347,9 @@ pub const Tool = enum {
             // It renders a value and never writes a byte anywhere. See
             // `nix_eval_needs_a_session`.
             .nix_eval,
+            // A build writes into the host's own Nix store, which is not the
+            // project and holds no source a language server reads.
+            .nix_build,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -1373,6 +1402,9 @@ pub const Tool = enum {
             // answer reaches the model rather than the disk. See
             // `src/run.zig`'s own `NixEvalToolRunner`.
             .nix_eval,
+            // A build writes into the host's own Nix store, which is neither
+            // the workspace nor on its filesystem.
+            .nix_build,
             .restrict_self,
             // The page reaches the model and never the disk. See
             // `lib/chock-core/fetch.zig`.
@@ -1522,6 +1554,19 @@ pub const Tool = enum {
                 "else on the machine. Give the expression alone, the way you would type it " ++
                 "into a repl. The answer is rendered the same way a repl renders it, up to " ++
                 max_nix_eval_text ++ " bytes.",
+            .nix_build => "Build one attribute of a flake, and get what it produced. Use it " ++
+                "to build this project, or a package of it, when the task is to find out " ++
+                "whether it builds or to run what it makes. The attribute path is a list of " ++
+                "names, one name per entry, such as [\"packages\", \"x86_64-linux\", " ++
+                "\"default\"]: it is never one dotted string, and a name holds letters, " ++
+                "digits, \"-\", \"_\" and \"+\". Leave \"flake\" out to build the " ++
+                "project you are working in. **A build runs on the machine, outside the " ++
+                "sandbox, so it is asked about by the attribute path you named, and a call " ++
+                "that names a flake is asked about that flake as well**, which a project " ++
+                "often does not allow even where it allows its own builds. A refusal says " ++
+                "the rule and not the reason. What the build produced is on the " ++
+                "PATH of every call after this one, and it is gone at the end of the session. " ++
+                "A build takes seconds and can take minutes, and the turn waits for it.",
             .restrict_self => "Promise that you will not do something in this session. Use it " ++
                 "when you have worked out what the task needs and can see what it does not need: " ++
                 "\"net.fetch\" at \"deny\" for a task that reads local files, \"git.push\" at " ++
@@ -1610,6 +1655,7 @@ pub const Tool = enum {
             .update_plan => UpdatePlanArgs,
             .provide_tool => ProvideToolArgs,
             .nix_eval => NixEvalArgs,
+            .nix_build => NixBuildArgs,
             .restrict_self => RestrictSelfArgs,
             .fetch_url => FetchUrlArgs,
             .ask_user => AskUserArgs,
@@ -1829,6 +1875,7 @@ pub const Registry = struct {
             .update_plan => toolErrorResult(allocator, call, try allocator.dupe(u8, plan_needs_a_session)),
             .provide_tool => toolErrorResult(allocator, call, try allocator.dupe(u8, provision_needs_a_session)),
             .nix_eval => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_eval_needs_a_session)),
+            .nix_build => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_build_needs_a_session)),
             .restrict_self => toolErrorResult(allocator, call, try allocator.dupe(u8, restrict_needs_a_session)),
             .fetch_url => toolErrorResult(allocator, call, try allocator.dupe(u8, fetch_needs_a_session)),
             .ask_user => toolErrorResult(allocator, call, try allocator.dupe(u8, ask_needs_a_session)),
@@ -1918,6 +1965,21 @@ pub const provision_needs_a_session = "no program was provisioned: a program is 
 pub const nix_eval_needs_a_session = "nothing was evaluated: a Nix evaluation runs in the " ++
     "harness itself, outside every sandbox, and this tool call was run without the session " ++
     "that owns it. Work from what is in the project instead.";
+
+/// What a `nix_build` call gets from `Registry.dispatchWith`.
+///
+/// **A `Registry` cannot build, and the reason is both of the reasons above at
+/// once.** A build is evaluated in Chock's own process and then realised by
+/// `nix` on the host, outside every sandbox, and what it produced joins the
+/// mount set every later tool call is built with. A `Registry` holds neither
+/// the evaluator nor a value that outlives one call. So the caller that owns
+/// the session answers this call, exactly as it answers `provide_tool`.
+///
+/// It refuses rather than pretending, because a model told a program is now
+/// there would call it on the next turn and find it is not.
+pub const nix_build_needs_a_session = "nothing was built: a build is evaluated in the harness " ++
+    "and realised on the machine, and this tool call was run without the session that owns " ++
+    "it. Do the work with what the toolchain already has.";
 
 /// What a `fetch_url` call gets from `Registry.dispatchWith`.
 ///
@@ -2570,6 +2632,28 @@ pub const NixEvalArgs = struct {
         .expression = "The Nix expression, alone, the way you would type it into a repl. It is " ++
             "evaluated in pure mode, so an impure builtin answers nothing and a path outside " ++
             "the workspace is refused.",
+    };
+};
+
+/// Public for the same reason `NixEvalArgs` is: the caller that owns the
+/// session holds the evaluator and the `nix` on the host, so it parses these
+/// arguments and this file never does. See `nix_build_needs_a_session`.
+///
+/// **The attribute path is a list and never one dotted string.** A Nix
+/// attribute name may itself hold a dot, so one string would leave the tool
+/// guessing where a level ends, and the policy action is built out of these
+/// same names: see `chock_core.nix.buildActionInto`.
+pub const NixBuildArgs = struct {
+    attribute: []const []const u8,
+    flake: ?[]const u8 = null,
+
+    pub const docs = .{
+        .attribute = "The attribute path, one name per entry, such as [\"packages\", " ++
+            "\"x86_64-linux\", \"default\"]. A name holds letters, digits, \"-\", " ++
+            "\"_\" and \"+\" and starts with a letter or a digit.",
+        .flake = "The flake to build from, such as \"github:NixOS/nixpkgs\". Leave it out " ++
+            "to build from the project you are working in, which is what you almost always " ++
+            "want.",
     };
 };
 
@@ -7315,6 +7399,7 @@ const full_support = Support{
     .memory = true,
     .provisioning = true,
     .nix_eval = true,
+    .nix_build = true,
 };
 
 test "every tool in the enum is offered, and each one is named exactly once" {
@@ -7338,15 +7423,16 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
 
-    // The twenty a session with everything gets, by name, so a tool that
+    // The whole list a session with everything gets, by name, so a tool that
     // quietly loses its entry is a test failure and not a smaller list
     // nobody notices.
     const expected = [_][]const u8{
-        "read_file",     "read_image",   "list_directory", "glob",
-        "grep",          "write_file",   "edit_file",      "run_command",
-        "read_guidance", "read_memory",  "write_memory",   "spawn_agent",
-        "update_plan",   "provide_tool", "nix_eval",       "restrict_self",
-        "fetch_url",     "ask_user",     "set_title",      "request_action",
+        "read_file",      "read_image",   "list_directory", "glob",
+        "grep",           "write_file",   "edit_file",      "run_command",
+        "read_guidance",  "read_memory",  "write_memory",   "spawn_agent",
+        "update_plan",    "provide_tool", "nix_eval",       "nix_build",
+        "restrict_self",  "fetch_url",    "ask_user",       "set_title",
+        "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -7424,12 +7510,12 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     try std.testing.expectEqual(Role.worker, (Context{}).role);
 }
 
-test "a session with no knowledgebase, no Nix and no vision is offered none of those five tools" {
+test "a session with no knowledgebase, no Nix and no vision is offered none of those six tools" {
     // A tool the model cannot use is worse than a tool that is missing: it
     // costs one turn to call and one to read the failure, and a small model
     // may never recover from the confusion. So a caller that could not make
     // the directory, cannot reach Nix, and talks to a provider that says
-    // nothing about images offers fifteen tools, not twenty with five that
+    // nothing about images offers six tools fewer, rather than six that
     // always fail.
     //
     // `spawn_agent` is the one tool this reasoning does not reach, because
@@ -7440,7 +7526,7 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 5, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 6, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
@@ -7448,7 +7534,9 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
         // A session that cannot evaluate never hears this name, the same
         // rule `provide_tool` above keeps and for the same reason.
         try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
-        // The fifth, and the only one of the five whose gate is the wire and
+        // And a session with no `nix` on the machine cannot build.
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_build"));
+        // The last, and the only one of the six whose gate is the wire and
         // the provider rather than something the caller built. See `Support`.
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_image"));
     }
@@ -7822,7 +7910,14 @@ test "a tool with no argument to read is named after itself, once each" {
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
+        // The two that are named after what they ask for and not after
+        // themselves. `nix_build` answers null here on purpose: its name is
+        // the attribute path, built by `chock_core.nix.buildActionFor`.
         if (tool == .run_command) continue;
+        if (tool == .nix_build) {
+            try std.testing.expect(tool.actionInto(&buffer, null, "", &.{}) == null);
+            continue;
+        }
         try std.testing.expectEqualStrings(
             "call." ++ f.name,
             tool.actionInto(&buffer, null, "", &.{}).?,
@@ -8191,6 +8286,10 @@ test "every tool has an action name, and every name reaches the table" {
     // This test is what makes that impossible.
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
+        // `nix_build` is named after the attribute path it asks for, which
+        // this builder cannot see. `chock_core.nix` has its own tests for
+        // that name, and `Loop.gateToolCall` refuses a call it cannot name.
+        if (tool == .nix_build) continue;
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         const action = tool.actionInto(&buffer, null, "", &.{}) orelse
             return error.ToolHasNoActionName;

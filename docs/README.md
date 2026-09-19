@@ -2,7 +2,7 @@
 
 - [sandbox.md](sandbox.md) - the layers a tool call runs inside, the throwaway
   workspace, the limits, and what the macOS sandbox holds and cannot.
-- [running.md](running.md) - `chock run`, the twenty tools, the session log,
+- [running.md](running.md) - `chock run`, the 21 tools, the session log,
   getting the work back out of the workspace, the exit codes, cost, the task
   list, and `chock doctor`.
 - [configuration.md](configuration.md) - `config.zon`, provider instances, how
@@ -15,7 +15,8 @@
 - [policy.md](policy.md) - the policy table in `chock.zon`, the paths a project
   denies, the ratchet, and an organisation's bundle above a project.
 - [tools.md](tools.md) - `provide_tool`, and getting a program the session has
-  not got, and `nix_eval`, and asking Nix what an expression says.
+  not got, `nix_eval`, and asking Nix what an expression says, and `nix_build`,
+  and building one attribute of a flake.
 - [plugins.md](plugins.md) - tools you supply yourself, as WebAssembly.
 - [subagents.md](subagents.md) - `spawn_agent`, the depth and width limits, and
   a spawn that waits or carries on.

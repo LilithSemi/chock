@@ -880,6 +880,9 @@ const Started = struct {
     /// null when it cannot. See `provisioningFor`, which says out loud why a
     /// session has none.
     provisioning: ?Provisioning,
+    /// What this session needs to build a Nix attribute on the host, or null
+    /// when it cannot. See `nixBuildFor`.
+    nix_build: ?NixBuild,
     /// How much a Nix evaluation of this session may put in the store, from
     /// the `nix` block of `chock.zon`, the operator's own `config.zon`, and
     /// the org policy bundle's ceiling. See `resolveNixCaps`.
@@ -2103,11 +2106,16 @@ fn start(
     // list depends on.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
 
+    // Beside provisioning and the caps, for the same reason: it is an answer
+    // about Nix that the tool list depends on.
+    const nix_build = nixBuildFor(arena, io, env, dev_shell_dir, workspace.workPath(), nix_caps);
+
     const support = chock_core.tools.Support{
         .adapter = adapter,
         .provider = .{ .images = instance.capabilities.images },
         .memory = memory_ready,
         .provisioning = provisioning != null,
+        .nix_build = nix_build != null,
         // **Always true, and that is the whole of the gate.** An evaluation
         // runs in this process, through fix, so it needs no `nix` binary, no
         // daemon and no store: see `lib/chock-nix/eval.zig`. A session that
@@ -2193,6 +2201,7 @@ fn start(
         .toolchain = toolchain,
         .tool_env = tool_env,
         .provisioning = provisioning,
+        .nix_build = nix_build,
         .nix_caps = nix_caps,
         .backing = backing,
         .storage = storage,
@@ -10513,26 +10522,9 @@ const ProvisionToolRunner = struct {
     /// the user's own configuration and the user's own flake registry.
     host_env: *const std.process.Environ.Map,
     environ: std.process.Environ,
-    /// The environment a tool call resolves `argv[0]` against. **This is the
-    /// map the sandbox runner holds a pointer to**, so a `PATH` written here
-    /// is the `PATH` the next call resolves against.
-    tool_env: *std.process.Environ.Map,
-    /// The context the sandbox runner dispatches with. `store_paths` is
-    /// repointed at `paths` below every time a program is provisioned.
-    context: *chock_core.tools.Context,
-    /// Every store path this session mounts: the dev shell's, and one
-    /// closure per provisioned program. Grows only.
-    ///
-    /// **Held with no repeats, and that is not tidiness.** A provisioned
-    /// package's closure and the dev shell's overlap almost entirely, because
-    /// both start at the same libc, so appending one whole would bind most of
-    /// the toolchain a second time. `withStore` builds one bind mount and one
-    /// Landlock rule per entry, so a repeat is a mount of the same source on
-    /// the same target, on every tool call, for the rest of the session.
-    paths: std.ArrayList([]const u8) = .empty,
-    /// The membership half of `paths`, so adding a closure of thirty thousand
-    /// entries costs one lookup each rather than a walk of the list each.
-    mounted: std.StringHashMapUnmanaged(void) = .empty,
+    /// What this session mounts and what its `PATH` holds. Shared with
+    /// `NixBuildToolRunner`: see `SessionMounts`.
+    mounts: *SessionMounts,
     /// Every program name already provisioned, so asking twice costs nothing
     /// and says so.
     already: std.ArrayList([]const u8) = .empty,
@@ -10630,7 +10622,7 @@ const ProvisionToolRunner = struct {
         tty.print(.plain, "chock: {s} is in the toolchain, {d} store paths, {d} mounted in all\n", .{
             program,
             provided.store_paths.len,
-            self.paths.items.len,
+            self.mounts.paths.items.len,
         });
 
         return .{
@@ -10646,40 +10638,15 @@ const ProvisionToolRunner = struct {
         };
     }
 
-    /// Take a resolved program into this session's toolchain.
-    ///
-    /// **This is the whole of "the mount set changes while the session is
-    /// live".** Two writes, and both are read by the next tool call and by
-    /// nothing that is already running: the store paths the sandbox binds,
-    /// and the `PATH` `argv[0]` is resolved against. See this type's own doc
-    /// comment for what those two do not reach.
+    /// Take a resolved program into this session's toolchain, and remember
+    /// that this name is now answered.
     fn adopt(
         self: *ProvisionToolRunner,
         program: []const u8,
         provided: chock_nix.provision.Provided,
     ) std.mem.Allocator.Error!void {
-        for (provided.store_paths) |path| try self.mount(path);
-        // The pointer the sandbox runner reads, repointed at the grown list.
-        // A slice of an `ArrayList` is only valid until it grows again, so
-        // this is done after every append and never cached anywhere else.
-        self.context.store_paths = self.paths.items;
-        try self.extendPath(provided.bin_dirs);
+        try self.mounts.adopt(provided);
         try self.already.append(self.arena, try self.arena.dupe(u8, program));
-    }
-
-    /// Add one store path to the mount set, once. See `paths`.
-    fn mount(self: *ProvisionToolRunner, path: []const u8) std.mem.Allocator.Error!void {
-        const entry = try self.mounted.getOrPut(self.arena, path);
-        if (entry.found_existing) return;
-        entry.key_ptr.* = path;
-        try self.paths.append(self.arena, path);
-    }
-
-    /// Take the paths this session starts with: the dev shell's own, or the
-    /// whole store for a project that states no toolchain. Called once, by
-    /// `runSession`, before the first turn.
-    fn start(self: *ProvisionToolRunner, paths: []const []const u8) std.mem.Allocator.Error!void {
-        for (paths) |path| try self.mount(path);
     }
 
     /// Run the two `nix` commands on an `Io` of this call's own. See this
@@ -10762,16 +10729,86 @@ const ProvisionToolRunner = struct {
             }
         };
     }
+};
+
+/// What this session mounts, and what its tool calls resolve `argv[0]`
+/// against.
+///
+/// **One of these per session, and two runners write to it.**
+/// `ProvisionToolRunner` adds a package the model asked for by name, and
+/// `NixBuildToolRunner` adds what a build produced. Each keeping a list of
+/// its own would leave each publishing a slice the other's additions are
+/// missing from, and the last one to write would be the whole mount set.
+///
+/// Everything here is allocated from `arena`, which `runSession` owns and
+/// which ends with the session: a store path the sandbox mounts on the last
+/// turn was allocated on the turn it was adopted.
+const SessionMounts = struct {
+    arena: std.mem.Allocator,
+    /// The context the sandbox runner dispatches with. `store_paths` is
+    /// repointed at `paths` below every time something is adopted.
+    context: *chock_core.tools.Context,
+    /// The environment a tool call resolves `argv[0]` against. **This is the
+    /// map the sandbox runner holds a pointer to**, so a `PATH` written here
+    /// is the `PATH` the next call resolves against.
+    tool_env: *std.process.Environ.Map,
+    /// Every store path this session mounts: the dev shell's, one closure per
+    /// provisioned program, and one per build. Grows only.
+    ///
+    /// **Held with no repeats, and that is not tidiness.** A new package's
+    /// closure and the dev shell's overlap almost entirely, because both start
+    /// at the same libc, so appending one whole would bind most of the
+    /// toolchain a second time. `withStore` builds one bind mount and one
+    /// Landlock rule per entry, so a repeat is a mount of the same source on
+    /// the same target, on every tool call, for the rest of the session.
+    paths: std.ArrayList([]const u8) = .empty,
+    /// The membership half of `paths`, so adding a closure of thirty thousand
+    /// entries costs one lookup each rather than a walk of the list each.
+    mounted: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Take what Nix produced into this session's toolchain.
+    ///
+    /// **This is the whole of "the mount set changes while the session is
+    /// live".** Two writes, and both are read by the next tool call and by
+    /// nothing that is already running: the store paths the sandbox binds, and
+    /// the `PATH` `argv[0]` is resolved against. See `ProvisionToolRunner`'s
+    /// own doc comment for what those two do not reach.
+    fn adopt(
+        self: *SessionMounts,
+        provided: chock_nix.provision.Provided,
+    ) std.mem.Allocator.Error!void {
+        for (provided.store_paths) |path| try self.mount(path);
+        // The pointer the sandbox runner reads, repointed at the grown list.
+        // A slice of an `ArrayList` is only valid until it grows again, so
+        // this is done after every append and never cached anywhere else.
+        self.context.store_paths = self.paths.items;
+        try self.extendPath(provided.bin_dirs);
+    }
+
+    /// Add one store path to the mount set, once. See `paths`.
+    fn mount(self: *SessionMounts, path: []const u8) std.mem.Allocator.Error!void {
+        const entry = try self.mounted.getOrPut(self.arena, path);
+        if (entry.found_existing) return;
+        entry.key_ptr.* = path;
+        try self.paths.append(self.arena, path);
+    }
+
+    /// Take the paths this session starts with: the dev shell's own, or the
+    /// whole store for a project that states no toolchain. Called once, by
+    /// `runSession`, before the first turn.
+    fn start(self: *SessionMounts, paths: []const []const u8) std.mem.Allocator.Error!void {
+        for (paths) |path| try self.mount(path);
+    }
 
     /// Put `dirs` at the front of the `PATH` a tool call resolves `argv[0]`
     /// against.
     ///
     /// **At the front, so the newest answer wins.** A program that is already
     /// on the path was already found, so the order only decides what happens
-    /// when an agent provisions a package that carries a program the dev shell
-    /// also has. Taking the provisioned one is the honest reading of a request
-    /// that named it.
-    fn extendPath(self: *ProvisionToolRunner, dirs: []const []const u8) std.mem.Allocator.Error!void {
+    /// when an agent adds a package that carries a program the dev shell also
+    /// has. Taking the new one is the honest reading of a request that named
+    /// it.
+    fn extendPath(self: *SessionMounts, dirs: []const []const u8) std.mem.Allocator.Error!void {
         var joined: std.ArrayList(u8) = .empty;
         for (dirs) |dir| {
             try joined.appendSlice(self.arena, dir);
@@ -11029,6 +11066,466 @@ fn nixEvalRefusal(
 /// named it out of nowhere.
 const nix_eval_is_off = "nothing was evaluated: this session cannot evaluate a Nix expression. " ++
     "Work from what is in the project instead.";
+
+/// What one `nix_build` call of this session may see, may take, and may run.
+const NixBuild = struct {
+    /// The one directory a pure evaluation may read, and the flake a call
+    /// that names none builds from: the workspace this session's tool calls
+    /// already work in, and never the user's own project.
+    workspace_root: []const u8,
+    /// What the project, the operator and the org bundle between them let an
+    /// evaluation put in the store. See `resolveNixCaps`.
+    caps: chock_policy.nix.Resolved,
+    /// The absolute path of `nix` on the host, found once at the start.
+    nix_program: []const u8,
+    /// The absolute path of `nix-store`, which holds a build against the
+    /// garbage collector. Null when the machine has none, which is said out
+    /// loud and is not fatal.
+    nix_store_program: ?[]const u8,
+    /// Where the garbage collector root links go, or null when this session
+    /// has no directory of its own for them.
+    root_dir: ?[]const u8,
+};
+
+/// Whether this session can build a Nix attribute on the host, and what it
+/// needs to do it. Null when it cannot, with the reason already on screen.
+///
+/// **The machinery only, and no policy here, which is what makes this
+/// different from `provisioningFor`.** A `provide_tool` request is decided
+/// once, before the session starts, because a mid-session question could only
+/// time out then. That is no longer the shape of a tool call: `Loop.gateToolCall`
+/// asks the arbiter on the turn the model calls, and a person can answer. So a
+/// build is decided on its own turn, under the attribute path it names and
+/// under the flake it names when it names one, and this half answers only
+/// whether there is a `nix` to run at all.
+///
+/// A project can still refuse every build with one row, `nix.build.*` at
+/// `deny`. The model is then offered the tool and told no on each call, which
+/// costs a turn: the alternative is to fold a class of rules into a yes or no
+/// before any attribute is known, and a fold like that would have to guess.
+fn nixBuildFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    dev_shell_dir: ?[]const u8,
+    workspace_root: []const u8,
+    caps: chock_policy.nix.Resolved,
+) ?NixBuild {
+    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+        tty.detail("chock: nix_build is off, because nix is not on this machine's PATH\n", .{});
+        return null;
+    };
+    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+    return .{
+        .workspace_root = workspace_root,
+        .caps = caps,
+        .nix_program = nix_program,
+        .nix_store_program = nix_store_program,
+        .root_dir = dev_shell_dir,
+    };
+}
+
+/// Answers `nix_build` and passes every other call straight through.
+///
+/// ## Why this is a wrapper and not a tool of the registry
+///
+/// Both of the reasons the two runners above it are. The evaluation half runs
+/// in Chock's own process, outside every sandbox, and the build half runs
+/// `nix` on the host and then changes what the next tool call mounts. A
+/// `Registry` holds neither the evaluator nor a value that outlives one call,
+/// so it refuses the name and says why. See
+/// `chock_core.tools.nix_build_needs_a_session`.
+///
+/// ## The three steps, and what each one answers
+///
+/// 1. **Evaluate the attribute**, in this process, with store writes on. That
+///    is what registers the derivation through `chock_nix.backend.Driver`, so
+///    its produced set can authorise a build of it. The seam it evaluates
+///    against writes no object and authorises no build, so import from
+///    derivation is refused here exactly as it is for `nix_eval`.
+/// 2. **The policy has already answered.** `Loop.gateToolCall` put this call
+///    to the policy under `nix.build.<attribute path>`, and under
+///    `nix.build.flake.<reference>` as well when the call named a flake,
+///    before the dispatch reached this file. A call that arrives here was
+///    permitted on every name it carries, and nothing asks a second time.
+/// 3. **Realise on the host**, through `chock_nix.build.realise`, which goes
+///    through the driver's own check and never around it. That check says
+///    this session evaluated this attribute. It does not say the host builds
+///    the bytes this session evaluated: see `lib/chock-nix/build.zig`'s own
+///    top comment for the gap and why it is not closed here.
+///
+/// ## What it produced reaches the agent the way a provisioned program does
+///
+/// The outputs join `SessionMounts`, so the next tool call's `sandbox.Config`
+/// binds them and its `PATH` finds them. Nothing is mounted into a running
+/// sandbox and no bytes travel over a socket: there is no long lived sandbox
+/// to mount into. The three things that does not reach are the three
+/// `ProvisionToolRunner` names: a background task already running, a subagent
+/// already running, and the next session.
+///
+/// **A path this session built still asks under `exec.nix.store.*`.**
+/// `Loop.Deps.store_closure` is read from the toolchain this session started
+/// with and never from `Context.store_paths`, so running a program out of a
+/// build the agent asked for is not the same act as running the project's own
+/// toolchain. See `runSession`, which sets that field.
+///
+/// ## It blocks the turn, and an `Io` of its own
+///
+/// The same as `ProvisionToolRunner`, for the same two reasons: the answer has
+/// to reach the mount set the next dispatch reads, and phase 2's `Io` cannot
+/// spawn a process. See that type's own doc comment, which states both in
+/// full.
+const NixBuildToolRunner = struct {
+    inner: chock_core.Loop.ToolRunner,
+    /// Null when this session cannot build. The model is not offered the tool
+    /// then, so a call that arrives anyway is refused here.
+    settings: ?NixBuild,
+    /// Where everything a build leaves behind is kept: the store paths and
+    /// the `bin` directories. Owned by `runSession`.
+    arena: std.mem.Allocator,
+    /// The environment `nix` itself runs with: the host's own.
+    host_env: *const std.process.Environ.Map,
+    environ: std.process.Environ,
+    /// What this session mounts. Shared with `ProvisionToolRunner`.
+    mounts: *SessionMounts,
+    /// How many builds this session has taken in, which names their garbage
+    /// collector root links apart. See `builtRootPrefix`.
+    builds: usize = 0,
+
+    fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *NixBuildToolRunner = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_build))) {
+            return self.inner.dispatch(gpa, io, call);
+        }
+
+        const answer = try self.build(gpa, io, call);
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = answer.text,
+            .is_error = answer.refused,
+            .truncated = false,
+        };
+    }
+
+    const Answer = struct { text: []u8, refused: bool };
+
+    fn build(
+        self: *NixBuildToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!Answer {
+        const settings = self.settings orelse return .{
+            .text = try gpa.dupe(u8, nix_build_is_off),
+            .refused = true,
+        };
+
+        const parsed = std.json.parseFromSlice(
+            chock_core.tools.NixBuildArgs,
+            gpa,
+            call.arguments,
+            .{ .ignore_unknown_fields = true },
+        ) catch return .{
+            .text = try gpa.dupe(u8, "the arguments of nix_build did not parse. Send " ++
+                "\"attribute\" as a list of names, and \"flake\" only if you mean another " ++
+                "flake."),
+            .refused = true,
+        };
+        defer parsed.deinit();
+
+        const attr_path = parsed.value.attribute;
+        // The workspace itself, which is the project the agent works in, so a
+        // call that names no flake builds what it has been editing.
+        const flake_ref = parsed.value.flake orelse settings.workspace_root;
+
+        chock_nix.build.checkAttrPath(attr_path) catch |err| return .{
+            .text = try chock_nix.build.requestRefusal(gpa, err),
+            .refused = true,
+        };
+        chock_nix.build.checkFlakeRef(flake_ref) catch |err| return .{
+            .text = try chock_nix.build.requestRefusal(gpa, err),
+            .refused = true,
+        };
+
+        const installable = try chock_nix.build.installableFor(self.arena, flake_ref, attr_path);
+        const expression = try chock_nix.build.expressionFor(self.arena, flake_ref, attr_path);
+
+        // The evaluation holds every value it answered, so it is dropped
+        // before the build, which is the long part.
+        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.build.evaluating);
+        defer driver.deinit();
+        applyNixCaps(&driver, settings.caps);
+
+        const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
+            .refused => |text| return .{ .text = text, .refused = true },
+            .found => |path| path,
+        };
+
+        // Before the wait, because a build can take minutes and a silent
+        // terminal looks like a session that has stopped.
+        tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
+
+        const answer = self.realiseWithNix(settings, &driver, .{
+            .derivation_path = drv_path,
+            .installable = installable,
+        }) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s} could not be built ({t}), so nothing was built. Do the work with what the " ++
+                    "toolchain already has.",
+                .{ installable, err },
+            ),
+            .refused = true,
+        };
+
+        const built = switch (answer) {
+            .refused => |text| {
+                tty.print(.warn, "chock: {s} was not built\n", .{installable});
+                return .{ .text = try gpa.dupe(u8, text), .refused = true };
+            },
+            .built => |one| one,
+        };
+
+        try self.mounts.adopt(built.provided);
+
+        tty.print(.plain, "chock: {s} is built, {d} store paths, {d} mounted in all\n", .{
+            installable,
+            built.provided.store_paths.len,
+            self.mounts.paths.items.len,
+        });
+
+        return .{ .text = try builtText(gpa, installable, built), .refused = false };
+    }
+
+    const Derivation = union(enum) { found: []const u8, refused: []u8 };
+
+    /// Evaluate `expression` and answer the derivation it is, with the driver
+    /// left holding that derivation in its produced set.
+    ///
+    /// **The derivation path is borrowed from the session, which ends with
+    /// this function.** It is copied into the arena before it is answered,
+    /// because the build that reads it runs afterwards.
+    fn derivationOf(
+        self: *NixBuildToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        settings: NixBuild,
+        driver: *chock_nix.backend.Driver,
+        expression: []const u8,
+        installable: []const u8,
+    ) std.mem.Allocator.Error!Derivation {
+        var session = chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{settings.workspace_root},
+            .io = io,
+            .store_backend = driver.backend(),
+            // What puts the derivation in the produced set, which is the one
+            // thing that can authorise a build of it.
+            .store_writes = true,
+        }) catch |err| return .{ .refused = try std.fmt.allocPrint(
+            gpa,
+            "the evaluator could not be started ({t}), so nothing was built.",
+            .{err},
+        ) };
+        defer session.deinit();
+
+        const buffer = try gpa.alloc(u8, chock_core.tools.max_nix_eval_bytes);
+        defer gpa.free(buffer);
+
+        const answer = session.answer(buffer, expression) catch |err| return .{
+            .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+        };
+
+        const drv_path = answer.derivation_path orelse return .{ .refused = try std.fmt.allocPrint(
+            gpa,
+            "{s} is not a derivation, so there is nothing to build. It evaluated to {s}. Name " ++
+                "an attribute that is a package.",
+            .{ installable, answer.text },
+        ) };
+
+        session.ensureDerivation(drv_path) catch |err| return .{
+            .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+        };
+
+        return .{ .found = try self.arena.dupe(u8, drv_path) };
+    }
+
+    /// Run the `nix` commands on an `Io` of this call's own. See
+    /// `ProvisionToolRunner.resolveWithNix`, which says why the `Io` is built
+    /// here and why it is backed by the page allocator.
+    fn realiseWithNix(
+        self: *NixBuildToolRunner,
+        settings: NixBuild,
+        driver: *chock_nix.backend.Driver,
+        request: chock_nix.build.Request,
+    ) chock_nix.build.Error!chock_nix.build.Answer {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var run_diag: ?chock_nix.Diagnostic = null;
+        defer if (run_diag) |*d| d.deinit(self.arena);
+        var host = chock_nix.provision.Host{
+            .nix_program = settings.nix_program,
+            .env = self.host_env,
+            .diag = &run_diag,
+        };
+
+        // **The driver the evaluation ran against, and never a fresh one.** A
+        // second driver here would be a second answer to the question of what
+        // this session produced, and the weaker of the two would be the rule.
+        const answer = chock_nix.build.realise(
+            self.arena,
+            io,
+            host.runner(),
+            driver,
+            request,
+        ) catch |err| {
+            if (run_diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+            return err;
+        };
+
+        if (answer == .built) self.rootBuilt(io, settings, request.installable, answer.built);
+        return answer;
+    }
+
+    /// Hold a build against the garbage collector, before the model is told
+    /// it is there. `nix build --no-link` leaves no root of its own, so a
+    /// `nix-collect-garbage` between now and the next tool call would take a
+    /// toolchain the agent has already been promised. The same reasoning
+    /// `ProvisionToolRunner.rootProvided` carries, and a failure is said out
+    /// loud and is not fatal for the same reason.
+    fn rootBuilt(
+        self: *NixBuildToolRunner,
+        io: std.Io,
+        settings: NixBuild,
+        installable: []const u8,
+        built: chock_nix.build.Built,
+    ) void {
+        const nix_store = settings.nix_store_program orelse return;
+        const dir = settings.root_dir orelse return;
+
+        const link_prefix = builtRootPrefix(self.arena, dir, self.builds) catch return;
+        self.builds += 1;
+
+        var diag: ?chock_nix.Diagnostic = null;
+        defer if (diag) |*d| d.deinit(self.arena);
+        chock_nix.store.addRoots(
+            self.arena,
+            io,
+            nix_store,
+            self.host_env,
+            link_prefix,
+            built.provided.store_paths,
+            &diag,
+        ) catch {
+            tty.print(
+                .warn,
+                "chock: {s} could not be held against the garbage collector. A " ++
+                    "nix-collect-garbage during this session can break it.\n",
+                .{installable},
+            );
+        };
+    }
+};
+
+/// What the model is told about a build that happened.
+fn builtText(
+    gpa: std.mem.Allocator,
+    installable: []const u8,
+    built: chock_nix.build.Built,
+) std.mem.Allocator.Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+
+    try text.print(gpa, "{s} was built. It produced", .{installable});
+    for (built.out_paths) |path| try text.print(gpa, " {s}", .{path});
+    try text.appendSlice(gpa, ". Every call after this one can read those paths and run what " ++
+        "is in their bin directories, by the program name alone. A background task or a " ++
+        "subagent that was already running does not have them, and they are gone at the end " ++
+        "of this session.");
+    return text.toOwnedSlice(gpa);
+}
+
+/// Where the garbage collector root links of one build go. Caller owns the
+/// result.
+///
+/// **A number and not the attribute path.** An installable holds `#` and `/`,
+/// which is not a file name, and `nix-store --add-root` names its links after
+/// the prefix it is given, so two builds sharing one prefix would mean the
+/// second call replaces the first one's links. The prefix starts with
+/// `chock_nix.DevShell.root_link_name`, read from there, so a new evaluation
+/// of the dev shell releases these too.
+fn builtRootPrefix(
+    arena: std.mem.Allocator,
+    dir: []const u8,
+    index: usize,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}-built-{d}", .{
+        dir,
+        chock_nix.DevShell.root_link_name,
+        index,
+    });
+}
+
+/// Why an attribute could not be turned into a derivation, in words a model
+/// can act on.
+///
+/// **The store refusal is read first, and it is the one that names a path.**
+/// An expression that imports a derivation stops inside the store backend,
+/// and fix reports the store's own text and nothing else. The same rule
+/// `nixEvalRefusal` follows, and the advice differs: a build does not make
+/// import from derivation work.
+fn nixBuildRefusal(
+    gpa: std.mem.Allocator,
+    session: *chock_nix.eval.Session,
+    driver: *chock_nix.backend.Driver,
+    installable: []const u8,
+    expression: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error![]u8 {
+    if (driver.lastError()) |said| return std.fmt.allocPrint(
+        gpa,
+        "{s} was not built, because evaluating it asked a store for something this session " ++
+            "will not do: {s}. Reading the result of one build to work out another, which is " ++
+            "what importing a derivation does, is refused here. Build the thing itself.",
+        .{ installable, said },
+    );
+
+    if (err == error.RestrictedInPureEval) return std.fmt.allocPrint(
+        gpa,
+        "{s} was not built: evaluating it reads something a pure evaluation may not, such as " ++
+            "a path outside the workspace, the environment, or a flake input that is not " ++
+            "already on this machine. Build an attribute of the project you are working in.",
+        .{installable},
+    );
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.print(gpa, "{s} was not built, because it did not evaluate ({t}).", .{ installable, err });
+
+    var said: std.Io.Writer.Allocating = .init(gpa);
+    defer said.deinit();
+    session.writeDiagnostics(&said.writer, expression) catch {};
+    if (said.written().len != 0) try text.print(gpa, "\n{s}", .{said.written()});
+    return text.toOwnedSlice(gpa);
+}
+
+/// What a `nix_build` call gets when the session cannot build at all. The
+/// model is not offered the tool in that case, so this is for a model that
+/// named it out of nowhere.
+const nix_build_is_off = "nothing was built: this session cannot build with Nix, because there " ++
+    "is no nix on this machine. Do the work with what the toolchain already has.";
 
 /// Starts a subagent: one `chock run` of its own, with the session, the
 /// scratchpad, the chain and the budget slice its parent decided. See
@@ -12167,18 +12664,37 @@ fn runSession(
         },
     };
 
-    var provisioning = ProvisionToolRunner{
+    // What this session mounts, written by the two runners below and read by
+    // every tool call. See `SessionMounts`.
+    var session_mounts = SessionMounts{
+        .arena = provision_arena.allocator(),
+        .context = &tool_runner.context,
+        .tool_env = started.tool_env,
+    };
+    // The dev shell's own paths, taken in first, so the list this holds is
+    // the whole mount set and never only the additions.
+    try session_mounts.start(context.store_paths);
+
+    // Between the evaluator and the provisioner, because a build is the two
+    // of them at once: it evaluates in this process and then runs `nix` on
+    // the host. See `NixBuildToolRunner`.
+    var nix_build = NixBuildToolRunner{
         .inner = nix_eval.runner(),
+        .settings = started.nix_build,
+        .arena = provision_arena.allocator(),
+        .host_env = env,
+        .environ = environ,
+        .mounts = &session_mounts,
+    };
+
+    var provisioning = ProvisionToolRunner{
+        .inner = nix_build.runner(),
         .settings = started.provisioning,
         .arena = provision_arena.allocator(),
         .host_env = env,
         .environ = environ,
-        .tool_env = started.tool_env,
-        .context = &tool_runner.context,
+        .mounts = &session_mounts,
     };
-    // The dev shell's own paths, taken in first, so the list this runner
-    // grows is the whole mount set and never only the additions.
-    try provisioning.start(context.store_paths);
 
     // This session's MCP servers, and the tools they supply.
     //
@@ -16774,16 +17290,20 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
     var context = chock_core.tools.Context{ .store_paths = &.{"/nix/store/aaa-coreutils"} };
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
-    try provisioning.start(context.store_paths);
+    try mounts.start(context.store_paths);
     const runner = provisioning.runner();
 
     const call = chock_proto.event.ToolCall{
@@ -16830,6 +17350,114 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
     try std.testing.expectEqual(@as(usize, 2), recorder.calls);
 }
 
+test "what a build produced is mounted by the next tool call, and not by the one before" {
+    // The two runners write to one mount set. Give each a list of its own and
+    // the last one to adopt publishes a slice the other's additions are
+    // missing from, which is a mount set that quietly shrinks.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    try tool_env.put("PATH", "/nix/store/aaa-devshell/bin");
+
+    var context = chock_core.tools.Context{ .store_paths = &.{"/nix/store/aaa-devshell"} };
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
+    try mounts.start(context.store_paths);
+
+    var nix_build = NixBuildToolRunner{
+        .inner = recorder.runner(),
+        .settings = null,
+        .arena = arena_state.allocator(),
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+    };
+    var provisioning = ProvisionToolRunner{
+        .inner = nix_build.runner(),
+        .settings = null,
+        .arena = arena_state.allocator(),
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+    };
+    const runner = provisioning.runner();
+
+    const call = chock_proto.event.ToolCall{
+        .call_id = "c1",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"myproject\"]}",
+    };
+
+    const before = try runner.dispatch(gpa, std.testing.io, call);
+    gpa.free(before.call_id);
+    gpa.free(before.output);
+    try std.testing.expectEqual(@as(usize, 1), recorder.last_store_paths.len);
+
+    // What `chock_nix.build.realise` answers with: the outputs' own closure,
+    // and one `bin` per output.
+    const closure = [_][]const u8{ "/nix/store/aaa-devshell", "/nix/store/bbb-myproject" };
+    try mounts.adopt(.{
+        .program = "/work#packages.x86_64-linux.default",
+        .installable = "/work#packages.x86_64-linux.default",
+        .bin_dirs = &.{"/nix/store/bbb-myproject/bin"},
+        .store_paths = &closure,
+    });
+
+    const after = try runner.dispatch(gpa, std.testing.io, call);
+    gpa.free(after.call_id);
+    gpa.free(after.output);
+
+    // Two paths and not three: the dev shell entry the closure repeats is
+    // mounted once.
+    try std.testing.expectEqual(@as(usize, 2), recorder.last_store_paths.len);
+    try std.testing.expectEqualStrings("/nix/store/bbb-myproject", recorder.last_store_paths[1]);
+    try std.testing.expectEqualStrings(
+        "/nix/store/bbb-myproject/bin:/nix/store/aaa-devshell/bin",
+        recorder.last_path,
+    );
+    try std.testing.expectEqual(@as(usize, 2), recorder.calls);
+}
+
+test "a program out of a build asks under exec.nix.store, and the dev shell's own still asks under exec.devshell" {
+    // **The split `Loop.Deps.store_closure` exists for.** That field is read
+    // from the toolchain the session started with, in `runSession`, and never
+    // from `chock_core.tools.Context.store_paths`, which a build grows. So a
+    // path the agent asked for keeps asking, while the toolchain the project
+    // declared keeps running with no prompt. Point that field at the grown
+    // list and the second expectation below becomes `exec.devshell`.
+    const startup_closure = [_][]const u8{"/nix/store/aaa-devshell"};
+
+    var buffer: [chock_core.tools.Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.aaa-devshell.bin.zig",
+        chock_core.tools.Tool.run_command.actionInto(
+            &buffer,
+            "/nix/store/aaa-devshell/bin/zig",
+            "",
+            &startup_closure,
+        ).?,
+    );
+
+    var built_buffer: [chock_core.tools.Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.nix.store.bbb-myproject.bin.myproject",
+        chock_core.tools.Tool.run_command.actionInto(
+            &built_buffer,
+            "/nix/store/bbb-myproject/bin/myproject",
+            "",
+            &startup_closure,
+        ).?,
+    );
+}
+
 test "a session that cannot provision refuses the call and names no package manager as a way out" {
     // The model is not offered `provide_tool` in this case, so this is a call
     // that came out of nowhere. It still has to be answered with something
@@ -16845,14 +17473,18 @@ test "a session that cannot provision refuses the call and names no package mana
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
 
     const result = try provisioning.runner().dispatch(gpa, std.testing.io, .{
@@ -17205,6 +17837,11 @@ test "asking twice for the same program builds nothing the second time" {
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     // `settings` names a `nix` that is not there. The point is that this test
     // never reaches it: a repeat is answered before anything is spawned.
     var provisioning = ProvisionToolRunner{
@@ -17218,8 +17855,7 @@ test "asking twice for the same program builds nothing the second time" {
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
     try provisioning.adopt("ripgrep", .{
         .program = "ripgrep",
@@ -19340,21 +19976,25 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
 
     const dev_shell = [_][]const u8{
         "/nix/store/aaa-glibc",
         "/nix/store/bbb-zig",
     };
-    try provisioning.start(&dev_shell);
+    try mounts.start(&dev_shell);
 
     // ripgrep's closure: one path of its own, and the libc the dev shell
     // already carries.

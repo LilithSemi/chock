@@ -21,8 +21,8 @@ agree to uphold it.
   them.
 - `test/` - the tests that need more than one process, or more of the
   repository than the library they test, by area: `auth`, `broker`, `cli`,
-  `container`, `core`, `devices`, `docs`, `pcsc`, `plugin`, `proto`, `redteam`,
-  `sandbox` and `workspace`.
+  `container`, `core`, `devices`, `docs`, `nix`, `pcsc`, `plugin`, `proto`,
+  `redteam`, `sandbox` and `workspace`.
 - `docs/` - the documentation. Start at [docs/README.md](docs/README.md).
 
 ## The rules that hold the model together

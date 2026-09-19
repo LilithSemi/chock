@@ -115,3 +115,95 @@ A `nix` block in `chock.zon` bounds what an evaluation may put in a store.
 the same block and the project wins over it, and an organisation's policy
 bundle is the last word over both. `max_session_bytes` is read and folded the
 same way, and nothing enforces it yet.
+
+# Building one attribute
+
+`nix_eval` says what a derivation is. `nix_build` makes it. The agent names an
+attribute path, a person or your policy answers, and the host builds it.
+
+```
+$ nix_build {"attribute":["packages","x86_64-linux","default"]}
+? nix.build.packages.x86_64-linux.default
+  /nix/store/...-myproject was built. It produced /nix/store/...-myproject.
+$ run_command {"argv":["myproject","--version"]}
+  0.1.0
+```
+
+The attribute path is a list with one name per entry, never one dotted string.
+A Nix attribute name may itself hold a dot, so one string would leave the tool
+guessing where a level ends. `flake` is optional: left out, the build is of the
+workspace the agent is already working in.
+
+## Two rules, because a build asks two questions
+
+What is being built is asked under `nix.build` followed by the attribute path.
+A build of your own project asks that and nothing else:
+
+```zon
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "nix.build.packages.*", .decision = .allow },
+        },
+    },
+}
+```
+
+A call that names a `flake` asks a second question, for the reference itself,
+and **both have to be allowed before anything is built**:
+
+```zon
+.{ .action = "nix.build.flake.github.NixOS.*", .decision = .allow },
+```
+
+So the rule above authorises your own attributes and no foreign flake, because
+a call that names one asks something nobody wrote a rule for. There is no
+shipped default for `nix.build.flake`, so a project that said nothing answers
+`ask` there and a person decides. This is the shape an MCP server's network
+already has: one rule says the act may happen, a second says where it may go.
+
+One name holding both would not be a name. An attribute path and a flake
+reference are both dotted paths, and joined into one string a reference of four
+parts with an attribute of two writes exactly what a reference of three with an
+attribute of three writes.
+
+**The derivation hash is deliberately in neither name.** It changes on every
+edit of the Nix, so a rule keyed on one would have to be rewritten daily, and
+within a week everybody would write `nix.build.*` instead. The rows answer the
+questions a person keeps: may this agent build this attribute, and from where.
+A revision or a `#fragment` on the reference is dropped before the name is
+built, because what a row grants is the repository and never the content.
+
+## What stops a build of anything else
+
+The attribute is evaluated inside Chock first, and that evaluation is what
+registers the derivation. A build of a store path this session did not itself
+produce is refused, by name, before `nix` is run at all. That check matters
+because a hand written derivation can name any builder, so building a path
+nobody evaluated here would be running a program of the model's choosing on
+your machine with a content hash in front of it.
+
+**It proves the request came from an evaluation of this session's own, and not
+that the host builds what this session evaluated.** Chock hands `nix` the
+attribute, and `nix` reads that attribute for itself, so the two can differ:
+Chock's evaluator and yours can read one expression differently, and an
+unpinned reference can move between the two moments. Closing that needs the
+derivation written into your store first, which Chock does not do yet.
+
+Import from derivation stays refused, here as in `nix_eval`. A build the agent
+asked for is not the same act as an evaluation that quietly needs one.
+
+## Where it runs, and what it costs
+
+The build runs on your machine, outside the sandbox, because the sandbox has no
+daemon, no network and no writable cache directory. What it produced is mounted
+by every tool call after that one and is on their `PATH`, which is the same road
+a provisioned program takes. A background task or a subagent that was already
+running does not get it, and nothing survives the session.
+
+A program out of a build still asks under `exec.nix.store.*` when the agent runs
+it, and not under `exec.devshell.*`. The dev shell is the toolchain your project
+declared; a build is something the agent asked for, and the two are not the same
+class. See [policy.md](policy.md).
+
+The turn waits for the build, with no deadline, exactly as `provide_tool` does.

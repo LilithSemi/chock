@@ -818,6 +818,39 @@ pub fn build(b: *std.Build) void {
     run_nix_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_nix_tests.step);
 
+    // A **real `nix`**, driven by the production argument vector. Every other
+    // test of a build answers `nix` from a table, which is what
+    // `lib/chock-nix/provision.zig` argues for, and a table still only says
+    // what somebody thought `nix` does. See `test/nix/real.zig`.
+    //
+    // An empty string on a machine with no `nix`, which that suite reads as a
+    // reason to skip. The same shape `chock_path_options.git_path` has, and
+    // for the same reason: the build script has an environment to search and
+    // a test binary has none.
+    const nix_path_options = b.addOptions();
+    nix_path_options.addOption(
+        []const u8,
+        "nix_path",
+        b.findProgram(&.{"nix"}, &.{}) catch "",
+    );
+
+    const nix_real_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/nix/real.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-nix", .module = chock_nix },
+                .{ .name = "nix_path", .module = nix_path_options.createModule() },
+            },
+        }),
+    });
+    const run_nix_real_tests = b.addRunArtifact(nix_real_tests);
+    // These spawn a program of this machine's own, so a build for another
+    // machine has nothing it can run.
+    run_nix_real_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_nix_real_tests.step);
+
     // The sibling of chock-nix, for a person with no Nix: what a container
     // image states, and the directories the sandbox mounts for it. It answers
     // the same two questions and hands back the same shape of value. Like

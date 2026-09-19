@@ -133,6 +133,21 @@ pub const Driver = struct {
         return self.message;
     }
 
+    /// Build `paths`, if this driver produced every one of them.
+    ///
+    /// **The same function the engine's own build goes through**, so a
+    /// caller outside the engine reaches no build the engine would be
+    /// refused. A second check written beside this one could answer
+    /// differently, and then the weaker of the two would be the real rule.
+    ///
+    /// The seam decides where the build happens, and a seam with no
+    /// `build_paths` refuses. See `lib/chock-nix/build.zig`, which installs
+    /// one only after a person or the policy has answered, so an evaluation
+    /// can never reach it.
+    pub fn build(self: *Driver, paths: []const []const u8, mode: BuildMode) anyerror!void {
+        return buildPaths(self, paths, null, mode);
+    }
+
     const driver_vtable: store.backend.Driver.VTable = .{
         .start = start,
         .run = run,
@@ -238,14 +253,14 @@ pub const Driver = struct {
                 return Error.BuildRefused;
             }
         }
-        const build = self.seam.vtable.build_paths orelse {
+        const run_build = self.seam.vtable.build_paths orelse {
             self.refuse(
                 "a build of {s} is refused: this session authorises no build",
                 .{paths[0]},
             );
             return Error.BuildRefused;
         };
-        return build(self.seam.context, paths, sink, mode);
+        return run_build(self.seam.context, paths, sink, mode);
     }
 
     fn queryMissing(raw: *anyopaque, allocator: std.mem.Allocator, paths: []const []const u8) !MissingPlan {
