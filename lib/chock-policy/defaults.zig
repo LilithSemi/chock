@@ -265,6 +265,24 @@ pub const rules: []const table.Rule = &.{
     // tools above already read, so it is the same class as `call.read_file`.
     // A build is a separate act under `nix.build`, which is not this row.
     .{ .action = "call.nix_eval", .decision = .allow },
+    // **A fixed output derivation that names no URL at all.** `zig.fetchDeps`,
+    // npm deps and `fetchCargoVendor` read their URLs out of a lock file while
+    // they build, so the derivation holds no URL anywhere and there is no host
+    // for a `net.connect` rule to cover. There never was one.
+    //
+    // Shipped `allow` because that is how every vendored dependency fetch
+    // works. A default that refuses them refuses nearly every Rust, Node and
+    // Zig package, this repository's own package and its own dev shell among
+    // them, and a control nobody can leave on is not a control.
+    //
+    // **What it costs.** The output hash proves the bytes are what the
+    // derivation expected and proves nothing about where the request went, so
+    // a build allowed here can reach a host nobody named. The row exists so a
+    // project can take it back: `.{ .action = "nix.fetch.opaque", .decision =
+    // .ask }` in its own `chock.zon` puts the question to a person, and
+    // `.deny` refuses such a build outright. Every derivation that does name a
+    // URL is unaffected and still goes to `net.connect` per host.
+    .{ .action = "nix.fetch.opaque", .decision = .allow },
     // **A language server, which every project that has one already runs.**
     // Shipped `allow` so that giving this act a name changes nothing for
     // anybody: a project with a `language_servers` block behaves exactly as it
@@ -459,6 +477,67 @@ test "net.connect and net.fetch hold no default rule and still answer ask" {
         .action = "net.connect.com.example.443",
     };
     try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(connect_key));
+}
+
+test "a build that fetches with no url is allowed by default, and a project can take it back" {
+    const gpa = std.testing.allocator;
+
+    // **The shipped answer, with no `chock.zon` at all.** Every vendored
+    // dependency fetch is a fixed output derivation that names no URL, so a
+    // default that refused them would refuse nearly every Rust, Node and Zig
+    // package.
+    const empty = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, empty);
+    try std.testing.expectEqual(
+        table.Decision.allow,
+        empty.evaluateKindAlone(key("nix.fetch.opaque")),
+    );
+
+    // **And the whole reason the row is here rather than absent.** A project
+    // that wants the question writes one line, and one that wants it gone
+    // writes the other.
+    const asking = try table.Table.parse(
+        gpa,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "nix.fetch.opaque", .decision = .ask },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+    defer table.Table.destroy(gpa, asking);
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        asking.evaluateKindAlone(key("nix.fetch.opaque")),
+    );
+
+    const denying = try table.Table.parse(
+        gpa,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "nix.fetch.opaque", .decision = .deny },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+    defer table.Table.destroy(gpa, denying);
+    try std.testing.expectEqual(
+        table.Decision.deny,
+        denying.evaluateKindAlone(key("nix.fetch.opaque")),
+    );
+
+    // A derivation that names a URL is unaffected: it still goes to
+    // `net.connect`, which holds no default rule and answers ask.
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        empty.evaluateKindAlone(key("net.connect.com.example.443")),
+    );
 }
 
 test "a tool this file forgot still answers ask" {

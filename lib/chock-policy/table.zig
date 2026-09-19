@@ -3386,16 +3386,16 @@ test "the corrected budget still reads a table under it and still refuses one cl
     // largest file of this shape the corrected budget still read.
     //
     // **The ceiling moved again, to 52, and it moved for a reason worth
-    // naming.** `defaults.zig` shipped 13 rules and now ships 54: wiring the
+    // naming.** `defaults.zig` shipped 13 rules and now ships 55: wiring the
     // git shim's approval half made every git subcommand the shim classifies a
     // key this table is asked about, and the shipped `.allow` rules are what
     // keep a project with no `chock.zon` from being prompted for `git add`.
-    // The last of them is `call.nix_eval`. Every one of those rules is counted
-    // twice per key by the budget above and adds one name to the action list,
-    // so a project's own file has less room than it did. **It is the
-    // pathological shape that lost the room**: 52 rules of three distinct 64
-    // byte names each, under a declared parent link. A real `chock.zon` holds
-    // a handful of short rules and is nowhere near this.
+    // The last of them is `nix.fetch.opaque`. Every one of those rules is
+    // counted twice per key by the budget above and adds one name to the
+    // action list, so a project's own file has less room than it did. **It is
+    // the pathological shape that lost the room**: 52 rules of three distinct
+    // 64 byte names each, under a declared parent link. A real `chock.zon`
+    // holds a handful of short rules and is nowhere near this.
     const gpa = std.testing.allocator;
 
     const admitted = try wideSource(gpa, 52, 64);
