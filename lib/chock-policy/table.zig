@@ -283,6 +283,15 @@ pub const Decision = enum {
     }
 };
 
+/// What `Table.decideChain` answers.
+pub const ChainAnswer = struct {
+    decision: Decision,
+    /// False when no rule of the file, of `defaults.zig` or of the org bundle
+    /// matched the key at any link, so `decision` is the `ask` this table
+    /// gives a key nobody wrote about.
+    named: bool,
+};
+
 /// The four parts of one policy question. Every part is a name that Chock
 /// itself knows: the kind of the agent that asked, the alias of the model
 /// behind it, the tool it called, and the action that tool wants to perform.
@@ -863,14 +872,33 @@ pub const Table = struct {
         key: Key,
         fault: ?*?ChainFault,
     ) Decision {
+        return self.decideChain(chain, key, fault).decision;
+    }
+
+    /// `evaluateChain`, and the one fact a `Decision` cannot carry: whether
+    /// any rule named this key at all.
+    ///
+    /// `ask` is both "nobody wrote a rule" and "somebody wrote `ask`", and a
+    /// caller that reads a second, wider name when the first is not covered
+    /// has to tell them apart or it widens past what an author wrote. See
+    /// `src/run.zig`'s `NixTableReader`, which reads a phase scoped Nix name
+    /// and then a phase free one.
+    ///
+    /// One walk and not two: `evaluateChain` is this with the flag dropped.
+    pub fn decideChain(
+        self: *const Table,
+        chain: []const []const u8,
+        key: Key,
+        fault: ?*?ChainFault,
+    ) ChainAnswer {
         if (chain.len == 0) {
             noteChain(fault, .{ .empty = key.action });
-            return .ask;
+            return .{ .decision = .ask, .named = false };
         }
         for (chain) |kind| {
             if (kind.len > 0) continue;
             noteChain(fault, .{ .link_with_no_name = key.action });
-            return .ask;
+            return .{ .decision = .ask, .named = false };
         }
         const last = chain[chain.len - 1];
         if (!std.mem.eql(u8, last, key.agent_kind)) {
@@ -878,7 +906,7 @@ pub const Table = struct {
                 .agent_kind = key.agent_kind,
                 .last = last,
             } });
-            return .ask;
+            return .{ .decision = .ask, .named = false };
         }
 
         // The first link seeds the fold. There is no `allow` here to seed it
@@ -890,15 +918,27 @@ pub const Table = struct {
         // a project can lower an answer and can never raise one. A session with
         // no bundle folds an empty rule list, which answers `allow` and changes
         // nothing.
-        const first = keyForKind(key, chain[0]);
-        var result = evaluateRules(self.policy.rules, first).intersect(ceilingRules(self.org, first));
+        var answer = self.linkAnswer(keyForKind(key, chain[0]));
         for (chain[1..]) |kind| {
-            const link = keyForKind(key, kind);
-            result = result
-                .intersect(evaluateRules(self.policy.rules, link))
-                .intersect(ceilingRules(self.org, link));
+            const link = self.linkAnswer(keyForKind(key, kind));
+            answer = .{
+                .decision = answer.decision.intersect(link.decision),
+                .named = answer.named or link.named,
+            };
         }
-        return result;
+        return answer;
+    }
+
+    /// One link of the chain, over the file, the shipped defaults and the org
+    /// bundle. An org rule counts as naming the key: without that, a wider
+    /// name could be read past a ceiling the organisation set on this one.
+    fn linkAnswer(self: *const Table, link: Key) ChainAnswer {
+        const own = rulesAnswer(self.policy.rules, link);
+        const ceiling = winnerFor(self.org, link);
+        return .{
+            .decision = own.decision.intersect(if (ceiling) |one| one.decision else .allow),
+            .named = own.named or ceiling != null,
+        };
     }
 
     /// True when this table holds a rule that could permit **some** action
@@ -1148,9 +1188,16 @@ fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) voi
 /// `.action` if it names one at all: this change is about which list is
 /// asked first, not about how wide one shipped default may be.
 fn evaluateRules(rules: []const Rule, key: Key) Decision {
-    if (winnerFor(rules, key)) |winner| return winner.decision;
-    if (winnerFor(defaults.rules, key)) |winner| return winner.decision;
-    return .ask;
+    return rulesAnswer(rules, key).decision;
+}
+
+/// `evaluateRules`, and whether a rule of either list named `key`.
+fn rulesAnswer(rules: []const Rule, key: Key) ChainAnswer {
+    if (winnerFor(rules, key)) |winner| return .{ .decision = winner.decision, .named = true };
+    if (winnerFor(defaults.rules, key)) |winner| {
+        return .{ .decision = winner.decision, .named = true };
+    }
+    return .{ .decision = .ask, .named = false };
 }
 
 /// `evaluateRules`, for a layer that is read as a ceiling: **a key no rule
@@ -3377,6 +3424,79 @@ test "the read time check counts the shipped defaults, and refuses what the file
     try std.testing.expectEqual(keys * rules_per_key * 2 * 64, walk.work);
 }
 
+test "a decision the rules named is told apart from the ask a key nobody wrote gets" {
+    // `ask` is two facts in one word, and a caller that reads a second, wider
+    // name when the first is not covered has to tell them apart or it widens
+    // past what an author wrote.
+    const gpa = std.testing.allocator;
+
+    const t = try Table.parse(gpa,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{ .{ .action = "nix.net.build.com.example.443", .decision = .ask } },
+        \\    },
+        \\}
+    , null);
+    defer Table.destroy(gpa, t);
+
+    const written = t.decideChain(&.{"main"}, .{
+        .agent_kind = "main",
+        .model = "a-model",
+        .tool = "nix_build",
+        .action = "nix.net.build.com.example.443",
+    }, null);
+    try std.testing.expect(written.named);
+    try std.testing.expectEqual(Decision.ask, written.decision);
+
+    const nobody = t.decideChain(&.{"main"}, .{
+        .agent_kind = "main",
+        .model = "a-model",
+        .tool = "nix_build",
+        .action = "nix.net.build.com.other.443",
+    }, null);
+    try std.testing.expect(!nobody.named);
+    try std.testing.expectEqual(Decision.ask, nobody.decision);
+
+    // A shipped default names a key too, so a project that wrote nothing is
+    // still decided.
+    const shipped = t.decideChain(&.{"main"}, .{
+        .agent_kind = "main",
+        .model = "a-model",
+        .tool = "nix_build",
+        .action = "nix.net.build.opaque",
+    }, null);
+    try std.testing.expect(shipped.named);
+    try std.testing.expectEqual(Decision.allow, shipped.decision);
+
+    // A chain this reader cannot fold names nothing, so a caller reading a
+    // second name is not sent past a fault either.
+    const broken = t.decideChain(&.{}, .{
+        .agent_kind = "main",
+        .model = "a-model",
+        .tool = "nix_build",
+        .action = "nix.net.build.com.example.443",
+    }, null);
+    try std.testing.expect(!broken.named);
+
+    // The two entry points cannot disagree: one walk answers both.
+    for ([_][]const u8{
+        "nix.net.build.com.example.443",
+        "nix.net.build.com.other.443",
+        "nix.net.build.opaque",
+    }) |action| {
+        const key: Key = .{
+            .agent_kind = "main",
+            .model = "a-model",
+            .tool = "nix_build",
+            .action = action,
+        };
+        try std.testing.expectEqual(
+            t.evaluateChain(&.{"main"}, key, null),
+            t.decideChain(&.{"main"}, key, null).decision,
+        );
+    }
+}
+
 test "the corrected budget still reads a table under it and still refuses one clearly over it" {
     // The point of this check is to refuse the right tables, so the fix above
     // must not turn it into a check that refuses every table or none.
@@ -3390,7 +3510,7 @@ test "the corrected budget still reads a table under it and still refuses one cl
     // git shim's approval half made every git subcommand the shim classifies a
     // key this table is asked about, and the shipped `.allow` rules are what
     // keep a project with no `chock.zon` from being prompted for `git add`.
-    // The last of them is `nix.fetch.opaque`. Every one of those rules is
+    // The last of them is `nix.net.build.opaque`. Every one of those rules is
     // counted twice per key by the budget above and adds one name to the
     // action list, so a project's own file has less room than it did. **It is
     // the pathological shape that lost the room**: 52 rules of three distinct
