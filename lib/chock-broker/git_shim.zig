@@ -106,6 +106,10 @@ pub const Reason = enum {
 /// resolves to `ask`, which is the policy table's safe default.
 pub const unreadable_action = "git.unknown";
 
+/// What a person reads on a question this file put. See
+/// `chock_proto.event.ApprovalRequest.source`.
+pub const request_source = "git";
+
 /// What the shim wants to ask about.
 pub const Ask = struct {
     /// The subcommand, as a slice of the caller's own argument vector. Empty
@@ -511,6 +515,7 @@ pub fn decide(
         .model_alias = caller.model_alias,
         .tool = caller.tool,
         .tool_call_id = caller.tool_call_id,
+        .source = request_source,
         .spawn_chain = caller.spawn_chain,
         .timeout_ms = caller.timeout_ms,
     }, diag);

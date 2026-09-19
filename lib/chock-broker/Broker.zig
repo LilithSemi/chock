@@ -277,6 +277,9 @@ pub const Request = struct {
     tool: []const u8,
     /// The call_id of the `tool.call` that caused this.
     tool_call_id: []const u8,
+    /// Which part of Chock wanted this, for the person answering. See
+    /// `event.ApprovalRequest.source`.
+    source: []const u8 = "",
     /// Every parent of the asking agent, root first, and the reason each one
     /// gave for starting the next. The asking agent itself is not a link:
     /// `agent_kind` names it. See `policyChain`.
@@ -808,6 +811,7 @@ fn askTheHuman(
             .spawn_chain = ask.spawn_chain,
             .timeout_at_ms = deadline_ms,
             .tool_call_id = ask.tool_call_id,
+            .source = ask.source,
             // The reviewer answers first, and its verdict goes with the diff.
             // Both are `.none` and empty for a plain `ask`.
             .review = record.verdict,
@@ -916,10 +920,11 @@ comptime {
     // action name, an agent kind, a model alias, a tool name, and the id of the
     // tool call it started itself. Replacing any of the first four would change
     // the key the policy is read with, which is a decision and not a redaction.
-    // `self_policy` reaches the fold and no record.
+    // `self_policy` reaches the fold and no record. `source` names a
+    // subsystem of Chock and holds nothing anybody else supplied.
     const chock_wrote_it = [_][]const u8{
         "action",       "agent_kind", "model_alias", "tool",
-        "tool_call_id", "timeout_ms", "self_policy",
+        "tool_call_id", "timeout_ms", "self_policy", "source",
     };
     for (@typeInfo(Request).@"struct".fields) |field| {
         var listed = false;

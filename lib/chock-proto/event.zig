@@ -861,6 +861,11 @@ pub const ApprovalRequest = struct {
     /// The reviewer's own one line reason, for the person about to answer.
     /// Empty when `review` is `.none`.
     review_note: []const u8 = "",
+    /// Which part of Chock wanted this, for the person answering: "the
+    /// sandbox", "a Nix build", "git". An action name alone does not say,
+    /// and the answer can turn on it. Empty for a log written before the
+    /// field existed and for a caller that filled in nothing.
+    source: []const u8 = "",
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());

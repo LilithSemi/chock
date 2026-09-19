@@ -927,6 +927,7 @@ pub const Session = struct {
             .reason = "",
             .tool = offer.name,
             .tool_call_id = call_id,
+            .source = "an MCP server",
         });
     }
 

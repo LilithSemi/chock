@@ -60,6 +60,9 @@ pub const Ask = struct {
     tool: []const u8,
     /// The call_id of the `tool.call` that caused this.
     tool_call_id: []const u8,
+    /// Which part of Chock wanted this, for the person answering. See
+    /// `chock_proto.event.ApprovalRequest.source`.
+    source: []const u8 = "",
 };
 
 /// What was decided.

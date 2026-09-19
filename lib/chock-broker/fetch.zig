@@ -739,6 +739,11 @@ pub const Session = struct {
     /// session that promised `net.fetch` at `deny` is stopped even though that
     /// name is not the host key. `restrict_self` offers exactly that promise in
     /// its own description, so it has to bind here.
+    ///
+    /// Nobody is prompted anywhere on this path. Only `allow` reads a page,
+    /// and every other decision, `ask` among them, is a refusal here, so
+    /// `fetch_url` writes no approval request and no person ever answers one
+    /// about a host it wanted.
     pub fn decide(
         self: *const Session,
         host: []const u8,

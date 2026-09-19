@@ -777,6 +777,11 @@ pub fn promptText(
     try text.appendSlice(gpa, "\nchock: this needs your approval before it can happen.\n\n");
     try text.print(gpa, "  action   {s}\n", .{request.action});
 
+    // An action name says what is wanted and never who wanted it, and the
+    // answer can turn on that: the sandbox reaching a host and a Nix build
+    // fetching from it are two different acts. Absent on an older log.
+    if (request.source.len != 0) try text.print(gpa, "  source   {s}\n", .{request.source});
+
     // The chain is shown, because "a subagent three levels down asked for this"
     // is a fact that changes the answer. The agent that asked is last, the way
     // `Broker.policyChain` builds it.
@@ -1527,10 +1532,14 @@ test "the question names the act, the chain, the reason and the review" {
         .tool_call_id = "call1",
         .review = .approved,
         .review_note = "the diff is the fix the task asked for",
+        .source = "a Nix build",
     }, .terminal);
     defer gpa.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "workspace.apply") != null);
+    // Which part of Chock asked. An action name alone does not say, and the
+    // answer can turn on it.
+    try testing.expect(std.mem.indexOf(u8, text, "source   a Nix build") != null);
     try testing.expect(std.mem.indexOf(u8, text, "main -> coder") != null);
     try testing.expect(std.mem.indexOf(u8, text, "move 3 objects") != null);
     try testing.expect(std.mem.indexOf(u8, text, "the session made a commit") != null);
@@ -1555,6 +1564,8 @@ test "the question names the act, the chain, the reason and the review" {
     }, .terminal);
     defer gpa.free(plain);
     try testing.expect(std.mem.indexOf(u8, plain, "review") == null);
+    // A log written before the field existed shows no empty line for it.
+    try testing.expect(std.mem.indexOf(u8, plain, "source") == null);
     // With no parents, the chain is the asking agent alone and there is no
     // arrow at all.
     try testing.expect(std.mem.indexOf(u8, plain, "->") == null);
