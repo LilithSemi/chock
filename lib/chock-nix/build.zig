@@ -364,6 +364,10 @@ pub const Writing = struct {
     writer: StoreWriter,
     /// This session's own, shared with every other build of it.
     budget: *Budget,
+    /// The store paths this session fetched on the host, before the
+    /// evaluation, after the policy answered for every host they came from.
+    /// See `lib/chock-nix/inputs.zig`.
+    fetched_paths: []const []const u8 = &.{},
 
     pub fn seam(self: *Writing) backend.Seam {
         return .{ .context = self, .vtable = &vtable };
@@ -374,12 +378,24 @@ pub const Writing = struct {
         .add_object = addObject,
     };
 
-    /// False for every path, so the evaluation writes each object of the
-    /// closure rather than taking one the store holds already. A write it
-    /// skips is a path the produced set never records, and a build of that
-    /// path would then be refused. Writing an object the store already holds
-    /// answers the same path and changes nothing else.
-    fn isValidPath(_: *anyopaque, _: []const u8) anyerror!bool {
+    /// True for a path of `fetched_paths` and false for every other path.
+    ///
+    /// **False is the answer that keeps the produced set whole**, so it is the
+    /// default: the evaluation then writes each object of the closure rather
+    /// than taking one the store holds already, and a write it skips is a path
+    /// the produced set never records, which would refuse the build of it.
+    /// Writing an object the store already holds answers the same path and
+    /// changes nothing else.
+    ///
+    /// **A flake input is the one thing that must answer true.** fix takes a
+    /// locked input from the store when the store says its path is valid, and
+    /// fetches the tree itself when it does not. Nothing is built out of these
+    /// paths, so none of them ever has to be in the produced set.
+    fn isValidPath(context: *anyopaque, path: []const u8) anyerror!bool {
+        const self: *Writing = @ptrCast(@alignCast(context));
+        for (self.fetched_paths) |one| {
+            if (std.mem.eql(u8, one, path)) return true;
+        }
         return false;
     }
 
@@ -737,7 +753,7 @@ const AnsweringGate = struct {
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s}, and this project allows no connection to it",
-            .{ one.derivation, one.url, one.host },
+            .{ one.subject, one.url, one.host },
         ) };
     }
 };

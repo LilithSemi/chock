@@ -121,7 +121,7 @@ const RecordingGate = struct {
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s}, and no rule allows it",
-            .{ one.derivation, one.url, one.host },
+            .{ one.subject, one.url, one.host },
         ) };
     }
 };
@@ -340,4 +340,160 @@ test "a real closure holding a fixed output derivation names its host, and a no 
     // send the same attribute again.
     try testing.expect(std.mem.indexOf(u8, answer.refused, probe_host) != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, installable) != null);
+}
+
+/// Run `nix` with these arguments on this machine and answer what it wrote on
+/// standard output, with the trailing newline off. Null when it refused.
+fn nixSaid(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    args: []const []const u8,
+) ?[]const u8 {
+    var env = std.process.Environ.Map.init(arena);
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+    const output = host.runner().run(arena, io, args) catch return null;
+    if (!output.succeeded()) return null;
+    return std.mem.trimEnd(u8, output.stdout, "\n");
+}
+
+fn writeAt(io: std.Io, dir: std.Io.Dir, name: []const u8, text: []const u8) !void {
+    var file = try dir.createFile(io, name, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, text);
+}
+
+test "a flake input that is in the store already is evaluated with no fetcher at all" {
+    // **The whole of the input mechanism, against the real thing.** A tree is
+    // put in the host store, its NAR hash is read from the same `nix`, and a
+    // lock pins an input to that hash. The lock's forge coordinates are never
+    // reached: fix takes the store path the hash names, because the seam says
+    // that path is valid. The second half of the test takes the path off the
+    // seam and the same evaluation stops with no fetcher, which is what proves
+    // the store hit and not the network is what answered.
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "dep");
+    try tmp.dir.createDirPath(io, "root");
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(io, &path_buffer)];
+    const dep_path = try std.fs.path.join(arena, &.{ base, "dep" });
+    const root_path = try std.fs.path.join(arena, &.{ base, "root" });
+
+    {
+        var dep = try tmp.dir.openDir(io, "dep", .{});
+        defer dep.close(io);
+        try writeAt(io, dep, "flake.nix", "{ outputs = { self }: { value = 7; }; }\n");
+    }
+
+    // The store path and the hash come from the same `nix`, so the test never
+    // computes either of them itself.
+    const store_path = nixSaid(arena, io, &.{ "store", "add", "--name", "source", "--mode", "nar", dep_path }) orelse
+        return error.SkipZigTest;
+    const nar_hash = nixSaid(arena, io, &.{ "hash", "path", "--type", "sha256", "--sri", dep_path }) orelse
+        return error.SkipZigTest;
+
+    {
+        var root = try tmp.dir.openDir(io, "root", .{});
+        defer root.close(io);
+        try writeAt(io, root, "flake.nix",
+            \\{
+            \\  inputs.dep.url = "github:chock/not-reached";
+            \\  outputs = { self, dep }: {
+            \\    drv = derivation {
+            \\      name = "chock-input-probe";
+            \\      builder = "/bin/sh";
+            \\      system = "chock-test-not-a-system";
+            \\      value = toString dep.value;
+            \\    };
+            \\  };
+            \\}
+            \\
+        );
+        try writeAt(io, root, "flake.lock", try std.fmt.allocPrint(arena,
+            \\{{
+            \\  "nodes": {{
+            \\    "dep": {{
+            \\      "locked": {{ "type": "github", "owner": "chock", "repo": "not-reached",
+            \\        "rev": "0000000000000000000000000000000000000000", "narHash": "{s}",
+            \\        "lastModified": 0 }},
+            \\      "original": {{ "type": "github", "owner": "chock", "repo": "not-reached" }}
+            \\    }},
+            \\    "root": {{ "inputs": {{ "dep": "dep" }} }}
+            \\  }},
+            \\  "root": "root",
+            \\  "version": 7
+            \\}}
+            \\
+        , .{nar_hash}));
+    }
+
+    const expression = try chock_nix.build.expressionFor(arena, root_path, &.{"drv"});
+
+    var store_writer = chock_nix.build.DaemonWriter.connect(
+        gpa,
+        io,
+        chock_nix.build.default_daemon_socket,
+    ) catch return error.SkipZigTest;
+    defer store_writer.deinit();
+
+    {
+        var budget: chock_nix.build.Budget = .{};
+        var writing = chock_nix.build.Writing{
+            .writer = store_writer.writer(),
+            .budget = &budget,
+            .fetched_paths = &.{store_path},
+        };
+        var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
+        defer driver.deinit();
+
+        var session = try chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{root_path},
+            .io = io,
+            .store_backend = driver.backend(),
+            .store_writes = true,
+            .flakes = true,
+        });
+        defer session.deinit();
+
+        var buffer: [512]u8 = undefined;
+        const answer = session.answer(&buffer, expression) catch return error.SkipZigTest;
+        try testing.expect(answer.derivation_path != null);
+    }
+
+    // The same flake, the same lock, and nothing saying the input's path is
+    // there. The evaluator has no fetcher, so it stops rather than reaching
+    // the forge the lock names.
+    {
+        var budget: chock_nix.build.Budget = .{};
+        var writing = chock_nix.build.Writing{
+            .writer = store_writer.writer(),
+            .budget = &budget,
+        };
+        var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
+        defer driver.deinit();
+
+        var session = try chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{root_path},
+            .io = io,
+            .store_backend = driver.backend(),
+            .store_writes = true,
+            .flakes = true,
+        });
+        defer session.deinit();
+
+        var buffer: [512]u8 = undefined;
+        try testing.expectError(error.FetchIoUnavailable, session.answer(&buffer, expression));
+    }
 }

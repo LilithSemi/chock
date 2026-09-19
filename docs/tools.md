@@ -135,6 +135,13 @@ A Nix attribute name may itself hold a dot, so one string would leave the tool
 guessing where a level ends. `flake` is optional: left out, the build is of the
 workspace the agent is already working in.
 
+**A `flake` that is not your project is refused.** The agent may write any
+reference, and fetching one means fetching its whole input graph. What that
+graph reaches is written in a lock file inside the flake, which nobody can read
+until the flake has already been fetched, so there is no moment at which your
+rules could answer for those hosts first. The agent is told so in one sentence
+and builds an attribute of your project instead.
+
 ## Two rules, because a build asks two questions
 
 What is being built is asked under `nix.build` followed by the attribute path.
@@ -157,16 +164,12 @@ and **both have to be allowed before anything is built**:
 .{ .action = "nix.build.flake.github.NixOS.*", .decision = .allow },
 ```
 
-So the rule above authorises your own attributes and no foreign flake, because
-a call that names one asks something nobody wrote a rule for. There is no
-shipped default for `nix.build.flake`, so a project that said nothing answers
-`ask` there and a person decides. This is the shape an MCP server's network
-already has: one rule says the act may happen, a second says where it may go.
-
-One name holding both would not be a name. An attribute path and a flake
-reference are both dotted paths, and joined into one string a reference of four
-parts with an attribute of two writes exactly what a reference of three with an
-attribute of three writes.
+A reference that is not your project is refused whatever those rules say, so
+the second rule narrows a subdirectory of your own tree and never widens to a
+foreign flake. One name holding both questions would not be a name: an
+attribute path and a flake reference are both dotted paths, and joined into one
+string a reference of four parts with an attribute of two writes exactly what a
+reference of three with an attribute of three writes.
 
 **The derivation hash is deliberately in neither name.** It changes on every
 edit of the Nix, so a rule keyed on one would have to be rewritten daily, and
@@ -246,6 +249,34 @@ reader did not find is a host nobody was asked about.
 
 A build needs your Nix daemon, because that is what takes the derivation in. A
 machine with no daemon builds nothing here and says so.
+
+## Where your flake inputs come from
+
+Chock's evaluator has no fetcher. It cannot open a connection, whatever an
+expression asks for, so a flake input reaches it one way: it is in your store
+before the session starts.
+
+`chock run` reads your project's `flake.lock` at startup, names every host the
+inputs would be fetched from, and puts each one to the same `net.connect` rules
+above. One question per host, whatever number of inputs share it. A `github`
+input with no host of its own is fetched from `api.github.com`, which redirects
+to `codeload.github.com`, so both are named. A lock file sits in your project
+directory beside `chock.zon`, and Chock reads a file there as something an
+attacker may have written, which is why the hosts in it are asked about at all.
+Only `allow` fetches: a session is starting up, so there is nobody to prompt,
+and `ask` is off there the same way it is for a language server.
+
+Everything it fetched goes in your store, and the evaluation takes each input
+from there, by the hash the lock pins. A node Chock cannot turn into a host is
+a refusal rather than a guess: an `indirect` input names a registry entry and
+not a host, and an `ssh://` URL is not a scheme that can be named as a host and
+a port.
+
+**A session whose inputs did not arrive still starts.** A project with no flake
+at all is the ordinary case, and nothing else a session start does refuses the
+session because an optional thing was missing. What you get instead is a build
+that says which input it wanted and where it would have come from, so the
+answer is a rule you can write rather than a fault nobody can act on.
 
 Import from derivation stays refused, here as in `nix_eval`. A build the agent
 asked for is not the same act as an evaluation that quietly needs one.

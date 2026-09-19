@@ -1749,12 +1749,35 @@ fn start(
     // yet is exactly the one somebody wants to move to a daemon.
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
 
+    // The policy table, read once, at the start, under whatever this
+    // installation's organisation put above it. **Before the dev shell**,
+    // because the dev shell is an evaluation of the project's flake and an
+    // evaluation of a flake fetches its inputs: the table is what answers for
+    // the hosts they come from.
+    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
+
     // The project's own toolchain. Two things come out of one evaluation: the
     // environment every tool call runs with, and the store paths the sandbox
     // mounts for it. After the banner, because an evaluation is the slowest
     // thing a session start does and a user watching it should already know
     // which session is waiting.
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
+
+    // The project's flake inputs, fetched once, on the host, under the same
+    // rule a build's own fetches go under. **Before the dev shell and before
+    // the first evaluation of anything**, because everything after this reads
+    // them out of the store rather than reaching for them itself. See
+    // `lib/chock-nix/inputs.zig`.
+    const flake_inputs = fetchFlakeInputs(
+        arena,
+        io,
+        env,
+        policy,
+        project_root,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+    );
 
     // **The image is read first, and a project that names one never evaluates
     // a dev shell.** A `flake.nix` is a file a project may have for its own
@@ -1818,10 +1841,6 @@ fn start(
         0
     else
         try handleUncommitted(gpa, io, env, &workspace, options);
-
-    // The policy table, read once, at the start, under whatever this
-    // installation's organisation put above it.
-    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
 
     // Whether the write and execute rule is on for this session, and the log
     // line that says which it was. **The one setting on the table that widens**,
@@ -2108,7 +2127,15 @@ fn start(
 
     // Beside provisioning and the caps, for the same reason: it is an answer
     // about Nix that the tool list depends on.
-    const nix_build = nixBuildFor(arena, io, env, dev_shell_dir, workspace.workPath(), nix_caps);
+    const nix_build = nixBuildFor(
+        arena,
+        io,
+        env,
+        dev_shell_dir,
+        workspace.workPath(),
+        nix_caps,
+        flake_inputs,
+    );
 
     const support = chock_core.tools.Support{
         .adapter = adapter,
@@ -4912,6 +4939,168 @@ fn applyModeFor(
         chock_policy.apply.integrate_action,
     });
     return .{ .mode = bounded, .decision = decision, .asked_for = settings.mode };
+}
+
+/// Everything a later build needs to know about this project's flake inputs.
+const FlakeInputs = struct {
+    /// Every store path the fetch put there, empty when nothing was fetched.
+    /// `chock_nix.build.Writing` answers `is_valid_path` from this, which is
+    /// what stops the evaluator fetching an input for itself.
+    store_paths: []const []const u8 = &.{},
+    /// Why they are not there, empty when they are. A build that then wants
+    /// one reads this sentence rather than a fault nobody can act on.
+    missing: []const u8 = "",
+    /// What the lock said the fetch would reach, so a refusal can name the
+    /// input and the host. Empty when the lock named nothing.
+    wanted: []const chock_nix.fetch.Fetch = &.{},
+};
+
+/// Who answers for a host this project's flake inputs would be fetched from.
+///
+/// **The policy table and nobody else.** A session is starting up, so there is
+/// nobody to prompt, and `ask` is off here for the reason
+/// `languageServerPermitted` states: a question with no one to answer it is a
+/// question that times out. The action name is the ordinary `net.connect` one,
+/// from `chock_broker.network.actionInto`, which is the same namespace a
+/// build's own fetches are asked under. There is no second namespace for a
+/// fetch.
+const StartupFetchGate = struct {
+    policy: *const chock_policy.table.Table,
+    chain: []const []const u8,
+    agent_kind: []const u8,
+    model: []const u8,
+
+    fn gate(self: *StartupFetchGate) chock_nix.fetch.Gate {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+
+    fn permitFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        one: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return .{ .refused = try std.fmt.allocPrint(
+                allocator,
+                "{s} would be fetched from \"{s}\", which is not a host name a rule can be " ++
+                    "written for",
+                .{ one.subject, one.host },
+            ) };
+
+        var fault: ?chock_policy.table.ChainFault = null;
+        const decision = self.policy.evaluateChain(self.chain, .{
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = @tagName(chock_core.tools.Tool.nix_build),
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        if (decision == .allow) return .permitted;
+
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "the input {s} comes from {s}, and this project's policy answers {t} for {s}",
+            .{ one.subject, one.host, decision, action },
+        ) };
+    }
+};
+
+/// Fetch this project's flake inputs into the host store, once, before
+/// anything evaluates.
+///
+/// **A session whose inputs did not arrive still starts.** Nothing else a
+/// session start does refuses the session because an optional thing was
+/// missing, and a project with no flake at all is the ordinary case. The
+/// reason is kept instead, and a build that later wants an input reads it.
+fn fetchFlakeInputs(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    policy: *const chock_policy.table.Table,
+    project_root: []const u8,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+) FlakeInputs {
+    const lock_bytes = readProjectLock(arena, io, project_root) orelse return .{};
+
+    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch return .{
+        .missing = "nix is not on this machine's PATH, so no flake input was fetched",
+    };
+
+    // The chain `evaluateChain` wants is the parents and this session, in that
+    // order. The same shape `provisionDecision` builds, and for the same
+    // reason: a session cannot state its own parents.
+    const chain = arena.alloc([]const u8, chain_links.len + 1) catch return .{
+        .missing = "this session ran out of memory before its flake inputs were fetched",
+    };
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    const wanted = switch (chock_nix.inputs.wantsOf(arena, lock_bytes) catch return .{}) {
+        .hosts => |list| list,
+        else => &.{},
+    };
+
+    var gate = StartupFetchGate{
+        .policy = policy,
+        .chain = chain,
+        .agent_kind = agent_kind,
+        .model = model,
+    };
+    var diag: ?chock_nix.Diagnostic = null;
+    var host = chock_nix.provision.Host{ .nix_program = nix_program, .env = env, .diag = &diag };
+
+    const answer = chock_nix.inputs.fetchAll(
+        arena,
+        io,
+        host.runner(),
+        gate.gate(),
+        project_root,
+        lock_bytes,
+    ) catch {
+        if (diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+        return .{
+            .wanted = wanted,
+            .missing = "the flake inputs could not be fetched, because nix could not be run",
+        };
+    };
+
+    switch (answer) {
+        .fetched => |paths| {
+            if (paths.len != 0) {
+                tty.detail("chock: {d} flake input paths are in the store\n", .{paths.len});
+            }
+            return .{ .store_paths = paths, .wanted = wanted };
+        },
+        .refused => |why| {
+            // Said out loud, because a session that starts without its inputs
+            // builds nothing that needs one, and the user is the person who
+            // can change the rule.
+            tty.print(.warn, "chock: {s}\n", .{why});
+            return .{ .missing = why, .wanted = wanted };
+        },
+    }
+}
+
+/// This project's `flake.lock`, or null when it has none.
+///
+/// **A file of the project, so it is read as one.** It sits beside
+/// `chock.zon`, and this project reads a file there as something an attacker
+/// may have written: every host it names goes to the policy.
+fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) ?[]const u8 {
+    const path = std.fs.path.join(arena, &.{ project_root, "flake.lock" }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(chock_nix.inputs.max_lock_bytes),
+    ) catch null;
 }
 
 fn provisioningFor(
@@ -11097,6 +11286,11 @@ const NixBuild = struct {
     /// The Nix daemon socket the derivation of a build is written to, before
     /// the host is told to realise it. See `chock_nix.build.Writing`.
     store_endpoint: []const u8,
+    /// This project's flake inputs, fetched on the host at the start of the
+    /// session under the policy. The evaluation reads them out of the store,
+    /// and a build that wants one this session does not have is refused with
+    /// the reason they are not there.
+    inputs: FlakeInputs,
 };
 
 /// Whether this session can build a Nix attribute on the host, and what it
@@ -11122,6 +11316,7 @@ fn nixBuildFor(
     dev_shell_dir: ?[]const u8,
     workspace_root: []const u8,
     caps: chock_policy.nix.Resolved,
+    inputs: FlakeInputs,
 ) ?NixBuild {
     const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
         tty.detail("chock: nix_build is off, because nix is not on this machine's PATH\n", .{});
@@ -11138,6 +11333,7 @@ fn nixBuildFor(
         // reached at the place its `nix` reads too.
         .store_endpoint = env.get("NIX_DAEMON_SOCKET_PATH") orelse
             chock_nix.build.default_daemon_socket,
+        .inputs = inputs,
     };
 }
 
@@ -11193,7 +11389,7 @@ const NixFetchGate = struct {
                 allocator,
                 "{s} fetches {s}, and \"{s}\" is not a host name a rule can be written for, so " ++
                     "nothing was fetched. Use an input whose host is an ordinary name.",
-                .{ one.derivation, one.url, one.host },
+                .{ one.subject, one.url, one.host },
             ) };
 
         const summary = try std.fmt.allocPrint(
@@ -11205,7 +11401,7 @@ const NixFetchGate = struct {
         const detail = try std.fmt.allocPrint(
             self.gpa,
             "{s} fetches {s} while it builds, over port {d}. The build is {s}.",
-            .{ one.derivation, one.url, one.port, self.installable },
+            .{ one.subject, one.url, one.port, self.installable },
         );
         defer self.gpa.free(detail);
 
@@ -11230,7 +11426,7 @@ const NixFetchGate = struct {
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s} while it builds. {s}",
-            .{ one.derivation, one.url, one.host, said },
+            .{ one.subject, one.url, one.host, said },
         ) };
     }
 };
@@ -11387,6 +11583,10 @@ const NixBuildToolRunner = struct {
             .text = try chock_nix.build.requestRefusal(gpa, err),
             .refused = true,
         };
+        if (!isWorkspaceFlake(settings.workspace_root, flake_ref)) return .{
+            .text = try foreignFlakeRefusal(gpa, flake_ref),
+            .refused = true,
+        };
 
         const installable = try chock_nix.build.installableFor(self.arena, flake_ref, attr_path);
         const expression = try chock_nix.build.expressionFor(self.arena, flake_ref, attr_path);
@@ -11428,6 +11628,11 @@ const NixBuildToolRunner = struct {
         var writing = chock_nix.build.Writing{
             .writer = store_writer.writer(),
             .budget = &self.budget,
+            // What stops fix fetching a flake input for itself: it takes a
+            // locked input out of the store when the store says the path is
+            // valid, and these are the paths this session fetched under the
+            // policy before it started. See `chock_nix.inputs`.
+            .fetched_paths = settings.inputs.store_paths,
         };
         driver.seam = writing.seam();
 
@@ -11506,6 +11711,10 @@ const NixBuildToolRunner = struct {
             // What puts the derivation in the produced set, which is the one
             // thing that can authorise a build of it.
             .store_writes = true,
+            // A build names an attribute of a flake, so `builtins.getFlake`
+            // has to work. `network` stays off, so the inputs of that flake
+            // come out of the store and never off a connection fix opened.
+            .flakes = true,
         }) catch |err| return .{ .refused = try std.fmt.allocPrint(
             gpa,
             "the evaluator could not be started ({t}), so nothing was built.",
@@ -11517,7 +11726,7 @@ const NixBuildToolRunner = struct {
         defer gpa.free(buffer);
 
         const answer = session.answer(buffer, expression) catch |err| return .{
-            .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            .refused = try nixBuildRefusal(gpa, &session, driver, settings, installable, expression, err),
         };
 
         const drv_path = answer.derivation_path orelse return .{ .refused = try std.fmt.allocPrint(
@@ -11528,7 +11737,7 @@ const NixBuildToolRunner = struct {
         ) };
 
         session.ensureDerivation(drv_path) catch |err| return .{
-            .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            .refused = try nixBuildRefusal(gpa, &session, driver, settings, installable, expression, err),
         };
 
         return .{ .found = try self.arena.dupe(u8, drv_path) };
@@ -11611,6 +11820,37 @@ const NixBuildToolRunner = struct {
     }
 };
 
+/// True when `flake_ref` is the workspace this session's tool calls work in,
+/// or a directory under it.
+fn isWorkspaceFlake(workspace_root: []const u8, flake_ref: []const u8) bool {
+    if (!std.mem.startsWith(u8, flake_ref, workspace_root)) return false;
+    const rest = flake_ref[workspace_root.len..];
+    return rest.len == 0 or rest[0] == '/';
+}
+
+/// What a `nix_build` that names another flake is told.
+///
+/// **A reference that is not this project is refused, and that is a decision
+/// rather than a gap.** Fetching it means fetching its whole input graph, and
+/// what that graph reaches is written in a lock file inside the flake, which
+/// cannot be read until the flake has already been fetched. So there is no
+/// moment at which the policy could be asked about those hosts first, and one
+/// question about the reference standing for every host under it is exactly
+/// the widening `lib/chock-nix/fetch.zig` refuses to make for a build.
+fn foreignFlakeRefusal(
+    gpa: std.mem.Allocator,
+    flake_ref: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "nothing was built: {s} is not the project you are working in, and it would have to be " ++
+            "fetched before it could be evaluated. This session fetches no flake but this " ++
+            "project's own. Leave \"flake\" out to build an attribute of the project, or add " ++
+            "what you need to its flake inputs and ask the user to run it again.",
+        .{flake_ref},
+    );
+}
+
 /// What the model is told about a build that happened.
 fn builtText(
     gpa: std.mem.Allocator,
@@ -11662,6 +11902,7 @@ fn nixBuildRefusal(
     gpa: std.mem.Allocator,
     session: *chock_nix.eval.Session,
     driver: *chock_nix.backend.Driver,
+    settings: NixBuild,
     installable: []const u8,
     expression: []const u8,
     err: anyerror,
@@ -11669,6 +11910,21 @@ fn nixBuildRefusal(
     // The store faults are the evaluation's own and the driver records none
     // of them, so they are read before its last refusal rather than after.
     if (try chock_nix.build.writeRefusal(gpa, installable, err)) |said| return said;
+
+    // **The one fault that names nothing by itself.** The evaluator has no
+    // fetcher, so an input that is not in the store stops here with an error
+    // that says only that. What the session knows is why the inputs are not
+    // there and where they would have come from, so that is what the model
+    // reads. See `chock_nix.inputs`.
+    if (err == error.FetchIoUnavailable) return chock_nix.inputs.missingRefusal(
+        gpa,
+        installable,
+        if (settings.inputs.missing.len != 0)
+            settings.inputs.missing
+        else
+            "this project's flake.lock does not pin it, so it was never fetched",
+        settings.inputs.wanted,
+    );
 
     if (driver.lastError()) |said| return std.fmt.allocPrint(
         gpa,
@@ -17630,7 +17886,7 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
     };
 
     const said = (try gate.gate().permit(arena, .{
-        .derivation = "b-src.drv",
+        .subject = "b-src.drv",
         .url = "https://files.example.com/src.tar.gz",
         .host = "files.example.com",
         .port = 443,
@@ -17645,7 +17901,7 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
     // falls under the class an author wrote and never over it, so a rule for
     // `net.connect.com.example.*` does not cover this one.
     const hostile = (try gate.gate().permit(arena, .{
-        .derivation = "c-src.drv",
+        .subject = "c-src.drv",
         .url = "https://evil.com.example.files/x",
         .host = "evil.com.example.files",
         .port = 443,
@@ -17657,13 +17913,124 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
 
     // A host no rule could ever have named is refused, and never reached.
     const unnameable = (try gate.gate().permit(arena, .{
-        .derivation = "d-src.drv",
+        .subject = "d-src.drv",
         .url = "https://a_b/x",
         .host = "a_b",
         .port = 443,
     })).refused;
     try std.testing.expect(std.mem.indexOf(u8, unnameable, "net.connect") == null);
     try std.testing.expect(std.mem.indexOf(u8, unnameable, "d-src.drv") != null);
+}
+
+test "a flake input host is asked of the policy table at startup, and ask is off there" {
+    // **The same egress namespace a build's own fetches are asked under.**
+    // There is nobody to prompt while a session is starting up, so only
+    // `allow` fetches: the same rule `languageServerPermitted` keeps.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const allowing = try chock_policy.table.Table.parse(
+        arena,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.connect.com.github.api.443", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+    var gate = StartupFetchGate{
+        .policy = allowing,
+        .chain = &.{"agent"},
+        .agent_kind = "agent",
+        .model = "test-model",
+    };
+    const wanted = chock_nix.fetch.Fetch{
+        .subject = "nixpkgs",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    };
+    try std.testing.expect(try gate.gate().permit(arena, wanted) == .permitted);
+
+    // A host the table says nothing about answers `ask`, and `ask` is off at
+    // startup. The words name the input, the host and the action, because the
+    // person who can change the rule is the one who reads them.
+    const quiet = try chock_policy.table.Table.parse(arena, ".{}", null);
+    var silent = StartupFetchGate{
+        .policy = quiet,
+        .chain = &.{"agent"},
+        .agent_kind = "agent",
+        .model = "test-model",
+    };
+    const said = (try silent.gate().permit(arena, wanted)).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+}
+
+test "a session whose inputs never arrived still builds, and the refusal names the input and the host" {
+    // **A session start refuses nothing because an optional thing was
+    // missing**, so what is owed instead is a later failure somebody can act
+    // on. The evaluator has no fetcher, so a missing input stops with
+    // `FetchIoUnavailable`, which names nothing by itself.
+    const gpa = std.testing.allocator;
+
+    const wanted = [_]chock_nix.fetch.Fetch{.{
+        .subject = "nixpkgs",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    }};
+    const settings = NixBuild{
+        .workspace_root = "/work",
+        .caps = .{ .max_object_bytes = 1 << 20, .max_session_bytes = 1 << 20 },
+        .nix_program = "/nix/store/aaa-nix/bin/nix",
+        .nix_store_program = null,
+        .root_dir = null,
+        .store_endpoint = chock_nix.build.default_daemon_socket,
+        .inputs = .{
+            .missing = "this project's policy answers ask for net.connect.com.github.api.443",
+            .wanted = &wanted,
+        },
+    };
+
+    var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
+    defer driver.deinit();
+    var session = try chock_nix.eval.Session.init(gpa, .{});
+    defer session.deinit();
+
+    const said = try nixBuildRefusal(
+        gpa,
+        &session,
+        &driver,
+        settings,
+        "/work#packages.x86_64-linux.default",
+        "(builtins.getFlake \"/work\")",
+        error.FetchIoUnavailable,
+    );
+    defer gpa.free(said);
+
+    try std.testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+}
+
+test "nix_build builds this project and refuses a flake reference that is not it" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expect(isWorkspaceFlake("/work", "/work"));
+    try std.testing.expect(isWorkspaceFlake("/work", "/work/sub"));
+    try std.testing.expect(!isWorkspaceFlake("/work", "/workspace"));
+    try std.testing.expect(!isWorkspaceFlake("/work", "github:NixOS/nixpkgs"));
+
+    const said = try foreignFlakeRefusal(gpa, "github:NixOS/nixpkgs");
+    defer gpa.free(said);
+    try std.testing.expect(std.mem.indexOf(u8, said, "github:NixOS/nixpkgs") != null);
 }
 
 test "a program out of a build asks under exec.nix.store, and the dev shell's own still asks under exec.devshell" {

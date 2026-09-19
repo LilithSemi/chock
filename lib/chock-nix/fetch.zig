@@ -66,9 +66,10 @@ pub const Error = provision.Error;
 
 /// One host a build would reach.
 pub const Fetch = struct {
-    /// The derivation that fetches it. Part of every refusal, because a
-    /// person reading one wants to know which input asked for the host.
-    derivation: []const u8,
+    /// What asked for the host: the derivation that fetches it, or the
+    /// input a lock names. Part of every refusal, because a person reading one
+    /// wants to know what asked.
+    subject: []const u8,
     url: []const u8,
     host: []const u8,
     port: u16,
@@ -77,7 +78,7 @@ pub const Fetch = struct {
 /// A URL of a fixed output derivation that could not be turned into a host
 /// and a port.
 pub const Unreadable = struct {
-    derivation: []const u8,
+    subject: []const u8,
     /// Empty when the derivation carried no URL at all.
     url: []const u8,
     why: Why,
@@ -199,14 +200,14 @@ pub fn fetchesOf(
 
         const name = try allocator.dupe(u8, entry.key_ptr.*);
         const urls = try urlsOf(allocator, one.object) orelse return .{ .unreadable = .{
-            .derivation = name,
+            .subject = name,
             .url = "",
             .why = .no_url,
         } };
 
         for (urls) |url| {
             const target = targetOf(url) catch |err| return .{ .unreadable = .{
-                .derivation = name,
+                .subject = name,
                 .url = try allocator.dupe(u8, url),
                 .why = switch (err) {
                     error.UrlSchemeUnknown => .scheme_unknown,
@@ -222,7 +223,7 @@ pub fn fetchesOf(
             );
             if ((try seen.getOrPut(allocator, key)).found_existing) continue;
             try fetches.append(allocator, .{
-                .derivation = name,
+                .subject = name,
                 .url = try allocator.dupe(u8, url),
                 .host = try allocator.dupe(u8, target.host),
                 .port = target.port,
@@ -323,24 +324,24 @@ pub fn unreadableRefusal(
             allocator,
             "{s} fetches over the network and says nowhere it fetches from, so no rule can " ++
                 "cover it and nothing was built.",
-            .{one.derivation},
+            .{one.subject},
         ),
         .scheme_unknown => std.fmt.allocPrint(
             allocator,
             "{s} fetches {s}, and that is not a scheme this reads. Only http and https can be " ++
                 "named as a host and a port, so nothing was built. Use an input that fetches " ++
                 "over https.",
-            .{ one.derivation, one.url },
+            .{ one.subject, one.url },
         ),
         .no_host => std.fmt.allocPrint(
             allocator,
             "{s} fetches {s}, which names no host this can put to a rule, so nothing was built.",
-            .{ one.derivation, one.url },
+            .{ one.subject, one.url },
         ),
         .port_not_a_port => std.fmt.allocPrint(
             allocator,
             "{s} fetches {s}, whose port is not a port, so nothing was built.",
-            .{ one.derivation, one.url },
+            .{ one.subject, one.url },
         ),
     };
 }
@@ -505,7 +506,7 @@ test "a closure that holds a fixed output derivation answers its host and its po
     try testing.expectEqual(@as(usize, 1), closure.fetches.len);
     try testing.expectEqualStrings("files.example.com", closure.fetches[0].host);
     try testing.expectEqual(@as(u16, 443), closure.fetches[0].port);
-    try testing.expectEqualStrings("b-src.drv", closure.fetches[0].derivation);
+    try testing.expectEqualStrings("b-src.drv", closure.fetches[0].subject);
 
     // The whole closure and not the one derivation, so an input that fetches
     // is found however deep it is.
@@ -649,7 +650,7 @@ test "a nix that would not read the closure answers its own last line" {
 
 test "the gate a caller wired none of permits nothing" {
     const answer = try Gate.refusing.permit(testing.allocator, .{
-        .derivation = "a.drv",
+        .subject = "a.drv",
         .url = "https://example.com/a",
         .host = "example.com",
         .port = 443,

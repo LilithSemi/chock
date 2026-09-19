@@ -7,6 +7,13 @@
 //! looked up: see this file's own test. What needs the host is a build, and a
 //! build is brokered rather than done here.
 //!
+//! **The evaluator has no fetcher, whatever io a caller passes.** fix can
+//! download a flake input over a connection of its own, and no rule of this
+//! project would see it, so `Options.io` reaches the file reader and the
+//! store and never the fetcher. A flake input is fetched on the host first,
+//! where the policy answers, and the evaluation reads it out of the store:
+//! see `lib/chock-nix/inputs.zig`.
+//!
 //! **Pure evaluation is the default, and the roots are the flake's own source
 //! tree.** Impure evaluation reads the environment and any path on the
 //! machine, which is the whole surface Chock exists to close, so a caller
@@ -51,6 +58,22 @@ pub const Options = struct {
     /// engine that evaluates but reads nothing, which every caller that only
     /// computes wants.
     io: ?std.Io = null,
+    /// Whether the evaluator may open a connection of its own.
+    ///
+    /// **Off, and it stays off.** fix has a fetcher, and an expression that
+    /// reaches it would fetch over a socket no rule of this project ever saw.
+    /// So the `io` above reaches the file reader and the store and never the
+    /// fetcher, and a fetch answers `FetchIoUnavailable` instead. What a flake
+    /// really needs is fetched on the host first, where the policy answers:
+    /// see `lib/chock-nix/inputs.zig`.
+    network: bool = false,
+    /// Whether `builtins.getFlake` works.
+    ///
+    /// **Off, because most expressions are not a flake.** fix keeps flakes
+    /// behind the same experimental feature Nix does, so a caller that
+    /// evaluates an attribute of a flake says so. An evaluation with this off
+    /// answers `MissingExperimentalFeature` for `builtins.getFlake`.
+    flakes: bool = false,
     /// Where a store operation goes, or null for an engine with no store
     /// behind it at all. See `chock-nix/backend.zig`: a driver over a
     /// refusing seam answers every store question with a refusal that names
@@ -94,10 +117,21 @@ pub const Session = struct {
         // that `configureLanguage` replaces whole.
         var language = engine.languagePolicy();
         language.max_call_depth = options.max_call_depth;
+        language.flakes_enabled = options.flakes;
+        language.fetch_tree_enabled = options.flakes;
         engine.configureLanguage(language);
 
         engine.configureMemory(options.gc_budget_bytes, null, false);
-        if (options.io) |io| engine.setFileIo(io);
+        if (options.io) |io| {
+            if (options.network) {
+                engine.setFileIo(io);
+            } else {
+                // The file reader and the store, and never the fetcher. See
+                // `Options.network`.
+                engine.sources.files.setIo(io);
+                engine.store.realization.setIo(io);
+            }
+        }
         if (options.store_backend) |driver| try engine.setStoreBackend(driver);
         if (options.store_writes) engine.enableStoreWrites();
         try engine.setPureEval(options.pure, options.roots);
@@ -256,4 +290,28 @@ test "a derivation answers its path beside the rendered value, and an ordinary v
 
     const plain = try session.answer(&buffer, "{ a = 1; }");
     try testing.expectEqual(@as(?[]const u8, null), plain.derivation_path);
+}
+
+test "an evaluation cannot reach a flake until a caller asks for one" {
+    var buffer: [256]u8 = undefined;
+    var session = try Session.init(testing.allocator, .{ .io = testing.io });
+    defer session.deinit();
+    try testing.expectError(
+        error.MissingExperimentalFeature,
+        session.evaluate(&buffer, "builtins.getFlake \"/work\""),
+    );
+}
+
+test "an evaluation with a flake cannot open a connection of its own" {
+    var buffer: [256]u8 = undefined;
+
+    // The whole of the wall. fix has a fetcher, this session gives it no io,
+    // and a flake reference that would be downloaded stops here rather than
+    // reaching a host nobody was asked about.
+    var session = try Session.init(testing.allocator, .{ .io = testing.io, .flakes = true });
+    defer session.deinit();
+    try testing.expectError(
+        error.FetchIoUnavailable,
+        session.evaluate(&buffer, "builtins.getFlake \"github:NixOS/nixpkgs\""),
+    );
 }
