@@ -115,6 +115,19 @@ pub fn installableFor(
     return std.fmt.allocPrint(allocator, "{s}#{s}", .{ registry, program });
 }
 
+/// One variable added to the environment of the `nix` this library runs.
+///
+/// **What makes an answer about a fetch true rather than advisory.** A
+/// nixpkgs `fetchurl` builder reads `NIX_MIRRORS_<site>` and
+/// `NIX_HASHED_MIRRORS` out of the environment `nix` itself runs with,
+/// because both are in the derivation's own `impureEnvVars`. So a mirror the
+/// policy allowed can be pinned there, and the builder cannot walk its own
+/// list past it. See `lib/chock-nix/fetch.zig`.
+pub const Variable = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// What runs `nix`.
 ///
 /// **A seam, because the thing on the other side of it is the Nix daemon.**
@@ -127,13 +140,15 @@ pub const Runner = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Run `nix` with these arguments and answer what it produced. The
-        /// output is owned by `allocator`.
+        /// Run `nix` with these arguments and these variables on top of its
+        /// own environment, and answer what it produced. The output is owned
+        /// by `allocator`.
         run: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
             io: std.Io,
             args: []const []const u8,
+            pins: []const Variable,
         ) Error!proc.Output,
     };
 
@@ -143,7 +158,19 @@ pub const Runner = struct {
         io: std.Io,
         args: []const []const u8,
     ) Error!proc.Output {
-        return self.vtable.run(self.ptr, allocator, io, args);
+        return self.vtable.run(self.ptr, allocator, io, args, &.{});
+    }
+
+    /// Run `nix` with `pins` in its environment. Every other variable is the
+    /// runner's own, and a pin with the name of one of those replaces it.
+    pub fn runPinned(
+        self: Runner,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        args: []const []const u8,
+        pins: []const Variable,
+    ) Error!proc.Output {
+        return self.vtable.run(self.ptr, allocator, io, args, pins);
     }
 };
 
@@ -177,6 +204,7 @@ pub const Host = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         args: []const []const u8,
+        pins: []const Variable,
     ) Error!proc.Output {
         const self: *Host = @ptrCast(@alignCast(ptr));
 
@@ -190,9 +218,19 @@ pub const Host = struct {
         try argv.append(allocator, self.nix_program);
         try argv.appendSlice(allocator, args);
 
+        // The host's own environment stays whole, so `nix` still reads the
+        // user's configuration and registry. A pin is added on top of it and
+        // lives only as long as this one call.
+        var pinned: ?std.process.Environ.Map = if (pins.len == 0) null else try pinnedEnv(
+            allocator,
+            self.env,
+            pins,
+        );
+        defer if (pinned) |*one| one.deinit();
+
         return proc.run(allocator, io, .{
             .argv = argv.items,
-            .env = self.env,
+            .env = if (pinned) |*one| one else self.env,
             // The same bound `store.closureOf` gives its own `nix path-info`:
             // a closure of thirty thousand paths is far below this, and a
             // `nix` that writes without end must not take the session's
@@ -208,6 +246,20 @@ pub const Host = struct {
         };
     }
 };
+
+/// A copy of `base` with `pins` written over it. The caller owns it and frees
+/// it with `deinit`.
+fn pinnedEnv(
+    allocator: std.mem.Allocator,
+    base: *const std.process.Environ.Map,
+    pins: []const Variable,
+) std.mem.Allocator.Error!std.process.Environ.Map {
+    var copy = std.process.Environ.Map.init(allocator);
+    errdefer copy.deinit();
+    for (base.keys(), base.values()) |name, value| try copy.put(name, value);
+    for (pins) |one| try copy.put(one.name, one.value);
+    return copy;
+}
 
 /// One program to provision.
 pub const Request = struct {
@@ -298,6 +350,47 @@ pub fn resolve(
         ) };
     }
 
+    var said: []const u8 = "";
+    const mounts = try mountsFor(allocator, io, runner, out_paths, &said) orelse {
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} was built and what it needs could not be read, so it was not added to the " ++
+                "toolchain. Nix said: {s}",
+            .{ installable, said },
+        ) };
+    };
+
+    return .{ .provided = .{
+        .program = request.program,
+        .installable = installable,
+        .bin_dirs = mounts.bin_dirs,
+        .store_paths = mounts.store_paths,
+    } };
+}
+
+/// What a sandbox has to mount for a set of build outputs, and what goes on
+/// the `PATH` beside it.
+pub const Mounts = struct {
+    bin_dirs: []const []const u8,
+    store_paths: []const []const u8,
+};
+
+/// The transitive closure of `out_paths`, and one `bin` directory per output.
+///
+/// **The outputs alone are not a mount set**: a program needs its dynamic
+/// linker, its libc, and every library those pull in. `lib/chock-nix/store.zig`
+/// says this at length.
+///
+/// Null when `nix path-info` itself refused, with the line it wrote left in
+/// `said`, so the caller writes a sentence in the words of what it was asking
+/// for. Every string comes from `allocator`.
+pub fn mountsFor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runner: Runner,
+    out_paths: []const []const u8,
+    said: *[]const u8,
+) Error!?Mounts {
     var closure_args: std.ArrayList([]const u8) = .empty;
     defer closure_args.deinit(allocator);
     try closure_args.appendSlice(allocator, &.{ "path-info", "-r", "--" });
@@ -305,27 +398,19 @@ pub fn resolve(
 
     const listed = try runner.run(allocator, io, closure_args.items);
     if (!listed.succeeded()) {
-        return .{ .refused = try std.fmt.allocPrint(
-            allocator,
-            "{s} was built and what it needs could not be read, so it was not added to the " ++
-                "toolchain. Nix said: {s}",
-            .{ installable, lastLine(listed.stderr) },
-        ) };
+        said.* = lastLine(listed.stderr);
+        return null;
     }
-
-    const closure = try store.parsePathList(allocator, listed.stdout);
 
     const bin_dirs = try allocator.alloc([]const u8, out_paths.len);
     for (out_paths, bin_dirs) |path, *slot| {
         slot.* = try std.fmt.allocPrint(allocator, "{s}/bin", .{path});
     }
 
-    return .{ .provided = .{
-        .program = request.program,
-        .installable = installable,
+    return .{
         .bin_dirs = bin_dirs,
-        .store_paths = closure,
-    } };
+        .store_paths = try store.parsePathList(allocator, listed.stdout),
+    };
 }
 
 /// One sentence for a name this file refuses before it builds anything.
@@ -453,7 +538,7 @@ fn suggestionIn(stderr: []const u8) []const u8 {
 }
 
 /// True when Nix could not reach its daemon.
-fn saysNoDaemon(stderr: []const u8) bool {
+pub fn saysNoDaemon(stderr: []const u8) bool {
     const spellings = [_][]const u8{
         "cannot connect to socket",
         "cannot open connection to remote store",
@@ -467,7 +552,7 @@ fn saysNoDaemon(stderr: []const u8) bool {
 }
 
 /// True when Nix could not fetch what it needed.
-fn saysNoNetwork(stderr: []const u8) bool {
+pub fn saysNoNetwork(stderr: []const u8) bool {
     const spellings = [_][]const u8{
         "unable to download",
         "Temporary failure in name resolution",
@@ -487,7 +572,7 @@ pub const max_raw_bytes: usize = 400;
 /// The last line that says anything, bounded at `max_raw_bytes`. Nix writes
 /// its own message last and its trace before it, so this is the line a person
 /// reads first.
-fn lastLine(stderr: []const u8) []const u8 {
+pub fn lastLine(stderr: []const u8) []const u8 {
     var found: []const u8 = "nothing";
     var lines = std.mem.splitScalar(u8, stderr, '\n');
     while (lines.next()) |raw| {
@@ -513,6 +598,9 @@ const FakeRunner = struct {
     seen: std.ArrayList([]const []const u8) = .empty,
     gpa: std.mem.Allocator,
     calls: usize = 0,
+    /// How many variables the last call pinned, which is what a test reads to
+    /// see that a caller that pins nothing really pins nothing.
+    last_pins: usize = 0,
 
     const Reply = struct {
         code: u8 = 0,
@@ -531,10 +619,12 @@ const FakeRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         args: []const []const u8,
+        pins: []const Variable,
     ) Error!proc.Output {
         _ = io;
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
         std.debug.assert(self.calls < self.replies.len);
+        self.last_pins = pins.len;
 
         const copy = try self.gpa.alloc([]const u8, args.len);
         for (args, copy) |from, *to| to.* = try self.gpa.dupe(u8, from);

@@ -880,6 +880,13 @@ const Started = struct {
     /// null when it cannot. See `provisioningFor`, which says out loud why a
     /// session has none.
     provisioning: ?Provisioning,
+    /// What this session needs to build a Nix attribute on the host, or null
+    /// when it cannot. See `nixBuildFor`.
+    nix_build: ?NixBuild,
+    /// How much a Nix evaluation of this session may put in the store, from
+    /// the `nix` block of `chock.zon`, the operator's own `config.zon`, and
+    /// the org policy bundle's ceiling. See `resolveNixCaps`.
+    nix_caps: chock_policy.nix.Resolved,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
     /// The base URL and the credential of the instance this session talks to.
@@ -1742,12 +1749,35 @@ fn start(
     // yet is exactly the one somebody wants to move to a daemon.
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
 
+    // The policy table, read once, at the start, under whatever this
+    // installation's organisation put above it. **Before the dev shell**,
+    // because the dev shell is an evaluation of the project's flake and an
+    // evaluation of a flake fetches its inputs: the table is what answers for
+    // the hosts they come from.
+    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
+
     // The project's own toolchain. Two things come out of one evaluation: the
     // environment every tool call runs with, and the store paths the sandbox
     // mounts for it. After the banner, because an evaluation is the slowest
     // thing a session start does and a user watching it should already know
     // which session is waiting.
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
+
+    // The project's flake inputs, fetched once, on the host, under the same
+    // rule a build's own fetches go under. **Before the dev shell and before
+    // the first evaluation of anything**, because everything after this reads
+    // them out of the store rather than reaching for them itself. See
+    // `lib/chock-nix/inputs.zig`.
+    const flake_inputs = fetchFlakeInputs(
+        arena,
+        io,
+        env,
+        policy,
+        project_root,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+    );
 
     // **The image is read first, and a project that names one never evaluates
     // a dev shell.** A `flake.nix` is a file a project may have for its own
@@ -1811,10 +1841,6 @@ fn start(
         0
     else
         try handleUncommitted(gpa, io, env, &workspace, options);
-
-    // The policy table, read once, at the start, under whatever this
-    // installation's organisation put above it.
-    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
 
     // Whether the write and execute rule is on for this session, and the log
     // line that says which it was. **The one setting on the table that widens**,
@@ -2094,11 +2120,35 @@ fn start(
         dev_shell_dir,
     );
 
+    // What a Nix evaluation of this session may put in the store. Read here,
+    // beside provisioning, because both are answers about Nix that the tool
+    // list depends on.
+    const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
+
+    // Beside provisioning and the caps, for the same reason: it is an answer
+    // about Nix that the tool list depends on.
+    const nix_build = nixBuildFor(
+        arena,
+        io,
+        env,
+        dev_shell_dir,
+        workspace.workPath(),
+        nix_caps,
+        flake_inputs,
+    );
+
     const support = chock_core.tools.Support{
         .adapter = adapter,
         .provider = .{ .images = instance.capabilities.images },
         .memory = memory_ready,
         .provisioning = provisioning != null,
+        .nix_build = nix_build != null,
+        // **Always true, and that is the whole of the gate.** An evaluation
+        // runs in this process, through fix, so it needs no `nix` binary, no
+        // daemon and no store: see `lib/chock-nix/eval.zig`. A session that
+        // cannot provision can still evaluate, which is the shape a project
+        // whose policy denies `nix.build` has.
+        .nix_eval = true,
         // A reviewer is offered no tool at all, so the list below comes back
         // empty and the prompt names none: see `agentRole`.
         .role = agentRole(options),
@@ -2178,6 +2228,8 @@ fn start(
         .toolchain = toolchain,
         .tool_env = tool_env,
         .provisioning = provisioning,
+        .nix_build = nix_build,
+        .nix_caps = nix_caps,
         .backing = backing,
         .storage = storage,
         .base_url = instance.base_url,
@@ -2996,6 +3048,55 @@ fn resolveLimits(
 fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
     config.limits.processes = resolved.processes;
     config.limits.memory_bytes = resolved.memory_bytes;
+}
+
+/// How much a Nix evaluation of this session may put in the store: the `nix`
+/// block of `chock.zon`, over the operator's own `config.zon`, over the built
+/// in default, held last under the org policy bundle's ceiling. The same
+/// shape `resolveLimits` above has, and the same three layers.
+///
+/// `max_object_bytes` lands on `chock_nix.backend.Driver.max_object_bytes`
+/// through `applyNixCaps`, and `max_session_bytes` on
+/// `NixBuildToolRunner.budget`, which every build of the session spends
+/// against.
+fn resolveNixCaps(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    config_dir: []const u8,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) StartError!chock_policy.nix.Resolved {
+    var diag: ?chock_policy.nix.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    // One diagnostic slot serves both files, the same way `resolveLimits`
+    // uses one: it carries which of the two it is about.
+    const project = chock_policy.nix.load(arena, io, project_root, &diag) catch |err|
+        return reportNixCaps(err, &diag);
+    const operator = chock_policy.nix.loadOperator(arena, io, config_dir, &diag) catch |err|
+        return reportNixCaps(err, &diag);
+
+    const ceiling = if (org_bundle) |bundle| bundle.nix else null;
+    return chock_policy.nix.foldLayers(project, operator, ceiling);
+}
+
+/// `resolved` written into the driver an evaluation answers through.
+fn applyNixCaps(driver: *chock_nix.backend.Driver, resolved: chock_policy.nix.Resolved) void {
+    driver.max_object_bytes = std.math.cast(usize, resolved.max_object_bytes) orelse
+        std.math.maxInt(usize);
+}
+
+/// The one message a refused `nix` block writes. The session does not start,
+/// for the reason `reportLimits` gives: a number that does not parse is one
+/// somebody wrote on purpose.
+fn reportNixCaps(err: anyerror, diag: *?chock_policy.nix.Diagnostic) StartError {
+    if (err == error.OutOfMemory) return error.OutOfMemory;
+    if (diag.*) |*d| {
+        tty.print(.err, "chock run: the nix block could not be read: {f}\n", .{d});
+    } else {
+        tty.print(.err, "chock run: the nix block could not be read: {t}\n", .{err});
+    }
+    return error.Reported;
 }
 
 /// The one message a refused `limits` block writes. The session does not
@@ -4840,6 +4941,187 @@ fn applyModeFor(
     return .{ .mode = bounded, .decision = decision, .asked_for = settings.mode };
 }
 
+/// Everything a later build needs to know about this project's flake inputs.
+const FlakeInputs = struct {
+    /// Every store path the fetch put there, empty when nothing was fetched.
+    /// `chock_nix.build.Writing` answers `is_valid_path` from this, which is
+    /// what stops the evaluator fetching an input for itself.
+    store_paths: []const []const u8 = &.{},
+    /// Why they are not there, empty when they are. A build that then wants
+    /// one reads this sentence rather than a fault nobody can act on.
+    missing: []const u8 = "",
+    /// What the lock said the fetch would reach, so a refusal can name the
+    /// input and the host. Empty when the lock named nothing.
+    wanted: []const chock_nix.fetch.Fetch = &.{},
+};
+
+/// Who answers for a host this project's flake inputs would be fetched from.
+///
+/// **The policy table and nobody else.** A session is starting up, so there is
+/// nobody to prompt, and `ask` is off here for the reason
+/// `languageServerPermitted` states: a question with no one to answer it is a
+/// question that times out. The action name is the ordinary `net.connect` one,
+/// from `chock_broker.network.actionInto`, which is the same namespace a
+/// build's own fetches are asked under. There is no second namespace for a
+/// fetch.
+const StartupFetchGate = struct {
+    policy: *const chock_policy.table.Table,
+    chain: []const []const u8,
+    agent_kind: []const u8,
+    model: []const u8,
+
+    fn gate(self: *StartupFetchGate) chock_nix.fetch.Gate {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_nix.fetch.Gate.VTable{
+        .permit = permitFn,
+        .allows_by_rule = allowsByRuleFn,
+    };
+
+    fn permitFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        one: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return .{ .refused = try std.fmt.allocPrint(
+                allocator,
+                "{s} would be fetched from \"{s}\", which is not a host name a rule can be " ++
+                    "written for",
+                .{ one.subject, one.host },
+            ) };
+
+        const decision = self.decisionFor(action);
+        if (decision == .allow) return .permitted;
+
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "the input {s} comes from {s}, and this project's policy answers {t} for {s}.",
+            .{ one.subject, one.host, decision, action },
+        ) };
+    }
+
+    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+        const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return false;
+        return self.decisionFor(action) == .allow;
+    }
+
+    fn decisionFor(
+        self: *const StartupFetchGate,
+        action: []const u8,
+    ) chock_policy.table.Decision {
+        var fault: ?chock_policy.table.ChainFault = null;
+        const decision = self.policy.evaluateChain(self.chain, .{
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = @tagName(chock_core.tools.Tool.nix_build),
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        return decision;
+    }
+};
+
+/// Fetch this project's flake inputs into the host store, once, before
+/// anything evaluates.
+///
+/// **A session whose inputs did not arrive still starts.** Nothing else a
+/// session start does refuses the session because an optional thing was
+/// missing, and a project with no flake at all is the ordinary case. The
+/// reason is kept instead, and a build that later wants an input reads it.
+fn fetchFlakeInputs(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    policy: *const chock_policy.table.Table,
+    project_root: []const u8,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+) FlakeInputs {
+    const lock_bytes = readProjectLock(arena, io, project_root) orelse return .{};
+
+    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch return .{
+        .missing = "nix is not on this machine's PATH, so no flake input was fetched",
+    };
+
+    // The chain `evaluateChain` wants is the parents and this session, in that
+    // order. The same shape `provisionDecision` builds, and for the same
+    // reason: a session cannot state its own parents.
+    const chain = arena.alloc([]const u8, chain_links.len + 1) catch return .{
+        .missing = "this session ran out of memory before its flake inputs were fetched",
+    };
+    for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain_links.len] = agent_kind;
+
+    const wanted = switch (chock_nix.inputs.wantsOf(arena, lock_bytes) catch return .{}) {
+        .hosts => |list| list,
+        else => &.{},
+    };
+
+    var gate = StartupFetchGate{
+        .policy = policy,
+        .chain = chain,
+        .agent_kind = agent_kind,
+        .model = model,
+    };
+    var diag: ?chock_nix.Diagnostic = null;
+    var host = chock_nix.provision.Host{ .nix_program = nix_program, .env = env, .diag = &diag };
+
+    const answer = chock_nix.inputs.fetchAll(
+        arena,
+        io,
+        host.runner(),
+        gate.gate(),
+        project_root,
+        lock_bytes,
+    ) catch {
+        if (diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+        return .{
+            .wanted = wanted,
+            .missing = "the flake inputs could not be fetched, because nix could not be run",
+        };
+    };
+
+    switch (answer) {
+        .fetched => |paths| {
+            if (paths.len != 0) {
+                tty.detail("chock: {d} flake input paths are in the store\n", .{paths.len});
+            }
+            return .{ .store_paths = paths, .wanted = wanted };
+        },
+        .refused => |why| {
+            // Said out loud, because a session that starts without its inputs
+            // builds nothing that needs one, and the user is the person who
+            // can change the rule.
+            tty.print(.warn, "chock: {s}\n", .{why});
+            return .{ .missing = why, .wanted = wanted };
+        },
+    }
+}
+
+/// This project's `flake.lock`, or null when it has none.
+///
+/// **A file of the project, so it is read as one.** It sits beside
+/// `chock.zon`, and this project reads a file there as something an attacker
+/// may have written: every host it names goes to the policy.
+fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) ?[]const u8 {
+    const path = std.fs.path.join(arena, &.{ project_root, "flake.lock" }) catch return null;
+    return std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(chock_nix.inputs.max_lock_bytes),
+    ) catch null;
+}
+
 fn provisioningFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -6406,6 +6688,11 @@ const GiveLockedToAll = struct {
     /// 2026-09-15: a git subcommand the shim classifies is decided one call at
     /// a time, mid turn, through the same arbiter. See `GitToolRunner`.
     git: *GitToolRunner,
+    /// The Nix build runner. **Fifth party**: a build's closure says which
+    /// hosts it would fetch from only after the attribute is evaluated, which
+    /// happens inside the tool call, so the question is asked mid turn too.
+    /// See `NixFetchGate`.
+    nix: *NixBuildToolRunner,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
         return .{ .ptr = self, .vtable = &vtable };
@@ -6416,26 +6703,29 @@ const GiveLockedToAll = struct {
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
-        giveLockedToAskers(self.mcp, self.plugins, self.git, locked);
+        giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, locked);
     }
 };
 
-/// Hand the handle to the three askers that are not the network broker.
+/// Hand the handle to the four askers that are not the network broker.
 ///
 /// **A free function, so a test can drive the fan out without a `ToolNetwork`,
-/// which needs a whole started session behind it.** All three have to be
+/// which needs a whole started session behind it.** All four have to be
 /// reached from the one seam: one that keeps a null handle asks nobody and
 /// refuses everything it gates, so a half wired fan out is a supplier of tools
-/// that quietly stops working, and a git shim that refuses `git add`.
+/// that quietly stops working, a git shim that refuses `git add`, and a build
+/// that refuses every attribute whose closure fetches.
 fn giveLockedToAskers(
     mcp_session: *chock_core.mcp.Session,
     plugin_session: *chock_core.plugin.Session,
     git_runner: *GitToolRunner,
+    nix_runner: *NixBuildToolRunner,
     locked: *chock_core.arbiter.Locked,
 ) void {
     mcp_session.giveLocked(locked);
     plugin_session.giveLocked(locked);
     git_runner.giveLocked(locked);
+    nix_runner.giveLocked(locked);
 }
 
 /// Write one `network.summary` event, when there is one to write. Best
@@ -10449,26 +10739,9 @@ const ProvisionToolRunner = struct {
     /// the user's own configuration and the user's own flake registry.
     host_env: *const std.process.Environ.Map,
     environ: std.process.Environ,
-    /// The environment a tool call resolves `argv[0]` against. **This is the
-    /// map the sandbox runner holds a pointer to**, so a `PATH` written here
-    /// is the `PATH` the next call resolves against.
-    tool_env: *std.process.Environ.Map,
-    /// The context the sandbox runner dispatches with. `store_paths` is
-    /// repointed at `paths` below every time a program is provisioned.
-    context: *chock_core.tools.Context,
-    /// Every store path this session mounts: the dev shell's, and one
-    /// closure per provisioned program. Grows only.
-    ///
-    /// **Held with no repeats, and that is not tidiness.** A provisioned
-    /// package's closure and the dev shell's overlap almost entirely, because
-    /// both start at the same libc, so appending one whole would bind most of
-    /// the toolchain a second time. `withStore` builds one bind mount and one
-    /// Landlock rule per entry, so a repeat is a mount of the same source on
-    /// the same target, on every tool call, for the rest of the session.
-    paths: std.ArrayList([]const u8) = .empty,
-    /// The membership half of `paths`, so adding a closure of thirty thousand
-    /// entries costs one lookup each rather than a walk of the list each.
-    mounted: std.StringHashMapUnmanaged(void) = .empty,
+    /// What this session mounts and what its `PATH` holds. Shared with
+    /// `NixBuildToolRunner`: see `SessionMounts`.
+    mounts: *SessionMounts,
     /// Every program name already provisioned, so asking twice costs nothing
     /// and says so.
     already: std.ArrayList([]const u8) = .empty,
@@ -10566,7 +10839,7 @@ const ProvisionToolRunner = struct {
         tty.print(.plain, "chock: {s} is in the toolchain, {d} store paths, {d} mounted in all\n", .{
             program,
             provided.store_paths.len,
-            self.paths.items.len,
+            self.mounts.paths.items.len,
         });
 
         return .{
@@ -10582,40 +10855,15 @@ const ProvisionToolRunner = struct {
         };
     }
 
-    /// Take a resolved program into this session's toolchain.
-    ///
-    /// **This is the whole of "the mount set changes while the session is
-    /// live".** Two writes, and both are read by the next tool call and by
-    /// nothing that is already running: the store paths the sandbox binds,
-    /// and the `PATH` `argv[0]` is resolved against. See this type's own doc
-    /// comment for what those two do not reach.
+    /// Take a resolved program into this session's toolchain, and remember
+    /// that this name is now answered.
     fn adopt(
         self: *ProvisionToolRunner,
         program: []const u8,
         provided: chock_nix.provision.Provided,
     ) std.mem.Allocator.Error!void {
-        for (provided.store_paths) |path| try self.mount(path);
-        // The pointer the sandbox runner reads, repointed at the grown list.
-        // A slice of an `ArrayList` is only valid until it grows again, so
-        // this is done after every append and never cached anywhere else.
-        self.context.store_paths = self.paths.items;
-        try self.extendPath(provided.bin_dirs);
+        try self.mounts.adopt(provided);
         try self.already.append(self.arena, try self.arena.dupe(u8, program));
-    }
-
-    /// Add one store path to the mount set, once. See `paths`.
-    fn mount(self: *ProvisionToolRunner, path: []const u8) std.mem.Allocator.Error!void {
-        const entry = try self.mounted.getOrPut(self.arena, path);
-        if (entry.found_existing) return;
-        entry.key_ptr.* = path;
-        try self.paths.append(self.arena, path);
-    }
-
-    /// Take the paths this session starts with: the dev shell's own, or the
-    /// whole store for a project that states no toolchain. Called once, by
-    /// `runSession`, before the first turn.
-    fn start(self: *ProvisionToolRunner, paths: []const []const u8) std.mem.Allocator.Error!void {
-        for (paths) |path| try self.mount(path);
     }
 
     /// Run the two `nix` commands on an `Io` of this call's own. See this
@@ -10698,16 +10946,86 @@ const ProvisionToolRunner = struct {
             }
         };
     }
+};
+
+/// What this session mounts, and what its tool calls resolve `argv[0]`
+/// against.
+///
+/// **One of these per session, and two runners write to it.**
+/// `ProvisionToolRunner` adds a package the model asked for by name, and
+/// `NixBuildToolRunner` adds what a build produced. Each keeping a list of
+/// its own would leave each publishing a slice the other's additions are
+/// missing from, and the last one to write would be the whole mount set.
+///
+/// Everything here is allocated from `arena`, which `runSession` owns and
+/// which ends with the session: a store path the sandbox mounts on the last
+/// turn was allocated on the turn it was adopted.
+const SessionMounts = struct {
+    arena: std.mem.Allocator,
+    /// The context the sandbox runner dispatches with. `store_paths` is
+    /// repointed at `paths` below every time something is adopted.
+    context: *chock_core.tools.Context,
+    /// The environment a tool call resolves `argv[0]` against. **This is the
+    /// map the sandbox runner holds a pointer to**, so a `PATH` written here
+    /// is the `PATH` the next call resolves against.
+    tool_env: *std.process.Environ.Map,
+    /// Every store path this session mounts: the dev shell's, one closure per
+    /// provisioned program, and one per build. Grows only.
+    ///
+    /// **Held with no repeats, and that is not tidiness.** A new package's
+    /// closure and the dev shell's overlap almost entirely, because both start
+    /// at the same libc, so appending one whole would bind most of the
+    /// toolchain a second time. `withStore` builds one bind mount and one
+    /// Landlock rule per entry, so a repeat is a mount of the same source on
+    /// the same target, on every tool call, for the rest of the session.
+    paths: std.ArrayList([]const u8) = .empty,
+    /// The membership half of `paths`, so adding a closure of thirty thousand
+    /// entries costs one lookup each rather than a walk of the list each.
+    mounted: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// Take what Nix produced into this session's toolchain.
+    ///
+    /// **This is the whole of "the mount set changes while the session is
+    /// live".** Two writes, and both are read by the next tool call and by
+    /// nothing that is already running: the store paths the sandbox binds, and
+    /// the `PATH` `argv[0]` is resolved against. See `ProvisionToolRunner`'s
+    /// own doc comment for what those two do not reach.
+    fn adopt(
+        self: *SessionMounts,
+        provided: chock_nix.provision.Provided,
+    ) std.mem.Allocator.Error!void {
+        for (provided.store_paths) |path| try self.mount(path);
+        // The pointer the sandbox runner reads, repointed at the grown list.
+        // A slice of an `ArrayList` is only valid until it grows again, so
+        // this is done after every append and never cached anywhere else.
+        self.context.store_paths = self.paths.items;
+        try self.extendPath(provided.bin_dirs);
+    }
+
+    /// Add one store path to the mount set, once. See `paths`.
+    fn mount(self: *SessionMounts, path: []const u8) std.mem.Allocator.Error!void {
+        const entry = try self.mounted.getOrPut(self.arena, path);
+        if (entry.found_existing) return;
+        entry.key_ptr.* = path;
+        try self.paths.append(self.arena, path);
+    }
+
+    /// Take the paths this session starts with: the dev shell's own, or the
+    /// whole store for a project that states no toolchain. Called once, by
+    /// `runSession`, before the first turn.
+    fn start(self: *SessionMounts, paths: []const []const u8) std.mem.Allocator.Error!void {
+        for (paths) |path| try self.mount(path);
+    }
 
     /// Put `dirs` at the front of the `PATH` a tool call resolves `argv[0]`
     /// against.
     ///
     /// **At the front, so the newest answer wins.** A program that is already
     /// on the path was already found, so the order only decides what happens
-    /// when an agent provisions a package that carries a program the dev shell
-    /// also has. Taking the provisioned one is the honest reading of a request
-    /// that named it.
-    fn extendPath(self: *ProvisionToolRunner, dirs: []const []const u8) std.mem.Allocator.Error!void {
+    /// when an agent adds a package that carries a program the dev shell also
+    /// has. Taking the new one is the honest reading of a request that named
+    /// it.
+    fn extendPath(self: *SessionMounts, dirs: []const []const u8) std.mem.Allocator.Error!void {
         var joined: std.ArrayList(u8) = .empty;
         for (dirs) |dir| {
             try joined.appendSlice(self.arena, dir);
@@ -10750,6 +11068,1119 @@ fn providedRootPrefix(
 const provisioning_is_off = "no program was provisioned: this session cannot add one. Do the " ++
     "work with a program the toolchain already has, and do not run apt, npm, pip, cargo or " ++
     "brew, because none of them can work in this sandbox.";
+
+/// Answers `nix_eval` and passes every other call straight through.
+///
+/// ## Why this is a wrapper and not a tool of the registry
+///
+/// The same reason `ProvisionToolRunner` above is one, from the other side.
+/// `chock_core.tools.Registry` runs one tool call inside a sandbox, and an
+/// evaluation runs in this process, outside every sandbox, against a store
+/// cap read out of the project's own policy at session start. A registry
+/// holds neither the evaluator nor the cap, so it refuses the call and says
+/// why, and this answers it. See
+/// `chock_core.tools.nix_eval_needs_a_session`.
+///
+/// ## Store writes stay off, and that is a decision
+///
+/// fix writes nothing to a store until a caller asks for it, and this caller
+/// does not ask. An evaluation that says what a derivation is computes the
+/// derivation path itself, with no daemon, no store mount and no object
+/// written anywhere: see `lib/chock-nix/eval.zig`'s own test. Turning writes
+/// on would buy nothing here and would put the bytes of every derivation an
+/// expression touches through this process.
+///
+/// **The driver is still installed, and `Seam.refusing` is what it is given.**
+/// An evaluation that reaches for a store then gets a refusal that names the
+/// path, which is what import from derivation needs: fix reports the store
+/// error text and nothing else about why the import stopped, so a model that
+/// read a subjectless failure would send the same expression again. See
+/// `nixEvalRefusal`.
+///
+/// ## One session per call
+///
+/// An engine holds every value it answered, so a session that lived for the
+/// whole run would grow with every call the agent made. A call is bounded in
+/// depth and in what it renders, and building an engine is cheap beside a
+/// sandbox, so each call gets its own and drops it.
+const NixEvalToolRunner = struct {
+    inner: chock_core.Loop.ToolRunner,
+    /// Null when this session cannot evaluate. The model is not offered the
+    /// tool then, so a call that arrives anyway is refused here.
+    settings: ?NixEval,
+
+    fn runner(self: *NixEvalToolRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *NixEvalToolRunner = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_eval))) {
+            return self.inner.dispatch(gpa, io, call);
+        }
+
+        const answer = try self.evaluate(gpa, io, call);
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = answer.text,
+            .is_error = answer.refused,
+            .truncated = false,
+        };
+    }
+
+    const Answer = struct { text: []u8, refused: bool };
+
+    fn evaluate(
+        self: *NixEvalToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!Answer {
+        const settings = self.settings orelse return .{
+            .text = try gpa.dupe(u8, nix_eval_is_off),
+            .refused = true,
+        };
+
+        const parsed = std.json.parseFromSlice(
+            chock_core.tools.NixEvalArgs,
+            gpa,
+            call.arguments,
+            .{ .ignore_unknown_fields = true },
+        ) catch return .{
+            .text = try gpa.dupe(u8, "the arguments of nix_eval did not parse. Send one field, " ++
+                "\"expression\", holding the expression alone."),
+            .refused = true,
+        };
+        defer parsed.deinit();
+
+        return settings.run(gpa, io, parsed.value.expression);
+    }
+};
+
+/// What one `nix_eval` call of this session may see and may take.
+const NixEval = struct {
+    /// The one directory a pure evaluation may read: the workspace this
+    /// session's tool calls already work in, and never the user's own
+    /// project. An expression that names any other path is refused by fix
+    /// itself: see `lib/chock-nix/eval.zig`.
+    workspace_root: []const u8,
+    /// What the project, the operator and the org bundle between them let an
+    /// evaluation put in the store. See `resolveNixCaps`.
+    caps: chock_policy.nix.Resolved,
+
+    /// The driver one call of this session answers through: nothing is
+    /// authorised, and the object cap is the one the policy folded.
+    fn driverFor(self: NixEval, gpa: std.mem.Allocator) chock_nix.backend.Driver {
+        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
+        applyNixCaps(&driver, self.caps);
+        return driver;
+    }
+
+    fn run(
+        self: NixEval,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        expression: []const u8,
+    ) std.mem.Allocator.Error!NixEvalToolRunner.Answer {
+        var driver = self.driverFor(gpa);
+        defer driver.deinit();
+
+        var session = chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{self.workspace_root},
+            .io = io,
+            .store_backend = driver.backend(),
+        }) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "the evaluator could not be started ({t}), so nothing was evaluated.",
+                .{err},
+            ),
+            .refused = true,
+        };
+        defer session.deinit();
+
+        const buffer = try gpa.alloc(u8, chock_core.tools.max_nix_eval_bytes);
+        defer gpa.free(buffer);
+
+        const answer = session.answer(buffer, expression) catch |err| return .{
+            .text = try nixEvalRefusal(gpa, &session, &driver, self.workspace_root, expression, err),
+            .refused = true,
+        };
+
+        if (answer.derivation_path) |path| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s}\n\nThat is a derivation, and {s} is its derivation file. Nothing was " ++
+                    "built: nix_eval evaluates and never builds.",
+                .{ answer.text, path },
+            ),
+            .refused = false,
+        };
+        return .{ .text = try gpa.dupe(u8, answer.text), .refused = false };
+    }
+};
+
+/// Why an evaluation did not answer, in words a model can act on.
+///
+/// **The store refusal is read first, and it is the one that names a path.**
+/// An expression that imports a derivation stops inside the store backend,
+/// and fix reports the store's own text and nothing else, so the driver's
+/// last refusal is the only place the derivation is named.
+fn nixEvalRefusal(
+    gpa: std.mem.Allocator,
+    session: *chock_nix.eval.Session,
+    driver: *chock_nix.backend.Driver,
+    workspace_root: []const u8,
+    expression: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error![]u8 {
+    if (driver.lastError()) |said| return std.fmt.allocPrint(
+        gpa,
+        "the expression asked a Nix store for something, and this session has none: {s}. " ++
+            "nix_eval works out what a derivation is and never builds one, so importing the " ++
+            "result of a build cannot work here. Ask about the derivation itself, such as its " ++
+            "drvPath, or do the work another way.",
+        .{said},
+    );
+
+    if (err == error.WriteFailed) return std.fmt.allocPrint(
+        gpa,
+        "the value is longer than {d} bytes rendered, so nothing came back. Ask for the part " ++
+            "of it you need, such as one attribute or builtins.attrNames of the set.",
+        .{chock_core.tools.max_nix_eval_bytes},
+    );
+
+    if (err == error.RestrictedInPureEval) return std.fmt.allocPrint(
+        gpa,
+        "the expression reads something a pure evaluation may not: a path outside the " ++
+            "workspace, the environment, or a channel. Only files under {s} can be read, and " ++
+            "the workspace is the only tree there is.",
+        .{workspace_root},
+    );
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.print(gpa, "the expression was not evaluated ({t}).", .{err});
+
+    var said: std.Io.Writer.Allocating = .init(gpa);
+    defer said.deinit();
+    session.writeDiagnostics(&said.writer, expression) catch {};
+    // Empty for a runtime fault, which is what the error name alone has to
+    // carry: see `chock_nix.eval.Session.writeDiagnostics`.
+    if (said.written().len != 0) try text.print(gpa, "\n{s}", .{said.written()});
+    return text.toOwnedSlice(gpa);
+}
+
+/// What a `nix_eval` call gets when the session cannot evaluate at all. The
+/// model is not offered the tool in that case, so this is for a model that
+/// named it out of nowhere.
+const nix_eval_is_off = "nothing was evaluated: this session cannot evaluate a Nix expression. " ++
+    "Work from what is in the project instead.";
+
+/// What one `nix_build` call of this session may see, may take, and may run.
+const NixBuild = struct {
+    /// The one directory a pure evaluation may read, and the flake a call
+    /// that names none builds from: the workspace this session's tool calls
+    /// already work in, and never the user's own project.
+    workspace_root: []const u8,
+    /// What the project, the operator and the org bundle between them let an
+    /// evaluation put in the store. See `resolveNixCaps`.
+    caps: chock_policy.nix.Resolved,
+    /// The absolute path of `nix` on the host, found once at the start.
+    nix_program: []const u8,
+    /// The absolute path of `nix-store`, which holds a build against the
+    /// garbage collector. Null when the machine has none, which is said out
+    /// loud and is not fatal.
+    nix_store_program: ?[]const u8,
+    /// Where the garbage collector root links go, or null when this session
+    /// has no directory of its own for them.
+    root_dir: ?[]const u8,
+    /// The Nix daemon socket the derivation of a build is written to, before
+    /// the host is told to realise it. See `chock_nix.build.Writing`.
+    store_endpoint: []const u8,
+    /// This project's flake inputs, fetched on the host at the start of the
+    /// session under the policy. The evaluation reads them out of the store,
+    /// and a build that wants one this session does not have is refused with
+    /// the reason they are not there.
+    inputs: FlakeInputs,
+};
+
+/// Whether this session can build a Nix attribute on the host, and what it
+/// needs to do it. Null when it cannot, with the reason already on screen.
+///
+/// **The machinery only, and no policy here, which is what makes this
+/// different from `provisioningFor`.** A `provide_tool` request is decided
+/// once, before the session starts, because a mid-session question could only
+/// time out then. That is no longer the shape of a tool call: `Loop.gateToolCall`
+/// asks the arbiter on the turn the model calls, and a person can answer. So a
+/// build is decided on its own turn, under the attribute path it names and
+/// under the flake it names when it names one, and this half answers only
+/// whether there is a `nix` to run at all.
+///
+/// A project can still refuse every build with one row, `nix.build.*` at
+/// `deny`. The model is then offered the tool and told no on each call, which
+/// costs a turn: the alternative is to fold a class of rules into a yes or no
+/// before any attribute is known, and a fold like that would have to guess.
+fn nixBuildFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    dev_shell_dir: ?[]const u8,
+    workspace_root: []const u8,
+    caps: chock_policy.nix.Resolved,
+    inputs: FlakeInputs,
+) ?NixBuild {
+    const nix_program = chock_nix.proc.resolve(arena, io, env, "nix") catch {
+        tty.detail("chock: nix_build is off, because nix is not on this machine's PATH\n", .{});
+        return null;
+    };
+    const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
+    return .{
+        .workspace_root = workspace_root,
+        .caps = caps,
+        .nix_program = nix_program,
+        .nix_store_program = nix_store_program,
+        .root_dir = dev_shell_dir,
+        // The host's own answer, so a machine that moved its socket is
+        // reached at the place its `nix` reads too.
+        .store_endpoint = env.get("NIX_DAEMON_SOCKET_PATH") orelse
+            chock_nix.build.default_daemon_socket,
+        .inputs = inputs,
+    };
+}
+
+/// Who answers for a host a Nix build would fetch from while it runs.
+///
+/// ## A fetch is a connection, and there is one egress namespace
+///
+/// A fixed output derivation builds with the network open to it, because its
+/// output hash is checked afterwards. That check is integrity and never
+/// egress: a URL carrying a secret of the workspace in its query string, with
+/// the hash of an innocuous file, passes it, and the request has already gone
+/// out. So every host the closure would reach is named and put to the policy
+/// before `nix` is told to build.
+///
+/// **The name is the ordinary `net.connect` one**, from
+/// `chock_broker.network.actionInto`, which reverses the labels so
+/// `evil.com.example.files` cannot match a rule an author wrote for
+/// `net.connect.com.example.*`. There is no second namespace for a fetch: a
+/// second one would need that reversal written and tested again, and would let
+/// a project allow a host in one namespace while denying it in the other.
+///
+/// **A host that cannot be named is a refusal.** A caller that cannot build an
+/// action name cannot ask the table, and fetching anyway would reach a host no
+/// rule could ever have named.
+const NixFetchGate = struct {
+    /// This tool call's own, for the question and for nothing that outlives
+    /// it. A refusal comes from the allocator `permit` is given, which is the
+    /// session's, because the build reads it after this call is over.
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    asker: ?chock_core.arbiter.Asker,
+    /// The `<flake ref>#<attribute>` the model asked for, which is what a
+    /// person reading the question wants to see.
+    installable: []const u8,
+    call: chock_proto.event.ToolCall,
+    /// What is being fetched, which is the whole of the difference between
+    /// the two questions this gate puts. The hosts, the namespace and the
+    /// rules are the same for both.
+    kind: Kind = .derivation,
+    /// The policy table, for the one question that must not prompt: which
+    /// mirror of a site a rule already permits. **Null answers no**, so a
+    /// session that wired none asks about the first mirror of the file rather
+    /// than taking one nobody answered for. See `Rule`.
+    rule: ?Rule = null,
+
+    /// What reads a rule without asking anybody.
+    ///
+    /// **The same table the arbiter reads, and never a second answer to the
+    /// same question.** What this picks still goes through `permit`, so the
+    /// broker decides and the log holds the answer. The shape is
+    /// `DevicePolicySeam`'s, and for the same reason: a decision this cheap
+    /// needs no question.
+    const Rule = struct {
+        policy: *const chock_policy.table.Table,
+        chain: []const []const u8,
+        agent_kind: []const u8,
+        model: []const u8,
+    };
+
+    /// Which of a build's two fetches this question is about.
+    const Kind = enum {
+        /// A fixed output derivation of the closure, which fetches while the
+        /// build runs.
+        derivation,
+        /// An input of the flake, which is fetched on the host before the
+        /// attribute can be evaluated at all.
+        flake_input,
+    };
+
+    fn gate(self: *NixFetchGate) chock_nix.fetch.Gate {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_nix.fetch.Gate.VTable{
+        .permit = permitFn,
+        .allows_by_rule = allowsByRuleFn,
+    };
+
+    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+        const rule = self.rule orelse return false;
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return false;
+
+        var fault: ?chock_policy.table.ChainFault = null;
+        const decision = rule.policy.evaluateChain(rule.chain, .{
+            .agent_kind = rule.agent_kind,
+            .model = rule.model,
+            .tool = self.call.tool,
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        return decision == .allow;
+    }
+
+    fn permitFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        one: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return .{ .refused = switch (self.kind) {
+                .derivation => try std.fmt.allocPrint(
+                    allocator,
+                    "{s} fetches {s}, and \"{s}\" is not a host name a rule can be written " ++
+                        "for, so nothing was fetched. Use an input whose host is an ordinary name.",
+                    .{ one.subject, one.url, one.host },
+                ),
+                .flake_input => try std.fmt.allocPrint(
+                    allocator,
+                    "the flake input {s} comes from \"{s}\", which is not a host name a rule " ++
+                        "can be written for, so nothing was fetched.",
+                    .{ one.subject, one.host },
+                ),
+            } };
+
+        const summary = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                self.gpa,
+                "a Nix build fetches from {s}",
+                .{one.host},
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                self.gpa,
+                "a Nix build needs the flake input {s} from {s}",
+                .{ one.subject, one.host },
+            ),
+        };
+        defer self.gpa.free(summary);
+        const detail = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                self.gpa,
+                "{s} fetches {s} while it builds, over port {d}. The build is {s}.",
+                .{ one.subject, one.url, one.port, self.installable },
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                self.gpa,
+                "the flake input {s} is fetched from {s}, over port {d}, before {s} can be " ++
+                    "evaluated at all. This project's own flake.lock is what names it.",
+                .{ one.subject, one.host, one.port, self.installable },
+            ),
+        };
+        defer self.gpa.free(detail);
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, self.gpa, self.io, .{
+            .action = action,
+            .summary = summary,
+            .detail = detail,
+            // A `nix_build` call carries no reason of its own, the same empty
+            // reason `GitToolRunner` sends.
+            .reason = "",
+            .tool = self.call.tool,
+            .tool_call_id = self.call.call_id,
+        });
+        if (answer.permitted) return .permitted;
+
+        // **The host and the derivation, then the one refusal sentence every
+        // other refused act in this project gives.** A model that reads a
+        // refusal with no subject asks for the same attribute again, and the
+        // host is what it has to ask for instead.
+        const said = try chock_core.arbiter.refusalText(self.gpa, action, answer);
+        defer self.gpa.free(said);
+        return .{ .refused = switch (self.kind) {
+            .derivation => try std.fmt.allocPrint(
+                allocator,
+                "{s} fetches {s} from {s} while it builds. {s}",
+                .{ one.subject, one.url, one.host, said },
+            ),
+            .flake_input => try std.fmt.allocPrint(
+                allocator,
+                "the flake input {s} comes from {s}. {s}",
+                .{ one.subject, one.host, said },
+            ),
+        } };
+    }
+};
+
+/// Answers `nix_build` and passes every other call straight through.
+///
+/// ## Why this is a wrapper and not a tool of the registry
+///
+/// Both of the reasons the two runners above it are. The evaluation half runs
+/// in Chock's own process, outside every sandbox, and the build half runs
+/// `nix` on the host and then changes what the next tool call mounts. A
+/// `Registry` holds neither the evaluator nor a value that outlives one call,
+/// so it refuses the name and says why. See
+/// `chock_core.tools.nix_build_needs_a_session`.
+///
+/// ## The three steps, and what each one answers
+///
+/// 1. **Evaluate the attribute**, in this process, with store writes on, and
+///    write the derivation closure into the host store through its daemon.
+///    That is what registers the derivation through
+///    `chock_nix.backend.Driver`, so its produced set can authorise a build
+///    of it, and it is what gives `nix` a path to name. The seam it evaluates
+///    against authorises no build, so import from derivation is refused here
+///    exactly as it is for `nix_eval`.
+/// 2. **The policy has already answered.** `Loop.gateToolCall` put this call
+///    to the policy under `nix.build.<attribute path>`, and under
+///    `nix.build.flake.<reference>` as well when the call named a flake,
+///    before the dispatch reached this file. A call that arrives here was
+///    permitted on every name it carries, and nothing asks a second time.
+/// 3. **Realise on the host**, through `chock_nix.build.realise`, which goes
+///    through the driver's own check and never around it. What the host is
+///    told to build is the derivation path that check authorised, so the
+///    attribute is read once, here. See `lib/chock-nix/build.zig`'s own top
+///    comment for what that proves and what it still does not.
+///
+/// ## What it produced reaches the agent the way a provisioned program does
+///
+/// The outputs join `SessionMounts`, so the next tool call's `sandbox.Config`
+/// binds them and its `PATH` finds them. Nothing is mounted into a running
+/// sandbox and no bytes travel over a socket: there is no long lived sandbox
+/// to mount into. The three things that does not reach are the three
+/// `ProvisionToolRunner` names: a background task already running, a subagent
+/// already running, and the next session.
+///
+/// **A path this session built still asks under `exec.nix.store.*`.**
+/// `Loop.Deps.store_closure` is read from the toolchain this session started
+/// with and never from `Context.store_paths`, so running a program out of a
+/// build the agent asked for is not the same act as running the project's own
+/// toolchain. See `runSession`, which sets that field.
+///
+/// ## It blocks the turn, and an `Io` of its own
+///
+/// The same as `ProvisionToolRunner`, for the same two reasons: the answer has
+/// to reach the mount set the next dispatch reads, and phase 2's `Io` cannot
+/// spawn a process. See that type's own doc comment, which states both in
+/// full.
+const NixBuildToolRunner = struct {
+    inner: chock_core.Loop.ToolRunner,
+    /// Null when this session cannot build. The model is not offered the tool
+    /// then, so a call that arrives anyway is refused here.
+    settings: ?NixBuild,
+    /// Where everything a build leaves behind is kept: the store paths and
+    /// the `bin` directories. Owned by `runSession`.
+    arena: std.mem.Allocator,
+    /// The environment `nix` itself runs with: the host's own.
+    host_env: *const std.process.Environ.Map,
+    environ: std.process.Environ,
+    /// What this session mounts. Shared with `ProvisionToolRunner`.
+    mounts: *SessionMounts,
+    /// How many builds this session has taken in, which names their garbage
+    /// collector root links apart. See `builtRootPrefix`.
+    builds: usize = 0,
+    /// How much of the host store this session has taken, across every build
+    /// of it. The cap on it comes from `NixBuild.caps` on each call, so what
+    /// survives between calls is the count.
+    budget: chock_nix.build.Budget = .{},
+    /// Who answers for a host a build would fetch from, and the log handle
+    /// that question and its answer travel through.
+    ///
+    /// **Null refuses every build whose closure fetches anything, and says
+    /// nobody could be asked.** The same direction `GitToolRunner.asker`
+    /// takes: a wiring this file forgot is a loud failure and never a silent
+    /// connection. See `NixFetchGate`.
+    asker: ?chock_core.arbiter.Asker = null,
+    /// What picks one mirror of a site out of the ten a mirrors file names,
+    /// with nobody asked. Null asks about the first of them instead, which is
+    /// safe and noisier. See `NixFetchGate.Rule`.
+    rule: ?NixFetchGate.Rule = null,
+
+    fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Take the session's own locked handle. **Called by `GiveLockedToAll`**,
+    /// once, before the first turn.
+    fn giveLocked(self: *NixBuildToolRunner, locked: *chock_core.arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *NixBuildToolRunner = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_build))) {
+            return self.inner.dispatch(gpa, io, call);
+        }
+
+        const answer = try self.build(gpa, io, call);
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = answer.text,
+            .is_error = answer.refused,
+            .truncated = false,
+        };
+    }
+
+    const Answer = struct { text: []u8, refused: bool };
+
+    fn build(
+        self: *NixBuildToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+    ) std.mem.Allocator.Error!Answer {
+        const settings = self.settings orelse return .{
+            .text = try gpa.dupe(u8, nix_build_is_off),
+            .refused = true,
+        };
+
+        const parsed = std.json.parseFromSlice(
+            chock_core.tools.NixBuildArgs,
+            gpa,
+            call.arguments,
+            .{ .ignore_unknown_fields = true },
+        ) catch return .{
+            .text = try gpa.dupe(u8, "the arguments of nix_build did not parse. Send " ++
+                "\"attribute\" as a list of names, and \"flake\" only if you mean another " ++
+                "flake."),
+            .refused = true,
+        };
+        defer parsed.deinit();
+
+        const attr_path = parsed.value.attribute;
+        // The workspace itself, which is the project the agent works in, so a
+        // call that names no flake builds what it has been editing.
+        const flake_ref = parsed.value.flake orelse settings.workspace_root;
+
+        chock_nix.build.checkAttrPath(attr_path) catch |err| return .{
+            .text = try chock_nix.build.requestRefusal(gpa, err),
+            .refused = true,
+        };
+        chock_nix.build.checkFlakeRef(flake_ref) catch |err| return .{
+            .text = try chock_nix.build.requestRefusal(gpa, err),
+            .refused = true,
+        };
+        if (!isWorkspaceFlake(settings.workspace_root, flake_ref)) return .{
+            .text = try foreignFlakeRefusal(gpa, flake_ref),
+            .refused = true,
+        };
+
+        const installable = try chock_nix.build.installableFor(self.arena, flake_ref, attr_path);
+        const expression = try chock_nix.build.expressionFor(self.arena, flake_ref, attr_path);
+
+        // The evaluation holds every value it answered, so it is dropped
+        // before the build, which is the long part.
+        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
+        defer driver.deinit();
+        applyNixCaps(&driver, settings.caps);
+
+        // One `Io` for the whole call: the daemon the evaluation writes
+        // through and the `nix` the build runs both need one that can open a
+        // socket and spawn a process, which phase 2's own cannot. See
+        // `ProvisionToolRunner.resolveWithNix`, which says why it is built
+        // here and why it is backed by the page allocator.
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
+        defer threaded.deinit();
+        const host_io = threaded.io();
+
+        // The derivation has to be in the host store before `nix` can be
+        // asked to realise it by name, and this is what puts it there.
+        var store_writer = chock_nix.build.DaemonWriter.connect(
+            gpa,
+            host_io,
+            settings.store_endpoint,
+        ) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s} was not built: the Nix daemon at {s} could not be reached ({t}), and a " ++
+                    "build puts the derivation it evaluated in the store through it. Do the " ++
+                    "work with what the toolchain already has, and tell the user.",
+                .{ installable, settings.store_endpoint, err },
+            ),
+            .refused = true,
+        };
+        defer store_writer.deinit();
+
+        self.budget.max_bytes = settings.caps.max_session_bytes;
+        var writing = chock_nix.build.Writing{
+            .writer = store_writer.writer(),
+            .budget = &self.budget,
+            // What stops fix fetching a flake input for itself: it takes a
+            // locked input out of the store when the store says the path is
+            // valid, and these are the paths this session fetched under the
+            // policy before it started. See `chock_nix.inputs`.
+            .fetched_paths = settings.inputs.store_paths,
+        };
+        driver.seam = writing.seam();
+
+        // What answers for every host this call would reach: the inputs of
+        // the flake before the evaluation, and the closure's own fixed output
+        // derivations before `nix` is told to build. One namespace and one
+        // arbiter for both, and `NixFetchGate.kind` is the only difference.
+        var gate = NixFetchGate{
+            .gpa = gpa,
+            .io = host_io,
+            .asker = self.asker,
+            .installable = installable,
+            .call = call,
+            .rule = self.rule,
+        };
+        var input_gate = NixFetchGate{
+            .gpa = gpa,
+            .io = host_io,
+            .asker = self.asker,
+            .installable = installable,
+            .call = call,
+            .kind = .flake_input,
+            .rule = self.rule,
+        };
+
+        const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
+            .refused => |text| return .{ .text = text, .refused = true },
+            .found => |path| path,
+            // **One retry, and never a loop.** The session start fetches an
+            // input only where the policy said `allow`, because there is
+            // nobody at the prompt then, so a project that wrote no rule
+            // arrives here with the inputs missing. This is the first moment a
+            // person can be asked, and a second failure is the answer.
+            .inputs_missing => blk: {
+                const now = try self.fetchInputs(host_io, settings, input_gate.gate(), installable);
+                if (now.store_paths.len == 0) return .{
+                    .text = try chock_nix.inputs.missingRefusal(
+                        gpa,
+                        installable,
+                        now.missing,
+                        now.wanted,
+                    ),
+                    .refused = true,
+                };
+
+                // Read by `is_valid_path` on the next evaluation, and kept for
+                // every later call of this session, so one answer serves the
+                // whole run.
+                writing.fetched_paths = now.store_paths;
+                if (self.settings) |*one| one.inputs = now;
+
+                break :blk switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
+                    .refused => |text| return .{ .text = text, .refused = true },
+                    .found => |path| path,
+                    .inputs_missing => return .{
+                        .text = try chock_nix.inputs.missingRefusal(
+                            gpa,
+                            installable,
+                            "the inputs this project's lock names were fetched and the " ++
+                                "evaluation still wanted one that is not among them.",
+                            now.wanted,
+                        ),
+                        .refused = true,
+                    },
+                };
+            },
+        };
+
+        // Before the wait, because a build can take minutes and a silent
+        // terminal looks like a session that has stopped.
+        tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
+
+        const answer = self.realiseWithNix(host_io, settings, &driver, gate.gate(), .{
+            .derivation_path = drv_path,
+            .installable = installable,
+        }) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s} could not be built ({t}), so nothing was built. Do the work with what the " ++
+                    "toolchain already has.",
+                .{ installable, err },
+            ),
+            .refused = true,
+        };
+
+        const built = switch (answer) {
+            .refused => |text| {
+                tty.print(.warn, "chock: {s} was not built\n", .{installable});
+                return .{ .text = try gpa.dupe(u8, text), .refused = true };
+            },
+            .built => |one| one,
+        };
+
+        try self.mounts.adopt(built.provided);
+
+        tty.print(.plain, "chock: {s} is built, {d} store paths, {d} mounted in all\n", .{
+            installable,
+            built.provided.store_paths.len,
+            self.mounts.paths.items.len,
+        });
+
+        return .{ .text = try builtText(gpa, installable, built), .refused = false };
+    }
+
+    const Derivation = union(enum) {
+        found: []const u8,
+        refused: []u8,
+        /// The evaluation wanted a flake input that is not in the store. The
+        /// evaluator has no fetcher, so this is the one fault it cannot name
+        /// itself: the caller fetches and evaluates again. See
+        /// `chock_nix.inputs`.
+        inputs_missing,
+    };
+
+    /// Fetch this project's flake inputs now, through the gate that can ask a
+    /// person, and answer what is in the store afterwards.
+    ///
+    /// **This is where a startup `ask` stops being a permanent no.**
+    /// `fetchFlakeInputs` fetches only on `allow`, because a session that is
+    /// starting up has nobody at the prompt. A build is a turn the model took,
+    /// so there is somebody to ask, and the question is the ordinary
+    /// `net.connect` one under the same namespace and the same arbiter as the
+    /// build's own fetches. One question per host, a host that cannot be named
+    /// is a refusal, and the fetch still happens on the host through `nix
+    /// flake archive`: fix never reaches the network itself.
+    ///
+    /// **The workspace's own lock and not the project's.** The agent works in
+    /// the workspace and may have edited the lock there, and that lock is what
+    /// the evaluation about to run reads.
+    fn fetchInputs(
+        self: *NixBuildToolRunner,
+        io: std.Io,
+        settings: NixBuild,
+        gate: chock_nix.fetch.Gate,
+        installable: []const u8,
+    ) std.mem.Allocator.Error!FlakeInputs {
+        const lock_bytes = readProjectLock(self.arena, io, settings.workspace_root) orelse return .{
+            .missing = "there is no flake.lock in the workspace, so nothing says where its " ++
+                "inputs come from.",
+        };
+
+        const wanted = switch (try chock_nix.inputs.wantsOf(self.arena, lock_bytes)) {
+            .hosts => |list| list,
+            else => &.{},
+        };
+
+        tty.print(
+            .plain,
+            "chock: {s} needs a flake input that is not in the store yet\n",
+            .{installable},
+        );
+
+        var diag: ?chock_nix.Diagnostic = null;
+        defer if (diag) |*one| one.deinit(self.arena);
+        var host = chock_nix.provision.Host{
+            .nix_program = settings.nix_program,
+            .env = self.host_env,
+            .diag = &diag,
+        };
+
+        const answer = chock_nix.inputs.fetchAll(
+            self.arena,
+            io,
+            host.runner(),
+            gate,
+            settings.workspace_root,
+            lock_bytes,
+        ) catch {
+            if (diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+            return .{
+                .wanted = wanted,
+                .missing = "nix could not be run, so the inputs were not fetched.",
+            };
+        };
+
+        return switch (answer) {
+            .fetched => |paths| .{ .store_paths = paths, .wanted = wanted },
+            .refused => |why| .{ .wanted = wanted, .missing = why },
+        };
+    }
+
+    /// Evaluate `expression` and answer the derivation it is, with the driver
+    /// left holding that derivation in its produced set.
+    ///
+    /// **The derivation path is borrowed from the session, which ends with
+    /// this function.** It is copied into the arena before it is answered,
+    /// because the build that reads it runs afterwards.
+    fn derivationOf(
+        self: *NixBuildToolRunner,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        settings: NixBuild,
+        driver: *chock_nix.backend.Driver,
+        expression: []const u8,
+        installable: []const u8,
+    ) std.mem.Allocator.Error!Derivation {
+        var session = chock_nix.eval.Session.init(gpa, .{
+            .roots = &.{settings.workspace_root},
+            .io = io,
+            .store_backend = driver.backend(),
+            // What puts the derivation in the produced set, which is the one
+            // thing that can authorise a build of it.
+            .store_writes = true,
+            // A build names an attribute of a flake, so `builtins.getFlake`
+            // has to work. `network` stays off, so the inputs of that flake
+            // come out of the store and never off a connection fix opened.
+            .flakes = true,
+        }) catch |err| return .{ .refused = try std.fmt.allocPrint(
+            gpa,
+            "the evaluator could not be started ({t}), so nothing was built.",
+            .{err},
+        ) };
+        defer session.deinit();
+
+        const buffer = try gpa.alloc(u8, chock_core.tools.max_nix_eval_bytes);
+        defer gpa.free(buffer);
+
+        const answer = session.answer(buffer, expression) catch |err| {
+            if (err == error.FetchIoUnavailable) return .inputs_missing;
+            return .{
+                .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            };
+        };
+
+        const drv_path = answer.derivation_path orelse return .{ .refused = try std.fmt.allocPrint(
+            gpa,
+            "{s} is not a derivation, so there is nothing to build. It evaluated to {s}. Name " ++
+                "an attribute that is a package.",
+            .{ installable, answer.text },
+        ) };
+
+        session.ensureDerivation(drv_path) catch |err| {
+            if (err == error.FetchIoUnavailable) return .inputs_missing;
+            return .{
+                .refused = try nixBuildRefusal(gpa, &session, driver, installable, expression, err),
+            };
+        };
+
+        return .{ .found = try self.arena.dupe(u8, drv_path) };
+    }
+
+    /// Run the `nix` commands on the `Io` this call built, which is the one
+    /// the derivation was written to the store through.
+    fn realiseWithNix(
+        self: *NixBuildToolRunner,
+        io: std.Io,
+        settings: NixBuild,
+        driver: *chock_nix.backend.Driver,
+        gate: chock_nix.fetch.Gate,
+        request: chock_nix.build.Request,
+    ) chock_nix.build.Error!chock_nix.build.Answer {
+        var run_diag: ?chock_nix.Diagnostic = null;
+        defer if (run_diag) |*d| d.deinit(self.arena);
+        var host = chock_nix.provision.Host{
+            .nix_program = settings.nix_program,
+            .env = self.host_env,
+            .diag = &run_diag,
+        };
+
+        // **The driver the evaluation ran against, and never a fresh one.** A
+        // second driver here would be a second answer to the question of what
+        // this session produced, and the weaker of the two would be the rule.
+        const answer = chock_nix.build.realise(
+            self.arena,
+            io,
+            host.runner(),
+            driver,
+            gate,
+            request,
+        ) catch |err| {
+            if (run_diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
+            return err;
+        };
+
+        if (answer == .built) self.rootBuilt(io, settings, request.installable, answer.built);
+        return answer;
+    }
+
+    /// Hold a build against the garbage collector, before the model is told
+    /// it is there. `nix build --no-link` leaves no root of its own, so a
+    /// `nix-collect-garbage` between now and the next tool call would take a
+    /// toolchain the agent has already been promised. The same reasoning
+    /// `ProvisionToolRunner.rootProvided` carries, and a failure is said out
+    /// loud and is not fatal for the same reason.
+    fn rootBuilt(
+        self: *NixBuildToolRunner,
+        io: std.Io,
+        settings: NixBuild,
+        installable: []const u8,
+        built: chock_nix.build.Built,
+    ) void {
+        const nix_store = settings.nix_store_program orelse return;
+        const dir = settings.root_dir orelse return;
+
+        const link_prefix = builtRootPrefix(self.arena, dir, self.builds) catch return;
+        self.builds += 1;
+
+        var diag: ?chock_nix.Diagnostic = null;
+        defer if (diag) |*d| d.deinit(self.arena);
+        chock_nix.store.addRoots(
+            self.arena,
+            io,
+            nix_store,
+            self.host_env,
+            link_prefix,
+            built.provided.store_paths,
+            &diag,
+        ) catch {
+            tty.print(
+                .warn,
+                "chock: {s} could not be held against the garbage collector. A " ++
+                    "nix-collect-garbage during this session can break it.\n",
+                .{installable},
+            );
+        };
+    }
+};
+
+/// True when `flake_ref` is the workspace this session's tool calls work in,
+/// or a directory under it.
+fn isWorkspaceFlake(workspace_root: []const u8, flake_ref: []const u8) bool {
+    if (!std.mem.startsWith(u8, flake_ref, workspace_root)) return false;
+    const rest = flake_ref[workspace_root.len..];
+    return rest.len == 0 or rest[0] == '/';
+}
+
+/// What a `nix_build` that names another flake is told.
+///
+/// **A reference that is not this project is refused, and that is a decision
+/// rather than a gap.** Fetching it means fetching its whole input graph, and
+/// what that graph reaches is written in a lock file inside the flake, which
+/// cannot be read until the flake has already been fetched. So there is no
+/// moment at which the policy could be asked about those hosts first, and one
+/// question about the reference standing for every host under it is exactly
+/// the widening `lib/chock-nix/fetch.zig` refuses to make for a build.
+fn foreignFlakeRefusal(
+    gpa: std.mem.Allocator,
+    flake_ref: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "nothing was built: {s} is not the project you are working in, and it would have to be " ++
+            "fetched before it could be evaluated. This session fetches no flake but this " ++
+            "project's own. Leave \"flake\" out to build an attribute of the project, or add " ++
+            "what you need to its flake inputs and ask the user to run it again.",
+        .{flake_ref},
+    );
+}
+
+/// What the model is told about a build that happened.
+fn builtText(
+    gpa: std.mem.Allocator,
+    installable: []const u8,
+    built: chock_nix.build.Built,
+) std.mem.Allocator.Error![]u8 {
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+
+    try text.print(gpa, "{s} was built. It produced", .{installable});
+    for (built.out_paths) |path| try text.print(gpa, " {s}", .{path});
+    try text.appendSlice(gpa, ". Every call after this one can read those paths and run what " ++
+        "is in their bin directories, by the program name alone. A background task or a " ++
+        "subagent that was already running does not have them, and they are gone at the end " ++
+        "of this session.");
+    return text.toOwnedSlice(gpa);
+}
+
+/// Where the garbage collector root links of one build go. Caller owns the
+/// result.
+///
+/// **A number and not the attribute path.** An installable holds `#` and `/`,
+/// which is not a file name, and `nix-store --add-root` names its links after
+/// the prefix it is given, so two builds sharing one prefix would mean the
+/// second call replaces the first one's links. The prefix starts with
+/// `chock_nix.DevShell.root_link_name`, read from there, so a new evaluation
+/// of the dev shell releases these too.
+fn builtRootPrefix(
+    arena: std.mem.Allocator,
+    dir: []const u8,
+    index: usize,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}-built-{d}", .{
+        dir,
+        chock_nix.DevShell.root_link_name,
+        index,
+    });
+}
+
+/// Why an attribute could not be turned into a derivation, in words a model
+/// can act on.
+///
+/// **The store refusal is read first, and it is the one that names a path.**
+/// An expression that imports a derivation stops inside the store backend,
+/// and fix reports the store's own text and nothing else. The same rule
+/// `nixEvalRefusal` follows, and the advice differs: a build does not make
+/// import from derivation work.
+fn nixBuildRefusal(
+    gpa: std.mem.Allocator,
+    session: *chock_nix.eval.Session,
+    driver: *chock_nix.backend.Driver,
+    installable: []const u8,
+    expression: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error![]u8 {
+    // The store faults are the evaluation's own and the driver records none
+    // of them, so they are read before its last refusal rather than after.
+    if (try chock_nix.build.writeRefusal(gpa, installable, err)) |said| return said;
+
+    if (driver.lastError()) |said| return std.fmt.allocPrint(
+        gpa,
+        "{s} was not built, because evaluating it asked a store for something this session " ++
+            "will not do: {s}. Reading the result of one build to work out another, which is " ++
+            "what importing a derivation does, is refused here. Build the thing itself.",
+        .{ installable, said },
+    );
+
+    if (err == error.RestrictedInPureEval) return std.fmt.allocPrint(
+        gpa,
+        "{s} was not built: evaluating it reads something a pure evaluation may not, such as " ++
+            "a path outside the workspace, the environment, or a flake input that is not " ++
+            "already on this machine. Build an attribute of the project you are working in.",
+        .{installable},
+    );
+
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    try text.print(gpa, "{s} was not built, because it did not evaluate ({t}).", .{ installable, err });
+
+    var said: std.Io.Writer.Allocating = .init(gpa);
+    defer said.deinit();
+    session.writeDiagnostics(&said.writer, expression) catch {};
+    if (said.written().len != 0) try text.print(gpa, "\n{s}", .{said.written()});
+    return text.toOwnedSlice(gpa);
+}
+
+/// What a `nix_build` call gets when the session cannot build at all. The
+/// model is not offered the tool in that case, so this is for a model that
+/// named it out of nowhere.
+const nix_build_is_off = "nothing was built: this session cannot build with Nix, because there " ++
+    "is no nix on this machine. Do the work with what the toolchain already has.";
 
 /// Starts a subagent: one `chock run` of its own, with the session, the
 /// scratchpad, the chain and the budget slice its parent decided. See
@@ -11877,18 +13308,48 @@ fn runSession(
     var provision_arena = std.heap.ArenaAllocator.init(gpa);
     defer provision_arena.deinit();
 
-    var provisioning = ProvisionToolRunner{
+    // Between the diagnostics and the provisioner, because it answers a call
+    // neither of them can and needs nothing either of them sets up. See
+    // `NixEvalToolRunner`.
+    var nix_eval = NixEvalToolRunner{
         .inner = diagnosing.runner(),
+        .settings = .{
+            .workspace_root = started.workspace.workPath(),
+            .caps = started.nix_caps,
+        },
+    };
+
+    // What this session mounts, written by the two runners below and read by
+    // every tool call. See `SessionMounts`.
+    var session_mounts = SessionMounts{
+        .arena = provision_arena.allocator(),
+        .context = &tool_runner.context,
+        .tool_env = started.tool_env,
+    };
+    // The dev shell's own paths, taken in first, so the list this holds is
+    // the whole mount set and never only the additions.
+    try session_mounts.start(context.store_paths);
+
+    // Between the evaluator and the provisioner, because a build is the two
+    // of them at once: it evaluates in this process and then runs `nix` on
+    // the host. See `NixBuildToolRunner`.
+    var nix_build = NixBuildToolRunner{
+        .inner = nix_eval.runner(),
+        .settings = started.nix_build,
+        .arena = provision_arena.allocator(),
+        .host_env = env,
+        .environ = environ,
+        .mounts = &session_mounts,
+    };
+
+    var provisioning = ProvisionToolRunner{
+        .inner = nix_build.runner(),
         .settings = started.provisioning,
         .arena = provision_arena.allocator(),
         .host_env = env,
         .environ = environ,
-        .tool_env = started.tool_env,
-        .context = &tool_runner.context,
+        .mounts = &session_mounts,
     };
-    // The dev shell's own paths, taken in first, so the list this runner
-    // grows is the whole mount set and never only the additions.
-    try provisioning.start(context.store_paths);
 
     // This session's MCP servers, and the tools they supply.
     //
@@ -12233,6 +13694,21 @@ fn runSession(
     // every subcommand the shim classifies, `git add` included.
     git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
 
+    // **And a Nix build, for the hosts its closure would fetch from.** A
+    // fixed output derivation builds with the network open to it, and which
+    // hosts it reaches is known only once the attribute is evaluated, which
+    // happens inside the tool call. A runner left with no arbiter refuses
+    // every build whose closure fetches anything. See `NixFetchGate`.
+    nix_build.asker = .{ .arbiter = session_arbiter.arbiter() };
+    // And the table itself, for the one question that must not prompt: which
+    // mirror of a site a rule already permits. See `NixFetchGate.Rule`.
+    nix_build.rule = .{
+        .policy = started.policy,
+        .chain = try policyChain(provision_arena.allocator(), started, options),
+        .agent_kind = options.agent_kind,
+        .model = started.model,
+    };
+
     // **And what one approved push may reach.** Built here because it needs the
     // display, which is not known where `git_aware` itself is built, and it is
     // ended with this frame: `disarm` runs on every path out of a tool call, so
@@ -12315,13 +13791,14 @@ fn runSession(
     // `context.idle` already are. See `chock_core.tools.Context.credentials`.
     tool_runner.context.credentials = git_credentials.seam();
 
-    // The handle each of those four needs, handed over once by `Loop.run`.
+    // The handle each of those five needs, handed over once by `Loop.run`.
     // See `GiveLockedToAll`.
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
         .mcp = &mcp_state.session,
         .plugins = &plugin_state.session,
         .git = &git_aware,
+        .nix = &nix_build,
     };
 
     // What carries the agent's own work back when it says it is finished.
@@ -12524,6 +14001,13 @@ fn runSession(
         // where it points and not from how it is spelled: see that
         // function's own doc.
         .project_root = started.sandbox_config.cwd,
+        // The toolchain phase 1 decided, so a program inside it names
+        // `exec.devshell.*` and every other store path names
+        // `exec.nix.store.*`. **Read from `Toolchain` and not from
+        // `tools.Context.store_paths`**, which grows when `provide_tool`
+        // realises a package: a store path this session caused to exist is
+        // the one thing the split is for. See `chock_core.Loop.Deps.store_closure`.
+        .store_closure = started.toolchain.store_paths,
         // What answers a `request_action` call. **This line is the difference
         // between a tool the model is offered and a tool that does
         // something**: `chock_core.Loop.Deps.handback` defaults to null, and a
@@ -16477,16 +17961,20 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
     var context = chock_core.tools.Context{ .store_paths = &.{"/nix/store/aaa-coreutils"} };
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
-    try provisioning.start(context.store_paths);
+    try mounts.start(context.store_paths);
     const runner = provisioning.runner();
 
     const call = chock_proto.event.ToolCall{
@@ -16533,6 +18021,321 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
     try std.testing.expectEqual(@as(usize, 2), recorder.calls);
 }
 
+test "what a build produced is mounted by the next tool call, and not by the one before" {
+    // The two runners write to one mount set. Give each a list of its own and
+    // the last one to adopt publishes a slice the other's additions are
+    // missing from, which is a mount set that quietly shrinks.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    try tool_env.put("PATH", "/nix/store/aaa-devshell/bin");
+
+    var context = chock_core.tools.Context{ .store_paths = &.{"/nix/store/aaa-devshell"} };
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
+    try mounts.start(context.store_paths);
+
+    var nix_build = NixBuildToolRunner{
+        .inner = recorder.runner(),
+        .settings = null,
+        .arena = arena_state.allocator(),
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+    };
+    var provisioning = ProvisionToolRunner{
+        .inner = nix_build.runner(),
+        .settings = null,
+        .arena = arena_state.allocator(),
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+    };
+    const runner = provisioning.runner();
+
+    const call = chock_proto.event.ToolCall{
+        .call_id = "c1",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"myproject\"]}",
+    };
+
+    const before = try runner.dispatch(gpa, std.testing.io, call);
+    gpa.free(before.call_id);
+    gpa.free(before.output);
+    try std.testing.expectEqual(@as(usize, 1), recorder.last_store_paths.len);
+
+    // What `chock_nix.build.realise` answers with: the outputs' own closure,
+    // and one `bin` per output.
+    const closure = [_][]const u8{ "/nix/store/aaa-devshell", "/nix/store/bbb-myproject" };
+    try mounts.adopt(.{
+        .program = "/work#packages.x86_64-linux.default",
+        .installable = "/work#packages.x86_64-linux.default",
+        .bin_dirs = &.{"/nix/store/bbb-myproject/bin"},
+        .store_paths = &closure,
+    });
+
+    const after = try runner.dispatch(gpa, std.testing.io, call);
+    gpa.free(after.call_id);
+    gpa.free(after.output);
+
+    // Two paths and not three: the dev shell entry the closure repeats is
+    // mounted once.
+    try std.testing.expectEqual(@as(usize, 2), recorder.last_store_paths.len);
+    try std.testing.expectEqualStrings("/nix/store/bbb-myproject", recorder.last_store_paths[1]);
+    try std.testing.expectEqualStrings(
+        "/nix/store/bbb-myproject/bin:/nix/store/aaa-devshell/bin",
+        recorder.last_path,
+    );
+    try std.testing.expectEqual(@as(usize, 2), recorder.calls);
+}
+
+test "a host a Nix build would fetch from is named in the one egress namespace, labels reversed" {
+    // **A fetch is a connection, and there is no second namespace for one.**
+    // `chock_broker.network.actionInto` writes the name, reversal and all, so
+    // one rule an author wrote covers a host however it is reached.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No asker at all, so nothing is permitted and the refusal carries the
+    // name the question would have been put under.
+    var gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+    };
+
+    const said = (try gate.gate().permit(arena, .{
+        .subject = "b-src.drv",
+        .url = "https://files.example.com/src.tar.gz",
+        .host = "files.example.com",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.example.files.443") != null);
+    // The derivation and the host are both in the words, so the model can ask
+    // for that host rather than send the same attribute again.
+    try std.testing.expect(std.mem.indexOf(u8, said, "b-src.drv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "files.example.com") != null);
+
+    // **Reversal is what makes a class rule safe.** A name a derivation chose
+    // falls under the class an author wrote and never over it, so a rule for
+    // `net.connect.com.example.*` does not cover this one.
+    const hostile = (try gate.gate().permit(arena, .{
+        .subject = "c-src.drv",
+        .url = "https://evil.com.example.files/x",
+        .host = "evil.com.example.files",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(
+        std.mem.indexOf(u8, hostile, "net.connect.files.example.com.evil.443") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, hostile, "net.connect.com.example.") == null);
+
+    // A host no rule could ever have named is refused, and never reached.
+    const unnameable = (try gate.gate().permit(arena, .{
+        .subject = "d-src.drv",
+        .url = "https://a_b/x",
+        .host = "a_b",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(std.mem.indexOf(u8, unnameable, "net.connect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unnameable, "d-src.drv") != null);
+}
+
+test "a flake input host is asked of the policy table at startup, and ask is off there" {
+    // **The same egress namespace a build's own fetches are asked under.**
+    // There is nobody to prompt while a session is starting up, so only
+    // `allow` fetches: the same rule `languageServerPermitted` keeps.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const allowing = try chock_policy.table.Table.parse(
+        arena,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "net.connect.com.github.api.443", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+    var gate = StartupFetchGate{
+        .policy = allowing,
+        .chain = &.{"agent"},
+        .agent_kind = "agent",
+        .model = "test-model",
+    };
+    const wanted = chock_nix.fetch.Fetch{
+        .subject = "nixpkgs",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    };
+    try std.testing.expect(try gate.gate().permit(arena, wanted) == .permitted);
+
+    // A host the table says nothing about answers `ask`, and `ask` is off at
+    // startup. The words name the input, the host and the action, because the
+    // person who can change the rule is the one who reads them.
+    const quiet = try chock_policy.table.Table.parse(arena, ".{}", null);
+    var silent = StartupFetchGate{
+        .policy = quiet,
+        .chain = &.{"agent"},
+        .agent_kind = "agent",
+        .model = "test-model",
+    };
+    const said = (try silent.gate().permit(arena, wanted)).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+}
+
+test "a startup refusal is not a permanent no, and a build asks about the input it wanted" {
+    // **The fault this replaced.** `fetchFlakeInputs` fetches only on `allow`,
+    // because a session start has nobody at the prompt, so a project that
+    // wrote no `net.connect` rule reached every build with its inputs
+    // missing and could never build anything. A build is a turn the model
+    // took, so there is somebody to ask.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var input_gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.aarch64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .kind = .flake_input,
+    };
+    const wanted = chock_nix.fetch.Fetch{
+        .subject = "flakever",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    };
+
+    // No asker at all, so nothing is permitted. The words are the input's and
+    // never a derivation's, and the action is the ordinary one.
+    const said = (try input_gate.gate().permit(arena, wanted)).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "flake input flakever") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "while it builds") == null);
+
+    // The sentence the model finally reads, joined to that refusal. **The
+    // seam has to read as prose**: the refusal ends on an action name, so
+    // without a full stop the next sentence ran straight into the port.
+    const refusal = try chock_nix.inputs.missingRefusal(
+        gpa,
+        "/work#packages.aarch64-linux.default",
+        said,
+        &.{wanted},
+    );
+    defer gpa.free(refusal);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "443 The inputs") == null);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "flakever from api.github.com") != null);
+    // Nobody is told to ask for a host they have just been refused.
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "ask the user") == null);
+}
+
+test "a build whose inputs arrived at startup never reaches the question" {
+    // **What a project that wrote its rules pays at build time: nothing.** The
+    // question is put from one branch only, the one a missing input takes, and
+    // an input the session start fetched is one the seam calls valid, so the
+    // evaluation takes it out of the store and that branch is never entered.
+    // `test/nix/real.zig` pins the other half against a real store.
+    var budget: chock_nix.build.Budget = .{};
+    var nowhere = NowhereWriter{};
+    var writing = chock_nix.build.Writing{
+        .writer = nowhere.writer(),
+        .budget = &budget,
+        .fetched_paths = &.{"/nix/store/aaaa-source"},
+    };
+    const seam = writing.seam();
+
+    try std.testing.expect(try seam.vtable.is_valid_path.?(seam.context, "/nix/store/aaaa-source"));
+    try std.testing.expect(!try seam.vtable.is_valid_path.?(seam.context, "/nix/store/bbbb-source"));
+}
+
+/// A `chock_nix.build.StoreWriter` that writes nowhere, for a test that asks
+/// the seam a question and never writes an object.
+const NowhereWriter = struct {
+    fn writer(self: *NowhereWriter) chock_nix.build.StoreWriter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: chock_nix.build.StoreWriter.VTable = .{ .add_object = addObject };
+
+    fn addObject(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        object: chock_nix.backend.AddObject,
+    ) anyerror![]u8 {
+        return allocator.dupe(u8, object.expectedPath());
+    }
+};
+
+test "nix_build builds this project and refuses a flake reference that is not it" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expect(isWorkspaceFlake("/work", "/work"));
+    try std.testing.expect(isWorkspaceFlake("/work", "/work/sub"));
+    try std.testing.expect(!isWorkspaceFlake("/work", "/workspace"));
+    try std.testing.expect(!isWorkspaceFlake("/work", "github:NixOS/nixpkgs"));
+
+    const said = try foreignFlakeRefusal(gpa, "github:NixOS/nixpkgs");
+    defer gpa.free(said);
+    try std.testing.expect(std.mem.indexOf(u8, said, "github:NixOS/nixpkgs") != null);
+}
+
+test "a program out of a build asks under exec.nix.store, and the dev shell's own still asks under exec.devshell" {
+    // **The split `Loop.Deps.store_closure` exists for.** That field is read
+    // from the toolchain the session started with, in `runSession`, and never
+    // from `chock_core.tools.Context.store_paths`, which a build grows. So a
+    // path the agent asked for keeps asking, while the toolchain the project
+    // declared keeps running with no prompt. Point that field at the grown
+    // list and the second expectation below becomes `exec.devshell`.
+    const startup_closure = [_][]const u8{"/nix/store/aaa-devshell"};
+
+    var buffer: [chock_core.tools.Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.aaa-devshell.bin.zig",
+        chock_core.tools.Tool.run_command.actionInto(
+            &buffer,
+            "/nix/store/aaa-devshell/bin/zig",
+            "",
+            &startup_closure,
+        ).?,
+    );
+
+    var built_buffer: [chock_core.tools.Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.nix.store.bbb-myproject.bin.myproject",
+        chock_core.tools.Tool.run_command.actionInto(
+            &built_buffer,
+            "/nix/store/bbb-myproject/bin/myproject",
+            "",
+            &startup_closure,
+        ).?,
+    );
+}
+
 test "a session that cannot provision refuses the call and names no package manager as a way out" {
     // The model is not offered `provide_tool` in this case, so this is a call
     // that came out of nowhere. It still has to be answered with something
@@ -16548,14 +18351,18 @@ test "a session that cannot provision refuses the call and names no package mana
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
 
     const result = try provisioning.runner().dispatch(gpa, std.testing.io, .{
@@ -16574,6 +18381,348 @@ test "a session that cannot provision refuses the call and names no package mana
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
 }
 
+/// A `NixEvalToolRunner` over `inner`, reading the workspace at `root` and
+/// holding an evaluation to `caps`.
+fn testNixEvalRunner(
+    inner: chock_core.Loop.ToolRunner,
+    root: []const u8,
+    caps: chock_policy.nix.Resolved,
+) NixEvalToolRunner {
+    return .{ .inner = inner, .settings = .{ .workspace_root = root, .caps = caps } };
+}
+
+/// The caps a project that named nothing gets, for a test about something
+/// other than the fold.
+const default_nix_caps = chock_policy.nix.Resolved{
+    .max_object_bytes = chock_policy.nix.default_max_object_bytes,
+    .max_session_bytes = chock_policy.nix.default_max_session_bytes,
+};
+
+/// One `nix_eval` call through a runner, for a test that asks about the
+/// answer. The caller owns both halves of the result.
+fn evaluateThrough(
+    gpa: std.mem.Allocator,
+    runner: *NixEvalToolRunner,
+    expression: []const u8,
+) !chock_proto.event.ToolResult {
+    const arguments = try std.json.Stringify.valueAlloc(
+        gpa,
+        .{ .expression = expression },
+        .{},
+    );
+    defer gpa.free(arguments);
+    return runner.runner().dispatch(gpa, std.testing.io, .{
+        .call_id = "c1",
+        .tool = "nix_eval",
+        .arguments = arguments,
+    });
+}
+
+test "an expression is evaluated in this process and the rendered value reaches the model" {
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval, "{ a = 1; b = \"two\"; }");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqualStrings("{ a = 1; b = \"two\"; }", result.output);
+    // Nothing went to the sandbox: an evaluation runs here, and a call this
+    // runner answers never reaches the one below it.
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+}
+
+test "a derivation answers its derivation path, and says that nothing was built" {
+    // The fact the eval and build split rests on, read from the tool the
+    // model actually calls: a derivation path is computed with no daemon and
+    // no store, and it is the name a later build would use.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval,
+        \\derivation { name = "x"; builder = "/bin/sh"; system = "x86_64-linux"; }
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.output,
+        "/nix/store/97qlv6h78lxlm9zc8849ahsbcklhsi2y-x.drv",
+    ) != null);
+    // The model is told the answer is a derivation, because a derivation and
+    // a string of the same path render the same way.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "is a derivation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "never builds") != null);
+}
+
+test "import from derivation is refused, and the refusal names the derivation" {
+    // Nix says very little when a build does not happen, so the derivation
+    // has to be in the words: a model that reads a refusal with no subject
+    // sends the same expression again. The driver is the only thing that
+    // knows the name, which is why one is installed for an evaluation that
+    // needs no store at all.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), "/nowhere", default_nix_caps);
+
+    const result = try evaluateThrough(gpa, &nix_eval,
+        \\import (derivation { name = "y"; builder = "/bin/sh"; system = "x86_64-linux"; })
+    );
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "-y.drv") != null);
+    // And it says what to do instead, so the next turn is not the same turn.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "drvPath") != null);
+}
+
+test "an expression that reads a path outside the workspace is refused" {
+    // Pure evaluation plus one root is the whole of this, and the root is the
+    // workspace. Widen `roots` in `NixEval.run` and the second call below
+    // starts answering.
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "note.txt", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "hello");
+    }
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(std.testing.io, &root_buffer)];
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = testNixEvalRunner(recorder.runner(), root, default_nix_caps);
+
+    const inside = try std.fmt.allocPrint(gpa, "builtins.readFile {s}/note.txt", .{root});
+    defer gpa.free(inside);
+    const read = try evaluateThrough(gpa, &nix_eval, inside);
+    defer gpa.free(read.call_id);
+    defer gpa.free(read.output);
+    try std.testing.expect(!read.is_error);
+    try std.testing.expectEqualStrings("\"hello\"", read.output);
+
+    const outside = try evaluateThrough(gpa, &nix_eval, "builtins.readFile /etc/hostname");
+    defer gpa.free(outside.call_id);
+    defer gpa.free(outside.output);
+    try std.testing.expect(outside.is_error);
+    // The refusal names the one tree that can be read, so the model can act
+    // on it rather than trying another path outside.
+    try std.testing.expect(std.mem.indexOf(u8, outside.output, root) != null);
+}
+
+test "the object cap a project names reaches the driver an evaluation answers through" {
+    // The wiring, and not the fold: `chock_policy.nix` has its own tests for
+    // which layer wins. Drop the `applyNixCaps` call in `NixEval.run` and the
+    // driver keeps `chock_nix.backend.default_max_object_bytes`.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = std.testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_object_bytes = \"4KiB\" } }");
+    }
+    {
+        var file = try config_tmp.dir.createFile(io, chock_policy.limits.operator_file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_session_bytes = \"8MiB\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    const resolved = try resolveNixCaps(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    );
+    try std.testing.expectEqual(@as(u64, 4 << 10), resolved.max_object_bytes);
+    try std.testing.expectEqual(@as(u64, 8 << 20), resolved.max_session_bytes);
+
+    // Through the very call `NixEvalToolRunner` makes, so the number is
+    // followed from the file the user wrote to the driver the evaluation
+    // answers through.
+    const settings = NixEval{ .workspace_root = "/nowhere", .caps = resolved };
+    var driver = settings.driverFor(gpa);
+    defer driver.deinit();
+    try std.testing.expectEqual(@as(usize, 4 << 10), driver.max_object_bytes);
+
+    // And a session whose policy named nothing keeps the library's own bound,
+    // so the line above reads the file and not a constant.
+    const quiet = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
+    var quiet_driver = quiet.driverFor(gpa);
+    defer quiet_driver.deinit();
+    try std.testing.expectEqual(
+        chock_nix.backend.default_max_object_bytes,
+        quiet_driver.max_object_bytes,
+    );
+}
+
+test "nix_eval answers through a store that takes no object, so it writes nothing to the host store" {
+    const gpa = std.testing.allocator;
+
+    // **The one difference between the two Nix tools.** A build writes its
+    // derivation closure into the host store, because that is the object the
+    // host is then told to realise. An evaluation that only reads writes
+    // nothing: give this seam an `add_object` and every expression the model
+    // sends could put bytes in the store.
+    const settings = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
+    var driver = settings.driverFor(gpa);
+    defer driver.deinit();
+    try std.testing.expect(driver.seam.vtable.add_object == null);
+    try std.testing.expect(driver.seam.vtable.build_paths == null);
+
+    // Store writes are off as well, so the two guards are apart: the seam
+    // could take nothing even if a caller turned writes on.
+    try std.testing.expect(driver.seam.vtable.read_file == null);
+
+    // What one of these evaluations does answer for a derivation is pinned by
+    // "a derivation answers its derivation path, and says that nothing was
+    // built", which reads the path out of the tool the model calls.
+}
+
+test "a nix block that does not parse stops the session rather than evaluating under another number" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A passing test may not let a line reach the real standard error.
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project_tmp = std.testing.tmpDir(.{});
+    defer project_tmp.cleanup();
+    var config_tmp = std.testing.tmpDir(.{});
+    defer config_tmp.cleanup();
+
+    {
+        var file = try project_tmp.dir.createFile(io, chock_policy.limits.file_name, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, ".{ .nix = .{ .max_object_bytes = \"50%\" } }");
+    }
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_len = try project_tmp.dir.realPath(io, &project_buffer);
+    var config_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_len = try config_tmp.dir.realPath(io, &config_buffer);
+
+    try std.testing.expectError(error.Reported, resolveNixCaps(
+        arena,
+        io,
+        project_buffer[0..project_len],
+        config_buffer[0..config_len],
+        null,
+    ));
+
+    // The field, the text, and the file it is in. The error name alone
+    // carries none of the three.
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "max_object_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said.err(), "50%") != null);
+}
+
+test "a session that cannot evaluate refuses the call and never says it evaluated" {
+    // The model is not offered the tool in that case, so this is a call it
+    // made out of nowhere. The refusal has to be honest for the same reason
+    // `provisioning_is_off` is.
+    const gpa = std.testing.allocator;
+
+    var context = chock_core.tools.Context{};
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
+
+    var nix_eval = NixEvalToolRunner{ .inner = recorder.runner(), .settings = null };
+
+    const result = try evaluateThrough(gpa, &nix_eval, "1 + 1");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(nix_eval_is_off, result.output);
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+
+    // And every other tool still goes straight through, whatever this
+    // session can do about Nix.
+    const other = try nix_eval.runner().dispatch(gpa, std.testing.io, .{
+        .call_id = "c2",
+        .tool = "read_file",
+        .arguments = "{\"path\":\"a\"}",
+    });
+    defer gpa.free(other.call_id);
+    defer gpa.free(other.output);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+}
+
+test "the tool is offered only to a session that can evaluate" {
+    // The other half of the gate, from the side `src/run.zig` sets. A tool
+    // the model cannot use costs one turn to call and one to read the
+    // failure: see `chock_core.tools.Support`.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const without = try chock_core.tools.Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+    });
+    for (without) |def| try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
+
+    const with = try chock_core.tools.Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+        .nix_eval = true,
+    });
+    var saw = false;
+    for (with) |def| {
+        if (std.mem.eql(u8, def.name, "nix_eval")) saw = true;
+    }
+    try std.testing.expect(saw);
+}
+
 test "asking twice for the same program builds nothing the second time" {
     // A model that forgets it already asked would otherwise pay for a second
     // resolution, which on a cache miss is minutes. The answer says the
@@ -16589,6 +18738,11 @@ test "asking twice for the same program builds nothing the second time" {
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     // `settings` names a `nix` that is not there. The point is that this test
     // never reaches it: a repeat is answered before anything is spawned.
     var provisioning = ProvisionToolRunner{
@@ -16602,8 +18756,7 @@ test "asking twice for the same program builds nothing the second time" {
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
     try provisioning.adopt("ripgrep", .{
         .program = "ripgrep",
@@ -18724,21 +20877,25 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
     var context = chock_core.tools.Context{};
     var recorder = RecordingToolRunner{ .context = &context, .tool_env = &tool_env };
 
+    var mounts = SessionMounts{
+        .arena = arena_state.allocator(),
+        .context = &context,
+        .tool_env = &tool_env,
+    };
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = null,
         .arena = arena_state.allocator(),
         .host_env = &tool_env,
         .environ = .empty,
-        .tool_env = &tool_env,
-        .context = &context,
+        .mounts = &mounts,
     };
 
     const dev_shell = [_][]const u8{
         "/nix/store/aaa-glibc",
         "/nix/store/bbb-zig",
     };
-    try provisioning.start(&dev_shell);
+    try mounts.start(&dev_shell);
 
     // ripgrep's closure: one path of its own, and the libc the dev shell
     // already carries.
@@ -18872,9 +21029,9 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     try std.testing.expectEqualStrings("call7", result.call_id);
 }
 
-test "one locked handle reaches all three askers, and one that missed it runs nothing" {
+test "one locked handle reaches all four askers, and one that missed it runs nothing" {
     // **The wiring that is easy to build and easy to leave half done.**
-    // `chock_core.Loop.Deps.give_locked` carries one handle and four parties
+    // `chock_core.Loop.Deps.give_locked` carries one handle and five parties
     // need it, so the fan out is this file's. One that keeps a null handle
     // asks nobody and refuses every call it gates, which is the safe direction
     // and a silent loss of a supplier's tools, or of `git add`, if only some
@@ -18920,6 +21077,20 @@ test "one locked handle reaches all three askers, and one that missed it runs no
     var mcp_aware = McpToolRunner{ .inner = git_aware.runner(), .state = &mcp_state };
     var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
 
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var context = chock_core.tools.Context{};
+    var mounts = SessionMounts{ .arena = gpa, .context = &context, .tool_env = &tool_env };
+    var nix_build = NixBuildToolRunner{
+        .inner = inner.runner(),
+        .settings = null,
+        .arena = gpa,
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+        .asker = .{ .arbiter = log.asker().arbiter },
+    };
+
     for ([_][]const u8{ "server_tool", "plugin_tool" }) |name| {
         const early = try plugin_aware.runner().dispatch(gpa, io, .{
             .call_id = "call1",
@@ -18959,7 +21130,19 @@ test "one locked handle reaches all three askers, and one that missed it runs no
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 
     // The handle arrives once, and all three work.
-    giveLockedToAskers(&mcp_state.session, &plugin_state.session, &git_aware, &log.locked);
+    // **And the Nix build runner is the fourth.** It has no tool call to run
+    // here, so what is asked of it is the handle itself: without one, every
+    // build whose closure fetches is refused for want of anybody to ask.
+    try std.testing.expect(nix_build.asker.?.locked == null);
+
+    giveLockedToAskers(
+        &mcp_state.session,
+        &plugin_state.session,
+        &git_aware,
+        &nix_build,
+        &log.locked,
+    );
+    try std.testing.expect(nix_build.asker.?.locked != null);
 
     const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
         .call_id = "call2",

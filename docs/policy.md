@@ -74,8 +74,8 @@ the file.
 **Chock ships default rules for the ordinary tool calls, so a project with no
 `chock.zon` at all still runs them without a prompt.** Reading a file, listing
 a directory, a glob, a grep, writing a file, editing a file, the workspace and
-toolchain paths a `run_command` call may execute, and the guidance and memory
-tools, all answer `allow` out of the box. A shipped default is a lower class
+toolchain paths a `run_command` call may execute, the guidance and memory
+tools, and `nix_eval`, all answer `allow` out of the box. A shipped default is a lower class
 of rule than anything in `chock.zon`: it is read only when a project's own
 rules name nothing that matches the key at all. **A project rule that matches
 wins outright**, whatever it names and however wide it is next to a default,
@@ -83,6 +83,17 @@ because the entire reason a default exists is to answer for a key the project
 did not. Writing `.{ .action = "call.write_file", .decision = .ask }` in your
 own `chock.zon` puts that call back behind a prompt, even though a shipped
 default would otherwise let it through.
+
+**A store path the session did not start with asks.** `run_command` names a
+program by the class it belongs to, and the store is two of those classes.
+`exec.devshell.*` is a program inside the Nix dev shell closure this session
+mounted at its start, and it is allowed: the toolchain was known before the
+model said anything. `exec.nix.store.*` is every other store path, and it is
+the one shipped rule that is not an `allow`. A store path is immutable, so it
+names one program forever, but the set of store paths is not: the agent can
+have an expression evaluated and the result built, and a path it made this way
+is not the toolchain it was given. `exec.path.*`, a bare name looked up on
+`PATH`, and `exec.workspace.*`, a path inside the project, are both unchanged.
 
 `net.connect.*` and `net.fetch.*` hold no shipped default, on purpose: a
 project that named nothing about a host still meets `ask` there, never
@@ -489,10 +500,10 @@ not the name: the server runs inside the same sandbox a tool call gets, and
 reaches nothing a tool call cannot. A program whose name cannot be one label of
 a rule does not start at all, and says so.
 
-### The three ceilings that are fields and not rules
+### The ceilings that are fields and not rules
 
 Some things a project sets are numbers rather than decisions, and a rule cannot
-narrow a number. A bundle therefore carries three blocks of its own:
+narrow a number. A bundle therefore carries four blocks of its own:
 
 - `budget` sets the most a session of this installation may spend. A project
   that asks for more is **refused when it starts**, and both numbers are in
@@ -515,8 +526,13 @@ narrow a number. A bundle therefore carries three blocks of its own:
   own sandbox. `chock doctor` reports the ceiling, resolved against the
   machine it runs on, so a person can read the number before a session ever
   starts.
+- `nix` sets the most a session of this installation may add to the Nix
+  store: how large one object may be, and how much a whole session may add in
+  total. See [Nix store byte caps](#nix-store-byte-caps) below for the block
+  itself. The same shape as `limits`: a project above the bundle's number is
+  **held to it and is not refused**.
 
-The budget ceiling differs from the other two on purpose. A refusal is right
+The budget ceiling differs from the other three on purpose. A refusal is right
 when the narrowing would otherwise be discovered late and without a reason,
 and a quiet minimum is right when the narrowing announces itself where it
 lands: a spawn that is refused says so, and `chock doctor` says so for a
@@ -571,7 +587,7 @@ actually uses back to where it may have come from:
 3. Chock's own machine sized default, if neither did.
 4. The org policy bundle's own `limits` ceiling, over whichever of the above
    won, if the bundle sets one. See
-   [The three ceilings that are fields and not rules](#the-three-ceilings-that-are-fields-and-not-rules).
+   [The ceilings that are fields and not rules](#the-ceilings-that-are-fields-and-not-rules).
 
 A misspelled field inside a `limits` block, in either file, is refused rather
 than read as the default: `.{ .limits = .{ .procceses = "50%" } }` stops the
@@ -582,3 +598,46 @@ under: `chock run` reads the two files once, before the first call, and writes
 the result into the sandbox it builds. A session the org ceiling lowered says
 so on its own output, once, with the number it was held to, because the
 program the number bounds cannot read it from inside the sandbox.
+
+## Nix store byte caps
+
+A `nix` block in `chock.zon` sets how much a Nix evaluation may add to the
+store:
+
+```zon
+.{
+    .nix = .{
+        .max_object_bytes = "16MiB",
+        .max_session_bytes = "256MiB",
+    },
+}
+```
+
+`max_object_bytes` bounds one object the store accepts: a Nix source file, a
+derivation, or a build output. It is checked against
+`chock_nix.backend.Driver` before the object reaches a store at all.
+`max_session_bytes` bounds the total a whole session may add across every
+object, and every build of one session spends against the same number. A
+build whose derivation would pass it is refused while it is being written, so
+nothing is built.
+
+**Neither field takes a percentage.** `limits.processes` and `limits.memory`
+each resolve a percentage against something the machine reports, a cpu count
+or a total. A store object has no such quantity to be a share of, so a
+percentage here is refused when the file is read, with a message that says
+why, rather than resolved against a number invented for the occasion. Each
+field is a bare number, or a number with a unit this reader knows: `B`,
+`KiB`, `MiB`, `GiB`, `TiB`.
+
+The fold is the same order `limits` uses:
+
+1. The project's own `chock.zon`, if it names the field.
+2. The operator's own `config.zon`, if it names the field and the project did
+   not.
+3. Chock's own built in default, if neither did.
+4. The org policy bundle's own `nix` ceiling, over whichever of the above
+   won, if the bundle sets one. See
+   [The ceilings that are fields and not rules](#the-ceilings-that-are-fields-and-not-rules).
+
+A misspelled field inside a `nix` block, in either file, is refused rather
+than read as the default, the same rule `limits` keeps.

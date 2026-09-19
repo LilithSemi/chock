@@ -187,6 +187,7 @@ const std = @import("std");
 const table = @import("table.zig");
 const subagent = @import("subagents.zig");
 const limits_mod = @import("limits.zig");
+const nix_mod = @import("nix.zig");
 
 /// The name of the bundle file. It lives in the data directory
 /// `lib/chock-auth/paths.zig` names, beside the credential store, because the
@@ -350,6 +351,15 @@ pub const Bundle = struct {
     /// a person can read it, and `src/doctor.zig`'s own `measureOrgCeilings`,
     /// which is where that happens.
     limits: ?limits_mod.Ceiling = null,
+    /// The most a session of this installation may add to the Nix store: how
+    /// large one object may be, and how much a whole session may add. Null
+    /// for a bundle that caps neither, which is every bundle that predates
+    /// this field, and then `nix_mod.foldLayers`'s first two layers are the
+    /// only limit there is.
+    ///
+    /// **A field and not a rule, and a minimum and not a refusal**, the same
+    /// shape `limits` has above: see `nix_mod.underCeiling`.
+    nix: ?nix_mod.Ceiling = null,
     /// Files every project of this installation must keep out of the sandbox,
     /// on top of whatever its own `deny_read` block names. Empty for a bundle
     /// that hides nothing, which is every bundle that predates this field.
@@ -432,6 +442,14 @@ pub const ParseError = error{
     /// can read. A ceiling that cannot parse is refused when the bundle is
     /// read, and never at the moment it would have bound a session.
     InvalidLimitsCeilingSetting,
+    /// The nix ceiling names neither `max_object_bytes` nor
+    /// `max_session_bytes`. The same rule `InvalidLimitsCeilingEmpty` keeps,
+    /// for the same reason.
+    InvalidNixCeilingEmpty,
+    /// The nix ceiling names a field whose text `nix_mod.parseBytes` cannot
+    /// read, including a percentage: see `nix_mod`'s own top comment for why
+    /// a store byte cap takes no percentage at all.
+    InvalidNixCeilingSetting,
 };
 
 /// What can go wrong while reading a bundle from a path.
@@ -493,10 +511,22 @@ pub const Diagnostic = union(enum) {
     /// A limits ceiling field's text does not parse. The field name is a
     /// literal of `lib/chock-policy/limits.zig`, so this owns nothing.
     invalid_limits_ceiling: InvalidLimitsCeiling,
+    /// The nix ceiling names neither `max_object_bytes` nor
+    /// `max_session_bytes`.
+    nix_ceiling_names_nothing,
+    /// A nix ceiling field's text does not parse, or names a percentage. The
+    /// field name is a literal of `lib/chock-policy/nix.zig`, so this owns
+    /// nothing.
+    invalid_nix_ceiling: InvalidNixCeiling,
 
     pub const InvalidLimitsCeiling = struct {
         field: []const u8,
         reason: limits_mod.SettingError,
+    };
+
+    pub const InvalidNixCeiling = struct {
+        field: []const u8,
+        reason: nix_mod.BytesError,
     };
 
     pub const NameTooLong = struct {
@@ -578,6 +608,14 @@ pub const Diagnostic = union(enum) {
             .invalid_limits_ceiling => |ceiling| try writer.print(
                 "the org policy bundle's limits ceiling names a {s} field that {s}",
                 .{ ceiling.field, limits_mod.reasonText(ceiling.reason) },
+            ),
+            .nix_ceiling_names_nothing => try writer.writeAll(
+                "the org policy bundle's nix ceiling names neither max_object_bytes nor " ++
+                    "max_session_bytes, so it caps nothing. Name at least one, or remove the block.",
+            ),
+            .invalid_nix_ceiling => |ceiling| try writer.print(
+                "the org policy bundle's nix ceiling names a {s} field that {s}",
+                .{ ceiling.field, nix_mod.reasonText(ceiling.reason) },
             ),
             .budget_max_cost_not_positive => |value| try writer.print(
                 "the org policy bundle's budget ceiling must be a number above zero, and this " ++
@@ -776,6 +814,29 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
             _ = limits_mod.parseSetting(text) catch |err| {
                 _ = note(diag, .{ .invalid_limits_ceiling = .{ .field = "memory", .reason = err } });
                 return error.InvalidLimitsCeilingSetting;
+            };
+        }
+    }
+
+    // The same two rules the limits ceiling above already keeps: a block
+    // that caps nothing is a mistake, and a field whose text
+    // `nix_mod.parseBytes` cannot read, including a percentage, is refused
+    // here rather than at the moment it would have bound a session.
+    if (bundle.nix) |ceiling| {
+        if (ceiling.max_object_bytes == null and ceiling.max_session_bytes == null) {
+            _ = note(diag, .nix_ceiling_names_nothing);
+            return error.InvalidNixCeilingEmpty;
+        }
+        if (ceiling.max_object_bytes) |text| {
+            _ = nix_mod.parseBytes(text) catch |err| {
+                _ = note(diag, .{ .invalid_nix_ceiling = .{ .field = "max_object_bytes", .reason = err } });
+                return error.InvalidNixCeilingSetting;
+            };
+        }
+        if (ceiling.max_session_bytes) |text| {
+            _ = nix_mod.parseBytes(text) catch |err| {
+                _ = note(diag, .{ .invalid_nix_ceiling = .{ .field = "max_session_bytes", .reason = err } });
+                return error.InvalidNixCeilingSetting;
             };
         }
     }

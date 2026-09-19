@@ -333,6 +333,26 @@ pub const Support = struct {
     /// `nix.build`. All three hold for the whole session, which is what makes
     /// a static tool list able to carry the answer. See `src/run.zig`.
     provisioning: bool = false,
+    /// This session can evaluate a Nix expression, so `nix_eval` has
+    /// somewhere to work.
+    ///
+    /// **Not a wire format question and not a provider question**, the same
+    /// as `provisioning` above. An evaluation runs in Chock's own process,
+    /// so a caller says true when it holds the evaluator and knows the one
+    /// directory a pure evaluation may read. See `src/run.zig`.
+    nix_eval: bool = false,
+    /// This session can build a Nix attribute on the host, so `nix_build` has
+    /// somewhere to work.
+    ///
+    /// **The machinery only, and never the answer.** `provisioning` above
+    /// folds the policy in, because a `provide_tool` request is decided once
+    /// at the start and an `ask` there reaches nobody. A build is decided per
+    /// call, under the attribute path it names and under the flake it names
+    /// when it names one, so the rows are read on the turn the model asks and
+    /// a person can answer them. A caller says true when `nix` is on the host
+    /// and it holds the evaluator, and reads no policy at all. See
+    /// `src/run.zig`.
+    nix_build: bool = false,
     /// What kind of agent this session runs as. **Not a wire format question
     /// and not a provider question**, the same as the two fields above: it
     /// asks what this agent is for. An `arbitrator` is offered no tool at all,
@@ -689,6 +709,8 @@ pub const Tool = enum {
     spawn_agent,
     update_plan,
     provide_tool,
+    nix_eval,
+    nix_build,
     restrict_self,
     fetch_url,
     ask_user,
@@ -717,6 +739,8 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .nix_eval,
+            .nix_build,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -749,6 +773,14 @@ pub const Tool = enum {
             // denies `nix.build`, never hears this name. See
             // `Support.provisioning`.
             .provide_tool => support.provisioning,
+            // Gated for the same reason `provide_tool` is: whether this
+            // session can evaluate at all is a fact about the caller that
+            // holds for the whole session. See `Support.nix_eval`.
+            .nix_eval => support.nix_eval,
+            // Gated on the machinery and not on the answer, which is what
+            // makes it different from `provide_tool` above. See
+            // `Support.nix_build`.
+            .nix_build => support.nix_build,
             .read_file,
             // Both of its gates were already read at the top of this
             // function, by `support.offers(self.needs())`. Nothing else holds
@@ -831,8 +863,27 @@ pub const Tool = enum {
     const exec_prefix = "exec";
 
     /// The class segment for a program `run_command` would resolve inside the
-    /// Nix store.
+    /// Nix store, and which the session's own startup closure does not hold.
+    /// See `devshell_class` for the half that split off this one.
     const store_class = "nix.store";
+
+    /// The class segment for a program inside a store path the session
+    /// mounted when it started.
+    ///
+    /// **A store path is immutable, but the set of store paths is not.** The
+    /// reason `store_class` once shipped a default of `allow` is that a
+    /// content addressed path names one program forever, unlike `./thing`,
+    /// which the agent can rewrite between two turns. That holds only while
+    /// the agent cannot put a new path in the store. It can: it evaluates an
+    /// expression, Chock registers the result, and a build makes store paths
+    /// that did not exist when the session started. A blanket allow written
+    /// for "the toolchain you were given" would then cover them too.
+    ///
+    /// So the two are separate classes. This one is the dev shell closure,
+    /// known at startup and mounted at startup, and nothing a session does
+    /// later joins it. Every other store path, a provisioned program and a
+    /// built one alike, keeps `store_class`.
+    const devshell_class = "devshell";
 
     /// The class segment for a program named by a path relative to the
     /// workspace. A path here carries at least one `/`: a bare name with
@@ -842,9 +893,10 @@ pub const Tool = enum {
     /// The class segment for a bare name, one with no `/` anywhere in it.
     /// `run_command`'s own description says a name like this is looked up on
     /// the host `PATH`, not read as a path inside the project. **Kept apart
-    /// from both other classes on purpose.** It cannot share `store_class`,
-    /// because nothing here resolves `PATH`, so this file never learns which
-    /// store entry, if any, the name would reach. It cannot share
+    /// from every other class on purpose.** It cannot share `store_class` or
+    /// `devshell_class`, because nothing here resolves `PATH`, so this file
+    /// never learns which store entry, if any, the name would reach. It
+    /// cannot share
     /// `workspace_class` either: `jq` almost always resolves off the project
     /// entirely, and a rule an author wrote to gate workspace programs must
     /// not silently also match it. `runInSandbox` is what resolves `PATH`,
@@ -880,8 +932,8 @@ pub const Tool = enum {
     ///
     /// `run_command`'s is the long one: the prefix, a separator, the class,
     /// a separator, and the path. `nix.store` and `workspace` are both nine
-    /// bytes long, `path` is shorter, and the bound below is sized for
-    /// either of the two nine byte classes.
+    /// bytes long, `devshell` and `path` are shorter, and the bound below is
+    /// sized for either of the two nine byte classes.
     ///
     /// **The path term is three times its own length and not one times
     /// it**, because of the escape below: a byte that is a dot or a percent
@@ -928,14 +980,18 @@ pub const Tool = enum {
     /// share a built name, because the one character that marks a boundary
     /// is a character no segment's own bytes can ever produce.
     ///
-    /// **No bound check on `buffer` here, on purpose.** `runCommandActionInto`
-    /// already checked `buffer.len` against `max_action_bytes` and `argv0`
-    /// against `max_raw_path_bytes` before calling this, and `max_action_bytes`
-    /// is sized for the worst path either bound allows. A check here could
+    /// **Public because `chock_core.nix` needs the same escape for the same
+    /// reason.** An attribute path and a flake reference are dotted paths
+    /// too, so building a Nix action out of them reuses this rather than
+    /// carrying a second encoder for the one hazard.
+    ///
+    /// **No bound check on `buffer` here, on purpose.** Every caller checks
+    /// `buffer.len` against its own `max_action_bytes`, sized for the worst
+    /// input its own bounds allow, before calling this. A check here could
     /// never fire for a real caller, and the "too long" test at the end of
     /// this file proves the refusal happens earlier, at the buffer check,
     /// rather than never at all.
-    fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
+    pub fn writeSegmentEscaped(buffer: []u8, cursor: usize, segment: []const u8) usize {
         var at = cursor;
         for (segment) |byte| {
             switch (byte) {
@@ -956,12 +1012,30 @@ pub const Tool = enum {
         return at;
     }
 
+    /// Whether `path`, an absolute path under the Nix store, is inside one of
+    /// the store paths in `closure`. See `devshell_class` and
+    /// `runCommandActionInto`'s own doc for what `closure` holds and why an
+    /// entry that is not a store path is skipped.
+    fn closureHolds(closure: []const []const u8, path: []const u8) bool {
+        for (closure) |raw| {
+            var entry = raw;
+            while (entry.len != 0 and entry[entry.len - 1] == '/') entry = entry[0 .. entry.len - 1];
+            if (entry.len <= store_prefix.len) continue;
+            if (!std.mem.startsWith(u8, entry, store_prefix)) continue;
+            if (!std.mem.startsWith(u8, path, entry)) continue;
+            if (path.len == entry.len or path[entry.len] == '/') return true;
+        }
+        return false;
+    }
+
     /// The action name for a `run_command` call whose first `argv` element,
     /// already read out by the real parser, is `argv0`. `project_root` is
-    /// `sandbox.Config.cwd`, the same value `leavesProject` reads. Written
-    /// into `buffer`. See `actionInto`.
+    /// `sandbox.Config.cwd`, the same value `leavesProject` reads. `closure`
+    /// is the set of store paths the session mounted at its start, empty for
+    /// a caller that knows none. Written into `buffer`. See `actionInto`.
     ///
     /// ```
+    /// /nix/store/dev-zig/bin/zig            ->  exec.devshell.dev-zig.bin.zig
     /// /nix/store/abc-jq/bin/jq              ->  exec.nix.store.abc-jq.bin.jq
     /// ./build.sh                            ->  exec.workspace.build%2Esh
     /// <project_root>/build.sh               ->  exec.workspace.build%2Esh
@@ -970,6 +1044,29 @@ pub const Tool = enum {
     /// jq                                    ->  exec.path.jq
     /// a/../b                                ->  exec.unparsed
     /// ```
+    ///
+    /// The first two lines differ only in the closure: `/nix/store/dev-zig`
+    /// is in it and `/nix/store/abc-jq` is not.
+    ///
+    /// **The closure is read dynamically and the classes stay static data.**
+    /// Which store paths a session mounted is known only at run time, so the
+    /// caller that knows gives it here, the same way it gives `project_root`
+    /// so an in-project absolute path can be told from one outside. What
+    /// `lib/chock-policy/defaults.zig` ships is still four fixed names.
+    ///
+    /// **An empty `closure` names every store path `store_class`.** That is
+    /// the answer for a session with no dev shell, and it is what this
+    /// function did before the class split. An entry that is not itself a
+    /// store path is skipped for the same reason: a plain `/nix/store` names
+    /// the whole store rather than a closure, and reading it as one would
+    /// put every store path in the store into `devshell_class`, which is the
+    /// hazard the split exists to close. See `Context.store_paths`, whose
+    /// own default is exactly that bare path.
+    ///
+    /// **A program is `<store path>/bin/<name>`, so being under a closure
+    /// entry counts and not only being equal to one.** The boundary is a
+    /// whole path component: `/nix/store/abc` does not hold
+    /// `/nix/store/abcd/bin/x`.
     ///
     /// **A path keeps its own order, and is never reversed.** Unlike
     /// `chock_broker.network.actionInto`'s host name, a path is already
@@ -1055,7 +1152,12 @@ pub const Tool = enum {
     /// ever a boundary this function wrote between two segments, never a
     /// byte a segment held, so no two distinct paths can ever share a built
     /// name.
-    fn runCommandActionInto(buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+    fn runCommandActionInto(
+        buffer: []u8,
+        argv0: ?[]const u8,
+        project_root: []const u8,
+        closure: []const []const u8,
+    ) ?[]const u8 {
         if (buffer.len < max_action_bytes) return null;
 
         var path = argv0 orelse return writeWhole(buffer, unparsed_action);
@@ -1110,7 +1212,7 @@ pub const Tool = enum {
         }
 
         const class: []const u8 = if (is_store)
-            store_class
+            (if (closureHolds(closure, path)) devshell_class else store_class)
         else if (has_slash)
             workspace_class
         else
@@ -1143,7 +1245,9 @@ pub const Tool = enum {
     /// the same as an element this file's own bound rejects. `project_root`
     /// is `sandbox.Config.cwd` and is read only for `run_command`: see
     /// `runCommandActionInto`'s own doc for why an absolute `argv0` inside
-    /// the project needs it.
+    /// the project needs it. `closure` is the session's own startup store
+    /// paths, read only for `run_command` as well, and an empty one is the
+    /// answer for a session that mounted no dev shell.
     ///
     /// Null when the name would not fit. See `runCommandActionInto`'s own
     /// doc for why nothing else answers null. `buffer` must hold
@@ -1156,7 +1260,8 @@ pub const Tool = enum {
     /// ```zon
     /// .{ .action = "call.write_file", .decision = .ask }     // every write asks
     /// .{ .action = "exec.workspace.*", .decision = .allow }  // a program the project built
-    /// .{ .action = "exec.nix.store.*", .decision = .ask }    // a program the store provides
+    /// .{ .action = "exec.devshell.*", .decision = .allow }   // the toolchain this session got
+    /// .{ .action = "exec.nix.store.*", .decision = .ask }    // any other store path
     /// ```
     ///
     /// Only `run_command` reads `argv0` at all: every other tool is named
@@ -1166,9 +1271,23 @@ pub const Tool = enum {
     ///
     /// No `else`: a tool added to the enum and forgotten here fails the build
     /// rather than being named by accident.
-    pub fn actionInto(self: Tool, buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+    pub fn actionInto(
+        self: Tool,
+        buffer: []u8,
+        argv0: ?[]const u8,
+        project_root: []const u8,
+        closure: []const []const u8,
+    ) ?[]const u8 {
         return switch (self) {
-            .run_command => runCommandActionInto(buffer, argv0, project_root),
+            .run_command => runCommandActionInto(buffer, argv0, project_root, closure),
+            // **The one tool whose action is not its own name.** A build is
+            // named after the attribute path it asks for, so a rule reads
+            // `nix.build.packages.*` and not the call. That name is built by
+            // `chock_core.nix.buildActionFor`, which needs the arguments and
+            // a buffer of its own, and `Loop.gateToolCall` asks it before it
+            // reaches here. Null is the safe direction for a caller that
+            // forgot: the call is refused for having no name.
+            .nix_build => null,
             .read_file,
             .read_image,
             .list_directory,
@@ -1182,6 +1301,7 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            .nix_eval,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -1224,6 +1344,12 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            // It renders a value and never writes a byte anywhere. See
+            // `nix_eval_needs_a_session`.
+            .nix_eval,
+            // A build writes into the host's own Nix store, which is not the
+            // project and holds no source a language server reads.
+            .nix_build,
             .restrict_self,
             .fetch_url,
             .ask_user,
@@ -1272,6 +1398,13 @@ pub const Tool = enum {
             .spawn_agent,
             .update_plan,
             .provide_tool,
+            // The store writes an evaluation could make are off, and the
+            // answer reaches the model rather than the disk. See
+            // `src/run.zig`'s own `NixEvalToolRunner`.
+            .nix_eval,
+            // A build writes into the host's own Nix store, which is neither
+            // the workspace nor on its filesystem.
+            .nix_build,
             .restrict_self,
             // The page reaches the model and never the disk. See
             // `lib/chock-core/fetch.zig`.
@@ -1410,6 +1543,30 @@ pub const Tool = enum {
                 "is the package \"ripgrep\". The program is there for every call after this one, " ++
                 "and for this session only. Resolving takes seconds and can take minutes, so ask " ++
                 "for a program you are going to use.",
+            .nix_eval => "Evaluate one Nix expression and read the answer. Use it to find out " ++
+                "what a package set or a flake really says: the value of an attribute, the " ++
+                "names in a set, the derivation path of a package. **Nothing is built.** A " ++
+                "derivation answers what it is and where its derivation file would be, and " ++
+                "that is the whole of it, so an expression that reads the result of a build, " ++
+                "such as an import of a derivation, is refused and says which derivation it " ++
+                "wanted. The evaluation is pure: the environment is empty, there is no " ++
+                "NIX_PATH and no channel, and it reads files inside the workspace and nothing " ++
+                "else on the machine. Give the expression alone, the way you would type it " ++
+                "into a repl. The answer is rendered the same way a repl renders it, up to " ++
+                max_nix_eval_text ++ " bytes.",
+            .nix_build => "Build one attribute of a flake, and get what it produced. Use it " ++
+                "to build this project, or a package of it, when the task is to find out " ++
+                "whether it builds or to run what it makes. The attribute path is a list of " ++
+                "names, one name per entry, such as [\"packages\", \"x86_64-linux\", " ++
+                "\"default\"]: it is never one dotted string, and a name holds letters, " ++
+                "digits, \"-\", \"_\" and \"+\". Leave \"flake\" out to build the " ++
+                "project you are working in. **A build runs on the machine, outside the " ++
+                "sandbox, so it is asked about by the attribute path you named, and a call " ++
+                "that names a flake is asked about that flake as well**, which a project " ++
+                "often does not allow even where it allows its own builds. A refusal says " ++
+                "the rule and not the reason. What the build produced is on the " ++
+                "PATH of every call after this one, and it is gone at the end of the session. " ++
+                "A build takes seconds and can take minutes, and the turn waits for it.",
             .restrict_self => "Promise that you will not do something in this session. Use it " ++
                 "when you have worked out what the task needs and can see what it does not need: " ++
                 "\"net.fetch\" at \"deny\" for a task that reads local files, \"git.push\" at " ++
@@ -1497,6 +1654,8 @@ pub const Tool = enum {
             .spawn_agent => SpawnAgentArgs,
             .update_plan => UpdatePlanArgs,
             .provide_tool => ProvideToolArgs,
+            .nix_eval => NixEvalArgs,
+            .nix_build => NixBuildArgs,
             .restrict_self => RestrictSelfArgs,
             .fetch_url => FetchUrlArgs,
             .ask_user => AskUserArgs,
@@ -1505,6 +1664,14 @@ pub const Tool = enum {
         };
     }
 };
+
+/// The most bytes one `nix_eval` answer renders to. A rendered attribute set
+/// of a real package set is far larger than a model can use, and the answer
+/// travels into the context window, so this is where it stops.
+pub const max_nix_eval_bytes: usize = 16 << 10;
+
+/// `max_nix_eval_bytes` as text, for `Tool.description`.
+const max_nix_eval_text = std.fmt.comptimePrint("{d}", .{max_nix_eval_bytes});
 
 /// `max_directory_entries` as text, for `Tool.description`, which is built at
 /// comptime and cannot call a formatter.
@@ -1707,6 +1874,8 @@ pub const Registry = struct {
             .spawn_agent => toolErrorResult(allocator, call, try allocator.dupe(u8, spawn_needs_a_session)),
             .update_plan => toolErrorResult(allocator, call, try allocator.dupe(u8, plan_needs_a_session)),
             .provide_tool => toolErrorResult(allocator, call, try allocator.dupe(u8, provision_needs_a_session)),
+            .nix_eval => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_eval_needs_a_session)),
+            .nix_build => toolErrorResult(allocator, call, try allocator.dupe(u8, nix_build_needs_a_session)),
             .restrict_self => toolErrorResult(allocator, call, try allocator.dupe(u8, restrict_needs_a_session)),
             .fetch_url => toolErrorResult(allocator, call, try allocator.dupe(u8, fetch_needs_a_session)),
             .ask_user => toolErrorResult(allocator, call, try allocator.dupe(u8, ask_needs_a_session)),
@@ -1779,6 +1948,38 @@ pub const restrict_needs_a_session = "nothing was promised: a promise is kept in
 pub const provision_needs_a_session = "no program was provisioned: a program is added to the " ++
     "toolchain of a whole session, and this tool call was run without one. Do the work with a " ++
     "program the toolchain already has.";
+
+/// What a `nix_eval` call gets from `Registry.dispatchWith`.
+///
+/// **A `Registry` cannot evaluate, and the reason is the same one
+/// `provision_needs_a_session` gives.** An evaluation runs in Chock's own
+/// process, outside every sandbox, against an evaluator the caller holds and
+/// a store cap the caller read out of the project's own policy. A `Registry`
+/// builds one `sandbox.Config` per dispatch and holds neither. So the caller
+/// that owns the session answers this call, exactly as it answers
+/// `provide_tool`, and this is the answer for a dispatch with no session
+/// behind it.
+///
+/// It refuses rather than answering an empty value, because a model handed a
+/// value nobody computed would reason about it.
+pub const nix_eval_needs_a_session = "nothing was evaluated: a Nix evaluation runs in the " ++
+    "harness itself, outside every sandbox, and this tool call was run without the session " ++
+    "that owns it. Work from what is in the project instead.";
+
+/// What a `nix_build` call gets from `Registry.dispatchWith`.
+///
+/// **A `Registry` cannot build, and the reason is both of the reasons above at
+/// once.** A build is evaluated in Chock's own process and then realised by
+/// `nix` on the host, outside every sandbox, and what it produced joins the
+/// mount set every later tool call is built with. A `Registry` holds neither
+/// the evaluator nor a value that outlives one call. So the caller that owns
+/// the session answers this call, exactly as it answers `provide_tool`.
+///
+/// It refuses rather than pretending, because a model told a program is now
+/// there would call it on the next turn and find it is not.
+pub const nix_build_needs_a_session = "nothing was built: a build is evaluated in the harness " ++
+    "and realised on the machine, and this tool call was run without the session that owns " ++
+    "it. Do the work with what the toolchain already has.";
 
 /// What a `fetch_url` call gets from `Registry.dispatchWith`.
 ///
@@ -2418,6 +2619,41 @@ pub const ProvideToolArgs = struct {
         .program = "The package name, alone. Not a path, not a URL, and not a flake reference: " ++
             "\"ripgrep\", or \"python3Packages.requests\" for a package inside a set. Where the " ++
             "name is looked up is set by the project and you cannot change it.",
+    };
+};
+
+/// Public for the same reason `ProvideToolArgs` is: the caller that owns the
+/// session holds the evaluator, so it parses these arguments and this file
+/// never does. See `nix_eval_needs_a_session`.
+pub const NixEvalArgs = struct {
+    expression: []const u8,
+
+    pub const docs = .{
+        .expression = "The Nix expression, alone, the way you would type it into a repl. It is " ++
+            "evaluated in pure mode, so an impure builtin answers nothing and a path outside " ++
+            "the workspace is refused.",
+    };
+};
+
+/// Public for the same reason `NixEvalArgs` is: the caller that owns the
+/// session holds the evaluator and the `nix` on the host, so it parses these
+/// arguments and this file never does. See `nix_build_needs_a_session`.
+///
+/// **The attribute path is a list and never one dotted string.** A Nix
+/// attribute name may itself hold a dot, so one string would leave the tool
+/// guessing where a level ends, and the policy action is built out of these
+/// same names: see `chock_core.nix.buildActionInto`.
+pub const NixBuildArgs = struct {
+    attribute: []const []const u8,
+    flake: ?[]const u8 = null,
+
+    pub const docs = .{
+        .attribute = "The attribute path, one name per entry, such as [\"packages\", " ++
+            "\"x86_64-linux\", \"default\"]. A name holds letters, digits, \"-\", " ++
+            "\"_\" and \"+\" and starts with a letter or a digit.",
+        .flake = "The flake to build from, such as \"github:NixOS/nixpkgs\". Leave it out " ++
+            "to build from the project you are working in, which is what you almost always " ++
+            "want.",
     };
 };
 
@@ -7162,6 +7398,8 @@ const full_support = Support{
     .provider = .{ .images = true },
     .memory = true,
     .provisioning = true,
+    .nix_eval = true,
+    .nix_build = true,
 };
 
 test "every tool in the enum is offered, and each one is named exactly once" {
@@ -7185,15 +7423,16 @@ test "every tool in the enum is offered, and each one is named exactly once" {
         try std.testing.expectEqual(@as(usize, 1), seen);
     }
 
-    // The nineteen a session with everything gets, by name, so a tool that
+    // The whole list a session with everything gets, by name, so a tool that
     // quietly loses its entry is a test failure and not a smaller list
     // nobody notices.
     const expected = [_][]const u8{
-        "read_file",     "read_image",   "list_directory", "glob",
-        "grep",          "write_file",   "edit_file",      "run_command",
-        "read_guidance", "read_memory",  "write_memory",   "spawn_agent",
-        "update_plan",   "provide_tool", "restrict_self",  "fetch_url",
-        "ask_user",      "set_title",    "request_action",
+        "read_file",      "read_image",   "list_directory", "glob",
+        "grep",           "write_file",   "edit_file",      "run_command",
+        "read_guidance",  "read_memory",  "write_memory",   "spawn_agent",
+        "update_plan",    "provide_tool", "nix_eval",       "nix_build",
+        "restrict_self",  "fetch_url",    "ask_user",       "set_title",
+        "request_action",
     };
     try std.testing.expectEqual(expected.len, defs.len);
     for (expected, defs) |name, def| try std.testing.expectEqualStrings(name, def.name);
@@ -7271,12 +7510,12 @@ test "an arbitrator is offered no tool at all, and a name it invented runs nothi
     try std.testing.expectEqual(Role.worker, (Context{}).role);
 }
 
-test "a session with no knowledgebase, no Nix and no vision is offered none of those four tools" {
+test "a session with no knowledgebase, no Nix and no vision is offered none of those six tools" {
     // A tool the model cannot use is worse than a tool that is missing: it
     // costs one turn to call and one to read the failure, and a small model
     // may never recover from the confusion. So a caller that could not make
     // the directory, cannot reach Nix, and talks to a provider that says
-    // nothing about images offers fifteen tools, not nineteen with four that
+    // nothing about images offers six tools fewer, rather than six that
     // always fail.
     //
     // `spawn_agent` is the one tool this reasoning does not reach, because
@@ -7287,18 +7526,23 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
     const arena = arena_state.allocator();
 
     const defs = try Registry.definitions(arena, plain_support);
-    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 4, defs.len);
+    try std.testing.expectEqual(@typeInfo(Tool).@"enum".fields.len - 6, defs.len);
     for (defs) |def| {
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "write_memory"));
         try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
-        // The fourth, and the only one of the four whose gate is the wire and
+        // A session that cannot evaluate never hears this name, the same
+        // rule `provide_tool` above keeps and for the same reason.
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
+        // And a session with no `nix` on the machine cannot build.
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_build"));
+        // The last, and the only one of the six whose gate is the wire and
         // the provider rather than something the caller built. See `Support`.
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_image"));
     }
 
-    // And the three gates are separate: a session that can provision and has
-    // no knowledgebase is offered the one and not the other two. A single
+    // And the four gates are separate: a session that can provision and has
+    // no knowledgebase is offered the one and not the other three. A single
     // flag standing for all of them would pass the check above and fail this.
     const nix_only = try Registry.definitions(arena, .{
         .adapter = .openai_compatible,
@@ -7308,8 +7552,24 @@ test "a session with no knowledgebase, no Nix and no vision is offered none of t
     for (nix_only) |def| {
         if (std.mem.eql(u8, def.name, "provide_tool")) saw_provide = true;
         try std.testing.expect(!std.mem.eql(u8, def.name, "read_memory"));
+        try std.testing.expect(!std.mem.eql(u8, def.name, "nix_eval"));
     }
     try std.testing.expect(saw_provide);
+
+    // The other half of the same separation: evaluating and provisioning are
+    // two facts about a session, and a caller that has one may not have the
+    // other. A session on a machine with Nix but a policy that denies a
+    // build is exactly this shape.
+    const eval_only = try Registry.definitions(arena, .{
+        .adapter = .openai_compatible,
+        .nix_eval = true,
+    });
+    var saw_eval = false;
+    for (eval_only) |def| {
+        if (std.mem.eql(u8, def.name, "nix_eval")) saw_eval = true;
+        try std.testing.expect(!std.mem.eql(u8, def.name, "provide_tool"));
+    }
+    try std.testing.expect(saw_eval);
 
     // And `read_guidance` is there either way: the shelf is compiled in, so
     // it needs no directory and cannot be missing.
@@ -7650,10 +7910,17 @@ test "a tool with no argument to read is named after itself, once each" {
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
+        // The two that are named after what they ask for and not after
+        // themselves. `nix_build` answers null here on purpose: its name is
+        // the attribute path, built by `chock_core.nix.buildActionFor`.
         if (tool == .run_command) continue;
+        if (tool == .nix_build) {
+            try std.testing.expect(tool.actionInto(&buffer, null, "", &.{}) == null);
+            continue;
+        }
         try std.testing.expectEqualStrings(
             "call." ++ f.name,
-            tool.actionInto(&buffer, null, "").?,
+            tool.actionInto(&buffer, null, "", &.{}).?,
         );
     }
 }
@@ -7666,8 +7933,86 @@ test "run_command on a program under the Nix store names the program, left to ri
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "exec.nix.store.abc-jq.bin.jq",
-        Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "").?,
+        Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "", &.{}).?,
     );
+}
+
+test "a program inside the session's startup closure is its own class" {
+    // The split the store needed. A store path is immutable, but the set of
+    // store paths is not: the agent can evaluate an expression and Chock can
+    // build the result, so a path that exists now did not exist when the
+    // session started. The closure is what the session mounted at its start,
+    // and a program in it is the toolchain the session was given.
+    //
+    // The program is `<store path>/bin/<name>`, so it is under a closure
+    // entry and never equal to one. The name still reads left to right, the
+    // same as the store class it split off.
+    const closure = [_][]const u8{
+        "/nix/store/dev-zig",
+        "/nix/store/dev-jq",
+    };
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.dev-zig.bin.zig",
+        Tool.run_command.actionInto(&buffer, "/nix/store/dev-zig/bin/zig", "", &closure).?,
+    );
+
+    // The entry itself, with nothing under it, is in the closure too.
+    var entry_buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.dev-jq",
+        Tool.run_command.actionInto(&entry_buffer, "/nix/store/dev-jq", "", &closure).?,
+    );
+}
+
+test "a store path the startup closure does not hold keeps the store class" {
+    // The whole point of the split: a path this session caused to exist is
+    // not the toolchain it was given, so it keeps the name Chock ships as
+    // `ask`. The sibling case is checked here as well, because a prefix
+    // compare with no component boundary would read `/nix/store/dev-zigzag`
+    // as inside `/nix/store/dev-zig`.
+    const closure = [_][]const u8{"/nix/store/dev-zig"};
+    const outside = [_][]const u8{
+        "/nix/store/built-by-the-agent/bin/thing",
+        "/nix/store/dev-zigzag/bin/zig",
+    };
+    const expected = [_][]const u8{
+        "exec.nix.store.built-by-the-agent.bin.thing",
+        "exec.nix.store.dev-zigzag.bin.zig",
+    };
+    for (outside, expected) |path, want| {
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            want,
+            Tool.run_command.actionInto(&buffer, path, "", &closure).?,
+        );
+    }
+}
+
+test "a session with no closure names every store path the store class" {
+    // Today's behaviour, unchanged. A session with no dev shell knows no
+    // closure, and the bare `/nix/store` that `Context.store_paths` defaults
+    // to names the whole store rather than a closure: reading it as one
+    // would put every store path there is into the dev shell class, which is
+    // the hazard the split exists to close.
+    const nothing: []const []const u8 = &.{};
+    const whole_store = [_][]const u8{"/nix/store"};
+    const with_slash = [_][]const u8{"/nix/store/"};
+    const not_a_store_path = [_][]const u8{ "/usr/bin", "/bin", "/etc" };
+
+    const closures = [_][]const []const u8{
+        nothing,
+        &whole_store,
+        &with_slash,
+        &not_a_store_path,
+    };
+    for (closures) |closure| {
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "exec.nix.store.abc-jq.bin.jq",
+            Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "", closure).?,
+        );
+    }
 }
 
 test "a dot a path already carried is never read as a boundary between segments" {
@@ -7688,8 +8033,8 @@ test "a dot a path already carried is never read as a boundary between segments"
     var one_segment: [Tool.max_action_bytes]u8 = undefined;
     var two_segments: [Tool.max_action_bytes]u8 = undefined;
 
-    const from_one_segment = Tool.run_command.actionInto(&one_segment, "./build.sh", "").?;
-    const from_two_segments = Tool.run_command.actionInto(&two_segments, "./build/sh", "").?;
+    const from_one_segment = Tool.run_command.actionInto(&one_segment, "./build.sh", "", &.{}).?;
+    const from_two_segments = Tool.run_command.actionInto(&two_segments, "./build/sh", "", &.{}).?;
 
     try std.testing.expectEqualStrings("exec.workspace.build%2Esh", from_one_segment);
     try std.testing.expectEqualStrings("exec.workspace.build.sh", from_two_segments);
@@ -7708,8 +8053,8 @@ test "a dot at a segment boundary never reads as the same name from either side"
     var a_dot_slash_b: [Tool.max_action_bytes]u8 = undefined;
     var a_slash_dot_b: [Tool.max_action_bytes]u8 = undefined;
 
-    const from_a_dot_slash_b = Tool.run_command.actionInto(&a_dot_slash_b, "a./b", "").?;
-    const from_a_slash_dot_b = Tool.run_command.actionInto(&a_slash_dot_b, "a/.b", "").?;
+    const from_a_dot_slash_b = Tool.run_command.actionInto(&a_dot_slash_b, "a./b", "", &.{}).?;
+    const from_a_slash_dot_b = Tool.run_command.actionInto(&a_slash_dot_b, "a/.b", "", &.{}).?;
 
     try std.testing.expectEqualStrings("exec.workspace.a%2E.b", from_a_dot_slash_b);
     try std.testing.expectEqualStrings("exec.workspace.a.%2Eb", from_a_slash_dot_b);
@@ -7734,11 +8079,11 @@ test "two spellings of the same program build the same name" {
     };
 
     var buffer: [Tool.max_action_bytes]u8 = undefined;
-    const a0 = Tool.run_command.actionInto(&buffer, group_a[0], "").?;
+    const a0 = Tool.run_command.actionInto(&buffer, group_a[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.workspace.build%2Esh", a0);
     for (group_a[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(a0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(a0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 
     // The bare `build.sh` normalises to the same one segment as
@@ -7747,22 +8092,22 @@ test "two spellings of the same program build the same name" {
     // a script the agent just wrote, and a rule for one must never also
     // cover the other.
     var bare_build: [Tool.max_action_bytes]u8 = undefined;
-    const bare_build_action = Tool.run_command.actionInto(&bare_build, "build.sh", "").?;
+    const bare_build_action = Tool.run_command.actionInto(&bare_build, "build.sh", "", &.{}).?;
     try std.testing.expectEqualStrings("exec.path.build%2Esh", bare_build_action);
     try std.testing.expect(!std.mem.eql(u8, a0, bare_build_action));
 
-    const b0 = Tool.run_command.actionInto(&buffer, group_b[0], "").?;
+    const b0 = Tool.run_command.actionInto(&buffer, group_b[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.workspace.a.b", b0);
     for (group_b[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(b0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(b0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 
-    const c0 = Tool.run_command.actionInto(&buffer, group_c[0], "").?;
+    const c0 = Tool.run_command.actionInto(&buffer, group_c[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.nix.store.x.bin.jq", c0);
     for (group_c[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(c0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(c0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 }
 
@@ -7800,8 +8145,8 @@ test "an absolute path inside the project and its relative spelling build the sa
 
         var rel_buffer: [Tool.max_action_bytes]u8 = undefined;
         var abs_buffer: [Tool.max_action_bytes]u8 = undefined;
-        const rel_name = Tool.run_command.actionInto(&rel_buffer, rel, project_root).?;
-        const abs_name = Tool.run_command.actionInto(&abs_buffer, abs, project_root).?;
+        const rel_name = Tool.run_command.actionInto(&rel_buffer, rel, project_root, &.{}).?;
+        const abs_name = Tool.run_command.actionInto(&abs_buffer, abs, project_root, &.{}).?;
         try std.testing.expectEqualStrings(rel_name, abs_name);
     }
 }
@@ -7819,8 +8164,8 @@ test "an absolute path outside the project keeps the name it already had" {
 
     var outside_buffer: [Tool.max_action_bytes]u8 = undefined;
     var inside_buffer: [Tool.max_action_bytes]u8 = undefined;
-    const outside_name = Tool.run_command.actionInto(&outside_buffer, "/etc/passwd", project_root).?;
-    const inside_name = Tool.run_command.actionInto(&inside_buffer, "etc/passwd", project_root).?;
+    const outside_name = Tool.run_command.actionInto(&outside_buffer, "/etc/passwd", project_root, &.{}).?;
+    const inside_name = Tool.run_command.actionInto(&inside_buffer, "etc/passwd", project_root, &.{}).?;
     try std.testing.expectEqualStrings(outside_name, inside_name);
 }
 
@@ -7837,6 +8182,12 @@ test "no two paths in a table built to confuse the encoding share a name" {
     // second carries a slash and the first does not, so a scheme that
     // classed them by segment count rather than by that slash would have
     // named them alike.
+    //
+    // The last four are the store, read against a closure that holds the
+    // first two entries and not the last two. A dev shell path and a store
+    // path that only differs from it by its class must stay apart, and so
+    // must a closure entry and its sibling with a longer name.
+    const closure = [_][]const u8{ "/nix/store/dev-zig", "/nix/store/dev-jq" };
     const paths = [_][]const u8{
         "./build.sh",
         "./build/sh",
@@ -7848,12 +8199,16 @@ test "no two paths in a table built to confuse the encoding share a name" {
         "a/b.c",
         "jq",
         "build.sh",
+        "/nix/store/dev-zig/bin/zig",
+        "/nix/store/dev-jq/bin/jq",
+        "/nix/store/dev-zigzag/bin/zig",
+        "/nix/store/built/bin/zig",
     };
 
     var buffers: [paths.len][Tool.max_action_bytes]u8 = undefined;
     var actions: [paths.len][]const u8 = undefined;
     for (paths, 0..) |path, i| {
-        actions[i] = Tool.run_command.actionInto(&buffers[i], path, "").?;
+        actions[i] = Tool.run_command.actionInto(&buffers[i], path, "", &closure).?;
     }
 
     for (actions, 0..) |a, i| {
@@ -7880,7 +8235,7 @@ test "a path with a .. component is never resolved, and answers unparsed instead
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         try std.testing.expectEqualStrings(
             "exec.unparsed",
-            Tool.run_command.actionInto(&buffer, path, "").?,
+            Tool.run_command.actionInto(&buffer, path, "", &.{}).?,
         );
     }
 }
@@ -7896,7 +8251,7 @@ test "a bare name run_command would resolve on PATH is its own class, neither st
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "exec.path.jq",
-        Tool.run_command.actionInto(&buffer, "jq", "").?,
+        Tool.run_command.actionInto(&buffer, "jq", "", &.{}).?,
     );
 }
 
@@ -7910,7 +8265,7 @@ test "run_command with no argv element to read still gets a name, and never null
     // for a buffer that is too small. The rot test below is what makes this
     // the rule for every tool and not just this one.
     var buffer: [Tool.max_action_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "").?);
+    try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "", &.{}).?);
 }
 
 test "a name too long for the buffer is a refusal, and never a truncated key" {
@@ -7920,7 +8275,7 @@ test "a name too long for the buffer is a refusal, and never a truncated key" {
     // fill in full gets `null` and nothing else.
     var small: [8]u8 = undefined;
     try std.testing.expect(
-        Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "") == null,
+        Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "", &.{}) == null,
     );
 }
 
@@ -7931,8 +8286,12 @@ test "every tool has an action name, and every name reaches the table" {
     // This test is what makes that impossible.
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
+        // `nix_build` is named after the attribute path it asks for, which
+        // this builder cannot see. `chock_core.nix` has its own tests for
+        // that name, and `Loop.gateToolCall` refuses a call it cannot name.
+        if (tool == .nix_build) continue;
         var buffer: [Tool.max_action_bytes]u8 = undefined;
-        const action = tool.actionInto(&buffer, null, "") orelse
+        const action = tool.actionInto(&buffer, null, "", &.{}) orelse
             return error.ToolHasNoActionName;
         try std.testing.expect(action.len > 0);
     }
@@ -9140,6 +9499,30 @@ test "a provide_tool call with no session behind it is refused, and never says t
     try std.testing.expectEqualStrings(provision_needs_a_session, result.output);
     // And it names what to do instead, rather than only what went wrong.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "already has") != null);
+}
+
+test "a nix_eval call with no session behind it is refused, and never answers a value" {
+    // A `Registry` cannot evaluate: the evaluator and the store cap both
+    // belong to the session, and a dispatch owns nothing that outlives one
+    // call. The caller that owns the session answers it, exactly as it
+    // answers `provide_tool`. What matters here is that the refusal is
+    // honest: a model handed an empty value would reason about it.
+    const allocator = std.testing.allocator;
+    var env = try std.testing.environ.createMap(allocator);
+    defer env.deinit();
+
+    const result = try Registry.dispatch(allocator, std.testing.io, &env, unreached_config, .{
+        .call_id = "call1",
+        .tool = "nix_eval",
+        .arguments = "{\"expression\":\"1 + 1\"}",
+    });
+    defer allocator.free(result.call_id);
+    defer allocator.free(result.output);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings(nix_eval_needs_a_session, result.output);
+    // And it names what to do instead, rather than only what went wrong.
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "in the project") != null);
 }
 
 test "a program that is not there names provide_tool only when this session really has it" {

@@ -97,6 +97,27 @@ same way a project's own choices win over everything this file sets. See
 [Sandbox resource limits](policy.md#sandbox-resource-limits) for the field
 syntax and the full order the layers fold in.
 
+## The machine's own Nix store caps
+
+`config.zon` also takes a `nix` block, in the same shape a project's own
+`chock.zon` takes one:
+
+```zon
+.{
+    .nix = .{
+        .max_object_bytes = "16MiB",
+        .max_session_bytes = "256MiB",
+    },
+}
+```
+
+This is the machine's own default for how much a Nix evaluation may add to
+the store: every project run from this machine which names no `nix` field of
+its own gets the number here instead of Chock's own built in default. A
+project's own `chock.zon` still wins over it. See
+[Nix store byte caps](policy.md#nix-store-byte-caps) for the field syntax and
+the full order the layers fold in.
+
 ## The project's own file
 
 `config.zon` is yours and it is about providers. `chock.zon`, in the project

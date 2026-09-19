@@ -36,10 +36,10 @@
 //! of its own to win with. It does nothing for a key that no rule at all
 //! contests, which is the case a shipped default exists for in the first
 //! place. It is safe for `run_command` to line up rules of its own for the
-//! three classes `actionInto` can name a path into, because `exec.*` is
+//! four classes `actionInto` can name a path into, because `exec.*` is
 //! `run_command`'s alone: nothing else in Chock ever asks the table about an
 //! `exec.*` key, so a `.tool = "run_command"` default would have cost
-//! nothing there. `exec.unparsed`, the fourth name `actionInto` can build,
+//! nothing there. `exec.unparsed`, the fifth name `actionInto` can build,
 //! holds no rule at all: see "What is deliberately absent" below.
 //!
 //! It is **not** safe for a tool whose own name is also read for a second,
@@ -58,6 +58,39 @@
 //! and it would answer for a key it was never meant to. Naming the
 //! exact action `actionInto` builds, and nothing wider, is what keeps a
 //! shipped default from ever answering a question it was not written for.
+//!
+//! ## The store is two classes and not one
+//!
+//! `exec.nix.store.*` shipped as `allow` for a time, and the reasoning
+//! written with it was that a store path is content addressed and immutable,
+//! so it names exactly one program forever, unlike `./thing`, which the agent
+//! can rewrite on the turn before it runs. **That reasoning held only while
+//! the agent could not put a path in the store.** It can now: it evaluates an
+//! expression, Chock registers the result, and a build makes store paths that
+//! did not exist when the session started. A blanket allow written for "the
+//! toolchain you were given" covered those too.
+//!
+//! So `lib/chock-core/tools.zig` names two classes where it named one.
+//! `exec.devshell.*` is a program inside the closure the session mounted at
+//! its start, which is known before the model says anything, and it is
+//! allowed here for the reason the store rule once was. `exec.nix.store.*` is
+//! every other store path, a provisioned program and a built one alike, and
+//! it asks.
+//!
+//! **It is the one shipped rule that is not an `allow`, and it is spelled out
+//! rather than left absent on purpose.** The absent rules below say `ask` by
+//! saying nothing, which is right for a key no class of Chock's own ever
+//! builds a sibling of. This key has three siblings that are allowed, and a
+//! reader comparing the four classes must see all four in one place. `ask`
+//! also ranks no lower than an unnamed key does, so nothing in `table.zig`'s
+//! `representatives` changes: see the `device.*` comment further down for
+//! what a rank below `ask` would have cost.
+//!
+//! `exec.path.*` needs no split of its own. A bare name is a `PATH` lookup,
+//! and `PATH` inside the sandbox is the one the session sets, so a lookup
+//! reaches only what the session mounted. A program `provide_tool` added is
+//! on that `PATH`, and the act that put it there was already decided at
+//! `nix.build`, before the tool was offered at all.
 //!
 //! ## Seven names with no `call.*` rule at all
 //!
@@ -147,8 +180,9 @@
 //! itself.** `./.git/../build.sh` and `./.git/../x/bin/bash` both name
 //! `exec.unparsed`, because a `..` at a depth greater than zero does not
 //! leave the project and `.git` always exists, and a project that denied
-//! `exec.workspace.*`, `exec.path.*` and `exec.nix.store.*` by name still
-//! answered `allow` for either, because none of the three named
+//! `exec.workspace.*`, `exec.path.*`, `exec.devshell.*` and
+//! `exec.nix.store.*` by name still
+//! answered `allow` for either, because none of the four named
 //! `exec.unparsed` and the shipped default did. An unnameable program is not
 //! a safe one merely for being unnameable: it is a program Chock could not
 //! tell apart from any other, and that is exactly the case `ask` exists for.
@@ -178,10 +212,12 @@ const table = @import("table.zig");
 /// vector. See this file's own top comment, "The git shim asks too", for why
 /// the block stops at the subcommands that reach no other host.
 ///
-/// `run_command` needs three rules, one for each class `actionInto` can
+/// `run_command` needs four rules, one for each class `actionInto` can
 /// build a path into, because `.tool = "run_command"` alone would be exactly
-/// the unsafe shape this file's own top comment measures against. It builds
-/// a fourth name, `exec.unparsed`, for a path it refuses to resolve, and that
+/// the unsafe shape this file's own top comment measures against. Three of
+/// the four are `allow` and `exec.nix.store.*` is `ask`: see "The store is
+/// two classes and not one". It builds a fifth name, `exec.unparsed`, for a
+/// path it refuses to resolve, and that
 /// one holds no rule here at all: see this file's own top comment, "What is
 /// deliberately absent". Every other tool needs exactly one rule, because
 /// `actionInto` builds it exactly one name, `"call." ++ @tagName(tool)`, and
@@ -212,13 +248,23 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.grep", .decision = .allow },
     .{ .action = "call.write_file", .decision = .allow },
     .{ .action = "call.edit_file", .decision = .allow },
-    .{ .action = "exec.nix.store.*", .decision = .allow },
+    // **The dev shell closure runs, and the rest of the store asks.** See
+    // this file's own top comment, "The store is two classes and not one",
+    // for why the store rule below is the one shipped default that is not an
+    // `allow`.
+    .{ .action = "exec.devshell.*", .decision = .allow },
+    .{ .action = "exec.nix.store.*", .decision = .ask },
     .{ .action = "exec.workspace.*", .decision = .allow },
     .{ .action = "exec.path.*", .decision = .allow },
     .{ .action = "call.read_guidance", .decision = .allow },
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
+    // **An evaluation reads and never builds.** It runs in the harness, in
+    // pure mode, and the one tree it may read is the workspace the reading
+    // tools above already read, so it is the same class as `call.read_file`.
+    // A build is a separate act under `nix.build`, which is not this row.
+    .{ .action = "call.nix_eval", .decision = .allow },
     // **A language server, which every project that has one already runs.**
     // Shipped `allow` so that giving this act a name changes nothing for
     // anybody: a project with a `language_servers` block behaves exactly as it
@@ -350,19 +396,41 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
         "call.read_memory",
         "call.write_memory",
         "call.provide_tool",
+        "call.nix_eval",
     };
     for (call_actions) |action| {
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key(action)));
     }
 
     const run_command_actions = [_][]const u8{
-        "exec.nix.store.abc-jq.bin.jq",
+        "exec.devshell.abc-jq.bin.jq",
         "exec.workspace.build%2Esh",
         "exec.path.jq",
     };
     for (run_command_actions) |action| {
         try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key(action)));
     }
+}
+
+test "a store path outside the dev shell closure asks with no chock.zon at all" {
+    // The fourth class `run_command` builds, and the one shipped rule that is
+    // not an `allow`. A store path the session did not start with is a path
+    // the session itself could have made, so it asks. Mutation check: put the
+    // row back to `allow` and this fails while every other default holds.
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        t.evaluateKindAlone(key("exec.nix.store.abc-jq.bin.jq")),
+    );
+    // The closure keeps running with no prompt, which is what the split is
+    // for: the toolchain was known before the model said anything.
+    try std.testing.expectEqual(
+        table.Decision.allow,
+        t.evaluateKindAlone(key("exec.devshell.abc-jq.bin.jq")),
+    );
 }
 
 test "net.connect and net.fetch hold no default rule and still answer ask" {
@@ -638,7 +706,7 @@ test "a project rule denying every exec class still denies a path that could not
     // Measured: `./build.sh` denies, but `./.git/../build.sh` and
     // `./.git/../x/bin/bash` both name `exec.unparsed` instead of
     // `exec.workspace.*`, because a `..` is never resolved lexically. None
-    // of the three rules below names `exec.unparsed`, so with the old
+    // of the four rules below names `exec.unparsed`, so with the old
     // shipped default of `allow` this fell straight through the project's
     // own denial of every exec class it knew to name.
     const gpa = std.testing.allocator;
@@ -647,6 +715,7 @@ test "a project rule denying every exec class still denies a path that could not
         \\.{ .policy = .{ .rules = .{
         \\    .{ .action = "exec.workspace.*", .decision = .deny },
         \\    .{ .action = "exec.path.*", .decision = .deny },
+        \\    .{ .action = "exec.devshell.*", .decision = .deny },
         \\    .{ .action = "exec.nix.store.*", .decision = .deny },
         \\} } }
     ;

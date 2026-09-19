@@ -49,6 +49,11 @@
 //! `org.zig`'s own `Bundle.limits` puts a ceiling over both that a project
 //! may go under and can never go over, the same rule `subagents` already
 //! keeps for the width of a spawn tree.
+//!
+//! `lib/chock-policy/nix.zig` holds the Nix store's own byte caps, read the
+//! same way and through the same three layers as `limits`: how much one
+//! store object may carry, and how much a whole session may add. `org.zig`'s
+//! own `Bundle.nix` is the ceiling over both.
 
 pub const table = @import("chock-policy/table.zig");
 pub const devices = @import("chock-policy/devices.zig");
@@ -59,6 +64,7 @@ pub const access = @import("chock-policy/access.zig");
 pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
 pub const limits = @import("chock-policy/limits.zig");
+pub const nix = @import("chock-policy/nix.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

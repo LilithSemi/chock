@@ -16,6 +16,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/udev.zig.git#67e0061ab53028c93134c9fe8e44a5a89a17137f",
             .hash = "udev-0.1.0-ZWb7H_1aBwCNMTs30b9SL6tTkvpmDLzz_RfKP1UPC1FZ",
         },
+        .fix = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/fix.git?ref=integration#b6d3cf17237f2f77bd7e0532c207f83152ecd1a8",
+            .hash = "fix-0.3.0-2pqVLF7MVwBtbO4Rg7qCN7gycwmV5Q1NH48rK5jCByhM",
+        },
     },
     .paths = .{
         "build.zig",
