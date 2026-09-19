@@ -1,58 +1,6 @@
 //! `chock run`: one agent session against the project in the current
-//! directory, from the command line, with no interface.
-//!
-//! ```
-//! cd ~/some-project
-//! chock run "add a test for the parser"
-//! ```
-//!
-//! ## Three phases, because one `std.Io` cannot do this job
-//!
-//! **`Registry.dispatch` calls `Sandbox.spawn`, which calls `fork`, and
-//! `fork` carries only the calling thread into the child.** A caller holding
-//! a lock on another thread gives a child that deadlocks, which is why every
-//! real tool call test in this project runs through a dedicated single
-//! threaded probe process. `test/core/tools_probe.zig` is where the shape
-//! that works came from: a `std.Io.Threaded` built with
-//! `std.mem.Allocator.failing`, which still reads a clock, still opens files,
-//! and still talks to a socket, and **cannot start a thread**, because
-//! `Threaded` uses its allocator for `async`, `concurrent`, and the group
-//! calls and for nothing else.
-//!
-//! That same `Io` cannot spawn a process: `Threaded`'s own `spawnPosix`
-//! builds an arena over that allocator, and a failing allocator fails there.
-//! And this command has to spawn `git`, twice, because `Workspace.open`
-//! builds a linked worktree and `Workspace.close` removes it again.
-//!
-//! So the work is in three phases, each with the `Io` its own job needs, and
-//! **only one `Io` exists at a time**:
-//!
-//! | Phase | `Io` | What runs |
-//! |---|---|---|
-//! | 1. setup | a real allocator | `Workspace.open`, which runs `git` |
-//! | 2. the session | `Allocator.failing` | `Loop.run`, which forks |
-//! | 3. teardown | a real allocator | `Workspace.close`, which runs `git` |
-//!
-//! **Phase 3 does not always close the workspace.** A session that ended badly
-//! keeps its workspace, and says where it is, because the alternative is
-//! deleting work nothing else has a copy of. See `cleanupFor`.
-//!
-//! Phase 2 is the one that matters. The rest is a consequence.
-//!
-//! **The allocator the session itself uses is an ordinary one throughout.**
-//! It is the `Io`'s allocator that must be unable to start a thread, not the
-//! caller's: see `lib/chock-core/tools.zig`'s own top comment on why
-//! `spawnCapturing`'s one deliberate thread is safe, and what it promises
-//! about the calling thread's allocator while the fork happens.
-//!
-//! ## There is no flag that approves everything
-//!
-//! `chock run` has nobody at the keyboard, and that is already answered: an
-//! approval that nobody answers before its timeout **is a refusal**, which is
-//! the safe direction and needs no new code. The place to say "allowed without
-//! asking" is the policy table in `chock.zon`, which is beyond the agent's
-//! reach. A rule in a file somebody wrote on purpose beats a flag somebody
-//! typed once that now lives in a continuous integration script forever.
+//! directory, from the command line, with no interface. The run is three
+//! phases, each with the `std.Io` its own job needs, one at a time.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -68,10 +16,6 @@ const chock_provider = @import("chock-provider");
 const chock_workspace = @import("chock-workspace");
 const sandbox = @import("chock-sandbox");
 
-/// The flag names a parent writes onto a child's command line, read from the
-/// one file that also builds one. See `chock_core.subagent.flag`: a name
-/// spelled here as well as there is a name that can quietly stop matching, and
-/// the fault would be a child that ran with no parent in its chain at all.
 const subagent = chock_core.subagent;
 
 const approval = @import("approval.zig");
@@ -134,12 +78,8 @@ const usage_text =
     \\
 ++ tty.options_text;
 
-/// The largest message `chock run` reads from standard input. A prompt is
-/// prose. This bounds a pipe somebody pointed at a disk image.
 const max_stdin_bytes: usize = 4 * 1024 * 1024;
 
-/// How much of a tool result is shown on . The whole thing is in the
-/// log; this is only what a person watching sees go past.
 const shown_result_bytes: usize = 800;
 
 const Options = struct {
@@ -148,115 +88,26 @@ const Options = struct {
     project: ?[]const u8 = null,
     session: ?[]const u8 = null,
     agent_kind: []const u8 = "main",
-    /// The org policy bundle to read instead of the one in the data directory.
-    /// See `loadOrgBundle`: the file this names is being handed to Chock now,
-    /// so an expired one is refused, which is the one thing an expiry acts on.
     org_bundle: ?[]const u8 = null,
     max_turns: ?usize = null,
     continue_newest: bool = false,
-    /// Take over a session that already exists and carry it on from what its
-    /// log holds, appending no message of the caller's own.
-    ///
-    /// **This is the replay half of a handover**: the process holding the log's
-    /// exclusive lock is the owner of that session, so becoming the owner is
-    /// taking that lock, and recovering what the last owner held is folding the
-    /// log. `chock_core.Loop.run` already does both, and it appends no second
-    /// `session.start` when the fold found one. So the only thing this flag
-    /// changes is that no user message is read and none is written: everything
-    /// else about the run is an ordinary run.
-    ///
-    /// **A session with nothing in it is refused rather than started.** See
-    /// `refuseAdoptWithNothingToAdopt`.
     adopt: bool = false,
-    /// Copy the project's uncommitted work into the workspace before the
-    /// session starts. Off by default: `git worktree add` checks out the
-    /// commit, which is reproducible, and a session that starts from a known
-    /// commit is easier to reason about. See `handleUncommitted`.
     allow_dirty: bool = false,
-    /// Turn off everything the harness tells the agent about itself. On by
-    /// default, because the notices are the feature; this is the off side of
-    /// the measurement that says whether they earn their place. See
-    /// `chock_core.notices`.
     no_notices: bool = false,
-    /// Ship this session's log into this directory as it is written, one file
-    /// per session. Null for a session that exports nothing, which is every
-    /// session that says nothing about it and which runs byte for byte the way
-    /// it did before export existed.
-    ///
-    /// **The file is byte for byte the log**, so the copy verifies at the far
-    /// end with `chock sessions verify`. See `lib/chock-proto/ship.zig`.
     export_dir: ?[]const u8 = null,
-    /// Ship each line of the log to this unix datagram socket as an RFC 5424
-    /// message. Null for a session that exports nothing.
-    ///
-    /// **A path and not a flag**, so a test never has to reach a real syslog
-    /// daemon and so a machine whose socket is somewhere unusual is served by
-    /// the same option. `chock_proto.ship.Syslog.defaultPath` names the usual
-    /// one for this platform, and the help text says it.
     export_syslog: ?[]const u8 = null,
-    /// The session that started this one, when this session is somebody's
-    /// subagent. Empty for a session a person started, which is every session
-    /// somebody types by hand.
-    ///
-    /// **A parent writes all six of these onto a child's command line**, and
-    /// nothing else does: see `chock_core.subagent.commandLine`. They are not
-    /// in the usage text for the same reason: a person has no use for them,
-    /// and the values that make them safe come from the parent process.
     parent_session: []const u8 = "",
-    /// Every agent above this one, root first, with the reason each started the
-    /// one below it. **This is what makes the policy an intersection**:
-    /// `chock_policy.table.evaluateChain` folds every kind in the chain, so
-    /// this session can hold no permission any agent above it lacks. A child
-    /// cannot state one for itself, because a child does not write its own
-    /// command line.
-    ///
-    /// **The whole chain and not the immediate parent alone.** One link was a
-    /// real fault: a grandchild folded two kinds, neither of them the root's,
-    /// and every session below the first reported depth 2, so `max_depth`
-    /// bounded nothing below the second level. `--parent-kind` is repeated once
-    /// per link, each followed by its own `--spawn-reason`, and
-    /// `chock_core.subagent.commandLine` is what writes them in that order.
     parent_chain: []const chock_proto.event.SpawnLink = &.{},
-    /// The session directory this session writes its scratchpad in, given by a
-    /// parent. **A session that was given one does not remove it**: it sits
-    /// inside the parent's own scratchpad, and the parent removes the whole
-    /// tree when its run ends.
     scratchpad: []const u8 = "",
-    /// The slice of the parent's budget this session may spend. Never widens
-    /// what `chock.zon` allows: the smaller of the two is what this session
-    /// runs under. See `budgetFor`.
     max_cost: ?f64 = null,
     currency: []const u8 = "",
     message_words: []const []const u8 = &.{},
-    /// Show the session on a display instead of printing it, and on which one.
-    ///
-    /// **`parseOptions` never sets this, and no command line can.** `chock run`
-    /// is the plain command line: it writes lines, it paints them, and it gains
-    /// no display whatever standard output is. The interface is bare `chock`,
-    /// and `src/ui.zig` is the only caller that turns this on, through
-    /// `mainWithInterface`.
-    ///
-    /// The session itself is identical either way. All this changes is where
-    /// `Printer`'s bytes go: to standard output, or to a buffer the display
-    /// shows and writes back out when it gives the  up.
     display: ?Display = null,
-    /// The caller asked for the usage text. Set by `readOptions` rather than
-    /// acted on, because `chock run` and bare `chock` answer it differently.
     help_wanted: bool = false,
 };
 
-/// What bare `chock` asks for when it hands the run over: which display to
-/// open, and the message it already has, if any.
-///
-/// **The display is opened by `runSession` and not by the caller**, so the
-/// header band has the project, the workspace and the model from its first
-/// frame: all three are worked out in phase 1, and the display comes up after
-/// it. Phase 1's own diagnostics reach the real terminal for the same reason,
-/// rather than the alternate screen that is about to be thrown away.
 pub const Display = struct {
     attach: ui.Attach,
-    /// A message already on standard input. The display is given it for its
-    /// first turn, so a piped run and a typed one take one path.
     first_message: []const u8 = "",
 };
 
@@ -270,8 +121,6 @@ pub fn main(
     return mainWith(arena, gpa, environ, exe_path, args, null);
 }
 
-/// `main`, with the session shown on a display. **Only `src/ui.zig` calls
-/// this**, and it is what keeps `Options.display` off every command line.
 pub fn mainWithInterface(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -287,18 +136,6 @@ pub fn mainWithInterface(
     });
 }
 
-/// Read a `chock run` command line, reporting whatever is wrong with it the way
-/// `chock run` reports it. Null when it was reported.
-///
-/// **Public because bare `chock` takes the same options.** An option is not a
-/// command name, so `chock --allow-dirty` is bare `chock` with an option on it
-/// and `src/main.zig` hands the whole line here. One parser, one list of
-/// options, and one error naming the option that is wrong: see
-/// `main.namesNoCommand` for what a second list already cost twice.
-///
-/// `help_wanted` is set rather than answered, because the two callers answer it
-/// differently: `chock run --help` prints the usage and stops, and bare `chock`
-/// never gets here with it, since `src/main.zig` owns `--help`.
 pub fn readOptions(arena: std.mem.Allocator, args: []const []const u8) !?Options {
     return parseOptions(arena, args) catch |err| switch (err) {
         error.HelpWanted => help: {
@@ -307,8 +144,6 @@ pub fn readOptions(arena: std.mem.Allocator, args: []const []const u8) !?Options
             asked.help_wanted = true;
             break :help asked;
         },
-        // Already reported by the parser, which names the option and prints the
-        // usage that lists the real ones.
         error.BadArguments => null,
         else => |e| return e,
     };
@@ -324,15 +159,8 @@ fn mainWith(
 ) !u8 {
     var options = (try readOptions(arena, args)) orelse return Exit.usage.code();
     if (options.help_wanted) return Exit.finished.code();
-    // Set here and never by the parser, so no command line can reach it. See
-    // `Options.display`.
     options.display = display;
 
-    // **Words on the line are the display's first message.** `chock
-    // --allow-dirty fix the parser` means the same as `chock run --allow-dirty
-    // fix the parser`, with a display: the words are what to ask, and without
-    // this they would be parsed and then quietly dropped, because a run with a
-    // display appends no message of its own. See `Display.first_message`.
     if (options.display) |*wanted| {
         if (options.message_words.len != 0) {
             wanted.first_message = try std.mem.join(arena, " ", options.message_words);
@@ -341,11 +169,9 @@ fn mainWith(
 
     var env = try environ.createMap(arena);
 
-    // `.environ` is what `Threaded` resolves a bare `argv[0]` against, and
-    // `Workspace.open` spawns a bare `git`. Left out, `Threaded` falls back to
-    // a compiled in `PATH` of `/usr/local/bin:/bin:/usr/bin`, which finds no
-    // `git` on a Nix machine at all: the failure is `error.NotFound` from a
-    // workspace that looks like it could not be built.
+    // `Workspace.open` spawns a bare `git`, and without `.environ` `Threaded`
+    // resolves it against a compiled in `PATH` that holds no `git` on a Nix
+    // machine.
     var setup_threaded = std.Io.Threaded.init(arena, .{ .environ = environ });
     const setup_io = setup_threaded.io();
 
@@ -359,19 +185,13 @@ fn mainWith(
             return e;
         },
     };
-    // From here the workspace exists on disk and has to be taken down again,
-    // whatever happens next.
     setup_threaded.deinit();
 
-    // See this file's own top comment. Nothing in this phase spawns a
-    // process, and everything in it either forks (the tool path) or would be
-    // unsafe to run beside a fork.
-    // The session `/resume` chose, if any. Read after phase 3, when this
-    // session is fully down: see `takeUp`.
+    // `fork` carries only the calling thread, so phase 2 runs on an `Io` whose
+    // allocator is `failing`: `Threaded` uses that allocator to start threads
+    // and for little else, and a thread here gives a forked child that
+    // deadlocks.
     var take_up: ?[]const u8 = null;
-    // What the audit sinks of this session came to. Read in phase 3, when the
-    // display is down and a line is one a person really reads: see
-    // `reportShipping`.
     var shipped: ShippingReport = .{};
 
     const outcome = phase: {
@@ -384,13 +204,6 @@ fn mainWith(
     defer teardown_threaded.deinit();
     const teardown_io = teardown_threaded.io();
 
-    // **A handover applies nothing, and this is not a shortcut.** `applyWork`
-    // asks a person to move a commit into their own repository because the
-    // session is over and this is the last chance the work has. A session that
-    // handed over is not over: the next owner is about to carry on in the same
-    // workspace, and asking now would put a question about half finished work
-    // in front of somebody, and would take the log lock this process has just
-    // let go of. See `handedOver`.
     const gave_away = handedOver(outcome);
     const applied = if (gave_away) Applied.nothing_to_apply else applyWork(
         gpa,
@@ -404,44 +217,17 @@ fn mainWith(
         break :blk Applied.failed;
     };
 
-    // **Show it.** Memory a user cannot see is memory a user cannot trust,
-    // and a note written this session is read by every session after it. So
-    // a run that wrote one says so, and names the directory `chock memory`
-    // reads and clears.
     reportNotes(teardown_io, &started);
 
-    // **What left this machine, and what did not.** Printed here and not in
-    // phase 2, because the display is down by now: a session that lost its audit
-    // sink halfway through must say so somewhere a person reads rather than
-    // behind an alternate screen. Prints nothing at all for a session that
-    // exported nothing, which is every session that asked for none.
     reportShipping(&shipped);
 
-    // After `applyWork`, which is the last thing that asks anybody anything,
-    // and before the log closes. Closing it closes every attached client with
-    // it, so a `chock approve` somebody left running learns the session is over
-    // rather than waiting on a socket nothing will ever write to again.
     if (started.approvals) |endpoint| endpoint.close(teardown_io);
 
-    // And the handover socket, at the same moment and for the same reason: the
-    // client that asked for this session is waiting on it, and the end of that
-    // stream is how it learns the log lock is free. `disarm` comes first, so
-    // nothing can look at a descriptor this has closed.
     started.storage.close(teardown_io);
 
-    // **Last of all, and after the log has closed.** The end of this stream is
-    // what tells the process taking over that the log lock is free, so it must
-    // not happen while anything here could still hold it. `Loop.run` releases
-    // the lock on its own return in phase 2, and closing the log releases it
-    // again whatever happened, so a client that reads the end of this stream
-    // knows the lock is gone by both routes. `disarm` comes first, so nothing
-    // can look at a descriptor this has closed.
     handover.disarm();
     if (started.handovers) |endpoint| endpoint.close(teardown_io);
 
-    // **A clean ending removes the workspace. Any other ending keeps it.** See
-    // `cleanupFor`: this used to remove it in every case, and a session that
-    // hit a rate limit on 2026-08-22 had 105 changed files deleted with it.
     const session_exit: ?Exit = if (outcome) |value| value else |_| null;
     takeDownWorkspace(
         &started.workspace,
@@ -452,58 +238,20 @@ fn mainWith(
         started.paths.work,
     );
 
-    // **"Gone when the run ends" is a promise, so something has to keep it.**
-    // The temp directory is emptied by the machine at some point of its own
-    // choosing, which is not the same thing: a session that ended an hour ago
-    // must not still have its files on disk. Removed in every case, including a
-    // session that failed, because ephemeral is the security property this
-    // directory is for, and a failed session's leftovers reach the next one
-    // exactly as well as a finished session's would. Every background task has
-    // already been waited for by then: see `runSession`.
-    //
-    // **A session that was given its scratchpad by a parent removes nothing.**
-    // That directory is inside the parent's own, the parent is what is about to
-    // read it, and the parent's own removal takes the whole tree, subagent
-    // directories and all.
-    //
-    // **A session that handed over keeps it, and this is a decision.** The
-    // scratchpad is keyed on the session identifier, so the next owner builds
-    // the same path and finds whatever is in it: the output file of every
-    // background command this session ran, and the notes the agent left itself.
-    // Removing it here would take those from a session that has not ended, and
-    // the log the next owner folds names those files by path. The next owner
-    // removes the directory when the session really does end.
     if (started.scratch_owned and !gave_away) {
         if (started.scratch_dir) |dir| chock_core.scratchpad.remove(teardown_io, dir);
     }
 
-    // After the workspace, because the session is over by now and every
-    // string the sandbox config and the tool environment borrowed lives in
-    // this arena.
     if (started.dev_shell) |*shell| shell.deinit();
-    // The device source, at the same point and for the same reason: a tool
-    // call can still be running until here, and `sandbox_config.device_source`
-    // still points at it until this line.
     if (started.device_source) |source| source.deinit();
-    // And the image, for the same reason and at the same point: it owns the
-    // strings the mount set and both environments borrowed.
-    //
-    // **It also lets go of the image's tree here, and not before.** The
-    // extracted tree is shared with every other session on this image, and this
-    // one holds a shared lock on it from `Image.load` to here, so that no other
-    // session can remove it while a tool call is still binding it. This is the
-    // last point at which a tool call of this session can be running: the
-    // sandbox is down and the loop is over. A session that ends abnormally
-    // never reaches this line and still lets go, because the kernel drops a
-    // `flock` when the process ends however it ends.
+    // Lets go here of the shared lock on the extracted tree, which stops
+    // another session removing it while a tool call still binds it. This is
+    // the last point at which a tool call of this session can be running.
     if (started.image) |*one| one.deinit(teardown_io);
 
     const result = outcome catch |err| {
-        // **`Busy` is not a fault, it is a second owner.** `Loop.run` takes the
-        // exclusive lock on the session log, and the kernel refuses the second
-        // asker: see `refuseAdoptWithNothingToAdopt`. Reported by name because
-        // "the session failed: Busy" reads as a crash and sends a reader
-        // looking at a log that is perfectly healthy.
+        // `Busy` is a second owner and not a fault: the kernel refused the
+        // second asker for the log's exclusive lock.
         if (err == error.Busy) {
             tty.print(.err, "chock run: {s}\n", .{busy_detail});
             return Exit.usage.code();
@@ -512,12 +260,7 @@ fn mainWith(
         return Exit.faulted.code();
     };
 
-    // **Last of all, because everything of this session has to be down first.**
-    // Its log is closed, its sockets are closed, its workspace is gone and its
-    // terminal is back: see `takeUp` for why each of those matters.
     if (take_up) |id| {
-        // Duped from `gpa` by the display, because it has to outlive the phase
-        // that produced it. This is the last reader of it.
         defer gpa.free(id);
         return takeUp(teardown_io, &env, started.exe_path, started.project_root, id);
     }
@@ -525,30 +268,9 @@ fn mainWith(
     return exitWithApply(result, applied, &shipped).code();
 }
 
-/// Take up another session of this project, in place of this one.
-///
-/// **A new process, and that is the point.** Phase 1 builds a workspace, opens
-/// a log, takes its lock and opens two sockets; phase 3 takes all of that down
-/// again. A session taken up needs every one of those done for itself, and the
-/// only honest way to get that is to run them, from the top, for the session
-/// being taken up. `chock run --session <id> --adopt` is a command that already
-/// exists and that was measured by hand on both platforms.
-///
-/// **A child and not an `execve`.** Zig 0.16's `std.posix` exposes no portable
-/// `execve` and this program does not link libc, so the one replacement call
-/// available would be `std.os.linux.execve`, which is a platform branch this
-/// file may not have. `std.process.spawn` is what every subagent already uses
-/// and it reaches the same place: the child owns the terminal, and this process
-/// waits for it and exits with its code. What it costs is a waiting parent.
-///
-/// **The terminal is already restored.** `runSession`'s own `defer` took the
-/// display down before phase 3, which left the alternate screen, put raw mode
-/// back and showed the cursor. The child brings its own up. Getting that order
-/// wrong would leave a broken shell behind if the child never started.
-///
-/// **This session has already ended cleanly**, with its own `session.end`
-/// written by `Loop.run`, exactly as leaving does. Nothing is lost, and there
-/// is nothing to return to if the child cannot be started.
+/// Take up another session of this project, in place of this one. A child and
+/// not an `execve`: Zig 0.16 exposes no portable `execve` and this program does
+/// not link libc.
 fn takeUp(
     io: std.Io,
     env: *const std.process.Environ.Map,
@@ -556,8 +278,8 @@ fn takeUp(
     project_root: []const u8,
     id: []const u8,
 ) !u8 {
-    // `--project` and not the working directory: a child inherits this
-    // process's, and this process may have been started anywhere.
+    // `--project` and not the working directory, which the child inherits from
+    // this process and which may be anywhere.
     const argv = [_][]const u8{
         exe_path,
         "run",
@@ -572,8 +294,6 @@ fn takeUp(
         .argv = &argv,
         .environ_map = env,
     }) catch |err| {
-        // The terminal is a person's own again by now, so this lands where they
-        // can read it.
         tty.print(
             .err,
             "chock: session {s} could not be taken up ({s}). It was not started, and this one " ++
@@ -584,86 +304,26 @@ fn takeUp(
     };
     return switch (try child.wait(io)) {
         .exited => |code| code,
-        // Killed by a signal, which is what a second Ctrl-C does. The child
-        // reports its own ending in its own log; this says the run did not end
-        // normally, the same way every other abnormal end here does.
         else => Exit.faulted.code(),
     };
 }
 
-/// What became of the session's own work at the end of the run.
 const Applied = enum {
-    /// The session left the workspace at the commit it started from, so
-    /// there was nothing to carry back and nothing was asked for.
     nothing_to_apply,
-    /// The session left the workspace at the commit it started from **and**
-    /// left changed files in it. The work is real, and none of it reaches the
-    /// user's repository, because only a commit can be carried back.
-    ///
-    /// **The workspace is kept for this case**, so the work is somewhere a
-    /// person can still get it: see `cleanupFor`. It used to be deleted here,
-    /// which is how a session measured on 2026-08-22 lost 105 changed files.
-    ///
-    /// **A separate answer from `nothing_to_apply`, because a script must be
-    /// able to tell them apart.** Before the write tools existed the agent
-    /// could not produce this state at all; with them it is the ordinary
-    /// shape of a session that forgot to commit, and it was measured on the
-    /// first real run of `write_file` and `edit_file`. Reporting it as
-    /// "nothing to apply" would be a step reporting success for work it
-    /// threw away, which `src/main.zig`'s own top comment names as the worst
-    /// kind of failure this program can have.
     uncommitted,
-    /// The broker moved the objects and the ref. The work is in the project.
     landed,
-    /// The decision did not permit it. The project is unchanged. An approval
-    /// nobody answers is a refusal, and that is the safe direction.
     refused,
-    /// The apply was permitted and the act itself failed, or the description
-    /// of it could not be read. The project may hold the objects and does not
-    /// hold the ref: `perform` moves the objects first.
     failed,
 };
 
-/// What becomes of the workspace once the run is over.
 const Cleanup = enum {
-    /// Take it down, the way every run always did.
     remove,
-    /// Leave it on disk, and say where it is. See `reportKeptWorkspace`.
     keep,
-    /// Leave it on disk for the process that is taking this session over.
-    ///
-    /// **The same act as `keep` and a different sentence, and the sentence is
-    /// the point.** `keep` tells a person their session went wrong and their
-    /// work is stranded. A handover left the workspace on purpose, the next
-    /// owner is about to work in it, and telling somebody to go and rescue it
-    /// would send them to move files out from under a running session.
     hand_on,
 };
 
-/// Whether the workspace comes down at the end of this run.
-///
-/// **A clean ending removes it, and every other ending keeps it.** The rule
-/// that only a commit reaches the user's repository is right and is unchanged
-/// here: it protected the repository exactly as designed. The loss was the
-/// cleanup. `Workspace.close` used to run on every ending, so a session that
-/// errored, was refused, reached its budget, made no progress, or was
-/// interrupted had whatever it produced deleted along with the worktree. A
-/// session measured on 2026-08-22 met a rate limit and lost 105 changed files
-/// that way.
-///
-/// Two conditions, and both have to hold for the workspace to go:
-///
-/// * **The session itself ended cleanly.** Anything else, including a run
-///   whose session could not report an ending at all, keeps it.
-/// * **There is nothing left in it.** `landed` means the commit is in the
-///   user's repository, and `nothing_to_apply` means the agent changed
-///   nothing. `uncommitted` is the measured case: real work, no commit, and
-///   nothing carried back, so the workspace is the only copy of it.
 fn cleanupFor(session_exit: ?Exit, applied: Applied) Cleanup {
     const ended = session_exit orelse return .keep;
-    // **Before the `finished` test, because a handover is neither.** The
-    // workspace stays, exactly as it does for every other ending that is not
-    // clean, and what changes is what a person is told: see `Cleanup.hand_on`.
     if (ended == .handed_over) return .hand_on;
     if (ended != .finished) return .keep;
     return switch (applied) {
@@ -672,65 +332,29 @@ fn cleanupFor(session_exit: ?Exit, applied: Applied) Cleanup {
     };
 }
 
-/// What becomes of the workspace when the session cannot even start.
-///
-/// **A process that adopted a workspace never removes it.**
-/// `chock_workspace.Workspace.close` runs `git worktree remove --force`, and
-/// the checkout it would remove is the one another owner left with work in it.
-/// A failure in `start` is this process's failure and is not a reason to delete
-/// somebody else's files. A workspace this process built is removed as it
-/// always was: nothing else has ever looked at it, so leaving it would fill a
-/// disk with directories that hold nothing.
-///
-/// **Its own function so a test can drive the decision**, which the `errdefer`
-/// that uses it cannot be made to run from one. A test that only called `keep`
-/// and `close` by hand would pin what those two do and say nothing about which
-/// one `start` picks.
+/// A process that adopted a workspace never removes it: the checkout
+/// `Workspace.close` would force away holds another owner's work.
 fn releaseOnFailure(adopted: bool) Cleanup {
     return if (adopted) .keep else .remove;
 }
 
-/// Whether this run gave the session to another process.
-///
-/// **Read out of the exit code, which is read out of the log**, and never out
-/// of a flag this process set. `finalExit` folds the log to reach the code, and
-/// the log is the truth about a session. A flag would be a second answer that
-/// can disagree with the first, and the process taking over reads only the log.
-///
-/// A run whose session could not report an ending at all did not hand over. It
-/// keeps its workspace either way, through `cleanupFor`'s first line.
 fn handedOver(outcome: anyerror!Exit) bool {
     const ended = outcome catch return false;
     return ended == .handed_over;
 }
 
-/// End the workspace the way `cleanup` says.
-///
-/// **Its own function so the two arms can be driven from a test.** The
-/// decision and the act are separable, and both have to be right: a `keep`
-/// that still removed would lose the work it was added to save, and a `remove`
-/// that stopped removing would fill the user's disk with every session they
-/// ever ran. `workspace` is not valid after this call returns, either way.
+/// `workspace` is not valid after this call returns, either way.
 fn takeDownWorkspace(
     workspace: *chock_workspace.Workspace,
     cleanup: Cleanup,
     arena: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
-    /// The session's own scratch directory, which the workspace sits inside.
-    /// Named in the failure message below rather than `workPath`, because
-    /// `close` frees every string the workspace owns before it can fail.
     scratch_path: []const u8,
 ) void {
     var close_diag: ?chock_workspace.Diagnostic = null;
     switch (cleanup) {
         .remove => workspace.close(arena, io, env, &close_diag) catch |err| {
-            // The session already happened and its log is already durable. A
-            // workspace that would not come down is worth saying out loud and
-            // is not worth throwing the session's own answer away over.
-            //
-            // Which call failed, and what it answered. The workspace used to
-            // print that itself and hand this command `error.Unexpected`.
             if (close_diag) |*fault| {
                 tty.print(.err, "chock run: the workspace at {s} could not be removed: {f}\n", .{
                     scratch_path,
@@ -750,21 +374,12 @@ fn takeDownWorkspace(
             workspace.keep(arena);
         },
         .hand_on => {
-            // The same act, and a sentence that says what really happened.
             tty.detail("chock run: the workspace stays for the next owner: {s}\n", .{workspace.workPath()});
             workspace.keep(arena);
         },
     }
 }
 
-/// Say where a kept workspace is, and how to be rid of it.
-///
-/// **One line of output turns a total loss into something a person can
-/// salvage**, and it is the only reason keeping the workspace is worth
-/// anything: a directory nobody names is a directory nobody finds. The second
-/// half names `chock workspace`, because a directory nobody removes is a disk
-/// that fills, and that command is the same shape `chock cache` and
-/// `chock memory` already have.
 fn reportKeptWorkspace(path: []const u8) void {
     tty.print(
         .warn,
@@ -777,319 +392,88 @@ fn reportKeptWorkspace(path: []const u8) void {
     );
 }
 
-/// The exit code of the whole run, which is a statement about the session,
-/// about whether its work landed, **and** about whether its record got out.
-///
-/// A session that finished and whose work was refused did not do what the
-/// user asked for, and a script that read 0 there would carry on as though
-/// the change was in the repository. So a refused apply lowers a `finished`
-/// to `refused`. It never raises anything: a session that faulted still
-/// reports the fault, because that is the first thing to act on.
-///
-/// **The audit fold is inside this one and never beside it.** `run` has one
-/// exit fold and calls it once, so an installation's required sink cannot be
-/// left out of the answer by a caller that forgot a second call. See
-/// `exitWithAudit` for what that fold decides and why it is so narrow.
 fn exitWithApply(session_exit: Exit, applied: Applied, shipped: *const ShippingReport) Exit {
     if (session_exit != .finished) return session_exit;
     const landed: Exit = switch (applied) {
         .nothing_to_apply, .landed => .finished,
         .refused => .refused,
-        // The agent did work and Chock threw it away. A script that read 0
-        // here would carry on as though the project had been changed, which
-        // is the same mistake a refused apply would make.
         .uncommitted, .failed => .faulted,
     };
     return exitWithAudit(landed, shipped);
 }
 
-/// The exit code of the whole run, once the audit trail is taken into account.
-///
-/// **This is the part of a required sink an organisation can act on**, and it
-/// is the third of the three things `chock_policy.org` decided a required sink
-/// changes. A session must not fail because an audit sink is down, so a
-/// required sink never stops a session and never refuses to start one; what it
-/// does is leave a status a wrapper can read, at the one moment the answer is
-/// final.
-///
-/// **Narrow on purpose.** A sink that went down and came back leaves no gap at
-/// all, because the log on disk is the queue, so a run like that exits exactly
-/// as it would have. Only a sink that still holds less than the whole log when
-/// the session is over reaches this. A transient outage costs nothing, which is
-/// what stops this being the refuse-to-start answer wearing a different hat.
-///
-/// **It never raises anything**, the same rule `exitWithApply` keeps. A session
-/// that faulted reports the fault, because a broken session is the first thing
-/// to act on and a script that read `audit_gap` there would go looking at the
-/// wrong problem.
-///
-/// **Last, and after `cleanupFor` has read the session's own code.** A
-/// workspace is removed because the session finished and its work landed, and
-/// an audit sink that could not be reached says nothing about either of those.
-/// Folding this in any earlier would keep the workspace of every clean session
-/// on a machine whose collector was down.
-///
-/// **Its own function and still only ever called from `exitWithApply`.** The
-/// decision is worth stating on its own, so a test can drive it without an
-/// apply; the call is inside the one fold `run` already makes, so nothing has
-/// to remember to make a second one.
+/// A required audit sink never stops a session and never refuses to start one.
+/// A sink that went down and came back leaves no gap: the log on disk is the
+/// queue.
 fn exitWithAudit(session_exit: Exit, report: *const ShippingReport) Exit {
     if (session_exit != .finished) return session_exit;
     return if (report.requiredGap()) .audit_gap else .finished;
 }
 
-/// Everything phase 1 built, which phases 2 and 3 use.
 const Started = struct {
-    /// The `chock` program itself, which is what a subagent of this session
-    /// runs. See `SubagentSpawner`.
     exe_path: []const u8,
-    /// The project this session works on, which a subagent of this session
-    /// works on too: a child is a session with a parent and nothing more.
     project_root: []const u8,
     paths: session_paths.Paths,
-    /// This session's own identifier, which names the ref its work lands on.
-    /// See `applyRef`.
     session_id: []const u8,
     workspace: chock_workspace.Workspace,
-    /// The policy table of `chock.zon`, parsed once when the session started.
-    /// **This is the only way to say yes to an approval in `chock run`**: see
-    /// `applyWork`. A project with no `chock.zon` gets the safe table, where
-    /// every key resolves to `ask`.
     policy: *const chock_policy.table.Table,
     sandbox_config: sandbox.Config,
-    /// This project's Nix dev shell, or null when it has none. Owns the
-    /// strings `sandbox_config.env` and `tool_env` borrow, so it outlives
-    /// the session and comes down in phase 3.
     dev_shell: ?chock_nix.DevShell,
-    /// This project's container image, or null when it names none. Owns the
-    /// strings `toolchain`, `sandbox_config.env` and `tool_env` borrow, for
-    /// the same reason the dev shell above does. A session has one of the two
-    /// and never both: see `loadImage`.
+    /// Owns strings `toolchain`, `sandbox_config.env` and `tool_env` borrow. A
+    /// session has one of this and `dev_shell`, never both.
     image: ?chock_container.Image,
-    /// Where the files a tool call runs come from. See `Toolchain`.
     toolchain: Toolchain,
-    /// The environment a tool call resolves `argv[0]` against: the dev
-    /// shell's when the project has one, the host's when it does not. See
-    /// `toolEnvironment`.
-    ///
-    /// **Mutable, because a session's toolchain can grow.** A provisioned
-    /// program joins this map's own `PATH`, and every tool call after that one
-    /// finds it. See `ProvisionToolRunner`.
     tool_env: *std.process.Environ.Map,
-    /// What this session needs to add a program to its toolchain with Nix, or
-    /// null when it cannot. See `provisioningFor`, which says out loud why a
-    /// session has none.
     provisioning: ?Provisioning,
-    /// What this session needs to build a Nix attribute on the host, or null
-    /// when it cannot. See `nixBuildFor`.
     nix_build: ?NixBuild,
-    /// How much a Nix evaluation of this session may put in the store, from
-    /// the `nix` block of `chock.zon`, the operator's own `config.zon`, and
-    /// the org policy bundle's ceiling. See `resolveNixCaps`.
     nix_caps: chock_policy.nix.Resolved,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
-    /// The base URL and the credential of the instance this session talks to.
     base_url: []const u8,
-    /// Which wire format that instance speaks. The adapter is not the provider,
-    /// so this comes from the instance kind and the user still hears the
-    /// instance name everywhere else.
     adapter: chock_provider.Client.Adapter,
-    /// What this session may spend, from the `budget` block of `chock.zon`, and
-    /// whether the endpoint bills anybody at all. See `lib/chock-cost.zig`.
     budget: ?chock_cost.budget.Budget,
     billing: chock_cost.prices.Billing,
-    /// How deep and how wide this project lets a spawn tree grow, from the
-    /// `subagents` block of `chock.zon`. A project that named none gets the
-    /// default 6 by 6 tree, and the file is kept beyond the agent's reach, so
-    /// **the model cannot raise its own limit**.
     subagents: chock_policy.subagents.Limits,
-    /// How an approved apply lands in the project, from the `apply` block of
-    /// `chock.zon` and the `workspace.integrate` row above it. **Both halves**,
-    /// because the log records the reason as well as the outcome. See
-    /// `applyModeFor` and `chock_policy.apply`.
     apply_mode: ApplyMode,
-    /// This project's language server, from the `language_servers` block of
-    /// `chock.zon`, or null when it named none.
-    ///
-    /// **From the project and never from the model**, the same road every other
-    /// block of this file takes: the project's own copy is bound back over the
-    /// agent's read only, so an agent cannot name the program that starts by
-    /// editing a file. A project that named none pays nothing at all, and every
-    /// write answers as it did before this existed.
     language_server: ?chock_core.lsp_driver.Settings,
-    /// The live source behind `sandbox_config.device_source`, or null when
-    /// this project named no device, or named one and every rule for it
-    /// answered less than `allow`. Owns the signal pipe and every scan's own
-    /// strings: see `chock_core.devices.HostSource`. Torn down in phase 3,
-    /// the same point `dev_shell` and `image` come down, because a tool call
-    /// can still be running before that and `sandbox_config` still borrows
-    /// this pointer.
+    /// Owns the signal pipe, and `sandbox_config.device_source` borrows this
+    /// pointer until phase 3.
     device_source: ?*chock_core.devices.HostSource,
-    /// This project's MCP servers, from the `mcp_servers` block of
-    /// `chock.zon`, or null when it named none.
-    ///
-    /// **From the project and never from the model**, the same road every
-    /// other block of this file takes. Null is the ordinary answer, and a
-    /// session with null does not run one line of `chock_core.mcp`: see
-    /// `runSession`, where the whole block is behind this one test.
     mcp_servers: ?[]const chock_core.mcp.Settings,
-    /// This project's plugins, from the `plugins` block of `chock.zon`, or null
-    /// when it named none.
-    ///
-    /// **From the project and never from the model**, the same road every other
-    /// block of this file takes, and the reason the name in every policy key
-    /// about a plugin is the project's: see `lib/chock-core/plugin.zig`. Null is
-    /// the ordinary answer, and a session with null runs no line of
-    /// `chock_core.plugin` at all: see `startPlugins`.
     plugins: ?[]const chock_core.plugin.Settings,
-    /// What the system prompt is built from, kept so phase 2 can build it
-    /// again once the MCP servers and the plugins have said which tools they
-    /// have.
-    ///
-    /// **Only a project with an `mcp_servers` or a `plugins` block ever uses
-    /// these.**
-    /// `system_prompt` and `tool_definitions` below are already built, and a
-    /// project with no MCP server takes them unchanged, which is what makes
-    /// such a session byte for byte the session it was before this existed.
     prompt_project: chock_core.prompt.Project,
     prompt_sources: chock_core.prompt.Sources,
-    /// Every parent of this session, root first, and this session left out.
-    /// Empty for a session a person started. **Built from the command line the
-    /// parent wrote**, so a session cannot state its own parents: see
-    /// `Options.parent_kind`.
     spawn_chain: []const chock_proto.event.SpawnLink,
     credential: chock_auth.lookup.Resolved,
     model: []const u8,
-    /// The provider instance's own name. A roster of model aliases is wanted
-    /// and this milestone has none, so the alias a session records is the
-    /// instance name: the only user chosen name there is today. A `message`
-    /// event says which one produced it either way, which is what the field is
-    /// for.
     model_alias: []const u8,
     system_prompt: []const u8,
     tool_definitions: []chock_core.tools.Definition,
-    /// This project's knowledgebase, or null when the directory could not be
-    /// made. **The one writable mount outside the workspace**, and only for
-    /// the two tool calls that use it: see `lib/chock-core/tools.zig`.
     memory_dir: ?[]const u8,
-    /// How many notes this project held when the session started, so the run
-    /// can say how many it wrote.
     notes_at_start: usize,
-    /// This project's toolchain cache, or null when the directory could not be
-    /// made. **The one writable mount a `run_command` call has that outlives
-    /// the session**, and no other tool call carries it: see
-    /// `lib/chock-core/cache.zig`.
     cache_dir: ?[]const u8,
-    /// This session's scratchpad, or null when the directory could not be
-    /// made. **It is removed when the run ends**, whatever the ending, which is
-    /// what makes it a writable surface outside the workspace that is not a
-    /// channel into the next session: see `lib/chock-core/scratchpad.zig`. The
-    /// capped temporary area beside it is gone sooner still, with the tool call
-    /// that mounted it, and has no host directory at all.
     scratch_dir: ?[]const u8,
-    /// Whether this session made its own scratchpad, and so is the one that
-    /// removes it. False for a subagent, which was given a directory inside
-    /// its parent's own: see `Options.scratchpad`.
     scratch_owned: bool,
-    /// The half of the scratchpad a background task's output is written into,
-    /// on the host. Null exactly when `scratch_dir` is. **The agent's sandbox
-    /// gets this bound read only** and the harness writes it from outside every
-    /// sandbox, which is what makes the output a record and not a claim: see
-    /// `lib/chock-core/tasks.zig`.
     tasks_dir: ?[]const u8,
-    /// How many tokens the model this session talks to can hold, from the
-    /// instance's own `context_tokens` in `chock.zon`. Null when the file said
-    /// nothing, and null is never a guess: the session then compacts only when
-    /// the provider refuses a request as too large. See
-    /// `chock_core.compaction.Policy`.
     context_tokens: ?u64,
-    /// How many files in the user's own project are not committed, and so are
-    /// not in the workspace the agent sees. **The user is already told this
-    /// number and the agent was not**, which is what this carries it here for:
-    /// see `handleUncommitted` and `chock_core.Loop.Deps.uncommitted_files`.
-    ///
-    /// Zero for a clean tree, zero for an overlay workspace, which copies the
-    /// whole project directory, and zero with `--allow-dirty`, which brings
-    /// the work across so that nothing is hidden.
     uncommitted_files: usize,
-    /// Where a client attaches to answer this session's approvals, or null when
-    /// the socket could not be made. See `lib/chock-broker/socket.zig`.
-    ///
-    /// **A pointer, because a `Waiter` holds one.** `start` returns a `Started`
-    /// by value, so a waiter that pointed into this struct would point at a
-    /// copy that has already moved. The endpoint itself lives in the arena and
-    /// is closed in phase 3.
-    ///
-    /// **Null is the old behaviour and never a crash.** A session directory
-    /// deeper than a unix socket path may be, or a filesystem that will not
-    /// hold one, gives a session with no socket. It still runs, and a question
-    /// it cannot ask anybody is still refused, the safe direction.
+    /// A pointer, because a `Waiter` holds one and `start` returns by value. Null
+    /// when the socket could not be made, and a question nobody can be asked is
+    /// refused.
     approvals: ?*chock_broker.socket.Endpoint,
-    /// Where another process asks for this session, or null when the socket
-    /// could not be made. See `lib/chock-broker/handover.zig`.
-    ///
-    /// **A pointer for the reason `approvals` is one**, and null is the old
-    /// behaviour: a session no process can take. `src/handover.zig` is what
-    /// points the loop at it.
     handovers: ?*chock_broker.handover.Endpoint,
-    /// The identifier this run's workspace is named after. Fresh on every
-    /// invocation, except for a run that took over a workspace another owner
-    /// left: see `takenOver`. Kept so phase 3 can name the directory it is
-    /// leaving on disk.
     attempt: []const u8,
-    /// Where this session's log goes as it is written, and empty for a session
-    /// that exports nowhere. See `auditSinks`: it is what `--export-dir` and
-    /// `--export-syslog` asked for **and** what this installation's org policy
-    /// bundle requires, with no way for the command line to drop one of the
-    /// second kind.
-    ///
-    /// **Built in phase 1 and read in phase 3**, so it lives in the run's own
-    /// arena rather than in anything phase 2 owns.
     audit_sinks: []const PlannedSink,
-    /// What must not reach the provider. See `redactionFor`, and
-    /// `lib/chock-core/redact.zig` for what redaction is and, just as plainly,
-    /// what it is not.
-    ///
-    /// **Borrowed for the whole session.** Every value in it lives in the run's
-    /// own arena, which is what `chock_core.redact.Policy.secrets` asks of a
-    /// caller.
     redact: chock_core.redact.Policy,
-    /// The same values, in the shape `chock_broker.Broker.redaction` takes.
-    /// See `brokerRedaction`: the broker writes into the same log as the loop
-    /// and cannot read a `chock_core.redact.Policy`, so the values travel and
-    /// the policy does not.
     redact_values: []const []const u8,
 };
 
 const StartError = error{Reported} || std.mem.Allocator.Error;
 
-/// The org policy bundle this installation was given, or null for one that was
-/// given none.
-///
-/// **This is the outermost layer of the policy**, the policy rule read one
-/// level up: `chock.zon` belongs to the project directory, so the developer who
-/// owns that directory writes it, and an organisation that wants to bound every
-/// project at once cannot use a file inside the thing it bounds. See
-/// `chock_policy.org`, which holds the reader and the whole of the reasoning.
-///
-/// Two ways in, and they are not the same act:
-///
-/// * **The installed bundle**, in the data directory beside the credential
-///   store. Absent is the ordinary answer and never a fault. An expired one
-///   still binds, in full: see `chock_policy.org`, and the reason is that a
-///   bundle can only narrow, so dropping one can only widen and can only widen
-///   at the moment nobody can be reached.
-/// * **`--org-bundle`**, which is somebody handing Chock a file now. A path
-///   that names nothing is a fault, because the caller asked for that file. An
-///   expired file is refused, because this is the moment of installing and the
-///   date is what says whether this file may still be installed. That refusal
-///   is the one thing an expiry acts on, and it is what stops the date being
-///   decoration.
-///
-/// The subject and the expiry are printed rather than kept quiet. A session
-/// running under a policy nobody can see is the failure this whole layer would
-/// otherwise introduce.
+/// An installed bundle that has expired still binds, in full: a bundle can only
+/// narrow, so dropping one can only widen, and at the moment nobody can be
+/// reached. `--org-bundle` is somebody handing Chock a file now, so an expired
+/// one is refused there and a path that names nothing is a fault.
 fn loadOrgBundle(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1098,13 +482,9 @@ fn loadOrgBundle(
 ) StartError!?*const chock_policy.org.Bundle {
     const named = options.org_bundle;
 
-    // **A subagent reads the installed bundle and never a named one.** A parent
-    // writes its child's command line, and `chock_core.subagent.flag` carries
-    // no bundle, so a child given a path here would be a child under a
-    // different, and possibly wider, org policy than its parent. That is the
-    // one direction the subagent limits exist to prevent, so it is refused out
-    // loud rather than left to be discovered. The installed bundle is the same
-    // file for every session of an installation, which is why it needs no flag.
+    // A subagent reads the installed bundle and never a named one. A parent
+    // writes its child's command line and carries no bundle, so a child given a
+    // path here would run under a wider org policy than its parent.
     if (named != null and options.parent_chain.len != 0) {
         tty.print(
             .err,
@@ -1124,8 +504,6 @@ fn loadOrgBundle(
     const bundle = chock_policy.org.load(arena, io, path, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.NoBundleFile => {
-            // An installation with no bundle is the ordinary one, and it is
-            // silent. A path the caller typed is not: they asked for that file.
             if (named) |asked| {
                 tty.print(.err, "chock run: there is no org policy bundle at {s}.\n", .{asked});
                 return error.Reported;
@@ -1142,23 +520,13 @@ fn loadOrgBundle(
         },
     };
 
-    // **The one clock read, and it is read here.** Everything the time decides
-    // is in the two functions below, which take it as a parameter, so a test
-    // can pin every word they write without asserting anything about a wall
-    // clock.
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
 
-    // A file being handed over now must be a file that may still be handed
-    // over. One already on this machine is a different question, and the
-    // answer to that one is `reportOrgBundle`.
     if (named) |asked| try refuseUninstallableBundle(bundle, now_ms, asked);
     reportOrgBundle(bundle, now_ms);
     return bundle;
 }
 
-/// Refuse a bundle somebody is handing to Chock now, when it is one nobody may
-/// hand over any more. See `chock_policy.org.refusalForInstall`: this is the
-/// one thing an expiry acts on, and it is what stops the date being decoration.
 fn refuseUninstallableBundle(
     bundle: *const chock_policy.org.Bundle,
     now_ms: i64,
@@ -1170,17 +538,6 @@ fn refuseUninstallableBundle(
     return error.Reported;
 }
 
-/// Say who this installation's policy belongs to, and say when it went stale.
-///
-/// **Who**: the organisation issued the credential, so Chock knows the subject
-/// without holding an identity of its own. This is the only place a person
-/// sees it today, and `src/run.zig` cannot yet put it in the session log: see
-/// this file's own note beside `recordWorkspace`.
-///
-/// **When**: the bundle keeps binding whatever the date says, which is the
-/// decision `chock_policy.org` writes out in full, so the date's whole job
-/// here is to be seen. An expiry that changed nothing and said nothing would
-/// be decoration, and a person under a stale policy has to be able to tell.
 fn reportOrgBundle(bundle: *const chock_policy.org.Bundle, now_ms: i64) void {
     if (bundle.subject.len != 0) {
         tty.print(.plain, "chock: org policy for {s}", .{bundle.subject});
@@ -1191,9 +548,6 @@ fn reportOrgBundle(bundle: *const chock_policy.org.Bundle, now_ms: i64) void {
         });
     }
 
-    // **A ceiling is said out loud, whoever the bundle names.** A person who
-    // is held to a number has to be able to see the number, and the one line
-    // that reports the subject is printed only for a bundle that named one.
     if (orgBudgetCeiling(bundle)) |ceiling| {
         tty.print(.plain, "chock: org policy budget ceiling {d} {s}\n", .{
             ceiling.max_cost,
@@ -1212,32 +566,10 @@ fn reportOrgBundle(bundle: *const chock_policy.org.Bundle, now_ms: i64) void {
     );
 }
 
-/// Whole days in a span of milliseconds, rounded down. For the one line that
-/// tells a person how stale their org policy is.
 fn daysIn(span_ms: i64) i64 {
     return @divFloor(span_ms, std.time.ms_per_day);
 }
 
-/// This project's policy table, under the org bundle this installation holds.
-///
-/// `chock.zon` is the project's and the agent cannot reach it, which is what
-/// makes it a control the model cannot loosen for itself. A project with no
-/// `chock.zon` gets the table where every key resolves to `ask`, which is the
-/// safe reading of a project that said nothing.
-///
-/// **The bundle is one more term of the intersection `evaluateChain` already
-/// takes**, so a rule in `chock.zon` can lower an answer and can never raise
-/// one: a project cannot widen what an org narrowed. An installation with no
-/// bundle hands in an empty rule list, which is the identity of that
-/// intersection and changes nothing at all. See
-/// `chock_policy.table.parseUnder`.
-///
-/// **A function rather than a block inside `start`**, because the wiring is
-/// the thing that could quietly go missing: a `start` that read the file
-/// without the bundle would build a table with no layer above it, and every
-/// test of the layers themselves would still pass. This takes the bundle and
-/// not a rule list, so there is no rule list a caller could get wrong, and
-/// there is one function a test can hold both halves against.
 fn loadPolicyUnder(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -1259,10 +591,6 @@ fn loadPolicyUnder(
         error.NoPolicyFile => chock_policy.table.Table.parseUnder(arena, ".{}", org_rules, null) catch
             return error.OutOfMemory,
         else => {
-            // The line, the column and the name of the rule that is wrong.
-            // The reader used to print all of that itself and hand this
-            // command an error name; now the reason arrives here and is
-            // ranked with every other line the command writes.
             if (policy_diag) |*d| {
                 tty.print(.err, "chock run: the policy in chock.zon could not be read: {f}\n", .{d});
             } else {
@@ -1273,17 +601,6 @@ fn loadPolicyUnder(
     };
 }
 
-/// Refuse this session when the policy says it may not use this provider
-/// instance, or may not use this model at it. See `chock_policy.access` for
-/// the two row names and for why only `allow` permits.
-///
-/// **Folded over the whole spawn chain**, so a subagent cannot use a model its
-/// parent could not. The chain is built the same way `provisionDecision`
-/// builds it, and for the same reason: a session cannot state its own parents.
-///
-/// **A project that names no provider row is refused nothing**, because the
-/// rows are read as a ceiling and a ceiling nobody wrote is no ceiling. Every
-/// configuration that predates these names therefore behaves as it did.
 fn refuseProviderAndModel(
     arena: std.mem.Allocator,
     policy: *const chock_policy.table.Table,
@@ -1307,15 +624,10 @@ fn refuseProviderAndModel(
     for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
     chain[chain_links.len] = options.agent_kind;
 
-    // A chain this reader cannot fold answers `deny` here, not `ask`: nobody is
-    // awake at the moment a session picks a model. Said out loud, because a
-    // chain that shape means the log holds something Chock did not write.
     var fault: ?chock_policy.table.ChainFault = null;
     const decision = chock_policy.access.ceiling(policy, .{
         .chain = chain,
         .agent_kind = options.agent_kind,
-        // The alias, which is what `table.Key.model` holds everywhere else.
-        // Today that is the instance name: see `Started.model_alias`.
         .model_alias = instance_name,
     }, &rows, &fault);
     if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
@@ -1358,19 +670,12 @@ fn start(
         return error.Reported;
     };
 
-    // The layer above this project's own policy, read before anything else so
-    // that a bundle Chock cannot read stops the session rather than being
-    // discovered halfway through it. Null for the ordinary installation, which
-    // then behaves exactly as it did before bundles existed.
     const org_bundle = try loadOrgBundle(arena, io, data_dir, options);
 
     var config_diag: ?chock_auth.config.Diagnostic = null;
     defer if (config_diag) |*d| d.deinit(arena);
     var config = chock_auth.config.load(arena, io, config_dir, &config_diag) catch |err| switch (err) {
         error.NoConfigFile => {
-            // The fault is ranked and the example is not, the same rule the
-            // usage text keeps: a whole block in one colour hides the line
-            // that says what went wrong.
             tty.print(
                 .err,
                 "chock run: there is no configuration at {s}/{s}. Write one, for example:\n\n",
@@ -1390,8 +695,6 @@ fn start(
             return error.Reported;
         },
         else => {
-            // The line, the column, and the provider whose entry is wrong.
-            // The reader used to print all of that itself.
             if (config_diag) |*d| {
                 tty.print(.err, "chock run: the configuration could not be read: {f}\n", .{d});
             } else {
@@ -1447,10 +750,6 @@ fn start(
         store,
         &credential_diag,
     ) catch |err| {
-        // Which of the three sources refused, and the mode or the message
-        // that made it refuse. The three readers used to print that between
-        // them, so a user saw a line from a library and then a second line
-        // from this command that said nothing more.
         if (credential_diag) |*d| {
             tty.print(
                 .err,
@@ -1467,20 +766,7 @@ fn start(
         return error.Reported;
     };
 
-    // **The pre-flight, and it is here on purpose: nothing has been built
-    // yet.** Below this line come the session directories, the log, the
-    // workspace, and on a project with a container image an extraction that
-    // costs seconds and real disk. A session that carries no credential to a
-    // provider that always needs one dies on that provider's 401 in the first
-    // turn, and exit 2 for "Chock never had a key" reads exactly like exit 2
-    // for a session that ran and then failed for any other reason.
-    //
-    // `Source.none` stays a non-failure in the lookup, because an endpoint
-    // that needs no key is legitimate. `credentialIsMissing` is what tells the
-    // two apart, and only for an address that is known to refuse.
     if (chock_auth.lookup.credentialIsMissing(instance, credential.source)) {
-        // **The instance and the address, and never any part of a value.**
-        // Nothing here has read a credential: the lookup found none.
         tty.print(
             .err,
             "chock run: the provider {s} has no credential. It talks to {s}, which refuses a " ++
@@ -1501,22 +787,10 @@ fn start(
         return error.Reported;
     }
 
-    // What this session keeps out of its own log and out of a provider request.
-    // **Built here, beside the credentials it borrows**, because
-    // `chock_core.redact` is inert until a caller fills it in and this is that
-    // caller: see `redactionFor`.
     const redaction = try redactionFor(arena, instance.name, credential.token, config.instances);
 
-    // The identifier. `--session` names one, `--continue` finds the newest,
-    // and neither makes a fresh one.
-    //
-    // Copied into the arena, and not left on this function's own stack:
-    // `chock_proto.log.Log` **borrows** the session string and stamps it onto
-    // every envelope it appends, for as long as the log is open. A pointer to
-    // a local here outlives this function by the whole session, and the log
-    // fills up with whatever the stack holds by then. That is what happened
-    // before this copy existed, and a log whose `session` field is stack
-    // rubbish is a log `chockd` cannot serve and a replay cannot key on.
+    // Copied into the arena: `chock_proto.log.Log` borrows the session string
+    // and stamps it onto every envelope for as long as the log is open.
     const stack_id = try chooseSessionId(arena, io, env, project_root, options);
     const id = try arena.dupe(u8, &stack_id);
 
@@ -1525,33 +799,19 @@ fn start(
         return error.Reported;
     };
 
-    // **Before `session_paths.create`, and long before the workspace.** A
-    // handover that has nothing to take over is a refusal, and a refusal that
-    // has already made three directories and a git worktree has left a mess
-    // behind for a fault it found afterwards.
     if (options.adopt) try refuseAdoptWithNothingToAdopt(gpa, io, paths.log, id);
 
     session_paths.create(io, paths) catch return error.Reported;
 
-    // **A session another process handed over keeps the workspace it was
-    // working in, and this is where the next owner takes it.** The last owner
-    // wrote a `workspace.open` event naming the attempt and the commit that
-    // workspace started from, and left the directory on disk. Rebuilding from
-    // committed state instead would throw away every uncommitted change the
-    // agent had made, which is exactly what makes a live handover honest or a
-    // lie. See `takenOver`, and `src/handover.zig` for the other half.
     const resuming = options.adopt or options.continue_newest or options.session != null;
     const taken = if (resuming) takenOver(gpa, io, arena, paths.log, paths.work) else null;
 
-    // The workspace gets an identifier of its own, fresh on every
-    // invocation, and never the session identifier. A session that is
-    // continued would otherwise ask `git worktree add` for a path the
-    // previous run already used, and a previous run that crashed before its
-    // own teardown would make every later `--continue` fail.
+    // Fresh on every invocation, and never the session identifier: a
+    // continued session would otherwise ask `git worktree add` for a path
+    // the previous run already used.
     const attempt = if (taken) |one| one.attempt else session_paths.newId(io);
-    // The arena, not the general purpose allocator: everything a `Workspace`
-    // owns lives as long as the process does, and `close` has to be given the
-    // same allocator `open` was.
+    // The arena, not the general purpose allocator: `close` has to be given
+    // the same allocator `open` was.
     var open_diag: ?chock_workspace.Diagnostic = null;
     var workspace = if (taken) |one| chock_workspace.Workspace.adopt(
         arena,
@@ -1563,11 +823,6 @@ fn start(
         one.base_commit,
         &open_diag,
     ) catch |err| {
-        // **Not a fall back to a fresh workspace, and this is deliberate.** The
-        // work is on disk under a path this command has just named, and a run
-        // that quietly started from committed state would leave it there with
-        // a person believing their session carried on. So this says what it
-        // found and stops, and `chock workspace` is what lists the directory.
         if (open_diag) |*fault| {
             tty.print(
                 .err,
@@ -1595,17 +850,9 @@ fn start(
         project_root,
         paths.work,
         &attempt,
-        // **The org policy bundle's own `deny_read`, folded as a union.** A
-        // project adds to this list and takes nothing off it. Empty for an
-        // installation with no bundle, which is the ordinary case, and then
-        // this is exactly what `Workspace.open` would have built.
         if (org_bundle) |bundle| bundle.deny_read else &.{},
         &open_diag,
     ) catch |err| {
-        // Which call failed and what it answered. The workspace builder used
-        // to print that for itself and hand this command `error.Unexpected`,
-        // so a user read a line with no command name on it and then a second
-        // line that said nothing more.
         if (open_diag) |*fault| {
             tty.print(
                 .err,
@@ -1619,8 +866,6 @@ fn start(
                 .{ project_root, @errorName(err) },
             );
         }
-        // The three the Darwin clone answers name themselves, and only this
-        // command holds the two paths that say what to change.
         switch (err) {
             error.ScratchOnAnotherVolume => tty.print(
                 .err,
@@ -1641,12 +886,6 @@ fn start(
                     "workspace cannot be built on it.\n",
                 .{project_root},
             ),
-            // **The path, because the message above names the file and not
-            // where it is.** `chock.zon` is the first thing a person writes
-            // with Chock, and a session that will not start over a comma is
-            // the first wall they meet. The line and the column are in the
-            // diagnostic; this says which file holds them and where a
-            // complete one is written out.
             error.ChockZonNotValid, error.DenyBlockNotValid, error.ChockZonTooLarge => tty.print(
                 .err,
                 "chock run: that file is {s}/chock.zon. docs/configuration.md holds a complete " ++
@@ -1657,15 +896,6 @@ fn start(
         }
         return error.Reported;
     };
-    // **A process that adopted a workspace never removes it.** `close` runs
-    // `git worktree remove --force`, and the checkout it would remove is the
-    // one another owner left with work in it. A failure below is this process's
-    // failure and not a reason to delete somebody else's files, so an adopted
-    // workspace is only let go of. A workspace this process built is removed as
-    // it always was: nothing else has ever looked at it.
-    //
-    // No diagnostic on the removal: it runs while an error is already on its
-    // way out, and the fault that error carries is the one worth reporting.
     errdefer switch (releaseOnFailure(taken != null)) {
         .keep => workspace.keep(arena),
         .remove => workspace.close(arena, io, env, null) catch {},
@@ -1684,18 +914,6 @@ fn start(
     } };
     const storage = backing.storage();
 
-    // Say which session this is before it starts, so a user who has to find it
-    // again does not have to wait for the session to end first. **Before the
-    // approval socket, so it is the first line on screen**: every line under it
-    // names a path built from this identifier, and a reader wants the
-    // identifier first.
-    //
-    // **One line, and it names the session and the model.** Those two decide
-    // what the run does and what the run costs, and the identifier is the key
-    // `chock sessions`, `chock usage`, and `chock plan` all take. Everything
-    // else this used to print is one command away, so it is behind `--verbose`:
-    // the address and the credential are a fact about a healthy start, and the
-    // log path is what `chock sessions` lists.
     tty.print(.plain, "chock: session {s}, model {s} via {s}\n", .{ id, model, instance.name });
     tty.detail("chock: log {s}\n", .{paths.log});
     tty.detail("chock: provider {s} ({s}), {s}\n", .{
@@ -1704,26 +922,11 @@ fn start(
         credential.source.describe(),
     });
 
-    // **Written before the first turn, and before the user's own message.** The
-    // next owner reads this out of the log and nothing else, so a run that
-    // wrote it later would have a window in which it held a workspace no
-    // handover could carry. See `recordWorkspace`.
-    //
-    // **And before the two control sockets, because this is what proves this
-    // process owns the session.** It is the first thing in a run that takes the
-    // log lock. Opening a socket first was a real fault: `Endpoint.open`
-    // removes whatever file is at the path, so a second `chock run --continue`
-    // against a session that was already running unlinked the live session's
-    // own approval and handover sockets, bound its own, and then found the lock
-    // held and exited. The live session was then listening on an inode nothing
-    // could reach, so `chock approve` and `chock detach` were both dead for it
-    // for the rest of its life, with nothing said. Now a process that does not
-    // own the session never reaches the two calls below.
+    // Before the two control sockets, because this is what proves this process
+    // owns the session. `Endpoint.open` removes whatever file is at the path, so
+    // a second run against a live session unlinked that session's approval and
+    // handover sockets and left it listening on an inode nothing could reach.
     recordWorkspace(gpa, io, storage, &workspace, &attempt) catch |err| {
-        // **`Busy` is a second owner and not a fault**, the same reading
-        // `main` gives it when `Loop.run` meets it. This is the first thing in
-        // a run that takes the log lock, so it is where a race for the session
-        // is now found, and "Busy" on its own reads as a crash.
         if (err == error.Busy) {
             tty.print(.err, "chock run: {s}\n", .{busy_detail});
         } else {
@@ -1737,37 +940,14 @@ fn start(
         return error.Reported;
     };
 
-    // The approval socket. **Opened before the first turn**, so a client that
-    // wants to answer a question this session has not asked yet can be attached
-    // already: `chock_broker.socket.timeoutMs` reads how many are attached at
-    // the moment the question is written, because a session nobody is watching
-    // has to stop rather than hold the session lock all night.
     const approvals = approvalEndpoint(arena, io, paths.dir, id);
 
-    // Opened here too, and before the first turn, so `chock detach` can reach a
-    // session from the moment it starts. A session that has not asked anything
-    // yet is exactly the one somebody wants to move to a daemon.
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
 
-    // The policy table, read once, at the start, under whatever this
-    // installation's organisation put above it. **Before the dev shell**,
-    // because the dev shell is an evaluation of the project's flake and an
-    // evaluation of a flake fetches its inputs: the table is what answers for
-    // the hosts they come from.
     const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
 
-    // The project's own toolchain. Two things come out of one evaluation: the
-    // environment every tool call runs with, and the store paths the sandbox
-    // mounts for it. After the banner, because an evaluation is the slowest
-    // thing a session start does and a user watching it should already know
-    // which session is waiting.
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
 
-    // The project's flake inputs, fetched once, on the host, under the same
-    // rule a build's own fetches go under. **Before the dev shell and before
-    // the first evaluation of anything**, because everything after this reads
-    // them out of the store rather than reaching for them itself. See
-    // `lib/chock-nix/inputs.zig`.
     const flake_inputs = fetchFlakeInputs(
         arena,
         io,
@@ -1779,11 +959,6 @@ fn start(
         model,
     );
 
-    // **The image is read first, and a project that names one never evaluates
-    // a dev shell.** A `flake.nix` is a file a project may have for its own
-    // build; a `container` block in `chock.zon` is a thing somebody wrote for
-    // Chock. So the stated answer wins over the found one, and the evaluation
-    // that would be thrown away is never paid for.
     var image = try loadImage(gpa, arena, io, env, project_root);
     errdefer if (image) |*one| one.deinit(io);
 
@@ -1803,10 +978,6 @@ fn start(
         sandbox_config.env = try sandboxEnvironment(arena, sandbox_config.env, shell);
     }
 
-    // What every tool call of this session binds, decided here and never at
-    // the tool call. See the comment above `Toolchain`: the third answer, the
-    // host's own system directories, is what a machine with no Nix and no
-    // image gets, and a machine with none of the three is refused right here.
     const toolchain = try toolchainFor(
         arena,
         io,
@@ -1816,17 +987,9 @@ fn start(
         sandbox_config.mounts,
     );
 
-    // Before the first turn, so a user who is about to be told the wrong
-    // thing by the agent hears why first. The count comes back so the agent
-    // can be told the same fact: before this, the user knew and the agent did
-    // not, which is how an agent comes to look for work that is not there.
-    // **A workspace this process took over imports nothing, and this is a
-    // refusal rather than a silent skip.** `--allow-dirty` copies every path
-    // `git status` names in the user's own tree over the same path in the
-    // workspace. On a fresh checkout that is the point of the flag. On an
-    // adopted one those paths may be files the last owner's agent wrote, so the
-    // import would overwrite the very work the handover was built to keep, with
-    // nothing said about it.
+    // A workspace this process took over imports nothing. `--allow-dirty` copies
+    // every path `git status` names over the same path in the workspace, and on
+    // an adopted one those may be files the last owner's agent wrote.
     if (taken != null and options.allow_dirty) {
         tty.print(
             .err,
@@ -1842,12 +1005,6 @@ fn start(
     else
         try handleUncommitted(gpa, io, env, &workspace, options);
 
-    // Whether the write and execute rule is on for this session, and the log
-    // line that says which it was. **The one setting on the table that widens**,
-    // so it is here and not in a `chock.zon` block of its own: see
-    // `chock_policy.hardening`. Read after the policy, because the policy is
-    // what decides it, and before `Started` holds the config, which is the last
-    // moment anything can change it.
     const write_execute = try hardeningDecision(
         arena,
         policy,
@@ -1857,24 +1014,13 @@ fn start(
     );
     sandbox_config.seccomp_options.strict_wx = write_execute.rule == .strict;
 
-    // **What this session's network is, decided once and written down.**
-    // Before this the field was left at its default and every session's
-    // header said `net none`, whatever its tool calls actually got. A header
-    // that says the same thing about every session says nothing, and this one
-    // told a model that the sandbox had no network at all while it had a
-    // router: see `chock_policy.table.Table.wantsRouter` for what decides it
-    // and why a router is a mechanism rather than a permission.
     sandbox_config.network = if (policy.wantsRouter()) .filtered else .none;
 
-    // How much of this machine a tool call may take, sized to the machine
-    // rather than to the numbers `lib/chock-sandbox/linux/rlimits.zig`
-    // compiles in. Settled here, beside the network row, because `Started`
-    // holds the config after this point.
     if (try resolveLimits(arena, io, project_root, config_dir, org_bundle)) |resolved| {
         applyLimits(&sandbox_config, resolved);
-        // The program these numbers bound cannot read them: `/sys/fs/cgroup`
-        // is hidden inside the sandbox and `/proc/meminfo` reports the whole
-        // machine. So a session the org held lower is told here.
+        // The program these numbers bound cannot read them: `/sys/fs/cgroup` is
+        // hidden inside the sandbox and `/proc/meminfo` reports the whole
+        // machine.
         if (resolved.processes_from_org) {
             tty.print(
                 .warn,
@@ -1893,12 +1039,6 @@ fn start(
 
     try recordSandbox(gpa, io, storage, &attempt, write_execute);
 
-    // This project's declared devices, from the `devices` block of
-    // `chock.zon`, read after the policy for the same reason the hardening
-    // row above is: the policy is what decides whether any of them actually
-    // reach a sandbox. **Null is the ordinary answer**, and it costs the
-    // session nothing: see `chock_core.devices.load`'s own top comment, "a
-    // project that names none pays nothing".
     var devices_diag: ?chock_core.devices.Diagnostic = null;
     defer if (devices_diag) |*d| d.deinit(arena);
     const declared_devices = chock_core.devices.load(arena, io, project_root, &devices_diag) catch |err| {
@@ -1926,11 +1066,6 @@ fn start(
         sandbox_config.device_source = host.deviceSource();
     }
 
-    // How an approved apply lands. **The one control that decides whether a "y"
-    // at an approval prompt can move a branch of the user's**, so it is read
-    // here, from the project's own file, under the row the organisation may
-    // have closed. Read after the policy for the same reason the hardening row
-    // is: the policy is what bounds it.
     const apply_mode = try applyModeFor(
         arena,
         io,
@@ -1941,25 +1076,11 @@ fn start(
         model,
     );
 
-    // Whether this session may talk to this provider instance at all, and
-    // whether it may use this model there. Before the first turn, because a
-    // session that may not use its model has nothing to do.
     try refuseProviderAndModel(arena, policy, spawnChain(options), options, instance.name, model);
 
-    // What this session may spend. The file is the project's, so a mistake in
-    // it is the user's to hear about now rather than on the turn it would have
-    // bitten. The same file is kept beyond the agent's reach, which is what
-    // makes this a control the model cannot raise for itself.
-    //
-    // The number the file asks for is not always the number the session gets:
-    // `budgetUnderOrg` folds it under the ceiling the org policy bundle sets,
-    // and refuses the session when the file asks for more than that.
     var budget_diag: ?chock_cost.budget.Diagnostic = null;
     defer if (budget_diag) |*d| d.deinit(arena);
     const from_file = chock_cost.budget.load(arena, io, project_root, &budget_diag) catch |err| {
-        // The reason, not only the error name. The reader used to print this
-        // itself, which put a library in charge of what a person sees; now it
-        // is ranked here like every other line this command writes.
         if (budget_diag) |*d| {
             tty.print(.err, "chock run: the budget in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1971,14 +1092,9 @@ fn start(
     const billing = chock_cost.prices.billingFor(instance.base_url);
     warnUnmeasurableBudget(budget, billing, instance.name, model);
 
-    // How many subagents this project allows, read from the same file and
-    // for the same reason. A `max_width` of zero refuses every spawn, which
-    // is how a project turns subagents off.
     var subagents_diag: ?chock_policy.subagents.Diagnostic = null;
     defer if (subagents_diag) |*d| d.deinit(arena);
     const limits_from_file = chock_policy.subagents.load(arena, io, project_root, &subagents_diag) catch |err| {
-        // The field that is wrong and the value it holds, which the error
-        // name alone does not carry.
         if (subagents_diag) |*d| {
             tty.print(.err, "chock run: the subagents block in chock.zon could not be read: {f}\n", .{d});
         } else {
@@ -1986,21 +1102,8 @@ fn start(
         }
         return error.Reported;
     };
-    // **Held under the org ceiling, the same as the budget above.** An
-    // organisation could cap what a project spends and not how wide its spawn
-    // tree grows, and a runaway tree is the more expensive of the two. This
-    // narrows quietly and says so where it lands, which is the opposite of the
-    // budget and for a stated reason: see `subagents.underCeiling`.
     const subagent_limits = subagentsUnderOrg(limits_from_file, org_bundle);
 
-    // This project's language server, read from the same file and for the
-    // same reason. **Null is the ordinary answer**, and it costs the session
-    // nothing: see `chock_core.lsp.Session`, whose first rule is that a
-    // harness which gets worse when a server is missing is worse than no
-    // harness.
-    //
-    // A mistake in the block is heard now rather than on the first edit of a
-    // `.zig` file, which is the same rule the three readers above keep.
     var language_server_diag: ?chock_core.lsp_driver.Diagnostic = null;
     defer if (language_server_diag) |*d| d.deinit(arena);
     const language_server = chock_core.lsp_driver.load(
@@ -2017,14 +1120,6 @@ fn start(
         return error.Reported;
     };
 
-    // This project's MCP servers, read from the same file and for the same
-    // reason. **Null is the ordinary answer**, and it costs the session
-    // nothing: see `chock_core.mcp`, whose first rule is the one
-    // `chock_core.lsp` states next door.
-    //
-    // A mistake in the block is heard now rather than on the turn the model
-    // calls a tool, which is the same rule every other reader of this file
-    // keeps.
     var mcp_diag: ?chock_core.mcp.Diagnostic = null;
     defer if (mcp_diag) |*d| d.deinit(arena);
     const mcp_servers = chock_core.mcp.load(arena, io, project_root, &mcp_diag) catch |err| {
@@ -2036,14 +1131,6 @@ fn start(
         return error.Reported;
     };
 
-    // This project's plugins, read from the same file and for the same reason.
-    // **Null is the ordinary answer**, and it costs the session nothing: see
-    // `chock_core.plugin`, whose first rule is the one `chock_core.lsp` states
-    // two blocks up.
-    //
-    // A mistake in the block is heard now rather than on the turn the model
-    // calls a tool, which is the same rule every other reader of this file
-    // keeps.
     var plugins_diag: ?chock_core.plugin.Diagnostic = null;
     defer if (plugins_diag) |*d| d.deinit(arena);
     const plugins = chock_core.plugin.load(arena, io, project_root, &plugins_diag) catch |err| {
@@ -2055,30 +1142,16 @@ fn start(
         return error.Reported;
     };
 
-    // Which wire this instance speaks. Read once, here, because two things
-    // need it: the client below, and the tool list right after, which is only
-    // allowed to name a tool this wire can carry.
     const adapter: chock_provider.Client.Adapter = switch (instance.kind) {
         .anthropic => .anthropic,
         .aiand, .openai_compat => .openai_compatible,
     };
 
-    // The tools this session offers. A tool is offered only when the adapter
-    // can express it **and** this provider instance does it. A tool the model
-    // cannot use costs a turn calling it and a turn reading the failure, which
-    // is worse than a tool that is not there. This project's knowledgebase, and
-    // the one directory outside the workspace a tool call may write. Made
-    // before the session starts, because the two memory tools bind it into the
-    // sandbox and a mount source that is not there is a mount that fails.
     const memory_dir = session_paths.memoryDir(arena, env, project_root) catch |err| {
         tty.print(.err, "chock run: the knowledgebase directory is unknown: {s}\n", .{@errorName(err)});
         return error.Reported;
     };
     const memory_ready = if (session_paths.createMemoryDir(io, memory_dir)) true else |_| ready: {
-        // Said out loud and not fatal: a session with no knowledgebase is a
-        // session that does less, not one that cannot run. `Support.memory`
-        // below then keeps the two tools out of the list, so the model is
-        // never told about a tool that has nowhere to work.
         tty.print(
             .warn,
             "chock run: the knowledgebase directory {s} could not be made, so this session " ++
@@ -2088,26 +1161,14 @@ fn start(
         break :ready false;
     };
 
-    // This project's toolchain cache: where the compiler writes, since the
-    // sandbox is writable in the workspace and nowhere else without it. Made
-    // before the session starts, for the same reason the knowledgebase is: a
-    // mount source that is not there is a mount that fails.
-    // Resolved, because on a build that moves no path this directory's own
-    // name is what a sandbox rule matches: see `resolvedForSandbox`.
     const cache_dir = resolvedForSandbox(arena, io, prepareCache(arena, gpa, io, env, project_root));
 
-    // This session's scratchpad: where a tool call puts a file that is not the
-    // project, and where a background task's output lands. Made before the
-    // session starts, for the same reason the two above are: a mount source
-    // that is not there is a mount that fails.
     const scratch_dir = resolvedForSandbox(arena, io, prepareScratchpad(arena, gpa, io, env, id, options));
     const tasks_dir: ?[]const u8 = if (scratch_dir) |dir|
         std.fs.path.join(arena, &.{ dir, chock_core.tasks.host_leaf }) catch return error.OutOfMemory
     else
         null;
 
-    // Provisioning, read before the tool list is built, because whether the
-    // model is told `provide_tool` exists is exactly this answer.
     const chain = spawnChain(options);
     const provisioning = try provisioningFor(
         arena,
@@ -2120,13 +1181,8 @@ fn start(
         dev_shell_dir,
     );
 
-    // What a Nix evaluation of this session may put in the store. Read here,
-    // beside provisioning, because both are answers about Nix that the tool
-    // list depends on.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
 
-    // Beside provisioning and the caps, for the same reason: it is an answer
-    // about Nix that the tool list depends on.
     const nix_build = nixBuildFor(
         arena,
         io,
@@ -2143,43 +1199,23 @@ fn start(
         .memory = memory_ready,
         .provisioning = provisioning != null,
         .nix_build = nix_build != null,
-        // **Always true, and that is the whole of the gate.** An evaluation
-        // runs in this process, through fix, so it needs no `nix` binary, no
-        // daemon and no store: see `lib/chock-nix/eval.zig`. A session that
-        // cannot provision can still evaluate, which is the shape a project
-        // whose policy denies `nix.build` has.
+        // An evaluation runs in this process, so it needs no `nix` binary,
+        // no daemon and no store.
         .nix_eval = true,
-        // A reviewer is offered no tool at all, so the list below comes back
-        // empty and the prompt names none: see `agentRole`.
         .role = agentRole(options),
     };
 
-    // The instruction files, the guidance shelf, and the knowledgebase
-    // index. Three sources, one mechanism: the prompt carries a bounded
-    // block or one line per thing, and a tool fetches the rest. See
-    // `lib/chock-core/index.zig`.
     const loaded_instructions = chock_core.instructions.load(arena, io, config_dir, project_root) catch
         return error.OutOfMemory;
     reportInstructions(loaded_instructions);
 
     const notes = chock_core.memory.list(arena, io, memory_dir) catch return error.OutOfMemory;
     const note_index = chock_core.memory.indexOf(arena, notes) catch return error.OutOfMemory;
-    // A count of notes at the start is a fact about a healthy session, and
-    // `chock memory` answers it whenever somebody asks. `reportNotes` still
-    // says at the end when this session **wrote** one, because that changes
-    // every session after it.
     if (notes.len != 0) {
         tty.detail("chock: {d} notes from earlier sessions ({s})\n", .{ notes.len, memory_dir });
     }
 
-    // The prompt. It is kept short, and the tool list in it is read from the
-    // same slice that fills `Request.tools`, so the prompt can never name a
-    // tool the model cannot call.
     const tool_definitions = chock_core.tools.Registry.definitions(arena, support) catch return error.OutOfMemory;
-    // Kept whole, because a project with an `mcp_servers` block builds the
-    // prompt a second time in phase 2, once the servers have said which tools
-    // they have. **Nothing else reads them**, and a project with no such block
-    // takes the prompt below unchanged.
     const prompt_project = projectKind(io, project_root);
     const prompt_sources = chock_core.prompt.Sources{
         .instructions = loaded_instructions,
@@ -2193,16 +1229,9 @@ fn start(
         prompt_sources,
     ) catch return error.OutOfMemory;
 
-    // The user's own message, appended before `Loop.run` is called: `run`
-    // starts from whatever the log already holds. See its own doc comment.
-    //
-    // **An adoption appends nothing, and reads no standard input.** The log
-    // already holds the conversation, and `Loop.run` folds it: a message added
-    // here would be a turn nobody asked for, and a read of standard input would
-    // block a daemon's child forever on a pipe nothing writes to.
-    // **A display appends none either, and for a related reason.** It asks for
-    // every message it sends, the first one included, so that a piped message
-    // and a typed one take one path: see `runSession`'s own loop.
+    // An adoption appends nothing and reads no standard input: a read would
+    // block a daemon's child for ever on a pipe nothing writes to. A display
+    // appends none either, and asks for every message it sends.
     if (!options.adopt and options.display == null) {
         const message_text = try readMessage(arena, io, options);
         if (message_text.len == 0) {
@@ -2267,88 +1296,16 @@ fn start(
     };
 }
 
-/// What this session keeps out of its own log and out of a provider request.
-///
-/// **Every provider credential this configuration holds, and not only the one
-/// this session sends with.** `chock_core.redact.Policy` is inert until a caller
-/// fills it in, and this is that caller. Two sources reach it:
-///
-/// 1. The credential this session resolved, whichever of the three sources
-///    answered for it.
-/// 2. The `token` written in place on any other provider in `config.zon`. A
-///    machine set up for a comparison run holds two, and the second one is a
-///    live credential that a tool result can echo just as easily as the first.
-///    A `token_file` gives a path and not a value, so there is nothing to add
-///    for one that this session did not resolve.
-///
-/// **A git password now has a producer, and this paragraph used to say it had
-/// none.** What stood here said that no code in this command opens an
-/// `askpass.Endpoint`, that the grant set is therefore always empty, and that
-/// an entry here would read as cover that is not there. All three stopped being
-/// true when `GitCredentials` landed, and a stale comment arguing for the old
-/// behaviour is how a fix gets reverted, so here is what happens instead.
-///
-/// **What flows.** A person approves a `git push` to an `https` remote and is
-/// then prompted, at the terminal or in the display's own question region, for
-/// the password. What they type is held in `GitCredentials.secret` for that one
-/// tool call, handed to a `chock_broker.askpass.Grants` for that call alone,
-/// and answered over a unix socket to the `chock askpass` that the real `git`
-/// runs inside the sandbox. It is overwritten when the call ends. **It is never
-/// stored**: there is no credential store entry for it, no configuration field,
-/// and nothing written to disk.
-///
-/// **So the policy carries a slot for it.** The slice built below is one longer
-/// than the number of credentials, and the extra entry is empty. `armPassword`
-/// writes the person's own bytes into it while the push runs and `disarm`
-/// empties it again, so the value is covered by the redaction funnel for
-/// exactly as long as it exists and for no longer. An empty value is inert:
-/// `Policy.isEmpty` and `brokerRedaction` both skip anything shorter than
-/// `redact.min_secret_bytes`, so a session that never pushes is unchanged.
-///
-/// **What it covers and what it does not.** It covers what this session sends
-/// to the provider, which is where a leaked value would leave the machine.
-/// `brokerRedaction` below reads the slice once, in phase 1, so the broker's
-/// own copy does not gain the live value; that is not a hole, because nothing
-/// the broker writes ever holds it. `git` puts the password in an HTTP header
-/// and in nothing it prints, and `askpass.appendPrompt` takes no `Grants` at
-/// all, so the session log has no route to it either. Both halves are held to
-/// by a test that greps the log and the standard error of a real push.
-///
-/// **A `chock_broker.secrets.Store` entry is still left out**, and its reason
-/// is unchanged: `Broker.secrets` is never filled. The heuristics stay off,
-/// which is `redact.zig`'s own default and its own argument.
-///
-/// **Built in phase 1, out of the arena, because the policy borrows.**
-/// `redact.Policy.secrets` is kept alive by the caller for the whole session,
-/// and both the credential and the parsed configuration already live in that
-/// arena.
-///
-/// **A subagent needs nothing from here.** Each child is a process that resolves
-/// its own credential and builds its own `Loop.Deps`, so it reaches this same
-/// function for itself.
-///
-/// **An empty token is not a short credential.** An instance that needs no
-/// credential at all, which is every local provider somebody runs without auth,
-/// has nothing to protect and nothing to say about it.
-///
-/// **A credential too short to match is skipped and said out loud, by name.**
-/// See `chock_core.redact.min_secret_bytes`: a short value appears inside
-/// ordinary words, inside hashes and inside base64, so matching one would fill a
-/// request with markers and teach an agent to distrust every marker it sees. The
-/// honest answer is to skip it and say which instance it belongs to, rather than
-/// leave somebody believing a value is protected when it is not.
-///
-/// **Nothing here prints a token and nothing may.** The line names the instance
-/// and nothing else. A diagnostic carrying the value would put the credential in
-/// the very place this exists to keep it out of.
+/// What this session keeps out of its own log and out of a provider request. A
+/// credential shorter than `chock_core.redact.min_secret_bytes` is skipped and
+/// said out loud by name, because a short value appears inside ordinary words,
+/// hashes and base64.
 fn redactionFor(
     arena: std.mem.Allocator,
     instance_name: []const u8,
     token: []const u8,
     instances: []const chock_auth.config.Instance,
 ) std.mem.Allocator.Error!chock_core.redact.Policy {
-    // The instance a value came from, so a value too short to match can be
-    // named to whoever wrote it. The name is never the value.
     const Named = struct { name: []const u8, value: []const u8 };
 
     var named: std.ArrayList(Named) = .empty;
@@ -2357,12 +1314,9 @@ fn redactionFor(
     for (instances) |one| {
         const inline_token = switch (one.credential) {
             .token => |value| value,
-            // A path, not a value. The one this session resolved is already
-            // above, and no other instance's file is read.
             .token_file, .absent => continue,
         };
         if (inline_token.len == 0) continue;
-        // The same bytes twice would warn twice about one credential.
         var already = false;
         for (named.items) |seen| {
             if (std.mem.eql(u8, seen.value, inline_token)) already = true;
@@ -2371,13 +1325,9 @@ fn redactionFor(
         try named.append(arena, .{ .name = one.name, .value = inline_token });
     }
 
-    // **One slot more than there are credentials**, and the last one is empty.
-    // It is where a git password goes while an approved push is running: see
-    // `GitCredentials.armPassword`, which writes the person's own bytes into
-    // it, and `disarm`, which empties it again. An empty value is inert, so a
-    // session that never pushes carries exactly the policy it always did:
-    // `Policy.isEmpty` and `brokerRedaction` both skip anything shorter than
-    // `min_secret_bytes`.
+    // One slot more than there are credentials, and the last one is empty. It is
+    // where a git password goes while an approved push runs, and an empty value
+    // is inert.
     const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + 1);
     for (named.items, secrets[0..named.items.len]) |one, *slot| {
         slot.* = .{ .value = one.value, .source = .credential };
@@ -2399,24 +1349,8 @@ fn redactionFor(
     return .{ .secrets = secrets };
 }
 
-/// The same values `redactionFor` found, in the shape a `chock_broker.Broker`
-/// takes.
-///
-/// **The broker writes into the same log the loop does, and the loop's own
-/// funnel cannot cover it.** `chock-broker` imports no `chock-core`, so a
-/// `chock_core.redact.Policy` cannot travel there. The values can, and they
-/// travel with no name attached: see `chock_broker.Broker.redaction` for why a
-/// name would be a route to the thing the redaction protects.
-///
-/// **The floor is applied here and the report of what it skipped is already
-/// out.** `redactionFor` above names every credential too short to match on,
-/// by instance, and says it is kept out of neither the log nor the request.
-/// That line covers this path too, so a value dropped here was said out loud
-/// once rather than twice.
-///
-/// **The heuristics do not travel and there is nothing to carry.** They are a
-/// pattern and not a value, and `redact.Policy.heuristics` is off in every
-/// session this command starts.
+/// `chock-broker` imports no `chock-core`, so a `chock_core.redact.Policy`
+/// cannot travel there. The values can, and they travel with no name attached.
 fn brokerRedaction(
     arena: std.mem.Allocator,
     policy: chock_core.redact.Policy,
@@ -2429,53 +1363,15 @@ fn brokerRedaction(
     return values.toOwnedSlice(arena);
 }
 
-/// One audit sink this session will write.
-///
-/// **Where a command line and an org bundle meet, and the only place they do.**
-/// See `auditSinks`.
 const PlannedSink = struct {
     kind: chock_policy.org.RequiredSink.Kind,
-    /// What this sink writes: the file inside the directory for a drop, the
-    /// socket for syslog. It is also the name a person reads, so there is one
-    /// string and not two that can disagree.
     path: []const u8,
-    /// Whether this installation's org policy bundle required it, rather than
-    /// somebody asking for it on this command line. **The whole of what
-    /// "required" costs at run time is in this flag**: see
-    /// `chock_policy.org` for the decision and `reportShipping`,
-    /// `Exporter.sayFault` and `exitWithAudit` for the three things it changes.
     required: bool = false,
 };
 
-/// Where this session's log is copied to, resolved from `--export-dir`,
-/// `--export-syslog` **and** the org policy bundle together.
-///
-/// **The union of the two, and this is the ratchet a sink can take.** A project
-/// may add a sink of its own, because more of the record reaching more places
-/// narrows nothing. A project may not drop one the installation named, and it
-/// cannot: there is no flag that removes a sink, and the required ones are put
-/// in this list before the command line's. `chock_policy.org` carries the whole
-/// reading.
-///
-/// **A function that takes both, so the wiring is what a test drives.** The org
-/// policy work extracted `loadPolicyUnder` for exactly this reason: a phase 1
-/// that read the flags without the bundle would have passed every test of the
-/// bundle reader and of the shipper, and every session in the installation
-/// would have exported only what a developer chose to. There is no path here
-/// that takes an `Options` alone.
-///
-/// **A sink named twice is opened once.** An installation that requires
-/// `/var/audit/chock` and a developer who types `--export-dir /var/audit/chock`
-/// mean one file, and two `FileDrop`s over one file would write the same bytes
-/// at the same offsets from two counts and leave a copy that verifies as
-/// broken. The required entry is the one that is kept, so a duplicate on the
-/// command line cannot demote a sink to optional.
-///
-/// **Built in phase 1, out of the arena, and this is a lifetime and not a
-/// tidiness.** The line phase 3 prints about a sink names this path, and phase
-/// 2's own allocations are gone by then. A real run crashed on exactly that:
-/// `Sinks.close` freed the path a `ShippingReport` still borrowed, and
-/// `reportShipping` read it afterwards.
+/// The union of `--export-dir`, `--export-syslog` and the org policy bundle: a
+/// project may add a sink and cannot drop one the installation named. A sink
+/// named twice is opened once, and the required entry is the one kept.
 fn auditSinks(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2485,9 +1381,6 @@ fn auditSinks(
 ) std.mem.Allocator.Error![]const PlannedSink {
     var planned: std.ArrayList(PlannedSink) = .empty;
 
-    // **The installation's first.** A required sink is the one a person did not
-    // ask for, so it is the one a report has to name first, and being first is
-    // what makes it the entry that survives a duplicate.
     if (org_bundle) |bundle| for (bundle.sinks) |one| {
         try addPlannedSink(arena, &planned, .{
             .kind = one.kind,
@@ -2511,8 +1404,6 @@ fn auditSinks(
     return planned.toOwnedSlice(arena);
 }
 
-/// Add `one` unless this list already writes the same place. See `auditSinks`:
-/// the entry already in the list wins, which keeps a required sink required.
 fn addPlannedSink(
     arena: std.mem.Allocator,
     planned: *std.ArrayList(PlannedSink),
@@ -2524,21 +1415,6 @@ fn addPlannedSink(
     try planned.append(arena, one);
 }
 
-/// The file this session writes inside the drop directory `dir`.
-///
-/// **The directory is made rather than required.** An operator turning export on
-/// names a directory a collector will watch, and refusing to start a session
-/// because it is not there yet would be an audit sink stopping work, which is
-/// the one thing this must never do. A directory that could not be made shows up
-/// as a sink that cannot be reached, which is reported and is still not fatal.
-/// That holds for a required sink too: see `chock_policy.org` for why a
-/// required sink that cannot be reached does not stop a session.
-/// Make `path` and every parent it needs, walking up **once**.
-///
-/// **The same shape `src/doctor.zig` uses, and for the same reason**: a walk
-/// that goes up one level, makes what it can, and comes back down cannot
-/// oscillate. `std.Io.Dir.createDirPath` can, which is what this exists to
-/// avoid: see `dropPathIn`.
 fn makeDirAll(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
@@ -2561,63 +1437,18 @@ fn dropPathIn(
     dir: []const u8,
     session_id: []const u8,
 ) std.mem.Allocator.Error![]const u8 {
-    // **Not `createDirPath`, which can loop for ever.** Measured 2026-08-24: it
-    // answers a `mkdir` of `ENOENT` by walking back to a component it can make
-    // and forward again, so a component whose parent exists and which still
-    // cannot be made sends it between the same two names without end. A path
-    // under `/proc` is exactly that shape, and `chock doctor` spun at most of a
-    // core for ninety seconds on one before this was found. Here it would hang
-    // a session before its first turn, on a directory an operator named.
+    // Not `createDirPath`, which can loop for ever: it answers a `mkdir` of
+    // `ENOENT` by walking back to a component it can make and forward again, so
+    // a component whose parent exists and still cannot be made sends it between
+    // the same two names without end. A path under `/proc` is that shape.
     makeDirAll(io, dir) catch {};
-    // One file per session, named after it, so a collector watching the
-    // directory sees exactly one file appear per run and can tell which session
-    // it holds without opening it.
     return try std.fmt.allocPrint(arena, "{s}/{s}.jsonl", .{ dir, session_id });
 }
 
-/// The workspace a session that handed over left behind, when there is one
-/// still on disk, or null.
-///
-/// **What is folded, and why each part of it is needed.** Two facts about a
-/// workspace cannot be worked out by a second process:
-///
-/// * **The attempt identifier**, because `start` mints a fresh one on every
-///   invocation and it names the checkout, the scratch object store, the
-///   pointer file, and the `config.worktree` stand in.
-/// * **The commit the checkout started at**, because
-///   `chock_workspace.Worktree.headMoved` measures the agent's work against it.
-///   A session that committed before it handed over has a `HEAD` that is not
-///   its base, so a new owner that read `HEAD` would decide nothing had changed
-///   and would never carry that commit back.
-///
-/// Both are in the log, in the `workspace.open` event the last owner wrote, and
-/// `chock_proto.state.Session` folds the newest one.
-///
-/// **Only a workspace that was opened before the ending that handed it over**,
-/// and this is not the same test as "the session ended `handed_over`". A
-/// `state.Session` fold never clears `end_reason`, and a resumed session writes
-/// no second `session.start`, so once a session has handed over once the fold
-/// says `handed_over` for ever, including while its next owner is running.
-///
-/// That difference was a way to delete live work. A session hands over from A
-/// to the daemon's child B, and B writes a `workspace.open` of its own. A person
-/// then runs `chock run --continue`: the fold reports A's stale reason and B's
-/// live workspace, so C would adopt the checkout B is working in. When B's turn
-/// ends and it lets go of the lock, C takes it, and B's own teardown then runs
-/// `git worktree remove --force` on the directory C is now using.
-///
-/// Reading the two positions closes it. B's `workspace.open` comes **after** the
-/// newest `session.end`, and A's came **before** it, so a workspace this may
-/// take is one whose event is older than the ending that says it was handed
-/// over. A session running right now always fails that test.
-///
-/// A session that ended any other abnormal way also keeps its workspace, per
-/// `cleanupFor`, and taking that one over is a separate decision with its own
-/// refusal in `src/detach.zig`.
-///
-/// **A directory that is not there is not a fault.** That is the ordinary
-/// adoption of a session which ended cleanly and had its workspace removed, and
-/// building a fresh one from committed state is what that session wants.
+/// The workspace a session that handed over left behind, or null. Only one opened
+/// before the ending that handed it over counts: a fold never clears
+/// `end_reason`, so a session that handed over once reads as `handed_over` for
+/// ever, and adopting that checkout lets the live owner's teardown remove it.
 fn takenOver(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2631,9 +1462,6 @@ fn takenOver(
     const store = backing.storage();
     defer store.close(io);
 
-    // **A replay of its own, and not `foldSession`.** What decides here is where
-    // two events sit relative to each other, and a fold keeps values rather than
-    // positions.
     var replay = store.replay(gpa, io, 0) catch return null;
     defer replay.deinit();
 
@@ -2642,8 +1470,7 @@ fn takenOver(
     var opened_at: ?u64 = null;
     var attempt: [session_paths.id_length]u8 = undefined;
     // A git object identifier is 40 hexadecimal characters for SHA-1 and 64 for
-    // SHA-256. This is room for either with space to spare, and it is a bound on
-    // what a log can make this hold rather than a claim about git.
+    // SHA-256.
     var base_buffer: [128]u8 = undefined;
     var base_len: usize = 0;
 
@@ -2661,9 +1488,6 @@ fn takenOver(
                     opened_at = null;
                     continue;
                 }
-                // An identifier of another length is a log this build cannot
-                // act on, and joining it onto a path would be joining whatever
-                // a writer put there.
                 if (opened.attempt.len != session_paths.id_length) continue;
                 if (!session_paths.isValidId(opened.attempt)) continue;
                 if (opened.base_commit.len > base_buffer.len) continue;
@@ -2678,14 +1502,8 @@ fn takenOver(
 
     if (!handed_over) return null;
     const opened = opened_at orelse return null;
-    // The one that closes the window above. An event written after the ending
-    // belongs to an owner that came after it, and that owner may be running.
     if (opened > ended_at) return null;
 
-    // **The disk decides, and not the log.** A person may have run
-    // `chock workspace clear` between the two owners, and a run that then asked
-    // `adopt` for a directory that is gone would fail where it should simply
-    // start again from committed state.
     const path = std.fs.path.join(arena, &.{ work_path, &attempt }) catch return null;
     var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
     dir.close(io);
@@ -2694,18 +1512,6 @@ fn takenOver(
     return .{ .attempt = attempt, .base_commit = base_commit };
 }
 
-/// Write down which workspace this run is working in, so the process that takes
-/// this session over next can find it.
-///
-/// **This is the whole of the workspace half of a handover.** The log is the
-/// only thing a new owner reads, so a workspace the log does not name is a
-/// workspace the next owner rebuilds from committed state, which throws away
-/// everything the agent has not committed.
-///
-/// Written on every run and not only before a handover, for the reason every
-/// other event is: a fact recorded when it becomes true is a fact a fold can
-/// rely on, and a fact recorded when somebody asks for it is a fact that is
-/// missing whenever the process ends before the asking.
 fn recordWorkspace(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2713,9 +1519,6 @@ fn recordWorkspace(
     workspace: *const chock_workspace.Workspace,
     attempt: []const u8,
 ) !void {
-    // **The lock is taken and given back here**, because `Loop.run` has not
-    // started yet and takes it for itself. `appendUserMessage` does the same
-    // thing a few lines further on and for the same reason.
     var locked = try storage.lock(io);
     defer locked.unlock(io) catch {};
     _ = try locked.append(gpa, io, .{
@@ -2726,9 +1529,6 @@ fn recordWorkspace(
             },
             .attempt = attempt,
             .path = workspace.workPath(),
-            // Empty for the overlay backing, which has no commit of its own. That
-            // is also why `takenOver` refuses to take one over: see
-            // `chock_workspace.Workspace.adopt`.
             .base_commit = switch (workspace.kind) {
                 .worktree => |wt| wt.base_commit,
                 .overlay => "",
@@ -2737,21 +1537,6 @@ fn recordWorkspace(
     }, std.Io.Timestamp.now(io, .real).toMilliseconds());
 }
 
-/// Write down which sandbox this run built.
-///
-/// **A session that gave up a piece of hardening must be distinguishable
-/// afterwards from one that did not.** This project has no silent degradation,
-/// and a control that turned a layer off quietly would be exactly that. So the
-/// answer is an event, on every run and not only on the run that relaxed
-/// something, for the reason every other event is written when it becomes true:
-/// a fold can rely on a fact that is always recorded, and a fact recorded only
-/// when it is interesting is missing whenever somebody disagrees about what is
-/// interesting.
-///
-/// **Written per attempt**, beside `recordWorkspace` and with the same
-/// identifier, because a later process that continues this session reads
-/// `chock.zon` again and its answer is the one that binds the tool calls it
-/// makes.
 fn recordSandbox(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2759,8 +1544,6 @@ fn recordSandbox(
     attempt: []const u8,
     hardening: Hardening,
 ) StartError!void {
-    // The lock is taken and given back here, for the reason `recordWorkspace`
-    // gives: `Loop.run` has not started yet and takes it for itself.
     var locked = storage.lock(io) catch |err| return reportSandboxRecord(err);
     defer locked.unlock(io) catch {};
     _ = locked.append(gpa, io, .{
@@ -2775,9 +1558,6 @@ fn recordSandbox(
     }, std.Io.Timestamp.now(io, .real).toMilliseconds()) catch |err| return reportSandboxRecord(err);
 }
 
-/// The one message a failed `recordSandbox` writes. **The session does not
-/// start**, because a run that cannot say which sandbox it built is a run
-/// nobody can audit afterwards, and that is the whole reason the event exists.
 fn reportSandboxRecord(err: anyerror) StartError {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     if (err == error.Busy) {
@@ -2793,29 +1573,9 @@ fn reportSandboxRecord(err: anyerror) StartError {
     return error.Reported;
 }
 
-/// Write down what this project's `devices` block asked for, and what
-/// policy answered for each one. **A no-op when `seam` is null**, which is
-/// what `devicesFor` answers for a project that named no device: no lock is
-/// taken and no line is written, the same silence `recordSandbox` above
-/// would keep if `SandboxOpen` did not exist to begin with.
-///
-/// **One row per declared device, whichever way policy went.** The same
-/// reasoning `recordSandbox` states for `SandboxOpen`: a fact recorded only
-/// when it is interesting is missing whenever somebody disagrees about what
-/// is interesting, and a project that named a device and was refused needs
-/// that refusal on the record as much as a project that was granted one.
-///
-/// **`enforced` reads `chock_sandbox.expresses.device_passthrough` and not
-/// only `decision`.** A build whose driver applies neither `Config.device_tree`
-/// nor `Config.device_source` grants nothing no matter what policy answers,
-/// and a reader auditing a session from such a machine has to be able to see
-/// that from the row alone: see `chock_proto.event.DeviceExposed`'s own top
-/// comment.
-///
-/// **A refusal is said out loud, not only logged.** The same reading
-/// `hardeningDecision` gives a project that gave up a layer: a person at the
-/// keyboard hears why a device they named is not there, and the line says
-/// what to do about it, which the log row alone does not.
+/// `enforced` reads `chock_sandbox.expresses.device_passthrough` and not only
+/// `decision`, because a build that applies neither `Config.device_tree` nor
+/// `Config.device_source` grants nothing whatever policy answers.
 fn recordDevices(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -2849,10 +1609,6 @@ fn recordDevices(
     }
 }
 
-/// The one message a failed `recordDevices` writes. **The session does not
-/// start**, the same rule `reportSandboxRecord` keeps: a device this project
-/// declared, granted or not, is invisible to anybody auditing this session
-/// afterward if the row that would have said so never reached the log.
 fn reportDevicesRecord(err: anyerror) StartError {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     if (err == error.Busy) {
@@ -2868,13 +1624,6 @@ fn reportDevicesRecord(err: anyerror) StartError {
     return error.Reported;
 }
 
-/// Open this session's handover socket, or answer null and say why.
-///
-/// **A session with no socket still runs, and no process can take it.** That is
-/// the safe direction, and it is what every session did before `chock detach`
-/// could reach a running one: `chock detach` then reports that the session is
-/// running and will not hand over, which is true. So every failure here is
-/// reported and carried on from, exactly as `approvalEndpoint` does.
 fn handoverEndpoint(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2906,14 +1655,6 @@ fn handoverEndpoint(
     return endpoint;
 }
 
-/// Open this session's approval socket, or answer null and say why.
-///
-/// **A session with no socket still runs.** The socket is how somebody who is
-/// not at this process's keyboard answers a question, and a session that cannot
-/// have one is exactly the session Chock had before this existed: a question it
-/// cannot ask anybody is refused, which is already the safe direction. So every
-/// failure here is reported and then carried on from, and none of them ends the
-/// run.
 fn approvalEndpoint(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -2922,8 +1663,6 @@ fn approvalEndpoint(
 ) ?*chock_broker.socket.Endpoint {
     const paths = chock_broker.socket.pathsFor(arena, session_dir, id) catch return null;
     const endpoint = arena.create(chock_broker.socket.Endpoint) catch return null;
-    // Which of the four steps of `open` failed, and what it answered. The
-    // socket used to print that itself and hand this command an error name.
     var socket_diag: ?chock_broker.Diagnostic = null;
     endpoint.* = chock_broker.socket.Endpoint.open(io, paths, &socket_diag) catch |err| {
         if (socket_diag) |*fault| {
@@ -2943,26 +1682,10 @@ fn approvalEndpoint(
         }
         return null;
     };
-    // Where a `chock approve` attaches. A healthy session has one, and the path
-    // is derived from the session identifier the first line already gave.
     tty.detail("chock: approvals {s}\n", .{paths.socket});
     return endpoint;
 }
 
-/// The ceiling this installation's org policy bundle sets, as a `Budget` the
-/// cost library can fold.
-///
-/// **This is the seam between two libraries that do not know each other.**
-/// `lib/chock-policy` imports no other chock library, so it writes the ceiling
-/// out in its own `org.BudgetCeiling`; `lib/chock-cost` owns the budget type
-/// and the one default currency. This command already joins the two libraries
-/// for the audit sinks, and it joins them here the same way, in one named
-/// function a test can hold both halves against.
-///
-/// A currency the bundle left out is `USD`, exactly as it is for a project
-/// that left it out of `chock.zon`. **The same default on both sides**, or an
-/// organisation that wrote a plain number would be refusing every project that
-/// wrote a plain number.
 fn orgBudgetCeiling(
     org_bundle: ?*const chock_policy.org.Bundle,
 ) ?chock_cost.budget.Budget {
@@ -2977,19 +1700,6 @@ fn orgBudgetCeiling(
     };
 }
 
-/// How wide and how deep this session's spawn tree may grow: the `subagents`
-/// block of `chock.zon`, held under the ceiling the org policy bundle sets.
-///
-/// **One function and not two, for the reason `budgetUnderOrg` gives.** A
-/// `start` that read the project's block and skipped the ceiling would pass
-/// every test of the fold itself, which is how a mechanism ships with green
-/// tests and no caller. There is one answer to "how far may this tree grow",
-/// and it is this.
-///
-/// **It narrows quietly, where the budget refuses.** A spawn this stops says
-/// so at the moment it happens and names the bundle as the source, so nothing
-/// is hidden by folding rather than refusing. See
-/// `chock_policy.subagents.underCeiling`.
 fn subagentsUnderOrg(
     from_file: chock_policy.subagents.Limits,
     org_bundle: ?*const chock_policy.org.Bundle,
@@ -2998,16 +1708,6 @@ fn subagentsUnderOrg(
     return chock_policy.subagents.underCeiling(from_file, bundle.subagents);
 }
 
-/// How many processes and how much memory this session's sandbox may take:
-/// the `limits` block of `chock.zon`, over the operator's own `config.zon`,
-/// over a default sized to this machine, held last under the org policy
-/// bundle's ceiling. The numbers land in `sandbox_config.limits`, which
-/// `lib/chock-sandbox/linux/rlimits.zig` turns into `pids.max`, `memory.max`
-/// and `RLIMIT_NPROC`.
-///
-/// Null when this machine's cpu count and total memory could not be read. The
-/// session still runs, on the compiled in defaults: a machine fact Chock
-/// cannot read is a reason to size nothing and not a reason to refuse work.
 fn resolveLimits(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3018,8 +1718,6 @@ fn resolveLimits(
     var diag: ?chock_policy.limits.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
 
-    // One diagnostic slot serves both files: it carries which of the two it
-    // is about. See `chock_policy.limits.Diagnostic.source`.
     const project = chock_policy.limits.load(arena, io, project_root, &diag) catch |err|
         return reportLimits(err, &diag);
     const operator = chock_policy.limits.loadOperator(arena, io, config_dir, &diag) catch |err|
@@ -3039,26 +1737,14 @@ fn resolveLimits(
     return chock_policy.limits.foldLayers(project, operator, ceiling, machine);
 }
 
-/// `resolved` written into the config this run's sandbox is built from.
-///
-/// Assigned, and not folded through `rlimits.Limits.narrow`: that is the
-/// ratchet for a caller which may only ask for less, and a large machine has
-/// to reach above `rlimits.default_processes`. The rows `chock_policy.limits`
-/// does not name keep their compiled in value.
+/// Assigned, and not folded through `rlimits.Limits.narrow`: that ratchet is
+/// for a caller which may only ask for less, and a large machine has to reach
+/// above `rlimits.default_processes`.
 fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) void {
     config.limits.processes = resolved.processes;
     config.limits.memory_bytes = resolved.memory_bytes;
 }
 
-/// How much a Nix evaluation of this session may put in the store: the `nix`
-/// block of `chock.zon`, over the operator's own `config.zon`, over the built
-/// in default, held last under the org policy bundle's ceiling. The same
-/// shape `resolveLimits` above has, and the same three layers.
-///
-/// `max_object_bytes` lands on `chock_nix.backend.Driver.max_object_bytes`
-/// through `applyNixCaps`, and `max_session_bytes` on
-/// `NixBuildToolRunner.budget`, which every build of the session spends
-/// against.
 fn resolveNixCaps(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3069,8 +1755,6 @@ fn resolveNixCaps(
     var diag: ?chock_policy.nix.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
 
-    // One diagnostic slot serves both files, the same way `resolveLimits`
-    // uses one: it carries which of the two it is about.
     const project = chock_policy.nix.load(arena, io, project_root, &diag) catch |err|
         return reportNixCaps(err, &diag);
     const operator = chock_policy.nix.loadOperator(arena, io, config_dir, &diag) catch |err|
@@ -3080,15 +1764,11 @@ fn resolveNixCaps(
     return chock_policy.nix.foldLayers(project, operator, ceiling);
 }
 
-/// `resolved` written into the driver an evaluation answers through.
 fn applyNixCaps(driver: *chock_nix.backend.Driver, resolved: chock_policy.nix.Resolved) void {
     driver.max_object_bytes = std.math.cast(usize, resolved.max_object_bytes) orelse
         std.math.maxInt(usize);
 }
 
-/// The one message a refused `nix` block writes. The session does not start,
-/// for the reason `reportLimits` gives: a number that does not parse is one
-/// somebody wrote on purpose.
 fn reportNixCaps(err: anyerror, diag: *?chock_policy.nix.Diagnostic) StartError {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     if (diag.*) |*d| {
@@ -3099,9 +1779,6 @@ fn reportNixCaps(err: anyerror, diag: *?chock_policy.nix.Diagnostic) StartError 
     return error.Reported;
 }
 
-/// The one message a refused `limits` block writes. The session does not
-/// start: a number that does not parse is one somebody wrote on purpose, and
-/// running under a different number is worse than saying so now.
 fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartError {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     if (diag.*) |*d| {
@@ -3113,9 +1790,6 @@ fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartErro
 }
 
 test "the limits a project and an operator name reach the sandbox this run builds" {
-    // The wiring, and not the fold: `chock_policy.limits` has its own tests
-    // for which layer wins. Drop either line of `applyLimits` and the
-    // matching expectation below reads what `rlimits.zig` compiles in.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -3161,9 +1835,6 @@ test "the limits a project and an operator name reach the sandbox this run build
 }
 
 test "a machine nobody configured still gets a number sized to it, and never a smaller one" {
-    // This runs on whatever machine the tests run on, so it asks the part
-    // that holds for every machine: the default is never under the fixed
-    // floor `rlimits.zig` compiles in, and it is what the config carries.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -3171,7 +1842,6 @@ test "a machine nobody configured still gets a number sized to it, and never a s
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // No `chock.zon` and no `config.zon`: every layer saying nothing.
     var project_tmp = testing.tmpDir(.{});
     defer project_tmp.cleanup();
     var config_tmp = testing.tmpDir(.{});
@@ -3203,7 +1873,6 @@ test "a limits block that does not parse stops the session rather than sizing it
     const gpa = testing.allocator;
     const io = testing.io;
 
-    // A passing test may not let a line reach the real standard error.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
@@ -3236,14 +1905,11 @@ test "a limits block that does not parse stops the session rather than sizing it
         null,
     ));
 
-    // The field, the text, and the file it is in. The error name alone
-    // carries none of the three.
     try testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "processes") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "200%") != null);
 }
 
-/// The smallest `sandbox.Config` that holds together. Nothing here is spawned.
 fn testConfig() sandbox.Config {
     return .{
         .root = "/",
@@ -3254,36 +1920,8 @@ fn testConfig() sandbox.Config {
     };
 }
 
-/// What this session may spend: the cap in `chock.zon`, the slice a parent
-/// gave it, and the ceiling the org policy bundle sets, folded in that order.
-///
-/// **A slice can only ever narrow.** A parent divides what it has left and
-/// hands a piece to each child, through `chock_core.subagent.budgetSlice`, and
-/// the project's own cap still binds every session of that project. Taking the
-/// smaller of the two means neither a parent nor a project file can be worked
-/// around by the other. A currency the parent did not name is the project's
-/// own, and a parent that named one wins: the parent is what divided the
-/// number.
-///
-/// **The ceiling is folded last, over every other source.** A budget reaches a
-/// session from `chock.zon` or from the slice a parent handed a subagent, and
-/// the ceiling has to bind both: an organisation that capped a project did not
-/// cap only the projects that read their cap out of a file. Folding last means
-/// there is one place the answer is checked, and no source that can be added
-/// later without passing through it.
-///
-/// **A session above the ceiling is refused here and not lowered.** The whole
-/// argument is beside `chock_cost.budget.underCeiling`. The one line of it:
-/// lowering the number quietly leaves a project believing it has money it does
-/// not have, and it finds out as a session that stops in the middle of the
-/// work with nothing said about why.
-///
-/// **One function and not two, so `start` has nothing else to call.** The two
-/// halves were separate while the ceiling did not exist, and a `start` that
-/// took the slice and skipped the ceiling would have passed every test of the
-/// fold itself: see `lib/chock-core/constitution.zig`, on mechanisms in this
-/// project that shipped with green tests and no caller at all. There is now
-/// one answer to "what may this session spend", and it is this.
+/// A session above the org ceiling is refused here and not lowered, because
+/// lowering it quietly leaves a project believing it has money it does not have.
 fn budgetUnderOrg(
     gpa: std.mem.Allocator,
     from_file: ?chock_cost.budget.Budget,
@@ -3300,12 +1938,8 @@ fn budgetUnderOrg(
             .max_cost = slice,
             .currency = currency,
         };
-        // Two caps in two currencies cannot be compared at all, and inventing
-        // a rate would be worse than not enforcing. The narrower answer is the
-        // parent's own, because a parent that hands out a slice has already
-        // decided the tree's total. The org ceiling below refuses this pair
-        // rather than taking a side, because there it is the ceiling that the
-        // other currency would walk around.
+        // Two caps in two currencies cannot be compared, and inventing a rate
+        // would be worse than not enforcing.
         if (!std.mem.eql(u8, file_cap.currency, currency)) {
             break :asked .{ .max_cost = slice, .currency = currency };
         }
@@ -3316,11 +1950,9 @@ fn budgetUnderOrg(
     };
 
     var diag: ?chock_cost.budget.Diagnostic = null;
-    // Neither of the two variants this call can raise owns memory: both hold
-    // numbers and strings borrowed from the two budgets, which outlive this
-    // function. `deinit` is still called all the same, because a caller that
-    // asks which variant it holds before releasing it is a caller that breaks
-    // the day a variant that does own memory is added.
+    // Neither variant this call can raise owns memory today. `deinit` is still
+    // called, because a caller that asks which variant it holds before releasing
+    // it breaks the day a variant that does own memory is added.
     defer if (diag) |*d| d.deinit(gpa);
     return chock_cost.budget.underCeiling(
         asked,
@@ -3341,77 +1973,25 @@ fn budgetUnderOrg(
     };
 }
 
-/// Every parent of this session, root first. Empty for a session a person
-/// started, and one link per agent above a subagent.
-///
-/// **The whole chain, because a parent writes the whole chain.** It used to be
-/// one link, from the single `--parent-kind` a parent wrote, and that was a
-/// real fault at three levels: a grandchild folded its own kind and its
-/// parent's, the grandparent's row of `chock.zon` never reached the answer, and
-/// the depth every session below the first reported was 2 whatever its real
-/// depth, so `max_depth` bounded nothing. `test/core/tree.zig` is what found
-/// it, by running a tree rather than by reading one.
 fn spawnChain(options: Options) []const chock_proto.event.SpawnLink {
     return options.parent_chain;
 }
 
-/// What kind of agent this session is, for the one question that decides
-/// whether it holds any tool at all.
-///
-/// **This is the join between the two libraries that each hold half of it.**
-/// `chock_broker.review.isArbitrator` names the kind, because the reviewer is
-/// the broker's own agent, and `chock_core.tools.Role` is what the tool list,
-/// the dispatch and the loop read. `chock-core` imports no `chock-broker` on
-/// purpose, so this file is the one place the two meet.
-///
-/// **Read from the kind on this process's own command line**, which a parent
-/// wrote and the child cannot change: a child does not write its own command
-/// line, see `SubagentSpawner`. So a reviewer holds no tools whether
-/// `applyWork` started it or `SessionArbiter` did.
-///
-/// **What it is not read from is the log**, and that is worth saying out loud.
-/// `chock run --continue` names no kind, so a person who resumed a reviewer's
-/// own session would run it as `main` and it would hold tools. That is true of
-/// the whole of `agent_kind` today, the policy row included, and not of this
-/// field alone. It is also outside what this exists to stop: the agent being
-/// reviewed cannot run `chock run`, and a person resuming a session is the
-/// person the record is kept for.
+/// Read from the command line and never from the log: `chock run --continue`
+/// names no kind.
 fn agentRole(options: Options) chock_core.tools.Role {
     return if (chock_broker.review.isArbitrator(options.agent_kind)) .arbitrator else .worker;
 }
 
-/// This session's scratchpad, made, or null when it could not be made at all.
-///
-/// **Nothing is announced and nothing is measured here**, which is where this
-/// differs from `prepareCache` next door, and both differences follow from the
-/// same fact: this directory is new every session and gone at the end of one.
-/// There is nothing to explain to a user who might find it later, and a fresh
-/// directory has nothing in it to measure. The bound is checked before each
-/// `run_command` instead, which is the only moment it can have grown: see
-/// `chock_core.tools`'s own `boundScratchpad`.
-///
-/// **A scratchpad that cannot be made is not fatal.** A session with none does
-/// less, it does not fail to run: a tool call then keeps whatever `TMPDIR` the
-/// dev shell stated, exactly as before this existed, and it can start no
-/// background task.
 fn prepareScratchpad(
     arena: std.mem.Allocator,
-    // Owns the message a failed layout leaves. **Not `arena`**: the message
-    // holds a copy of a path the library built in a frame of its own, and the
-    // allocator named here is the one that releases it.
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
     id: []const u8,
     options: Options,
 ) ?[]const u8 {
-    // A subagent writes inside its parent's own scratchpad, at a path the
-    // parent built and made: see `chock_core.subagent.childDir`. The layout is
-    // built again here, which is what makes it safe to be given one, and it is
-    // the same call a session that made its own directory makes.
     if (options.scratchpad.len != 0) {
-        // Which directory could not be made, and why. The library used to
-        // print that itself and told this command only that it failed.
         var diag: ?chock_core.Diagnostic = null;
         defer if (diag) |*fault| fault.deinit(gpa);
         chock_core.scratchpad.makeLayout(
@@ -3465,52 +2045,21 @@ fn prepareScratchpad(
     return dir;
 }
 
-/// The spelling of `dir` a sandbox rule can act on, or null for a directory
-/// that was never made.
-///
-/// **A build that moves no path turns a mount into a rule, and a rule matches
-/// the path the kernel resolved.** macOS reaches `$TMPDIR` below `/var`, a link
-/// to `/private/var`, so a rule on the unresolved spelling matches nothing and
-/// every tool call of the session reads as refused. The question is answered by
-/// `sandbox.resolvedPath`; this owns the copy, because that function answers
-/// into a buffer of the caller's own frame. A build that moves paths gets the
-/// caller's own string back untouched.
+/// The spelling of `dir` a sandbox rule can act on, or null for a directory that
+/// was never made. A build that moves no path turns a mount into a rule, and a
+/// rule matches the path the kernel resolved: macOS reaches `$TMPDIR` below
+/// `/var`, a link to `/private/var`, so a rule on the unresolved spelling
+/// matches nothing and every tool call reads as refused.
 fn resolvedForSandbox(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ?[]const u8 {
     const path = dir orelse return null;
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = sandbox.resolvedPath(io, path, &buffer);
     if (std.mem.eql(u8, resolved, path)) return path;
-    // A copy that cannot be made leaves the unresolved name, which is what
-    // this session had before. Slower to fail than to work, and never a
-    // session that refuses to start over an allocation.
     return arena.dupe(u8, resolved) catch path;
 }
 
-/// This project's toolchain cache, made and measured, or null when it could
-/// not be made at all.
-///
-/// **Three things happen here, and each one answers a rule this feature was
-/// given.** See `lib/chock-core/cache.zig`:
-///
-/// 1. **Announced.** The first time a project gets a cache, the path is
-///    printed with what empties it. A persistent directory of Chock's must
-///    never be one a user finds later and cannot explain.
-/// 2. **Bounded.** A cache grows without limit by nature, so a cache over
-///    `cache.max_bytes` is emptied here and the user is told. A cache is
-///    rebuildable by definition, which is what makes emptying honest: the
-///    only cost is building it again.
-/// 3. **Said out loud.** A cache that already holds something is named with
-///    its size, so the reuse this whole feature exists for is visible in the
-///    session and not only in the wall clock.
-///
-/// **A cache that cannot be made is not fatal.** A session with none does
-/// less, it does not fail to run: the tool calls then get no `HOME`, exactly
-/// as before this existed.
 fn prepareCache(
     arena: std.mem.Allocator,
-    // Owns the message a failed layout leaves. **Not `arena`**: the message
-    // holds a copy of a path the library built in a frame of its own, and the
-    // allocator named here is the one that releases it.
     gpa: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
@@ -3526,9 +2075,6 @@ fn prepareCache(
         return null;
     };
 
-    // Which directory could not be made, and why. Nothing under `lib/` prints,
-    // so a session that carried no sink here threw the reason away and left a
-    // person with a name they could not act on.
     var diag: ?chock_core.Diagnostic = null;
     defer if (diag) |*fault| fault.deinit(gpa);
     const is_new = session_paths.createCacheDir(
@@ -3555,10 +2101,6 @@ fn prepareCache(
     };
 
     if (is_new) {
-        // Kept on a quiet run, and it fires once for the life of a project. A
-        // persistent directory of Chock's must never be one a user finds later
-        // and cannot explain, which is a fact about the machine and not about
-        // this session.
         tty.print(
             .plain,
             "chock: this project has no toolchain cache yet, so one is made at {s}. " ++
@@ -3568,14 +2110,8 @@ fn prepareCache(
         return dir;
     }
 
-    // Measured with the bound as the stopping point, so a cache that is
-    // already over it is not walked to the end to learn what is already
-    // decided.
     const size = chock_core.cache.measure(arena, io, dir, chock_core.cache.max_bytes);
     if (chock_core.cache.verdictFor(size) == .empty) {
-        // The same sink the layout above was given, which is still empty
-        // because that call answered. Only the layout knows which directory
-        // it rebuilt and failed on.
         const went = chock_core.cache.clear(arena, io, dir, chock_core.cache.sinkOf(gpa, &diag)) catch {
             if (diag) |fault| {
                 tty.print(
@@ -3592,9 +2128,6 @@ fn prepareCache(
             }
             return dir;
         };
-        // Kept on a quiet run: this session builds from nothing, so it is
-        // slower than the last one, and a person watching would otherwise have
-        // no way to explain that.
         tty.print(
             .warn,
             "chock: the toolchain cache {s} held {d} MiB, over the bound of {d} MiB, so it was " ++
@@ -3604,8 +2137,6 @@ fn prepareCache(
         return dir;
     }
     if (size.files != 0) {
-        // A cache that is doing its job. `chock cache` says the same thing
-        // whenever somebody wants it.
         tty.detail("chock: toolchain cache {d} MiB in {d} files ({s})\n", .{
             size.bytes / (1024 * 1024),
             size.files,
@@ -3615,15 +2146,6 @@ fn prepareCache(
     return dir;
 }
 
-/// Read this project's Nix dev shell, and say on screen what the session
-/// ended up with. Null is a project that states no toolchain of its own, and
-/// `toolchainFor` is what then decides, and says, what a session mounts
-/// instead.
-///
-/// **A dev shell that will not evaluate is reported and is not fatal.** A
-/// broken `flake.nix` is often exactly what the user started the session to
-/// fix, and refusing to run would leave them with no agent and a broken
-/// flake instead of one of the two.
 fn loadDevShell(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -3633,10 +2155,6 @@ fn loadDevShell(
 ) ?chock_nix.DevShell {
     const dir = cache_dir orelse return null;
 
-    // What `nix` said, and the three notices a `load` that succeeded can
-    // still leave: a toolchain that could not be rooted, a cache that could
-    // not be written, and store paths left out of the mount set. The library
-    // used to print all of them itself.
     var diag: ?chock_nix.Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
 
@@ -3655,36 +2173,22 @@ fn loadDevShell(
         break :loaded null;
     };
 
-    // A notice from a `load` that answered. Not fatal, and worth a line: a
-    // session whose toolchain is not rooted breaks under a
+    // A session whose toolchain is not rooted breaks under a
     // `nix-collect-garbage` that runs while it does.
     if (loaded != null) {
         if (diag) |*notice| tty.print(.warn, "chock: {f}\n", .{notice});
     }
 
     if (loaded) |shell| {
-        // A dev shell that loaded is the shape a healthy start has, and the two
-        // counts are a measurement of it rather than something to act on.
         tty.detail("chock: dev shell {s}: {d} variables, {d} store paths mounted\n", .{
             if (shell.evaluated) "evaluated" else "cached",
             shell.variables.len,
             shell.store_paths.len,
         });
     }
-    // **A session with no dev shell says nothing here**, and `toolchainFor`
-    // says it instead. This line used to read "the sandbox mounts the whole
-    // Nix store", which is false on a machine that has no Nix store: measured
-    // on 2026-08-25 on a bare Debian, where it was printed and then every tool
-    // call died with `MountTreeFailed`. Only the function that really decides
-    // the mount set may state it.
     return loaded;
 }
 
-/// Chock's own directory for this project's dev shell, made, or null when it
-/// could not be. **Two things live in it**, and both are properties of this
-/// project's toolchain rather than of one session: the cached evaluation of
-/// the dev shell, and the garbage collector roots, which now cover a
-/// provisioned program as well as the shell itself.
 fn devShellDirFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3703,98 +2207,30 @@ fn devShellDirFor(
     return dir;
 }
 
-/// Told before the evaluation, never on a cache hit: a rebuild is an event the
-/// user can see, because it can take a while and silence looks like a hang.
 fn reportEvaluatingDevShell(project_root: []const u8) void {
     tty.print(.plain, "chock: reading the dev shell of {s} with nix\n", .{project_root});
 }
 
-// One question decides this: which programs can a tool call find, and how much
-// of this machine does the sandbox mount for them. There are now three answers,
-// and a session takes exactly one of them.
-//
-// 1. **The project's Nix dev shell.** The narrowest answer, and the one this
-//    project uses. Every path is the transitive closure of `flake.nix`.
-// 2. **A container image the project names.** For a person with no Nix. The
-//    image is a source of files exactly as a closure is: it is extracted on
-//    the host, before the session, and a tool call still runs in Chock's own
-//    sandbox and in no container. See `lib/chock-container.zig`.
-// 3. **The host's own system directories.** The fallback, when the project
-//    states neither.
-//
-// ## The fallback is derived and it is not a refusal, and here is why
-//
-// Measured on 2026-08-25 in a `debian:stable-slim` container with no Nix: the
-// old default, `/nix/store`, is a bind source that is not there, so
-// `sourceIsDirectory` answers `error.SourceMissing` and every tool call of the
-// session dies with `MountTreeFailed`. The session started, the model
-// answered, and the first tool call failed. That is the worst of the three
-// possible behaviours, because the person had already begun.
-//
-// Of the two honest replacements, refusing at session start and deriving a set
-// from the host, this takes the second:
-//
-// * **Refusing makes a downloaded Chock unusable on the commonest Linux
-//   install** until the person installs a container runtime. On a machine
-//   where that runtime is Docker, joining the group that may write its socket
-//   is equal to root. Refusing would push a person toward a materially weaker
-//   trust position to get anything at all.
-// * **It weakens no layer.** Every namespace, Landlock, seccomp, the cgroup
-//   and the network namespace are exactly what `chock doctor` measured. What
-//   grows is the mount set, read only, and `chock-sandbox` marks a read only
-//   bind `NOSUID` and `NODEV` as well.
-// * **It is the decision this project already made for Nix.** The documented
-//   default has always been the host's whole `/nix/store`, which is that
-//   machine's whole toolchain area. `/usr` is the same object on a machine
-//   with no Nix. One rule with two answers, depending on which package manager
-//   the person happens to use, would not be a rule.
-// * **It is not silent.** `reportToolchain` says on screen what was mounted
-//   and how to narrow it, and `chock doctor` carries the same row.
-// * **The home directory is not in it.** The widest thing the fallback reaches
-//   is the system directories every user of that machine can already read.
-//
-// A machine with none of these directories gets the refusal, at session start,
-// with the reason. See `refuseWithNoToolchain`.
+// The host's own system directories are the third answer because `/nix/store` is
+// a bind source that is not there on a machine with no Nix, so every tool call
+// of such a session died with `MountTreeFailed`. They are read only, they reach
+// no home directory, and a machine with none of them is refused at session start.
 
-/// Where the files a tool call runs come from. Decided once, before the first
-/// turn, and read by every tool call of the session.
 const Toolchain = struct {
-    /// Host paths bound at their own path, each read only. A Nix closure, or
-    /// the host's own system directories.
     store_paths: []const []const u8 = &.{},
-    /// Host paths bound somewhere else. What a container image gives, because
-    /// an image is a whole root filesystem held in one directory.
     mounts: []const chock_core.tools.ToolchainMount = &.{},
     which: Which,
 
     const Which = enum { dev_shell, image, host };
 };
 
-/// The host directories a session mounts when the project states no toolchain
-/// of its own. **Every one of them read only**, and every one of them a
-/// directory an ordinary user of that machine can already read.
-///
-/// `/etc` is on the list and it is the only entry that is not obviously a
-/// toolchain. Debian resolves `/usr/bin/cc` through `/etc/alternatives`, glibc
-/// reads `/etc/ld.so.cache` to find a shared library, and the CA certificates
-/// TLS needs are at `/etc/ssl/certs`, so a session without it gets a compiler
-/// that does not start and no https at all. It holds no secret an
-/// unprivileged process can read: `/etc/shadow` and a host key are readable by
-/// root alone, and the sandbox has the user's own privilege and no more.
-///
-/// **A routed tool call takes this one directory for itself**, because it has
-/// to write a `resolv.conf` into it and the bind above is read only. Everything
-/// here is still readable at the same path with the same bytes, and nothing a
-/// tool call writes reaches the host. See
-/// `chock_sandbox.namespace.ownDirectory`.
-///
-/// The list is filtered by what really exists, so a machine with no `/lib64`
-/// gets no mount for one. See `hostToolchainPaths`.
-/// **Public for `src/doctor.zig`**, which counts the same list so that a
-/// report and a session cannot disagree about how wide the fallback is.
+/// The host directories a session mounts when the project states no toolchain of
+/// its own, each read only. `/etc` is the one entry that is not obviously a
+/// toolchain: Debian resolves `/usr/bin/cc` through `/etc/alternatives`, glibc
+/// reads `/etc/ld.so.cache` to find a shared library, and TLS needs the
+/// certificates at `/etc/ssl/certs`. A routed tool call takes this one directory
+/// for itself, because it has to write a `resolv.conf` into it.
 pub const host_toolchain_candidates: []const []const u8 = &.{
-    // A machine with Nix keeps exactly the behaviour it had. It is first
-    // because it is the narrowest thing on the list that is still whole.
     "/nix/store",
     "/usr",
     "/bin",
@@ -3807,12 +2243,6 @@ pub const host_toolchain_candidates: []const []const u8 = &.{
     "/opt",
 };
 
-/// Which of `host_toolchain_candidates` this machine really has.
-///
-/// **A machine with a Nix store gets that and nothing else**, which is exactly
-/// what Chock did before this function existed. There is no reason to widen a
-/// working machine to fix a broken one, and a Nix store already holds every
-/// program such a machine's `PATH` names.
 fn hostToolchainPaths(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -3823,50 +2253,25 @@ fn hostToolchainPaths(
 
     var found: std.ArrayList([]const u8) = .empty;
     for (host_toolchain_candidates[1..]) |path| {
-        // A symbolic link counts: `/bin` is a link into `/usr` on Debian and
-        // on Arch, and a bind mount follows it. Leaving those out would give a
-        // sandbox with no `/bin`, and then nothing in it starts.
+        // A symbolic link counts: `/bin` is a link into `/usr` on Debian and on
+        // Arch, and a bind mount follows it.
         if (!pathIsDirectory(io, path)) continue;
         try found.append(arena, path);
     }
     return found.toOwnedSlice(arena);
 }
 
-/// True when `path` is a directory, or a link that leads to one. False for
-/// everything else, including a path this process may not read: a source it
-/// cannot stat is a source the sandbox cannot bind either.
 fn pathIsDirectory(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
 }
 
-/// The mount set of a container image, in the shape a tool call binds, minus
-/// any entry that would sit above something the sandbox puts there itself.
-///
-/// **The kinds come from the image and are not read again here.** `.dockerenv`
-/// is a regular file at the top of a real Debian image tree, and Landlock
-/// answers `EINVAL` for a directory right over a file: see
-/// `chock_core.tools.ToolchainMount`.
-///
-/// ## Why an image entry above a sandbox mount has to go
-///
-/// **Measured on 2026-08-25, with a real `alpine:3.20` in a Debian container.**
-/// An image entry is bound read only the moment it is built, and the workspace
-/// is bound at the project's own path, which on an ordinary machine is under
-/// `/home`. The two orders both break, and neither breaks quietly:
-///
-/// * The image first: the sandbox then has to make `/home/somebody/project` as
-///   a mount target inside a read only `/home`, and `mkdirat` answers `EROFS`.
-///   Every tool call ends in `MountTreeFailed`.
-/// * The image second: the image's `/home` covers the workspace, so the
-///   Landlock rule that names the project's path finds nothing there. Every
-///   tool call ends in `LandlockRuleFailed`. This is the one that was really
-///   measured, over `/run`, before `Image.sandbox_owns` took that name.
-///
-/// So an image entry that is a strict ancestor of another mount's target is
-/// left out, and the caller says which. **What is lost is small and the loss
-/// is stated**: `/home`, `/run` and `/tmp` are empty in every base image,
-/// because a real container gets them from the runtime at start.
+/// The mount set of a container image, minus any entry that would sit above
+/// something the sandbox puts there itself. `.dockerenv` is a regular file at the
+/// top of a real Debian image tree, and Landlock answers `EINVAL` for a directory
+/// right over a file. An image entry that is a strict ancestor of another mount's
+/// target breaks both orders: the image first leaves `mkdirat` answering `EROFS`
+/// inside a read only `/home`, and the image second covers the workspace.
 fn imageToolchainMounts(
     arena: std.mem.Allocator,
     image: *const chock_container.Image,
@@ -3896,17 +2301,11 @@ fn imageToolchainMounts(
     };
 }
 
-/// What an image's mount set came to, and what was left out of it.
 const ImageMounts = struct {
     mounts: []const chock_core.tools.ToolchainMount,
-    /// The targets that were left out, so a caller can say so. Empty is the
-    /// ordinary answer.
     dropped: []const []const u8,
 };
 
-/// True when `target` is a strict ancestor of the target of one of `mounts`.
-/// The comparison is on whole path components, so `/ho` is never read as being
-/// above `/home/somebody`.
 fn isAboveAMount(target: []const u8, mounts: []const sandbox.namespace.Mount) bool {
     for (mounts) |mount| {
         const other = switch (mount) {
@@ -3923,20 +2322,9 @@ fn isAboveAMount(target: []const u8, mounts: []const sandbox.namespace.Mount) bo
     return false;
 }
 
-/// The environment a tool call resolves its own `argv[0]` against, for a
-/// session whose files come from an image.
-///
-/// **`PATH` is rewritten to name the tree on the host.** The image's own
-/// `PATH` names paths inside the sandbox, such as `/usr/bin`, and this
-/// resolution happens on the host before any sandbox exists. So each entry is
-/// joined onto the extracted tree, and `resolveOnPath` then finds the image's
-/// own program and not this machine's. `chock_core.tools.prepare` maps it back
-/// to the image's own path, because the mount set puts it there: see that
-/// file's own `sandboxPathOf`.
-///
-/// An image that states no `PATH` gets none, and a tool call then has to name
-/// an absolute path. That is honest: the image really did not say where its
-/// programs are.
+/// `PATH` is rewritten to name the tree on the host, because this resolution
+/// happens before any sandbox exists and the image's own `PATH` names paths
+/// inside one. An image that states no `PATH` gets none.
 fn imageToolEnvironment(
     arena: std.mem.Allocator,
     image: *const chock_container.Image,
@@ -3958,10 +2346,6 @@ fn imageToolEnvironment(
     return map;
 }
 
-/// `search`, with every entry joined onto the image tree. An entry that is not
-/// absolute is left out: the image's own `PATH` is read before any sandbox
-/// exists, and a relative entry would resolve against this process's own
-/// working directory, which is the user's project.
 fn hostSearchPath(
     arena: std.mem.Allocator,
     rootfs: []const u8,
@@ -3978,16 +2362,8 @@ fn hostSearchPath(
     return built.toOwnedSlice(arena);
 }
 
-/// The environment the sandboxed program itself is given, for a session whose
-/// files come from an image: what the workspace already needs, plus what the
-/// image states.
-///
-/// The same rule `sandboxEnvironment` keeps for a dev shell, for the same
-/// reason. **The workspace's own variables win**, because the workspace's git
-/// variables are what make git work at all against a read only object store.
-/// **The image's `PATH` is given**, because the image's own files are what the
-/// sandbox is built from, so a `PATH` naming them reaches nothing that is not
-/// there already. See `sandboxEnvironment` for what leaving it out cost.
+/// The workspace's own variables win, because its git variables are what make git
+/// work at all against a read only object store.
 fn imageSandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -4007,17 +2383,9 @@ fn imageSandboxEnvironment(
     return entries.toOwnedSlice(arena);
 }
 
-/// This project's container image, or null when it names none.
-///
-/// **Every refusal here happens at session start**, before a turn, before a
-/// tool call, and with the command to run next in it. Task 48 set that rule
-/// for Nix and it is the same rule: nothing fetches during a tool call,
-/// because a tool call has no network and no daemon socket. A person who has
-/// already begun and then loses every tool call is the fault this whole
-/// function exists to avoid.
-///
-/// The `Image` owns the strings the mount set and both environments borrow, so
-/// the caller keeps it for the length of the session.
+/// Every refusal here happens at session start, because a tool call has no
+/// network and no daemon socket. The `Image` owns the strings the mount set and
+/// both environments borrow.
 fn loadImage(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -4042,11 +2410,9 @@ fn loadImage(
         .named => |reference| reference,
     };
 
-    // **The arena owns the message, and never the library's own working
-    // allocator.** `Image.load` builds a private arena and destroys it on
-    // every error path, so a message built from that one is read after the
-    // free: see `lib/chock-container/diagnostic.zig`. This arena lives as long
-    // as the session.
+    // The arena owns the message and never the library's own working allocator:
+    // `Image.load` builds a private arena and destroys it on every error path,
+    // so a message built from that one is read after the free.
     var diag: ?chock_container.Diagnostic = null;
     defer if (diag) |*d| d.deinit(arena);
     const sink = chock_container.sinkOf(arena, &diag);
@@ -4113,16 +2479,11 @@ fn loadImage(
 
     switch (answer) {
         .refused => |text| {
-            // **Owned by `gpa` and not by the image's own arena**, because a
-            // refusal outlives the arena that produced it: see `Image.load`.
             defer gpa.free(text);
             tty.print(.err, "chock run: {s}\n", .{text});
             return error.Reported;
         },
         .provided => |image| {
-            // A notice from a load that answered: a cache that could not be
-            // written, or one entry of the tree that is not mounted. Neither
-            // stops a session and both change what a tool call finds.
             if (diag) |*notice| tty.print(.warn, "chock: {f}\n", .{notice});
             return image;
         },
@@ -4130,12 +2491,6 @@ fn loadImage(
 }
 
 test "the one act an agent may ask for is spelled the same in all three places" {
-    // `chock-core` imports no `chock-broker`, so the action name and the tool
-    // name are each written down twice: once where the agent's tool is defined
-    // and once where the broker's act and its policy key are. This file imports
-    // both, so this is where they are held together. A rename that reached only
-    // one of them would leave a project writing a rule for a key nothing ever
-    // builds, and every request refused for want of a name.
     try std.testing.expectEqualStrings(
         chock_broker.actions.Kind.workspace_apply.wireName(),
         chock_core.handback.apply_action,
@@ -4147,12 +2502,6 @@ test "the one act an agent may ask for is spelled the same in all three places" 
 }
 
 test "a machine with a nix store gets only that, and one without gets its own system directories" {
-    // The fallback that replaced the default which broke every tool call on a
-    // machine with no Nix. Both halves are asserted against this machine's own
-    // filesystem, because the question is what really exists here.
-    //
-    // Mutation check: make `hostToolchainPaths` answer the whole candidate
-    // list without filtering and the branch this machine is not in fails.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4161,36 +2510,22 @@ test "a machine with a nix store gets only that, and one without gets its own sy
     const paths = try hostToolchainPaths(arena, std.testing.io);
 
     if (pathIsDirectory(std.testing.io, "/nix/store")) {
-        // **A working machine is not widened to fix a broken one.** This is
-        // exactly what Chock bound before the fallback existed.
         try std.testing.expectEqual(@as(usize, 1), paths.len);
         try std.testing.expectEqualStrings("/nix/store", paths[0]);
         return;
     }
 
-    // A machine with no Nix. Something has to be there, or no tool call could
-    // run at all, and `/nix/store` must not be one of them.
     try std.testing.expect(paths.len != 0);
     for (paths) |path| try std.testing.expect(!std.mem.eql(u8, path, "/nix/store"));
 }
 
 test "every host candidate is absolute, so a session's mount set cannot depend on a working directory" {
-    // A relative entry would be resolved against wherever `chock run` was
-    // started, which is the user's project, and the sandbox would then bind a
-    // directory of the project as the toolchain.
     for (host_toolchain_candidates) |path| {
         try std.testing.expect(std.fs.path.isAbsolute(path));
     }
 }
 
 test "an image's own PATH is rewritten to the tree on the host" {
-    // The half of the image wiring that is easy to get wrong and silent when
-    // it is wrong. `argv[0]` is resolved on the host, before any sandbox
-    // exists, and the image's `PATH` names paths inside the sandbox. Without
-    // this, `resolveOnPath` would find this machine's own `/usr/bin/ls` and
-    // the session would run the host's program with the image's libraries.
-    //
-    // Mutation check: return `search` unchanged and the first assertion fails.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4202,25 +2537,14 @@ test "an image's own PATH is rewritten to the tree on the host" {
         built,
     );
 
-    // A relative entry is left out. It would resolve against this process's
-    // own working directory, which is the user's project.
     const filtered = try hostSearchPath(arena, "/tree", "/usr/bin:.:bin");
     try std.testing.expectEqualStrings("/tree/usr/bin", filtered);
 
-    // An image that states an empty `PATH` gets an empty one, and never the
-    // tree itself: a bare tree on `PATH` would offer every top level entry of
-    // the image as a program.
     const empty = try hostSearchPath(arena, "/tree", "");
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "an image's mount kinds carry through, because landlock refuses a directory right over a file" {
-    // Measured on 2026-08-25: `docker export` writes `.dockerenv` as a regular
-    // file at the top of a Debian tree. A rule with `read_dir` over it answers
-    // EINVAL and takes down every tool call in the session.
-    //
-    // Mutation check: answer `.directory` for every entry and the second
-    // assertion fails.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4241,8 +2565,6 @@ test "an image's mount kinds carry through, because landlock refuses a directory
         .rootfs = "/tree",
         .mounts = &mounts,
         .extracted = false,
-        // Never loaded, so it holds no tree. The same reason `arena` above is
-        // undefined: this image is a value the test built, not a session.
         .in_use = undefined,
     };
 
@@ -4251,21 +2573,11 @@ test "an image's mount kinds carry through, because landlock refuses a directory
     try std.testing.expectEqual(@as(usize, 0), built.dropped.len);
     try std.testing.expectEqual(chock_core.tools.ToolchainMount.Kind.directory, built.mounts[0].kind);
     try std.testing.expectEqual(chock_core.tools.ToolchainMount.Kind.file, built.mounts[1].kind);
-    // The source is the host's and the target is the image's own path. That
-    // difference is the whole reason `ToolchainMount` exists beside
-    // `store_paths`.
     try std.testing.expectEqualStrings("/tree/usr", built.mounts[0].source);
     try std.testing.expectEqualStrings("/usr", built.mounts[0].target);
 }
 
 test "an image entry above a mount the sandbox makes itself is left out and said out loud" {
-    // Measured on 2026-08-25 in a Debian container with a real alpine:3.20:
-    // the image's own empty `/run` covered the git object store the workspace
-    // puts at `/run/chock/objects`, and every tool call in the session ended in
-    // `LandlockRuleFailed`.
-    //
-    // Mutation check: drop the `isAboveAMount` guard and the first assertion
-    // reads 2, which is the mount set that broke every tool call.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4286,13 +2598,9 @@ test "an image entry above a mount the sandbox makes itself is left out and said
         .rootfs = "/tree",
         .mounts = &image_mounts,
         .extracted = false,
-        // Never loaded, so it holds no tree. The same reason `arena` above is
-        // undefined: this image is a value the test built, not a session.
         .in_use = undefined,
     };
 
-    // The workspace, at the project's own path, which on an ordinary machine
-    // is under `/home`.
     const sandbox_mounts = [_]sandbox.namespace.Mount{.{ .bind = .{
         .source = "/state/01.work/wt",
         .target = "/home/somebody/project",
@@ -4305,18 +2613,11 @@ test "an image entry above a mount the sandbox makes itself is left out and said
     try std.testing.expectEqual(@as(usize, 1), built.dropped.len);
     try std.testing.expectEqualStrings("/home", built.dropped[0]);
 
-    // A whole path component, so a name that merely starts the same way is not
-    // read as being above it.
     try std.testing.expect(!isAboveAMount("/ho", &sandbox_mounts));
-    // And a mount is not above itself, or an image could never bind the very
-    // path the sandbox already names.
     try std.testing.expect(!isAboveAMount("/home/somebody/project", &sandbox_mounts));
 }
 
 test "an image session keeps the workspace's own variables and carries the image's PATH" {
-    // The same two rules the dev shell half keeps. `GIT_OBJECT_DIRECTORY` is
-    // what makes git work against a read only object store, and an image that
-    // happened to state that name would otherwise break every git call.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4339,8 +2640,6 @@ test "an image session keeps the workspace's own variables and carries the image
         .rootfs = "/tree",
         .mounts = &.{},
         .extracted = true,
-        // Never loaded, so it holds no tree. The same reason `arena` above is
-        // undefined: this image is a value the test built, not a session.
         .in_use = undefined,
     };
 
@@ -4348,28 +2647,18 @@ test "an image session keeps the workspace's own variables and carries the image
     try std.testing.expectEqual(@as(usize, 4), built.len);
     try std.testing.expectEqualStrings("GIT_OBJECT_DIRECTORY=/run/chock/git/objects", built[0]);
     try std.testing.expectEqualStrings("KEEP=me", built[1]);
-    // **The image's own `PATH`, and never the host prefixed one below.** The
-    // rootfs is the sandbox's own root, so a program inside looks for
-    // `/usr/bin` and not for the `/tree/usr/bin` the host reads it at.
     try std.testing.expectEqualStrings("PATH=/usr/local/bin:/usr/bin:/bin", built[2]);
     try std.testing.expectEqualStrings("LANG=C.UTF-8", built[3]);
 
-    // And the tool environment is the other half: `PATH` is the one name it
-    // rewrites, and every other variable is the image's own.
     const tool_env = try imageToolEnvironment(arena, &image);
     try std.testing.expectEqualStrings("/tree/usr/local/bin:/tree/usr/bin:/tree/bin", tool_env.get("PATH").?);
     try std.testing.expectEqualStrings("C.UTF-8", tool_env.get("LANG").?);
 }
 
-/// Told before an extraction, never on a cache hit. The same rule the dev
-/// shell evaluation follows: it takes a while, and silence looks like a hang.
 fn reportExtractingImage(reference: []const u8) void {
     tty.print(.plain, "chock: writing the files of {s} to disk, once\n", .{reference});
 }
 
-/// **Said before the wait and not after it.** An image cache is shared, so a
-/// second session waits for the one that is writing the tree rather than
-/// rebuilding it underneath. A minute of silence reads as a hang.
 fn reportWaitingForImage(reference: []const u8) void {
     tty.print(
         .plain,
@@ -4378,13 +2667,9 @@ fn reportWaitingForImage(reference: []const u8) void {
     );
 }
 
-/// Which toolchain this session got, said on screen, and the refusal when
-/// there is none.
-///
-/// **The trust position of an image is its own line and never a layer.** A
-/// root daemon that unpacked the image is a weaker trust position, not a
-/// broken sandbox, and `chock_sandbox.guarantees` is unchanged either way. See
-/// `chock_container.Runtime.Trust`.
+/// The trust position of an image is its own line and never a layer. A root
+/// daemon that unpacked the image is a weaker trust position, not a broken
+/// sandbox, and `chock_sandbox.guarantees` is unchanged either way.
 fn toolchainFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4402,9 +2687,6 @@ fn toolchainFor(
             built.mounts.len,
         });
         for (built.dropped) |target| {
-            // Said out loud, because a program that looks for something under
-            // one of these finds an empty directory and the reason is nowhere
-            // else on screen.
             tty.print(
                 .warn,
                 "chock: the image's own {s} is not mounted, because this session puts its own " ++
@@ -4451,82 +2733,23 @@ fn toolchainFor(
     return .{ .store_paths = paths, .which = .host };
 }
 
-/// What a session needs to add a program to its toolchain with Nix.
 const Provisioning = struct {
-    /// The absolute path of `nix` on the host, found once at the start rather
-    /// than on the turn the model asks. A machine with no `nix` has no
-    /// `Provisioning` at all, so the tool is never offered.
     nix_program: []const u8,
-    /// The absolute path of `nix-store`, which makes the garbage collector
-    /// root. Null when it is not on the host: a provisioned program then
-    /// works and is not held against `nix-collect-garbage`, which is said out
-    /// loud once rather than found out at mount time.
     nix_store_program: ?[]const u8,
-    /// Where a program name is looked up. **Not the model's to choose**: see
-    /// `chock_nix.provision`'s own top comment, which is where the whole of
-    /// the safety argument is written.
-    ///
-    /// The flake registry entry, so a user who pinned `nixpkgs` with `nix
-    /// registry pin` gets programs from the revision they pinned, and a user
-    /// who did not gets the one their `nix` already uses. That is the same
-    /// answer `nix run nixpkgs#thing` gives the user by hand, which is the
-    /// property worth having: Chock resolves what the user's own Nix
-    /// resolves.
+    /// The flake registry entry, so a user who pinned `nixpkgs` gets programs
+    /// from the revision they pinned. Chock resolves what the user's own Nix
+    /// resolves, and the model does not choose this.
     registry: []const u8,
-    /// Where the garbage collector root links go, or null when this session
-    /// has no directory of its own for them. The dev shell's directory, so a
-    /// provisioned program is released by exactly the thing that releases the
-    /// dev shell: removing Chock's state for this project.
     root_dir: ?[]const u8,
 };
 
-/// The name of the broker action a provisioning request is measured against.
-/// **The same key `chock_broker.actions.Kind.nix_build` uses**, read from
-/// there rather than spelled again, because a policy rule a user wrote for
-/// `nix.build` must cover this too.
 const provision_action = chock_broker.actions.Kind.nix_build.wireName();
 
-/// Whether this session may add a program to its toolchain, and what it needs
-/// to do it. Null when it may not, with the reason already on screen.
-///
-/// ## Filtered, and by the part of the broker that can run here
-///
-/// Everything with real consequence goes behind the broker, and running `nix
-/// build` on the host, outside the sandbox, with the daemon, is exactly that.
-/// So the decision is the broker's own: the policy table of `chock.zon`, under
-/// the action `nix.build`, folded over the whole spawn chain by `evaluateChain`
-/// so a subagent can hold no permission its parent lacks. The act itself is
-/// `chock_broker.actions.perform`, which is where `nix.build` already lived
-/// before this existed.
-///
-/// **What is not here is the question, and the reason is structural.**
-/// `Broker.request` appends an `approval.request` to the session log and waits
-/// for an `approval.response`, and `Loop.run` holds the exclusive lock on that
-/// log for the whole session: nothing can append an answer while a turn is
-/// running, so a mid-session question can only ever time out, and a request
-/// nobody answers is a refusal. `chock run` already says this about its own end
-/// of session approval, in `applyWork`. Asking a question whose answer is
-/// decided before it is asked would cost a person's time and change nothing.
-///
-/// So the decision is read once, at the start, and it decides whether the
-/// tool exists at all:
-///
-/// * `allow` gives the session the tool.
-/// * `ask` and `deny` do not, and the model is never told about it, which is
-///   the offer rule applied to a tool that could not work.
-///
-/// **A project with no `chock.zon` therefore cannot provision**, because the
-/// empty table answers `ask` for every key. That is the safe direction and it
-/// is the one this project already chose everywhere else: the way to say yes is
-/// a rule in a file that is kept beyond the agent's reach. What this project's
-/// policy says about provisioning, folded over the whole spawn chain so a
-/// subagent can hold no permission its parent lacks. See
-/// `chock_policy.table.evaluateChain`, which is the one function that applies
-/// it.
-///
-/// Separate from `provisioningFor` because it is the half that is a decision
-/// rather than a fact about the machine, and it is the half a test can pin
-/// without a `nix` on the host.
+/// Whether this session may add a program to its toolchain, and what it needs to
+/// do it. Read once, at the start: `Loop.run` holds the exclusive lock on the
+/// log for the whole session, so nothing can append an answer while a turn is
+/// running and a mid-session question can only time out. A project with no
+/// `chock.zon` therefore cannot provision.
 fn provisionDecision(
     arena: std.mem.Allocator,
     policy: *const chock_policy.table.Table,
@@ -4534,19 +2757,11 @@ fn provisionDecision(
     agent_kind: []const u8,
     model: []const u8,
 ) std.mem.Allocator.Error!chock_policy.table.Decision {
-    // The chain `evaluateChain` wants is the parents and this session, in
-    // that order. The same shape `Broker.request` builds from an `Ask`, and
-    // for the same reason: a session cannot state its own parents.
     const chain = try arena.alloc([]const u8, chain_links.len + 1);
     defer arena.free(chain);
     for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
     chain[chain_links.len] = agent_kind;
 
-    // A chain the policy reader cannot fold answers `ask`, which is already
-    // the safe answer. The reason used to reach a terminal from inside the
-    // library; it reaches this command instead, which is what ranks a line
-    // for a person. Said out loud because a chain this shape means the log
-    // holds something Chock did not write.
     var fault: ?chock_policy.table.ChainFault = null;
     const decision = policy.evaluateChain(chain, .{
         .agent_kind = agent_kind,
@@ -4558,22 +2773,6 @@ fn provisionDecision(
     return decision;
 }
 
-/// Whether this session may start the language server its project names.
-///
-/// **This was the one act of a session that nothing could refuse.** The command
-/// came out of `chock.zon` and was started, with no action name, so it reached
-/// no policy table and no org bundle: an organisation that had narrowed every
-/// other path had no say over which program ran beside its agent. Giving the
-/// act a name is the whole fix, and it needed no new field anywhere, because
-/// the bundle's rules already fold over every action name there is.
-///
-/// **Only `allow` starts it**, the same rule `provisionDecision` keeps for
-/// `provide_tool`. There is nobody to prompt when a session is starting up, so
-/// `ask` means off here, and it says so rather than starting quietly.
-///
-/// **A program that cannot be named refuses**, and never passes. A caller that
-/// cannot build an action name cannot ask the table, and starting the server
-/// anyway would run a program no rule could ever have named.
 fn languageServerPermitted(
     arena: std.mem.Allocator,
     policy: *const chock_policy.table.Table,
@@ -4594,9 +2793,6 @@ fn languageServerPermitted(
         return false;
     };
 
-    // The chain `evaluateChain` wants is the parents and this session, in that
-    // order. The same shape `provisionDecision` builds, and for the same
-    // reason: a session cannot state its own parents.
     const chain = try arena.alloc([]const u8, chain_links.len + 1);
     defer arena.free(chain);
     for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
@@ -4619,30 +2815,11 @@ fn languageServerPermitted(
     return false;
 }
 
-/// Implements `chock_core.devices.PolicySeam`, the same shape
-/// `languageServerPermitted` above answers for `lsp.<program>`.
-///
-/// **Only `allow` exposes a device.** `lib/chock-policy/devices.zig` ships no
-/// default for `device.*`, so an action nobody named in a `policy` block
-/// answers `ask`, and `ask` refuses here: there is nobody to prompt while a
-/// device is arriving mid session any more than there is while a language
-/// server is starting up, and prompting a person per arrival is a later
-/// change, not this one. See `.superpowers/sdd/task-6-brief.md`.
-///
-/// **Only a device this project named in its own `devices` block is ever
-/// asked about at all.** `chock_core.devices.HostSource.scan` calls this seam
-/// for every USB or serial device this machine has plugged in, named or not,
-/// because it cannot tell the difference from sysfs alone. `declared` is the
-/// list that draws the line: an identity this project never wrote down
-/// cannot reach the sandbox no matter what an organisation's bundle or this
-/// project's own policy table would have answered for it, the same as an
-/// MCP server this project never named cannot be started by a rule that
-/// would have permitted it.
-///
-/// **Folded over the whole spawn chain**, so a subagent cannot expose a
-/// device its parent could not, and the org bundle folds in beside it.
-/// Neither is code here: both are properties of `evaluateChain` taking a
-/// minimum, the same as `languageServerPermitted` relies on.
+/// Only `allow` exposes a device, and only a device this project named in its own
+/// `devices` block is ever asked about at all.
+/// `chock_core.devices.HostSource.scan` calls this seam for every USB or serial
+/// device the machine has plugged in, named or not, because it cannot tell the
+/// difference from sysfs alone, and `declared` draws the line.
 const DevicePolicySeam = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -4661,12 +2838,6 @@ const DevicePolicySeam = struct {
         return self.decisionFor(action) == .allow;
     }
 
-    /// The policy answer for `action`, or `.ask` when this project never
-    /// named `action` in its own `devices` block at all: see this struct's
-    /// own top comment, "only a device this project named". `.ask` and not
-    /// `.deny`, because the reason to read out of a decision this cheap is
-    /// the same reason a rule nobody wrote answers `.ask`: an unnamed action
-    /// never reached a rule, so it never reached a `deny` either.
     fn decisionFor(self: *const DevicePolicySeam, action: []const u8) chock_policy.table.Decision {
         var named = false;
         for (self.declared) |one| {
@@ -4689,37 +2860,15 @@ const DevicePolicySeam = struct {
     }
 };
 
-/// What this project's `devices` block resolved to for one attempt.
-///
-/// **Every field is null together when this project named no device.** See
-/// `devicesFor`'s own first line, and the test that proves it: no seam is
-/// built, no `HostSource` is built, and `Config.device_tree` names nothing,
-/// so a `Sandbox.spawn` that reads this session's config never binds `/dev`,
-/// never forks the device helper, and never polls an extra descriptor. See
-/// `lib/chock-sandbox/linux/driver.zig`'s own `wants_device` gate, which is
-/// what reads `device_source` and answers that question for a call.
+/// Every field is null together when this project named no device, so a
+/// `Sandbox.spawn` that reads this session's config never binds `/dev`, never
+/// forks the device helper, and never polls an extra descriptor.
 const DeviceWiring = struct {
-    /// Null exactly when this project named no device: see `DevicePolicySeam`
-    /// itself, which is never built for a project with nothing to evaluate.
-    /// Non-null on every build, Linux or not, because `recordDevices` needs
-    /// it to write a `device.exposed` row even where nothing can be enforced.
     seam: ?*DevicePolicySeam = null,
-    /// Non-null only on a build that answers true for
-    /// `chock_sandbox.Sandbox.expresses.device_passthrough`. Null on every
-    /// other build, whatever this project declared: see that field's own doc
-    /// comment.
     host: ?*chock_core.devices.HostSource = null,
-    /// Set together with `host`, and null whenever it is.
     device_tree: ?sandbox.Config.DeviceTree = null,
 };
 
-/// Build this attempt's `DeviceWiring` from `declared`, this project's own
-/// `devices` block, already read by the caller. Null in and nothing out: see
-/// `DeviceWiring`'s own top comment.
-///
-/// **Folds the spawn chain the same way `hardeningDecision` does**, and for
-/// the same reason: `chain_links` is the parents and `agent_kind` is this
-/// session, and a session cannot state its own parents.
 fn devicesFor(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -4745,13 +2894,6 @@ fn devicesFor(
         .declared = list,
     };
 
-    // **Only a build whose driver can act on `device_tree` and
-    // `device_source` ever names either.** A session on a build that answers
-    // false for `sandbox.expresses.device_passthrough` never opens `/dev`
-    // and never asks a question its own driver could not answer. The seam
-    // above is still returned, so `recordDevices` can still write a row that
-    // says what policy would have decided, with `enforced` false: see
-    // `chock_proto.event.DeviceExposed`'s own top comment.
     if (!sandbox.expresses.device_passthrough) return .{ .seam = seam };
 
     const host = try arena.create(chock_core.devices.HostSource);
@@ -4759,38 +2901,20 @@ fn devicesFor(
     return .{
         .seam = seam,
         .host = host,
-        // The hidden tree is the host's own `/dev`, mirrored: a node's path
-        // relative to it is what `DEVNAME` already gives, see
-        // `chock_core.devices.evaluateArrival`'s own doc comment. Never
-        // granted through `sandbox_config.rules`: Landlock is an allowlist,
-        // so a path this session never names is a path the sandboxed program
-        // cannot open, list, or resolve through, even though the bind is
-        // really there after the pivot.
+        // The hidden tree is the host's own `/dev`, mirrored, so a node's path
+        // relative to it is what `DEVNAME` already gives. Never granted through
+        // `sandbox_config.rules`: Landlock is an allowlist, so a path this
+        // session never names cannot be opened, listed or resolved through, even
+        // though the bind is really there after the pivot.
         .device_tree = .{ .host = "/dev", .inside = "/.chock-device-tree" },
     };
 }
 
-/// What this session's policy answered about sandbox hardening, and what that
-/// answer means for the filter. Both halves, because the log records the reason
-/// as well as the outcome.
 const Hardening = struct {
     decision: chock_policy.table.Decision,
     rule: chock_policy.hardening.WriteExecute,
 };
 
-/// Whether this session may run with the write and execute rule off.
-///
-/// **The same shape as `provisionDecision` above, and for the same reason.**
-/// This is a capability of the whole session, answered once, before the first
-/// turn and before a broker exists. The filter is built one time and every tool
-/// call runs under it, so there is no later moment at which an answer of `ask`
-/// could be put to anybody. `chock_policy.hardening.writeExecuteFor` is what
-/// reads only `allow` as permission.
-///
-/// **Folded over the whole spawn chain**, so a subagent cannot give up
-/// hardening its parent kept, and the org bundle folds in beside it, so an
-/// organisation can forbid this for every project at once. Neither of those is
-/// code here: both are properties of `evaluateChain` taking a minimum.
 fn hardeningDecision(
     arena: std.mem.Allocator,
     policy: *const chock_policy.table.Table,
@@ -4798,8 +2922,6 @@ fn hardeningDecision(
     agent_kind: []const u8,
     model: []const u8,
 ) std.mem.Allocator.Error!Hardening {
-    // The chain `evaluateChain` wants is the parents and this session, in that
-    // order. The same shape `provisionDecision` builds.
     const chain = try arena.alloc([]const u8, chain_links.len + 1);
     defer arena.free(chain);
     for (chain_links, chain[0..chain_links.len]) |link, *slot| slot.* = link.agent_kind;
@@ -4809,18 +2931,12 @@ fn hardeningDecision(
     const decision = policy.evaluateChain(chain, .{
         .agent_kind = agent_kind,
         .model = model,
-        // No tool call asked for this and none ever can: the filter is built
-        // before the first turn. The name is the one every act with no tool
-        // call behind it carries. See `chock_broker.actions.self_asked_tool`.
         .tool = chock_broker.actions.self_asked_tool,
         .action = chock_policy.hardening.jit_action,
     }, &fault);
     if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
 
     const rule = chock_policy.hardening.writeExecuteFor(decision);
-    // **Said out loud, and not only written to the log.** A person at the
-    // keyboard of a session that gave up a layer has to be able to see that
-    // they are, the same reading `org.zig` takes for an expired bundle.
     if (rule == .relaxed) tty.print(
         .warn,
         "chock: the write and execute rule is off for this session, because this project's " ++
@@ -4832,65 +2948,18 @@ fn hardeningDecision(
     return .{ .decision = decision, .rule = rule };
 }
 
-/// How an approved apply lands in the project, and the policy answer that
-/// decided it. Both halves, because the log records the reason as well as the
-/// outcome, exactly as `Hardening` does.
 const ApplyMode = struct {
-    /// What the project asked for, after the row above it bounded it. **Null
-    /// when the row answers `deny`**, which is "no landing at all", and every
-    /// apply of the session then parks the work at its ref.
     mode: ?chock_policy.apply.Mode = .merge,
-    /// The answer the `workspace.integrate` row gave.
     decision: chock_policy.table.Decision = .allow,
-    /// What `chock.zon` asked for, before the row bounded it. **The half a
-    /// person has to be told about**: a project that wrote `merge` and gets no
-    /// landing is the one case where the session does something other than what
-    /// the file says, and `mode` alone cannot show it. See `bounded_mode_fmt`.
     asked_for: chock_policy.apply.Mode = .merge,
 };
 
-/// The line a person reads when the `workspace.integrate` row takes the landing
-/// away. It takes the landing the session would have taken, the answer the row
-/// gave, and the name of the row.
-///
-/// **One text, said in two places.** `applyModeFor` prints it before the
-/// session starts, which is the whole of it for a run with no display, and
-/// `runSession` says it again in the transcript once the display is up, because
-/// a full screen display opens its alternate screen over everything printed
-/// before it and this line was never read. Two spellings of one fact drift
-/// apart.
-///
-/// **It does not say the file asks for it.** The mode is `merge` for a project
-/// with no `chock.zon` at all, so a line naming the file would be a claim about
-/// a file that may not be there.
 const bounded_mode_fmt = "this session's work would land as {s}, and the policy answers {t} " ++
     "for {s}, so the work waits at its ref and no branch of yours moves.";
 
-/// Whether this session's approved applies may move a branch of the user's,
-/// and which shape they take when they do. **A null `mode` is "they may
-/// not"**, which is what `deny` on the row leaves.
-///
-/// **Two files and one answer.** `chock.zon` names the mode, because the shape
-/// a project wants its work in is the project's own taste; the
-/// `workspace.integrate` row says whether the mode may be anything but `ref`,
-/// because "may an approval move my branch at all" is a question an
-/// organisation gets to answer for every project at once. See
-/// `chock_policy.apply`'s own top comment for why the two are not written in
-/// one place.
-///
-/// **Read as a ceiling, so a project that said nothing is unchanged.**
-/// `Table.ceilingChain` is the verb and not `evaluateChain`: a row nobody wrote
-/// answers `allow`, which is no ceiling, so an installation whose organisation
-/// has never heard of this row does not have every project's setting taken
-/// away. The same reading `refuseProviderAndModel` takes for a provider.
-///
-/// **Folded over the whole spawn chain**, so a subagent cannot move a branch
-/// its parent could not, and the org bundle folds in beside it. Neither is code
-/// here: both are properties of `ceilingChain` taking a minimum.
-///
-/// A mistake in the block ends the run. The file is the project's, and a
-/// project that meant `merge` and typed `mdoe` has to hear about it now rather
-/// than find out at the end of the session that nothing was integrated.
+/// A null `mode` is that an approved apply may not move a branch of the user's.
+/// Read as a ceiling, so `Table.ceilingChain` is the verb and not
+/// `evaluateChain`: a row nobody wrote answers `allow`, which is no ceiling.
 fn applyModeFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -4921,18 +2990,12 @@ fn applyModeFor(
     const decision = policy.ceilingChain(chain, .{
         .agent_kind = agent_kind,
         .model = model,
-        // The tool an agent calls to ask for an apply, and the name a request
-        // the harness makes carries too. See `actions.self_asked_tool`.
         .tool = chock_broker.actions.self_asked_tool,
         .action = chock_policy.apply.integrate_action,
     }, &fault);
     if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
 
     const bounded = chock_policy.apply.boundBy(settings.mode, decision);
-    // **Said out loud, and not only written to the log.** A person whose
-    // project asked for a merge and will not get one has to be able to see
-    // that before the session runs, not at the end of it. `deny` is the one
-    // answer that takes the landing away, so null is the whole of the case.
     if (bounded == null) tty.print(.warn, "chock: " ++ bounded_mode_fmt ++ "\n", .{
         settings.mode.wireName(),
         decision,
@@ -4941,37 +3004,18 @@ fn applyModeFor(
     return .{ .mode = bounded, .decision = decision, .asked_for = settings.mode };
 }
 
-/// Everything a later build needs to know about this project's flake inputs.
 const FlakeInputs = struct {
-    /// Every store path the fetch put there, empty when nothing was fetched.
-    /// `chock_nix.build.Writing` answers `is_valid_path` from this, which is
-    /// what stops the evaluator fetching an input for itself.
     store_paths: []const []const u8 = &.{},
-    /// Why they are not there, empty when they are. A build that then wants
-    /// one reads this sentence rather than a fault nobody can act on.
     missing: []const u8 = "",
-    /// What the lock said the fetch would reach, so a refusal can name the
-    /// input and the host. Empty when the lock named nothing.
     wanted: []const chock_nix.fetch.Fetch = &.{},
 };
 
-/// Reads this project's table about one request a Nix build would make.
-///
-/// Two names for one host, most specific first. The phase scoped name
-/// `nix.net.eval.com.github.443` is read, and then `nix.net.com.github.443`,
-/// which covers the same host in either phase. The table matches a name
-/// against itself or a trailing `.*` and `patternIsWellFormed` refuses a
-/// wildcard in the middle, so `nix.net.*.com.github.443` is a parse error and
-/// there is no one name that would do instead. `nix_build` already asks two
-/// actions for one call, the attribute and the flake, and this reads the same
-/// way.
-///
-/// **A rule that names the phase scoped key decides, whatever it says.** The
-/// wider name is read only when no rule names the narrow one, which is what
-/// `decideChain` reports and `evaluateChain` cannot: an author who wrote `ask`
-/// for `nix.net.build.com.github.443` beside `allow` for
-/// `nix.net.com.github.443` asked to be prompted for that build, and falling
-/// through would hand it a silent yes.
+/// Two names for one host, most specific first: `nix.net.eval.com.github.443` and
+/// then `nix.net.com.github.443`. The table matches a name against itself or a
+/// trailing `.*`, and `patternIsWellFormed` refuses a wildcard in the middle, so
+/// there is no one name that would do instead. A rule that names the phase scoped
+/// key decides whatever it says, because falling through would hand a silent yes
+/// to an author who asked to be prompted.
 const NixTableReader = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -4987,8 +3031,6 @@ const NixTableReader = struct {
         return self.answer(names.either_phase) orelse .ask;
     }
 
-    /// Null when no rule of the project, of the shipped defaults or of the org
-    /// bundle names `action`.
     fn answer(self: NixTableReader, action: []const u8) ?chock_policy.table.Decision {
         var fault: ?chock_policy.table.ChainFault = null;
         const answered = self.policy.decideChain(self.chain, .{
@@ -5002,13 +3044,6 @@ const NixTableReader = struct {
     }
 };
 
-/// Who answers for a host this project's flake inputs would be fetched from.
-///
-/// **The policy table and nobody else.** A session is starting up, so there is
-/// nobody to prompt, and `ask` is off here for the reason
-/// `languageServerPermitted` states: a question with no one to answer it is a
-/// question that times out. This fetch exists so an expression can evaluate,
-/// so its names are the `eval` ones. See `NixTableReader`.
 const StartupFetchGate = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -5036,9 +3071,6 @@ const StartupFetchGate = struct {
         };
     }
 
-    /// Nobody is at the prompt during a session start, so this reads the table
-    /// for each host in turn and the first one it does not allow refuses the
-    /// lot. There is no question here to batch.
     fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -5053,9 +3085,6 @@ const StartupFetchGate = struct {
         return .permitted;
     }
 
-    /// A flake input names a host or it is not fetched at all, so nothing
-    /// here ever reaches this question. Refused rather than permitted, for the
-    /// reason every unwired seam in this file is.
     fn permitOpaqueFn(
         _: *anyopaque,
         _: std.mem.Allocator,
@@ -5064,8 +3093,6 @@ const StartupFetchGate = struct {
         return .{ .refused = "a flake input is fetched by host and never without one" };
     }
 
-    /// A flake input names a host and never a mirror site, so this too is
-    /// unreachable and refuses rather than permits.
     fn permitSiteFn(
         _: *anyopaque,
         _: std.mem.Allocator,
@@ -5121,12 +3148,9 @@ const StartupFetchGate = struct {
         return ruleAnswerOf(self.reader().decide(names));
     }
 
-    /// An input fetch exists so an expression can evaluate.
     const phase: chock_broker.network.NixPhase = .eval;
 };
 
-/// What a table decision means to a caller choosing a mirror. Everything that
-/// is neither `allow` nor `deny` still needs a question, so it is unsettled.
 fn ruleAnswerOf(decision: chock_policy.table.Decision) chock_nix.fetch.RuleAnswer {
     return switch (decision) {
         .allow => .allow,
@@ -5135,13 +3159,6 @@ fn ruleAnswerOf(decision: chock_policy.table.Decision) chock_nix.fetch.RuleAnswe
     };
 }
 
-/// Fetch this project's flake inputs into the host store, once, before
-/// anything evaluates.
-///
-/// **A session whose inputs did not arrive still starts.** Nothing else a
-/// session start does refuses the session because an optional thing was
-/// missing, and a project with no flake at all is the ordinary case. The
-/// reason is kept instead, and a build that later wants an input reads it.
 fn fetchFlakeInputs(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -5158,9 +3175,6 @@ fn fetchFlakeInputs(
         .missing = "nix is not on this machine's PATH, so no flake input was fetched",
     };
 
-    // The chain `evaluateChain` wants is the parents and this session, in that
-    // order. The same shape `provisionDecision` builds, and for the same
-    // reason: a session cannot state its own parents.
     const chain = arena.alloc([]const u8, chain_links.len + 1) catch return .{
         .missing = "this session ran out of memory before its flake inputs were fetched",
     };
@@ -5204,20 +3218,14 @@ fn fetchFlakeInputs(
             return .{ .store_paths = paths, .wanted = wanted };
         },
         .refused => |why| {
-            // Said out loud, because a session that starts without its inputs
-            // builds nothing that needs one, and the user is the person who
-            // can change the rule.
             tty.print(.warn, "chock: {s}\n", .{why});
             return .{ .missing = why, .wanted = wanted };
         },
     }
 }
 
-/// This project's `flake.lock`, or null when it has none.
-///
-/// **A file of the project, so it is read as one.** It sits beside
-/// `chock.zon`, and this project reads a file there as something an attacker
-/// may have written: every host it names goes to the policy.
+/// Read as a file an attacker may have written: every host it names goes to the
+/// policy.
 fn readProjectLock(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) ?[]const u8 {
     const path = std.fs.path.join(arena, &.{ project_root, "flake.lock" }) catch return null;
     return std.Io.Dir.cwd().readFileAlloc(
@@ -5238,14 +3246,6 @@ fn provisioningFor(
     model: []const u8,
     dev_shell_dir: ?[]const u8,
 ) std.mem.Allocator.Error!?Provisioning {
-    // **A capability that is off is not worth a paragraph on a quiet run.**
-    // This used to print the policy answer, the action name, and a `chock.zon`
-    // rule to paste, on every start of every project that had said nothing
-    // about `nix.build`. Nobody had asked for a program to be added, so the
-    // whole block taught configuration for a thing that had not come up. The
-    // fact still reaches anybody who wants it, in one sentence, and the model
-    // is told the tool does not exist by the only means that matters: the tool
-    // is not in its list.
     const decision = try provisionDecision(arena, policy, chain_links, options.agent_kind, model);
     if (decision != .allow) {
         tty.detail(
@@ -5259,10 +3259,6 @@ fn provisioningFor(
         tty.detail("chock: provide_tool is off, because nix is not on this machine's PATH\n", .{});
         return null;
     };
-    // Best effort, and said out loud: a provisioned program with no root
-    // works, and a `nix-collect-garbage` during the session can take it away.
-    // Kept on a quiet run, because it only prints for a session that **can**
-    // provision, so the hazard it names is one this session can really meet.
     const nix_store_program = chock_nix.proc.resolve(arena, io, env, "nix-store") catch null;
     if (nix_store_program == null or dev_shell_dir == null) {
         tty.print(
@@ -5281,17 +3277,6 @@ fn provisioningFor(
     };
 }
 
-/// The environment a tool call resolves its own `argv[0]` against.
-///
-/// **The dev shell's, when the project has one**, which is the whole of the
-/// rule: the program a tool call runs is the project's, not whichever one this
-/// machine happens to have on the user's `PATH`. Before this existed it worked
-/// only by accident, and only for a `chock run` typed inside `nix develop`.
-///
-/// Only `PATH` is read from it, in `lib/chock-core/tools.zig`'s own
-/// `resolveOnPath`, and the map carries every variable regardless: a second
-/// name read from it later should find the dev shell's answer rather than
-/// this function's idea of which names matter.
 fn toolEnvironment(
     arena: std.mem.Allocator,
     host_env: *std.process.Environ.Map,
@@ -5309,38 +3294,13 @@ fn toolEnvironment(
     return map;
 }
 
-/// The environment the sandboxed program itself is given: what the workspace
-/// already needs, plus what the dev shell states.
-///
-/// **The workspace's own variables win.** The workspace's
-/// `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` are what make
-/// git work at all against a read only object store, and a flake that happened
-/// to set one of those names would otherwise break every git call the agent
-/// makes. Written as a skip rather than left to the order of the list, because
-/// two entries with one name is undefined in POSIX and "whichever libc reads
-/// first" is not a rule to rely on.
-///
-/// **`PATH` is given, and it used to be left out.** The old reason was that a
-/// tool call binds exactly the one program it names, at an absolute path, so
-/// the sandbox needed no `PATH` at all. That stopped being true once the dev
-/// shell's whole closure became the mount set: the program is bound on its
-/// own only when no mount already carries it, and for a flake project every
-/// tool in the toolchain is already there. So the missing `PATH` hid nothing
-/// and only stopped honest programs finding what was mounted beside them.
-///
-/// **What it cost, measured 2026-09-18.** `cargo build` answered "could not
-/// execute process `rustc -vV` (never executed)" with `ENOENT`, while `rustc`
-/// run as a tool call worked, because `argv[0]` is resolved against the dev
-/// shell's `PATH` on the host and a child's own lookup had none. Every
-/// toolchain has this shape: cargo runs rustc, make runs cc, npm runs node.
-/// The model reading that error concluded the sandbox forbids a program that
-/// runs a program, which it does not.
-///
-/// **And it was never a boundary.** The same session got a real build by
-/// passing `--config env.PATH=...` on the command line, because everything it
-/// named was mounted already. **The mount set is the boundary**: a `PATH` that
-/// names store paths reaches nothing that is not bound, and a program that
-/// wants something outside the closure still finds nothing there.
+/// The workspace's own `GIT_OBJECT_DIRECTORY` and
+/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` win, because they are what make git work
+/// against a read only object store. Written as a skip, because two entries with
+/// one name is undefined in POSIX. `PATH` is given: `cargo build` answered
+/// `ENOENT` for `rustc` without it, since a child's own lookup has no dev shell
+/// `PATH`. The mount set is the boundary, so a `PATH` naming store paths reaches
+/// nothing that is not bound.
 fn sandboxEnvironment(
     arena: std.mem.Allocator,
     workspace_env: []const []const u8,
@@ -5360,7 +3320,6 @@ fn sandboxEnvironment(
     return entries.toOwnedSlice(arena);
 }
 
-/// True when one of these `KEY=VALUE` entries has this name.
 fn namesKey(entries: []const []const u8, key: []const u8) bool {
     for (entries) |entry| {
         const equals = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
@@ -5396,10 +3355,6 @@ test "the sandbox environment keeps the workspace's own variables and carries th
     try std.testing.expectEqualStrings("PATH=/nix/store/aaa/bin", built[2]);
     try std.testing.expectEqualStrings("ZIG_GLOBAL_CACHE_DIR=/nix/store/bbb-cache", built[3]);
 
-    // **The dev shell's own, and never the host's.** A program that spawns a
-    // sibling by name finds it only if this names the directory it is in, and
-    // the whole point is that the directory is one the mount set already
-    // carries.
     try std.testing.expect(namesKey(built, "PATH"));
 }
 
@@ -5413,12 +3368,9 @@ test "the tool environment is the dev shell's own, and the host's when there is 
     defer host.deinit();
     try host.put("PATH", "/host/bin");
 
-    // With no dev shell, `argv[0]` is resolved the way it always was.
     const without = try toolEnvironment(arena, &host, null);
     try std.testing.expectEqualStrings("/host/bin", without.get("PATH").?);
 
-    // With one, the project's toolchain is what a tool call finds, and the
-    // host's `PATH` is not in the answer at all.
     const variables = [_][]const u8{"PATH=/nix/store/aaa-zig/bin"};
     const shell = chock_nix.DevShell{
         .arena = undefined,
@@ -5430,13 +3382,6 @@ test "the tool environment is the dev shell's own, and the host's when there is 
     try std.testing.expectEqualStrings("/nix/store/aaa-zig/bin", with.get("PATH").?);
 }
 
-/// Say whether this session wrote anything to the knowledgebase.
-///
-/// Counted at the end against the count at the start, rather than tracked
-/// through the loop: a note that replaced an existing one changes no count,
-/// and saying "wrote 0 notes" for a session that corrected one would be
-/// wrong. So this reports the directory whenever there is anything in it, and
-/// the growth when there was any.
 fn reportNotes(io: std.Io, started: *const Started) void {
     const dir = started.memory_dir orelse return;
     const now = chock_core.memory.count(io, dir);
@@ -5452,17 +3397,6 @@ fn reportNotes(io: std.Io, started: *const Started) void {
     tty.print(.plain, "chock: {d} notes ({s}). Read or clear them with: chock memory\n", .{ now, dir });
 }
 
-/// Say which instruction files went into the prompt.
-///
-/// **A user who clones a repository and sees an unexpected four hundred line
-/// `AGENTS.md` load has learned something worth knowing.** These files are
-/// untrusted input, and the cheapest defence against a surprise is saying that
-/// the surprise happened. So this stays on a quiet run.
-///
-/// **One line for all of them, and the sizes are behind `--verbose`.** The
-/// paths are what somebody acts on, because a path is what they open. The layer
-/// and the byte count answer a question nobody has until the path has already
-/// surprised them.
 fn reportInstructions(loaded: chock_core.instructions.Loaded) void {
     if (loaded.files.len != 0) {
         tty.print(.plain, "chock: instructions", .{});
@@ -5483,36 +3417,19 @@ fn reportInstructions(loaded: chock_core.instructions.Loaded) void {
     }
 }
 
-/// The first seven characters of an object id, the length git itself
-/// abbreviates to. The whole id is always in the log; this is for a line a
-/// person reads.
 fn shortId(id: []const u8) []const u8 {
     return if (id.len > 7) id[0..7] else id;
 }
 
-/// The ref a session's work lands on, under `refs/chock/`, named after the
-/// session.
-///
-/// **Never the branch the user has checked out.** The worktree is detached
-/// exactly so a session cannot move a branch of the user, and moving one here
-/// at the end would give back with the right hand what that took away with the
-/// left: the user's own working tree would suddenly read as a large diff
-/// against a commit they never made. A ref of the session's own is in the
-/// project, reachable, and inert until the user merges or cherry-picks it.
+/// Never the branch the user has checked out. The worktree is detached exactly
+/// so a session cannot move one, and a ref of the session's own is reachable and
+/// inert until the user merges or cherry-picks it.
 fn applyRef(gpa: std.mem.Allocator, session_id: []const u8) std.mem.Allocator.Error![]u8 {
     return std.fmt.allocPrint(gpa, "refs/chock/{s}", .{session_id});
 }
 
-/// The question `apply.mode = .ask` puts, and the answers it takes.
-/// The words the display's own question region offers.
-///
-/// **Each one is a `Mode.fromAnswer` word.** A person who chooses by number and
-/// a person who types the word reach the same answer, because
-/// `chock_core.ask.chosen` turns the number into the word before this reads it.
 const landing_options = [_][]const u8{ "merge", "rebase", "squash" };
 
-/// What the display asks. `landing_question` below is the console's own wording,
-/// which can afford more rows than a region has.
 const landing_text =
     "How should this session's work land? " ++
     "merge, rebase and squash each carry it onto the branch you have checked out. " ++
@@ -5531,29 +3448,11 @@ const landing_question =
     \\Which? [merge/rebase/squash] 
 ;
 
-/// Which shape this apply takes, for a project whose mode is `ask`.
-///
-/// **The question comes before the approval, not instead of it.** A person
-/// answers this, and then reads an approval request that names the answer and
-/// says what it does to their branch. So the prompt they say "y" to is still the
-/// prompt that describes the act, which is the property the whole approval flow
-/// rests on.
-///
-/// **Nobody to ask means no landing.** A subagent, a session the daemon started
-/// and a `chock run` whose standard input is a pipe all have nobody at the
-/// keyboard, and so does a session with the full screen display up, which owns
-/// the terminal and cannot have a second reader on it. Each of those keeps the
-/// work at the ref, which is the narrow answer. `chock_core.ask` refuses the
-/// same three the same way and for the same reason.
-/// The landing one answer names, and null for every answer that names none.
-///
-/// **Its own function so it can be driven without a display.** The region a
-/// person answers in cannot be built in a test here, so the part that can be
-/// wrong is the reading of the answer, and that part is this.
-///
-/// **Only a landing word moves a branch.** A person who typed something else,
-/// who pressed Enter, who was never there, or who ran out of time all get the
-/// answer that moves nothing. That is the same rule the console path keeps.
+/// The question comes before the approval and not instead of it, so the prompt a
+/// person says yes to is still the one that describes the act. Nobody to ask
+/// means no landing: a subagent, a session the daemon started, a `chock run`
+/// whose standard input is a pipe, and one with the display up all keep the work
+/// at the ref.
 fn landingFor(answer: chock_core.ask.Answer) ?chock_policy.apply.Landing {
     return switch (answer) {
         .answered => |said| chock_policy.apply.Mode.fromAnswer(said),
@@ -5561,12 +3460,6 @@ fn landingFor(answer: chock_core.ask.Answer) ?chock_policy.apply.Landing {
     };
 }
 
-/// What this apply may do to the branch: a landing, or nothing and why.
-///
-/// **Null `mode` is the policy row's `deny`**, read once when the session
-/// started, and it is the one answer that takes the capability away. Every
-/// other way out of this function with no landing is nobody answering, which is
-/// the narrow answer and moves no branch either.
 fn chosenLanding(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -5575,11 +3468,6 @@ fn chosenLanding(
 ) chock_broker.integrate.Wanted {
     const asked = mode orelse return .{ .none = .policy_refused };
     if (asked.settled()) |landing| return .{ .land = landing };
-    // **A display has a region for a question, so the question goes there.**
-    // `Ui.showQuestion` carries the options and the countdown, and it is the
-    // region a person is already reached through while a screen is up. A bare
-    // prompt written around the display would land in cells the display
-    // believes it owns, which is why the console path below is not used here.
     if (screen) |up| {
         var display = DisplayAsker{ .screen = up };
         const answer = display.ask(gpa, io, .{
@@ -5599,9 +3487,6 @@ fn chosenLanding(
     var buffer: [approval.max_answer_bytes]u8 = undefined;
     const said = switch (console.read(io, &buffer, @intCast(chock_broker.Broker.default_timeout_ms))) {
         .bytes => |count| buffer[0..count],
-        // Nobody typed, the input ended, or something asked the session to
-        // stop. All three are "nobody answered", and the answer to that is the
-        // one that moves nothing.
         .idle, .ended, .canceled => {
             console.write(io, "\n");
             return .{ .none = .nobody_answered };
@@ -5611,69 +3496,27 @@ fn chosenLanding(
     return .{ .none = .nobody_answered };
 }
 
-/// Every sandbox layer of this session, in the order the header names them.
-///
-/// **Two honest sources, and neither is the platform.** `src/ui.zig` may not
-/// read `builtin` and neither may this: what a layer is worth comes from the
-/// sandbox itself.
-///
-/// * **`given` is what the driver of this build declares it applies.**
-///   `chock_sandbox.Sandbox.guarantees` is the driver's own answer, one member
-///   per capability layer, and a layer that is not in it is a layer this build
-///   never had. Every one is in it on Linux. Darwin declares four, which are
-///   the network, the signals, the IPC and the paths, and it does not declare
-///   a system call filter or a mounted workspace: see `darwin/driver.zig`.
-/// * **`network` is what this session asked for**, out of the config it will
-///   really spawn with. `.host` gives the network layer up, and that is allowed
-///   only for an act a user approved.
-///
-/// **A layer that failed to apply never reaches this, and that is stronger than
-/// showing it off.** The Linux driver refuses rather than degrades: every step
-/// of `applyLayers` has a member of `SetupError` of its own, a kernel with no
-/// Landlock is `SpawnError.LandlockUnavailable`, and each of them fails the
-/// whole call. So there is no state in which a tool ran with a layer quietly
-/// missing, and `✓` beside a layer the driver gives is a claim about every call
-/// that ran, not a guess about one.
-///
-/// **`witness` is the one thing this machine can answer differently**, and it
-/// only ever takes a layer away. `witness.unavailable` names the guarantees a
-/// probe here asked about and got refused, such as a kernel with no Landlock
-/// or one that will not take this build's filter. Those are measured facts
-/// about this machine, so they outrank the tick. A guarantee nothing probed is
-/// **not** a third answer: see the paragraph above, which is why. See
-/// `witnessLayers` for what is really asked, and `ui.Layer.State` for what
-/// each answer prints.
-///
-/// The result borrows only static strings, so a caller may keep it for as long
-/// as it likes.
+/// `given` is what the driver of this build declares it applies. Every layer is
+/// in it on Linux; Darwin declares four, and neither a system call filter nor a
+/// mounted workspace. A layer that failed to apply never reaches this, because
+/// the Linux driver refuses rather than degrades. `witness` is the one thing this
+/// machine can answer differently, and it only ever takes a layer away.
 fn sandboxLayers(
     given: sandbox.Sandbox.Guarantees,
     witness: LayerWitness,
     network: sandbox.namespace.Network,
     workspace: []const u8,
 ) [layer_names.len]ui.Layer {
-    // Nothing may be called refused that was never asked. A caller that broke
-    // this would draw a cross on a layer no probe ever ran against, which is
-    // the fault this file removed, pointing the other way.
     std.debug.assert(witness.unavailable.subsetOf(witness.probed));
 
     var built: [layer_names.len]ui.Layer = undefined;
     for (layer_names, &built) |named, *slot| {
         const note: []const u8 = switch (named.guarantee) {
-            // **The note is the mode's own name, and no longer a word of its
-            // own.** It used to read "off" for the closed mode, which was
-            // right while a network was on or off and is wrong now that there
-            // are three answers: a reader who saw "off" beside a ✓ and
-            // "filtered" beside another ✓ had to learn a second vocabulary to
-            // tell what either one meant. "none", "filtered" and "host" are
-            // the three names of `namespace.Network`, so the header and the
-            // code say the same word for the same thing.
             .network_isolated => switch (network) {
                 .none => "none",
                 .filtered => "filtered",
                 .host => "host",
             },
-            // The workspace kind goes beside this one.
             .workspace_mounted => workspace,
             else => "",
         };
@@ -5690,69 +3533,26 @@ fn sandboxLayers(
     return built;
 }
 
-/// What this machine refused, out of what this session asked it.
-///
-/// **Two sets and not one, so that a refusal can be told from a question
-/// nobody asked.** A guarantee in `probed` is one this process really asked
-/// the machine about. A guarantee in `unavailable` came back refused, and
-/// `unavailable` is always a subset of `probed`: nothing may be called refused
-/// that was never asked, and `sandboxLayers` asserts it.
-///
-/// **A guarantee in neither changes nothing.** The driver applies it and dies
-/// if it cannot, so it reads on: see `ui.Layer.State.on`.
+/// Two sets and not one, so a refusal can be told from a question nobody asked.
+/// `unavailable` is always a subset of `probed`. A guarantee in neither reads
+/// on, because the driver applies it and dies if it cannot.
 const LayerWitness = struct {
     probed: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
     unavailable: sandbox.Sandbox.Guarantees = sandbox.Sandbox.Guarantees.initEmpty(),
 
-    /// Record one answer. `available` is what the machine said.
     fn saw(self: *LayerWitness, guarantee: sandbox.Sandbox.Guarantee, available: bool) void {
         self.probed.insert(guarantee);
         if (!available) self.unavailable.insert(guarantee);
     }
 };
 
-/// Measure what can be measured about this session's sandbox layers, once,
-/// here, before the header is drawn and before the first tool call.
-///
-/// **Only what this process can really observe, and nothing else.** A probe
-/// that changes nothing and a fork that asks the kernel the same question
-/// `spawn` will ask are observations. The absence of an error from code that
-/// has not run yet is not.
-///
-/// **What a probe is for now: the two questions a machine can answer
-/// differently.** A layer this build applies is enforced or the call dies, so
-/// a probe cannot make its tick any truer. What a probe can find is a machine
-/// that will refuse the layer outright, and the header draws that as
-/// `BLOCKED`. Five of the six are asked, because one fork answers for three
-/// namespaces at no extra cost, and the sixth cannot be asked at all:
-///
-/// * `path_restricted` is `sandbox.landlock.probeAbi`, a system call that
-///   reads the ABI version and changes nothing. `src/doctor.zig` reads it the
-///   same way. It witnesses that this kernel has Landlock, and not that a
-///   ruleset restricted anything.
-/// * `signal_isolated`, `ipc_isolated` and `network_isolated` are
-///   `sandbox.namespace.probeAvailability`, which forks a child that calls
-///   `namespace.enter` with the same default options `spawn` uses, so the
-///   three namespaces are really made. Its third answer, `unknown`, is a probe
-///   that could not run, and it is recorded as neither.
-/// * `syscall_restricted` is `sandbox.seccomp.probeInstall`, which forks a
-///   child that installs this build's own filter and exits. The filter cannot
-///   be removed, so the question can only be asked in a child.
-/// * `workspace_mounted` is **not** measured, and it does not need to be. The
-///   namespace probe enters a mount namespace and it builds no root and
-///   `pivot_root`s into none, so crediting the workspace layer from it would
-///   be the same overclaim in a new place. `buildRoot` and `pivotInto` both
-///   die, so the layer is enforced or the call never runs.
-///
-/// **Linux only, and that costs Darwin nothing.** Darwin's `path_restricted`
-/// is Seatbelt and never Landlock, and a raw Landlock system call asked of a
-/// kernel that is not Linux answers nothing true about that profile. The same
-/// holds for the other two probes, which name Linux mechanisms outright. So on
-/// Darwin this measures nothing and every guarantee that driver gives reads
-/// on, because `darwin/driver.zig` dies when Seatbelt refuses the profile, and
-/// the two it does not give read `NONE`. `src/doctor.zig`'s own
-/// `measureSeatbelt` spawns a real confined child against probe files on disk,
-/// which is a report's work and not a header's.
+/// A layer this build applies is enforced or the call dies, so a probe cannot
+/// make its tick truer. What a probe can find is a machine that refuses the layer
+/// outright. `path_restricted` reads the Landlock ABI version and changes
+/// nothing. The three namespace guarantees come from one fork that calls
+/// `namespace.enter`. `syscall_restricted` forks a child that installs this
+/// build's filter, because a filter cannot be removed. `workspace_mounted` is not
+/// probed: the namespace probe builds no root and pivots into none. Linux only.
 fn witnessLayers(
     gpa: std.mem.Allocator,
     given: sandbox.Sandbox.Guarantees,
@@ -5768,9 +3568,6 @@ fn witnessLayers(
         }
     }
 
-    // One fork answers for all three namespaces, because `enter` makes them
-    // together. `unknown` is a probe that could not run, and it is left out of
-    // `probed` rather than counted as either answer.
     const namespaces = sandbox.namespace.probeAvailability();
     if (namespaces != .unknown) {
         for ([_]sandbox.Sandbox.Guarantee{
@@ -5783,17 +3580,15 @@ fn witnessLayers(
     }
 
     if (given.contains(.syscall_restricted)) {
-        // Built here and not in the child: a fork may happen while another
-        // thread holds this allocator's lock. **No trap set**, for the reason
-        // `probeInstall` gives: a filter that asks for a user notification
-        // with no listener behind it makes the kernel answer every observed
-        // call with `ENOSYS`, and the child's own answer would be lost.
+        // Built here and not in the child: a fork may happen while another thread
+        // holds this allocator's lock. No trap set: a filter that asks for a user
+        // notification with no listener behind it makes the kernel answer every
+        // observed call with `ENOSYS`.
         if (sandbox.seccomp.build(gpa, .{})) |insns| {
             defer gpa.free(insns);
             switch (sandbox.seccomp.probeInstall(sandbox.bpf.Prog.init(insns))) {
                 .ok => out.saw(.syscall_restricted, true),
                 .refused => out.saw(.syscall_restricted, false),
-                // Nothing was measured, so nothing is claimed either way.
                 .unknown => {},
             }
         } else |_| {}
@@ -5802,12 +3597,6 @@ fn witnessLayers(
     return out;
 }
 
-/// What each layer of the header is called, and which guarantee it is.
-///
-/// **The names are the display's and the guarantees are `chock_sandbox`'s**, so
-/// this table is the one place the two vocabularies meet. The exhaustive switch
-/// below is what makes a seventh guarantee a compile error here rather than a
-/// layer that quietly never reaches a screen.
 const layer_names = [_]struct {
     name: []const u8,
     guarantee: sandbox.Sandbox.Guarantee,
@@ -5821,9 +3610,6 @@ const layer_names = [_]struct {
 };
 
 comptime {
-    // Every guarantee reaches the header, and no name is used twice. A
-    // guarantee added to `chock_sandbox` and not to the table above would be a
-    // layer a person is never told about.
     var seen = sandbox.Sandbox.Guarantees.initEmpty();
     for (layer_names) |named| {
         if (seen.contains(named.guarantee)) @compileError(
@@ -5836,39 +3622,15 @@ comptime {
     );
 }
 
-/// Who asks the person at this machine: the display, the bare prompt, or
-/// nobody.
-///
-/// **Never both, and that is the whole of this function.** `approval.Terminal`
-/// reads standard input and writes its prompt straight at the terminal, and
-/// `src/ui.zig` holds that same descriptor in raw mode and keeps a copy of every
-/// cell. Two readers on one descriptor race for every byte, and a prompt written
-/// around a display lands in cells the display believes it owns. A session with
-/// a display is a session at a terminal too, so an `or` here would give the
-/// broker both.
-///
-/// Its own function, over two booleans, so the rule is somewhere a test can
-/// reach rather than an `if` inside a method that needs a session to build.
+/// Never both a display and the bare prompt: two readers on one descriptor race
+/// for every byte, and a prompt written around a display lands in cells the
+/// display believes it owns.
 fn asksHere(has_display: bool, at_terminal: bool) enum { display, terminal, nobody } {
     if (has_display) return .display;
     if (at_terminal) return .terminal;
     return .nobody;
 }
 
-/// Everybody who can answer a question this session asks, and how long one may
-/// wait.
-///
-/// **Two waiters, and a session can have either, both, or neither.** A person
-/// at this process's own terminal is `src/approval.zig`, and a client attached
-/// to the session's unix socket is `chock_broker.socket`. Both are
-/// implementations of the same `Broker.Waiter` seam, both answer through the
-/// caller's own `locked` handle, and neither touches the session lock: see
-/// `lib/chock-broker/socket.zig`'s own top comment for why the broker does not
-/// have to own the log for any of this to work.
-///
-/// **Built in place and never returned by value.** A `Broker.Waiter` holds a
-/// pointer into this struct, so a copy of it is a waiter pointing at a value
-/// that has moved.
 const Approvers = struct {
     stdin: approval.Stdin,
     terminal: approval.Terminal,
@@ -5876,13 +3638,8 @@ const Approvers = struct {
     socket: chock_broker.socket.Waiter,
     pair: chock_broker.socket.Pair,
     at_terminal: bool,
-    /// Whether a display is up. **Never both this and `terminal`**: they are
-    /// two readers of one device, and `waiter` is what keeps that true.
     has_display: bool,
     has_socket: bool,
-    /// How many clients were attached when this was built. Read once, at the
-    /// moment the question is about to be written, because that is the moment
-    /// `timeoutMs` is asking about.
     attached: usize,
 
     fn init(
@@ -5891,7 +3648,6 @@ const Approvers = struct {
         io: std.Io,
         started: *Started,
         locked: *ApprovalLock,
-        /// The display, when one is up. See `waiter`.
         screen: ?*ui.Ui,
     ) void {
         self.at_terminal = approval.hasTerminal(io);
@@ -5916,10 +3672,6 @@ const Approvers = struct {
         self.has_socket = started.approvals != null;
         self.attached = 0;
         if (started.approvals) |endpoint| {
-            // **Before the count is read.** A client that has connected and not
-            // been accepted yet is a client the kernel is holding, and a
-            // question written before this call would be given a deadline of
-            // zero over somebody who is already there.
             endpoint.acceptPending(io);
             self.attached = endpoint.attached();
             self.socket = .{
@@ -5932,20 +3684,6 @@ const Approvers = struct {
         }
     }
 
-    /// The one waiter the broker is given.
-    ///
-    /// **The display replaces the bare terminal and never joins it.** Both read
-    /// the same descriptor, and two readers on one descriptor race for every
-    /// byte; the display also holds that device in raw mode and keeps a copy of
-    /// every cell, so a prompt written around it lands in cells it believes it
-    /// owns. So a session with a display asks in its own approval region, and a
-    /// session with none asks at the prompt exactly as it always did. See
-    /// `approval.Display`.
-    ///
-    /// A session with nobody at all gets the plain waiter, which only sleeps,
-    /// and `timeoutMs` gives it a deadline that has already passed to go with
-    /// it. Building a terminal waiter for a session with no terminal would be a
-    /// prompt written to nothing.
     fn waiter(self: *Approvers) chock_broker.Broker.Waiter {
         const here: ?chock_broker.Broker.Waiter = switch (asksHere(self.has_display, self.at_terminal)) {
             .display => self.display.waiter(),
@@ -5963,14 +3701,9 @@ const Approvers = struct {
     }
 
     fn timeoutMs(self: *const Approvers) i64 {
-        // A display is a person watching, the same as a terminal is, so the
-        // question gets the full deadline rather than the zero of a session
-        // nobody can answer.
         return chock_broker.socket.timeoutMs(self.at_terminal or self.has_display, self.attached);
     }
 
-    /// The first fault any half reported, or null. A `Waiter` cannot give an
-    /// error back to the broker, so the caller reads it here instead.
     fn failed(self: *const Approvers) ?anyerror {
         if (self.has_display) {
             if (self.display.failed) |err| return err;
@@ -5983,23 +3716,6 @@ const Approvers = struct {
     }
 };
 
-/// The person at this terminal, as a `chock_core.ask.Console`.
-///
-/// **A bridge and nothing else, and the two ends are two files apart on
-/// purpose.** `chock_core.ask.Prompt` holds every decision about a question: the
-/// bounds, the marker that keeps the model's words out of column zero, the
-/// filter, and the deadline. It reaches a device through a vtable, because
-/// nothing under `lib/` writes to one. `src/approval.zig` owns the real
-/// descriptor, the poll with a bound, and the flush an unterminated line needs.
-/// This forwards one to the other, so neither has to know the other's type.
-///
-/// **A question is never asked while a display is up.** The display holds the
-/// terminal in raw mode and keeps a copy of every cell, so a prompt written
-/// around it lands in cells it believes it owns and two readers race for every
-/// byte. That is the rule `asksHere` already keeps for an approval, and the
-/// caller below keeps it here by giving `Prompt.at_terminal` a false when a
-/// screen is up. **`src/ui.zig` has no region for a question yet**, so such a
-/// session tells the agent nobody was asked.
 const QuestionConsole = struct {
     stdin: approval.Stdin = .{},
 
@@ -6032,23 +3748,9 @@ const QuestionConsole = struct {
     }
 };
 
-/// What keeps a full screen display alive while the session waits.
-///
-/// **The display used to be frozen for the whole of every wait**, because
-/// `src/ui.zig` reads its keyboard and repaints in one place and that place runs
-/// only when an event arrives. Between two events nothing read the keyboard, so
-/// a person could not scroll while a tool call ran, and could not scroll at all
-/// while the harness waited for the first token of a reply. See `ui.Ui.pumpStep`
-/// for the whole of the fault and for why a second thread is not the answer.
-///
-/// **Two seams and one implementation, because two libraries wait.**
-/// `chock_core.idle.Idle` is the wait on a sandboxed program's output pipe and
-/// `chock_provider.Client.Idle` is the wait on the provider going quiet. Neither
-/// library imports the other, so each declares the shape it needs and this
-/// bridges both to the one display, which is the same cost
-/// `chock_core.ask.Console` pays to stay out of `src/approval.zig`.
-///
-/// **Built in place and never copied**: both seams hold a pointer into this.
+/// `src/ui.zig` reads its keyboard and repaints in one place, and that place runs
+/// only when an event arrives, so between two events nothing reads the keyboard.
+/// Built in place and never copied: both seams hold a pointer into this.
 const DisplayPump = struct {
     screen: *ui.Ui,
 
@@ -6069,42 +3771,14 @@ const DisplayPump = struct {
     }
 };
 
-/// What puts an `ask_user` question on a display, in the region `src/ui.zig`
-/// keeps for it.
-///
-/// **Before this, a session with a display told the agent nobody was asked.**
-/// `chock_core.ask.Prompt` reads `at_terminal` before it writes a byte and comes
-/// straight back with `.nobody`, and the caller below gave it a false whenever a
-/// screen was up: a prompt written around a display lands in cells the display
-/// believes it owns, and two readers on one descriptor race for every byte. That
-/// was the honest answer while there was no region to ask in. There is one now.
-///
-/// **This is not the arbiter and never becomes one.** An ask grants nothing,
-/// whatever the person types: there is no member of `ui.Text` or of
-/// `chock_core.ask.Answer` that could carry a decision, and this appends nothing
-/// to the log at all. `lib/chock-core/ask.zig`'s own top comment says why the two
-/// paths stay apart, and `src/ui.zig`'s `Question` says it again beside the
-/// approval region that looks so like it.
-///
-/// **The deadline is measured here and shown by the region**, the same way
-/// `approval.Display` moves an approval's countdown, so a person can see how
-/// long they have. A question nobody answers ends in `timed_out`, which the model
-/// is told to carry on from.
-///
-/// **Built in place and never copied**: an `Asker` holds a pointer into this.
+/// This is not the arbiter and never becomes one. An ask grants nothing,
+/// whatever the person types, and appends nothing to the log at all. Built in
+/// place and never copied: an `Asker` holds a pointer into this.
 const DisplayAsker = struct {
     screen: *ui.Ui,
-    /// Whether a stop has been asked for. A field for the same reason
-    /// `chock_core.ask.Prompt.stop` is one: a test answers it without raising a
-    /// real signal at the whole test binary.
     stop: *const fn () bool = interrupt.requested,
-    /// How long one question waits. The same five minutes the bare prompt waits.
     timeout_ms: i64 = chock_core.ask.default_timeout_ms,
-    /// What the deadline is measured against. A field for the reason `stop` is
-    /// one.
     now: *const fn (io: std.Io) i64 = nowMs,
-    /// Which agent is asking, as Chock names it. Chock's own word, never the
-    /// model's.
     agent_kind: []const u8 = "",
 
     fn asker(self: *DisplayAsker) chock_core.ask.Asker {
@@ -6123,18 +3797,12 @@ const DisplayAsker = struct {
         return self.ask(gpa, io, question);
     }
 
-    /// Put one question up and wait for a line, for at most `timeout_ms`.
-    ///
-    /// Its own function, taking and giving ordinary values, so a test drives
-    /// exactly what the loop drives.
     pub fn ask(
         self: *DisplayAsker,
         gpa: std.mem.Allocator,
         io: std.Io,
         question: chock_core.ask.Question,
     ) chock_core.ask.Error!chock_core.ask.Answer {
-        // **First, and before anything is shown.** A person who pressed Ctrl-C
-        // is leaving, not answering.
         if (self.stop()) return .stopped;
 
         self.screen.showQuestion(.{
@@ -6143,8 +3811,6 @@ const DisplayAsker = struct {
             .options = question.options,
             .left_ms = self.timeout_ms,
         });
-        // **On every path out**, including the error one: a region a person can
-        // still see and can no longer answer is worse than none.
         defer self.screen.clearQuestion();
 
         const deadline = self.now(io) + self.timeout_ms;
@@ -6164,11 +3830,6 @@ const DisplayAsker = struct {
                 .canceled => return .stopped,
                 .declined => return .declined,
                 .answered => |said| {
-                    // **The number a person typed is the option it names**, the
-                    // same rule `chock_core.ask.chosen` keeps at the bare
-                    // prompt, so the model reads the same answer whichever way
-                    // it was given. Anything that is not a number in range is
-                    // the person's own words.
                     const words = chock_core.ask.chosen(said, question.options) orelse said;
                     return .{ .answered = try gpa.dupe(u8, words) };
                 },
@@ -6181,118 +3842,34 @@ const DisplayAsker = struct {
     }
 };
 
-/// `chock_proto.storage.Locked` is not `pub`, so no file outside that one can
-/// name it. This reaches the same type through the return type of
-/// `Storage.lock`, which is public, the same way `src/approval.zig` does.
 const ApprovalLock = @typeInfo(
     @typeInfo(@TypeOf(chock_proto.storage.Storage.lock)).@"fn".return_type.?,
 ).error_union.payload;
 
-/// The broker, as `chock_core.Loop` asks a question of one mid session.
-///
-/// **This is the caller `chock_policy.ratchet.widen_action` and
-/// `chock_broker.review.requesterText` did not have.** Both were built, tested,
-/// and refused for one reason: `Loop.run` holds the exclusive lock on the
-/// session log for the whole session, so no answer could arrive and no question
-/// was worth asking. `lib/chock-broker/socket.zig` removes that reason, and this
-/// is what joins the loop to the broker now that it is gone.
-///
-/// ## It runs inside the lock, on purpose
-///
-/// `decide` is handed the loop's own `locked` handle and passes it straight to
-/// `Broker.request`, which writes the question and the answer through it. There
-/// is no second open of the log and no second lock: see
-/// `lib/chock-broker/socket.zig`'s own top comment on why the broker does not
-/// have to own the log for any of this to work.
-///
-/// ## What it folds, and why it folds it again
-///
-/// The loop holds a `state.Session` of its own and this seam is handed none, so
-/// the log is folded here. That is not a workaround: the fold is the truth of a
-/// session, and it is what makes this right about a session that was resumed,
-/// handed to the daemon, or compacted.
-///
-/// **A full replay of the whole log used to run on every question, and
-/// `gateToolCall` now asks this for every ordinary tool call, not only a
-/// widening proposal, so that was quadratic in the length of the session.**
-/// Measured 2026-09-07, `ReleaseSafe`, real `JsonLines` storage: one full
-/// replay of a 1200 event, 404 KB log took 73 ms, and 400 gated calls against
-/// a session that started there, each folding from event 0 and then
-/// appending one `approval_response`, took 20.4 s. `folded` and `folded_at`
-/// below are what fixes that: `foldSessionSince` resumes each question's
-/// fold from where the previous one stopped, so the cost of a question is
-/// the events since the last one, not the whole session. The same 400 calls
-/// measured 83 ms with that change, and every one of them still starts by
-/// reading whatever the log holds up to that instant, so a mid session
-/// `restrict_self` still binds the very next question: see
-/// `foldSessionSince`'s own doc comment for why a partial, resumed fold
-/// reaches the same state a full one would.
-///
-/// **Keeping `folded` alive traded a growing replay cost for a growing
-/// `folded` itself, and `context` was the part of it nobody had measured.**
-/// A `state.Session` mirrors the whole conversation in `context`, and that
-/// list only grows: `decideFn` never reads it, but a `state.Session` kept
-/// for the run's whole life used to carry it anyway. Measured 2026-09-07,
-/// `Debug`, a synthetic session of realistic gated tool calls (a user turn,
-/// an assistant turn with a tool call, a granted `net.connect`, and a
-/// `usage` event per turn, with a self-narrowing every fifth turn and a
-/// subagent spawn every fiftieth): a kept `state.Session`'s own arena held
-/// 117 KB at 100 turns, 449 KB at 400, and 7.3 MB at 4000, and `context`
-/// alone accounted for 80% of that at 100 turns and 96% of it at 4000. The
-/// part of the total that keeps growing is also the part that dominates.
-/// `folded` is now a `state.PolicyFold`, not a `state.Session`: over the
-/// identical traffic its own arena held 23.6 KB at 100 turns, 53 KB at 400,
-/// and 288 KB at 4000, because it carries `children`, `self_policy`,
-/// `grants`, and `spend` and nothing else. See `PolicyFold`'s own top
-/// comment for why a struct with no `context` field is the bound, rather
-/// than a `state.Session` whose `context` is dropped after each fold.
-///
-/// ## The reviewer, and the honest limit on it
-///
-/// `agent_review` and `agent_then_human` want a reviewer subagent, and
-/// `reviewerFor` builds the same one `applyWork` uses. A session whose limits,
-/// budget, or process state will not start one gets `review_unavailable`, which
-/// does not permit: that is the rule `lib/chock-broker/review.zig` would be
-/// worthless without.
+/// `decide` is handed the loop's own `locked` handle and passes it to
+/// `Broker.request`, so there is no second open of the log and no second lock.
+/// `foldSessionSince` resumes each question's fold from where the last one
+/// stopped: a full replay per question is quadratic in the length of the session,
+/// and `gateToolCall` asks for every ordinary tool call. A session that cannot
+/// start a reviewer gets `review_unavailable`, which does not permit.
 const SessionArbiter = struct {
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
     env: *std.process.Environ.Map,
     started: *Started,
     options: Options,
-    /// The display, when bare `chock` brought one up. **This is the one thing
-    /// that makes a mid session question answerable in the interface**: an
-    /// approval arrives during a turn, and during a turn the display is the
-    /// only thing reading the terminal. Null for `chock run`, which asks at the
-    /// prompt. See `Approvers.waiter`.
     screen: ?*ui.Ui = null,
-    /// What `decideFn` has folded of this session's own log so far. Null
-    /// until the first question, after which it is kept and only ever
-    /// caught up, never rebuilt: see `foldSessionSince`. Freed by `deinit`,
-    /// which the one caller that builds a `SessionArbiter` must run once the
-    /// session is over.
-    ///
-    /// **`chock_proto.state.PolicyFold`, and not `chock_proto.state.Session`.**
-    /// A `Session` kept this way used to carry `context`, the mirrored
-    /// message history, which grows for the life of the run and which
-    /// nothing below ever reads: see `PolicyFold`'s own top comment for the
-    /// measurement. `PolicyFold` holds exactly what `decideFn` reads
-    /// (`children`, `self_policy`, `grants`, `spend`) and has no field to
-    /// misread `context` out of.
+    /// Kept after the first question and only ever caught up, never rebuilt.
+    /// `PolicyFold` and not `state.Session`: a `Session` carries `context`, the
+    /// mirrored message history, which grows for the life of the run and which
+    /// nothing below ever reads.
     folded: ?chock_proto.state.PolicyFold = null,
-    /// The byte offset `folded` has been read up to, so the next fold knows
-    /// where to resume. Meaningless while `folded` is null, and 0 means
-    /// "from the start of the log", the same as `storage.replay`'s own
-    /// `offset` reads it: see `foldSessionSince`.
     folded_at: u64 = 0,
 
     fn arbiter(self: *SessionArbiter) chock_core.arbiter.Arbiter {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Release what `decideFn` folded, if it ever ran. Safe to call on a
-    /// `SessionArbiter` no question ever reached, since `folded` is then
-    /// still null.
     fn deinit(self: *SessionArbiter) void {
         if (self.folded) |*session| session.deinit();
     }
@@ -6308,12 +3885,6 @@ const SessionArbiter = struct {
     ) chock_core.arbiter.Answer {
         const self: *SessionArbiter = @ptrCast(@alignCast(ptr));
 
-        // **Kept across every question this arbiter is ever asked, and
-        // caught up rather than rebuilt.** See this struct's own `folded`
-        // and `folded_at`, and `foldSessionSince`'s doc comment for why a
-        // fold resumed this way still reaches the same state a fold of the
-        // whole log from event 0 would, including a `restrict_self` that
-        // landed since the last question.
         if (self.folded == null) self.folded = chock_proto.state.PolicyFold.init(self.gpa);
         const session = &self.folded.?;
         foldSessionSince(gpa, io, self.started.storage, session, &self.folded_at);
@@ -6321,9 +3892,6 @@ const SessionArbiter = struct {
         var review_child = reviewChild(self.gpa, self.environ, self.env, self.started, self.options);
         var review_spawner = reviewerFor(review_child.spawner(), self.started, session);
 
-        // The loop's own handle, so a reviewer this decision starts is appended
-        // to the log as a child and counted against the width bound: see
-        // `ReviewSpawner.locked`.
         review_spawner.locked = locked;
 
         var approvers: Approvers = undefined;
@@ -6333,32 +3901,14 @@ const SessionArbiter = struct {
             .policy = self.started.policy,
             .waiter = approvers.waiter(),
             .reviewer = review_spawner.reviewer(),
-            // **The broker writes into the log this loop holds the lock on.**
-            // `Loop.appendAndApply` cannot cover what another library appends,
-            // so the same values reach both. See `brokerRedaction`.
             .redaction = self.started.redact_values,
-            // **The memory that stops this loop from asking the same
-            // question twice.** `session` was just caught up to the end of
-            // the log, so it already holds every `approved_by_user_for_session`
-            // answer a person gave to an earlier question in this session.
-            // Without this, a person who says "yes, for the rest of the
-            // session" to one tool call would be asked again on the very
-            // next one, because `decideFn` builds a brand new `Broker` every
-            // time it runs, even though `session` itself is kept.
-            //
-            // **`session.arena.allocator()`, paired with the memory in the
-            // same field.** `session.grants` is filled through that arena, so
-            // a live grant this broker records has to grow through it too:
-            // see `chock_broker.Broker.Grants`'s own doc comment. `request`
-            // below is given the same arena as its own `gpa`, so the two
-            // agree twice over.
+            // `session` was just caught up, so it holds every
+            // `approved_by_user_for_session` answer given earlier and a person
+            // is not asked twice. `session.grants` is filled through that
+            // arena, so a live grant has to grow through it too.
             .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
         };
 
-        // The promises this session and every session above it made. The same
-        // read `applyWork` does, and for the same reason: a promise is enforced
-        // in the broker, out of a record nothing can rewrite, and never by the
-        // agent about itself.
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -6371,59 +3921,15 @@ const SessionArbiter = struct {
             session,
         ) catch &.{};
 
-        // Why the broker refused, or could not decide. `d.deinit` is called so
-        // the arena's own bookkeeping stays honest, but the bytes themselves
-        // are not reclaimed until `session`'s arena is: `session` is now kept
-        // for the life of the run (see `SessionArbiter.folded`), not torn
-        // down at the end of this call the way it used to be.
-        //
-        // **Measured, not assumed, and it is not one Diagnostic a question.**
-        // `Broker.request`'s own `.allow` and `.deny` arms never touch `diag`
-        // at all, and neither does `findAnswer`'s success arm for
-        // `allowed_by_policy`, `denied_by_policy`, `approved_by_user`,
-        // `approved_by_user_for_session`, `refused_by_user`, or `expired`
-        // (`lib/chock-broker/Broker.zig`): an ordinary tool call that is
-        // decided outright, answered from a remembered grant, or answered by
-        // a person in the plain way costs nothing here. `diag` is written
-        // only on a path this build itself calls abnormal, and among those,
-        // only `answer_is_about_another_request` (two short strings) and
-        // `answer_names_an_unknown_decision` (one) own any bytes at all: see
-        // `lib/chock-broker/diagnostic.zig`'s own `deinit`, where every other
-        // variant `request` can reach from here is listed as owning nothing,
-        // borrowed from the `Ask` this call already holds. Standing in for
-        // the worse of those two, `ReleaseSafe`, a real `ArenaAllocator`: 400
-        // such diagnostics in a row, one a question and never freed early,
-        // cost 28166 bytes of arena capacity. 4000 cost 458062, about 450 KB.
-        // That is the ceiling of a session where *every* question takes an
-        // abnormal path, and a session like that has a problem elsewhere
-        // already. An ordinary session pays none of it. Bounded either way, so nothing
-        // here frees it early: see this file's own top comment on why
-        // `session`'s arena is kept for the life of the run in the first
-        // place, and the hazard freeing part of it early would risk.
         var broker_diag: ?chock_broker.Diagnostic = null;
         defer if (broker_diag) |*d| d.deinit(session.arena.allocator());
-        // **`session.arena.allocator()`, and not `gpa`.**
+        // `session.arena.allocator()` and not `gpa`.
         // `chock_proto.state.SessionGrants.granted` is a
-        // `std.StringHashMapUnmanaged`: it carries no allocator of its own,
-        // and its `grow` (`lib/zig/std/hash_map.zig`) allocates the new
-        // backing array with whatever allocator the *current* call passes
-        // and frees the *old* array with that same value, whichever
-        // allocator actually built it. `foldSessionSince` above filled
-        // `session.grants` through `session`'s own arena, and that arena
-        // never changes for as long as `session` is kept, so this call has
-        // to use that same arena, or a later regrow frees arena memory
-        // through the wrong allocator.
-        //
-        // **This does not fail on the first grant, or the tenth.** A regrow
-        // only happens once the map's current capacity is exceeded, so a
-        // session with a handful of remembered grants never reaches it in a
-        // quick test. A long session that asks about many hosts would, and
-        // the failure then lands as an invalid free deep inside `grow`,
-        // nowhere near the mismatched allocator that caused it. `request`'s
-        // own storage writes are unaffected either way: `append` uses this
-        // allocator only for a scratch buffer it frees before it returns,
-        // and the backing store grows through the allocator the storage
-        // backend was opened with, never this one.
+        // `std.StringHashMapUnmanaged`, so its `grow` frees the old backing
+        // array with whatever allocator the current call passes.
+        // `foldSessionSince` filled `session.grants` through this arena, and
+        // a regrow past the map's first capacity would otherwise free arena
+        // memory through the wrong allocator.
         const outcome = broker.request(session.arena.allocator(), io, self.started.storage, locked, .{
             .action = ask.action,
             .summary = ask.summary,
@@ -6434,20 +3940,10 @@ const SessionArbiter = struct {
             .tool = ask.tool,
             .tool_call_id = ask.tool_call_id,
             .source = ask.source,
-            // The decision is the intersection over the whole chain, so a
-            // subagent holds no permission its parent lacks.
             .spawn_chain = self.started.spawn_chain,
             .self_policy = promised,
             .timeout_ms = approvers.timeoutMs(),
         }, &broker_diag) catch |err| {
-            // A cancelled wait, or a log that cannot be read. Neither is a
-            // decision, and the safe reading of "no decision" is that the act
-            // does not happen. The question stays open in the log, which is the
-            // state a crash at the same moment leaves.
-            //
-            // The broker used to print its own reason and hand this loop an
-            // error name, so a user saw a line from a library and then a
-            // second line from Chock that said less.
             if (broker_diag) |*fault| {
                 tty.print(
                     .warn,
@@ -6475,10 +3971,6 @@ const SessionArbiter = struct {
         return .{
             .permitted = outcome.permits(),
             .outcome = @tagName(outcome),
-            // **The one thing a reviewer's part of this says to the agent that
-            // asked.** `requesterText` takes an outcome and nothing else, and a
-            // comptime guard in that file keeps it that way, so a reviewer's
-            // own words go to the log and never back to the requester.
             .review_text = if (outcome.reviewOutcome()) |review|
                 chock_broker.review.requesterText(review)
             else
@@ -6487,109 +3979,27 @@ const SessionArbiter = struct {
     }
 };
 
-/// The network broker a tool call's own sandbox gets, and the session state
-/// that lets it answer a question its own table cannot decide alone.
-///
-/// **One of these for the whole session.** `chock_broker.network.Network`'s
-/// own doc comment says one belongs to one `Sandbox.spawn`, which is the MCP
-/// host's own shape: an MCP server is one long lived process. A tool call is
-/// different, and a dispatch runs to completion before the next one starts
-/// unless it asked to run in the background, and `chock_core.tools.runCommand`
-/// keeps a background call away from this seam entirely: see
-/// `chock_core.tools.Context.net`'s own doc comment. So renaming
-/// `network.tool` before handing the broker out, once per call, is safe, and
-/// it is what lets a `net.connect` question read the tool name every other
-/// action in this project already reads it by, rather than a fixed name this
-/// file would otherwise have to invent.
-///
-/// **`network.asker` starts null and is filled exactly once.** Nothing here
-/// can build a `chock_broker.Broker` before the session's own locked handle
-/// exists, and that handle belongs to `Loop.run`, not to this file: see
-/// `giveFn`, which `GiveLockedToAll` calls once from the seam
-/// `chock_core.Loop.GiveLocked` reaches, right after `Loop.run` takes the
-/// handle and before the first turn starts. Until then an `ask` decision
-/// refuses outright, which is the same direction
-/// `chock_core.arbiter.Asker.decide` takes for a handle that has not arrived.
-///
-/// **The grant memory is caught up before every call, and not kept from
-/// whatever `giveFn` last saw.** `chock_broker.Broker.request` is given
-/// `&session.grants`, a pointer into `self.session`, and every
-/// `approved_by_user_for_session` answer it writes updates that value in
-/// place: see `chock_proto.state.SessionGrants`. **This file used to fold
-/// `session` once, at the top of the run, and keep it live for every question
-/// after that, on the reasoning that nothing outside this broker's own asks
-/// ever writes a `net.connect` grant, so there was nothing a re-fold would
-/// see that this did not already hold.** That reasoning missed
-/// `policy.self`: a mid session `restrict_self` is exactly a fact this file's
-/// own stale copy could not see, and `SessionGrants.invalidate` only runs
-/// when the log carrying it is folded again. Measured on 2026-09-05: a
-/// session that granted a connection and then restricted itself read `true`
-/// out of the grant this file kept live, and `null`, correctly invalidated,
-/// out of a fresh fold of the same log. `brokerFn` now catches up before
-/// every call, through `refreshToolPromises`.
-///
-/// **`brokerFn` runs on every tool call, not on a smaller subset of them.**
-/// `lib/chock-core/tools.zig`'s own dispatch sets `config.net_broker =
-/// net.router(call.tool, call.call_id)` for every call `context.net` is set
-/// for, with no narrower condition, the same "every ordinary tool call" shape
-/// `SessionArbiter.decideFn` answers through `gateToolCall`. So a full replay
-/// from event 0 on every call here is exactly the same quadratic
-/// `SessionArbiter`'s own top comment measured, not a smaller instance of it.
-/// `refreshToolPromises` used to reset `session` and refold the whole log on
-/// every call, for the reason its own doc comment gives below. It now resumes
-/// from a kept offset instead, the same `foldSessionSince` shape `decideFn`
-/// uses, which sidesteps that reason rather than fighting it: see
-/// `refreshToolPromises`'s own doc comment. Measured against the identical
-/// scenario `SessionArbiter`'s own top comment used, chock-proto alone
-/// (`storage.JsonLines`, `ReleaseSafe`): 400 calls, each folding the whole log
-/// from event 0 and then appending one event, took 77.3 s against a log that
-/// started at 1200 events. The same 400 calls, resumed from a kept offset,
-/// took 0.83 s.
-///
-/// **`session` below is a `chock_proto.state.PolicyFold`, for the same
-/// reason `SessionArbiter.folded` is.** `refreshToolPromises` reads
-/// `self_policy` and `grants` and nothing else, so a kept `state.Session`
-/// would carry `context` for the run's whole life for no reader here. See
-/// `SessionArbiter`'s own top comment for the measurement, and
-/// `PolicyFold`'s own top comment for why the type carries no such field to
-/// grow.
+/// One of these for the whole session. A dispatch runs to completion before the
+/// next one starts unless it asked to run in the background, and a background
+/// call is kept away from this seam, so renaming `network.tool` once per call is
+/// safe. `network.asker` starts null and `giveFn` fills it exactly once, after
+/// `Loop.run` takes the handle; until then an `ask` decision refuses outright.
+/// The fold is caught up before every call and resumed from a kept offset,
+/// because a mid session `restrict_self` is invisible to a stale copy.
 const ToolNetwork = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     started: *Started,
-    /// The display, when bare `chock` brought one up. See `SessionArbiter.screen`
-    /// for why a person mid session can only be reached through this or a
-    /// terminal, never both.
     screen: ?*ui.Ui,
 
-    /// The channel every tool call's own sandbox is offered, renamed before
-    /// each call: see `brokerFn`.
     network: chock_broker.network.Network,
     transport: chock_broker.network.System = .{},
-    /// See `backgroundRouterFn`.
     background_nets: [chock_core.tasks.max_tasks]BackgroundNet = @splat(.{}),
     background_used: usize = 0,
-    /// The sending end of `chock_core.tools.Context.approval_wait_ns`. Reset
-    /// to zero before every call this seam builds a broker for, and bumped by
-    /// `chock_broker.network.Network.askPermits` while a person is asked
-    /// about a connection that call opened.
     approval_wait_ns: std.atomic.Value(u64) = .init(0),
 
-    /// **`chock_proto.state.PolicyFold`, and not `chock_proto.state.Session`.**
-    /// Kept for the life of the run and caught up before every call, the same
-    /// as `SessionArbiter.folded`, and for the same reason it is a
-    /// `PolicyFold`: `refreshToolPromises` reads `self_policy` and `grants`
-    /// and nothing else, so this holds nothing else either. See
-    /// `PolicyFold`'s own top comment.
     session: chock_proto.state.PolicyFold,
-    /// The byte offset `session` has been read up to, so the next call to
-    /// `refreshToolPromises` knows where to resume. 0 means "from the start
-    /// of the log", the same as `storage.replay`'s own `offset` reads it: see
-    /// `foldSessionSince` and `SessionArbiter.folded_at`, which this mirrors.
     folded_at: u64 = 0,
-    /// Who this session shows a question to, and who is attached to its
-    /// approval socket. Built once, alongside `broker`, because both need the
-    /// locked handle `giveFn` is given.
     approvers: Approvers = undefined,
     broker: chock_broker.Broker = undefined,
 
@@ -6602,38 +4012,24 @@ const ToolNetwork = struct {
         .background_router = backgroundRouterFn,
     };
 
-    /// One network per background call, because that call reads it on a
-    /// thread of its own long after this returns, and `self.network` is
-    /// rewritten by the next foreground call. Bounded by the number of
-    /// background tasks a session may start at all, so this allocates
-    /// nothing and can run out only when tasks have.
+    /// One network per background call, because that call reads it on a thread of
+    /// its own long after this returns and `self.network` is rewritten by the
+    /// next foreground call.
     const BackgroundNet = struct {
         network: chock_broker.network.Network = undefined,
-        /// The call id, copied. The caller's own string belongs to a dispatch
-        /// that has returned by the time the task runs.
         id: [64]u8 = undefined,
         id_len: usize = 0,
     };
 
-    /// See `chock_core.tools.NetSeam.VTable.background_router`.
-    ///
-    /// **Null when this project's policy says a background call gets no
-    /// network**, and null again when a session has already started as many
-    /// tasks as it may. The caller then builds the `.none` sandbox a
-    /// background call always used to get.
-    ///
-    /// **`asker` is left null on purpose, and that is the whole safety
-    /// argument.** A `Network` with no asker answers `allow` from the table
-    /// and refuses everything else outright: see `answerWith`. So a
-    /// background call reaches exactly what the policy permits and never
-    /// reaches for the session loop's locked handle, which is what kept
-    /// background calls off the network in the first place.
+    /// `asker` is left null on purpose. A `Network` with no asker answers `allow`
+    /// from the table and refuses everything else outright, so a background call
+    /// reaches what the policy permits and never reaches for the session loop's
+    /// locked handle.
     fn backgroundRouterFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?sandbox.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         if (!self.started.policy.wantsBackgroundRouter()) return null;
         if (self.background_used == self.background_nets.len) return null;
 
-        // Caught up before the copy, for the reason `routerFn` gives.
         self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
 
         const slot = &self.background_nets[self.background_used];
@@ -6646,7 +4042,6 @@ const ToolNetwork = struct {
         slot.network.asker = null;
         slot.network.tool = tool;
         slot.network.tool_call_id = slot.id[0..slot.id_len];
-        // Its own counts, not a copy of the foreground call's.
         slot.network.granted = 0;
         slot.network.refused = 0;
         slot.network.diagnostic = null;
@@ -6656,27 +4051,12 @@ const ToolNetwork = struct {
     fn routerFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) sandbox.NetRouter {
         const self: *ToolNetwork = @ptrCast(@alignCast(ptr));
         self.network.tool = tool;
-        // **The real id, and not the empty one this used to send.** A
-        // `net.connect` question this call asks now names the call it came
-        // from: see `chock_broker.network.Network.tool_call_id`'s own doc
-        // comment for what an empty one used to cost the red team oracle.
         self.network.tool_call_id = call_id;
-        // **Every call, not only one that asks.** A call with nothing to ask
-        // about must not read as one that waited for a person, because the
-        // counter it would read is whatever the call before it left behind:
-        // see `chock_core.tools.Context.approval_wait_ns`'s own doc comment.
         self.approval_wait_ns.store(0, .monotonic);
-        // **Caught up before every call.** See this struct's own top comment
-        // on why a fold kept from `giveFn` alone misses a mid session
-        // `restrict_self`.
         self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
         return self.network.netRouter();
     }
 
-    /// Take the session's own locked handle and build everything that needed
-    /// it. **Called by `GiveLockedToAll`, which is what
-    /// `chock_core.Loop.GiveLocked` reaches**: three parties need this one
-    /// handle and the seam carries one, so the fan out is there and not here.
     fn giveFn(self: *ToolNetwork, locked: *chock_core.arbiter.Locked) void {
         self.network.self_policy = refreshToolPromises(self.gpa, self.io, self.started.storage, &self.session, &self.folded_at);
         self.approvers.init(self.gpa, self.io, self.started, locked, self.screen);
@@ -6684,17 +4064,10 @@ const ToolNetwork = struct {
             .policy = self.started.policy,
             .waiter = self.approvers.waiter(),
             .redaction = self.started.redact_values,
-            // **The live bug this line used to be.** `self.session.grants` is
-            // filled through `self.session.arena`, by `PolicyFold.apply`
-            // inside `refreshToolPromises` above. `chock_broker.network.zig`
-            // then calls `asker.broker.request` with `Network.gpa`, a plain
-            // allocator, never the arena, so a `grants_allocator` left unset
-            // here used to let a `grow` past the map's first capacity free
-            // arena memory through that plain `gpa` instead: an invalid free
-            // and a leak, silent until a session made enough distinct
-            // `approved_by_user_for_session` grants to force a regrow. See
-            // `chock_broker.Broker.Grants`'s own doc comment for why the two
-            // are now one field, so this cannot be set without the other.
+            // `self.session.grants` is filled through `self.session.arena`, and
+            // `chock_broker.network.zig` calls `asker.broker.request` with a
+            // plain allocator, so a `grants_allocator` left unset here lets a
+            // `grow` free arena memory through that plain allocator.
             .grants = .{ .memory = &self.session.grants, .allocator = self.session.arena.allocator() },
         };
         self.network.asker = .{
@@ -6705,28 +4078,6 @@ const ToolNetwork = struct {
         };
     }
 
-    /// **A granted connection used to leave nothing behind but a terminal
-    /// line.** `network.granted` and `network.refused` were read by nobody
-    /// but a person watching the terminal at the moment the session ended, so
-    /// a tool call's own egress said nothing at all to the log:
-    /// `SECURITY.md` and `docs/threat-model.md` both call the log the
-    /// evidence, and a terminal line is not the log. `McpState.deinit` prints
-    /// "refused N of M" for the same reason, one server at a time, and it has
-    /// the same gap. `logSummary` below is what closes it.
-    ///
-    /// **A session end summary, and not one event per connection.** A
-    /// `net.connect` question a person answers already writes an
-    /// `approval.request` and an `approval.response`. This file's own
-    /// `Network.answer` decides `allow` and `deny` itself and never calls the
-    /// broker for either, exactly so that the common case keeps costing
-    /// nothing: see `lib/chock-broker/network.zig`'s own top comment on the
-    /// volume that would create. Measured on 2026-09-06, over the real
-    /// storage backend: 200 `approval.request` and `approval.response` pairs
-    /// cost 170047 bytes, against 228 bytes for the one `network.summary`
-    /// event this struct now writes, whatever the connection count. A
-    /// summary event costs the same whether the session opened one
-    /// connection or a thousand, so it is written once here rather than
-    /// logged per connection.
     fn deinit(self: *ToolNetwork) void {
         if (self.network.refused != 0) {
             tty.print(
@@ -6747,10 +4098,6 @@ const ToolNetwork = struct {
         self.session.deinit();
     }
 
-    /// Write `networkSummaryEvent`'s own event to the log, when there is one
-    /// to write. Formats the diagnostic here, where the type it belongs to is
-    /// in scope, and hands the rest to `logNetworkSummary`, which is a free
-    /// function so a test can call it without building a whole `ToolNetwork`.
     fn logSummary(self: *ToolNetwork) void {
         var diag_text: ?[]u8 = null;
         defer if (diag_text) |t| self.gpa.free(t);
@@ -6768,37 +4115,15 @@ const ToolNetwork = struct {
     }
 };
 
-/// Hands the session's own locked handle to every party that asks a question
-/// from inside a turn.
-///
-/// **`chock_core.Loop.Deps.give_locked` is one seam and three parties need
-/// what it carries.** A tool call's own network broker asks about a host, an
-/// MCP session asks about a tool a server supplies, and a plugin session asks
-/// about a tool a module supplies. All three run inside the turn that
-/// `Loop.run` holds the log's exclusive lock for, so all three need the very
-/// handle it holds, and none of them may open the log a second time.
-///
-/// **The same pointer to all of them, once.** See
-/// `chock_core.Loop.GiveLocked`'s own top comment: `run` holds this handle at
-/// the same address from the moment it hands it over until the session ends,
-/// so there is nothing here to refresh and nothing to unlock.
-///
-/// **A session whose asker is null runs no third party tool at all.** That is
-/// deliberate: `chock_core.mcp.Session.asker` answers `not_asked` for a
-/// session that was never wired, so a wiring this file forgot is a loud
-/// failure and never a silent grant.
+/// Hands the session's own locked handle to every party that asks a question from
+/// inside a turn. All of them run inside the turn `Loop.run` holds the log's
+/// exclusive lock for, so none may open the log a second time. A session whose
+/// asker is null runs no third party tool at all.
 const GiveLockedToAll = struct {
     network: *ToolNetwork,
     mcp: *chock_core.mcp.Session,
     plugins: *chock_core.plugin.Session,
-    /// The git shim's own runner. **Fourth party to the same handle**, since
-    /// 2026-09-15: a git subcommand the shim classifies is decided one call at
-    /// a time, mid turn, through the same arbiter. See `GitToolRunner`.
     git: *GitToolRunner,
-    /// The Nix build runner. **Fifth party**: a build's closure says which
-    /// hosts it would fetch from only after the attribute is evaluated, which
-    /// happens inside the tool call, so the question is asked mid turn too.
-    /// See `NixFetchGate`.
     nix: *NixBuildToolRunner,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
@@ -6814,14 +4139,6 @@ const GiveLockedToAll = struct {
     }
 };
 
-/// Hand the handle to the four askers that are not the network broker.
-///
-/// **A free function, so a test can drive the fan out without a `ToolNetwork`,
-/// which needs a whole started session behind it.** All four have to be
-/// reached from the one seam: one that keeps a null handle asks nobody and
-/// refuses everything it gates, so a half wired fan out is a supplier of tools
-/// that quietly stops working, a git shim that refuses `git add`, and a build
-/// that refuses every attribute whose closure fetches.
 fn giveLockedToAskers(
     mcp_session: *chock_core.mcp.Session,
     plugin_session: *chock_core.plugin.Session,
@@ -6835,13 +4152,6 @@ fn giveLockedToAskers(
     nix_runner.giveLocked(locked);
 }
 
-/// Write one `network.summary` event, when there is one to write. Best
-/// effort: `Loop.run` has already released the storage lock by the time
-/// `ToolNetwork.deinit` runs, see `chock_core.Loop.run`'s own top of function
-/// `defer`, so this takes it again for one append. A session whose log
-/// cannot be reached one more time at the very end still exits. It says so
-/// on the terminal instead, the same way every other best-effort append in
-/// this file does.
 fn logNetworkSummary(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6875,25 +4185,11 @@ fn logNetworkSummary(
     };
 }
 
-/// Write this session's `sandbox.supervisor` events, one for each layer the
-/// supervisor puts on itself.
-///
-/// **Always, and not only when something degraded.** A reader that finds no
-/// event cannot tell a session where every supervisor confined itself from a
-/// session written by a build that did not know the fact, and an audit that
-/// cannot tell those apart is not an audit. See
-/// `chock_proto.event.SandboxSupervisor`.
-///
-/// **One event per layer, and the fail mode table says which layers there
-/// are.** `SandboxSupervisor.layer` was given a field of its own for exactly
-/// this, so a second layer is a second event and never a second kind. Walking
-/// `sandbox.Sandbox.failModeFor` rather than a list here is what keeps the log
-/// and the driver naming the same three layers.
-///
-/// Best effort, for the reason `logNetworkSummary` gives: `Loop.run` has
-/// already given the storage lock back by the time this runs, so this takes it
-/// again for one append, and a session whose log cannot be reached one more
-/// time still exits. It says so on the terminal instead.
+/// Always, and not only when something degraded. A reader that finds no event
+/// cannot tell a session where every supervisor confined itself from a session
+/// written by a build that did not know the fact. Walking
+/// `sandbox.Sandbox.failModeFor` keeps the log and the driver naming the same
+/// three layers.
 fn logSupervisorAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6917,7 +4213,6 @@ fn logSupervisorAudit(
     }
 }
 
-/// The one message a failed `logSupervisorAudit` writes.
 fn reportSupervisorRecord(err: anyerror) void {
     tty.print(
         .warn,
@@ -6927,8 +4222,6 @@ fn reportSupervisorRecord(err: anyerror) void {
     );
 }
 
-/// The `sandbox.supervisor` event `logSupervisorAudit` writes. **Pure**, so
-/// its shape can be checked without touching storage: see the tests below.
 fn supervisorEvent(
     layer: sandbox.Sandbox.LayerName,
     fail_mode: sandbox.Sandbox.FailMode,
@@ -6938,34 +4231,15 @@ fn supervisorEvent(
         .sandbox_supervisor = .{
             .process = sandbox.Sandbox.SupervisorAudit.process_name,
             .layer = layer.wireName(),
-            // **Written out and never left for a reader to infer.** The
-            // supervisor is the one process in this design that runs on
-            // without a layer, and a row that did not say so reads exactly
-            // like a row about the sandboxed program, where the same numbers
-            // would mean the call never ran.
             .fail_mode = @tagName(fail_mode),
             .confined = counts.confined,
             .unconfined = counts.unconfined,
             .unreported = counts.unreported,
-            // Empty when nothing went unconfined, and empty as well for a fault
-            // code this build has no name for. `unconfined` above is the field
-            // that carries the fact either way, so a missing name never hides it.
             .reason = if (counts.first_fault) |fault| @tagName(fault) else "",
         },
     };
 }
 
-/// Write this session's one `sandbox.syscalls` event.
-///
-/// **Always, and not only when something was watched.** A reader that finds no
-/// event cannot tell a session that watched nothing from a session written by
-/// a build that could not watch at all, the same argument
-/// `logSupervisorAudit` above makes. See
-/// `chock_proto.event.SandboxSyscalls`.
-///
-/// Best effort, and for the reason that function gives: the storage lock is
-/// already back, so this takes it again for one append, and a session whose
-/// log cannot be reached one more time still exits.
 fn logSyscallAudit(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -6975,9 +4249,6 @@ fn logSyscallAudit(
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
     var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
     var names: [syscall_name_cap][]const u8 = undefined;
-    // **Called with the tool calls already stopped.** The names it gives back
-    // point into the audit's own storage, and a call still in flight could
-    // add one. See `SyscallAudit.pathCounts`.
     const ev = syscallEvent(
         audit.counts(),
         audit.pathCounts(),
@@ -6999,7 +4270,6 @@ fn logSyscallAudit(
     ) catch |err| reportSyscallRecord(err);
 }
 
-/// The one message a failed `logSyscallAudit` writes.
 fn reportSyscallRecord(err: anyerror) void {
     tty.print(
         .warn,
@@ -7009,19 +4279,10 @@ fn reportSyscallRecord(err: anyerror) void {
     );
 }
 
-/// How many rows a `sandbox.syscalls` event carries. One for each call the
-/// sandbox can watch, read from the sandbox itself so the two cannot drift.
 const syscall_row_count = @typeInfo(sandbox.seccomp.TrapCall).@"enum".fields.len;
 
-/// How many paths one `sandbox.syscalls` event can name, read from the sandbox
-/// for the reason the row count above is.
 const syscall_name_cap = sandbox.Sandbox.SyscallAudit.name_cap;
 
-/// The `sandbox.syscalls` event `logSyscallAudit` writes. **Pure**, so its
-/// shape can be checked without touching storage: see the tests below.
-///
-/// `rows` is the caller's own storage for the row list, because the event
-/// borrows it rather than owning it.
 fn syscallEvent(
     counts: sandbox.Sandbox.SyscallAudit.Counts,
     paths: sandbox.Sandbox.SyscallAudit.PathCounts,
@@ -7029,9 +4290,6 @@ fn syscallEvent(
     path_rows: *[syscall_row_count]chock_proto.event.UnverifiedPaths,
     names: *[syscall_name_cap][]const u8,
 ) chock_proto.event.Event {
-    // The names come back from the audit in the order the reader kept them,
-    // which mixes the calls together. The event gives each call its own list,
-    // so they are grouped here, one call at a time, into the caller's storage.
     var filled: usize = 0;
     inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
         const first = filled;
@@ -7052,11 +4310,6 @@ fn syscallEvent(
             .truncated = paths.truncated[field.value],
             .ungranted_names = names[first..filled],
         };
-        // **Left out for a call that recorded nothing**, rather than written
-        // as a row of zeros. A path audit is off by default, most calls name
-        // no path at all, and a row of zeros for each of them would be most
-        // of the line. `paths_verified` below is always there, so a reader
-        // still learns the mechanism exists and what its output is worth.
         const row = path_rows[field.value];
         const said_something = row.granted != 0 or row.ungranted != 0 or
             row.ungranted_unnamed != 0 or row.relative != 0 or row.unread != 0 or
@@ -7069,10 +4322,8 @@ fn syscallEvent(
             .observed = counts.observed,
             .unobserved = counts.unobserved,
             .calls = rows,
-            // **False, and a field rather than a word in a comment.** The
-            // supervisor lets the held call run, so the program can change the
-            // argument after the reader read it. See
-            // `chock_proto.event.UnverifiedPaths`.
+            // False: the supervisor lets the held call run, so the program can change
+            // the argument after the reader read it.
             .paths_verified = false,
             .path_readers_unreported = paths.readers_unreported,
             .path_readers_absent = paths.readers_absent,
@@ -7080,9 +4331,6 @@ fn syscallEvent(
     };
 }
 
-/// The `network.summary` event `ToolNetwork.logSummary` writes, or null when
-/// the session opened no connection and had none refused. **Pure**, so its
-/// shape can be checked without touching storage: see the test below.
 fn networkSummaryEvent(
     granted: usize,
     refused: usize,
@@ -7097,15 +4345,6 @@ fn networkSummaryEvent(
 }
 
 test "the supervisor event names the fault, and the audit question is one field" {
-    // **The requirement.** A machine reading the log answers "did the process
-    // that holds the credential run unfiltered in this session" from
-    // `unconfined` alone, and a person reading it learns the repair from
-    // `reason`. Before this, both facts reached standard error and died with
-    // the terminal.
-    //
-    // Mutation check: write a bare "failed" for `reason` in `supervisorEvent`
-    // and the `no_new_privs_refused` expectation fails, which is the whole
-    // value of the split `seccomp.InstallError` carries.
     const ev = supervisorEvent(.seccomp, .open, .{
         .confined = 11,
         .unconfined = 2,
@@ -7122,18 +4361,6 @@ test "the supervisor event names the fault, and the audit question is one field"
 }
 
 test "the event says which way the layer fails, and the answer comes from the sandbox table" {
-    // **The fail mode is a value in the row and not a thing a reader works
-    // out.** Two rows can carry the same three counts and mean opposite
-    // things: a supervisor with `unconfined` above zero ran on without the
-    // layer, and the sandboxed program never could. Nothing in the row said
-    // which until this field.
-    //
-    // **Read from `failModeFor` and not spelled here**, so this test fails if
-    // the table and the log ever disagree rather than passing against a copy
-    // of the answer.
-    //
-    // Mutation check: write a constant `"open"` in `supervisorEvent` instead
-    // of the argument and the `closed` expectation below fails.
     const table = sandbox.Sandbox.failModeFor(.supervisor, .seccomp).?;
     try std.testing.expectEqual(sandbox.Sandbox.FailMode.open, table);
     const open = supervisorEvent(.seccomp, table, .{
@@ -7152,9 +4379,6 @@ test "the event says which way the layer fails, and the answer comes from the sa
     });
     try std.testing.expectEqualStrings("closed", closed.sandbox_supervisor.fail_mode);
 
-    // Every layer the sandboxed program wears fails closed, and the table is
-    // what says so. A build that changed one of them to `open` would be a
-    // build where a tool call can run with a layer missing.
     for (comptime std.enums.values(sandbox.Sandbox.LayerName)) |layer| {
         try std.testing.expectEqual(
             @as(?sandbox.Sandbox.FailMode, .closed),
@@ -7164,14 +4388,6 @@ test "the event says which way the layer fails, and the answer comes from the sa
 }
 
 test "every layer the supervisor puts on itself gets a row of its own" {
-    // **The capability drop and the Landlock ruleset used to reach a terminal
-    // and nothing else.** Only the filter had a record, so a session log could
-    // not answer whether the process holding the credential kept its
-    // capabilities. `SandboxSupervisor.layer` exists so that a second layer is
-    // a second row of the same kind.
-    //
-    // Mutation check: write only the seccomp row in `logSupervisorAudit` and
-    // the count below is 1 instead of 3.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7195,29 +4411,16 @@ test "every layer the supervisor puts on itself gets a row of its own" {
         if (parsed.value.event != .sandbox_supervisor) continue;
         rows += 1;
         const said = parsed.value.event.sandbox_supervisor;
-        // Every row says how this process fails, whichever layer it names.
         try std.testing.expectEqualStrings("open", said.fail_mode);
         if (std.mem.eql(u8, said.layer, "landlock")) landlock_unconfined = said.unconfined;
         if (std.mem.eql(u8, said.layer, "seccomp")) seccomp_unconfined = said.unconfined;
     }
     try std.testing.expectEqual(@as(usize, 3), rows);
-    // **One layer's refusal is not another's.** A reader must be able to say
-    // which layer the credential holding process went without.
     try std.testing.expectEqual(@as(u64, 1), landlock_unconfined);
     try std.testing.expectEqual(@as(u64, 0), seccomp_unconfined);
 }
 
 test "a session where every supervisor confined itself still writes the event" {
-    // **An absent event is not an answer.** A reader that found nothing could
-    // not tell a clean session from one written by a build that never knew the
-    // fact, so the event goes in whichever way it went. `SandboxOpen` is
-    // written on every attempt for the same reason, and `NetworkSummary` is
-    // the one event that is deliberately not: nobody audits an absence of
-    // connections.
-    //
-    // Mutation check: make `logSupervisorAudit` return before the append when
-    // `unconfined` is zero, the shape `logNetworkSummary` has, and `found`
-    // stays false here while every other test in this file stays green.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7241,19 +4444,12 @@ test "a session where every supervisor confined itself still writes the event" {
         const said = parsed.value.event.sandbox_supervisor;
         try std.testing.expectEqual(@as(u64, 2), said.confined);
         try std.testing.expectEqual(@as(u64, 0), said.unconfined);
-        // No fault, so no name. An invented one would read as a degradation
-        // that never happened.
         try std.testing.expectEqualStrings("", said.reason);
     }
     try std.testing.expect(found);
 }
 
 test "the supervisor's own degradation reaches the log, not only the terminal" {
-    // The whole chain above storage: the audit a driver filled, the event, and
-    // the line in the log a replay reads back.
-    //
-    // Mutation check: make `logSupervisorAudit` append nothing and `found`
-    // stays false.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7284,15 +4480,6 @@ test "the supervisor's own degradation reaches the log, not only the terminal" {
 }
 
 test "the syscall event names one row for each call the sandbox can watch, and says nothing was watched" {
-    // **The requirement.** A machine reading the log answers "what did this
-    // session's programs open" from the rows, and answers "is this record
-    // complete" from `observed` and `unobserved`. A row of zeros with no
-    // `observed` count would read as a session whose programs opened nothing,
-    // which is a claim and not a fact.
-    //
-    // Mutation check: drop `observed` from `syscallEvent` and the first
-    // expectation fails. Fill `rows` from a fixed list instead of from
-    // `TrapCall` and the row count stops moving with the sandbox.
     var rows: [syscall_row_count]chock_proto.event.SyscallCount = undefined;
     var path_rows: [syscall_row_count]chock_proto.event.UnverifiedPaths = undefined;
     var names: [syscall_name_cap][]const u8 = undefined;
@@ -7309,8 +4496,6 @@ test "the syscall event names one row for each call the sandbox can watch, and s
     try std.testing.expectEqual(@as(u64, 1), said.unobserved);
     try std.testing.expectEqual(syscall_row_count, said.calls.len);
 
-    // Each row carries the name the sandbox gives the call, so a reader never
-    // has to know the syscall numbers of the machine that wrote the log.
     inline for (@typeInfo(sandbox.seccomp.TrapCall).@"enum".fields) |field| {
         try std.testing.expectEqualStrings(field.name, said.calls[field.value].name);
     }
@@ -7318,20 +4503,10 @@ test "the syscall event names one row for each call the sandbox can watch, and s
         @as(u64, 900),
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].count,
     );
-    // A call nobody made still gets a row. Without it a reader cannot tell a
-    // call that was watched and never made from a call this build cannot
-    // watch.
     try std.testing.expectEqual(
         @as(u64, 0),
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].count,
     );
-    // A session that asked for no path audit leaves the path field out
-    // altogether rather than writing a row of zeros for every call. The
-    // machine readable flag is still there, so a reader learns the mechanism
-    // exists and that nothing it could produce would be verified.
-    //
-    // Mutation check: write `unverified_paths` whether or not anything was
-    // recorded and the first expectation below fails.
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.openat)].unverified_paths,
@@ -7341,17 +4516,6 @@ test "the syscall event names one row for each call the sandbox can watch, and s
 }
 
 test "a full path record is still one short line of the session log" {
-    // **The requirement, and it is a number.** A session that names a path for
-    // every call would grow the log without bound, which is a cost this
-    // project has already paid once: 200 network connections cost 159 KB
-    // before that record was made a summary. The cap in
-    // `sandbox.notify.kept_path_cap` is what bounds it, and this is what
-    // checks the cap was chosen well rather than only written down.
-    //
-    // This builds the worst case the reader can produce: every slot full, and
-    // every name as long as a slot holds.
-    //
-    // Mutation check: raise `notify.kept_path_bytes` to 512 and this fails.
     const gpa = std.testing.allocator;
     var longest: [sandbox.notify.kept_path_bytes]u8 = @splat('n');
     longest[0] = '/';
@@ -7362,8 +4526,6 @@ test "a full path record is still one short line of the session log" {
         counted.name_call[slot] = @intFromEnum(sandbox.seccomp.TrapCall.openat);
         counted.names[slot] = &longest;
     }
-    // Every counter of every row saturated, so a row is never left out for
-    // saying nothing and no field is missing from the measurement.
     for (0..sandbox.notify.call_count) |slot| {
         counted.granted[slot] = std.math.maxInt(u32);
         counted.ungranted[slot] = std.math.maxInt(u32);
@@ -7390,15 +4552,9 @@ test "a full path record is still one short line of the session log" {
     });
     defer gpa.free(line);
 
-    // **Under two kilobytes for the worst case, and written once for a whole
-    // session.** Measured on 2026-09-11: this line is 1,503 bytes with every
-    // slot full and every counter saturated, and a real record that named
-    // three paths is 743 bytes. The fault this cap exists to stop is a record
-    // that grows with the number of opens, and this one does not grow at all.
     try std.testing.expect(line.len < 2048);
 }
 
-/// A path record with nothing in it, for the tests that are about the counts.
 fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
     return .{
         .readers_unreported = 0,
@@ -7416,20 +4572,6 @@ fn emptyPathCounts() sandbox.Sandbox.SyscallAudit.PathCounts {
 }
 
 test "the syscall event names each call's own paths, and says they are not verified" {
-    // **The requirement, and the caveat that must survive a refactor.** A
-    // machine reading the log answers "what did this session's programs open
-    // that nothing in its own sandbox configuration granted" from
-    // `ungranted_names`, "how much is missing" from `ungranted_unnamed`, and
-    // "is any of this proof" from `paths_verified`.
-    //
-    // The names come back from the sandbox mixed together, one list for every
-    // call, so the grouping here is what gives each call its own. A row that
-    // took the whole list would report the program's `execve` target as a file
-    // it opened.
-    //
-    // Mutation check: drop the `name_call` comparison in `syscallEvent` and
-    // the `openat` row picks up the `execve` name, so the count of two below
-    // becomes three.
     const openat = @intFromEnum(sandbox.seccomp.TrapCall.openat);
     const execve = @intFromEnum(sandbox.seccomp.TrapCall.execve);
 
@@ -7460,7 +4602,6 @@ test "the syscall event names each call's own paths, and says they are not verif
     }, counted, &rows, &path_rows, &names);
 
     const said = ev.sandbox_syscalls;
-    // **The word an auditor has to type.** See `chock_proto.event.UnverifiedPaths`.
     try std.testing.expectEqual(false, said.paths_verified);
     try std.testing.expectEqual(@as(u64, 2), said.path_readers_unreported);
     try std.testing.expectEqual(@as(u64, 1), said.path_readers_absent);
@@ -7468,8 +4609,6 @@ test "the syscall event names each call's own paths, and says they are not verif
     const opens = said.calls[openat].unverified_paths.?;
     try std.testing.expectEqual(@as(u64, 812), opens.granted);
     try std.testing.expectEqual(@as(u64, 9), opens.ungranted);
-    // **The explicit overflow count.** Without it a full set reads as the
-    // whole truth.
     try std.testing.expectEqual(@as(u64, 6), opens.ungranted_unnamed);
     try std.testing.expectEqual(@as(u64, 71), opens.relative);
     try std.testing.expectEqual(@as(u64, 1), opens.truncated);
@@ -7481,13 +4620,6 @@ test "the syscall event names each call's own paths, and says they are not verif
     try std.testing.expectEqual(@as(usize, 1), execs.ungranted_names.len);
     try std.testing.expectEqualStrings("/bin/sh", execs.ungranted_names[0]);
 
-    // **A call that recorded nothing gets no row at all.** `connect` names a
-    // socket address and never a path, so a row of zeros for it would be a
-    // quarter of this line saying nothing. The `count` field beside it still
-    // says how many times the call was made.
-    //
-    // Mutation check: write the row whether or not it said anything and this
-    // expectation fails.
     try std.testing.expectEqual(
         @as(?chock_proto.event.UnverifiedPaths, null),
         said.calls[@intFromEnum(sandbox.seccomp.TrapCall.connect)].unverified_paths,
@@ -7495,11 +4627,6 @@ test "the syscall event names each call's own paths, and says they are not verif
 }
 
 test "what the sandboxed programs asked the kernel for reaches the log, not only the counter" {
-    // The whole chain above storage: the audit a driver filled, the event, and
-    // the line in the log a replay reads back.
-    //
-    // Mutation check: make `logSyscallAudit` append nothing and `found` stays
-    // false.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7524,8 +4651,6 @@ test "what the sandboxed programs asked the kernel for reaches the log, not only
         found = true;
         const said = parsed.value.event.sandbox_syscalls;
         try std.testing.expectEqual(@as(u64, 1), said.observed);
-        // **The field an audit reads.** One tool call ran with nothing
-        // watching it, so the rows are short by a whole call.
         try std.testing.expectEqual(@as(u64, 1), said.unobserved);
         try std.testing.expectEqualStrings("seccomp_user_notif", said.mechanism);
         for (said.calls) |row| {
@@ -7538,14 +4663,6 @@ test "what the sandboxed programs asked the kernel for reaches the log, not only
 }
 
 test "a session that watched nothing still writes the event, so an absence is never an answer" {
-    // **An absent event is not an answer.** A reader that found nothing could
-    // not tell a session that watched nothing from a session written by a
-    // build that could not watch at all. `SandboxSupervisor` is written on
-    // every session for the same reason.
-    //
-    // Mutation check: make `logSyscallAudit` return before the append when
-    // `observed` is zero and `found` stays false here, while every other test
-    // in this file stays green.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7585,10 +4702,6 @@ test "a session's own network summary carries what the terminal line said, for t
 }
 
 test "a tool call's own network reaches the log, not only the terminal" {
-    // The requirement itself. Before this, `ToolNetwork.deinit` printed and
-    // wrote nothing, so `SECURITY.md`'s claim that the log is the evidence
-    // was false for a tool call's own network: see `logNetworkSummary`'s own
-    // top comment.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7633,31 +4746,6 @@ test "a session with nothing granted and nothing refused writes no summary to th
     }
 }
 
-/// Catch `session` up with what `storage` holds and hand back this session's
-/// own promises, in the form the ratchet reads.
-///
-/// **Called before every tool call, not once at session start.** See
-/// `ToolNetwork`'s own top comment: a `policy.self` event written mid session
-/// narrows `session.grants` only when `Session.apply` sees it, which means
-/// reading the log again.
-///
-/// **Resumed through `at`, not reset and refolded from event 0.** This used
-/// to `session.deinit()` and rebuild `session` from nothing on every call,
-/// because `Session.apply` only ever grows its lists, so folding the whole
-/// log a second time onto a `session` that already held the first fold would
-/// have duplicated every context entry and every promise. Resetting paid for
-/// that safety with the same quadratic cost `SessionArbiter.decideFn` was
-/// measured at and fixed for: `ToolNetwork`'s own top comment has the number.
-/// `foldSessionSince` sidesteps the duplication instead of paying for it: it
-/// is never asked to re-read an event this `session` already applied, only
-/// to read what `storage` holds past `at.*`, so there is nothing left for a
-/// second fold to duplicate. See `foldSessionSince`'s own doc comment for why
-/// a fold resumed that way reaches the same state a fold from event 0 would,
-/// including a `restrict_self` that landed since the last question.
-///
-/// The returned slice is owned by `session.arena`, the same allocator
-/// `chock_core.self_policy.restrictionsFrom` is given, so it lives exactly as
-/// long as `session` does and needs no release of its own.
 fn refreshToolPromises(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -7673,14 +4761,6 @@ fn refreshToolPromises(
 }
 
 test "a mid session restrict_self reaches refreshToolPromises on the very next call, and a fold-once cache does not see it" {
-    // **The same ratchet load bearing test `foldSessionSince` itself has, one
-    // level up.** `refreshToolPromises` is `ToolNetwork.brokerFn`'s own read
-    // of a session's promises, and a promise the agent made mid session has
-    // to bind the tool call right after it, not the one after that. This
-    // proves the resumed shape catches it, and shows what a cache that folded
-    // once and never again would have missed: exactly the bug `ToolNetwork`
-    // had before it started refolding before every call, see this file's own
-    // `ToolNetwork` top comment.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -7690,9 +4770,6 @@ test "a mid session restrict_self reaches refreshToolPromises on the very next c
 
     const action = "net.connect";
 
-    // `stale` folds once, the way `ToolNetwork` used to keep `session` live
-    // with no second fold at all, and never calls `refreshToolPromises`
-    // again.
     var stale = chock_proto.state.Session.init(gpa);
     defer stale.deinit();
     foldSession(gpa, io, storage, &stale);
@@ -7702,16 +4779,12 @@ test "a mid session restrict_self reaches refreshToolPromises on the very next c
     ) catch &.{};
     try std.testing.expectEqual(@as(usize, 0), stale_promised.len);
 
-    // `live` is `ToolNetwork`'s own shape: one `session` and one `at`, kept
-    // across calls and caught up by `refreshToolPromises` on each one.
     var live = chock_proto.state.PolicyFold.init(gpa);
     defer live.deinit();
     var live_at: u64 = 0;
     const first = refreshToolPromises(gpa, io, storage, &live, &live_at);
     try std.testing.expectEqual(@as(usize, 0), first.len);
 
-    // Mid session, the agent narrows itself: the same `policy.self` event
-    // `Loop.runRestrictSelf` writes.
     var locked = try storage.lock(io);
     _ = try locked.append(gpa, io, .{ .policy_self = .{
         .restrictions = &.{.{ .action = action, .ceiling = .deny, .reason = "narrowed mid session" }},
@@ -7719,68 +4792,19 @@ test "a mid session restrict_self reaches refreshToolPromises on the very next c
     } }, 0);
     try locked.unlock(io);
 
-    // **The naive cache never asks the log again**, so `stale`'s own copy of
-    // the promises is still the empty one it read before the narrowing:
-    // exactly the stale read the fold-once bug produced.
     try std.testing.expectEqual(@as(usize, 0), stale.self_policy.restrictions.items.len);
 
-    // **The fix**: the very next call resumes from where the last one
-    // stopped, reads the `policy.self` event that landed since, and the
-    // promise is in the very next answer `refreshToolPromises` gives, before
-    // the broker is ever asked to honour it.
     const second = refreshToolPromises(gpa, io, storage, &live, &live_at);
     try std.testing.expectEqual(@as(usize, 1), second.len);
     try std.testing.expectEqualStrings(action, second[0].action);
     try std.testing.expectEqual(chock_policy.table.Decision.deny, second[0].ceiling);
 }
 
-/// The broker, as `chock_core.Loop` carries an agent's work back mid session.
-///
-/// **This is the first act an agent may ask for by name**, and it is
-/// deliberately the narrowest one there is: `workspace.apply`, which
-/// `chock_core.tools.Tool.request_action` is the only caller of. The gap it
-/// closes is small and was real. An agent that believed it was finished had no
-/// way to say so and get an answer: the work was carried back at the end of the
-/// run, and until then a session could sit at a prompt for hours with a commit
-/// nobody had been offered.
-///
-/// ## It does exactly what `applyWork` does
-///
-/// Both go through `carryCommit`, so the person sees the same request with the
-/// same diff in it, the decision comes from the same policy table, and the work
-/// lands in the same place: a ref under `refs/chock/`, which is inert until
-/// somebody merges it. **An agent that asks gains nothing an agent that waits
-/// would not have had.** In particular it cannot move a branch of the user's,
-/// because there is no code path here that moves one.
-///
-/// ## Three answers before anybody is asked
-///
-/// * **No worktree at all.** An overlay workspace has no commit to carry and no
-///   ref to move, so the request cannot be honoured and is refused rather than
-///   approximated. See `chock_sandbox.Guarantee`'s own doc comment, which is
-///   where that rule is written down.
-/// * **Nothing changed.** The worktree is at the commit it started from and
-///   holds no changed file, so there is nothing to put to anybody.
-/// * **Changed files and no commit.** This is the measured case, and it is the
-///   one that cost a session: an agent reported that it had committed, had not,
-///   and nobody was told. **Asking is not committing**, so the answer is the
-///   count of what is uncommitted and a plain statement that none of it is
-///   carried, and no approval is requested for an empty change.
-///
-/// ## It runs inside the loop's own lock
-///
-/// `apply` is handed the loop's own `locked` handle and passes it down, exactly
-/// as `SessionArbiter.decide` does. There is no second open of the log and no
-/// second lock: see `lib/chock-broker/socket.zig`'s own top comment.
 const SessionHandback = struct {
     environ: std.process.Environ,
     env: *std.process.Environ.Map,
     started: *Started,
     options: Options,
-    /// The display, when bare `chock` brought one up. **This is what puts the
-    /// diff and the question in front of the person during a turn**, which is
-    /// the only time this seam is ever called. Null for `chock run`, which asks
-    /// at the prompt. See `Approvers.waiter`.
     screen: ?*ui.Ui = null,
 
     fn handback(self: *SessionHandback) chock_core.handback.Handback {
@@ -7792,9 +4816,6 @@ const SessionHandback = struct {
     fn applyFn(
         ptr: *anyopaque,
         gpa: std.mem.Allocator,
-        /// The session's own `Io`, which **cannot spawn a process**. Not used
-        /// here, and named so that a reader sees the swap rather than wondering
-        /// where it went. See the local one below.
         io: std.Io,
         locked: *chock_core.handback.Locked,
         ask: chock_core.handback.Ask,
@@ -7802,32 +4823,17 @@ const SessionHandback = struct {
         _ = io;
         const self: *SessionHandback = @ptrCast(@alignCast(ptr));
 
-        // **An `Io` of its own, for the reason a subagent and a `nix` build
-        // each get one.** Phase 2 runs on an `Io` built over
-        // `Allocator.failing`, so `Threaded.spawnPosix` fails there, and every
-        // step below runs `git`: reading whether a commit was made, describing
-        // what it would change, and moving the objects. Measured, not reasoned
-        // about: the first real run of this tool answered "whether you have
-        // made a commit could not be read (OutOfMemory)".
-        //
-        // **Backed by the page allocator and never by the session's own**, and
-        // this is the part that matters: a background task's thread may be
-        // inside `Sandbox.spawn` at this moment, and a lock another thread
-        // holds at a `fork` is a lock the child inherits as held forever. See
-        // `SubagentSpawner`, which states it in full.
-        //
-        // It is used for the log as well as for `git`, which costs nothing: an
-        // append through `locked` is a write to a file this process already
-        // holds open, and the handle is the caller's either way.
+        // An `Io` of its own: phase 2 runs over `Allocator.failing`, so
+        // `Threaded.spawnPosix` fails there and every step below runs `git`.
+        // Backed by the page allocator, because a background task's thread
+        // may be inside `Sandbox.spawn` and a lock another thread holds at a
+        // `fork` is one the child inherits as held for ever.
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
         defer threaded.deinit();
         const spawning_io = threaded.io();
 
         const tree = switch (self.started.workspace.kind) {
             .worktree => |wt| wt,
-            // A project with no git of its own has no commit to carry across
-            // and no ref to move. Refused by saying so, and never by putting a
-            // question nobody can act on to a person.
             .overlay => return .{ .carried = false, .output = try gpa.dupe(
                 u8,
                 "nothing was carried back and nobody was asked: this session works on a copy of " ++
@@ -7845,8 +4851,6 @@ const SessionHandback = struct {
                 .{@errorName(err)},
             ) };
         };
-        // **Asking is not committing**, and this is the branch that says so.
-        // See `nothingCommitted`.
         const new_id = moved orelse return .{
             .carried = false,
             .output = try self.nothingCommitted(gpa, spawning_io, tree),
@@ -7869,18 +4873,11 @@ const SessionHandback = struct {
             .new_id = new_id,
             .ref = ref,
             .reason = ask.reason,
-            // The call that asked, so a reader of the log joins the question to
-            // it. `applyWork` leaves this empty, which is what tells the same
-            // reader that the harness asked and no agent did.
             .tool_call_id = ask.tool_call_id,
         });
         defer carried.deinit(gpa);
 
         return switch (carried) {
-            // **Carried, because the user has the work.** It was this session
-            // that put it there, so an agent that asks twice is told the
-            // second answer is the same as the first rather than being told a
-            // refusal it would try to argue with.
             .already_there => .{ .carried = true, .output = try std.fmt.allocPrint(
                 gpa,
                 "already carried back: the ref {s} in {s} is at this very commit, so nothing " ++
@@ -7899,10 +4896,6 @@ const SessionHandback = struct {
                     "be in the user's repository. Say so in your answer, and do not commit the " ++
                     "same work again.",
             ) },
-            // **The outcome's own name and nothing a reviewer wrote.** A
-            // reviewer's reasoning goes to the log and to the person, never
-            // back to the agent it is about: see
-            // `lib/chock-broker/review.zig`.
             .refused => |outcome| .{ .carried = false, .output = try std.fmt.allocPrint(
                 gpa,
                 "nothing was carried back: the answer was \"{s}\". The user's repository is " ++
@@ -7911,10 +4904,6 @@ const SessionHandback = struct {
                     "carried back.{s}",
                 .{ @tagName(outcome), reviewNote(outcome) },
             ) },
-            // **What the agent is told about the branch is the outcome and
-            // never the plan.** A model told "your work is on their branch"
-            // when it is not would say so to the user, and a model told the
-            // opposite would ask to carry the same work twice.
             .landed => |done| switch (done.integration) {
                 .moved => |m| .{ .carried = true, .output = try std.fmt.allocPrint(
                     gpa,
@@ -7924,10 +4913,6 @@ const SessionHandback = struct {
                     .{ done.objects, ref, tree.project_root, m.landing.wireName(), m.branch, m.to },
                 ) },
                 .park => |p| parked: {
-                    // **The clause is built first**, because a park with no
-                    // landing has no landing to name. Every park says why
-                    // either way: there is no longer a way to ask for nothing,
-                    // so no park is the ordinary case.
                     const note = if (p.wanted) |it|
                         try std.fmt.allocPrint(
                             gpa,
@@ -7954,13 +4939,6 @@ const SessionHandback = struct {
         };
     }
 
-    /// What an agent is told when it asked and had made no commit.
-    ///
-    /// **Asking is not committing**, and this is where that is said. The
-    /// numbers are the point: an agent that has written twelve files and
-    /// committed none has to be told twelve, or it reads "nothing to carry" as
-    /// "there was nothing there" and stops. That is the shape of the session
-    /// this whole tool exists because of.
     fn nothingCommitted(
         self: *SessionHandback,
         gpa: std.mem.Allocator,
@@ -7999,49 +4977,16 @@ const SessionHandback = struct {
     }
 };
 
-/// The one sentence about a review that goes back to the agent that asked, or
-/// nothing at all.
-///
-/// **It says a reviewer took part and where the reasoning is, and it carries
-/// none of it.** `chock_broker.review.requesterText` is the one function that
-/// turns a review outcome into words for a requester, and a comptime guard in
-/// that file keeps it taking an outcome and nothing else.
 fn reviewNote(outcome: chock_broker.Broker.Outcome) []const u8 {
     const review = outcome.reviewOutcome() orelse return "";
     return chock_broker.review.requesterText(review);
 }
 
-/// Carry the session's own commit back into the user's repository, through
-/// the broker, after an approval.
-///
-/// **The worktree is thrown away at the end of the run**, so without this the
-/// agent's work has no path back at all: Chock could read a project and
-/// reason about one, and could not change one.
-///
-/// `lib/chock-broker/actions.zig` already holds the act itself,
-/// `workspace.apply`, which moves exactly the objects the request listed and
-/// then moves one ref with a compare and swap. Nothing here widens what the
-/// sandbox can do: the act runs in this process, on the host, with the agent
-/// already gone. That is the whole separation, and it is why this is wired
-/// through the broker rather than given to the agent as a tool.
-///
-/// **A person at a terminal answers this one.** `Loop.run` holds the exclusive
-/// lock on the session log for the whole session and this function takes it
-/// again here, so nothing outside this process can append an
-/// `approval.response`, and every question used to expire unasked.
-/// `src/approval.zig` goes through that wall without touching the lock: it is
-/// a `Broker.Waiter`, so it runs **inside** this process, and it appends the
-/// answer through the same `locked` handle below. See its own top comment.
-///
-/// **A session with nobody at all still refuses at once.** A subagent and a
-/// daemon session are spawned with `.stdin = .ignore`, and a pipe is not a
-/// terminal either. Such a session can still be answered, by a client attached
-/// to its approval socket, and `Approvers` is what gives the broker whichever
-/// of the two this session has. With neither, the deadline has already passed:
-/// an unanswered request is a refusal, and refusing at once is the honest thing
-/// when nobody can be asked. The other way to say yes with nobody there is the
-/// policy table in `chock.zon`, which is kept beyond the agent's reach: see
-/// this file's own top comment.
+/// Carry the session's own commit back into the user's repository, through the
+/// broker, after an approval. The worktree is thrown away at the end of the run,
+/// so without this the agent's work has no path back at all. Nothing here widens
+/// what the sandbox can do: the act runs in this process, on the host, with the
+/// agent already gone.
 fn applyWork(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -8052,8 +4997,6 @@ fn applyWork(
 ) !Applied {
     const tree = switch (started.workspace.kind) {
         .worktree => |wt| wt,
-        // A project with no git of its own has no commit to carry across and no
-        // ref to move.
         .overlay => return .nothing_to_apply,
     };
 
@@ -8066,8 +5009,6 @@ fn applyWork(
 
     const ref = try applyRef(arena, started.session_id);
 
-    // Before the waiter, because the waiter holds this handle and answers
-    // through it. One lock, taken once: see `src/approval.zig`.
     var locked = try started.storage.lock(io);
     defer locked.unlock(io) catch {};
 
@@ -8077,28 +5018,17 @@ fn applyWork(
         .started = started,
         .options = options,
         .locked = &locked,
-        // **Null, and that is not an oversight.** This runs in phase 3, and
-        // `runSession`'s own `defer` took the display down at the end of phase
-        // 2: the alternate screen is gone, raw mode is off, and the transcript
-        // is back on the real screen. So there is no region to draw a question
-        // in and the bare prompt is the right one. See `takeUp`, which relies
-        // on the same ordering.
         .screen = null,
         .tree = tree,
         .new_id = new_id,
         .ref = ref,
         .reason = "the session made a commit, and the workspace it is in is about to be removed",
-        // No tool call asked for this one: `chock run` asks on the session's
-        // behalf after the loop has ended. See `carryCommit`.
         .tool_call_id = "",
     });
     defer carried.deinit(gpa);
 
     switch (carried) {
         .not_described, .failed => return .failed,
-        // The work is in the project, so this is `landed` and not a third
-        // answer: `cleanupFor` and `exitWithApply` both ask the same question,
-        // which is whether the user has the work, and they do.
         .already_there => {
             tty.print(
                 .plain,
@@ -8117,10 +5047,6 @@ fn applyWork(
                     "Your repository is unchanged.\n",
                 .{ new_id, @tagName(outcome) },
             );
-            // A reviewer took part, so the record holds a verdict and one line
-            // of reasoning. Say where it is: an unread record is the same as
-            // no oversight while looking like some, and a person who has just
-            // been told "not applied" is exactly the person who wants it.
             if (outcome.reviewOutcome() != null) {
                 tty.print(
                     .warn,
@@ -8138,9 +5064,6 @@ fn applyWork(
                 .{ done.objects, ref, tree.project_root },
             );
             switch (done.integration) {
-                // **The line that says a branch of theirs moved.** A person
-                // whose branch is somewhere new has to read that, and has to be
-                // told where it was, so they can put it back with one command.
                 .moved => |m| tty.print(
                     .plain,
                     "chock run: your branch {s} moved from {s} to {s} ({s}), and your working " ++
@@ -8149,17 +5072,6 @@ fn applyWork(
                     .{ m.branch, shortId(m.from), shortId(m.to), m.landing.wireName(), m.from },
                 ),
                 .park => |p| {
-                    // **Every park says that no branch moved, and every park
-                    // says why.** The sentence used to be inside the `if`
-                    // below, so the common case, a project that asked for
-                    // nothing, printed the object count and then a `git merge`
-                    // command and nothing else. The command is one for the
-                    // person to run, and a reader took it for a report of what
-                    // Chock had already done. `Action.summary` says the same
-                    // words on the same occasion, so the two read alike.
-                    //
-                    // Mutation check: drop either arm and a park stops saying
-                    // what happened to the branch.
                     if (p.wanted) |it| tty.print(
                         .warn,
                         "chock run: the {s} this apply would have taken did not happen, " ++
@@ -8183,45 +5095,20 @@ fn applyWork(
     }
 }
 
-/// What one brokered `workspace.apply` came to.
-///
-/// **Nothing here is a sentence.** The two callers say different things about
-/// the same ending, because one is talking to a person at the end of a run and
-/// the other is answering a tool call the model made. See `carryCommit`.
 const CarryOut = union(enum) {
-    /// What the act would change could not be read, so nobody was asked and
-    /// nothing happened.
     not_described,
-    /// The ref is already at this very commit, so the act would move nothing.
-    /// Nobody was asked.
-    ///
-    /// **This is reachable only because an agent can ask.** Before
-    /// `request_action` existed, one run made one request and the ref could
-    /// never already be there. Now an agent carries its work back mid session
-    /// and the run then reaches `applyWork` with the same commit, and putting
-    /// that question to a person a second time spends a decision on a change
-    /// that is already made.
     already_there,
-    /// The decision did not permit it. The project is unchanged.
     refused: chock_broker.Broker.Outcome,
-    /// The objects and the ref moved. How many objects, and what happened to
-    /// the branch the user has checked out.
-    ///
-    /// **This one owns memory**, which is why `CarryOut` has a `deinit` and the
-    /// other members do not need one: the branch names and the two object ids
-    /// come out of the broker's own `Result` and are handed on rather than
-    /// copied, so nothing here can fail for want of memory at the moment the
-    /// work has already landed.
+    /// This one owns memory. The branch names and the two object ids come out of
+    /// the broker's own `Result` and are handed on rather than copied, so nothing
+    /// here can fail for want of memory once the work has landed.
     landed: struct {
         objects: usize,
         integration: chock_broker.integrate.Outcome,
     },
 
-    /// It was permitted and the act itself failed. The project may hold the
-    /// objects and does not hold the ref: `perform` moves the objects first.
     failed,
 
-    /// Release what a `CarryOut` owns. Safe on every member.
     fn deinit(self: *CarryOut, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .landed => |*done| done.integration.deinit(gpa),
@@ -8231,34 +5118,10 @@ const CarryOut = union(enum) {
     }
 };
 
-/// Ask for one `workspace.apply` and carry it out when the answer permits it.
-///
-/// **The one implementation, with two callers who ask for different reasons.**
-/// `applyWork` asks at the end of the run, on the session's behalf, because the
-/// workspace is about to be removed and this is the work's last chance.
-/// `SessionHandback` asks in the middle of a session, because the agent called
-/// `request_action` and said it was finished. Both end in exactly the same
-/// place: the objects and a ref under `refs/chock/`, which is inert until a
-/// person merges it. **An agent that asks gains nothing an agent that waits
-/// would not have had**, and in particular it cannot move a branch.
-///
-/// **The decision is never this function's and never the agent's.**
-/// `chock_broker.actions.run` puts the request to the policy table of
-/// `chock.zon`, which is kept beyond the agent's reach, and where that table
-/// answers `ask` it puts the request to a person through `Approvers`. What a
-/// person reads is the description built above: the commit and the diff it
-/// makes, so the question is one they can really answer.
-///
-/// **It takes the lock and never opens the log**, so it works in both places.
-/// `Loop.run` holds the exclusive lock for the whole of a session, so the mid
-/// session caller hands its own handle down; `applyWork` runs after the loop
-/// has ended and takes the lock itself. See `lib/chock-broker/socket.zig`'s own
-/// top comment for why the broker does not have to own the log for any of this.
-///
-/// Every string this reads lives in `arena`, which the caller owns, and every
-/// diagnostic it meets is printed rather than returned: a display turns each
-/// one into a row of its transcript, so this is right in the middle of a
-/// session as well as at the end of one. See `src/tty.zig`.
+/// Ask for one `workspace.apply` and carry it out when the answer permits it. An
+/// agent that asks gains nothing an agent that waits would not have had, and in
+/// particular it cannot move a branch. It takes the lock and never opens the log,
+/// so it works both mid session and at the end of one.
 fn carryCommit(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -8268,35 +5131,19 @@ fn carryCommit(
         env: *std.process.Environ.Map,
         started: *Started,
         options: Options,
-        /// The session log, already locked by the caller.
         locked: *ApprovalLock,
-        /// The display, when one is up. **This is what makes a mid session
-        /// question answerable in the interface**: see `Approvers.waiter`.
         screen: ?*ui.Ui,
         tree: chock_workspace.worktree.Worktree,
-        /// The commit that moves.
         new_id: []const u8,
-        /// The ref it lands on, from `applyRef`.
         ref: []const u8,
-        /// Why the act is wanted, in the words of whoever wants it. A person
-        /// reads this in the request.
         reason: []const u8,
-        /// The `tool.call` that asked, or empty when the harness asked on the
-        /// session's behalf. The policy key still names a tool either way: see
-        /// `chock_broker.actions.self_asked_tool`, which a reader of the log
-        /// rebuilds the same key from.
         tool_call_id: []const u8,
     },
 ) CarryOut {
     const started = params.started;
     const ctx = chock_broker.actions.Context{ .env = params.env };
-    // What git said, and the one notice a description that succeeded can
-    // still leave: a file in the scratch object store that is not an object
-    // and therefore does not move. The broker used to print both itself.
     var describe_diag: ?chock_broker.Diagnostic = null;
     defer if (describe_diag) |*d| d.deinit(arena);
-    // **Answered before the act is described**, so the description a person
-    // reads names the shape they picked. See `chosenLanding`.
     const wanted = chosenLanding(gpa, io, started.apply_mode.mode, params.screen);
     const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
         .repository = params.tree.project_root,
@@ -8320,22 +5167,12 @@ fn carryCommit(
         }
         return .not_described;
     };
-    // Said out loud on a description that answered: a file the apply leaves
-    // behind is work the user does not get, and silence about it looks the
-    // same as an apply that carried everything.
     if (describe_diag) |*notice| tty.print(.warn, "chock run: {f}\n", .{notice});
 
-    // **Before anybody is asked.** `old_id` is where the ref is now, read from
-    // the user's own repository, and a compare and swap from an id to itself
-    // moves nothing. See `CarryOut.already_there` for the one route that
-    // reaches this.
-    //
-    // **And the branch has to have nothing to gain either.** A mode that
-    // integrates can leave the ref at the session's commit and the branch
-    // untouched, when the working tree was dirty at the moment of the first
-    // request. Asking again is then worth doing, because the tree may be clean
-    // now; asking again when the plan moves nothing either would spend a
-    // person's attention on a change that is already made.
+    // Before anybody is asked: a compare and swap from an id to itself moves
+    // nothing. The branch has to have nothing to gain either, because a mode that
+    // integrates can leave the branch untouched when the working tree was dirty
+    // at the moment of the first request.
     if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
         recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
             .park = .{ .wanted = wanted.landing(), .why = .already_there },
@@ -8343,27 +5180,10 @@ fn carryCommit(
         return .already_there;
     }
 
-    // **The session's own log, folded once, read by two things below.** At the
-    // end of a run `Loop.run` has ended, so the `state.Session` it kept is gone
-    // and the log is what is left; in the middle of one this seam is handed no
-    // fold of its own. That is not a fallback either way: the fold is the truth
-    // of a session, and it is what makes both readers right about a session
-    // that was resumed, or handed to the daemon, or compacted a dozen times.
     var session = chock_proto.state.Session.init(gpa);
     defer session.deinit();
     foldSession(gpa, io, started.storage, &session);
 
-    // The ratchet. Every promise this decision is bound by: the ones this
-    // session made about itself, and the ones every session above it made. An
-    // agent that said "I will not apply this work" while it was planning cannot
-    // apply it now, whatever the policy table says, and it cannot have taken
-    // the promise back: see `chock_policy.ratchet`, and
-    // `chock_core.Loop.runRestrictSelf`, which is what refused every attempt
-    // to.
-    //
-    // **The promise is read here and applied in the broker.** The promise
-    // reaches the decision the same way the spawn chain does: as a fact about
-    // the request, out of a record nothing can rewrite.
     const promised = promisesFor(
         gpa,
         arena,
@@ -8373,17 +5193,9 @@ fn carryCommit(
         &session,
     ) catch return .failed;
 
-    // A project whose `chock.zon` answers `agent_review` for `workspace.apply`
-    // gets a reviewer here, and one that says anything else pays for nothing:
-    // the broker asks for a review only where the folded decision asked for
-    // one. This is acceptance of changes, and this is where a change is
-    // accepted.
     var review_child = reviewChild(gpa, params.environ, params.env, started, params.options);
     var review_spawner = reviewerFor(review_child.spawner(), started, &session);
 
-    // The caller's own handle, so a reviewer this approval starts is appended
-    // to the log as a child and counted against the width bound. See
-    // `ReviewSpawner.locked`.
     review_spawner.locked = params.locked;
 
     var approvers: Approvers = undefined;
@@ -8393,54 +5205,26 @@ fn carryCommit(
         .policy = started.policy,
         .waiter = approvers.waiter(),
         .reviewer = review_spawner.reviewer(),
-        // The detail of this one is the commit itself, which is workspace bytes
-        // and the likeliest place a credential sits. See `brokerRedaction`.
         .redaction = started.redact_values,
-        // **The memory that stops this from asking about `workspace.apply`
-        // twice.** `session` was just folded from the whole log, above, so it
-        // already holds every `approved_by_user_for_session` answer a person
-        // gave to an earlier request in this session, `workspace.apply`
-        // included. Without this, `docs/approvals.md`'s "rest of the session"
-        // is offered here and never kept: see `SessionArbiter.decideFn`,
-        // which wires the same field for the same reason.
-        //
-        // **`session.arena.allocator()`, and not `gpa`, for the reason
-        // `decideFn` spends a whole paragraph on.** `chock_broker.actions.run`
-        // below calls `perform`, which hands back a `Result` this function's
-        // own caller frees with `gpa` after `session` is gone: see the
-        // `gpa.free(carried.ref)` two callers up. That `gpa` has to stay a
-        // plain allocator for that reason alone, so it cannot be the value
-        // `broker.request` uses to grow `session.grants.granted` too: this
-        // field is `Broker`'s seam for keeping the two apart. See
-        // `Broker.Grants`'s own doc comment for the free-through-the-
-        // wrong-allocator fault this exists to avoid.
+        // `session` holds every `approved_by_user_for_session` answer already
+        // given, so a person keeps the rest of the session they were offered. The
+        // arena and not `gpa`: `gpa` frees the `Result` after `session` is gone,
+        // so growing `session.grants` through it would free arena memory through
+        // the wrong allocator.
         .grants = .{ .memory = &session.grants, .allocator = session.arena.allocator() },
     };
 
-    // Why the broker refused, or why the act itself failed. The broker used
-    // to print that and hand this command an error name.
     var apply_diag: ?chock_broker.Diagnostic = null;
     defer if (apply_diag) |*d| d.deinit(gpa);
     var attempt = chock_broker.actions.run(&broker, gpa, io, started.storage, params.locked, ctx, .{
         .action = .{ .workspace_apply = apply },
         .reason = params.reason,
         .agent_kind = params.options.agent_kind,
-        // The decision is the intersection over the whole chain, so a subagent
-        // can hold no permission its parent lacks. The chain comes from the
-        // command line the parent wrote, and this session cannot add to it.
         .spawn_chain = started.spawn_chain,
         .model_alias = started.model_alias,
-        // The tool an agent calls for this, and the name a request the harness
-        // made carries too. See `chock_broker.actions.self_asked_tool`.
         .tool = chock_broker.actions.self_asked_tool,
         .tool_call_id = params.tool_call_id,
-        // What this session promised about itself. Empty for a session that
-        // promised nothing, which narrows nothing at all.
         .self_policy = promised,
-        // A terminal waits for the person at it, a display does too, and so
-        // does a session somebody has attached a client to; a session with none
-        // of the three refuses at once rather than holding the lock for five
-        // minutes over a question that cannot be answered.
         .timeout_ms = approvers.timeoutMs(),
     }, &apply_diag) catch |err| {
         if (apply_diag) |*fault| {
@@ -8465,10 +5249,6 @@ fn carryCommit(
 
     switch (attempt) {
         .refused => |outcome| {
-            // **Refused is recorded too.** "No branch moved" is a fact about
-            // this session whichever way the apply went, and a record written
-            // only when something happened is missing exactly where a reader
-            // needs it.
             recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
                 .park = .{ .wanted = wanted.landing(), .why = .apply_refused },
             });
@@ -8477,10 +5257,6 @@ fn carryCommit(
         .done => |*done| {
             const carried = done.result.workspace_apply;
             recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);
-            // **The two strings this does not need are freed, and the one it
-            // does is handed on.** `Result.deinit` would free all three, and a
-            // copy of the third could fail for want of memory at the one moment
-            // the work has already landed and the answer must be the truth.
             gpa.free(carried.ref);
             gpa.free(carried.new_id);
             return .{ .landed = .{
@@ -8491,22 +5267,6 @@ fn carryCommit(
     }
 }
 
-/// Write down what this apply did to the branch.
-///
-/// **Once per apply, whichever way it went.** A session has to be
-/// distinguishable afterwards by what happened to somebody's branch, and a
-/// control that moved one quietly would be the wrong shape whatever it was
-/// written in. See `chock_proto.event.WorkspaceIntegrate`, which carries the
-/// reason as well as the outcome, and `recordSandbox`, which is the same
-/// arrangement for the sandbox a session ran under.
-///
-/// **It writes through the caller's own locked handle**, so it works in the
-/// middle of a session and at the end of one, which is the same rule
-/// `carryCommit` itself keeps.
-///
-/// A record that cannot be written is said out loud and does not end the
-/// session: the work is already where it is, and refusing to report that would
-/// lose the run as well as the record.
 fn recordIntegration(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -8522,16 +5282,8 @@ fn recordIntegration(
     _ = locked.append(gpa, io, .{
         .workspace_integrate = .{
             .ref = ref,
-            // **The outcome and not the plan**, the rule
-            // `chock_broker.actions.Result` states for the field this reads. A plan
-            // that said `merge` can still end at `park`, and the configured mode
-            // can be `ask`, which is a question and not a landing any apply takes.
-            // `Landing` has no `ask` member, so neither has this row.
             .mode = switch (outcome) {
                 .moved => |m| m.landing.wireName(),
-                // **Empty for a park that never settled on a landing**, which
-                // the policy row refusing and nobody answering both leave.
-                // Naming one here would be a claim about an act nobody chose.
                 .park => |p| if (p.wanted) |it| it.wireName() else "",
             },
             .decision = @tagName(apply_mode.decision),
@@ -8552,17 +5304,9 @@ fn recordIntegration(
     };
 }
 
-/// What to answer when the worktree is still at the commit the session
-/// started from. Either the agent changed nothing, or it changed files and
-/// never committed them, and those are two different things to tell a user.
-///
-/// **The second case is new with the write tools.** An agent that could only
-/// read and run programs left a clean worktree, so "the head did not move"
-/// and "there is nothing here" were the same fact. An agent that can write
-/// leaves files behind, and `git worktree remove`, a few lines further on,
-/// deletes them. Saying nothing there is a run that exits 0 with the
-/// project unchanged and the work gone, which is exactly what the first real
-/// session with these tools did.
+/// An agent that can write leaves files behind and `git worktree remove` deletes
+/// them, so saying nothing is a run that exits 0 with the project unchanged and
+/// the work gone.
 fn uncommittedWork(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -8570,9 +5314,6 @@ fn uncommittedWork(
     tree: chock_workspace.worktree.Worktree,
 ) Applied {
     const counts = chock_workspace.worktree.countUncommitted(gpa, io, env, tree.path, null) catch |err| {
-        // A count that could not be read is not a reason to claim either
-        // answer. Say which check did not happen, the same way
-        // `handleUncommitted` does at the other end of the session.
         tty.print(
             .err,
             "chock run: the session made no commit, and the work left in {s} could not be counted: {s}\n",
@@ -8593,28 +5334,11 @@ fn uncommittedWork(
     return .uncommitted;
 }
 
-/// Deal with the project's uncommitted work, before the session starts.
-///
-/// **`git worktree add` checks out the commit, not the working tree**, so an
-/// agent in a fresh worktree sees `HEAD`. That behaviour stays the default,
-/// because a known commit is reproducible. What was wrong was the silence: a
-/// user was never told, and so believed the agent could see work it could
-/// not. Chock's own repository is the case that exposed it, with three files
-/// in `HEAD` and 83 uncommitted.
-///
-/// So: warn when the tree is dirty and name the flag, or, with the flag,
-/// carry the work across and say how much came. **Only when the tree is
-/// actually dirty**, or the message becomes noise people learn to skip.
-///
-/// The overlay kind of workspace copies the whole project directory,
-/// uncommitted work included, so nothing there is invisible and nothing here
-/// applies to it.
-///
-/// Returns how many files the agent will not see, which is zero in every case
-/// where nothing is hidden: an overlay, a clean tree, a count that could not be
-/// read, and `--allow-dirty`, which brings the work across. **The number goes
-/// to the agent as well as to the user**: see
-/// `chock_core.Loop.Deps.uncommitted_files`.
+/// `git worktree add` checks out the commit and not the working tree, so an agent
+/// in a fresh worktree sees `HEAD` and a user who is not told believes it can see
+/// work it cannot. The overlay kind of workspace copies the whole project
+/// directory, so nothing there is invisible. Returns how many files the agent
+/// will not see, which is zero in every case where nothing is hidden.
 fn handleUncommitted(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -8629,11 +5353,6 @@ fn handleUncommitted(
 
     if (!options.allow_dirty) {
         const counts = chock_workspace.worktree.countUncommitted(gpa, io, env, tree.project_root, null) catch |err| {
-            // A count that could not be read is not a reason to refuse the
-            // session: the session still runs correctly from the commit. Say
-            // so rather than fail, and never stay silent about a check that
-            // did not happen. **Zero, and not a guess**: an agent told a made
-            // up number is worse off than one told nothing.
             tty.print(
                 .warn,
                 "chock run: the uncommitted work in {s} could not be counted: {s}. " ++
@@ -8645,17 +5364,12 @@ fn handleUncommitted(
         if (!counts.any()) return 0;
         const text = try dirtyWarning(gpa, counts);
         defer gpa.free(text);
-        // **The one startup line that is worth interrupting for.** It changes
-        // what the agent can see, so it is ranked as a warning and it is the
-        // only coloured thing on a healthy start.
         tty.print(.warn, "{s}", .{text});
         return counts.total();
     }
 
     var import_diag: ?chock_workspace.Diagnostic = null;
     var report = tree.importUncommitted(gpa, io, env, &import_diag) catch |err| {
-        // Which call failed and what it answered, which the error name alone
-        // does not carry.
         if (import_diag) |*fault| {
             tty.print(
                 .err,
@@ -8680,21 +5394,12 @@ fn handleUncommitted(
     const text = try importSentence(gpa, report);
     defer gpa.free(text);
     tty.print(.plain, "{s}", .{text});
-    // A skip the user cannot see is the same silence this whole function
-    // exists to end. See `ImportReport.skipped`.
     for (report.skipped.items) |skip| {
         tty.print(.warn, "chock run: {s} was not brought across: {s}\n", .{ skip.path, skip.reason });
     }
-    // The work is in the workspace now, so nothing is hidden from the agent
-    // and there is nothing to tell it about.
     return 0;
 }
 
-/// What a user is told about work the agent will not see. Its own function,
-/// not a `tty.print` inside `handleUncommitted`, so a test can pin the
-/// sentence: the count, the split, and the name of the flag that changes it
-/// are the three things a user acts on, and a message that gets any of them
-/// wrong sends somebody looking for files that are not there.
 fn dirtyWarning(
     gpa: std.mem.Allocator,
     counts: chock_workspace.worktree.Uncommitted,
@@ -8707,10 +5412,6 @@ fn dirtyWarning(
     );
 }
 
-/// What a user is told after `--allow-dirty` carried the work across. The
-/// same three facts as `dirtyWarning`, from the other side: the two paths
-/// give a user the same kind of statement rather than one warning and one
-/// silence.
 fn importSentence(
     gpa: std.mem.Allocator,
     report: chock_workspace.worktree.ImportReport,
@@ -8728,15 +5429,6 @@ fn importSentence(
     );
 }
 
-/// Say once, at the start, that a cap cannot be enforced on this session, and
-/// name the provider and the model. Decided by the project owner: **Chock does
-/// not refuse the session over this.** The user chose the provider and may have
-/// good reasons, and a harness that blocks work to protect a number it cannot
-/// measure is worse than one that is honest about what it cannot see.
-///
-/// At the start, and not at the turn where the cap would have bitten: a user
-/// who set a cap and heard nothing would fairly assume it was working. A free
-/// provider is measurable, so this never fires for a local model.
 fn warnUnmeasurableBudget(
     budget: ?chock_cost.budget.Budget,
     billing: chock_cost.prices.Billing,
@@ -8753,76 +5445,42 @@ fn warnUnmeasurableBudget(
         .{ cap.max_cost, cap.currency, model, provider_name },
     );
 }
-/// The longest credential a person may type at a prompt.
-///
-/// Well above a forge token, which is about ninety characters, and far below
-/// `chock_core.ask.max_answer_bytes`, which is what the display's own question
-/// buffer holds. A person who types more than this is refused plainly rather
-/// than given a value cut in half, because half a password is a wrong password.
+/// Well above a forge token and far below `chock_core.ask.max_answer_bytes`. A
+/// person who types more is refused plainly rather than given a value cut in
+/// half, because half a password is a wrong password.
 const max_secret_bytes: usize = 512;
 
-/// How long a person has to type a credential.
-///
-/// **Longer than an approval deadline on purpose.** An approval is a key
-/// press. This is a password somebody may have to fetch from a manager first,
-/// and a prompt that expired while they were looking would fail a push the
-/// person had already said yes to.
 const secret_prompt_timeout_ms: i64 = 180_000;
 
-/// How long one look at the display's question region waits.
 const secret_look_ms: u64 = 100;
 
-/// How a person is asked to type a credential.
-///
-/// **A terminal and the display, and never the approval socket.** The unix
-/// path of that socket checks `peercred` and the TCP path checks nobody:
-/// `src/serve.zig` and `src/daemon.zig` both say that Chock does no
-/// authentication over a network, and a pairing bootstrap is planned and not
-/// built. So a password crossing it would be a password on the wire in any
-/// deployment that used `--host`, and there is no exception for one push.
-///
-/// **A session with neither refuses the push**, and the refusal says which two
-/// surfaces exist. That is the same direction every other "nobody could be
-/// asked" case in this project takes.
+/// A terminal and the display, and never the approval socket. The unix path of
+/// that socket checks `peercred` and the TCP path checks nobody, so a password
+/// crossing it would be a password on the wire. A session with neither refuses
+/// the push.
 const SecretAsker = struct {
     io: std.Io,
-    /// The display, when one is up. Borrowed: `runSession` owns it.
     screen: ?*ui.Ui = null,
-    /// Whether this process has a terminal of its own.
     at_terminal: bool = false,
 
-    /// Whether anybody can be asked at all.
     fn canAsk(self: SecretAsker) bool {
         return self.screen != null or self.at_terminal;
     }
 
-    /// One sentence for a person, and for the agent's own tool result, when
-    /// nobody can be asked.
     const nobody_text = "this session cannot prompt anybody for a password: a credential is typed " ++
         "at the terminal running chock, or into the display's own question region, and this " ++
         "session has neither. It is never asked for over the approval socket, because chock " ++
         "does no authentication on that socket. Push from a session you are sitting at, or use " ++
         "an ssh remote, whose key never leaves your machine.";
 
-    /// Ask, and copy what was typed into `into`. Null is every way of not
-    /// getting one: nobody there, nothing typed, a person who cancelled, or
-    /// more bytes than `into` holds.
-    ///
-    /// **The display wins over the terminal and never joins it.** Both read the
-    /// same device, and the display holds it in raw mode and owns every cell,
-    /// so a prompt written around it lands in cells it believes it owns. That
-    /// is the rule `Approvers.waiter` already keeps.
     fn ask(self: SecretAsker, question: []const u8, into: []u8) ?[]const u8 {
         if (self.screen) |screen| return askDisplay(screen, self.io, question, into);
         if (!self.at_terminal) return null;
         return tty.readSecret(self.io, question, into) catch null;
     }
 
-    /// The display's own question region, masked. See `ui.Question.Echo`.
     fn askDisplay(screen: *ui.Ui, io: std.Io, question: []const u8, into: []u8) ?[]const u8 {
         screen.showQuestion(.{ .text = question, .echo = .masked });
-        // **On every path out**, which is what puts the terminal back and
-        // overwrites the buffer the person typed into.
         defer screen.clearQuestion();
 
         const started_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
@@ -8833,8 +5491,6 @@ const SecretAsker = struct {
             screen.questionLeft(deadline_ms - now_ms);
             switch (screen.awaitText(secret_look_ms)) {
                 .waiting => continue,
-                // A person who pressed Ctrl-C is leaving, and one who pressed
-                // Enter with nothing typed has refused. Both are a no.
                 .canceled, .declined => return null,
                 .answered => |said| {
                     if (said.len == 0 or said.len > into.len) return null;
@@ -8846,77 +5502,40 @@ const SecretAsker = struct {
     }
 };
 
-/// What one approved `git push` may reach, and nothing else may.
-///
-/// **The lifetime is the whole of the security property.** `arm` opens what
-/// the push needs, `disarm` closes it, and `grantFn` answers null for every
-/// call but the one between them. `lib/chock-broker/agentproxy.zig` says at
-/// length why that matters for the ssh agent: a proxied agent can sign
-/// anything at all while it is reachable, and the agent protocol cannot say
-/// what a signature is for, so no proxy can decide by reading the bytes. Scope
-/// is the only defence there is.
-///
-/// **Exactly one of the two is ever armed.** The remote's scheme decides
-/// which, on the host, before anybody is asked: see
-/// `lib/chock-broker/git_remote.zig`. An `https` remote prompts for a password
-/// and opens the askpass socket; an `ssh` remote proxies the agent and prompts
-/// for nothing; a local remote needs neither and gets neither.
-///
-/// **The value never rests anywhere.** It is typed by a person, held in
-/// `secret` for one tool call, and overwritten in `disarm`. There is no
-/// credential store entry, no configuration field, and nothing written to
-/// disk.
+/// What one approved `git push` may reach, and nothing else may. `arm` opens what
+/// the push needs, `disarm` closes it, and `grantFn` answers null for every call
+/// but the one between them. A proxied ssh agent can sign anything at all while
+/// it is reachable and the agent protocol cannot say what a signature is for, so
+/// scope is the only defence there is. The value is typed by a person, held for
+/// one tool call, and overwritten in `disarm`.
 const GitCredentials = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// The directory this session's per act sockets live in. Owned by the
-    /// caller's arena.
-    ///
-    /// **Not the session's `.ctl` directory.** That one holds the approval
-    /// socket and the handover socket, and it is bound into no sandbox ever:
-    /// an agent that could reach the approval socket could answer its own
-    /// questions.
+    /// Not the session's `.ctl` directory, which is bound into no sandbox
+    /// ever: an agent that could reach the approval socket could answer its
+    /// own questions.
     dir: []const u8,
-    /// The chock binary, absolute, or empty when it could not be resolved.
-    /// Bound into the sandbox as the askpass helper.
     helper: []const u8,
-    /// Who is prompted.
     secrets: SecretAsker,
-    /// The policy this session reads `secret.password.*` under. `grants` is
-    /// filled per act and is empty the rest of the time.
     asker: chock_broker.askpass.Asker,
-    /// The person's own `SSH_AUTH_SOCK`, or empty when they run no agent.
     host_agent: []const u8,
-    /// The slot in this session's redaction policy that a live password fills.
-    ///
-    /// **Filled the moment a person types and emptied the moment the call
-    /// ends**, so the value is covered by the redaction funnel for exactly as
-    /// long as it exists. See `redactionFor`, which reserves it and says why an
-    /// empty slot costs a session that never pushes nothing.
     live: ?*chock_core.redact.Secret = null,
 
-    /// The call this is armed for, or null. **Everything below it is read only
-    /// while this is not null.**
     armed_call: ?[]const u8 = null,
-    /// Owned per act and freed by `disarm`.
     socket_path: []u8 = &.{},
     agent_path: []u8 = &.{},
     env: []const []const u8 = &.{},
     endpoint: ?chock_broker.askpass.Endpoint = null,
     proxy: ?chock_broker.agentproxy.Proxy = null,
 
-    /// The one host a person typed a password for, and the value they typed.
     host: [chock_broker.askpass.max_host_bytes]u8 = undefined,
     host_len: usize = 0,
     secret: [max_secret_bytes]u8 = undefined,
     secret_len: usize = 0,
     grant: [1]chock_broker.askpass.Grant = undefined,
 
-    /// What arming one act came to, for the caller to turn into a sentence.
     const Outcome = union(enum) {
-        /// Armed, or deliberately armed with nothing, which is a local remote.
         ready,
-        /// Not armed, and this is what to tell the agent. Owned by the caller.
         refused: []u8,
     };
 
@@ -8926,14 +5545,12 @@ const GitCredentials = struct {
 
     const vtable = chock_core.credentials.Seam.VTable{ .grant = grantFn, .step = stepFn };
 
-    /// What this tool call may reach. **Null for every call but the one act a
-    /// person approved**, which is the whole point.
     fn grantFn(ptr: *anyopaque, tool: []const u8, call_id: []const u8) ?chock_core.credentials.Grant {
         const self: *GitCredentials = @ptrCast(@alignCast(ptr));
         const armed = self.armed_call orelse return null;
         if (!std.mem.eql(u8, armed, call_id)) return null;
-        // The tool is checked as well as the call, so a grant cannot travel to
-        // a different tool that happened to be given the same id.
+        // The tool is checked as well as the call, so a grant cannot travel
+        // to a different tool that happened to be given the same id.
         if (!std.mem.eql(u8, tool, "run_command")) return null;
 
         return .{
@@ -8944,30 +5561,14 @@ const GitCredentials = struct {
         };
     }
 
-    /// One look at whichever socket is open. **Writes no log**, which is
-    /// `lib/chock-core/idle.zig`'s own contract: this runs in the middle of a
-    /// tool call the loop has not returned from. The prompts are kept by the
-    /// endpoint and written by `record` once the call has ended.
     fn stepFn(ptr: *anyopaque) void {
         const self: *GitCredentials = @ptrCast(@alignCast(ptr));
         if (self.endpoint) |*one| _ = one.step(self.gpa, self.io, null, self.asker, step_budget_ms) catch {};
         if (self.proxy) |*one| one.step(self.io, step_budget_ms);
     }
 
-    /// How long one look waits. Short, because it runs in the gap between two
-    /// slices of a wait and a display is repainting in the same gap.
     const step_budget_ms = 20;
 
-    /// Open what one approved push needs, and nothing it does not.
-    ///
-    /// **Called after a person has already said yes to the push**, so this
-    /// asks nobody whether the act may happen. What it may ask is for a
-    /// password, which is a different question with a different answer.
-    ///
-    /// `rest` is what follows the `push` subcommand, which `git_shim.classify`
-    /// already cut out of the argument vector.
-    ///
-    /// The caller owns any `refused` text and frees it with `gpa.free`.
     fn arm(
         self: *GitCredentials,
         gpa: std.mem.Allocator,
@@ -8984,11 +5585,6 @@ const GitCredentials = struct {
         const url = resolved orelse return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
 
         switch (chock_broker.git_remote.credentialFor(url)) {
-            // Nothing authenticates, so nothing is armed and the push runs with
-            // no credential surface at all. **This is a third case and not a
-            // gap**: a `file://` or a local path remote needs neither of the
-            // two, and arming one anyway would be a capability nobody asked
-            // for.
             .none => return .ready,
             .unreadable => return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) },
             .password => return self.armPassword(gpa, io, call_id, url),
@@ -8996,9 +5592,6 @@ const GitCredentials = struct {
         }
     }
 
-    /// The URL of the remote this push names, owned by the caller, or null when
-    /// it cannot be read. See `lib/chock-broker/git_remote.zig` for why every
-    /// doubt ends here.
     fn remoteUrl(
         self: *GitCredentials,
         gpa: std.mem.Allocator,
@@ -9008,7 +5601,6 @@ const GitCredentials = struct {
     ) !?[]u8 {
         _ = self;
         const named = chock_broker.git_remote.remoteNameIn(rest) orelse return null;
-        // A push may name a URL where a remote's name would go.
         if (chock_broker.git_remote.namesAUrl(named)) return try gpa.dupe(u8, named);
 
         const path = try projectConfigPath(gpa, project_root);
@@ -9027,8 +5619,6 @@ const GitCredentials = struct {
         return try gpa.dupe(u8, url);
     }
 
-    /// Prompt a person, hold what they typed for this one call, and open the
-    /// askpass socket.
     fn armPassword(
         self: *GitCredentials,
         gpa: std.mem.Allocator,
@@ -9040,10 +5630,6 @@ const GitCredentials = struct {
             return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
         if (!isPlainHost(host)) return .{ .refused = try gpa.dupe(u8, unreadable_remote_text) };
 
-        // **The policy first, and the prompt second.** A host the project
-        // denies costs no prompt at all, and the refusal is the same one
-        // `git` would have read off the socket: one decider, two callers. See
-        // `askpass.Asker.mayPrompt`.
         if (self.asker.mayPrompt(host)) |refusal| {
             return .{ .refused = try std.fmt.allocPrint(
                 gpa,
@@ -9072,9 +5658,8 @@ const GitCredentials = struct {
         self.secret_len = typed.len;
         errdefer self.wipe();
 
-        // **Before anything is opened.** Nothing can echo the value until the
-        // socket exists, and covering it first means there is no window at all
-        // rather than a short one.
+        // Before anything is opened. Nothing can echo the value until the
+        // socket exists, so there is no window at all rather than a short one.
         if (self.live) |slot| slot.value = self.secret[0..self.secret_len];
 
         @memcpy(self.host[0..host.len], host);
@@ -9117,20 +5702,16 @@ const GitCredentials = struct {
             entries.deinit(gpa);
         }
         try entries.append(gpa, try std.fmt.allocPrint(gpa, "GIT_ASKPASS={s}", .{helper_inside}));
-        // **A path and never a value.** That is the only reason a variable may
-        // be in this design at all: see `lib/chock-broker/askpass.zig`.
         try entries.append(gpa, try std.fmt.allocPrint(
             gpa,
             "{s}={s}/{s}",
             .{ chock_broker.askpass.env_socket, inside, chock_broker.askpass.socket_name },
         ));
         // git writes its two prompts through gettext, so a translated git
-        // writes bytes `askpass.readPrompt` cannot read and then refuses. See
-        // that function's own comment.
+        // writes bytes `askpass.readPrompt` cannot read and then refuses.
         try entries.append(gpa, try gpa.dupe(u8, "LC_ALL=C"));
-        // Nothing may fall back to a terminal: the helper is the only route to
-        // a password, and a git that opened /dev/tty inside the sandbox would
-        // be asking nobody.
+        // Nothing may fall back to a terminal: a git that opened /dev/tty
+        // inside the sandbox would be asking nobody.
         try entries.append(gpa, try gpa.dupe(u8, "GIT_TERMINAL_PROMPT=0"));
         self.env = try entries.toOwnedSlice(gpa);
 
@@ -9138,8 +5719,6 @@ const GitCredentials = struct {
         return .ready;
     }
 
-    /// Open the proxy to the person's own ssh agent. **No prompt**, because an
-    /// agent is what answers instead of a person.
     fn armAgent(
         self: *GitCredentials,
         gpa: std.mem.Allocator,
@@ -9181,8 +5760,6 @@ const GitCredentials = struct {
             for (entries.items) |entry| gpa.free(entry);
             entries.deinit(gpa);
         }
-        // **A path, and the agent is on the other end of it.** The key stays on
-        // the host: see `lib/chock-broker/agentproxy.zig`.
         try entries.append(gpa, try std.fmt.allocPrint(
             gpa,
             "{s}={s}/{s}",
@@ -9195,11 +5772,9 @@ const GitCredentials = struct {
         return .ready;
     }
 
-    /// Close everything this act opened, and overwrite the value.
-    ///
-    /// **Called on every path out of an approved push**, including a failing
-    /// one, because the socket existing for one moment longer than the act is
-    /// the whole of what this design is guarding against.
+    /// Called on every path out of an approved push, including a failing one,
+    /// because the socket existing one moment longer than the act is what
+    /// this design guards against.
     fn disarm(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io) void {
         if (self.endpoint) |*one| one.close(io);
         self.endpoint = null;
@@ -9218,11 +5793,7 @@ const GitCredentials = struct {
         self.wipe();
     }
 
-    /// Overwrite the value and forget the host it belonged to.
     fn wipe(self: *GitCredentials) void {
-        // **The redaction slot first.** It borrows the very bytes the next line
-        // overwrites, so a slot left pointing at them would hand the redactor a
-        // run of zeroes to search for.
         if (self.live) |slot| slot.value = "";
         chock_broker.askpass.wipe(self.secret[0..self.secret_len]);
         self.secret_len = 0;
@@ -9231,19 +5802,11 @@ const GitCredentials = struct {
         self.asker.grants = .{};
     }
 
-    /// Write what the sockets did into the session log, **after** the tool call
-    /// has ended.
-    ///
-    /// **This is here and not in the look, because of
-    /// `lib/chock-core/idle.zig`'s own contract**: a look runs in the middle of
-    /// a call the loop has not returned from and may not append to the log. So
-    /// the endpoint keeps each prompt's text and this writes them once it is
-    /// safe to. See `askpass.Endpoint.kept`.
-    ///
-    /// **A prompt's text is bytes `git` composed out of a URL and holds no
-    /// value.** `askpass.appendPrompt` takes no `Grants` at all, so there is
-    /// nothing in scope here that could put a credential in the log even by
-    /// mistake.
+    /// Write what the sockets did into the session log, after the tool call
+    /// has ended: a look runs in the middle of a call the loop has not
+    /// returned from and may not append. A prompt's text is bytes `git`
+    /// composed out of a URL, and `askpass.appendPrompt` takes no `Grants` at
+    /// all.
     fn record(self: *GitCredentials, gpa: std.mem.Allocator, io: std.Io, locked: ?*chock_core.arbiter.Locked) void {
         const endpoint = if (self.endpoint) |*one| one else return;
         const handle = locked orelse return;
@@ -9264,22 +5827,13 @@ const GitCredentials = struct {
     }
 };
 
-/// Where a project's git configuration is, for reading a remote's URL.
-///
-/// **The project's own `.git`, and never the session workspace's.** The
-/// workspace is the agent's to write, so a configuration read from it is text
-/// the agent chose. The project root is not mounted writable into any sandbox,
-/// so what is read here is what the person themselves configured. A linked
-/// worktree shares the project's configuration anyway, so this is also the file
-/// `git` would really read.
+/// The project's own `.git`, and never the session workspace's, which is the
+/// agent's to write. A linked worktree shares the project's configuration
+/// anyway, so this is also the file `git` would really read.
 fn projectConfigPath(gpa: std.mem.Allocator, project_root: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}/.git/config", .{project_root});
 }
 
-/// True when every byte could be part of a host name. **A host reaches a
-/// prompt a person reads and a terminal a person watches**, and it comes out of
-/// a file, so it is checked rather than trusted. `askpass.actionInto` refuses
-/// what it cannot build an action from; this refuses what it cannot print.
 fn isPlainHost(host: []const u8) bool {
     if (host.len == 0 or host.len > chock_broker.askpass.max_host_bytes) return false;
     for (host) |byte| {
@@ -9289,143 +5843,47 @@ fn isPlainHost(host: []const u8) bool {
     return true;
 }
 
-/// What the agent is told when the remote cannot be read.
-///
-/// **Named alternatives, because that is what makes a model adapt**, which is
-/// the rule `git_shim.hostReachingRefusal` keeps and which was measured on the
-/// refusal of a shell name.
 const unreadable_remote_text = "git push was not run: chock could not read which remote this " ++
     "push goes to, and it will not guess. A credential is armed from the remote's scheme, so a " ++
     "remote it cannot read is one it cannot arm the right thing for. Name the remote's URL on " ++
     "the command line, as in git push https://host/project.git HEAD:main, and run it again.";
 
-/// What the agent is told when the push needs the person's ssh agent and there
-/// is none.
 const no_agent_text = "git push was not run: this remote authenticates with an ssh key, and " ++
     "there is no ssh agent for chock to proxy. chock never copies a key into the sandbox, so an " ++
     "agent is the only way a key can sign for it. Start one and add the key, as in ssh-add, and " ++
     "run chock again. An https remote is prompted for instead and needs no agent.";
 
-/// What the agent is told when the socket could not be opened at all.
 const no_socket_text = "git push was not run: chock could not open the socket the credential " ++
     "travels on. Nothing was sent anywhere. This is a fault on this machine and not a refusal.";
 
-/// What the agent is told when chock cannot find its own binary to bind in as
-/// the askpass helper.
 const no_helper_text = "git push was not run: chock could not resolve its own path, so it " ++
     "could not put the password helper inside the sandbox. This is a fault on this machine and " ++
     "not a refusal.";
 
-/// What the agent is told by a runner that was given no way to arm a
-/// credential at all.
-///
-/// **A wiring this file forgot is a loud failure and never a silent grant.**
-/// The same direction `GitToolRunner.asker` takes when it is null.
 const credentials_not_wired_text = "git push was not run: this session has no way to hold a " ++
     "credential, so nothing could authenticate. This is a fault in how the session was started " ++
     "and not a refusal. Report it, and work with what is already in the workspace.";
 
-/// What the agent is told when the person was asked and typed nothing.
-///
-/// **This is a refusal and it says so.** A person who pressed Enter with
-/// nothing typed, or who pressed Ctrl-C, has declined, and a message that
-/// blamed the machine would send a model looking for something to fix.
 const nothing_typed_text = "git push was not run: chock asked for the password and nobody " ++
     "typed one, so the push was declined. Nothing was sent anywhere. Ask the user whether they " ++
     "want this push to happen at all before trying it again.";
 
-/// A `ToolRunner` that reads a `run_command` call for a git command line
-/// before it runs, and answers the subcommands that cannot work inside the
-/// sandbox at all itself. Everything else goes straight through to `inner`,
-/// unchanged.
-///
-/// **This is the git shim, wired in where a tool call actually happens.**
-/// `lib/chock-broker/git_shim.zig` says at length what it is and what it is
-/// not: it prevents a mistake, it is not a boundary, and nothing here treats it
-/// as one. The capability layers are what stop an attack, and they stop the
-/// same things whether this runner is in the way or not.
-///
-/// ## The approval half is wired, and this is where it happens
-///
-/// **This comment used to say the opposite, at length, and every claim in it
-/// is now false.** It said the approval half could not be wired because
-/// `ToolRunner.dispatch` is handed no lock on the session log, because nobody
-/// could answer a question asked while `Loop.run` holds that lock, and because
-/// a subcommand reaching a host fails inside the sandbox whatever anybody
-/// answers. A stale comment arguing for the old behaviour is how a fix gets
-/// reverted, so here is what is true instead:
-///
-/// * `chock_core.arbiter.Asker` carries an arbiter and the loop's own locked
-///   handle, and `chock_core.Loop.GiveLocked` hands that handle over once,
-///   right after `Loop.run` takes it. `GiveLockedToAll` is what fills it in
-///   here. So a question asked from inside a tool call is written through the
-///   handle the loop already holds, and nothing opens the log a second time.
-/// * A question asked mid turn does reach a person. `Approvers` gives the
-///   broker the display when bare `chock` brought one up, and the approval
-///   socket otherwise, so `chock approve` answers from another process. This
-///   is the same seam `chock_core.mcp.Session.dispatch` and
-///   `chock_core.plugin.Session.dispatch` already ask on for every call, and
-///   **there is deliberately no second way to ask** built here.
-/// * A subcommand that reaches a host no longer fails for want of a network.
-///   The sandbox reaches whatever host this project's `net.connect` rules
-///   name. See `chock_broker.git_shim.hostReachingRefusal`, which now blames
-///   the thing that is actually missing.
-///
-/// ## What a yes gets, and the one thing it does not
-///
-/// A yes runs the real git **inside the sandbox**, which is the only act this
-/// runner can carry out and the whole of what
-/// `lib/chock-broker/git_shim.zig`'s own top comment promises a user.
-///
-/// **A subcommand that reaches another host is asked about and still does not
-/// run, even approved.** An act that leaves the sandbox is performed on the
-/// host out of a payload that names the effect, and nothing builds such a
-/// payload for a git subcommand yet: the shim reads an argument vector, and an
-/// argument vector holds no object id, no lease and no remote URL, so the shim
-/// must not invent one. `git push` in particular needs the credential half
-/// too, which is `src/askpass.zig` and `lib/chock-broker/askpass.zig` waiting
-/// on a caller that opens an `askpass.Endpoint`. Until that lands, an approved
-/// host-reaching subcommand is told what is missing rather than told no: see
-/// `hostReachingRefusal`, and `docs/status.md`.
-///
-/// ## A project with no `chock.zon` gains no prompt
-///
-/// `lib/chock-policy/defaults.zig` ships `.allow` for every git action name
-/// the shim can build for a subcommand that changes only the session's own
-/// workspace, `git.commit` among them. That is not a softening of this runner:
-/// it is what keeps the promise `docs/status.md` already makes, and it is a
-/// shipped default, so a project's own `chock.zon` overrides any of it with
-/// one line.
+/// A `ToolRunner` that reads a `run_command` call for a git command line before
+/// it runs. It prevents a mistake and it is not a boundary: the capability layers
+/// stop the same things whether this runner is in the way or not. A subcommand
+/// that reaches another host is asked about and still does not run, even
+/// approved, because an act that leaves the sandbox needs a payload naming the
+/// effect and an argument vector holds no object id, no lease and no remote URL.
 const GitToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// Who decides, and the log handle the question and the answer travel
-    /// through.
-    ///
-    /// **Null refuses every subcommand the shim classifies, and says nobody
-    /// could be asked.** That is the same direction
-    /// `chock_core.mcp.Session.asker` takes, and for the same reason: a wiring
-    /// this file forgot is then a loud failure and never a silent grant. See
-    /// `chock_core.arbiter.Asker.decide`.
     asker: ?chock_core.arbiter.Asker = null,
-    /// What arms the credential of one approved push, or null for a runner
-    /// that cannot arm one at all.
-    ///
-    /// **Null refuses every push and says what is missing.** That is the same
-    /// direction `asker` above takes: a wiring this file forgot is a loud
-    /// failure and never a silent grant.
     credentials: ?*GitCredentials = null,
-    /// The project this session works on, for reading a remote's URL out of
-    /// the person's own git configuration. See `projectConfigPath`.
     project_root: []const u8 = "",
 
     fn runner(self: *GitToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Take the session's own locked handle. **Called by `GiveLockedToAll`,
-    /// which is what `chock_core.Loop.GiveLocked` reaches**, once, before the
-    /// first turn. A runner whose `asker` was never named has nothing to fill
-    /// in and still refuses.
     fn giveLocked(self: *GitToolRunner, locked: *chock_core.arbiter.Locked) void {
         if (self.asker) |*one| one.locked = locked;
     }
@@ -9439,17 +5897,9 @@ const GitToolRunner = struct {
         call: chock_proto.event.ToolCall,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *GitToolRunner = @ptrCast(@alignCast(ptr));
-        // **On every path out, whichever one it is.** A socket that outlived
-        // the act it was opened for is the one thing this whole design exists
-        // to stop, so the closing is a `defer` over both branches below and
-        // never a line at the end of the happy one. It does nothing at all
-        // when no push was armed, which is every other call.
         defer self.finishPush(gpa, io);
 
         if (try self.gitAnswer(gpa, io, call)) |output| {
-            // The same shape an ordinary refused tool call already has: an
-            // `is_error` result the model reads and answers, never an error
-            // that ends the session. See `chock_core.Loop.runTool`.
             return .{
                 .call_id = try gpa.dupe(u8, call.call_id),
                 .output = output,
@@ -9460,12 +5910,6 @@ const GitToolRunner = struct {
         return self.inner.dispatch(gpa, io, call);
     }
 
-    /// Write what the sockets did into the log, then close them.
-    ///
-    /// **The record comes first and the closing second**, because the endpoint
-    /// is what kept the prompts: see `GitCredentials.record`, and
-    /// `lib/chock-core/idle.zig` for why they could not be written while the
-    /// call was still running.
     fn finishPush(self: *GitToolRunner, gpa: std.mem.Allocator, io: std.Io) void {
         const creds = self.credentials orelse return;
         if (creds.armed_call == null) return;
@@ -9473,18 +5917,6 @@ const GitToolRunner = struct {
         creds.disarm(gpa, io);
     }
 
-    /// What the agent is told instead of running `call`, or null when this call
-    /// reaches the real git. Owned by the caller.
-    ///
-    /// A call this cannot read at all reads as "not a git call": the argument
-    /// vector is `run_command`'s own to check, and `chock_core.tools` already
-    /// says what is wrong with one it cannot parse. Two readers of the same
-    /// arguments giving two different complaints is worse than one.
-    ///
-    /// **Nothing is asked about a read only subcommand.** `classify` answers
-    /// `run_the_real_git` for those and this returns before it reaches the
-    /// seam, so `git status` and `git log` cost a session exactly what they
-    /// cost before the approval half existed.
     fn gitAnswer(
         self: *GitToolRunner,
         gpa: std.mem.Allocator,
@@ -9501,10 +5933,8 @@ const GitToolRunner = struct {
 
         const argv = parsed.value.argv;
         if (argv.len == 0) return null;
-        // `argv[0]` is a bare program name resolved on the PATH, and
-        // `chock_core.tools` refuses any spelling with a slash in it before
-        // this runner is reached, so there is one spelling of git to match
-        // here.
+        // `chock_core.tools` refuses any spelling with a slash in it before this
+        // runner is reached, so there is one spelling of git to match here.
         if (!std.mem.eql(u8, argv[0], "git")) return null;
 
         const ask = switch (chock_broker.git_shim.classify(argv)) {
@@ -9512,12 +5942,6 @@ const GitToolRunner = struct {
             .ask => |a| a,
         };
 
-        // **Every string a question carries comes out of the shim.** The
-        // action name is the key `lib/chock-policy` matches and the log
-        // records, and the two texts are the ones `git_shim.decide` already
-        // builds for the broker's own route to the same question. One wording
-        // and not two, so the two routes cannot drift apart on what a person
-        // is shown.
         const action = try ask.actionName(gpa);
         defer gpa.free(action);
         const summary = try chock_broker.git_shim.summaryOf(gpa, ask);
@@ -9529,45 +5953,24 @@ const GitToolRunner = struct {
             .action = action,
             .summary = summary,
             .detail = detail,
-            // A `run_command` call carries no reason of its own:
-            // `event.ToolCall` has no field for one. The same empty reason
-            // `chock_core.mcp.Session.askAbout` sends, rather than a sentence
-            // this file would have to invent on the model's behalf.
             .reason = "",
-            // **The tool the agent called, which is part of the policy key.**
-            // `run_command`, and never the subcommand: the subcommand is
-            // already the action.
             .tool = call.tool,
             .tool_call_id = call.call_id,
             .source = chock_broker.git_shim.request_source,
         });
 
-        // **One refusal sentence, written in one place.**
-        // `chock_core.arbiter.refusalText` is the same text the loop and both
-        // third party tool sessions give, so a git subcommand refused here
-        // reads exactly like any other refused act.
         if (!answer.permitted) return try chock_core.arbiter.refusalText(gpa, action, answer);
 
-        // **An approved push runs, and this is where its credential is
-        // armed.** Exactly one of the two is opened, chosen from the remote's
-        // own scheme, and it is closed again in `finishPush` whatever happens
-        // next. See `GitCredentials`.
         if (std.mem.eql(u8, ask.subcommand, "push")) {
             return try self.armPush(gpa, io, call, ask.rest);
         }
 
-        // Every other subcommand that has to reach a host is asked about and
-        // still does not run. See this struct's own top comment: the act that
-        // reaches the host is not built for those, and the honest answer names
-        // what is missing rather than implying the yes was a no.
         if (chock_broker.git_shim.needsNetwork(ask.subcommand)) {
             return try chock_broker.git_shim.hostReachingRefusal(gpa, ask.subcommand);
         }
         return null;
     }
 
-    /// Arm what this push needs, or answer what to tell the agent instead.
-    /// Null means the real git runs.
     fn armPush(
         self: *GitToolRunner,
         gpa: std.mem.Allocator,
@@ -9583,42 +5986,10 @@ const GitToolRunner = struct {
     }
 };
 
-/// A `ToolRunner` that asks the language server about a file the agent just
-/// wrote, and appends what it said to that call's own result. Everything else
-/// goes straight through to `inner`, unchanged and untouched.
-///
-/// **This is the diagnostics half of the language server, wired in where a tool
-/// call actually happens**, and `lib/chock-core/lsp.zig` holds every decision
-/// behind it: where the server runs, why the agent cannot drive it, how much
-/// reaches the model, and what a session with no server costs.
-///
-/// ## Why here and not inside the registry
-///
-/// Same reason as `ProvisionToolRunner` next door, one step further along the
-/// same argument. `chock_core.tools.Registry` runs one tool call inside a
-/// sandbox and knows nothing that outlives one call, and a language server is
-/// long lived and stateful by definition: it indexes a project once and answers
-/// from that index for the rest of the session. So the thing that holds it is
-/// the caller that owns the session, and the registry never hears about it.
-///
-/// ## What decides whether the seam is reached at all
-///
-/// **`session.server` is null unless this project's own `chock.zon` names a
-/// language server**, and null is the ordinary case. This runner is still
-/// reached on every write, answers null before it touches a seam, and hands
-/// the tool result back byte for byte as the tool built it: no process starts,
-/// nothing waits, and nothing is added to the context. `runSession` fills the
-/// three fields in from `chock_core.lsp_driver.Settings` when a project has
-/// one, and leaves every one of them at its default when it has not.
-///
-/// The wiring is also where the argument about **when** diagnostics are
-/// collected lives: after the write, before the model's next turn, on the
-/// result of the call that made the change.
+/// A language server is long lived and stateful and the registry knows nothing
+/// that outlives one call, so the caller that owns the session holds it.
 const DiagnosticToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// The session's own language server, and what it has already said. Not
-    /// owned: the caller keeps it alive for as long as this value is in use,
-    /// the same borrowing every other runner here already asks for.
     session: *chock_core.lsp.Session,
 
     fn runner(self: *DiagnosticToolRunner) chock_core.Loop.ToolRunner {
@@ -9636,15 +6007,8 @@ const DiagnosticToolRunner = struct {
         const self: *DiagnosticToolRunner = @ptrCast(@alignCast(ptr));
         const result = try self.inner.dispatch(gpa, io, call);
 
-        // **A call that failed wrote nothing**, so there is nothing new to say
-        // about the file and the refusal it already carries is the whole
-        // answer. Checked before the path is even read, so a failed write costs
-        // exactly what it cost before this runner existed.
         if (result.is_error) return result;
 
-        // A result this function does not hand back is a result nobody frees.
-        // `chock_core.Loop.runTool` owns exactly these two fields, and it never
-        // sees one this runner gave up on part way through.
         errdefer {
             gpa.free(result.call_id);
             gpa.free(result.output);
@@ -9657,9 +6021,6 @@ const DiagnosticToolRunner = struct {
         const block = (try self.session.afterWrite(gpa, io, path)) orelse return result;
         defer gpa.free(block);
 
-        // The one allocation this runner makes to the result. `output` came
-        // from this same `gpa`, through every runner below: see
-        // `chock_core.Loop.runTool`, which frees exactly these two fields.
         const joined = try std.mem.concat(gpa, u8, &.{ result.output, block });
         gpa.free(result.output);
 
@@ -9669,40 +6030,12 @@ const DiagnosticToolRunner = struct {
     }
 };
 
-/// Answers a call to a tool an MCP server supplies, and passes every other
-/// call straight through to `inner`, unchanged and untouched.
-///
-/// **Outside every runner that reads a tool name and acts on it**, so a name a
-/// third party program chose never reaches the sandbox runner, the git shim or
-/// the provisioner. None of those has any reason to see a name Chock does not
-/// own. `PluginToolRunner` is one layer further out still, for the same reason
-/// and with the same shape, and the two lists cannot collide: see
-/// `reservedNames`.
-///
-/// ## Why a wrapper and not a tool of the registry
-///
-/// The same reason `DiagnosticToolRunner` next door gives, one step further
-/// along. `chock_core.tools.Registry` runs one tool call inside one sandbox
-/// and knows nothing that outlives one call. An MCP server is a process that
-/// lives as long as the session and holds state, so the thing that holds it is
-/// the caller that owns the session, and the registry never hears about it.
-///
-/// ## A session with no MCP server passes every call through, and that is the
-/// whole of what it costs
-///
-/// `chock_core.mcp.Session.dispatch` answers null for a name no server
-/// declared, which every call of such a session is, and null costs one walk of
-/// an empty list. See `startMcp`, which builds the empty session for a project
-/// that named none.
+/// Outside every runner that reads a tool name and acts on it, so a name a third
+/// party program chose never reaches the sandbox runner, the git shim or the
+/// provisioner.
 const McpToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// The session's own MCP servers. Not owned: the caller keeps them alive
-    /// for as long as this value is in use, the same borrowing every other
-    /// runner here already asks for.
     state: *McpState,
-    /// Whether a server has already been reported as having changed its tool
-    /// list. **Said once**, the rule `chock_core.lsp.Session` keeps for a
-    /// server that stopped answering.
     said_changed: bool = false,
 
     fn runner(self: *McpToolRunner) chock_core.Loop.ToolRunner {
@@ -9722,32 +6055,17 @@ const McpToolRunner = struct {
         const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
             return self.inner.dispatch(gpa, io, call);
 
-        // A server may have said its tools changed while that call was being
-        // answered. **Read here and never acted on**: see `startMcp`, and see
-        // `lib/chock-core/mcp.zig` on the ratchet.
         self.noteWidening();
 
-        // `chock_core.Loop.runTool` owns exactly `call_id` and `output` and
-        // frees both, the same contract every other runner here answers under.
         errdefer gpa.free(outcome.text);
         return .{
             .call_id = try gpa.dupe(u8, call.call_id),
             .output = outcome.text,
             .is_error = outcome.is_error,
-            // The cut, when there was one, is already marked inside the text:
-            // see `chock_core.mcp.textForModel`. This field says a result was
-            // cut short **before it reached the event**, which is a different
-            // fact and not this one.
             .truncated = false,
         };
     }
 
-    /// Say, one time, that a server proposed a widening this session cannot
-    /// take.
-    ///
-    /// **A person needs this line and the agent must not.** A project owner
-    /// whose server gained a tool has to know why the agent cannot see it, and
-    /// telling the agent instead would name a tool it can never call.
     fn noteWidening(self: *McpToolRunner) void {
         if (self.said_changed) return;
         var index: usize = 0;
@@ -9766,46 +6084,25 @@ const McpToolRunner = struct {
     }
 };
 
-/// Everything this session's MCP servers need to stay alive, in one value the
-/// caller owns.
-///
-/// **The arrays are fixed and never reallocated.** A `chock_core.mcp.Server`
-/// points at the driver beside it, and that driver points at the helper beside
-/// it, so a list that grew would move both out from under the pointers.
-/// `chock_core.mcp.max_servers` is what `chock_core.mcp.parse` already
-/// refuses above, so a project cannot ask for more than there is room for.
+/// The arrays are fixed and never reallocated: a `chock_core.mcp.Server` points
+/// at the driver beside it and that driver at the helper beside it, so a list
+/// that grew would move both out from under the pointers.
 const McpState = struct {
-    /// Every offer, and the decision taken about it once, at the start.
     session: chock_core.mcp.Session,
-    /// Where the mount trees, the argv, the tool list and the second system
-    /// prompt live. They outlive every tool call and end with the session, the
-    /// same reason `provision_arena` next door has one of its own.
     arena: std.heap.ArenaAllocator,
 
     helpers: [chock_core.mcp.max_servers]chock_core.helper.Helper = undefined,
     drivers: [chock_core.mcp.max_servers]chock_core.mcp_driver.Driver = undefined,
-    /// One network broker per server, for the servers this project's policy
-    /// let out. See `chock_broker.network.Network`, which decides each
-    /// connection, and `startMcp`, which is the caller it was built for.
     networks: [chock_core.mcp.max_servers]chock_broker.network.Network = undefined,
     transports: [chock_core.mcp.max_servers]chock_broker.network.System = undefined,
     records: [chock_core.mcp.max_servers]chock_core.mcp.Server = undefined,
-    /// How many of the arrays above are built. **Only these are touched by
-    /// `deinit`**, because the rest are `undefined`.
     count: usize = 0,
 
     fn init(gpa: std.mem.Allocator) McpState {
         return .{ .session = .init(gpa), .arena = .init(gpa) };
     }
 
-    /// **Ends every server, then waits for it.** A helper writes below the
-    /// session scratchpad that phase 3 is about to remove, the same hazard the
-    /// task table and the language server already wait for: see
-    /// `chock_core.helper.Helper.deinit`.
     fn deinit(self: *McpState, io: std.Io) void {
-        // **The allocator the brokers were given.** `init` builds the arena on
-        // it, so this is the same one, and a network diagnostic is freed with
-        // the allocator that filled it.
         const gpa = self.arena.child_allocator;
 
         var index: usize = 0;
@@ -9813,13 +6110,9 @@ const McpState = struct {
             self.helpers[index].deinit(io);
             self.drivers[index].deinit();
 
-            // **A refused connection has no other moment to be read.** The
-            // network broker answers from inside `Sandbox.spawn`, with the
-            // session's own loop waiting on that call, so nothing can print
-            // when it happens: see `chock_broker.network.Network.diagnostic`,
-            // which is the only place a reason goes. Saying nothing here would
-            // leave a project owner with a server that quietly reaches nothing
-            // and no way to find out which rule is missing.
+            // A refused connection has no other moment to be read: the network
+            // broker answers from inside `Sandbox.spawn`, with the session's own
+            // loop waiting on that call, so nothing can print when it happens.
             const network = &self.networks[index];
             if (network.refused != 0) {
                 tty.print(
@@ -9839,22 +6132,8 @@ const McpState = struct {
     }
 };
 
-/// What this project's policy says about one action a third party supplies,
-/// folded over the whole spawn chain.
-///
-/// The same shape and the same reasoning as `provisionDecision` above, through
-/// `chock_policy.table.evaluateChain`, which is the one function that applies
-/// it. **`chock-core` evaluates no policy table**, which is why this lives here
-/// and reaches the library through `chock_core.mcp.Decider`.
-///
-/// **One of these answers for MCP and for plugins alike.**
-/// `chock_core.plugin.Decider` *is* `chock_core.mcp.Decider`, on purpose: the
-/// question a policy table answers does not change with who asked it, and a
-/// second shape of the same thing would be a second thing to keep in step.
 const TablePolicy = struct {
     policy: *const chock_policy.table.Table,
-    /// Every agent kind from the root of the spawn tree down to this session,
-    /// root first. Built once, because it is the same for every question.
     chain: []const []const u8,
     agent_kind: []const u8,
     model: []const u8,
@@ -9870,17 +6149,11 @@ const TablePolicy = struct {
         return self.answer(tool, action);
     }
 
-    /// Answer one question. Its own function, taking ordinary values, so
-    /// `startMcp` can ask about a server's network without going through a
-    /// vtable for it.
     fn answer(
         self: *TablePolicy,
         tool: []const u8,
         action: []const u8,
     ) chock_policy.table.Decision {
-        // A chain the policy reader cannot fold answers `ask`, which is
-        // already the safe answer. Said out loud because a chain this shape
-        // means the log holds something Chock did not write.
         var fault: ?chock_policy.table.ChainFault = null;
         const decision = self.policy.evaluateChain(self.chain, .{
             .agent_kind = self.agent_kind,
@@ -9893,44 +6166,12 @@ const TablePolicy = struct {
     }
 };
 
-/// Reads a URL for the agent, and is what makes `fetch_url` a tool that does
-/// something rather than one that says it cannot.
-///
-/// **The decision is not here.** `chock_broker.fetch.Session` holds it: which
-/// host a policy row permits, which redirect hop may be followed, and what a
-/// site's own `robots.txt` says. This is the join between that and
-/// `chock_core.fetch.Fetcher`, which is the seam the loop holds because
-/// `chock-core` reads no policy table.
-///
-/// ## Why the loop calls this and not a tool runner
-///
-/// A promise binds a fetch, and the promises of a session live in the fold of
-/// its log. See `chock_core.Loop.runFetch`, and `chock_core.fetch`'s own top
-/// comment.
-///
-/// ## The promises of the sessions above this one are read once
-///
-/// **A promise a parent made has to reach its children, or it is worth
-/// nothing**, which is the whole argument `promisesFor` makes. They are read at
-/// session start rather than per call, and that is exact rather than a saving:
-/// a parent is blocked inside its own `spawn_agent` call for the whole life of
-/// a child, so it can make no new promise while this session runs. This
-/// session's own promises are not read here at all. They arrive on every call
-/// from the loop's own fold, which is the only reading that is current in the
-/// middle of a turn.
-///
-/// ## The robots cache belongs to the session
-///
-/// One `robots.txt` per site per session, so reading five pages of one manual
-/// costs six requests and not ten. `chock_broker.fetch.Robots` is where it
-/// lives, and this value is what keeps it alive.
+/// The promises of the sessions above this one are read at session start rather
+/// than per call, which is exact: a parent is blocked inside its own
+/// `spawn_agent` call for the whole life of a child.
 const SessionFetcher = struct {
     gpa: std.mem.Allocator,
-    /// The decision and the hop loop. Owned here, because the `robots.txt`
-    /// cache inside it lasts the session.
     session: chock_broker.fetch.Session,
-    /// Every promise the sessions above this one made, in an arena that
-    /// outlives the session. Empty for a session a person started.
     ancestors: []const chock_policy.ratchet.Restriction = &.{},
 
     fn deinit(self: *SessionFetcher) void {
@@ -9951,25 +6192,16 @@ const SessionFetcher = struct {
     ) chock_core.fetch.Error!chock_core.fetch.Answer {
         const self: *SessionFetcher = @ptrCast(@alignCast(ptr));
 
-        // The tool the agent called is one of the four parts of a policy key,
-        // and it comes from the call rather than from a constant here, so a
-        // rule that names a tool means the tool that really asked.
         self.session.tool = ask.tool;
 
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        // This session's own promises, which the loop folded a moment ago, and
-        // the ones every session above it made. Both are ceilings, so the order
-        // they are in changes nothing.
         var promised: std.ArrayList(chock_policy.ratchet.Restriction) = .empty;
         try promised.appendSlice(arena, ask.self_policy);
         try promised.appendSlice(arena, self.ancestors);
 
-        // Why a page was not read, for the person watching. The agent is told
-        // by `Outcome.refused`, which is a different sentence for a different
-        // reader: see `lib/chock-broker/fetch.zig`.
         var diag: ?chock_broker.Diagnostic = null;
         defer if (diag) |*one| one.deinit(self.gpa);
 
@@ -9979,10 +6211,6 @@ const SessionFetcher = struct {
         }, &diag);
         defer outcome.deinit(self.gpa);
 
-        // **It travels on the result and not to standard error.** It used to
-        // be printed here, which put it on a second stream, out of order with
-        // the result it explains, and out of the log, so a replay lost it. See
-        // `chock_proto.event.ToolResult.note`.
         const note: []u8 = if (diag) |*one|
             try std.fmt.allocPrint(gpa, "{f}", .{one})
         else
@@ -10004,38 +6232,9 @@ const SessionFetcher = struct {
     }
 };
 
-/// Start this project's MCP servers, ask each one what tools it has, and
-/// answer the tool list and the system prompt the session runs with.
-///
-/// **A project that named no server returns before it does anything**, with
-/// the list and the prompt phase 1 already built, unchanged. That is the first
-/// rule of `lib/chock-core/mcp.zig` and it is the cheap path, not the
-/// exceptional one.
-///
-/// ## The network is a rule and never a flag
-///
-/// A server keeps `Sandbox.Config.network` at `none`, which is what a tool
-/// call and a language server get and is strictly safer. A server reaches the
-/// network only when this project's policy answers `allow` for
-/// `mcp.<server>.network`, and even then it reaches nothing until a
-/// `net.connect.*` rule names a host: `lib/chock-broker/network.zig` answers
-/// every connection against the same table, per connection, for the whole
-/// session.
-///
-/// ## Nothing here fails the session
-///
-/// A server that could not be prepared, would not start, or was too slow to
-/// list its tools is reported once and dropped, and the session runs on with
-/// whatever it did get. A fault in a third party program must never end a
-/// session that is doing real work, which is the rule
-/// `chock_nix.provision.resolve` and `chock_core.lsp` already follow.
-/// The spawn chain `chock_policy.table.evaluateChain` wants: the parents and
-/// this session, in that order.
-///
-/// The same shape `provisionDecision` builds, and for the same reason: a
-/// session cannot state its own parents. **One function, because two callers
-/// need it** and a chain built one link short is a session folding its parent's
-/// kind and not its grandparent's.
+/// A server keeps `Sandbox.Config.network` at `none` and reaches the network only
+/// when this project's policy answers `allow` for `mcp.<server>.network`, and
+/// even then reaches nothing until a `net.connect.*` rule names a host.
 fn policyChain(
     keep: std.mem.Allocator,
     started: *const Started,
@@ -10073,9 +6272,6 @@ fn startMcp(
     for (settings) |one| {
         std.debug.assert(state.count < chock_core.mcp.max_servers);
 
-        // **The same sandbox a tool call gets**, built by the same two
-        // functions `chock_core.tools.Registry.dispatchWith` uses, so a server
-        // reaches nothing a tool call cannot.
         const prepared = blk: {
             const with_store = chock_core.tools.withStore(
                 keep,
@@ -10106,10 +6302,6 @@ fn startMcp(
         var config = prepared.config;
         const index = state.count;
 
-        // Built for every server, whether it is let out or not, so `deinit`
-        // never reads one that was left `undefined`. Attaching it to the
-        // config is what gives a server a channel, and that is the line
-        // below.
         state.transports[index] = .{};
         state.networks[index] = .{
             .gpa = gpa,
@@ -10118,18 +6310,10 @@ fn startMcp(
             .chain = chain,
             .agent_kind = options.agent_kind,
             .model = started.model,
-            // **The server's own name, and not one of its tools.** The socket
-            // belongs to the process, which outlives every call through it, so
-            // the tool part of a `net.connect` key names the server a rule is
-            // about.
             .tool = one.name,
             .transport = state.transports[index].transport(),
         };
 
-        // **`Network.none` unless a rule says otherwise.** See this function's
-        // own doc comment: a flag would be a second policy system, and a
-        // default of `filtered` would hand a third party program the one thing
-        // the sandbox exists to withhold.
         var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
         const net_action = chock_core.mcp.networkActionInto(&buffer, one.name).?;
         if (policy.answer(one.name, net_action) == .allow) {
@@ -10141,10 +6325,6 @@ fn startMcp(
             );
         }
 
-        // **The page allocator, and never `gpa`.** The helper's own thread is
-        // inside `Sandbox.spawn` while this session's threads allocate, and
-        // `fork` carries only the calling thread: see
-        // `chock_core.helper.Helper.arena`.
         state.helpers[index] = chock_core.helper.Helper.init(std.heap.page_allocator);
         state.drivers[index] = chock_core.mcp_driver.Driver.init(
             gpa,
@@ -10157,10 +6337,6 @@ fn startMcp(
 
     state.session.servers = state.records[0..state.count];
 
-    // **One round trip per server, before any work, and it is bounded.** A
-    // server that is slow to answer delays the start of every session that
-    // names it, so it is dropped rather than waited on: see
-    // `chock_core.mcp.discovery_budget_ns`.
     var discovery = std.heap.ArenaAllocator.init(gpa);
     defer discovery.deinit();
 
@@ -10186,18 +6362,12 @@ fn startMcp(
         };
         try state.session.admit(server, declared, policy.decider());
         if (server.failure) |reason| {
-            // The one refusal that takes a whole server with it, and the
-            // reason a person most needs to hear: a server that tried to take
-            // the name of one of Chock's own tools.
             tty.print(.warn, "chock: the MCP server {s}: {s}\n", .{ server.name, reason });
         }
     }
 
     reportMcpOffers(&state.session);
 
-    // The built-in list first, in the order the enum gives, and the MCP tools
-    // after it. The same slice fills `Request.tools` and the prompt's own tool
-    // list, so the model never hears a name it cannot call.
     var list: std.ArrayList(chock_core.tools.Definition) = .empty;
     try list.appendSlice(keep, started.tool_definitions);
     try state.session.appendDefinitions(keep, &list);
@@ -10212,12 +6382,6 @@ fn startMcp(
     return .{ definitions, prompt };
 }
 
-/// Say what the MCP servers gave this session, and what was turned away.
-///
-/// **A tool the model can call is a fact a person should see**, because it is
-/// a program nobody here wrote acting inside their session. A tool that was
-/// refused is worth a line too: a project that wrote a rule and still has no
-/// tool needs to know which of the two went wrong.
 fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
     if (session.isEmpty()) return;
 
@@ -10229,11 +6393,6 @@ fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
         if (offer.decision != .allow) asking += 1;
     }
     tty.detail("chock: {d} MCP tools in this session\n", .{offered});
-    // **A person needs this line, because the count above no longer says it.**
-    // A tool whose row is `ask`, `agent_review` or `agent_then_human` is
-    // offered to the model and decided one call at a time, so it is in the
-    // count and it will still stop and ask: see
-    // `chock_core.mcp.Session.dispatch`.
     if (asking != 0) tty.detail(
         "chock: {d} of them ask before each call, because this project's policy does not allow them outright\n",
         .{asking},
@@ -10248,60 +6407,20 @@ fn reportMcpOffers(session: *const chock_core.mcp.Session) void {
     }
 }
 
-// A plugin is the second third party that supplies tools, and everything below
-// is the shape MCP already has one file up: the same runner, in the same place
-// in the chain, over the same `Decider`. What is different is stated where it
-// is different, and there are only two things:
-//
-// * **There is no discovery round trip.** A plugin's tool list is read out of
-//   its own module file with no engine at all, so a plugin that is never called
-//   starts no process: see `chock_core.plugin_module`.
-// * **The host process runs guest code**, and a wasm guest owns the address
-//   space of the process that runs it in the engine this project has. So the
-//   sandbox it gets is built by taking things away, and `plugin_host.lockdown`
-//   is that: see `startPlugins`.
+// A plugin's tool list is read out of its own module file with no engine at all,
+// so a plugin that is never called starts no process. A wasm guest owns the
+// address space of the process that runs it in the engine this project has, so
+// its sandbox is built by taking things away.
 
-/// Where the plugin host program's module is bound inside its own sandbox.
-///
-/// **A fixed path and not the project's own.** The module is the only file this
-/// process opens by name, and a fixed target means the path a plugin host reads
-/// says nothing about where the person keeps their work.
 const plugin_module_target = "/plugin.wasm";
 
-/// Where `chock` itself is bound inside a plugin host process's own sandbox.
-///
-/// **The program one plugin runs inside is this program**, started under
-/// `chock_core.plugin_host.verb`. There is no second program to find, which is
-/// what makes a plugin survive an install that copies one file: see that
-/// declaration for the whole argument.
 const plugin_host_target = "/chock";
 
-/// Answers a call to a tool a plugin supplies, and passes every other call
-/// straight through to `inner`, unchanged and untouched.
-///
-/// **The same shape and the same position as `McpToolRunner`**, which is the
-/// point: a tool a third party supplies is a tool a third party supplies, and a
-/// second shape of the same wrapper would be a second thing to keep in step.
-/// This one is outside the MCP runner, so a name a plugin declared reaches
-/// nothing else at all.
-///
-/// **The order of the two is not what keeps them apart.** No plugin tool can
-/// take a name an MCP server already declared: `startPlugins` fills
-/// `chock_core.plugin.Session.reserved` with what MCP got first, and a plugin
-/// tool of that name is refused with a reason the model reads. So the two lists
-/// are disjoint before either runner sees a call.
-///
-/// ## A session with no plugin passes every call through
-///
-/// `chock_core.plugin.Session.dispatch` answers null for a name no plugin
-/// declared, which every call of such a session is, and null costs one walk of
-/// an empty list. See `startPlugins`, which builds the empty session for a
-/// project that named none.
+/// Outside the MCP runner, so a name a plugin declared reaches nothing else at
+/// all. `startPlugins` fills `chock_core.plugin.Session.reserved` with what MCP
+/// got first, so the two lists are disjoint before either runner sees a call.
 const PluginToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// The session's own plugins. Not owned: the caller keeps them alive for as
-    /// long as this value is in use, the same borrowing every other runner here
-    /// already asks for.
     state: *PluginState,
 
     fn runner(self: *PluginToolRunner) chock_core.Loop.ToolRunner {
@@ -10321,53 +6440,29 @@ const PluginToolRunner = struct {
         const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
             return self.inner.dispatch(gpa, io, call);
 
-        // `chock_core.Loop.runTool` owns exactly `call_id` and `output` and
-        // frees both, the same contract every other runner here answers under.
         errdefer gpa.free(outcome.text);
         return .{
             .call_id = try gpa.dupe(u8, call.call_id),
             .output = outcome.text,
             .is_error = outcome.is_error,
-            // The cut, when there was one, is already marked inside the text:
-            // see `chock_core.mcp.textForModel`, which a plugin result goes
-            // through as well. This field says a result was cut short **before
-            // it reached the event**, which is a different fact and not this
-            // one.
             .truncated = false,
         };
     }
 };
 
-/// Everything this session's plugins need to stay alive, in one value the
-/// caller owns.
-///
-/// **The arrays are fixed and never reallocated**, for the reason `McpState`
-/// gives: a `chock_core.plugin.Loaded` points at the driver beside it, and that
-/// driver points at the helper beside it, so a list that grew would move both
-/// out from under the pointers. `chock_core.plugin.max_plugins` is what
-/// `chock_core.plugin.parse` already refuses above, so a project cannot ask for
-/// more than there is room for.
 const PluginState = struct {
-    /// Every offer, and the decision taken about it once, at the start.
     session: chock_core.plugin.Session,
-    /// Where the mount trees, the argv, the tool list and the second system
-    /// prompt live. They outlive every tool call and end with the session.
     arena: std.heap.ArenaAllocator,
 
     helpers: [chock_core.plugin.max_plugins]chock_core.helper.Helper = undefined,
     drivers: [chock_core.plugin.max_plugins]chock_core.plugin_host.Driver = undefined,
     records: [chock_core.plugin.max_plugins]chock_core.plugin.Loaded = undefined,
-    /// How many of the arrays above are built. **Only these are touched by
-    /// `deinit`**, because the rest are `undefined`.
     count: usize = 0,
 
     fn init(gpa: std.mem.Allocator) PluginState {
         return .{ .session = .init(gpa), .arena = .init(gpa) };
     }
 
-    /// **Ends every host process, then waits for it.** The same rule `McpState`
-    /// keeps, for the same reason: a helper writes below the session scratchpad
-    /// that phase 3 is about to remove.
     fn deinit(self: *PluginState, io: std.Io) void {
         var index: usize = 0;
         while (index < self.count) : (index += 1) {
@@ -10380,34 +6475,9 @@ const PluginState = struct {
     }
 };
 
-/// Read this project's plugins, decide about every tool they declare, and
-/// answer the tool list and the system prompt the session runs with.
-///
-/// **A project that named no plugin returns before it does anything**, with the
-/// list and the prompt it was given, unchanged. That is the first rule of
-/// `lib/chock-core/plugin.zig`, and it is the cheap path and not the
-/// exceptional one.
-///
-/// `definitions` and `prompt` are what the session has so far, which is phase
-/// 1's own pair for a project with no MCP server and `startMcp`'s answer for a
-/// project with one. **Plugins come last**, so an MCP server that is already in
-/// the session keeps every name it declared: see `reservedNames`.
-///
-/// ## Nothing here starts a process
-///
-/// A plugin's tool list, the capabilities each tool declares and the policy
-/// decision about each one are all read out of the module's own file, before
-/// one byte of guest code has run. `chock_core.plugin_host.Driver` starts the
-/// host process on the **first call** of a tool, so a project that names a
-/// plugin and never uses it pays for a file read and nothing else.
-///
-/// ## Nothing here fails the session
-///
-/// A plugin whose module could not be read, whose name the policy key language
-/// refuses, or whose tools the policy denies is reported once and dropped, and
-/// the session runs on with whatever it did get. The rule
-/// `chock_nix.provision.resolve`, `chock_core.lsp` and `startMcp` already
-/// follow.
+/// Plugins come last, so an MCP server already in the session keeps every name it
+/// declared. Nothing here starts a process: the host process starts on the first
+/// call of a tool.
 fn startPlugins(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -10421,12 +6491,9 @@ fn startPlugins(
 ) std.mem.Allocator.Error!struct { []chock_core.tools.Definition, []const u8 } {
     const settings = started.plugins orelse return .{ definitions, prompt };
 
-    // **There is no plugin on Darwin today**, because a plugin host is a
-    // sandboxed process and `Sandbox.spawn` refuses there. Said once, at the
-    // start, and never as a tool the model is offered and cannot use: a wrong
-    // tool costs a turn calling it and a turn reading the failure, which is
-    // worse than a tool that is not there. `chock_core.mcp` reaches the same
-    // answer by way of a discovery round trip that cannot happen.
+    // There is no plugin on Darwin today, because a plugin host is a
+    // sandboxed process and `Sandbox.spawn` refuses there. Said once, and
+    // never as a tool the model is offered and cannot use.
     if (builtin.target.os.tag != .linux) {
         tty.print(
             .warn,
@@ -10446,13 +6513,6 @@ fn startPlugins(
         .model = started.model,
     };
 
-    // **The program a plugin runs inside is this program.** Nothing is looked
-    // for beside `chock`, so nothing can be missing: `chock` re-execs itself
-    // under a hidden word, the way it already does for a subagent. See
-    // `chock_core.plugin_host.verb`.
-    //
-    // A machine that cannot say where its own program is cannot run a sandbox
-    // either, so this is said once and the session goes on without plugins.
     const host_path = try chock_core.plugin_host.selfProgramPath(keep, io, started.exe_path) orelse {
         tty.print(
             .warn,
@@ -10468,10 +6528,6 @@ fn startPlugins(
     for (settings) |one| {
         std.debug.assert(state.count < chock_core.plugin.max_plugins);
 
-        // **Resolved, and not only joined.** The path is bound into a mount
-        // tree, and `chock_sandbox.namespace` takes an absolute path or
-        // nothing: a relative one is a hard failure of the whole session rather
-        // than one plugin that did not load.
         const named = if (std.fs.path.isAbsolute(one.module))
             one.module
         else
@@ -10486,9 +6542,6 @@ fn startPlugins(
             continue;
         };
 
-        // The module's own bytes, read on the host with no engine anywhere
-        // near them. They are wanted only until `admit` has copied what it
-        // keeps, so they live in an arena of this loop's own.
         var reading = std.heap.ArenaAllocator.init(gpa);
         defer reading.deinit();
         const bytes = std.Io.Dir.cwd().readFileAlloc(
@@ -10506,9 +6559,6 @@ fn startPlugins(
             continue;
         };
 
-        // **The sandbox before the decision.** Everything that can fail is done
-        // before the session is told about a tool, so a tool the model is
-        // offered always has a host to reach.
         const config = try pluginSandbox(
             keep,
             io,
@@ -10551,9 +6601,6 @@ fn startPlugins(
         read.deinit();
 
         if (failure) |why| {
-            // The refusals that take a whole plugin with them, and the one a
-            // person most needs to hear: a plugin that tried to take the name
-            // of one of Chock's own tools.
             tty.print(
                 .warn,
                 "chock: the plugin {s} is not in this session, because {s}\n",
@@ -10562,10 +6609,9 @@ fn startPlugins(
             continue;
         }
 
-        // **Every capability its offered tools declared, and no other.** The
-        // list is fixed on argv before the process exists, so nothing the guest
-        // does and nothing on the pipe can widen it: see
-        // `chock_core.plugin_engine.gate` and `src/plugin-host.zig`.
+        // Every capability its offered tools declared, and no other. The list is
+        // fixed on argv before the process exists, so nothing the guest does and
+        // nothing on the pipe can widen it.
         const capabilities = try chock_core.plugin_engine.unionOfCapabilities(
             keep,
             &state.session,
@@ -10574,10 +6620,6 @@ fn startPlugins(
         const argv = try pluginArgv(keep, capabilities);
 
         const index = state.count;
-        // **The page allocator, and never `gpa`.** The helper's own thread is
-        // inside `Sandbox.spawn` while this session's threads allocate, and
-        // `fork` carries only the calling thread: see
-        // `chock_core.helper.Helper.arena`.
         state.helpers[index] = chock_core.helper.Helper.init(std.heap.page_allocator);
         state.drivers[index] = chock_core.plugin_host.Driver.init(
             gpa,
@@ -10593,9 +6635,6 @@ fn startPlugins(
 
     if (state.session.isEmpty()) return .{ definitions, prompt };
 
-    // The list the session already had first, in the order it already had, and
-    // the plugin tools after it. The same slice fills `Request.tools` and the
-    // prompt's own tool list, so the model never hears a name it cannot call.
     var list: std.ArrayList(chock_core.tools.Definition) = .empty;
     try list.appendSlice(keep, definitions);
     try state.session.appendDefinitions(keep, &list);
@@ -10612,18 +6651,8 @@ fn startPlugins(
     };
 }
 
-/// The tool names this session already holds when the plugins are read: every
-/// tool an MCP server declared and the policy allowed.
-///
-/// **Two suppliers of tools reach one model through one name space.** A name
-/// that meant one thing to the runner chain and another to the person reading
-/// the list is worse than a tool that is not offered, so the supplier that is
-/// already in the session keeps its names and a plugin tool of the same name is
-/// refused with a reason the model reads. See
-/// `chock_core.plugin.Session.reserved`.
-///
-/// A refused MCP tool is not in the list: it is offered to nobody, so there is
-/// nothing for a plugin to collide with.
+/// The supplier already in the session keeps its names, and a plugin tool of the
+/// same name is refused with a reason the model reads.
 fn reservedNames(
     keep: std.mem.Allocator,
     mcp_session: *const chock_core.mcp.Session,
@@ -10636,19 +6665,6 @@ fn reservedNames(
     return names.toOwnedSlice(keep);
 }
 
-/// The command line one plugin host process is started with.
-///
-/// **Every word here is a path inside that process's own sandbox**, and not a
-/// path on this machine: `plugin_host_target` is where `chock` itself is bound
-/// and `plugin_module_target` is where the plugin's module is.
-///
-/// **The second word is what makes `chock` a plugin host and not a session.**
-/// It is read from `chock_core.plugin_host.verb`, which is also what
-/// `src/main.zig` dispatches on, so the two cannot drift apart.
-///
-/// The capabilities come last, and they are the whole of what the gate in the
-/// host process will allow. They are on argv because argv is fixed before that
-/// process exists: see `chock_core.plugin_engine.gate`.
 fn pluginArgv(
     keep: std.mem.Allocator,
     capabilities: []const []const u8,
@@ -10661,31 +6677,11 @@ fn pluginArgv(
     return argv.toOwnedSlice(keep);
 }
 
-/// The sandbox one plugin host process runs in.
-///
-/// **Built by taking things away from the config a tool call gets**, which is
-/// the only way to be sure a plugin reaches nothing a tool call cannot: see
-/// `chock_core.plugin_host.lockdown`, which takes the network and every rule
-/// away and keeps only what is named here, read only.
-///
-/// Three paths, and no fourth:
-///
-/// * **The host program**, bound at `plugin_host_target` with the execute
-///   right. Without that right `execve` on it is refused before one instruction
-///   runs: the Landlock ruleset handles execute for every path, which is the
-///   same fact `test/sandbox/probe.zig` records for its own probe binary.
-/// * **The plugin's module**, bound read only at `plugin_module_target`. It is
-///   the one file this process opens by name.
-/// * **This session's store paths**, read only, exactly as they already are for
-///   every tool call. The host program this project builds is statically linked
-///   (measured on 2026-08-23), so it needs none of this itself; a build that
-///   links it against the store resolves its loader here rather than failing to
-///   start with nothing to read.
-///
-/// **The workspace is not one of them.** Its mounts come through, because the
-/// mount tree is the caller's, and a mount with no rule is present and
-/// unreachable. So a plugin reads neither the project nor anything the session
-/// writes.
+/// The sandbox one plugin host process runs in, built by taking things away from
+/// the config a tool call gets. The host program carries the execute right,
+/// without which `execve` on it is refused before one instruction runs. The
+/// workspace is not in it: its mounts come through with no rule, present and
+/// unreachable.
 fn pluginSandbox(
     keep: std.mem.Allocator,
     io: std.Io,
@@ -10696,9 +6692,6 @@ fn pluginSandbox(
     module_path: []const u8,
 ) std.mem.Allocator.Error!sandbox.Config {
     var base = workspace_config;
-    // **Not the project directory.** A plugin host opens the one file it was
-    // given, by an absolute path, and a working directory inside the workspace
-    // would be a directory this process has no rule for anyway.
     base.cwd = "/";
     base.rules = &.{};
 
@@ -10719,9 +6712,8 @@ fn pluginSandbox(
 
     var reach: std.ArrayList(sandbox.Config.Rule) = .empty;
     try reach.appendSlice(keep, with_store.rules);
-    // A file and not a directory, so the rule cannot carry the `read_dir`
-    // right: `landlock_add_rule` answers EINVAL for a directory right over a
-    // file. See `chock_sandbox.landlock.AccessFs.read_only_file`.
+    // A file and not a directory, so the rule cannot carry the `read_dir` right:
+    // `landlock_add_rule` answers EINVAL for a directory right over a file.
     try reach.append(keep, .{
         .path = plugin_host_target,
         .access = .{ .execute = true, .read_file = true },
@@ -10736,12 +6728,6 @@ fn pluginSandbox(
     return config;
 }
 
-/// Say what the plugins gave this session, and what was turned away.
-///
-/// **A tool the model can call is a fact a person should see**, because it is a
-/// module nobody here wrote acting inside their session. A tool that was
-/// refused is worth a line too: a project that wrote a rule and still has no
-/// tool needs to know which of the two went wrong.
 fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
     if (session.isEmpty()) return;
 
@@ -10753,8 +6739,6 @@ fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
         if (offer.decision != .allow) asking += 1;
     }
     tty.detail("chock: {d} plugin tools in this session\n", .{offered});
-    // The same line `reportMcpOffers` prints, for the same reason: see
-    // `chock_core.plugin.Session.dispatch`.
     if (asking != 0) tty.detail(
         "chock: {d} of them ask before each call, because this project's policy does not allow them outright\n",
         .{asking},
@@ -10769,89 +6753,17 @@ fn reportPluginOffers(session: *const chock_core.plugin.Session) void {
     }
 }
 
-/// Answers `provide_tool` and passes every other call straight through.
-///
-/// ## Why this is a wrapper and not a tool of the registry
-///
-/// `chock_core.tools.Registry` runs one tool call inside a sandbox and knows
-/// nothing that outlives one call. Provisioning is the opposite of that: it
-/// changes the toolchain of the whole session, and it has to run `nix` on the
-/// host, outside every sandbox. So it takes the road `spawn_agent` already
-/// takes, one layer further out: the registry refuses the call and says why,
-/// and the caller that owns the session answers it. See
-/// `chock_core.tools.provision_needs_a_session`, and `GitToolRunner` next
-/// door, which is the same shape for a different reason.
-///
-/// ## The mount set really does change while the session is live, and here is why
-///
-/// **Measured, not assumed.** There is no long lived sandbox. Every tool call
-/// builds its own `sandbox.Config` inside `Registry.dispatchWith`, out of
-/// `chock_core.tools.Context.store_paths`, and `Sandbox.spawn` runs once per
-/// call. So a store path added between two tool calls is mounted by the
-/// second one, with nothing restarted. That is why this holds a pointer to
-/// the very `Context` the sandbox runner dispatches with, rather than a copy.
-///
-/// Three things it does not reach, and each one is said in the answer the
-/// model reads rather than left for the model to find out:
-///
-/// * **A background task already running.** `chock_core.tasks.Table.start`
-///   deep copies the `sandbox.Config` on purpose, so a task that started
-///   before the program was provisioned runs in the mount set it started
-///   with.
-/// * **A subagent already running.** A child is its own process with its own
-///   dev shell, and its parent's toolchain is not part of what it inherits.
-/// * **The next session.** Nothing here is written to the dev shell cache: a
-///   provisioned program lasts for this session and no longer. That is a
-///   decision. What a project needs every time belongs in `flake.nix`, which is
-///   the first rule of a toolchain, and a cache that grew by whatever any agent
-///   ever asked for would quietly become the toolchain nobody declared.
-///
-/// ## An `Io` of its own, for the same reason a subagent gets one
-///
-/// Phase 2 runs on an `Io` that cannot spawn a process. `nix` is a process,
-/// on the host, so this builds one `std.Io.Threaded` of its own for the
-/// length of the resolution and takes it down again, **backed by the page
-/// allocator**, never by the session's own. See `SubagentSpawner`, which
-/// states the reason in full: a background task's thread may be inside
-/// `Sandbox.spawn` at that moment, and a lock held by another thread at a
-/// `fork` is a lock the child inherits as held forever.
-///
-/// ## It blocks the turn, and it is not a background task
-///
-/// `chock_core.tasks` exists and is proven, and a build of minutes is the
-/// shape it handles. It is not used here, and the reason is the answer's
-/// destination: a background task's result is drained by `Loop` at a safe
-/// point and handed to the **model**, and this answer has to reach the
-/// **mount set** that the dispatch on this very thread is about to read. A
-/// second thread writing `Context.store_paths` while a dispatch reads it is a
-/// race on a slice, and the publish would still have to happen at a point
-/// this runner does not sit under. A model that has to poll for its own
-/// toolchain is also worse to use than one that is told "it is there now".
-///
-/// So the turn waits, and a line is printed first, which is the same
-/// treatment `DevShell.load`'s own slow evaluation gets. **There is no
-/// deadline on it**: `Ctrl-C` reaches the `nix` child, because nothing here
-/// puts it in a process group of its own, exactly as it reaches a subagent.
+/// There is no long lived sandbox: every tool call builds its own
+/// `sandbox.Config`, so a store path added between two calls is mounted by the
+/// second. It reaches neither a background task already running, which deep
+/// copied its config, nor a subagent, nor the next session.
 const ProvisionToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// Null when this session cannot provision, which is the case where the
-    /// model was never told the tool exists. A call that arrives anyway is
-    /// refused here rather than passed down, because the registry below would
-    /// answer with `provision_needs_a_session`, which names the wrong reason.
     settings: ?Provisioning,
-    /// Where everything a provisioned program leaves behind is kept: the
-    /// store paths, the `bin` directories, and the names already asked for.
-    /// Owned by `runSession`, and freed when the session ends.
     arena: std.mem.Allocator,
-    /// The environment `nix` itself runs with: the host's own, so `nix` reads
-    /// the user's own configuration and the user's own flake registry.
     host_env: *const std.process.Environ.Map,
     environ: std.process.Environ,
-    /// What this session mounts and what its `PATH` holds. Shared with
-    /// `NixBuildToolRunner`: see `SessionMounts`.
     mounts: *SessionMounts,
-    /// Every program name already provisioned, so asking twice costs nothing
-    /// and says so.
     already: std.ArrayList([]const u8) = .empty,
 
     fn runner(self: *ProvisionToolRunner) chock_core.Loop.ToolRunner {
@@ -10917,8 +6829,6 @@ const ProvisionToolRunner = struct {
             };
         }
 
-        // Before the wait, because a resolution can take minutes and a silent
-        // terminal looks like a session that has stopped.
         tty.print(.plain, "chock: resolving {s} with nix, which can take some time\n", .{program});
 
         const resolved = self.resolveWithNix(settings, program) catch |err| return .{
@@ -10941,9 +6851,6 @@ const ProvisionToolRunner = struct {
 
         try self.adopt(program, provided);
 
-        // The closure it needed and the whole mount set, because the two are
-        // different numbers and the difference is the point: most of a new
-        // package's closure is already there. See `ProvisionToolRunner.paths`.
         tty.print(.plain, "chock: {s} is in the toolchain, {d} store paths, {d} mounted in all\n", .{
             program,
             provided.store_paths.len,
@@ -10963,8 +6870,6 @@ const ProvisionToolRunner = struct {
         };
     }
 
-    /// Take a resolved program into this session's toolchain, and remember
-    /// that this name is now answered.
     fn adopt(
         self: *ProvisionToolRunner,
         program: []const u8,
@@ -10974,9 +6879,6 @@ const ProvisionToolRunner = struct {
         try self.already.append(self.arena, try self.arena.dupe(u8, program));
     }
 
-    /// Run the two `nix` commands on an `Io` of this call's own. See this
-    /// type's own doc comment for why the `Io` is built here and why it is
-    /// backed by the page allocator.
     fn resolveWithNix(
         self: *ProvisionToolRunner,
         settings: Provisioning,
@@ -10986,8 +6888,6 @@ const ProvisionToolRunner = struct {
         defer threaded.deinit();
         const io = threaded.io();
 
-        // Why `nix` could not be run, which the library used to print for
-        // itself and this runner could only repeat as an error name.
         var run_diag: ?chock_nix.Diagnostic = null;
         defer if (run_diag) |*d| d.deinit(self.arena);
         var host = chock_nix.provision.Host{
@@ -11003,13 +6903,10 @@ const ProvisionToolRunner = struct {
             return err;
         };
 
-        // Held against the garbage collector as soon as it exists, and before
-        // the model is told it is there. `nix build --no-link` leaves no root
-        // of its own, so a `nix-collect-garbage` between now and the next tool
-        // call would take a toolchain the agent has already been promised.
-        // The same reasoning `chock_nix.store.addRoots` carries for the dev
-        // shell, and a failure is said out loud and is not fatal for the same
-        // reason.
+        // Held against the garbage collector before the model is told it is
+        // there. `nix build --no-link` leaves no root of its own, so a
+        // `nix-collect-garbage` before the next tool call would take a toolchain
+        // the agent has already been promised.
         if (answer == .provided) self.rootProvided(io, settings, program, answer.provided);
         return answer;
     }
@@ -11025,7 +6922,6 @@ const ProvisionToolRunner = struct {
         const dir = settings.root_dir orelse return;
 
         const link_prefix = providedRootPrefix(self.arena, dir, program) catch return;
-        // What `nix-store` said, which the library used to print for itself.
         var diag: ?chock_nix.Diagnostic = null;
         defer if (diag) |*d| d.deinit(self.arena);
         chock_nix.store.addRoots(
@@ -11056,61 +6952,25 @@ const ProvisionToolRunner = struct {
     }
 };
 
-/// What this session mounts, and what its tool calls resolve `argv[0]`
-/// against.
-///
-/// **One of these per session, and two runners write to it.**
-/// `ProvisionToolRunner` adds a package the model asked for by name, and
-/// `NixBuildToolRunner` adds what a build produced. Each keeping a list of
-/// its own would leave each publishing a slice the other's additions are
-/// missing from, and the last one to write would be the whole mount set.
-///
-/// Everything here is allocated from `arena`, which `runSession` owns and
-/// which ends with the session: a store path the sandbox mounts on the last
-/// turn was allocated on the turn it was adopted.
 const SessionMounts = struct {
     arena: std.mem.Allocator,
-    /// The context the sandbox runner dispatches with. `store_paths` is
-    /// repointed at `paths` below every time something is adopted.
     context: *chock_core.tools.Context,
-    /// The environment a tool call resolves `argv[0]` against. **This is the
-    /// map the sandbox runner holds a pointer to**, so a `PATH` written here
-    /// is the `PATH` the next call resolves against.
     tool_env: *std.process.Environ.Map,
-    /// Every store path this session mounts: the dev shell's, one closure per
-    /// provisioned program, and one per build. Grows only.
-    ///
-    /// **Held with no repeats, and that is not tidiness.** A new package's
-    /// closure and the dev shell's overlap almost entirely, because both start
-    /// at the same libc, so appending one whole would bind most of the
-    /// toolchain a second time. `withStore` builds one bind mount and one
-    /// Landlock rule per entry, so a repeat is a mount of the same source on
-    /// the same target, on every tool call, for the rest of the session.
+    /// Every store path this session mounts, with no repeats. A new package's
+    /// closure and the dev shell's overlap almost entirely, and `withStore`
+    /// builds one bind mount and one Landlock rule per entry.
     paths: std.ArrayList([]const u8) = .empty,
-    /// The membership half of `paths`, so adding a closure of thirty thousand
-    /// entries costs one lookup each rather than a walk of the list each.
     mounted: std.StringHashMapUnmanaged(void) = .empty,
 
-    /// Take what Nix produced into this session's toolchain.
-    ///
-    /// **This is the whole of "the mount set changes while the session is
-    /// live".** Two writes, and both are read by the next tool call and by
-    /// nothing that is already running: the store paths the sandbox binds, and
-    /// the `PATH` `argv[0]` is resolved against. See `ProvisionToolRunner`'s
-    /// own doc comment for what those two do not reach.
     fn adopt(
         self: *SessionMounts,
         provided: chock_nix.provision.Provided,
     ) std.mem.Allocator.Error!void {
         for (provided.store_paths) |path| try self.mount(path);
-        // The pointer the sandbox runner reads, repointed at the grown list.
-        // A slice of an `ArrayList` is only valid until it grows again, so
-        // this is done after every append and never cached anywhere else.
         self.context.store_paths = self.paths.items;
         try self.extendPath(provided.bin_dirs);
     }
 
-    /// Add one store path to the mount set, once. See `paths`.
     fn mount(self: *SessionMounts, path: []const u8) std.mem.Allocator.Error!void {
         const entry = try self.mounted.getOrPut(self.arena, path);
         if (entry.found_existing) return;
@@ -11118,21 +6978,10 @@ const SessionMounts = struct {
         try self.paths.append(self.arena, path);
     }
 
-    /// Take the paths this session starts with: the dev shell's own, or the
-    /// whole store for a project that states no toolchain. Called once, by
-    /// `runSession`, before the first turn.
     fn start(self: *SessionMounts, paths: []const []const u8) std.mem.Allocator.Error!void {
         for (paths) |path| try self.mount(path);
     }
 
-    /// Put `dirs` at the front of the `PATH` a tool call resolves `argv[0]`
-    /// against.
-    ///
-    /// **At the front, so the newest answer wins.** A program that is already
-    /// on the path was already found, so the order only decides what happens
-    /// when an agent adds a package that carries a program the dev shell also
-    /// has. Taking the new one is the honest reading of a request that named
-    /// it.
     fn extendPath(self: *SessionMounts, dirs: []const []const u8) std.mem.Allocator.Error!void {
         var joined: std.ArrayList(u8) = .empty;
         for (dirs) |dir| {
@@ -11144,19 +6993,9 @@ const SessionMounts = struct {
     }
 };
 
-/// Where the garbage collector root links of one provisioned program go.
-/// Caller owns the result.
-///
-/// **The program's own name is in it, and that is not decoration.**
 /// `nix-store --add-root` names its links after the prefix it is given, so two
 /// programs sharing one prefix means the second call replaces the first one's
-/// links, and a program the agent is still using stops being held. The name is
-/// safe in a path because `chock_nix.provision.checkName` has already refused
-/// every character that is not a letter, a digit, `-`, `_`, `+` or `.`.
-///
-/// The prefix starts with `chock_nix.DevShell.root_link_name`, read from
-/// there, so a new evaluation of the dev shell releases these too: see that
-/// constant's own doc comment.
+/// links and a program the agent is still using stops being held.
 fn providedRootPrefix(
     arena: std.mem.Allocator,
     dir: []const u8,
@@ -11169,52 +7008,16 @@ fn providedRootPrefix(
     });
 }
 
-/// What a `provide_tool` call gets when the session cannot provision at all.
-/// The model is not offered the tool in that case, so this is for a model that
-/// named it out of nowhere. It says the one thing that is true and useful:
-/// stop, and use what is here.
 const provisioning_is_off = "no program was provisioned: this session cannot add one. Do the " ++
     "work with a program the toolchain already has, and do not run apt, npm, pip, cargo or " ++
     "brew, because none of them can work in this sandbox.";
 
-/// Answers `nix_eval` and passes every other call straight through.
-///
-/// ## Why this is a wrapper and not a tool of the registry
-///
-/// The same reason `ProvisionToolRunner` above is one, from the other side.
-/// `chock_core.tools.Registry` runs one tool call inside a sandbox, and an
-/// evaluation runs in this process, outside every sandbox, against a store
-/// cap read out of the project's own policy at session start. A registry
-/// holds neither the evaluator nor the cap, so it refuses the call and says
-/// why, and this answers it. See
-/// `chock_core.tools.nix_eval_needs_a_session`.
-///
-/// ## Store writes stay off, and that is a decision
-///
-/// fix writes nothing to a store until a caller asks for it, and this caller
-/// does not ask. An evaluation that says what a derivation is computes the
-/// derivation path itself, with no daemon, no store mount and no object
-/// written anywhere: see `lib/chock-nix/eval.zig`'s own test. Turning writes
-/// on would buy nothing here and would put the bytes of every derivation an
-/// expression touches through this process.
-///
-/// **The driver is still installed, and `Seam.refusing` is what it is given.**
-/// An evaluation that reaches for a store then gets a refusal that names the
-/// path, which is what import from derivation needs: fix reports the store
-/// error text and nothing else about why the import stopped, so a model that
-/// read a subjectless failure would send the same expression again. See
-/// `nixEvalRefusal`.
-///
-/// ## One session per call
-///
-/// An engine holds every value it answered, so a session that lived for the
-/// whole run would grow with every call the agent made. A call is bounded in
-/// depth and in what it renders, and building an engine is cheap beside a
-/// sandbox, so each call gets its own and drops it.
+/// An evaluation runs in this process, outside every sandbox. Store writes stay
+/// off, and the driver is installed with `Seam.refusing`, so an evaluation that
+/// reaches for a store gets a refusal that names the path, which import from
+/// derivation needs. One engine per call, because an engine holds every value.
 const NixEvalToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// Null when this session cannot evaluate. The model is not offered the
-    /// tool then, so a call that arrives anyway is refused here.
     settings: ?NixEval,
 
     fn runner(self: *NixEvalToolRunner) chock_core.Loop.ToolRunner {
@@ -11272,19 +7075,10 @@ const NixEvalToolRunner = struct {
     }
 };
 
-/// What one `nix_eval` call of this session may see and may take.
 const NixEval = struct {
-    /// The one directory a pure evaluation may read: the workspace this
-    /// session's tool calls already work in, and never the user's own
-    /// project. An expression that names any other path is refused by fix
-    /// itself: see `lib/chock-nix/eval.zig`.
     workspace_root: []const u8,
-    /// What the project, the operator and the org bundle between them let an
-    /// evaluation put in the store. See `resolveNixCaps`.
     caps: chock_policy.nix.Resolved,
 
-    /// The driver one call of this session answers through: nothing is
-    /// authorised, and the object cap is the one the policy folded.
     fn driverFor(self: NixEval, gpa: std.mem.Allocator) chock_nix.backend.Driver {
         var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
         applyNixCaps(&driver, self.caps);
@@ -11335,12 +7129,6 @@ const NixEval = struct {
     }
 };
 
-/// Why an evaluation did not answer, in words a model can act on.
-///
-/// **The store refusal is read first, and it is the one that names a path.**
-/// An expression that imports a derivation stops inside the store backend,
-/// and fix reports the store's own text and nothing else, so the driver's
-/// last refusal is the only place the derivation is named.
 fn nixEvalRefusal(
     gpa: std.mem.Allocator,
     session: *chock_nix.eval.Session,
@@ -11380,62 +7168,23 @@ fn nixEvalRefusal(
     var said: std.Io.Writer.Allocating = .init(gpa);
     defer said.deinit();
     session.writeDiagnostics(&said.writer, expression) catch {};
-    // Empty for a runtime fault, which is what the error name alone has to
-    // carry: see `chock_nix.eval.Session.writeDiagnostics`.
     if (said.written().len != 0) try text.print(gpa, "\n{s}", .{said.written()});
     return text.toOwnedSlice(gpa);
 }
 
-/// What a `nix_eval` call gets when the session cannot evaluate at all. The
-/// model is not offered the tool in that case, so this is for a model that
-/// named it out of nowhere.
 const nix_eval_is_off = "nothing was evaluated: this session cannot evaluate a Nix expression. " ++
     "Work from what is in the project instead.";
 
-/// What one `nix_build` call of this session may see, may take, and may run.
 const NixBuild = struct {
-    /// The one directory a pure evaluation may read, and the flake a call
-    /// that names none builds from: the workspace this session's tool calls
-    /// already work in, and never the user's own project.
     workspace_root: []const u8,
-    /// What the project, the operator and the org bundle between them let an
-    /// evaluation put in the store. See `resolveNixCaps`.
     caps: chock_policy.nix.Resolved,
-    /// The absolute path of `nix` on the host, found once at the start.
     nix_program: []const u8,
-    /// The absolute path of `nix-store`, which holds a build against the
-    /// garbage collector. Null when the machine has none, which is said out
-    /// loud and is not fatal.
     nix_store_program: ?[]const u8,
-    /// Where the garbage collector root links go, or null when this session
-    /// has no directory of its own for them.
     root_dir: ?[]const u8,
-    /// The Nix daemon socket the derivation of a build is written to, before
-    /// the host is told to realise it. See `chock_nix.build.Writing`.
     store_endpoint: []const u8,
-    /// This project's flake inputs, fetched on the host at the start of the
-    /// session under the policy. The evaluation reads them out of the store,
-    /// and a build that wants one this session does not have is refused with
-    /// the reason they are not there.
     inputs: FlakeInputs,
 };
 
-/// Whether this session can build a Nix attribute on the host, and what it
-/// needs to do it. Null when it cannot, with the reason already on screen.
-///
-/// **The machinery only, and no policy here, which is what makes this
-/// different from `provisioningFor`.** A `provide_tool` request is decided
-/// once, before the session starts, because a mid-session question could only
-/// time out then. That is no longer the shape of a tool call: `Loop.gateToolCall`
-/// asks the arbiter on the turn the model calls, and a person can answer. So a
-/// build is decided on its own turn, under the attribute path it names and
-/// under the flake it names when it names one, and this half answers only
-/// whether there is a `nix` to run at all.
-///
-/// A project can still refuse every build with one row, `nix.build.*` at
-/// `deny`. The model is then offered the tool and told no on each call, which
-/// costs a turn: the alternative is to fold a class of rules into a yes or no
-/// before any attribute is known, and a fold like that would have to guess.
 fn nixBuildFor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -11456,76 +7205,30 @@ fn nixBuildFor(
         .nix_program = nix_program,
         .nix_store_program = nix_store_program,
         .root_dir = dev_shell_dir,
-        // The host's own answer, so a machine that moved its socket is
-        // reached at the place its `nix` reads too.
         .store_endpoint = env.get("NIX_DAEMON_SOCKET_PATH") orelse
             chock_nix.build.default_daemon_socket,
         .inputs = inputs,
     };
 }
 
-/// Who answers for a host a Nix build would fetch from.
-///
-/// ## A build's egress has a namespace of its own
-///
-/// A fixed output derivation builds with the network open to it, because its
-/// output hash is checked afterwards. That check is integrity and never
-/// egress: a URL carrying a secret of the workspace in its query string, with
-/// the hash of an innocuous file, passes it, and the request has already gone
-/// out. So every host the closure would reach is named and put to the policy
-/// before `nix` is told to build.
-///
-/// The names are `nix.net` and never `net.connect`, from
-/// `chock_broker.network.nixActionsInto`, which reverses the labels through
-/// the same code `net.connect` uses so `evil.com.example.files` cannot match a
-/// rule an author wrote for `nix.net.com.example.*`. A separate namespace is
-/// what keeps a rule that lets a build fetch from a host from also letting the
-/// agent's own sandbox open a socket to it.
-///
-/// **A host that cannot be named is a refusal.** A caller that cannot build an
-/// action name cannot ask the table, and fetching anyway would reach a host no
-/// rule could ever have named.
+/// A fixed output derivation builds with the network open to it, and its output
+/// hash is integrity and never egress: a URL carrying a secret in its query
+/// string, with the hash of an innocuous file, passes it. The names are `nix.net`
+/// and never `net.connect`, so a rule that lets a build fetch from a host does
+/// not let the agent's own sandbox open a socket to it.
 const NixFetchGate = struct {
-    /// What a build that fetches with no URL is asked under. Fixed segments,
-    /// so nothing a model chose is ever part of the key and one answer covers
-    /// a session rather than one package.
     const opaque_action = chock_broker.network.nix_opaque_action;
 
-    /// What the one question about a build's hosts is asked under. Only the
-    /// hosts no `nix.net` rule covers are ever in it: a rule that allows or
-    /// denies a host is read first, under that host's own name, so this never
-    /// stands in for a decision a project already wrote down.
-    ///
-    /// It has no port, and every host name this file builds ends in one, so
-    /// no host can ever write this name.
     const many_action = chock_broker.network.nix_action_prefix ++ ".hosts";
 
-    /// This tool call's own, for the question and for nothing that outlives
-    /// it. A refusal comes from the allocator `permit` is given, which is the
-    /// session's, because the build reads it after this call is over.
     gpa: std.mem.Allocator,
     io: std.Io,
     asker: ?chock_core.arbiter.Asker,
-    /// The `<flake ref>#<attribute>` the model asked for, which is what a
-    /// person reading the question wants to see.
     installable: []const u8,
     call: chock_proto.event.ToolCall,
-    /// What is being fetched. It picks the phase half of every name and the
-    /// words a person reads, and nothing else differs between the two.
     kind: Kind = .derivation,
-    /// The policy table, for the one question that must not prompt: which
-    /// mirror of a site a rule already permits. **Null answers no**, so a
-    /// session that wired none asks about the first mirror of the file rather
-    /// than taking one nobody answered for. See `Rule`.
     rule: ?Rule = null,
 
-    /// What reads a rule without asking anybody.
-    ///
-    /// **The same table the arbiter reads, and never a second answer to the
-    /// same question.** What this picks still goes through `permit`, so the
-    /// broker decides and the log holds the answer. The shape is
-    /// `DevicePolicySeam`'s, and for the same reason: a decision this cheap
-    /// needs no question.
     const Rule = struct {
         policy: *const chock_policy.table.Table,
         chain: []const []const u8,
@@ -11533,17 +7236,11 @@ const NixFetchGate = struct {
         model: []const u8,
     };
 
-    /// Which of a build's two fetches this question is about.
     const Kind = enum {
-        /// A fixed output derivation of the closure, which fetches while the
-        /// build runs.
         derivation,
-        /// An input of the flake, which is fetched on the host before the
-        /// attribute can be evaluated at all.
         flake_input,
     };
 
-    /// The half of the namespace this gate's questions are named under.
     fn phase(self: *const NixFetchGate) chock_broker.network.NixPhase {
         return switch (self.kind) {
             .derivation => .build,
@@ -11551,8 +7248,6 @@ const NixFetchGate = struct {
         };
     }
 
-    /// Both names for one host, borrowed from the buffers. Null when the host
-    /// is not a name a rule can be written for.
     fn namesOf(
         self: *const NixFetchGate,
         scoped: []u8,
@@ -11579,26 +7274,9 @@ const NixFetchGate = struct {
         .permit_site = permitSiteFn,
     };
 
-    /// Decide every host of one build.
-    ///
-    /// ## One question, and the rules are not collapsed
-    ///
-    /// A nixpkgs closure reaches a hundred distinct hosts. A hundred questions
-    /// is one decision and ninety nine keystrokes, and by the tenth nobody is
-    /// reading the host name, which is worse for safety than one question
-    /// somebody actually reads.
-    ///
-    /// So the table is read for every host first, under that host's own two
-    /// `nix.net` names. **A host a rule already allows is decided there and
-    /// never appears in the question**, and a host a rule
-    /// denies refuses the build with nobody asked. Only the hosts no rule
-    /// covers are left, and those go into one question that names them all.
-    /// A project rule therefore still names one host and still does exactly
-    /// what it did.
-    ///
-    /// A yes covers the hosts of that question, for this build. It is not a
-    /// blanket: the next build reads the table again and asks again about
-    /// whatever it reaches that no rule covers.
+    /// A nixpkgs closure reaches a hundred distinct hosts, and a hundred
+    /// questions is one decision and ninety nine keystrokes. A host a rule
+    /// already allows never appears in the question.
     fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -11616,10 +7294,6 @@ const NixFetchGate = struct {
                 return .{ .refused = try self.unnameable(allocator, one) };
             }
 
-            // **A host a rule already settles is settled now**, under that
-            // host's own name, and it is not in the question. A session with
-            // no table wired reads none of them here and puts them all to the
-            // question, which asks more rather than less.
             if (self.decisionFor(one)) |decision| {
                 if (decision != .ask) {
                     switch (try self.decideOne(allocator, one)) {
@@ -11632,22 +7306,13 @@ const NixFetchGate = struct {
         }
 
         if (asking.items.len == 0) return .permitted;
-        // One host reads the way it always did: a list of one is a worse
-        // question than the sentence it replaces.
         if (asking.items.len == 1) return self.decideOne(allocator, asking.items[0]);
         return self.decideMany(allocator, asking.items);
     }
 
-    /// Whether this build may fetch without saying where it goes.
-    ///
-    /// **Two fixed segments and nothing a model chose.** `opaque_action` can
-    /// never collide with an attribute path the way a name built out of one
-    /// could, and one answer covers the whole build: the derivation names go
-    /// in the words a person reads and never in the key.
-    ///
-    /// The question states the whole of the decision. A fixed output
-    /// derivation's hash still proves the bytes are what the derivation
-    /// expected. What it cannot prove is where the request went.
+    /// Whether this build may fetch without saying where it goes. A fixed
+    /// output derivation's hash still proves the bytes are what the
+    /// derivation expected. What it cannot prove is where the request went.
     fn permitOpaqueFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -11705,7 +7370,6 @@ const NixFetchGate = struct {
         return ruleAnswerOf(self.decisionFor(one) orelse return .unsettled);
     }
 
-    /// One sentence for a host no rule could ever name.
     fn unnameable(
         self: *NixFetchGate,
         allocator: std.mem.Allocator,
@@ -11727,9 +7391,6 @@ const NixFetchGate = struct {
         };
     }
 
-    /// What this project's table answers for `one`, or null when this gate
-    /// was wired no table to read. Two names, most specific first: see
-    /// `NixTableReader`.
     fn decisionFor(
         self: *NixFetchGate,
         one: chock_nix.fetch.Fetch,
@@ -11752,14 +7413,8 @@ const NixFetchGate = struct {
         };
     }
 
-    /// Whether this build may fetch from a mirror set.
-    ///
-    /// One question for the set and never one per mirror. The key is the
-    /// site and the hash of that site's own list, so a rule somebody wrote
-    /// survives a bump to another site's mirrors and stops covering this one
-    /// the moment its list changes. `chooseMirror` has already taken a mirror
-    /// a rule allows and passed over every mirror a rule denies, so what
-    /// reaches here is the candidate nothing settled.
+    /// The key is the site and the hash of that site's own list, so a rule
+    /// somebody wrote stops covering it the moment that list changes.
     fn permitSiteFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -11821,8 +7476,6 @@ const NixFetchGate = struct {
         return .{ .refused = try allocator.dupe(u8, said) };
     }
 
-    /// What a person reads about who asked. See
-    /// `chock_proto.event.ApprovalRequest.source`.
     fn requestSource(self: *const NixFetchGate) []const u8 {
         return switch (self.kind) {
             .derivation => "a Nix build",
@@ -11830,18 +7483,8 @@ const NixFetchGate = struct {
         };
     }
 
-    /// The most hosts one question names in its own summary line, before it
-    /// says how many more there are. The rest are in the detail.
     const hosts_in_summary: usize = 3;
 
-    /// Every host of one build, in one question.
-    ///
-    /// **The summary is what a person sees at the prompt and the detail is
-    /// behind the detail key**, the same two fields every other question in
-    /// this project fills. The detail carries the rule a project would write
-    /// for each host, because that is what stops the question coming back,
-    /// and a hundred of those lines belong behind a key rather than in a
-    /// prompt.
     fn decideMany(
         self: *NixFetchGate,
         allocator: std.mem.Allocator,
@@ -11894,9 +7537,6 @@ const NixFetchGate = struct {
         const said = try chock_core.arbiter.refusalText(self.gpa, many_action, answer);
         defer self.gpa.free(said);
 
-        // **What was refused, by name.** A model that reads a refusal with no
-        // subject sends the same attribute again, and the hosts are what it
-        // has to ask for instead.
         var names: std.ArrayList(u8) = .empty;
         defer names.deinit(self.gpa);
         for (wanted[0..@min(wanted.len, hosts_in_summary)], 0..) |one, index| {
@@ -11910,7 +7550,6 @@ const NixFetchGate = struct {
         ) };
     }
 
-    /// One host, asked and answered the way it always was.
     fn decideOne(
         self: *NixFetchGate,
         allocator: std.mem.Allocator,
@@ -11918,8 +7557,6 @@ const NixFetchGate = struct {
     ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
         var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
         var either: [chock_broker.network.max_action_bytes]u8 = undefined;
-        // The phase scoped name is what the question is put under, because it
-        // is the more specific of the two a rule may cover this host with.
         const action = (self.namesOf(&scoped, &either, one) orelse
             return .{ .refused = try self.unnameable(allocator, one) }).phase;
 
@@ -11955,8 +7592,6 @@ const NixFetchGate = struct {
             .action = action,
             .summary = summary,
             .detail = detail,
-            // A `nix_build` call carries no reason of its own, the same empty
-            // reason `GitToolRunner` sends.
             .reason = "",
             .tool = self.call.tool,
             .tool_call_id = self.call.call_id,
@@ -11964,10 +7599,6 @@ const NixFetchGate = struct {
         });
         if (answer.permitted) return .permitted;
 
-        // **The host and the derivation, then the one refusal sentence every
-        // other refused act in this project gives.** A model that reads a
-        // refusal with no subject asks for the same attribute again, and the
-        // host is what it has to ask for instead.
         const said = try chock_core.arbiter.refusalText(self.gpa, action, answer);
         defer self.gpa.free(said);
         return .{ .refused = switch (self.kind) {
@@ -11985,97 +7616,27 @@ const NixFetchGate = struct {
     }
 };
 
-/// Answers `nix_build` and passes every other call straight through.
-///
-/// ## Why this is a wrapper and not a tool of the registry
-///
-/// Both of the reasons the two runners above it are. The evaluation half runs
-/// in Chock's own process, outside every sandbox, and the build half runs
-/// `nix` on the host and then changes what the next tool call mounts. A
-/// `Registry` holds neither the evaluator nor a value that outlives one call,
-/// so it refuses the name and says why. See
-/// `chock_core.tools.nix_build_needs_a_session`.
-///
-/// ## The three steps, and what each one answers
-///
-/// 1. **Evaluate the attribute**, in this process, with store writes on, and
-///    write the derivation closure into the host store through its daemon.
-///    That is what registers the derivation through
-///    `chock_nix.backend.Driver`, so its produced set can authorise a build
-///    of it, and it is what gives `nix` a path to name. The seam it evaluates
-///    against authorises no build, so import from derivation is refused here
-///    exactly as it is for `nix_eval`.
-/// 2. **The policy has already answered.** `Loop.gateToolCall` put this call
-///    to the policy under `nix.build.<attribute path>`, and under
-///    `nix.build.flake.<reference>` as well when the call named a flake,
-///    before the dispatch reached this file. A call that arrives here was
-///    permitted on every name it carries, and nothing asks a second time.
-/// 3. **Realise on the host**, through `chock_nix.build.realise`, which goes
-///    through the driver's own check and never around it. What the host is
-///    told to build is the derivation path that check authorised, so the
-///    attribute is read once, here. See `lib/chock-nix/build.zig`'s own top
-///    comment for what that proves and what it still does not.
-///
-/// ## What it produced reaches the agent the way a provisioned program does
-///
-/// The outputs join `SessionMounts`, so the next tool call's `sandbox.Config`
-/// binds them and its `PATH` finds them. Nothing is mounted into a running
-/// sandbox and no bytes travel over a socket: there is no long lived sandbox
-/// to mount into. The three things that does not reach are the three
-/// `ProvisionToolRunner` names: a background task already running, a subagent
-/// already running, and the next session.
-///
-/// **A path this session built still asks under `exec.nix.store.*`.**
-/// `Loop.Deps.store_closure` is read from the toolchain this session started
-/// with and never from `Context.store_paths`, so running a program out of a
-/// build the agent asked for is not the same act as running the project's own
-/// toolchain. See `runSession`, which sets that field.
-///
-/// ## It blocks the turn, and an `Io` of its own
-///
-/// The same as `ProvisionToolRunner`, for the same two reasons: the answer has
-/// to reach the mount set the next dispatch reads, and phase 2's `Io` cannot
-/// spawn a process. See that type's own doc comment, which states both in
-/// full.
+/// The attribute is evaluated in this process, with store writes on, and the
+/// derivation closure is written into the host store through its daemon, which
+/// registers the derivation so its produced set can authorise a build of it. A
+/// path this session built still asks under `exec.nix.store.*`, because
+/// `Loop.Deps.store_closure` is read from the toolchain the session started with.
 const NixBuildToolRunner = struct {
     inner: chock_core.Loop.ToolRunner,
-    /// Null when this session cannot build. The model is not offered the tool
-    /// then, so a call that arrives anyway is refused here.
     settings: ?NixBuild,
-    /// Where everything a build leaves behind is kept: the store paths and
-    /// the `bin` directories. Owned by `runSession`.
     arena: std.mem.Allocator,
-    /// The environment `nix` itself runs with: the host's own.
     host_env: *const std.process.Environ.Map,
     environ: std.process.Environ,
-    /// What this session mounts. Shared with `ProvisionToolRunner`.
     mounts: *SessionMounts,
-    /// How many builds this session has taken in, which names their garbage
-    /// collector root links apart. See `builtRootPrefix`.
     builds: usize = 0,
-    /// How much of the host store this session has taken, across every build
-    /// of it. The cap on it comes from `NixBuild.caps` on each call, so what
-    /// survives between calls is the count.
     budget: chock_nix.build.Budget = .{},
-    /// Who answers for a host a build would fetch from, and the log handle
-    /// that question and its answer travel through.
-    ///
-    /// **Null refuses every build whose closure fetches anything, and says
-    /// nobody could be asked.** The same direction `GitToolRunner.asker`
-    /// takes: a wiring this file forgot is a loud failure and never a silent
-    /// connection. See `NixFetchGate`.
     asker: ?chock_core.arbiter.Asker = null,
-    /// What picks one mirror of a site out of the ten a mirrors file names,
-    /// with nobody asked. Null asks about the first of them instead, which is
-    /// safe and noisier. See `NixFetchGate.Rule`.
     rule: ?NixFetchGate.Rule = null,
 
     fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// Take the session's own locked handle. **Called by `GiveLockedToAll`**,
-    /// once, before the first turn.
     fn giveLocked(self: *NixBuildToolRunner, locked: *chock_core.arbiter.Locked) void {
         if (self.asker) |*one| one.locked = locked;
     }
@@ -12129,8 +7690,6 @@ const NixBuildToolRunner = struct {
         defer parsed.deinit();
 
         const attr_path = parsed.value.attribute;
-        // The workspace itself, which is the project the agent works in, so a
-        // call that names no flake builds what it has been editing.
         const flake_ref = parsed.value.flake orelse settings.workspace_root;
 
         chock_nix.build.checkAttrPath(attr_path) catch |err| return .{
@@ -12149,23 +7708,14 @@ const NixBuildToolRunner = struct {
         const installable = try chock_nix.build.installableFor(self.arena, flake_ref, attr_path);
         const expression = try chock_nix.build.expressionFor(self.arena, flake_ref, attr_path);
 
-        // The evaluation holds every value it answered, so it is dropped
-        // before the build, which is the long part.
         var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
         defer driver.deinit();
         applyNixCaps(&driver, settings.caps);
 
-        // One `Io` for the whole call: the daemon the evaluation writes
-        // through and the `nix` the build runs both need one that can open a
-        // socket and spawn a process, which phase 2's own cannot. See
-        // `ProvisionToolRunner.resolveWithNix`, which says why it is built
-        // here and why it is backed by the page allocator.
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
         defer threaded.deinit();
         const host_io = threaded.io();
 
-        // The derivation has to be in the host store before `nix` can be
-        // asked to realise it by name, and this is what puts it there.
         var store_writer = chock_nix.build.DaemonWriter.connect(
             gpa,
             host_io,
@@ -12186,18 +7736,12 @@ const NixBuildToolRunner = struct {
         var writing = chock_nix.build.Writing{
             .writer = store_writer.writer(),
             .budget = &self.budget,
-            // What stops fix fetching a flake input for itself: it takes a
-            // locked input out of the store when the store says the path is
-            // valid, and these are the paths this session fetched under the
-            // policy before it started. See `chock_nix.inputs`.
+            // What stops fix fetching a flake input for itself: it takes a locked
+            // input out of the store when the store says the path is valid.
             .fetched_paths = settings.inputs.store_paths,
         };
         driver.seam = writing.seam();
 
-        // What answers for every host this call would reach: the inputs of
-        // the flake before the evaluation, and the closure's own fixed output
-        // derivations before `nix` is told to build. One namespace and one
-        // arbiter for both, and `NixFetchGate.kind` is the only difference.
         var gate = NixFetchGate{
             .gpa = gpa,
             .io = host_io,
@@ -12219,11 +7763,9 @@ const NixBuildToolRunner = struct {
         const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
             .refused => |text| return .{ .text = text, .refused = true },
             .found => |path| path,
-            // **One retry, and never a loop.** The session start fetches an
-            // input only where the policy said `allow`, because there is
-            // nobody at the prompt then, so a project that wrote no rule
-            // arrives here with the inputs missing. This is the first moment a
-            // person can be asked, and a second failure is the answer.
+            // One retry, and never a loop. The session start fetches an input
+            // only where the policy said `allow`, because there is nobody at the
+            // prompt then, so this is the first moment a person can be asked.
             .inputs_missing => blk: {
                 const now = try self.fetchInputs(host_io, settings, input_gate.gate(), installable);
                 if (now.store_paths.len == 0) return .{
@@ -12236,9 +7778,6 @@ const NixBuildToolRunner = struct {
                     .refused = true,
                 };
 
-                // Read by `is_valid_path` on the next evaluation, and kept for
-                // every later call of this session, so one answer serves the
-                // whole run.
                 writing.fetched_paths = now.store_paths;
                 if (self.settings) |*one| one.inputs = now;
 
@@ -12259,8 +7798,6 @@ const NixBuildToolRunner = struct {
             },
         };
 
-        // Before the wait, because a build can take minutes and a silent
-        // terminal looks like a session that has stopped.
         tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
 
         const answer = self.realiseWithNix(host_io, settings, &driver, gate.gate(), .{
@@ -12298,28 +7835,13 @@ const NixBuildToolRunner = struct {
     const Derivation = union(enum) {
         found: []const u8,
         refused: []u8,
-        /// The evaluation wanted a flake input that is not in the store. The
-        /// evaluator has no fetcher, so this is the one fault it cannot name
-        /// itself: the caller fetches and evaluates again. See
-        /// `chock_nix.inputs`.
         inputs_missing,
     };
 
-    /// Fetch this project's flake inputs now, through the gate that can ask a
-    /// person, and answer what is in the store afterwards.
-    ///
-    /// **This is where a startup `ask` stops being a permanent no.**
-    /// `fetchFlakeInputs` fetches only on `allow`, because a session that is
-    /// starting up has nobody at the prompt. A build is a turn the model took,
-    /// so there is somebody to ask, and the question is the `nix.net.eval`
-    /// one, through the same arbiter as the
-    /// build's own fetches. One question per host, a host that cannot be named
-    /// is a refusal, and the fetch still happens on the host through `nix
-    /// flake archive`: fix never reaches the network itself.
-    ///
-    /// **The workspace's own lock and not the project's.** The agent works in
-    /// the workspace and may have edited the lock there, and that lock is what
-    /// the evaluation about to run reads.
+    /// This is where a startup `ask` stops being a permanent no: a build is a
+    /// turn the model took, so there is somebody to ask. The fetch still happens
+    /// on the host through `nix flake archive`, and fix never reaches the network
+    /// itself. The workspace's own lock and not the project's.
     fn fetchInputs(
         self: *NixBuildToolRunner,
         io: std.Io,
@@ -12372,12 +7894,6 @@ const NixBuildToolRunner = struct {
         };
     }
 
-    /// Evaluate `expression` and answer the derivation it is, with the driver
-    /// left holding that derivation in its produced set.
-    ///
-    /// **The derivation path is borrowed from the session, which ends with
-    /// this function.** It is copied into the arena before it is answered,
-    /// because the build that reads it runs afterwards.
     fn derivationOf(
         self: *NixBuildToolRunner,
         gpa: std.mem.Allocator,
@@ -12391,12 +7907,9 @@ const NixBuildToolRunner = struct {
             .roots = &.{settings.workspace_root},
             .io = io,
             .store_backend = driver.backend(),
-            // What puts the derivation in the produced set, which is the one
-            // thing that can authorise a build of it.
             .store_writes = true,
-            // A build names an attribute of a flake, so `builtins.getFlake`
-            // has to work. `network` stays off, so the inputs of that flake
-            // come out of the store and never off a connection fix opened.
+            // `network` stays off, so the inputs of that flake come out of the
+            // store and never off a connection fix opened.
             .flakes = true,
         }) catch |err| return .{ .refused = try std.fmt.allocPrint(
             gpa,
@@ -12432,8 +7945,6 @@ const NixBuildToolRunner = struct {
         return .{ .found = try self.arena.dupe(u8, drv_path) };
     }
 
-    /// Run the `nix` commands on the `Io` this call built, which is the one
-    /// the derivation was written to the store through.
     fn realiseWithNix(
         self: *NixBuildToolRunner,
         io: std.Io,
@@ -12450,9 +7961,6 @@ const NixBuildToolRunner = struct {
             .diag = &run_diag,
         };
 
-        // **The driver the evaluation ran against, and never a fresh one.** A
-        // second driver here would be a second answer to the question of what
-        // this session produced, and the weaker of the two would be the rule.
         const answer = chock_nix.build.realise(
             self.arena,
             io,
@@ -12469,12 +7977,6 @@ const NixBuildToolRunner = struct {
         return answer;
     }
 
-    /// Hold a build against the garbage collector, before the model is told
-    /// it is there. `nix build --no-link` leaves no root of its own, so a
-    /// `nix-collect-garbage` between now and the next tool call would take a
-    /// toolchain the agent has already been promised. The same reasoning
-    /// `ProvisionToolRunner.rootProvided` carries, and a failure is said out
-    /// loud and is not fatal for the same reason.
     fn rootBuilt(
         self: *NixBuildToolRunner,
         io: std.Io,
@@ -12509,23 +8011,16 @@ const NixBuildToolRunner = struct {
     }
 };
 
-/// True when `flake_ref` is the workspace this session's tool calls work in,
-/// or a directory under it.
 fn isWorkspaceFlake(workspace_root: []const u8, flake_ref: []const u8) bool {
     if (!std.mem.startsWith(u8, flake_ref, workspace_root)) return false;
     const rest = flake_ref[workspace_root.len..];
     return rest.len == 0 or rest[0] == '/';
 }
 
-/// What a `nix_build` that names another flake is told.
-///
-/// **A reference that is not this project is refused, and that is a decision
-/// rather than a gap.** Fetching it means fetching its whole input graph, and
-/// what that graph reaches is written in a lock file inside the flake, which
-/// cannot be read until the flake has already been fetched. So there is no
-/// moment at which the policy could be asked about those hosts first, and one
-/// question about the reference standing for every host under it is exactly
-/// the widening `lib/chock-nix/fetch.zig` refuses to make for a build.
+/// A reference that is not this project is refused. Fetching it means fetching
+/// its whole input graph, and what that graph reaches is written in a lock file
+/// inside the flake, which cannot be read until the flake has been fetched, so
+/// there is no moment at which the policy could be asked about those hosts.
 fn foreignFlakeRefusal(
     gpa: std.mem.Allocator,
     flake_ref: []const u8,
@@ -12540,7 +8035,6 @@ fn foreignFlakeRefusal(
     );
 }
 
-/// What the model is told about a build that happened.
 fn builtText(
     gpa: std.mem.Allocator,
     installable: []const u8,
@@ -12558,15 +8052,6 @@ fn builtText(
     return text.toOwnedSlice(gpa);
 }
 
-/// Where the garbage collector root links of one build go. Caller owns the
-/// result.
-///
-/// **A number and not the attribute path.** An installable holds `#` and `/`,
-/// which is not a file name, and `nix-store --add-root` names its links after
-/// the prefix it is given, so two builds sharing one prefix would mean the
-/// second call replaces the first one's links. The prefix starts with
-/// `chock_nix.DevShell.root_link_name`, read from there, so a new evaluation
-/// of the dev shell releases these too.
 fn builtRootPrefix(
     arena: std.mem.Allocator,
     dir: []const u8,
@@ -12579,14 +8064,6 @@ fn builtRootPrefix(
     });
 }
 
-/// Why an attribute could not be turned into a derivation, in words a model
-/// can act on.
-///
-/// **The store refusal is read first, and it is the one that names a path.**
-/// An expression that imports a derivation stops inside the store backend,
-/// and fix reports the store's own text and nothing else. The same rule
-/// `nixEvalRefusal` follows, and the advice differs: a build does not make
-/// import from derivation work.
 fn nixBuildRefusal(
     gpa: std.mem.Allocator,
     session: *chock_nix.eval.Session,
@@ -12595,8 +8072,6 @@ fn nixBuildRefusal(
     expression: []const u8,
     err: anyerror,
 ) std.mem.Allocator.Error![]u8 {
-    // The store faults are the evaluation's own and the driver records none
-    // of them, so they are read before its last refusal rather than after.
     if (try chock_nix.build.writeRefusal(gpa, installable, err)) |said| return said;
 
     if (driver.lastError()) |said| return std.fmt.allocPrint(
@@ -12626,85 +8101,24 @@ fn nixBuildRefusal(
     return text.toOwnedSlice(gpa);
 }
 
-/// What a `nix_build` call gets when the session cannot build at all. The
-/// model is not offered the tool in that case, so this is for a model that
-/// named it out of nowhere.
 const nix_build_is_off = "nothing was built: this session cannot build with Nix, because there " ++
     "is no nix on this machine. Do the work with what the toolchain already has.";
 
-/// Starts a subagent: one `chock run` of its own, with the session, the
-/// scratchpad, the chain and the budget slice its parent decided. See
-/// `chock_core.subagent`, which owns everything about a child except the two
-/// events the loop appends around one.
-///
-/// ## Why a child is a process and not a thread
-///
-/// `Sandbox.spawn` calls `fork`, and `fork` carries only the calling thread,
-/// so an agent tree built from threads deadlocks the moment a child runs a
-/// tool. See this file's own top comment, which is where phase 2 comes from,
-/// and `chock daemon`, which already runs a child per session for the same
-/// reason. **A subagent is a session with a parent and nothing more.**
-///
-/// ## The parent decides the child's confinement, and the child cannot widen it
-///
-/// Everything narrowing about a child is on the command line the parent writes
-/// here: the kind, the parent's own kind, the budget slice, and the directory
-/// it may write in. `chock_policy.table.evaluateChain` then folds every kind in
-/// the chain, so the child holds no permission its parent lacks, and the child
-/// has no way to state a chain of its own because it does not write its own
-/// command line. **A check the child performs on itself would be worth
-/// nothing.**
-///
-/// ## An `Io` of its own, and why that is safe here
-///
-/// Phase 2 runs on an `Io` that cannot start a thread, which is what makes the
-/// tool path's own `fork` safe. Spawning a process needs an allocator that
-/// works, so this builds one `std.Io.Threaded` of its own for the length of the
-/// child and takes it down again. **Backed by the page allocator**, never by
-/// the session's own: a background task's thread may be inside `Sandbox.spawn`
-/// at that moment, and a lock held by another thread at a `fork` is a lock the
-/// child inherits as held forever. That is the same answer
-/// `chock_core.tasks.Table.gpa` already gives, for the reason
-/// `lib/chock-core/tools.zig`'s own top comment states in full.
-///
-/// ## `run` is called on the parent's thread, or on the table's
-///
-/// A spawn that waits calls `runFn` from the loop itself. A spawn that carries
-/// on calls it from a thread of `chock_core.subagent.Table`'s own, beside the
-/// parent's own turn. Everything `runFn` reads is either a value of the job's
-/// own arena or a field of `started` that nothing writes after phase 1, and the
-/// `Io` it spawns the child on is built inside the call, so it is the calling
-/// thread's alone. **`prepareFn` is always on the parent's thread**, because
-/// the parent appends `session.spawn` from what it answers.
-///
-/// ## What reaches a child that is still running
-///
-/// **A Ctrl-C reaches it, and nothing else has to.** The child is one
-/// `std.process.spawn` and nothing here puts it in a group of its own, so it
-/// stays in this process's group and the terminal signals both together. The
-/// child is a `chock run` of its own, so it reads that the same way this one
-/// does: it stops at its next safe point and writes its own `session.end`,
-/// which its parent then reads as a session that ended rather than as a child
-/// that died. **This is not true of a tool call**, because `Sandbox.spawn` does
-/// put every process of a call in a group of its own, which is exactly why
-/// `chock_core.tools.cancelRunningTool` has to reach those from inside the
-/// program: see that function's own doc comment.
+/// Starts a subagent: one `chock run` of its own. A child is a process and not a
+/// thread, because `Sandbox.spawn` calls `fork` and `fork` carries only the
+/// calling thread. The child cannot state a chain of its own, so a check it
+/// performed on itself would be worth nothing. The `Io` it spawns on is backed by
+/// the page allocator, because a lock another thread holds at a `fork` is one the
+/// child inherits as held for ever.
 const SubagentSpawner = struct {
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
     env: *std.process.Environ.Map,
     started: *const Started,
-    /// The kind this session runs as, which becomes the child's parent link.
     agent_kind: []const u8,
-    /// True to give the child no scratchpad at all.
-    ///
-    /// **This exists for the reviewer agent and for nothing else.**
-    /// `lib/chock-core/scratchpad.zig` says plainly that a parent may read a
-    /// child's scratchpad, and the parent of a reviewer is the agent whose
-    /// request is being reviewed. A reviewer given one is a reviewer whose
-    /// working notes the requester can read, which loses the asymmetry
-    /// `lib/chock-broker/review.zig` is built around. An arbitrator reads a
-    /// case and answers; it has nothing to write down.
+    /// True to give the child no scratchpad at all. This exists for the reviewer
+    /// agent and for nothing else: a parent may read a child's scratchpad, and
+    /// the parent of a reviewer is the agent whose request is being reviewed.
     no_scratchpad: bool = false,
 
     fn spawner(self: *SubagentSpawner) chock_core.subagent.Spawner {
@@ -12713,11 +8127,6 @@ const SubagentSpawner = struct {
 
     const vtable = chock_core.subagent.Spawner.VTable{ .prepare = prepareFn, .run = runFn };
 
-    /// Choose the child's identifier and say where its log and its scratchpad
-    /// will be. **Nothing is created here**: `chock run` builds its own session
-    /// directory and its own scratchpad layout, so a child that never starts
-    /// leaves nothing behind, and a log that was never opened is exactly the
-    /// `died` this parent then reads.
     fn prepareFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -12739,9 +8148,6 @@ const SubagentSpawner = struct {
         const log_path = try allocator.dupe(u8, paths.log);
         errdefer allocator.free(log_path);
 
-        // Inside the parent's own scratchpad, under `agents/`. A child sees its
-        // own and nothing else, and siblings see nothing of each other: see
-        // `chock_core.scratchpad`'s own visibility rule.
         const scratchpad_path = if (self.no_scratchpad)
             try allocator.dupe(u8, "")
         else if (self.started.scratch_dir) |parent_dir|
@@ -12759,11 +8165,6 @@ const SubagentSpawner = struct {
         };
     }
 
-    /// Run the child to its end, then read its own log to learn what happened.
-    ///
-    /// **The log is the answer, and the exit status is not.** A child that was
-    /// killed and a child that refused its task can exit the same way, and only
-    /// the log tells them apart: see `chock_core.subagent.readReport`.
     fn runFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -12774,10 +8175,6 @@ const SubagentSpawner = struct {
         _ = io;
         const self: *SubagentSpawner = @ptrCast(@alignCast(ptr));
 
-        // **This session's own chain, with this session on the end of it.** A
-        // chain that stopped at the immediate parent was the fault
-        // `test/core/tree.zig` found: a grandchild held whatever the agent at
-        // the top of its own tree was denied.
         const chain = try chock_core.subagent.Command.chainBelow(
             allocator,
             self.started.spawn_chain,
@@ -12802,12 +8199,6 @@ const SubagentSpawner = struct {
         return readChildLog(allocator, prepared, request.shape);
     }
 
-    /// Spawn the child and wait for it. See this type's own doc comment for
-    /// the `Io` this builds and why it is backed by the page allocator.
-    ///
-    /// **Nothing is returned.** Whatever became of the process, the answer
-    /// comes out of the child's own log; a child that never started leaves one
-    /// that cannot be read, which reads as `died`.
     fn runToTheEnd(self: *SubagentSpawner, argv: []const []const u8) void {
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
         defer threaded.deinit();
@@ -12817,9 +8208,6 @@ const SubagentSpawner = struct {
             .argv = argv,
             .environ_map = self.env,
             .stdin = .ignore,
-            // The child's transcript is in the child's own log, which is what
-            // the parent reads. Its standard error is where a setup failure is
-            // reported, and a person watching wants to see one.
             .stdout = .ignore,
             .stderr = .inherit,
         }) catch |err| {
@@ -12838,16 +8226,11 @@ const SubagentSpawner = struct {
         }
     }
 
-    /// Open the child's log and read the outcome out of it. A log that will not
-    /// open is a child that died, which is what `readReport` answers for a log
-    /// it cannot read either.
     fn readChildLog(
         allocator: std.mem.Allocator,
         prepared: chock_core.subagent.Prepared,
         shape: chock_core.subagent.Shape,
     ) chock_core.subagent.Error!chock_core.subagent.Report {
-        // A real allocator's `Io` again, because opening a file is all this
-        // does and the process it was waiting for has already ended.
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
@@ -12872,73 +8255,17 @@ const SubagentSpawner = struct {
     }
 };
 
-/// The reviewer agent, as a `chock-broker` asks for one: a subagent that reads
-/// one case and answers, and acts on nothing.
-///
-/// **This is the caller `lib/chock-broker/review.zig` would otherwise not
-/// have.** The broker imports no `chock-core` on purpose, so the seam is a
-/// vtable and the process that runs a child implements it, which is here.
-///
-/// ## What the reviewer is given, and what it is not
-///
-/// * **No scratchpad**, by `SubagentSpawner.no_scratchpad`. See that field.
-/// * **No tools at all**, by `agentRole`, which reads the reviewer's kind and
-///   answers `chock_core.tools.Role.arbitrator`. An arbitrator is told why an
-///   act is guarded, and one that could also act would hold the map and a way
-///   to use it: see `lib/chock-broker/review.zig`'s own top comment.
-/// * **A slice of what is left of this session's cap.** A review is a whole
-///   subagent, and `chock_core.subagent.budgetSlice` is what decides how much
-///   of the remainder it may spend. A session with a cap and nothing left of
-///   it runs no review at all, and that is a refusal: see `reviewFn`.
-/// * **The case, and nothing of the parent's conversation.** A subagent reads
-///   its task and nothing else, which is what makes the asymmetry in
-///   `review.taskFor` checkable by reading one function.
-///
-/// ## A reviewer is a child, and the parent's log says so
-///
-/// `session.spawn` is appended for a reviewer exactly as `Loop.runSpawn`
-/// appends one for a subagent the model asked for, and **before the child
-/// runs**, which is the rule the whole log keeps: a crash in between still
-/// leaves proof that the child was asked for, and a parent that resumes counts
-/// that child.
-///
-/// **Without it a reviewer was a real process the width bound could not see**,
-/// so a session could pass its own width bound with nothing noticing.
-/// `reviewBounds` measures the standing from the same folded log, so the event
-/// this appends is what the next review is measured against.
-///
-/// The append goes through `locked`, the handle whoever is calling the broker
-/// already holds. That was the reason this could not be done: `applyWork` takes
-/// the lock for the whole approval and this seam was handed no way to reach it.
-/// `lib/chock-broker/socket.zig` settled that pattern for the answer, and both
-/// callers of this seam now hold a handle at the moment they build one.
+/// The reviewer agent: a subagent that reads one case and answers, and acts on
+/// nothing. It gets no scratchpad, no tools at all, and the case with nothing of
+/// the parent's conversation. `session.spawn` is appended for it before the child
+/// runs, and without that a reviewer was a process the width bound could not see.
 const ReviewSpawner = struct {
-    /// What starts the child. `reviewChild` is what every real caller builds
-    /// it from, with the scratchpad turned off. **A seam and not a
-    /// `SubagentSpawner`**: see `reviewerFor`.
     child: chock_core.subagent.Spawner,
-    /// What the reviewer may spend, or null for a session with no cap.
     budget: ?chock_cost.budget.Budget,
-    /// True when this session has a cap and has already spent or promised all
-    /// of it. **A review nothing can pay for is a review that does not run**,
-    /// and that is a refusal rather than an allow.
     nothing_left: bool,
-    /// Set when the spawn limits refuse a reviewer at this depth, so a tree
-    /// cannot grow one level per approval.
     refused_by_limits: ?chock_policy.subagents.Refusal,
-    /// The parent's own log, locked, so `session.spawn` can be appended for the
-    /// reviewer. **Null is a caller that cannot record a child, and such a
-    /// caller starts none**: see `recordSpawn` and `SpawnNotRecorded`.
-    ///
-    /// **Set after the lock is taken and never before.** Both callers build a
-    /// `ReviewSpawner` first and lock afterwards, because the waiter holds the
-    /// same handle: see `applyWork`.
     locked: ?*ApprovalLock = null,
 
-    /// What recording a reviewer as a child can fail with. `NoLog` is a caller
-    /// that holds no handle on the session log; the rest is whatever writing to
-    /// that log can fail with. **The caller does the same thing with every one
-    /// of them**, which is to start nothing: see `reviewFn`.
     const SpawnNotRecorded = error{NoLog} || chock_proto.storage.StorageError;
 
     fn reviewer(self: *ReviewSpawner) chock_broker.review.Reviewer {
@@ -12951,13 +8278,9 @@ const ReviewSpawner = struct {
 
     const vtable = chock_broker.review.Reviewer.VTable{ .review = reviewFn };
 
-    /// Run one review to its end and read the verdict out of the child's own
-    /// log.
-    ///
-    /// **Every way this can fail is `error.ReviewNotRun`**, and the broker
-    /// turns every one of those into `review_unavailable`, which refuses. That
-    /// is the rule the whole arrangement would be worthless without: the
-    /// cheapest attack on a review is to make it fail.
+    /// Every way this can fail is `error.ReviewNotRun`, and the broker turns each
+    /// one into `review_unavailable`, which refuses: the cheapest attack on a
+    /// review is to make it fail.
     fn reviewFn(
         ptr: *anyopaque,
         gpa: std.mem.Allocator,
@@ -12990,8 +8313,6 @@ const ReviewSpawner = struct {
         const request = chock_core.subagent.Request{
             .agent_kind = chock_broker.review.default_kind,
             .task = task,
-            // The parent names the members and the parent alone checks the
-            // answer: see `chock_core.subagent`'s own top comment.
             .shape = .{ .schema = &chock_broker.review.result_fields },
             .reason = case.action,
             .budget = self.budget,
@@ -13003,15 +8324,10 @@ const ReviewSpawner = struct {
         };
         defer chock_core.subagent.freePrepared(gpa, prepared);
 
-        // **Before the child runs**, so a crash between the two still leaves
-        // proof that this child was asked for, and a parent that resumes counts
-        // it. The same order and the same reason as `Loop.runSpawn`.
-        //
-        // **A reviewer nothing records is the fault this closes**, so a spawn
-        // that cannot be written starts nothing at all. That is a refusal, like
-        // every other way a review does not happen, and it is the safe
-        // direction: a child the width bound cannot see is worse than a review
-        // that did not run.
+        // Before the child runs, so a crash between the two still leaves proof
+        // that this child was asked for. A spawn that cannot be written starts
+        // nothing: a child the width bound cannot see is worse than a review that
+        // did not run.
         self.recordSpawn(gpa, io, request, prepared) catch {
             tty.print(
                 .warn,
@@ -13028,10 +8344,6 @@ const ReviewSpawner = struct {
         };
         defer chock_core.subagent.freeReport(gpa, report);
 
-        // A reviewer that died, ran out of its slice, stopped making progress,
-        // or answered in the wrong shape has not decided anything. Reading a
-        // half answer as a verdict is the one mistake that turns a broken
-        // review into permission.
         if (report.outcome != .finished) {
             tty.print(
                 .warn,
@@ -13044,18 +8356,6 @@ const ReviewSpawner = struct {
         return chock_broker.review.readAnswer(gpa, report.result);
     }
 
-    /// Append the `session.spawn` that puts this reviewer in its parent's own
-    /// width count.
-    ///
-    /// **The same event `Loop.runSpawn` writes, and it has to be**, because the
-    /// same fold reads both: `chock_proto.state.Session.children` is what
-    /// `reviewBounds` measures the next review against and what
-    /// `chock_policy.subagents.check` bounds. A reviewer recorded some other
-    /// way would be a reviewer neither of them can see.
-    ///
-    /// The budget members carry the slice this reviewer was given, so a parent
-    /// that resumes knows what it has already handed out: see
-    /// `chock_core.subagent.committedToChildren`.
     fn recordSpawn(
         self: *ReviewSpawner,
         gpa: std.mem.Allocator,
@@ -13074,32 +8374,9 @@ const ReviewSpawner = struct {
     }
 };
 
-/// Build the reviewer this session's end of session approval may need.
-///
-/// **Nothing here starts anything.** A `chock.zon` that answers `allow`, `ask`
-/// or `deny` for `workspace.apply` never reaches the seam, so a session under
-/// an ordinary policy pays for none of this. What it does do is measure, once,
-/// the two facts a review cannot be started without: whether the spawn limits
-/// allow one more agent here, and what is left of the budget.
-///
-/// Both are measured from the session's own log rather than from a counter of
-/// this call's own, which is the same rule `Loop.runSpawn` keeps: a session
-/// that was resumed counts the children it really has and the money it really
-/// spent. `session` is that fold, and the caller owns it: `applyWork` reads
-/// the promises out of the same one, so the log is walked once.
-/// **`child` is the seam and not a `SubagentSpawner`**, so a test can drive
-/// `ReviewSpawner.reviewFn` from end to end with nothing that starts a process.
-/// That is what makes "a reviewer that runs is a reviewer the log counted" a
-/// tested fact rather than a comment: the two happen in the same function, and
-/// only a test that runs the whole of it can see that they both happened. Every
-/// real caller passes `reviewChild`.
-///
-/// **`session: anytype`, because two shapes of fold pass through here.**
-/// `applyWork` passes a full `chock_proto.state.Session`, folded once and
-/// discarded at the end of the run. `SessionArbiter.decideFn` passes a
-/// `chock_proto.state.PolicyFold`, kept for the run's whole life: see that
-/// type's own top comment for why it carries no more than `children` and
-/// `spend`, which is exactly what this function reads off `session`.
+/// Nothing here starts anything. The spawn limits and what is left of the budget
+/// are read from the session's own log, so a session that was resumed counts the
+/// children it really has.
 fn reviewerFor(
     child: chock_core.subagent.Spawner,
     started: *const Started,
@@ -13107,8 +8384,6 @@ fn reviewerFor(
 ) ReviewSpawner {
     const bounds = reviewBounds(
         started.subagents,
-        // This session's own standing: how deep it is, and how many children it
-        // has already started.
         .{ .depth = started.spawn_chain.len + 1, .width = session.children.items.len },
         started.budget,
         session.spend,
@@ -13123,12 +8398,6 @@ fn reviewerFor(
     };
 }
 
-/// The subagent machinery a reviewer's own child is started with.
-///
-/// **One function and not two copies**, because the one thing that makes it
-/// different from every other child is easy to leave out of the second copy:
-/// see `SubagentSpawner.no_scratchpad`. A parent may read a child's scratchpad,
-/// and the parent of a reviewer is the agent whose request is being reviewed.
 fn reviewChild(
     gpa: std.mem.Allocator,
     environ: std.process.Environ,
@@ -13146,31 +8415,12 @@ fn reviewChild(
     };
 }
 
-/// The two facts a review cannot be started without. See `reviewBounds`.
 const ReviewBounds = struct {
-    /// What the reviewer may spend, or null for a session with no cap of its
-    /// own and for one with nothing left.
     budget: ?chock_cost.budget.Budget,
-    /// Which of the two nulls above this is. **A session with no cap runs a
-    /// review; a session that has spent its cap does not**, and a caller that
-    /// read the two the same way would start a reviewer on a budget that is
-    /// already gone.
     nothing_left: bool,
-    /// Which spawn limit refuses a reviewer here, or null when neither does.
     refused_by_limits: ?chock_policy.subagents.Refusal,
 };
 
-/// Whether a reviewer may be started here, and what it may spend.
-///
-/// Separate from `reviewerFor` because it is the half that is a decision
-/// rather than a fact about the machine, and a test can pin it with no session
-/// directory, no credential and no child process. The same split
-/// `provisionDecision` makes, for the same reason.
-///
-/// **A reviewer is an agent, so it is measured against the same two limits
-/// every other agent is.** The limits bound the depth and the width of the
-/// tree, and a reviewer started per approval with no such check would grow one
-/// level for each one.
 fn reviewBounds(
     limits: chock_policy.subagents.Limits,
     standing: chock_policy.subagents.Standing,
@@ -13178,9 +8428,6 @@ fn reviewBounds(
     spend: chock_proto.state.Spend,
     children: []const chock_proto.state.Child,
 ) ReviewBounds {
-    // What is left, measured the way `chock_core.subagent.budgetSlice` says
-    // to: the cap, less what this session spent, less every slice it already
-    // promised a child. One reviewer, so the remainder is not divided.
     const committed = chock_core.subagent.committedToChildren(children, cap);
     return .{
         .budget = chock_core.subagent.budgetSlice(cap, spend, committed, 1),
@@ -13189,44 +8436,12 @@ fn reviewBounds(
     };
 }
 
-/// How far up the spawn tree `promisesFor` walks.
-///
-/// The longest chain a project can configure, from
-/// `chock_policy.subagents.max_settable`, read from there so the two cannot
-/// disagree. The walk follows `session.start.parent_session` out of files this
-/// process did not write in this run, so a bound is what stops a loop of them
-/// turning the end of a session into a walk with no end.
 const max_ancestor_sessions: usize = chock_policy.subagents.max_settable;
 
-/// Every promise the end of session decision is bound by: the ones this
-/// session made about itself, and the ones every session above it made.
-///
-/// **A promise a parent made has to reach its children, or it is worth
-/// nothing.** An agent that promises not to apply its work and then starts a
-/// subagent to apply it has kept the letter of the promise and none of it. A
-/// child already holds no more than its parent, and `table.evaluateChain`
-/// applies that to the policy file. This applies the same rule to the half of
-/// the policy the parent wrote itself.
-///
-/// **The promises come out of the ancestors' own logs and never off a command
-/// line.** The parent could have been asked to pass them down, and then a
-/// parent that passed none would be a parent widening its child. The logs sit
-/// in this project's session directory, which is outside every workspace and
-/// is mounted into no sandbox, so they are records no agent in the tree can
-/// reach. See `session.zig`'s own `pathsFor`.
-///
-/// **A log that cannot be read stops the walk and says so.** Everything read
-/// before it still binds, including a part read ancestor's own promises, so
-/// the fault costs only what is above the fault. That is the honest reading of
-/// a broken installation rather than of an attack: these files sit where no
-/// agent in the tree can reach them, so none of them can arrange this. Silence
-/// would be the fault, so this prints.
-///
-/// **`session: anytype`, for the same reason `reviewerFor` reads one that
-/// way.** This reads only `session.self_policy.restrictions.items`, which
-/// `chock_proto.state.Session` and `chock_proto.state.PolicyFold` both carry.
-/// The ancestor walk below builds its own full `Session` regardless, since an
-/// ancestor's fold is never kept past this one call.
+/// A promise a parent made has to reach its children, or an agent that promises
+/// not to apply its work can start a subagent to apply it. The promises come out
+/// of the ancestors' own logs and never off a command line, where a parent that
+/// passed none would be a parent widening its child.
 fn promisesFor(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -13264,9 +8479,6 @@ fn promisesFor(
         var ancestor = chock_proto.state.Session.init(gpa);
         defer ancestor.deinit();
         const whole = foldSessionById(gpa, io, dir, next, &ancestor);
-        // **Whatever was read still binds.** A log with a torn tail holds
-        // every promise made before the crash, and dropping those because the
-        // last line is half written would be the permissive answer to a fault.
         try appendPromises(arena, &out, ancestor.self_policy.restrictions.items);
         if (!whole) {
             tty.print(
@@ -13277,15 +8489,11 @@ fn promisesFor(
             );
             break;
         }
-        // The ancestor's own arena goes away with it, so the identifier of the
-        // one above it is copied out before that happens.
         next = try arena.dupe(u8, ancestor.parent_session);
     }
     return out.toOwnedSlice(arena);
 }
 
-/// Add every promise of one folded session to `out`, copied into `arena`,
-/// which outlives the session they were folded from.
 fn appendPromises(
     arena: std.mem.Allocator,
     out: *std.ArrayList(chock_policy.ratchet.Restriction),
@@ -13302,15 +8510,10 @@ fn appendPromises(
     }
 }
 
-/// Fold the log of the session `id` of the project whose session directory is
-/// `dir`. False when there is no such log, or when it could not be read to its
-/// end. **`session` still holds everything that was read**, so a caller that
-/// wants the part of a torn log has it.
-///
-/// **The file is checked before the log is opened**, the same rule
-/// `src/plan.zig` keeps and for the same reason: `chock_proto.log.Log.open`
+/// The file is checked before the log is opened: `chock_proto.log.Log.open`
 /// creates the file and writes a header into it when there is none, so asking
-/// about a session that never existed would otherwise bring one into being.
+/// about a session that never existed would bring one into being. `session`
+/// still holds everything that was read.
 fn foldSessionById(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -13337,13 +8540,6 @@ fn foldSessionById(
     return true;
 }
 
-/// Fold one session's whole log into `session`.
-///
-/// `applyWork` runs after `Loop.run` has ended, so the `state.Session` the
-/// loop kept is gone and the log is what is left. **A log this cannot read is
-/// not a failure here**: the caller wants two numbers to bound a review with,
-/// and an unreadable log leaves them at what has been read so far, which is
-/// the smaller and therefore the safer answer.
 fn foldSession(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -13358,46 +8554,10 @@ fn foldSession(
     }
 }
 
-/// Fold only what `storage` has written since `at`, into `session`, and move
-/// `at` to the new end of what was read. The incremental twin of
-/// `foldSession`: the same fold, run in more than one piece.
-///
-/// **A fold split across many calls reaches the same state a single fold of
-/// the whole log would.** `state.Session.apply` only ever adds to `session`
-/// or overwrites one field with a newer value of the same kind: it never
-/// looks back at what it already applied to decide how to apply the next
-/// event. So applying events 1 through 400 and then 401 through 450 leaves
-/// `session` exactly where applying 1 through 450 in one call would.
-/// `SessionArbiter.decideFn` is built on that: see its own doc comment for
-/// the cost this removes and the measurement that proves it.
-///
-/// **This is not the mistake `ToolNetwork` made once already**, of folding a
-/// session and then never folding it again, on the reasoning that nothing
-/// else could change what it held: a mid session `restrict_self` proved that
-/// reasoning wrong. This function is never asked to skip a fold. Every call
-/// still reads everything written since the last one, all the way to the
-/// current end of the log, before `session` is used for anything. What it
-/// skips is only the part already read.
-///
-/// **A line that will not decode stops the fold and leaves `at` unmoved.**
-/// `foldSession`'s own full replay from event 0 would meet that same line at
-/// that same position on its very next call and stop there too, so a caller
-/// that keeps calling this with the same `at` sees the identical failure
-/// every time, never a silent skip past what could not be read. A torn tail
-/// is different: `log.Replay.next` reports one by returning null with its
-/// position put back at the tear's own start, so `at` moves there, and a
-/// later call that finds the tear closed by a fresh append reads the
-/// completed line instead of stopping again. See that function's own doc
-/// comment.
-///
-/// **`session: anytype`, because two different folds are resumed this way.**
-/// `SessionArbiter.decideFn` resumes a `chock_proto.state.Session`, and
-/// `ToolNetwork.refreshToolPromises` resumes a `chock_proto.state.PolicyFold`,
-/// which holds the smaller part of a session's state those two callers
-/// actually read: see `PolicyFold`'s own top comment. Both types have the
-/// same `apply(Envelope) Allocator.Error!void` this loop calls, and the loop
-/// itself reads nothing else off `session`, so one function serves both
-/// without either fold pretending to be the other.
+/// A fold split across many calls reaches the same state a single fold of the
+/// whole log would, because `state.Session.apply` only ever adds or overwrites one
+/// field and never looks back. A line that will not decode stops the fold and
+/// leaves `at` unmoved; a torn tail moves `at` to the tear's own start.
 fn foldSessionSince(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -13417,41 +8577,9 @@ fn foldSessionSince(
     at.* = replay.at();
 }
 
-/// Put what the log already holds on the display, oldest event first.
-///
-/// ## Why a resumed session used to open empty
-///
-/// The display is built with nothing on it, and every row it draws comes from
-/// an event the loop is about to write. A session that was taken up has all of
-/// its conversation behind it instead, so the transcript stayed empty and a
-/// resume read exactly like a fresh start. That is most of why `/resume` read
-/// as broken. `ui.Ui.replay` is the display's half of the answer and this is
-/// the caller's half.
-///
-/// ## Every session and not only a resumed one
-///
-/// **One path, because a fresh log folds to nothing.** At this point phase 1
-/// has written the session's opening events and no turn has run, and none of
-/// those events is a row: see `ui.Ui.replay`, which sends everything but a
-/// message through the same fold the live session uses, and that fold ignores
-/// what it does not draw. A flag saying "this run resumed" would be a second
-/// answer to a question the log already answers.
-///
-/// ## What a very long log costs
-///
-/// Nothing that grows without bound. `ui.Ui.kept_lines` drops the oldest row
-/// once there are too many, so a session of thousands of events leaves the
-/// newest screenfuls and the memory each one holds is capped. No frame is drawn
-/// while this runs either: see `ui.Ui.replay`.
-///
-/// ## A log that cannot be read is said out loud
-///
-/// **A refusal to read is not a reason to refuse the session.** The
-/// conversation the model is given is folded from the same log by
-/// `chock_core.Loop`, and that fold is what decides whether the session can
-/// run. This one only decides what is on the screen, so it reports and carries
-/// on. The line reaches the display's own transcript, because the display is
-/// already up by the time this runs: see `src/ui.zig`'s `Diagnostics`.
+/// One path for every session, because a fresh log folds to nothing: none of the
+/// events phase 1 wrote is a row. A log that cannot be read is said out loud and
+/// does not refuse the session: this only decides what is on screen.
 fn replayInto(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -13479,10 +8607,6 @@ fn replayInto(
             );
             return;
         } orelse {
-            // A torn tail is a crash part way through a write, not a clean end
-            // of log, so the last thing that happened may be missing from what
-            // is on screen. Said, because a person who resumed after a crash is
-            // the person who most needs to know.
             if (replay.truncated()) tty.print(
                 .warn,
                 "chock: this session's log ends part way through a line, so the last event " ++
@@ -13496,10 +8620,6 @@ fn replayInto(
     }
 }
 
-/// Phase 2. **No `env` parameter**: the environment a tool call resolves
-/// `argv[0]` against is `started.tool_env`, which is the dev shell's when
-/// the project has one, and nothing else in this phase reads an environment
-/// at all.
 fn runSession(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -13507,13 +8627,7 @@ fn runSession(
     env: *std.process.Environ.Map,
     started: *Started,
     options: Options,
-    /// Filled with the session `/resume` chose, when one was. `main` takes it
-    /// up once this session's workspace and sockets are down: see `takeUp`.
     take_up: *?[]const u8,
-    /// Filled with what each audit sink of this session came to. **Carried out
-    /// of phase 2 rather than printed inside it**, because the display is still
-    /// up here and a line about a sink that stopped arriving has to be one a
-    /// person really reads. See `reportShipping`.
     shipped: *ShippingReport,
 ) !Exit {
     var http = switch (started.adapter) {
@@ -13522,84 +8636,42 @@ fn runSession(
     };
     defer http.deinit();
 
-    // Where every tool call's own sandbox says whether the process that holds
-    // the credential could confine itself. **Attached here, before the tool
-    // runner takes its copy of the config**, and given back at the very end as
-    // one event. See `chock_sandbox.Sandbox.SupervisorAudit` for why the fact
-    // has to reach the log at all, and `logSupervisorAudit` for the write.
-    //
-    // The pointer is taken off the config again on the way out, because
-    // `started` outlives this frame and the record does not.
     var supervisor_audit: sandbox.Sandbox.SupervisorAudit = .{};
     started.sandbox_config.supervisor_audit = &supervisor_audit;
     defer started.sandbox_config.supervisor_audit = null;
-    // **Registered above every defer that ends a tool call**, so it runs after
-    // them: the background task table ends the calls that are still running,
-    // and a call still inside `Sandbox.spawn` would otherwise be counted after
-    // this event was already written.
     defer logSupervisorAudit(gpa, io, started.storage, &supervisor_audit);
 
-    // The same route, for the same reason, carrying what the programs those
-    // tool calls ran asked the kernel for. **Off unless a policy asks**: the
-    // sandbox watches nothing until `Config.seccomp_options.traps` names a
-    // call, so this event reads as "nothing was asked for" on an ordinary
-    // session. See `chock_sandbox.Sandbox.SyscallAudit`.
+    // Off unless a policy asks: the sandbox watches nothing until
+    // `Config.seccomp_options.traps` names a call.
     var syscall_audit: sandbox.Sandbox.SyscallAudit = .{};
     started.sandbox_config.syscall_audit = &syscall_audit;
     defer started.sandbox_config.syscall_audit = null;
     defer logSyscallAudit(gpa, io, started.storage, &syscall_audit);
 
-    // The toolchain this session mounts, **always named here and never left
-    // at the library's own default**. Phase 1 decided it once, out of the dev
-    // shell, the image, or the host's own system directories, and refused the
-    // session outright when it could produce none of the three. See
-    // `Toolchain`.
     var context = chock_core.tools.Context{
         .memory_dir = started.memory_dir,
-        // Only a `run_command` call is given this, inside `dispatchWith`:
-        // the compiler is the program that writes a cache, and no other tool
-        // call has a reason to reach one. See `chock_core.tools.Context`.
         .cache_dir = started.cache_dir,
         .scratch_dir = started.scratch_dir,
-        // The one writable area no cap can bound, so it gets a free space floor
-        // read before each writing tool call instead. See
-        // `chock_core.tools.default_workspace_free_floor_bytes`, which says
-        // plainly how much weaker a floor is than a cap.
         .workspace_dir = started.workspace.workPath(),
         .session_id = started.session_id,
     };
     context.store_paths = started.toolchain.store_paths;
     context.toolchain_mounts = started.toolchain.mounts;
-    // Provisioning, read by `notFoundRefusal`: a `run_command` call that names
-    // a program nobody has is told to call `provide_tool`, and only when this
-    // session really has one.
     context.provisioning = started.provisioning != null;
-    // The second of the three places the role is read. This one is a boundary
-    // and not a list: an arbitrator that named a tool out of nowhere runs
-    // nothing. See `chock_core.tools.Role`.
     context.role = agentRole(options);
 
-    // Where a background command's output is written, and what the loop drains
-    // at the top of each turn. Null for a session with no scratchpad, which
-    // then refuses a background call and says why: see
-    // `chock_core.tools.background_needs_a_session`.
-    //
-    // **The page allocator, and never `gpa`.** A task's own thread allocates
-    // from this beside a thread that may be inside `Sandbox.spawn`, and `fork`
-    // carries only the calling thread. See `chock_core.tasks.Table.gpa`.
+    // The page allocator, and never `gpa`. A task's own thread allocates from
+    // this beside a thread that may be inside `Sandbox.spawn`, and `fork` carries
+    // only the calling thread.
     var table: ?chock_core.tasks.Table = if (started.tasks_dir) |dir| .{
         .gpa = std.heap.page_allocator,
         .dir = dir,
         .runner = chock_core.tools.backgroundRunner(),
     } else null;
-    // **Ends every task still running, then waits for it.** A thread of this
-    // table writes into a directory phase 3 is about to remove, so leaving one
-    // running is not an option. Waiting alone is not one either: a task is
-    // measured against `chock_core.tasks.default_timeout_ns`, and a session
-    // that is over must not sit for half an hour on a build whose output
-    // nobody will now read. `cancelRunningTool` is the same call a second
-    // Ctrl-C makes, and it reaches every running call: see
-    // `chock_core.tools.cancelRunningTool`.
+    // Ends every task still running, then waits for it: a thread of this table
+    // writes into a directory phase 3 is about to remove. Waiting alone is not an
+    // option either, because a session that is over must not sit for half an hour
+    // on a build whose output nobody will read.
     defer if (table) |*one| {
         chock_core.tools.cancelRunningTool();
         one.deinit();
@@ -13607,56 +8679,24 @@ fn runSession(
     if (table) |*one| context.tasks = one;
 
     var tool_runner = chock_core.Loop.SandboxToolRunner{
-        // The dev shell's environment, when this project has one: see
-        // `toolEnvironment`. The host's is what a project with no dev shell
-        // still gets.
         .env = started.tool_env,
         .sandbox_config = started.sandbox_config,
         .context = context,
     };
 
-    // The git shim, in front of the sandbox runner: see `GitToolRunner`. It
-    // answers the subcommands that cannot work inside the sandbox at all and
-    // passes everything else straight through.
     var git_aware = GitToolRunner{ .inner = tool_runner.runner() };
 
-    // This session's language server, and what it has already said. See
-    // `lib/chock-core/lsp.zig` for every decision behind it.
-    //
-    // **A project that named no server leaves every field at its default**, so
-    // `afterWrite` answers null before it reaches a seam, no process starts,
-    // nothing waits, and the tool result is the one the tool built, byte for
-    // byte. That is the first rule of that whole file and it is the cheap
-    // path, not the exceptional one.
     var language_server = chock_core.lsp.Session{};
 
-    // The helper the server runs in, and the driver that speaks to it. Both
-    // live for the whole session and both are owned here, beside the workspace
-    // and the task table, for the reason `DiagnosticToolRunner` states: the
-    // registry is one process per call and a language server is not.
-    //
-    // **Started on the first ask and not here.** A session that never edits a
-    // file the server serves never starts one, which is what makes a project
-    // with a server cost nothing until it is used.
     var server_helper = chock_core.helper.Helper.init(std.heap.page_allocator);
-    // **Ends the helper, then waits for it.** A helper writes below the
-    // session scratchpad that phase 3 is about to remove, the same hazard the
-    // task table waits for and with a longer life: see
-    // `chock_core.helper.Helper.deinit`.
     defer server_helper.deinit(io);
 
     var server_driver: ?chock_core.lsp_driver.Driver = null;
     defer if (server_driver) |*one| one.deinit();
 
-    // The mount tree and the argv the helper is started with, which outlive
-    // every tool call and end with the session, the same reason
-    // `provision_arena` below has one of its own.
     var server_arena = std.heap.ArenaAllocator.init(gpa);
     defer server_arena.deinit();
 
-    // **Asked once, here, and not on every diagnostic.** Starting the server is
-    // the act a policy decides; what it then reports is the session's own
-    // business. See `languageServerPermitted`.
     const server_settings: ?chock_core.lsp_driver.Settings = if (started.language_server) |settings|
         (if (try languageServerPermitted(
             gpa,
@@ -13670,17 +8710,6 @@ fn runSession(
         null;
 
     if (server_settings) |settings| {
-        // The same sandbox a tool call gets, built by the same two functions
-        // `chock_core.tools.Registry.dispatchWith` uses, so a helper reaches
-        // nothing a tool call cannot: the session's toolchain, then the mount
-        // tree, the Landlock rules and the program binding. See
-        // `chock_core.tools.prepare`.
-        //
-        // **The mount set is the one this session starts with.** A program
-        // provisioned later joins `Context.store_paths` and reaches the tool
-        // calls after it, and it does not reach a helper that is already
-        // running, which is the same honest limit `ProvisionToolRunner`
-        // already states for a background task and for a subagent.
         const prepared = blk: {
             const with_store = chock_core.tools.withStore(
                 server_arena.allocator(),
@@ -13698,10 +8727,6 @@ fn runSession(
                 &.{},
                 &.{},
             ) catch |err| {
-                // The program is the project's, so a project that named one
-                // this machine does not have hears it now, once, rather than
-                // on every edit. The session runs on with no diagnostics,
-                // which is exactly what a session with no server does.
                 tty.print(
                     .warn,
                     "chock: the language server {s} could not be prepared ({t}), so nothing " ++
@@ -13717,18 +8742,6 @@ fn runSession(
                 .gpa = gpa,
                 .process = &server_helper,
                 .request = .{ .config = ready.config, .argv = ready.argv },
-                // The host side of the workspace mount, which is where a tool
-                // call's write really landed, and the sandbox side, which is
-                // what every URI on the wire is built from. See
-                // `chock_core.lsp_driver.Driver`.
-                //
-                // **For an overlay backing this is the upper layer**, which
-                // holds only the files the agent has written. That is exactly
-                // the set this driver ever asks about, because it is only
-                // reached after a write of the file it names: see
-                // `DiagnosticToolRunner`. A file the agent has not touched is
-                // not read from here at all, and the server still sees it,
-                // because the server reads the merged view inside the sandbox.
                 .work_root = started.workspace.workPath(),
                 .sandbox_root = started.sandbox_config.cwd,
             };
@@ -13740,27 +8753,14 @@ fn runSession(
         }
     }
 
-    // In front of the git shim, so it sees the result of a write that really
-    // happened. The registry is one process per call, so a server that outlives
-    // a call is held out here: see `DiagnosticToolRunner`.
     var diagnosing = DiagnosticToolRunner{
         .inner = git_aware.runner(),
         .session = &language_server,
     };
 
-    // Provisioning, outermost, because it answers a call the two runners below
-    // it have no way to answer and changes what the one below them mounts. See
-    // `ProvisionToolRunner`.
-    //
-    // **Its own arena**, whose contents outlive every tool call and end with
-    // the session: a store path the sandbox mounts on the last turn was
-    // allocated on the turn the program was provisioned.
     var provision_arena = std.heap.ArenaAllocator.init(gpa);
     defer provision_arena.deinit();
 
-    // Between the diagnostics and the provisioner, because it answers a call
-    // neither of them can and needs nothing either of them sets up. See
-    // `NixEvalToolRunner`.
     var nix_eval = NixEvalToolRunner{
         .inner = diagnosing.runner(),
         .settings = .{
@@ -13769,20 +8769,13 @@ fn runSession(
         },
     };
 
-    // What this session mounts, written by the two runners below and read by
-    // every tool call. See `SessionMounts`.
     var session_mounts = SessionMounts{
         .arena = provision_arena.allocator(),
         .context = &tool_runner.context,
         .tool_env = started.tool_env,
     };
-    // The dev shell's own paths, taken in first, so the list this holds is
-    // the whole mount set and never only the additions.
     try session_mounts.start(context.store_paths);
 
-    // Between the evaluator and the provisioner, because a build is the two
-    // of them at once: it evaluates in this process and then runs `nix` on
-    // the host. See `NixBuildToolRunner`.
     var nix_build = NixBuildToolRunner{
         .inner = nix_eval.runner(),
         .settings = started.nix_build,
@@ -13801,20 +8794,10 @@ fn runSession(
         .mounts = &session_mounts,
     };
 
-    // This session's MCP servers, and the tools they supply.
-    //
-    // **A project that named none pays for nothing at all.** `mcp_servers` is
-    // null in that case, `startMcp` returns before it touches anything, the
-    // session offers exactly the tools it offered before this existed, and the
-    // system prompt below is the one phase 1 already built, byte for byte.
-    //
-    // **Started here and not in phase 1**, unlike every other block of
-    // `chock.zon`. A server has to be asked what tools it has before the model
-    // can be offered one, and asking means starting a process, which means a
-    // `fork`. Phase 1 runs beside the threads that build the workspace, and a
-    // `fork` there carries a lock another thread holds: see
-    // `chock_core.helper.Helper.arena`. So the tool list is finished here, and
-    // the system prompt is built a second time from the pieces phase 1 kept.
+    // Started here and not in phase 1, unlike every other block of `chock.zon`. A
+    // server has to be asked what tools it has before the model can be offered
+    // one, and asking means a `fork`, which phase 1 cannot do beside the threads
+    // that build the workspace.
     var mcp_state = McpState.init(gpa);
     defer mcp_state.deinit(io);
 
@@ -13827,16 +8810,6 @@ fn runSession(
         &mcp_state,
     );
 
-    // This session's plugins, and the tools they supply.
-    //
-    // **A project that named none pays for nothing at all**, the same rule the
-    // MCP block above keeps: `plugins` is null in that case, `startPlugins`
-    // returns before it touches anything, and the pair below is the one the
-    // line above answered, byte for byte.
-    //
-    // **After MCP**, because two suppliers of tools reach one model through one
-    // name space and the one that is already in the session keeps its names:
-    // see `startPlugins`.
     var plugin_state = PluginState.init(gpa);
     defer plugin_state.deinit(io);
 
@@ -13852,23 +8825,16 @@ fn runSession(
         mcp_prompt,
     );
 
-    // A name an MCP server supplies must never reach the sandbox runner, the
-    // git shim or the provisioner at all. See `McpToolRunner`.
     var mcp_aware = McpToolRunner{
         .inner = provisioning.runner(),
         .state = &mcp_state,
     };
 
-    // Outermost of the tool runners, and a plugin name reaches nothing else.
-    // See `PluginToolRunner`, which is the same wrapper one layer out.
     var plugin_aware = PluginToolRunner{
         .inner = mcp_aware.runner(),
         .state = &plugin_state,
     };
 
-    // What starts a subagent. See `SubagentSpawner`: a child is a process,
-    // because `fork` carries only the calling thread and a tree built from
-    // threads would deadlock the first time a child ran a tool.
     var subagent_spawner = SubagentSpawner{
         .gpa = gpa,
         .environ = environ,
@@ -13877,34 +8843,15 @@ fn runSession(
         .agent_kind = options.agent_kind,
     };
 
-    // The children this session starts and does not wait for. The same shape
-    // the background command table above takes, and the same allocator, for the
-    // same reason: a child's own thread allocates from this beside a thread that
-    // may be inside `Sandbox.spawn`, and `fork` carries only the calling thread.
-    // See `chock_core.subagent.Table.gpa`.
     var children = chock_core.subagent.Table{
         .gpa = std.heap.page_allocator,
         .spawner = subagent_spawner.spawner(),
     };
-    // **Waits, and does not cancel.** A child writes into a session directory
-    // below this session's own scratchpad, which phase 3 is about to remove, so
-    // leaving one running is not an option. Ending it is a different thing from
-    // ending a background command: a child holds a log of its own that a person
+    // Waits, and does not cancel. A child holds a log of its own that a person
     // reads afterwards, and a child killed between two turns leaves one with no
-    // `session.end`, which its parent then reads as a child that died. A Ctrl-C
-    // already reaches it, because a child stays in this process's own process
-    // group: see `SubagentSpawner.runToTheEnd`. `Loop.run` has already waited
-    // and recorded every child by the time this runs, so this ordinarily has
-    // nothing left to wait for.
+    // `session.end`, which its parent then reads as a child that died.
     defer children.deinit();
 
-    // What the two thread tables lost, if either lost anything. Both fill
-    // their slot on a child's own thread at the one moment the allocator has
-    // already refused, so neither can give an error back and neither may
-    // allocate a message. They kept a plain value instead, and this is where
-    // a person is told about it: a subagent whose record was lost is a
-    // `session.spawn` with no `agent.complete` after it, and a log that reads
-    // that way with nothing said is a session nobody can explain.
     defer {
         if (children.takeLost()) |lost| tty.print(.warn, "chock: {f}\n", .{lost});
         if (table) |*one| {
@@ -13914,40 +8861,17 @@ fn runSession(
 
     var printer = Printer.init(gpa, io);
     printer.paint = tty.stdoutPainter();
-    // The plan fold this holds outlives every event, so it is freed once, here,
-    // and never rebuilt when the display takes the printer's output over.
     defer printer.deinit();
 
-    // The display, for bare `chock` and for nothing else: see
-    // `Options.display`. **One implementation of `chock_core.Loop.Observer`
-    // wrapping another**, so the printer keeps composing every line, into the
-    // display's own buffer instead of standard output, and the display shows
-    // the tail of that buffer. `chock run` and the interface therefore carry
-    // the same bytes by construction and not by two code paths agreeing.
-    //
-    // **Opened here and not by the caller**, so its header band carries the
-    // project, the workspace and the model from its first frame: all three are
-    // worked out in phase 1, which has already run. See `Display`.
     var screen: ?*ui.Ui = null;
-    // Before phase 3, which prints for a person to read: see `stop`. Freeing is
-    // separate, because the transcript outlives the display.
     defer if (screen) |one| one.deinit();
 
-    // What this process could really observe about its own sandbox layers.
-    //
-    // **Before the display and not beside the header.** Two of the three
-    // probes fork, and a fork taken after `Ui.start` would be a fork of a
-    // process holding a terminal in raw mode. The child writes nothing but its
-    // own pipe and ends with `exit_group`, so it would be safe either way, and
-    // asking first costs nothing and removes the question. See
-    // `witnessLayers`.
+    // Before the display: two of the three probes fork, and a fork taken after
+    // `Ui.start` would be a fork of a process holding a terminal in raw mode.
     const layer_witness = witnessLayers(gpa, sandbox.Sandbox.guarantees);
 
     if (options.display) |wanted| {
         screen = ui.Ui.start(gpa, io, env, wanted.attach) catch |err| open_failed: {
-            // A terminal that will not give its size is a reason to print the
-            // old way, not a reason to end a session. Nothing was taken: see
-            // `Ui.start`.
             tty.print(
                 .warn,
                 "chock: the display could not start ({s}), printing plainly instead.\n",
@@ -13957,9 +8881,6 @@ fn runSession(
         };
     }
 
-    // The sandbox layers of this session, which the header borrows for as long
-    // as it is up. Declared here, before the display, so it outlives it. See
-    // `sandboxLayers` for where each one comes from.
     const layers = sandboxLayers(
         sandbox.Sandbox.guarantees,
         layer_witness,
@@ -13971,26 +8892,10 @@ fn runSession(
     );
 
     if (screen) |one| {
-        // **Unpainted, because the transcript is read twice**: once as text in
-        // the cells of the display, where an escape sequence would be a stray
-        // sequence at a place on the screen nothing chose, and once on the real
-        // screen when the display comes down.
-        //
-        // **Field by field and not a fresh value**, so the plan fold this
-        // printer holds is the same one for the whole session. See `deinit`.
         printer.paint = .off;
         printer.out = .{ .buffer = .{ .gpa = gpa, .bytes = &one.transcript } };
         one.wrap(printer.observer());
-        // The same table `context.tasks` above gives the tool runner and
-        // `deps.tasks` below gives the loop. **Borrowed, and read only from
-        // here**: `Ui.pollFinishedTasks` calls `Table.peek` while a person is
-        // being waited for, and the drain that records a completion and
-        // tells the agent about it stays with `chock_core.Loop.Deps.tasks`.
         if (table) |*one_table| one.tasks = one_table;
-        // What the header band says. **Only this file holds these**, which is
-        // why they are handed over rather than read: see `ui.Facts`. Every one
-        // of them lives in the arena for the whole run, so the display may
-        // borrow them.
         one.describe(.{
             .project = std.fs.path.basename(started.project_root),
             .workspace = switch (started.workspace.kind) {
@@ -13998,25 +8903,11 @@ fn runSession(
                 .overlay => "overlay",
             },
             .model = started.model,
-            // The provider instance's own name, which is what `model_alias`
-            // holds today: see `Started.model_alias`.
             .provider = started.model_alias,
-            // **The part of the header a person is there to see.** See
-            // `sandboxLayers`. It ranks above the four facts on the same row.
             .layers = &layers,
         });
-        // Where this project keeps its sessions, and which one this is, so
-        // `/resume` can offer the others. See `ui.Ui.resumable`.
         one.resumable(started.paths.dir, started.session_id);
-        // **After the header and before the first message is asked for.** The
-        // order is the whole of it: `describe` fills the band, this fills the
-        // transcript under it, and the loop below then asks for a message. The
-        // other order shows an empty header over a full transcript.
         replayInto(gpa, io, started.storage, one);
-        // **Said again, because the first saying is under this screen.**
-        // `applyModeFor` prints it in phase 1, which runs before `Ui.start`, so
-        // the alternate screen opened straight over the one line that says why
-        // no branch of the person's will move. See `bounded_mode_fmt`.
         if (started.apply_mode.mode == null) one.note(
             bounded_mode_fmt,
             .{
@@ -14025,16 +8916,9 @@ fn runSession(
                 chock_policy.apply.integrate_action,
             },
         );
-        // A message already on standard input is the first turn's, so a piped
-        // run and a typed one take one path through the loop below.
         if (options.display.?.first_message.len != 0) one.prime(options.display.?.first_message);
     }
 
-    // What the harness tells the agent that the agent cannot work out for
-    // itself, and the clock the time part of it reads. The offset is read once
-    // here, from the machine's own zone database, because a session that is
-    // hours long does not cross a summer time boundary often enough to be
-    // worth reading again every turn. See `src/clock.zig`.
     const wall = clock.Real{
         .io = io,
         .offset_minutes = clock.localOffsetMinutes(
@@ -14044,29 +8928,12 @@ fn runSession(
         ),
     };
 
-    // From here to the end of the session, Ctrl-C asks the session to stop
-    // rather than killing the process where it stands. **The point is the
-    // `session.end`**: a signal does not run a deferred append, so a killed
-    // session left a log that stops mid conversation with nothing saying why,
-    // and nothing replaying it, `--continue` included, could tell that apart
-    // from a process that died mid write. See `interrupt` and
-    // `chock_core.Loop.Deps.canceled`.
-    //
-    // Installed here and not in phase 1: before the loop exists there is
-    // nothing reading the flag, so a Ctrl-C during the workspace build keeps
-    // the plain old behaviour of ending the process at once.
+    // A signal does not run a deferred append, so a killed session left a log
+    // that stops mid conversation with nothing saying why. Installed here,
+    // because before the loop exists there is nothing reading the flag.
     interrupt.install();
 
-    // And from here another process can ask for this session. Armed here for
-    // the same reason the signal handler is installed here: before the loop
-    // exists there is nothing to read the answer, so a `chock detach` that
-    // arrived during the workspace build waits for the first turn boundary,
-    // which is the first moment the answer means anything.
-    //
-    // **Nothing is armed for a session whose socket could not be opened**, and
-    // that session simply cannot be taken. See `handoverEndpoint`.
     if (started.handovers) |endpoint| handover.arm(endpoint);
-    // Before phase 3 closes the endpoint, and before this phase's `Io` goes.
     defer handover.disarm();
 
     var session_arbiter = SessionArbiter{
@@ -14077,17 +8944,8 @@ fn runSession(
         .options = options,
         .screen = screen,
     };
-    // `decideFn` keeps a folded `state.Session` live across every question
-    // it answers: see `SessionArbiter.folded`. Freed here rather than by a
-    // `defer` next to that field's own first use, since `decideFn` is called
-    // through a `vtable` and never owns the moment its last call happens.
     defer session_arbiter.deinit();
 
-    // What gives a tool call's own sandbox a network broker: see
-    // `ToolNetwork`'s own top comment. The chain is the same one every other
-    // policy question this session asks folds, and it is freed with this
-    // function's own frame rather than an arena, because nothing else in this
-    // session needs it kept.
     const tool_network_chain = try policyChain(gpa, started, options);
     defer gpa.free(tool_network_chain);
 
@@ -14104,7 +8962,6 @@ fn runSession(
             .chain = tool_network_chain,
             .agent_kind = options.agent_kind,
             .model = started.model,
-            // Renamed before every call: see `ToolNetwork.brokerFn`.
             .tool = "",
             .transport = undefined,
         },
@@ -14112,46 +8969,17 @@ fn runSession(
     tool_network.network.transport = tool_network.transport.transport();
     defer tool_network.deinit();
 
-    // **A tool call moves off `Network.none` here, for the whole session.**
-    // `tool_runner.context` was copied into `tool_runner` above, before
-    // `screen` and this were known, so the field is set on the copy directly:
-    // the same pattern `tool_runner.context.idle` below already uses. See
-    // `chock_core.tools.Context.net`.
-    // **Only when this session is meant to have one.** A project that permits
-    // no host gets no network namespace, no kernel ruleset and no resolver,
-    // which is what `started.sandbox_config.network` above already says it
-    // gets. The two are read from one answer so they cannot disagree.
     if (started.sandbox_config.network == .filtered) {
         tool_runner.context.net = tool_network.seam();
     }
     tool_runner.context.approval_wait_ns = &tool_network.approval_wait_ns;
 
-    // **What makes a tool a third party supplies answerable at all.** Both
-    // sessions read their policy once, before this function ran, and only a
-    // `deny` decided anything then. Every other answer is decided one call at
-    // a time from here on, through the same arbiter every other mid session
-    // question in this project goes through: see
-    // `chock_core.mcp.Session.dispatch`. A session left with no asker refuses
-    // every MCP and plugin tool call and says nobody could be asked.
     mcp_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
     plugin_state.session.asker = .{ .arbiter = session_arbiter.arbiter() };
 
-    // **And the git shim, through the very same arbiter.** `git_aware` was
-    // built above, before this file had one to name, so the field is set on it
-    // here the way both sessions above are: see `GitToolRunner`, which holds
-    // why the approval half of the shim could not be wired before the seam
-    // existed and what is true now. A runner left with no arbiter refuses
-    // every subcommand the shim classifies, `git add` included.
     git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
 
-    // **And a Nix build, for the hosts its closure would fetch from.** A
-    // fixed output derivation builds with the network open to it, and which
-    // hosts it reaches is known only once the attribute is evaluated, which
-    // happens inside the tool call. A runner left with no arbiter refuses
-    // every build whose closure fetches anything. See `NixFetchGate`.
     nix_build.asker = .{ .arbiter = session_arbiter.arbiter() };
-    // And the table itself, for the one question that must not prompt: which
-    // mirror of a site a rule already permits. See `NixFetchGate.Rule`.
     nix_build.rule = .{
         .policy = started.policy,
         .chain = try policyChain(provision_arena.allocator(), started, options),
@@ -14159,32 +8987,16 @@ fn runSession(
         .model = started.model,
     };
 
-    // **And what one approved push may reach.** Built here because it needs the
-    // display, which is not known where `git_aware` itself is built, and it is
-    // ended with this frame: `disarm` runs on every path out of a tool call, so
-    // by the time this is torn down there is nothing left open.
-    //
-    // **A directory of its own, and never the session's `.ctl`.** That one
-    // holds the approval socket and the handover socket, and an agent that
-    // could reach the approval socket could answer its own questions. This one
-    // holds nothing but the sockets of the act being performed, and it is made
-    // `0o700` by `chock_broker.socket.ensureDir`, which both `Endpoint.open`
-    // and `Proxy.open` call on the parent of the path they are given.
+    // A directory of its own, and never the session's `.ctl`: an agent that could
+    // reach the approval socket could answer its own questions.
     const credential_dir = try std.fmt.allocPrint(
         gpa,
         "{s}/{s}.cred",
         .{ started.paths.dir, started.session_id },
     );
     defer gpa.free(credential_dir);
-    // Scratch, and this is the only thing that removes it. A directory that is
-    // not there is not a fault: nothing was ever armed in that session.
     defer std.Io.Dir.cwd().deleteTree(io, credential_dir) catch {};
 
-    // **The absolute path of this binary, because a bind mount needs a real
-    // one.** `chock` is statically linked, so binding it into the sandbox needs
-    // nothing else on the far side. An empty string is a machine where the path
-    // could not be resolved, and `armPassword` refuses rather than building a
-    // mount tree that names nothing.
     const credential_helper = std.Io.Dir.realPathFileAlloc(
         .cwd(),
         io,
@@ -14204,9 +9016,6 @@ fn runSession(
         .secrets = .{
             .io = io,
             .screen = screen,
-            // **The same rule the approval prompt keeps**: the display replaces
-            // the bare terminal and never joins it, because both read the same
-            // device. See `SecretAsker.ask`.
             .at_terminal = approval.hasTerminal(io) and screen == null,
         },
         .asker = .{
@@ -14215,34 +9024,20 @@ fn runSession(
             .agent_kind = options.agent_kind,
             .model = started.model,
         },
-        // **The person's own agent, out of the process environment and never
-        // the dev shell's.** A key belongs to whoever started chock.
         .host_agent = env.get(chock_broker.agentproxy.env_socket) orelse "",
-        // **The reserved slot at the end, which `redactionFor` put there.**
         // `@constCast` is sound here: the slice was allocated mutable in phase
-        // 1's arena and `Policy.secrets` is `const` only because a policy is
-        // passed by value everywhere else. This is the one owner that writes
-        // it, and it writes it from one thread.
+        // 1's arena, and this is the one owner that writes it, from one thread.
         .live = if (started.redact.secrets.len != 0)
             &@constCast(started.redact.secrets)[started.redact.secrets.len - 1]
         else
             null,
     };
-    // Nothing is ever open here by now, because `finishPush` closes on every
-    // path out of a tool call. This is the belt: a session that ended inside a
-    // call still leaves no socket behind.
     defer git_credentials.disarm(gpa, io);
 
     git_aware.credentials = &git_credentials;
     git_aware.project_root = started.project_root;
-    // **A tool call can be armed from here, and from nowhere else.**
-    // `tool_runner.context` was copied into `tool_runner` above, so the field
-    // is set on the copy directly, the same way `context.net` and
-    // `context.idle` already are. See `chock_core.tools.Context.credentials`.
     tool_runner.context.credentials = git_credentials.seam();
 
-    // The handle each of those five needs, handed over once by `Loop.run`.
-    // See `GiveLockedToAll`.
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
         .mcp = &mcp_state.session,
@@ -14251,10 +9046,6 @@ fn runSession(
         .nix = &nix_build,
     };
 
-    // What carries the agent's own work back when it says it is finished.
-    // **The same act `applyWork` performs at the end of the run**, through the
-    // same `carryCommit`, so an agent that asks reaches exactly what an agent
-    // that waits would have reached and nothing more. See `SessionHandback`.
     var session_handback = SessionHandback{
         .environ = environ,
         .env = env,
@@ -14263,9 +9054,6 @@ fn runSession(
         .screen = screen,
     };
 
-    // What answers a `fetch_url` call. **Its own arena**, because the spawn
-    // chain and the promises of the sessions above this one are read once here
-    // and read again on every call for the rest of the session.
     var fetch_arena = std.heap.ArenaAllocator.init(gpa);
     defer fetch_arena.deinit();
 
@@ -14273,26 +9061,16 @@ fn runSession(
         .gpa = gpa,
         .session = .{
             .gpa = gpa,
-            // Read one time at the start of the session, and it cannot change
-            // while the session runs.
             .table = started.policy,
-            // The same chain every other policy question folds, so a subagent
-            // can read no host its parent may not.
             .chain = try policyChain(fetch_arena.allocator(), started, options),
             .agent_kind = options.agent_kind,
             .model = started.model,
-            // Replaced per call with the tool that really asked. See
-            // `SessionFetcher.fetchFn`.
             .tool = chock_core.Loop.fetch_tool_name,
             .env = env,
         },
         .ancestors = ancestors: {
             var above = chock_proto.state.Session.init(gpa);
             defer above.deinit();
-            // An empty session, so this reads the ancestors and nothing else:
-            // this session's own promises arrive on every call from the loop's
-            // own fold, which is the only reading that is current in the
-            // middle of a turn. See `SessionFetcher`.
             break :ancestors promisesFor(
                 gpa,
                 fetch_arena.allocator(),
@@ -14305,14 +9083,6 @@ fn runSession(
     };
     defer fetcher.deinit();
 
-    // The audit sinks of this session, or none at all. **A session that named
-    // no sink opens no file and makes no socket**, and the observer the loop is
-    // given below is then the printer's or the display's own, which is what
-    // makes such a session the very session it was before export existed.
-    //
-    // Declared before the exporter, so its own `defer` runs after the
-    // exporter's last push. The other order would close the file the final
-    // `session.end` still has to travel through.
     var sinks = Sinks{};
     defer sinks.close(io);
     sinks.open(options, started.audit_sinks, started.session_id);
@@ -14324,33 +9094,10 @@ fn runSession(
         .inner = if (screen) |one| one.observer() else printer.observer(),
         .sinks = sinks.slice(),
     };
-    // **On every path out of this function**, a crash included. The last line
-    // of a session is its `session.end`, and that is what tells a reader at the
-    // far end that they are looking at a whole record rather than one that
-    // stopped.
     defer if (sinks.count != 0) exporter.finish(shipped);
 
-    // **A sink this installation requires is reached for now, and not when the
-    // first event fails to ship.** See `Exporter.probe`, and `chock_policy.org`
-    // for the decision this is one third of. A session that requires nothing
-    // does nothing here, which is what keeps an installation with no bundle
-    // behaving as it did.
     if (sinks.anyRequired()) exporter.probe();
 
-    // What puts an `ask_user` question to the person. **Declared here so it
-    // outlives `deps`**, which holds a pointer into it.
-    //
-    // **Two of them, and a session has exactly one.** A session with a display
-    // asks in the region `src/ui.zig` keeps for it, and a session with none asks
-    // at the bare prompt exactly as it always did. Never both: the display holds
-    // the terminal in raw mode and keeps a copy of every cell, so a prompt
-    // written around it lands in cells it believes it owns and two readers race
-    // for every byte. That is the same rule `asksHere` keeps for an approval.
-    //
-    // **`at_terminal` is the whole refusal rule for the prompt.** A subagent, a
-    // session the daemon started, and a `chock run` whose standard input is a
-    // pipe all read false there, so the question comes straight back and the
-    // agent is told nobody was asked.
     var question_console = QuestionConsole{};
     var question_prompt = chock_core.ask.Prompt{
         .console = question_console.console(),
@@ -14358,20 +9105,13 @@ fn runSession(
         .stop = interrupt.requested,
     };
     var display_asker = DisplayAsker{
-        // Never read while `screen` is null: see the `asker` line below.
         .screen = screen orelse undefined,
         .agent_kind = options.agent_kind,
     };
 
-    // What keeps the display alive through every wait this session makes.
-    // **Declared here so it outlives both the client and `deps`**, each of which
-    // holds a pointer into it. A session with no display has none of this, and
-    // both waits then behave exactly as they did before it existed.
     var pump = DisplayPump{ .screen = screen orelse undefined };
     if (screen != null) {
         http.idle = pump.providerIdle();
-        // The runner's own copy, which is the one a dispatch reads: `context`
-        // above was copied into it. See `chock_core.tools.Context.idle`.
         tool_runner.context.idle = pump.coreIdle();
     }
 
@@ -14379,158 +9119,52 @@ fn runSession(
         .client = http.client(),
         .storage = started.storage,
         .tool_runner = plugin_aware.runner(),
-        // Hands the session's own locked handle to the tool call network
-        // broker, the MCP session and the plugin session once `run` has taken
-        // it, so an `ask` any of the three reaches can reach a person: see
-        // `GiveLockedToAll` and `chock_core.Loop.GiveLocked`.
         .give_locked = give_locked.giveLocked(),
-        // The built-in list, plus whatever this project's MCP servers and
-        // plugins declared and the policy allowed. Identical to
-        // `started.tool_definitions` for a project that named neither: see
-        // `startMcp` and `startPlugins`.
         .tool_definitions = tool_definitions,
         .model = started.model,
         .model_alias = started.model_alias,
         .agent_kind = options.agent_kind,
-        // The third of the three places the role is read. The loop answers
-        // `spawn_agent`, `update_plan` and `restrict_self` itself, so this is
-        // what stops an arbitrator starting a subagent: see
-        // `chock_core.Loop.Deps.role`.
         .role = agentRole(options),
         .system_prompt = system_prompt,
-        // The printer, or the display, or either of those with an exporter in
-        // front of it. **The exporter wraps and never replaces**, the same shape
-        // the display already takes over the printer, so a session with an audit
-        // sink prints exactly what a session without one prints.
         .observer = if (sinks.count != 0) exporter.observer() else exporter.inner,
         .canceled = interrupt.requested,
-        // **Only at a turn boundary, which is why this is not `canceled`.** A
-        // session that stopped between two tool calls of one turn leaves an
-        // assistant message whose `tool_use` parts have no matching results,
-        // and the next owner has to send that context to a provider. See
-        // `chock_core.Loop.Deps.handover`.
+        // Only at a turn boundary, which is why this is not `canceled`. A session
+        // that stopped between two tool calls of one turn leaves an assistant
+        // message whose `tool_use` parts have no matching results.
         .handover = handover.requested,
         .budget = started.budget,
         .billing = started.billing,
-        // The chain is empty for a session a person started, and holds the
-        // parent for a session another agent started: see `spawnChain`, and
-        // `Options.parent_kind`, which is what makes the policy an intersection
-        // rather than this session's own kind alone.
         .subagents = started.subagents,
         .spawn_chain = started.spawn_chain,
         .parent_session = options.parent_session,
         .spawner = subagent_spawner.spawner(),
-        // What a spawn that asked to carry on is started on, and what the loop
-        // drains at the top of each turn: see `chock_core.Loop.Deps.children`.
         .children = &children,
-        // The threshold trigger. Null here leaves the overflow backstop as the
-        // only trigger, which is the honest behaviour for a model whose limit
-        // nobody stated: see `chock_core.compaction.Policy`.
         .compaction = .{ .context_limit_tokens = started.context_tokens },
-        // The prompt is kept short, and none of this reaches it: a notice goes
-        // at the end of the context, on the turn it applies to, so the
-        // provider's cache keeps the same prefix it had last turn. See
-        // `chock_core.notices`.
         .notices = .{
             .enabled = !options.no_notices,
             .clock = wall.clock(),
         },
         .uncommitted_files = started.uncommitted_files,
-        // The same table `context.tasks` above gives the tool runner. The
-        // runner fills it and the loop drains it: see
-        // `chock_core.Loop.Deps.tasks`.
         .tasks = if (table) |*one| one else null,
-        // The ratchet. What the loop asks when an agent proposes to widen a
-        // promise it already made, and, since `gateToolCall` learned to ask,
-        // every call bound for the tool runner too. Before the approval
-        // socket there was nobody who could answer mid session, so every such
-        // proposal was refused unasked: see `SessionArbiter`.
         .arbiter = session_arbiter.arbiter(),
-        // The same root `sandbox_config.cwd` already names, so
-        // `tools.Tool.actionInto` reads an in-project absolute `argv0` from
-        // where it points and not from how it is spelled: see that
-        // function's own doc.
         .project_root = started.sandbox_config.cwd,
-        // The toolchain phase 1 decided, so a program inside it names
-        // `exec.devshell.*` and every other store path names
-        // `exec.nix.store.*`. **Read from `Toolchain` and not from
-        // `tools.Context.store_paths`**, which grows when `provide_tool`
-        // realises a package: a store path this session caused to exist is
-        // the one thing the split is for. See `chock_core.Loop.Deps.store_closure`.
         .store_closure = started.toolchain.store_paths,
-        // What answers a `request_action` call. **This line is the difference
-        // between a tool the model is offered and a tool that does
-        // something**: `chock_core.Loop.Deps.handback` defaults to null, and a
-        // session with none tells the agent nothing was carried and nobody was
-        // asked. See `SessionHandback`.
         .handback = session_handback.handback(),
-        // What answers a `fetch_url` call. **This line is the difference
-        // between a tool the model is offered and a tool that does something**:
-        // `chock_core.Loop.Deps.fetcher` defaults to null, and a session with
-        // none tells the agent it can read nothing. See `SessionFetcher`, and
-        // `lib/chock-broker/fetch.zig` for every decision behind it.
         .fetcher = fetcher.fetcher(),
-        // What answers an `ask_user` call. **This line is the difference
-        // between a tool the model is offered and a tool that reaches a
-        // person**: `chock_core.Loop.Deps.asker` defaults to null, and a session
-        // with none tells the agent nobody was asked.
-        //
-        // **It is not the arbiter and never becomes one.** An ask grants
-        // nothing, whatever the person types: see `lib/chock-core/ask.zig`'s own
-        // top comment for why the two paths stay apart.
-        //
-        // **The display when there is one, and the bare prompt otherwise.** See
-        // `DisplayAsker`, which is the half of this feature that was missing
-        // until now: a session with a display told the agent nobody was asked,
-        // however many people were watching it.
         .asker = if (screen != null) display_asker.asker() else question_prompt.asker(),
-        // **What keeps this session's own credential out of a provider
-        // request**, built in phase 1 beside the credential it borrows: see
-        // `redactionFor`. `chock_core.Loop.Deps.redact` defaults inert, so this
-        // line is the difference between a mechanism and a running one.
-        //
-        // **The request is redacted and the log is not**, which is
-        // `lib/chock-core/redact.zig`'s own decision: the record stays complete,
-        // so `chock sessions verify` and every command that folds a log still
-        // mean what they meant.
         .redact = started.redact,
     };
-    // Null unless the caller asked for a limit, which is what `Loop.Deps`
-    // already defaults to: see its own doc comment on why a turn count is
-    // not the stop condition.
     deps.max_turns = options.max_turns;
 
-    // **One turn for `chock run`, and as many as the person asks for in the
-    // interface.** `chock run` takes one message on its command line and gets
-    // one answer, which is this loop going round once. The interface asks for
-    // the next message when the loop comes back and appends it to the log the
-    // same way `start` appended the first, so a second turn is the same thing
-    // `chock run --continue` does, in one process and without letting the log
-    // lock go.
-    //
-    // **`Loop.run` needs nothing new for this.** It folds the log it is given,
-    // appends no second `session.start` when the fold found one, and carries on
-    // from whatever is there. A log with several `session.end` events is
-    // exactly what a session that was continued looks like, and `finalExit`
-    // reads the last of them.
-    // **Every message the interface sends is asked for here, the first one
-    // included.** `start` appends none when there is a display, so a piped
-    // message and a typed one take the same path: see `Ui.prime`.
     var turns: usize = 0;
     while (true) {
         if (screen) |one| {
             switch (try one.askForMessage(gpa)) {
-                // An empty line, Ctrl-C at the field, or a display that
-                // stopped. See `Ui.askForMessage`.
                 .done => break,
                 .message => |next| {
                     defer gpa.free(next);
                     try appendUserMessage(gpa, io, started.storage, next);
                 },
-                // **`/resume`.** This session ends here, cleanly and with its
-                // own `session.end`, exactly as leaving does; the identifier is
-                // carried out to `main`, which takes the other one up once this
-                // one's workspace and sockets are down. See `takeUp`.
                 .take_up => |id| {
                     take_up.* = id;
                     break;
@@ -14542,43 +9176,19 @@ fn runSession(
         turns += 1;
         if (screen == null) break;
 
-        // Read out of the log rather than out of a flag, for one reason: the
-        // log is the truth of a session, and whether this turn finished is a
-        // statement about the session.
         if (!keepAsking(try finalExit(gpa, io, started.storage), interrupt.requested())) break;
     }
 
-    // **A session nobody asked anything of has no ending to read.** `Loop.run`
-    // is what writes a `session.end`, and it never ran, so the log holds a
-    // `session.start` and nothing else. That is the same outcome as bare `chock`
-    // with no message at all, and it reports the same way.
     if (turns == 0) return .usage;
 
     return try finalExit(gpa, io, started.storage);
 }
 
-/// Whether the interface asks for another message after a turn that ended this
-/// way.
-///
-/// **Only a turn that finished earns the next question.** Every other ending is
-/// the session saying it is over: Ctrl-C, a handover to another process, a
-/// budget that ran out, a refusal nobody answered, a turn limit, a crash.
-/// Putting a field on the screen of a session that is already ending would ask
-/// a person for work that nothing would do, and the workspace and the log are
-/// being taken down underneath it.
-///
-/// **`interrupted` is read as well as the ending**, and it is not the same
-/// question: a Ctrl-C that landed after this turn's `session.end` was written
-/// leaves a finished turn and a person who has asked to stop. It costs one
-/// atomic read and it closes that window.
 fn keepAsking(ending: Exit, interrupted: bool) bool {
     if (interrupted) return false;
     return ending == .finished;
 }
 
-/// The exit code, read back out of the log rather than out of whatever the code
-/// happened to return: the log is the truth of a session, and the exit code is
-/// a statement about the session.
 fn finalExit(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.Storage) !Exit {
     var replay = try storage.replay(gpa, io, 0);
     defer replay.deinit();
@@ -14592,53 +9202,24 @@ fn finalExit(gpa: std.mem.Allocator, io: std.Io, storage: chock_proto.storage.St
         last = exitFor(ended.reason);
         saw_end = true;
     }
-    // A log with no `session.end` at all is a session that stopped without
-    // saying why, which is a fault however it happened.
     if (!saw_end) return .faulted;
     return last;
 }
 
-/// How many audit sinks one session can have: a file drop and a syslog socket
-/// from the command line, and every sink the org policy bundle requires. See
-/// `lib/chock-proto/ship.zig` for what one over a network would need that this
-/// command's own single threaded rule does not allow, and `chock_policy.org`
-/// for why a bundle's own count is bounded too.
 const max_sinks: usize = chock_policy.org.max_sinks + 2;
 
-/// What each audit sink of one session came to, carried out of phase 2 so phase
-/// 3 can say it once the display is down.
-///
-/// **Fixed size and it allocates nothing.** It is filled on the session's own
-/// path, where the `Io` cannot start a thread, and read after that path has
-/// gone. A `Health` holds counts, an error, and a literal of
-/// `lib/chock-proto/ship.zig`, so nothing in it points at anything phase 2
-/// owned.
 const ShippingReport = struct {
     entries: [max_sinks]Entry = undefined,
     count: usize = 0,
 
     const Entry = struct {
-        /// What a person calls this sink: the file it writes, or the socket it
-        /// speaks to. Lives as long as the run does.
         name: []const u8,
         health: chock_proto.ship.Health,
-        /// Whether the installation required this sink. See `PlannedSink`.
         required: bool = false,
 
-        /// Whether this sink holds less than the whole of the session's log,
-        /// and will never hold the rest.
-        ///
-        /// **Two ways, and both are permanent.** A tail nothing was shipped
-        /// from is a tail that is on this machine and nowhere else, because the
-        /// session is over and nothing will push again. A refused line is one
-        /// the sink was there for and would not carry, and retrying it would
-        /// send the same bytes to the same sink for ever, so it is a hole in
-        /// the record as much as the tail is.
-        ///
-        /// **A sink that was down and came back is not a gap.** The log on disk
-        /// is the queue, so the shipper gave it every line it missed and
-        /// `stalled_at` cleared. That is why this is read at the end and never
-        /// while the session runs.
+        /// Whether this sink holds less than the whole of the session's log, and
+        /// will never hold the rest. A sink that was down and came back is not a
+        /// gap: the log on disk is the queue.
         fn gap(self: Entry) bool {
             return self.health.stalled_at != null or self.health.refused != 0;
         }
@@ -14654,14 +9235,6 @@ const ShippingReport = struct {
         return self.entries[0..self.count];
     }
 
-    /// Whether a sink this installation **required** holds less than the whole
-    /// of this session's log. See `Exit.audit_gap`, which is what this decides,
-    /// and `chock_policy.org` for why an organisation gets an exit status here
-    /// and never a session that refused to run.
-    ///
-    /// **Only a required sink.** A `--export-dir` somebody typed is that
-    /// person's own business, and a full disk under it must not turn a
-    /// developer's own run red.
     fn requiredGap(self: *const ShippingReport) bool {
         for (self.slice()) |one| {
             if (one.required and one.gap()) return true;
@@ -14670,18 +9243,6 @@ const ShippingReport = struct {
     }
 };
 
-/// Say what left this machine.
-///
-/// **A line either way, and a rank that tells them apart.** A session whose
-/// export worked says so in one plain line, which is what makes the absence of
-/// that line mean something; a session whose sink was down says the whole state
-/// as a warning. Prints nothing at all for a session that asked for no sink.
-///
-/// **A sink the installation required says so, and names the installation.**
-/// Nobody typed it, so a reader who is told only a path goes looking through a
-/// command line that does not hold it. And a gap in a required trail is the one
-/// thing here that reaches the exit status, so the line that reports it has to
-/// be the line that explains that code.
 fn reportShipping(report: *const ShippingReport) void {
     for (report.slice()) |one| {
         if (!one.health.wantsSaying()) {
@@ -14713,25 +9274,10 @@ fn reportShipping(report: *const ShippingReport) void {
     }
 }
 
-/// The audit sinks of one session: every `PlannedSink` `auditSinks` resolved
-/// out of the command line and out of the org policy bundle, and nothing at all
-/// when there were none.
-///
-/// **Its own type so the wiring is a fact a test can check.** Three mechanisms
-/// in this project have shipped with green tests and no real caller, and a sink
-/// built inside a function no test drives would be the fourth.
-///
-/// **Never moved after `open`.** Each `Sending` holds a `Sink` pointing into
-/// this struct's own `drops` or `syslogs`, so a copy of a `Sinks` has shippers
-/// aimed at the original. `runSession` keeps one on its own frame and nothing
-/// else holds one.
-/// **It owns no string.** Every name here is the run's own arena, built in
-/// phase 1, because a `ShippingReport` borrows these names and is read in phase
-/// 3. See `auditSinks` for the crash that taught this.
+/// Never moved after `open`: each `Sending` holds a `Sink` pointing into this
+/// struct's own arrays. Every name here is the run's own arena, because a
+/// `ShippingReport` borrows them and is read in phase 3.
 const Sinks = struct {
-    /// One transport per planned sink, in the slot its `Sending` points at. A
-    /// bundle may require several of a kind, so neither of these is a single
-    /// value any more.
     drops: [max_sinks]chock_proto.ship.FileDrop = @splat(.{ .path = "" }),
     syslogs: [max_sinks]chock_proto.ship.Syslog = @splat(.{ .path = "" }),
     drop_count: usize = 0,
@@ -14739,20 +9285,7 @@ const Sinks = struct {
     sending: [max_sinks]Exporter.Sending = undefined,
     count: usize = 0,
 
-    /// Build every sink in `planned`, which is `Started.audit_sinks`.
-    ///
-    /// **Fails at nothing, and allocates nothing.** An audit sink must never be
-    /// a reason a session does not start, the paths are already built, and that
-    /// holds for a required sink as much as for one somebody typed: see
-    /// `chock_policy.org`.
     fn open(self: *Sinks, options: Options, planned: []const PlannedSink, session_id: []const u8) void {
-        // **Whether this run took up a log another run wrote.** A sink that
-        // cannot say what it already holds is then given lines it may have, and
-        // it is told so; a session nobody continued has nothing that can arrive
-        // twice. See `chock_proto.ship.Health.resent_from_start`. `--session` for
-        // an identifier that names no log yet is counted here as well, which
-        // over-states rather than under-states, and over-stating is the safe
-        // direction for a note about duplicates.
         const continued = options.adopt or options.continue_newest or options.session != null;
         for (planned) |one| {
             if (self.count >= self.sending.len) return;
@@ -14785,9 +9318,6 @@ const Sinks = struct {
         return self.sending[0..self.count];
     }
 
-    /// Whether this installation required any of these. See `Exporter.probe`:
-    /// a required sink is reached for before the first turn and an optional one
-    /// is not.
     fn anyRequired(self: *const Sinks) bool {
         for (self.sending[0..self.count]) |one| {
             if (one.required) return true;
@@ -14801,33 +9331,17 @@ const Sinks = struct {
     }
 };
 
-/// Ships each event to an audit sink as the loop appends it, and passes every
-/// call on to the observer it wraps.
-///
-/// **It reads the log and never writes it.** `Loop.run` owns that file and holds
-/// its exclusive lock for the whole session, so a second writer of it is the one
-/// thing this may not become. See `lib/chock-proto/ship.zig`, which carries the
-/// whole argument, and `chock_core.Loop.Observer`, whose `onEvent` returns
-/// nothing exactly so that a watcher cannot stop a session.
 const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     storage: chock_proto.storage.Storage,
-    /// The observer this one wraps: the printer, or the display.
     inner: chock_core.Loop.Observer,
     sinks: []Sending,
-    /// Whether a fault has already been said.
-    ///
-    /// **Said once, and not once an event.** A sink that is down is down for
-    /// every event after it, and a line per event would bury the session the
-    /// lines are about. The end of the run says the whole state again, with the
-    /// counts: see `reportShipping`.
     said: bool = false,
 
     const Sending = struct {
         name: []const u8,
         shipper: chock_proto.ship.Shipper,
-        /// Whether this installation required this sink. See `PlannedSink`.
         required: bool = false,
     };
 
@@ -14841,9 +9355,6 @@ const Exporter = struct {
         .onNotice = onNoticeFn,
     };
 
-    /// **The inner observer first, and the sinks after.** A person watching sees
-    /// the line at the same moment they would have seen it with no export at
-    /// all, so turning export on cannot slow the terminal down behind a sink.
     fn onEventFn(ptr: *anyopaque, id: u64, ev: chock_proto.event.Event) void {
         const self: *Exporter = @ptrCast(@alignCast(ptr));
         self.inner.onEvent(id, ev);
@@ -14860,8 +9371,6 @@ const Exporter = struct {
         self.inner.onNotice(text);
     }
 
-    /// Ship whatever the log has gained. Fails at nothing: everything that went
-    /// wrong is in the shipper's own health record.
     fn push(self: *Exporter) void {
         for (self.sinks) |*one| {
             const before = one.shipper.health.faults;
@@ -14872,20 +9381,9 @@ const Exporter = struct {
         }
     }
 
-    /// Tell whoever is watching, at the moment it happens.
-    ///
-    /// **Through the observer this wraps and never through `tty`.** A display
-    /// may be up, and a line written straight to standard error would land
-    /// behind an alternate screen where nobody reads it.
-    /// `chock_core.Loop.Observer.onNotice` is the one channel that reaches a
-    /// person whichever way they are watching, and it is deliberately not an
-    /// event: this says what the harness is doing, not what the session did.
     fn sayFault(self: *Exporter, one: Sending) void {
         var buffer: [512]u8 = undefined;
         const why = @errorName(one.shipper.health.first_fault orelse error.Unexpected);
-        // **A required sink names the installation and not a flag.** Nobody
-        // typed this path, so a reader told only a path goes looking through a
-        // command line that does not hold it.
         const text = if (one.required) std.fmt.bufPrint(
             &buffer,
             "{s} could not be reached ({s}). This installation's org policy requires that sink. " ++
@@ -14901,24 +9399,10 @@ const Exporter = struct {
         self.inner.onNotice(text);
     }
 
-    /// Reach for every sink before the first turn.
-    ///
-    /// **Only worth doing when a sink is required**, and `runSession` calls it
-    /// only then, which is what keeps an installation with no bundle behaving
-    /// exactly as it did. An optional sink is a person's own choice and finding
-    /// it down when the first event fails to ship is soon enough.
-    ///
-    /// A required sink is not that: nobody at this keyboard chose it, the
-    /// person who did cannot see this machine, and being told before a model
-    /// has spent anything is the difference between a fixable morning and a
-    /// session whose record does not exist. The push is not extra work either:
-    /// the header line has to travel before any event can, so this is the same
-    /// bytes at an earlier moment.
     fn probe(self: *Exporter) void {
         self.push();
     }
 
-    /// Ship what is left, make each sink durable, and record what each came to.
     fn finish(self: *Exporter, report: *ShippingReport) void {
         for (self.sinks) |*one| {
             one.shipper.finish(self.gpa, self.io, self.storage);
@@ -14931,51 +9415,13 @@ const Exporter = struct {
     }
 };
 
-/// Prints what happens, as it happens. See `chock_core.Loop.Observer`: the
-/// loop holds the exclusive lock on the log for the whole session, so this is
-/// the only way a caller sees anything before the session ends.
-/// **What the model says is shown while it says it**, through
-/// `chock_core.Loop.Observer.onPiece`: see that method for the measured
-/// silence it exists to end. The `message` event that closes a turn then adds
-/// only the newline, because every word in it has already been on the screen
-/// for however long the turn took. `streamed` is what remembers that.
 const Printer = struct {
     io: std.Io,
-    /// Feeds `plan_arena` and nothing else. See `plan`.
     gpa: std.mem.Allocator,
-    /// Where the bytes go. `.stdout` is every real caller, and the default,
-    /// so a session needs to say nothing. A test gives `.buffer` instead, so
-    /// what a terminal would have shown becomes a value a test can read: see
-    /// the tests named for the blank line at the end of this file.
     out: Out = .stdout,
-    /// The escape sequences this printer may use. **`off` by default**, so a
-    /// test that builds one and does not ask for colour compares plain bytes,
-    /// and so a printer somebody forgets to configure writes what it always
-    /// wrote. The real caller passes `tty.stdoutPainter()`, which is off unless
-    /// standard output is a terminal that can show colour: see `src/tty.zig`.
-    ///
-    /// **What the model says is never painted.** The answer is the program's
-    /// output, a person may be piping it somewhere, and Chock has no way to
-    /// know which words in it matter. Only the lines Chock writes around it
-    /// carry a rank.
     paint: tty.Painter = .off,
-    /// How many pieces of this turn's answer have been printed as they
-    /// arrived. Reset by the `message` event that closes the turn.
-    ///
-    /// **Without this the answer is printed twice**, once piece by piece and
-    /// once whole, and the second copy arrives only when the turn is already
-    /// over.
     streamed: usize = 0,
-    /// The task list as it stands, folded from every `plan.update` so far.
-    ///
-    /// **One row for a whole update needs the whole list**, and one event
-    /// carries only the steps that moved: see `foldPlan`. Without this fold
-    /// the printer can say what changed and cannot say how much of the work is
-    /// done, which is the number a person watching wants.
     plan: chock_proto.state.Plan = .{},
-    /// Owns every string in `plan`. **Made on the first update and never
-    /// reset**, because a plan is at most a few dozen short steps and a step
-    /// that is reworded a hundred times still costs a few kilobytes.
     plan_arena: ?std.heap.ArenaAllocator = null,
 
     const Out = union(enum) {
@@ -15003,20 +9449,9 @@ const Printer = struct {
         .onNotice = onNoticeFn,
     };
 
-    /// What the harness itself is doing, on its own line. See
-    /// `chock_core.Loop.Observer.onNotice`: a session that waits out a rate
-    /// limit in silence looks exactly like a session that has hung, and a user
-    /// who cannot tell the two apart presses Ctrl-C on one that was about to
-    /// carry on.
     fn onNoticeFn(ptr: *anyopaque, text: []const u8) void {
         const self: *Printer = @ptrCast(@alignCast(ptr));
         defer self.flush();
-        // **Dim, and not a warning, although one thing on this channel would
-        // earn a warning.** Two things arrive here: the harness saying it is
-        // waiting out a rate limit, and the block of notices the loop builds
-        // for the model. The second arrives most turns, and a colour that
-        // fires most turns has stopped saying anything. One channel gets one
-        // rank: see `src/tty.zig` on not painting by category.
         self.open(.dim);
         self.write("\nchock: ");
         self.write(text);
@@ -15024,12 +9459,6 @@ const Printer = struct {
         self.close(.dim);
     }
 
-    /// **The reasoning is not shown and the answer is.** A model that thinks
-    /// before it answers writes far more reasoning than answer, and a terminal
-    /// that showed both would bury the answer in it. The reasoning is in the
-    /// log either way, which is where a person who wants it goes. The silence
-    /// this ends is the answer's own silence: text is what the model is
-    /// telling the user.
     fn onPieceFn(ptr: *anyopaque, piece: chock_core.Loop.Piece) void {
         const self: *Printer = @ptrCast(@alignCast(ptr));
         defer self.flush();
@@ -15049,11 +9478,6 @@ const Printer = struct {
         defer self.flush();
         switch (ev) {
             .message => |m| {
-                // **A system role message is the harness talking to the
-                // model**, for example the notice that a compaction is
-                // coming. The user has to see that: a session that quietly
-                // told the model something is a session the user cannot
-                // explain afterwards.
                 if (m.role == .system) {
                     self.open(.dim);
                     for (m.content) |part| {
@@ -15064,42 +9488,23 @@ const Printer = struct {
                     self.close(.dim);
                     return;
                 }
-                // The user's own message is not echoed: the user just typed
-                // it. The tool role's message is the same result the
-                // `tool.result` event already showed.
                 if (m.role != .assistant) return;
-                // The turn is over, so whatever was streamed belongs to it and
-                // not to the next one.
                 const streamed = self.streamed;
                 self.streamed = 0;
-                // **The newline closes what was written, so it needs
-                // something to close.** A turn that only reasoned before it
-                // called a tool shows nothing here, and an unconditional
-                // newline after nothing is a blank line. Every model that
-                // thinks first has such a turn, the `.tool_call` branch below
-                // opens with a newline of its own, and a session with many
-                // tool calls became mostly whitespace.
                 var wrote_anything = streamed != 0;
                 for (m.content) |part| switch (part) {
                     .text => |text| {
                         if (text.len == 0) continue;
-                        // Already on the screen, piece by piece, since the
-                        // moment the model produced it. See `streamed`.
                         if (streamed != 0) continue;
                         self.write(text);
                         wrote_anything = true;
                     },
                     .reasoning => {},
-                    // An image is the tool's answer and not the assistant's
-                    // words, the same as `.tool_result` beside it. A terminal
-                    // cannot draw it either.
                     .tool_use, .tool_result, .image, .unknown => {},
                 };
                 if (wrote_anything) self.write("\n");
             },
             .tool_call => |call| {
-                // Dim. A person scrolling a long run is looking for the answer
-                // and for what went wrong, and a call is neither.
                 self.open(.dim);
                 defer self.close(.dim);
                 self.write("\n$ ");
@@ -15109,12 +9514,6 @@ const Printer = struct {
                 self.write("\n");
             },
             .tool_result => |result| {
-                // **Chock's own sentence goes first, and above the result it
-                // explains.** The result is written for the model and reads as
-                // a message about the user rather than to them; this line is
-                // the one written to the person. See
-                // `chock_proto.event.ToolResult.note`, and `onNoticeFn` for
-                // why Chock's own channel is dim and not a warning.
                 if (result.note.len != 0) {
                     self.open(.dim);
                     self.write("chock: ");
@@ -15122,9 +9521,6 @@ const Printer = struct {
                     self.write("\n");
                     self.close(.dim);
                 }
-                // **Only a failed result is painted.** A result that worked is
-                // ordinary output, and it gets the colour every ordinary line
-                // gets, which is none.
                 const rank: tty.Rank = if (result.is_error) .err else .plain;
                 self.open(rank);
                 defer self.close(rank);
@@ -15134,16 +9530,7 @@ const Printer = struct {
                 if (shown.len != result.output.len) self.write("\n[...the whole result is in the log]");
                 self.write("\n");
             },
-            // **A compaction that happens in silence is the five minute
-            // silence again.** The project owner watched a session sit with
-            // no output and reasonably guessed it was compacting; it was not,
-            // because nothing compacted at all then. Now that something does,
-            // it says so, and it says the log kept everything.
             .compaction => |folded| {
-                // **A fold the model had no part in is not the ordinary case**,
-                // so it does not read as one. The reason decides the rank here
-                // the same way it does for a session that ended. See
-                // `chock_proto.event.Compaction.stand_in_reason`.
                 const rank: tty.Rank = if (folded.stand_in_reason.len != 0) .warn else .dim;
                 self.open(rank);
                 defer self.close(rank);
@@ -15158,10 +9545,6 @@ const Printer = struct {
                 }
                 self.write(". Every turn is still in the session log.\n");
             },
-            // **A background task that finished in silence would be a command
-            // the user never saw run at all.** The agent is told the same fact
-            // in the same moment, as a message, and the person watching has no
-            // other way to learn a build ended.
             .task_complete => |done| {
                 self.open(.dim);
                 defer self.close(.dim);
@@ -15169,8 +9552,6 @@ const Printer = struct {
                 self.write(done.task_id);
                 self.write(" finished, ");
                 self.write(done.status.wireName());
-                // The number, for the reason `src/ui.zig` gives beside the
-                // same line: without it a failure reads as a success.
                 var code_buffer: [16]u8 = undefined;
                 self.write(std.fmt.bufPrint(&code_buffer, " {d}", .{done.code}) catch "");
                 self.write(": ");
@@ -15178,12 +9559,6 @@ const Printer = struct {
                 self.write("\n");
             },
             .plan_update => |update| self.foldPlan(update),
-            // **A promise the agent made about itself is written where the
-            // person watching sees it**, and not only into the log. It is a
-            // decision the agent took on its own, it holds for the rest of the
-            // session, and nothing can lift it, so it is exactly the sort of
-            // thing a person wants to read at the moment it happens rather than
-            // in the morning.
             .policy_self => |update| {
                 self.open(.dim);
                 defer self.close(.dim);
@@ -15200,10 +9575,6 @@ const Printer = struct {
                 }
             },
             .session_end => |ended| {
-                // **The reason decides the rank.** A session that finished is
-                // the ordinary case and reads as one. Every other reason is
-                // something to act on: the agent gave up, ran out of money, was
-                // refused, or crashed.
                 const rank: tty.Rank = if (ended.reason == .finished) .dim else .warn;
                 self.open(rank);
                 defer self.close(rank);
@@ -15219,35 +9590,10 @@ const Printer = struct {
         }
     }
 
-    /// Fold one `plan.update` in, and write the one row a person needs.
-    ///
-    /// **A list of N steps used to cost N rows every time any one of them
-    /// moved.** One `update_plan` call really did write four rows saying what
-    /// each step is now, and a task list has one current state, not one per
-    /// event. `src/ui.zig`'s `Ui.foldPlan` settled the shape and this writes
-    /// the same one: how much is done, and what is being worked on.
-    ///
-    /// **The running step is named and not only counted.** The common move is
-    /// a step going from pending to in_progress, which moves no count at all,
-    /// so a row with only counts on it would say nothing happened.
-    ///
-    /// **A step that was given up keeps a row of its own.** That is an event
-    /// and not a state: only a transcript can say when a step was dropped and
-    /// what else was going on. It fires on the move to `abandoned` and never
-    /// on an update that repeats a status the step already had.
-    ///
-    /// **This summary is richer than the display's by one clause, and only
-    /// when that clause has something to say.** The display keeps the standing
-    /// state in the plan sidebar beside the transcript, where a given up step
-    /// is a row a person can see for the rest of the session. `chock run` has
-    /// no sidebar, so the same fact has to travel on the summary or be lost:
-    /// `1 of 4 done` reads as three left when one of the four was abandoned.
-    /// The count is written only while it is not zero, so an ordinary session
-    /// reads exactly as the display reads.
+    /// One event carries only the steps that moved, and a task list has one
+    /// current state. The abandoned count is written only while it is not zero,
+    /// or `1 of 4 done` reads as three left.
     fn foldPlan(self: *Printer, update: chock_proto.event.PlanUpdate) void {
-        // Which steps are newly given up has to be read before the fold. After
-        // it, an update repeating a status it already had looks the same as one
-        // that changed it.
         var gave_up: [max_said_steps]usize = undefined;
         var count: usize = 0;
         for (update.steps, 0..) |step, at| {
@@ -15261,9 +9607,6 @@ const Printer = struct {
         }
 
         if (self.plan_arena == null) self.plan_arena = .init(self.gpa);
-        // A plan that could not be folded is left as it stands. An observer
-        // watches and never decides, so an allocator that has refused is not
-        // this file's fault to report.
         self.plan.apply(self.plan_arena.?.allocator(), update) catch {};
 
         self.open(.dim);
@@ -15273,9 +9616,6 @@ const Printer = struct {
             self.write("\nchock: plan step ");
             self.write(update.steps[at].id);
             self.write(" was given up");
-            // An update that only moved a status carries no subject: the words
-            // the step had are kept, and the fold is where they now are. See
-            // `chock_proto.state.Plan.apply`.
             const said = self.subjectOf(update.steps[at]);
             if (said.len != 0) {
                 self.write(": ");
@@ -15304,19 +9644,14 @@ const Printer = struct {
         self.write("\n");
     }
 
-    /// The most steps of one update that can each get a row of their own. An
-    /// update is a whole task list, which `chock_core.tools` already bounds.
     const max_said_steps = 64;
 
-    /// The words of one step of an update, taken from the fold when the update
-    /// itself carried none.
     fn subjectOf(self: *const Printer, step: chock_proto.event.PlanStep) []const u8 {
         if (step.subject.len != 0) return step.subject;
         const held = self.plan.find(step.id) orelse return "";
         return held.subject;
     }
 
-    /// The first step being worked on, or null when none is.
     fn stepInProgress(self: *const Printer) ?chock_proto.state.Plan.Step {
         for (self.plan.steps.items) |step| {
             if (ui.isStatus(step.status, .in_progress)) return step;
@@ -15324,50 +9659,26 @@ const Printer = struct {
         return null;
     }
 
-    /// Start a run of text of this rank. Writes nothing at all when the
-    /// painter is off, which is every pipe, every file, and every test that
-    /// does not ask for colour.
     fn open(self: *Printer, rank: tty.Rank) void {
         self.write(self.paint.open(rank));
     }
 
-    /// End it.
     fn close(self: *Printer, rank: tty.Rank) void {
         self.write(self.paint.close(rank));
     }
 
-    /// A failed write is dropped on purpose. An observer watches and never
-    /// decides: see `chock_core.Loop.Observer`. A terminal that went away,
-    /// for example a pipe into `head`, must not end a session that is doing
-    /// real work, and the log still holds every one of these bytes.
-    ///
-    /// **Through `src/tty.zig`'s standard output writer, and never straight to
-    /// the descriptor.** That writer is holding bytes that have not left yet,
-    /// so a write that went around it would arrive in front of them. One
-    /// buffered standard output, or the order is not defined.
+    /// A failed write is dropped on purpose. Through `src/tty.zig`'s standard
+    /// output writer and never straight to the descriptor, because that writer is
+    /// holding bytes that have not left yet.
     fn write(self: *Printer, bytes: []const u8) void {
         switch (self.out) {
             .stdout => if (!tty.writeOut(bytes)) {
-                // Nobody set the streams, which is a path that runs before
-                // `main` wired them. Straight out is where these bytes always
-                // went, and nothing is buffered to get ahead of.
                 std.Io.File.stdout().writeStreamingAll(self.io, bytes) catch {};
             },
-            // A test's own buffer. A failed append is dropped the same way a
-            // failed write is, for the reason above.
             .buffer => |buffer| buffer.bytes.appendSlice(buffer.gpa, bytes) catch {},
         }
     }
 
-    /// Send what standard output is holding, at the end of one observer call.
-    ///
-    /// **Two reasons, and each one alone would be enough.** The answer arrives
-    /// piece by piece and a person watches it arrive, so holding pieces back
-    /// until a buffer filled would turn a stream into a stutter. And
-    /// `Loop.run` forks for every tool call: a child inherits the parent's
-    /// unsent bytes, and although neither `exec` nor `std.process.exit` sends
-    /// them, a buffer that is empty at every fork is one less thing to reason
-    /// about.
     fn flush(self: *Printer) void {
         switch (self.out) {
             .stdout => tty.flushOut(),
@@ -15393,9 +9704,6 @@ fn appendUserMessage(
     );
 }
 
-/// The message: the words on the command line, joined by a space, or, with
-/// none, everything on standard input. **A pipe therefore works with no extra
-/// flag**, which is the same default `chock login` uses for a credential.
 fn readMessage(arena: std.mem.Allocator, io: std.Io, options: Options) StartError![]const u8 {
     if (options.message_words.len != 0) {
         return std.mem.join(arena, " ", options.message_words);
@@ -15474,18 +9782,6 @@ fn chooseSessionId(
     return session_paths.newId(io);
 }
 
-/// Refuse an adoption that has nothing to take over, and say which of the four
-/// reasons it is.
-///
-/// **A handover with nothing to hand over must be a refusal that names what is
-/// wrong.** The process holding the log's exclusive lock is the owner of that
-/// session, so an adoption is that lock changing hands, and each answer below
-/// is a different way of asking for a lock that means nothing.
-///
-/// The reading is `sessions_cmd.readinessOf`, which `chock detach` and
-/// `chock daemon` ask as well. **The words are this command's own**, because
-/// what a person should do next differs by which command they typed. See that
-/// function for why none of this is what stops two owners.
 fn refuseAdoptWithNothingToAdopt(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -15512,8 +9808,7 @@ fn refuseAdoptWithNothingToAdopt(
                 "it, and ownership is not taken from a session that is still using it.\n",
             .{id},
         ),
-        // Fails closed, the same rule `chock sessions` keeps for a removal: an
-        // absent answer is never a permissive answer.
+        // Fails closed: an absent answer is never a permissive answer.
         .unknown => tty.print(
             .err,
             "chock run: session {s} could not be read, or its lock could not be tested, so it " ++
@@ -15524,21 +9819,9 @@ fn refuseAdoptWithNothingToAdopt(
     return error.Reported;
 }
 
-/// What a person is told when the session lock was taken by somebody else
-/// between the check and the session's own attempt. See
-/// `refuseAdoptWithNothingToAdopt` for why a check cannot close that window and
-/// why nothing is lost when it happens: the log is whole, and the session can be
-/// adopted again.
 const busy_detail = "another process took the session's log lock first, so it owns that session " ++
     "now. Nothing was lost: the log is whole, and `chock sessions` says who is running.";
 
-/// What the prompt says about the project. One paragraph, and `prompt.Project`
-/// drops it when both fields are empty.
-///
-/// This recognizes one project kind, by one file, and that is honest for a
-/// prototype: naming a build command Chock guessed is worse than naming
-/// none, because a model that runs a command that does not exist spends a
-/// turn finding that out.
 fn projectKind(io: std.Io, project_root: []const u8) chock_core.prompt.Project {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const build_zig = std.fmt.bufPrint(&buffer, "{s}/build.zig", .{project_root}) catch return .{};
@@ -15548,8 +9831,6 @@ fn projectKind(io: std.Io, project_root: []const u8) chock_core.prompt.Project {
 
 const ParseError = error{ HelpWanted, BadArguments } || std.mem.Allocator.Error;
 
-/// Every option that takes a value of its own. One list, read before a value
-/// is taken off the command line: see `parseOptions`.
 const value_options = [_][]const u8{
     "--provider",
     "--model",
@@ -15560,9 +9841,6 @@ const value_options = [_][]const u8{
     "--max-turns",
     "--export-dir",
     "--export-syslog",
-    // The six a parent puts on a child's command line. Their names are read
-    // from `chock_core.subagent.flag`, so the parent that writes one and the
-    // child that reads it cannot spell it differently: see that file.
     subagent.flag.parent_session,
     subagent.flag.parent_kind,
     subagent.flag.spawn_reason,
@@ -15581,9 +9859,6 @@ fn takesValue(argument: []const u8) bool {
 fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!Options {
     var options = Options{};
     var words: std.ArrayList([]const u8) = .empty;
-    // The spawn chain, one link per `--parent-kind`, in the order they arrive.
-    // A list and not one string: **the whole chain is what binds a child**, and
-    // the parent writes one pair per agent above it.
     var chain: std.ArrayList(chock_proto.event.SpawnLink) = .empty;
 
     var index: usize = 0;
@@ -15617,15 +9892,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             continue;
         }
 
-        // The name is checked before a value is taken, and not after. The
-        // other way round, `chock run --nonsense` reads the next word as the
-        // value of an option that does not exist, and then says "--nonsense
-        // needs a value", which sends a user looking for the right value
-        // instead of the right option.
         if (!takesValue(argument)) {
-            // The fault is ranked and the usage text is not. Colouring a whole
-            // help page red would make the one line that says what is wrong
-            // harder to find, which is the fault this project is fixing.
             tty.print(.err, "chock run: there is no option named {s}.\n\n", .{argument});
             tty.print(.err, "{s}", .{usage_text});
             return error.BadArguments;
@@ -15659,14 +9926,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_session)) {
             options.parent_session = value;
         } else if (std.mem.eql(u8, argument, subagent.flag.parent_kind)) {
-            // One more agent above this one. **Appended and never replaced**: a
-            // parser that kept the last one would leave a session three deep
-            // running under a chain of one link.
             try chain.append(arena, .{ .agent_kind = value, .reason = "" });
         } else if (std.mem.eql(u8, argument, subagent.flag.spawn_reason)) {
-            // The reason belongs to the link just named, which is how a pair is
-            // put back together. `commandLine` writes the two in that order and
-            // is the only thing that writes either.
             if (chain.items.len == 0) {
                 tty.print(
                     .err,
@@ -15700,11 +9961,6 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
                 return error.BadArguments;
             }
         } else {
-            // Unreachable in practice: `takesValue` above already refused
-            // every name that is not one of these. This is here so adding a
-            // name to `value_options` and forgetting the branch is a build
-            // that still says something true, rather than one that silently
-            // drops the option.
             tty.print(.err, "chock run: {s} is not handled yet.\n", .{argument});
             return error.BadArguments;
         }
@@ -15716,11 +9972,6 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
     }
 
     if (options.adopt) {
-        // A session that does not exist yet has nothing to adopt, and a fresh
-        // identifier is what `chooseSessionId` hands back when neither of these
-        // is given. Without this check, `--adopt` on its own would make an empty
-        // log and then refuse it for being empty, which sends a reader looking
-        // at the wrong fault.
         if (options.session == null and !options.continue_newest) {
             tty.print(
                 .err,
@@ -15730,10 +9981,6 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             );
             return error.BadArguments;
         }
-        // **The whole point of the flag is that the conversation continues
-        // where it stopped.** A message beside it is a person asking for two
-        // different things at once, and guessing which one they meant would
-        // either drop the message or start a turn nobody asked for.
         if (words.items.len != 0) {
             tty.print(
                 .err,
@@ -15753,9 +10000,6 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 const testing = std.testing;
 
 test "--adopt takes over a session that exists, and refuses every shape that is not that" {
-    // **The replay half of a handover.** Three facts: it is off unless asked
-    // for, it needs a session that already exists, and it takes no message,
-    // because the conversation it carries on is the one in the log.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -15765,30 +10009,19 @@ test "--adopt takes over a session that exists, and refuses every shape that is 
     try testing.expect(!(try parseOptions(arena, &.{"a message"})).adopt);
     try testing.expect((try parseOptions(arena, &.{ "--adopt", "--session", id })).adopt);
     try testing.expect((try parseOptions(arena, &.{ "--adopt", "--continue" })).adopt);
-    // And it really appends nothing: no words means `start` reads no standard
-    // input and writes no message event.
     try testing.expectEqual(
         @as(usize, 0),
         (try parseOptions(arena, &.{ "--adopt", "--session", id })).message_words.len,
     );
 
-    // **Each refusal is captured and read**, because the two are different
-    // mistakes and a person has to be told which one they made. See
-    // `tty.Capture`, and `test/proto/lock.zig` for why a test may not let a
-    // line reach standard error.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
-    // A fresh identifier is what `chooseSessionId` hands back with neither of
-    // these, so `--adopt` alone would make an empty session and then refuse it
-    // for being empty, which points a reader at the wrong fault.
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--adopt"}));
     try testing.expect(std.mem.indexOf(u8, said.err(), "--session") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "--continue") != null);
 
-    // A message beside it is a person asking for two different things at once,
-    // and the refusal says which of the two to drop.
     said.clear();
     try testing.expectError(
         error.BadArguments,
@@ -15798,8 +10031,6 @@ test "--adopt takes over a session that exists, and refuses every shape that is 
     try testing.expectEqualStrings("", said.out());
 }
 
-/// Write a log holding a `workspace.open` and, when `reason` says so, a
-/// `session.end`. The shape a run that handed over leaves behind.
 fn writeHandoverLog(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -15816,8 +10047,6 @@ fn writeHandoverLog(
 
     var locked = try store.lock(io);
     defer locked.unlock(io) catch {};
-    // A fixed time and never a clock: this suite makes no assertion over one,
-    // and nothing this test reads is a time.
     _ = try locked.append(gpa, io, .{ .session_start = .{
         .agent_kind = "main",
         .model_alias = "local",
@@ -15835,14 +10064,6 @@ fn writeHandoverLog(
 }
 
 test "the next owner finds the handed over workspace in the log, and takes nothing else" {
-    // **The workspace half of a live handover.** `start` mints a fresh attempt
-    // identifier on every invocation and `headMoved` measures work against the
-    // commit the checkout started at, so neither can be worked out by a second
-    // process. Both are in the log, and this is what reads them back.
-    //
-    // Mutation check: return null for a `handed_over` session, and every
-    // handover rebuilds from committed state, which throws away everything the
-    // agent had not committed.
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -15866,36 +10087,17 @@ test "the next owner finds the handed over workspace in the log, and takes nothi
 
     try writeHandoverLog(gpa, io, log_path, id, attempt, base_commit, .handed_over);
 
-    // **The directory has to be there.** A person may have run
-    // `chock workspace clear` between the two owners, and a run that then asked
-    // `adopt` for a path that is gone would fail where it should start again
-    // from committed state.
     try testing.expect(takenOver(gpa, io, arena, log_path, work) == null);
 
     const checkout = try std.fmt.allocPrint(arena, "{s}/{s}", .{ work, attempt });
     try std.Io.Dir.createDirAbsolute(io, checkout, .default_dir);
 
     const taken = takenOver(gpa, io, arena, log_path, work).?;
-    // Spelled out, and not compared against a second read of the same log: what
-    // is pinned is that these two values reach the next owner unchanged.
     try testing.expectEqualStrings(attempt, &taken.attempt);
     try testing.expectEqualStrings(base_commit, taken.base_commit);
 }
 
 test "a workspace opened after the handover belongs to the owner that came next" {
-    // **The way this could have deleted live work.** A `state.Session` fold
-    // never clears `end_reason`, and a resumed session writes no second
-    // `session.start`, so once a session has handed over once the fold says
-    // `handed_over` for ever, including while its next owner runs.
-    //
-    // A session hands over from A to the daemon's child B. B writes a
-    // `workspace.open` of its own and works. A person runs `chock run
-    // --continue`: with the reason alone, C would adopt the checkout B is
-    // working in, and when B's turn ended, B's own teardown would run
-    // `git worktree remove --force` on the directory C had just taken.
-    //
-    // The positions are what tell the two apart. Mutation check: drop the
-    // `opened > ended_at` test and this stops holding, which is that.
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -15920,7 +10122,6 @@ test "a workspace opened after the handover belongs to the owner that came next"
         try std.Io.Dir.createDirAbsolute(io, checkout, .default_dir);
     }
 
-    // Owner A opens a workspace and hands the session over.
     {
         const log = try chock_proto.log.Log.open(io, log_path, id);
         var backing = chock_proto.storage.JsonLines{ .log = log };
@@ -15928,7 +10129,6 @@ test "a workspace opened after the handover belongs to the owner that came next"
         defer store.close(io);
         var locked = try store.lock(io);
         defer locked.unlock(io) catch {};
-        // A fixed time and never a clock: nothing this test reads is a time.
         _ = try locked.append(gpa, io, .{ .workspace_open = .{
             .kind = .worktree,
             .attempt = first_attempt,
@@ -15941,13 +10141,9 @@ test "a workspace opened after the handover belongs to the owner that came next"
         } }, 2);
     }
 
-    // The next owner takes A's workspace, which is what it is for.
     const taken = takenOver(gpa, io, arena, log_path, work).?;
     try testing.expectEqualStrings(first_attempt, &taken.attempt);
 
-    // Owner B starts, in the same workspace or in one of its own, and is
-    // running now: its `workspace.open` is the newest event and there is no
-    // ending after it.
     {
         const log = try chock_proto.log.Log.open(io, log_path, id);
         var backing = chock_proto.storage.JsonLines{ .log = log };
@@ -15963,20 +10159,10 @@ test "a workspace opened after the handover belongs to the owner that came next"
         } }, 3);
     }
 
-    // **And now nobody takes anything.** The stale `handed_over` is still the
-    // newest ending, and a build that read the reason alone would hand B's live
-    // checkout to a third process.
     try testing.expect(takenOver(gpa, io, arena, log_path, work) == null);
 }
 
 test "only a session that handed over gives its workspace away" {
-    // A session that crashed also keeps its workspace, per `cleanupFor`, and
-    // taking that one over is a separate decision with its own refusal in
-    // `src/detach.zig`. A session still running has written no ending at all.
-    //
-    // Mutation check: drop the `end_reason` test in `takenOver` and every
-    // `--continue` of a crashed session starts inside that session's leftovers,
-    // which is a change nobody asked for and which no test here covers.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -15987,12 +10173,6 @@ test "only a session that handed over gives its workspace away" {
         .canceled_by_user,
         .budget_reached,
     };
-    // **What each reason answered, joined and compared once at the end.**
-    // A per case `expect` says only that one of them failed, so this used to
-    // carry a `std.debug.print` of the index beside it. Writing the whole table
-    // instead names every reason and its answer in the failure itself, and it
-    // puts nothing on standard error: see `test/proto/lock.zig`, which is what
-    // makes that a rule rather than a preference.
     var answered: std.ArrayList(u8) = .empty;
     defer answered.deinit(gpa);
     var wanted: std.ArrayList(u8) = .empty;
@@ -16031,16 +10211,6 @@ test "only a session that handed over gives its workspace away" {
 }
 
 test "a run that adopted a workspace never removes it, however it fails" {
-    // **The worst thing this feature could do.** `Workspace.close` runs
-    // `git worktree remove --force`, and an adopted checkout holds work another
-    // owner left in it. A run that adopted one and then failed for its own
-    // reasons, a bad provider or a lock it lost, must let go of it and never
-    // delete it. `keep` is that: the same value released, and nothing on disk
-    // touched.
-    //
-    // Driven against a real worktree, because what is pinned is what happens to
-    // the files. Mutation check: call `close` for an adopted workspace and the
-    // file the last owner wrote is gone.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -16060,9 +10230,6 @@ test "a run that adopted a workspace never removes it, however it fails" {
     try std.Io.Dir.createDirAbsolute(io, scratch, .default_dir);
 
     var env = try std.testing.environ.createMap(arena);
-    // The same ceiling every workspace test uses: this checkout is a git
-    // repository and `tmpDir` sits underneath it, so without one `git` walks up
-    // and finds the wrong repository.
     try env.put("GIT_CEILING_DIRECTORIES", tmp_path);
     try makeGitProject(arena, io, &env, project);
 
@@ -16075,7 +10242,6 @@ test "a run that adopted a workspace never removes it, however it fails" {
         defer handle.close(io);
         try handle.writeStreamingAll(io, "work nobody committed\n");
     }
-    // A handover leaves it exactly here.
     first.keep(arena);
 
     var second = try chock_workspace.Workspace.adopt(
@@ -16088,24 +10254,16 @@ test "a run that adopted a workspace never removes it, however it fails" {
         base_commit,
         null,
     );
-    // **The decision `start`'s own errdefer makes, and not a call this test
-    // chose.** Mutation check: make `releaseOnFailure` answer `.remove` for an
-    // adopted workspace, and the file the last owner wrote is gone.
     switch (releaseOnFailure(true)) {
         .keep => second.keep(arena),
         .remove => second.close(arena, io, &env, null) catch {},
         .hand_on => unreachable,
     }
-    // And a workspace this process built is still removed, or every session a
-    // person ever failed to start would stay on their disk.
     try testing.expectEqual(Cleanup.remove, releaseOnFailure(false));
 
     const stat = try std.Io.Dir.cwd().statFile(io, written, .{});
     try testing.expectEqual(@as(u64, "work nobody committed\n".len), stat.size);
 
-    // And the checkout is still a live worktree, so a third owner can take it
-    // in turn. A `close` here would have removed the registration as well as
-    // the files.
     var third = try chock_workspace.Workspace.adopt(
         arena,
         io,
@@ -16121,32 +10279,16 @@ test "a run that adopted a workspace never removes it, however it fails" {
 }
 
 test "a handover keeps the workspace and the scratchpad, and applies nothing" {
-    // **The three teardown decisions of a live handover, in one place.** Each
-    // one is a row of the table in `src/detach.zig`, and each one would be a
-    // silent loss if it went the other way:
-    //
-    // * a removed workspace is every uncommitted change gone
-    // * a removed scratchpad is every background command's output gone, and the
-    //   log names those files by path
-    // * an apply asks a person about half finished work, and takes the log lock
-    //   this process has just let go of
-    //
-    // Mutation check: make `handedOver` answer false and all three flip.
     try testing.expect(handedOver(Exit.handed_over));
     try testing.expect(!handedOver(Exit.finished));
     try testing.expect(!handedOver(Exit.faulted));
     try testing.expect(!handedOver(Exit.refused));
-    // A run whose session could not report an ending at all did not hand over.
     try testing.expect(!handedOver(error.Busy));
 
-    // And the workspace stays, with a sentence of its own rather than the one
-    // that tells a person their session went wrong.
     try testing.expectEqual(Cleanup.hand_on, cleanupFor(.handed_over, .nothing_to_apply));
     try testing.expectEqual(Cleanup.keep, cleanupFor(.faulted, .nothing_to_apply));
     try testing.expectEqual(Cleanup.remove, cleanupFor(.finished, .nothing_to_apply));
 
-    // The exit code passes through untouched, because a handover is a statement
-    // about the session and never about whether work landed.
     const nothing_shipped = ShippingReport{};
     try testing.expectEqual(
         Exit.handed_over,
@@ -16188,20 +10330,11 @@ test "a message that starts with a dash is a message after --, and an option oth
     try testing.expectEqual(@as(usize, 2), options.message_words.len);
     try testing.expectEqualStrings("--not-an-option", options.message_words[0]);
 
-    // And without the separator the same word is refused, rather than
-    // quietly becoming part of a prompt.
-    //
-    // **What the refusal says is captured and read.** A test that let it reach
-    // the terminal would not be checking it, and it would put a
-    // `failed command:` line in the build log of a suite that passed: see
-    // `tty.Capture`, and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--not-an-option"}));
-    // The word is named back, so a person can see which of several arguments
-    // the parser objected to.
     try testing.expect(std.mem.indexOf(u8, said.err(), "--not-an-option") != null);
     try testing.expectEqualStrings("", said.out());
 }
@@ -16212,23 +10345,15 @@ test "an unparsable command line fails, and never runs a session with a guessed 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // **Every refusal is captured and names what it refused.** A parser that
-    // said "bad arguments" for all five would pass an error only test, and a
-    // person would have to guess which word was wrong. See `tty.Capture`, and
-    // `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
-    // An option with no value must not swallow the next option, and must not
-    // fall back to a default.
     const refusals = [_]struct { argv: []const []const u8, names: []const u8 }{
         .{ .argv = &.{"--model"}, .names = "--model" },
         .{ .argv = &.{ "--max-turns", "lots" }, .names = "lots" },
         .{ .argv = &.{ "--max-turns", "0" }, .names = "--max-turns 0" },
         .{ .argv = &.{"--nonsense"}, .names = "--nonsense" },
-        // Two ways to name the session at once is a command line that means
-        // two different things.
         .{
             .argv = &.{ "--continue", "--session", "01JQ" ++ "A" ** 22 },
             .names = "two different sessions",
@@ -16250,8 +10375,6 @@ test "--help is asked for on purpose, so it is not a usage failure" {
 }
 
 test "the exit code comes from the last session end in the log, and a log with none is a fault" {
-    // The log is the truth of a session, so the exit code is read back out of
-    // it rather than out of whatever the code happened to return.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -16259,7 +10382,6 @@ test "the exit code comes from the last session end in the log, and a log with n
         var backing = try chock_proto.storage.Memory.init(gpa, "01RUN");
         const storage = backing.storage();
         defer storage.close(io);
-        // A log that stops with nothing saying why.
         var locked = try storage.lock(io);
         const content = [_]chock_proto.event.ContentPart{.{ .text = "hello" }};
         _ = try locked.append(gpa, io, .{ .message = .{ .role = .user, .content = &content } }, 1);
@@ -16278,9 +10400,6 @@ test "the exit code comes from the last session end in the log, and a log with n
     }
 
     {
-        // A session continued after an earlier one finished: the last end is
-        // the one that decides. A reader that took the first would report
-        // yesterday's answer for today's session.
         var backing = try chock_proto.storage.Memory.init(gpa, "01RUN");
         const storage = backing.storage();
         defer storage.close(io);
@@ -16296,52 +10415,29 @@ test "the exit code comes from the last session end in the log, and a log with n
 }
 
 test "an option that does not exist is named as such, and never as one that needs a value" {
-    // A parser that took the value first answers `chock run --nonsense` with
-    // "--nonsense needs a value", which sends a user looking for the right
-    // value instead of the right option. Measured by hand before this fix.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // **The words themselves are what this test is about**, so they are
-    // captured and read rather than let through: see `tty.Capture`, and
-    // `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--nonsense"}));
     try testing.expect(std.mem.indexOf(u8, said.err(), "no option named --nonsense") != null);
-    // Mutation check for this whole test: take the value first and the line
-    // below becomes "--nonsense needs a value", which is the message that sent
-    // a user looking for the right value instead of the right option.
     try testing.expect(std.mem.indexOf(u8, said.err(), "needs a value") == null);
 
-    // And it does not swallow the word after it either: with the value first,
-    // `--nonsense add` parsed as an option with the value "add" and the
-    // message never appeared at all.
     said.clear();
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{ "--nonsense", "add" }));
     try testing.expect(std.mem.indexOf(u8, said.err(), "no option named --nonsense") != null);
     said.clear();
 
-    // Every name in the table still takes its value, so this refusal is not
-    // simply refusing everything.
-    //
-    // **Every failure is collected and compared once**, rather than printed as
-    // it happens. A `std.debug.print` used to name the first option that
-    // failed; this names all of them, and it writes nothing to standard error
-    // on a run that passes. See `test/proto/lock.zig`.
     var refused: std.ArrayList(u8) = .empty;
     defer refused.deinit(gpa);
 
     for (value_options) |name| {
         try testing.expect(takesValue(name));
-        // `--spawn-reason` says why one named agent started another, so it is
-        // read into the link the `--parent-kind` before it opened. On its own
-        // it names a link that does not exist, which is its own refusal and is
-        // pinned where the chain is: see the flags test above.
         const before: []const []const u8 = if (std.mem.eql(u8, name, subagent.flag.spawn_reason))
             &.{ subagent.flag.parent_kind, "main" }
         else
@@ -16352,17 +10448,10 @@ test "an option that does not exist is named as such, and never as one that need
         };
     }
 
-    // Empty, and a failure names every option that was refused rather than
-    // only the first one.
     try testing.expectEqualStrings("", refused.items);
 }
 
 test "the flags a parent writes are the flags this parser reads" {
-    // The parent builds a child's command line with
-    // `chock_core.subagent.commandLine` and this is what reads one. A name
-    // that matched in one place and not the other would be a child that ran
-    // with no parent in its chain, no budget slice, and a scratchpad of its
-    // own outside its parent's: three narrowings gone, in silence.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -16391,8 +10480,6 @@ test "the flags a parent writes are the flags this parser reads" {
         .budget = .{ .max_cost = 1.25, .currency = "USD" },
     }, prepared);
 
-    // The program name and the subcommand come off, the way `src/main.zig`
-    // takes them off before it calls this parser.
     const options = try parseOptions(arena, argv[2..]);
 
     try testing.expectEqualStrings("reviewer", options.agent_kind);
@@ -16403,31 +10490,18 @@ test "the flags a parent writes are the flags this parser reads" {
     try testing.expectEqualStrings("/home/ross/project", options.project.?);
     try testing.expectEqualStrings("local", options.provider.?);
     try testing.expectEqualStrings("a-model", options.model.?);
-    // The task is the message, and it is the whole of what the child reads.
     try testing.expectEqual(@as(usize, 1), options.message_words.len);
     try testing.expectEqualStrings("read the parser", options.message_words[0]);
 
-    // And the chain this session runs under names **every** agent above it,
-    // root first, which is what makes the policy an intersection over the whole
-    // tree and not over the last two levels of it. A chain that came back one
-    // link short was a real fault: see `spawnChain`.
     const chain = spawnChain(options);
     try testing.expectEqual(@as(usize, 2), chain.len);
     try testing.expectEqualStrings("main", chain[0].agent_kind);
     try testing.expectEqualStrings("split the work", chain[0].reason);
     try testing.expectEqualStrings("coder", chain[1].agent_kind);
     try testing.expectEqualStrings("review the parser", chain[1].reason);
-    // So the depth this session reports is its real depth, which is what
-    // `chock_policy.subagents.check` is given and what bounds the tree.
     try testing.expectEqual(@as(usize, 3), chain.len + 1);
     try testing.expectEqual(@as(usize, 0), spawnChain(.{}).len);
 
-    // A reason with no kind before it names a link that does not exist, and a
-    // parser that took it would put one agent's reason on another agent's link.
-    //
-    // **The refusal is captured and says which flag it belongs after**, because
-    // the whole fault is an ordering one and a bare "bad arguments" would not
-    // name it. See `tty.Capture`, and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
@@ -16442,9 +10516,6 @@ test "the flags a parent writes are the flags this parser reads" {
 }
 
 test "a budget ceiling is said out loud, whether or not the bundle names a subject" {
-    // A person held to a number has to see the number. The line that reports
-    // the subject is printed only for a bundle that named one, so a ceiling
-    // that rode on that line would be silent for every anonymous bundle.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -16457,7 +10528,6 @@ test "a budget ceiling is said out loud, whether or not the bundle names a subje
     reportOrgBundle(anonymous, 0);
     try testing.expect(std.mem.indexOf(u8, said.err(), "budget ceiling 5 USD") != null);
 
-    // And a bundle that sets none says nothing about one.
     said.clear();
     const no_ceiling = try chock_policy.org.parse(arena, ".{ .rules = .{} }", null);
     reportOrgBundle(no_ceiling, 0);
@@ -16467,20 +10537,13 @@ test "a budget ceiling is said out loud, whether or not the bundle names a subje
 test "an org budget ceiling binds this session, and a project above it is refused out loud" {
     const gpa = testing.allocator;
 
-    // The layer above the project. It is a field of the bundle and not a rule,
-    // and the fold is a minimum: see `chock_policy.org.BudgetCeiling`.
     const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
 
-    // A project below the ceiling keeps its own number. Narrowing is free.
     const modest = chock_cost.budget.Budget{ .max_cost = 2.5, .currency = "USD" };
     const kept = (try budgetUnderOrg(gpa, modest, .{}, &capped)).?;
     try testing.expectEqual(@as(f64, 2.5), kept.max_cost);
     try testing.expectEqualStrings("USD", kept.currency);
 
-    // A project above it is refused, and both numbers are in what the person
-    // reads. **Not clamped to 5**: a session that ran at 5 while `chock.zon`
-    // said 50 would stop in the middle of the work with nothing said about
-    // why, which is the failure this whole refusal exists to remove.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
@@ -16495,26 +10558,19 @@ test "an org budget ceiling binds this session, and a project above it is refuse
 test "an org bundle with no ceiling leaves a project alone, and one with a ceiling caps a project that wrote none" {
     const gpa = testing.allocator;
 
-    // Every bundle written before this field. A rule only bundle sets no
-    // ceiling at all, so the project's own cap is the only cap there is.
     const rules_only: chock_policy.org.Bundle = .{};
     const own = chock_cost.budget.Budget{ .max_cost = 50.0, .currency = "USD" };
     const untouched = (try budgetUnderOrg(gpa, own, .{}, &rules_only)).?;
     try testing.expectEqual(@as(f64, 50.0), untouched.max_cost);
 
-    // An installation with no bundle at all reads the same way.
     const no_bundle = (try budgetUnderOrg(gpa, own, .{}, null)).?;
     try testing.expectEqual(@as(f64, 50.0), no_bundle.max_cost);
 
-    // A project that wrote no cap gets the organisation's. A ceiling that
-    // bound only the projects which had already agreed to be bound would bind
-    // nothing.
     const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
     const from_org = (try budgetUnderOrg(gpa, null, .{}, &capped)).?;
     try testing.expectEqual(@as(f64, 5.0), from_org.max_cost);
     try testing.expectEqualStrings("USD", from_org.currency);
 
-    // And a project with no cap under no ceiling still has no cap.
     try testing.expectEqual(
         @as(?chock_cost.budget.Budget, null),
         try budgetUnderOrg(gpa, null, .{}, &rules_only),
@@ -16525,17 +10581,11 @@ test "the org ceiling is folded after the parent slice, so no source of a budget
     const gpa = testing.allocator;
     const capped: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0, .currency = "USD" } };
 
-    // A slice narrows below the ceiling, which is every subagent of a project
-    // that is itself under the ceiling.
     const sliced = (try budgetUnderOrg(gpa, .{ .max_cost = 5.0, .currency = "USD" }, .{
         .max_cost = 1.25,
     }, &capped)).?;
     try testing.expectEqual(@as(f64, 1.25), sliced.max_cost);
 
-    // A slice in another currency is where `budgetFor` alone would let a
-    // session past the ceiling: it takes the parent's currency and the
-    // parent's number, and 900 JPY says nothing about 5 USD. The fold runs
-    // over the answer and not over the file, so the pair is refused here.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
@@ -16549,60 +10599,39 @@ test "the org ceiling is folded after the parent slice, so no source of a budget
 }
 
 test "a ceiling that names no currency is USD, the same default a project gets" {
-    // Both sides default the same way, or an organisation that wrote a plain
-    // number would refuse every project that wrote a plain number.
     const plain: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 5.0 } };
     const ceiling = orgBudgetCeiling(&plain).?;
     try testing.expectEqual(@as(f64, 5.0), ceiling.max_cost);
     try testing.expectEqualStrings(chock_cost.budget.default_currency, ceiling.currency);
 
-    // A bundle that names one keeps it.
     const yen: chock_policy.org.Bundle = .{ .budget = .{ .max_cost = 900.0, .currency = "JPY" } };
     try testing.expectEqualStrings("JPY", orgBudgetCeiling(&yen).?.currency);
 
-    // No bundle, and a bundle with no ceiling, are the same answer.
     try testing.expectEqual(@as(?chock_cost.budget.Budget, null), orgBudgetCeiling(null));
     const rules_only: chock_policy.org.Bundle = .{};
     try testing.expectEqual(@as(?chock_cost.budget.Budget, null), orgBudgetCeiling(&rules_only));
 }
 
 test "a budget slice narrows what chock.zon allows and can never widen it" {
-    // Both controls hold. A parent divides what it has left, and the project's
-    // own cap still binds every session of that project, so neither one can be
-    // worked around by the other.
-    //
-    // **Driven through `budgetUnderOrg` with no bundle**, because that is the
-    // one function that answers what a session may spend. An installation with
-    // no org policy bundle sets no ceiling, so what comes back here is the
-    // slice fold on its own.
     const gpa = testing.allocator;
     const file_cap = chock_cost.budget.Budget{ .max_cost = 5.0, .currency = "USD" };
 
-    // No slice at all: the project's cap, unchanged.
     try testing.expectEqual(@as(f64, 5.0), (try budgetUnderOrg(gpa, file_cap, .{}, null)).?.max_cost);
 
-    // A slice below the cap wins, because it is the narrower of the two.
     try testing.expectEqual(
         @as(f64, 1.25),
         (try budgetUnderOrg(gpa, file_cap, .{ .max_cost = 1.25 }, null)).?.max_cost,
     );
 
-    // **A slice above the cap does not widen it.** A parent that asked for
-    // more than the project allows gets the project's number.
     try testing.expectEqual(
         @as(f64, 5.0),
         (try budgetUnderOrg(gpa, file_cap, .{ .max_cost = 500.0 }, null)).?.max_cost,
     );
 
-    // A project with no cap of its own still runs the child under its slice,
-    // which is what bounds a tree whose project set no total.
     const sliced = (try budgetUnderOrg(gpa, null, .{ .max_cost = 1.25 }, null)).?;
     try testing.expectEqual(@as(f64, 1.25), sliced.max_cost);
     try testing.expectEqualStrings("USD", sliced.currency);
 
-    // Two caps in two currencies cannot be compared, and inventing a rate
-    // would be worse than not enforcing. The parent's own number is the answer,
-    // because a parent that handed out a slice already decided the total.
     const in_yen = (try budgetUnderOrg(gpa, file_cap, .{
         .max_cost = 900.0,
         .currency = "JPY",
@@ -16610,15 +10639,12 @@ test "a budget slice narrows what chock.zon allows and can never widen it" {
     try testing.expectEqual(@as(f64, 900.0), in_yen.max_cost);
     try testing.expectEqualStrings("JPY", in_yen.currency);
 
-    // And a session nobody gave a slice keeps whatever the file said, cap or
-    // no cap.
     try testing.expectEqual(
         @as(?chock_cost.budget.Budget, null),
         try budgetUnderOrg(gpa, null, .{}, null),
     );
 }
 
-/// A value each option in `value_options` accepts, for the test above.
 fn valueFor(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "--max-turns")) return "3";
     if (std.mem.eql(u8, name, subagent.flag.max_cost)) return "1.25";
@@ -16627,11 +10653,6 @@ fn valueFor(name: []const u8) []const u8 {
 }
 
 test "the dirty tree warning names the count, the split, and the flag" {
-    // The message a user acts on. Pinned whole: a count that says the wrong
-    // number, or a flag named wrongly, sends somebody looking for files that
-    // are not there. The numbers themselves come from git, and
-    // `lib/chock-workspace/worktree.zig`'s own `countUncommitted` tests pin
-    // that half.
     const gpa = testing.allocator;
     const text = try dirtyWarning(gpa, .{ .modified = 9, .untracked = 3 });
     defer gpa.free(text);
@@ -16640,21 +10661,16 @@ test "the dirty tree warning names the count, the split, and the flag" {
             "           (9 modified, 3 untracked). Pass --allow-dirty to include them.\n",
         text,
     );
-    // The flag is spelled the same way the parser reads it, so the message
-    // cannot name an option that does not exist.
     const parsed = try parseOptions(gpa, &.{"--allow-dirty"});
     try testing.expect(parsed.allow_dirty);
     try testing.expect(std.mem.indexOf(u8, text, "--allow-dirty") != null);
 }
 
 test "a clean tree gets no warning at all, so the message stays worth reading" {
-    // `handleUncommitted` returns before it ever builds a sentence when the
-    // count is zero, and this is the check it returns on.
     const clean = chock_workspace.worktree.Uncommitted{};
     try testing.expect(!clean.any());
     try testing.expectEqual(@as(usize, 0), clean.total());
 
-    // One untracked file is enough to make it worth saying.
     const dirty = chock_workspace.worktree.Uncommitted{ .untracked = 1 };
     try testing.expect(dirty.any());
 }
@@ -16665,13 +10681,9 @@ test "--allow-dirty is off unless it is asked for, and it takes no value" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The default is the committed state. A flag that quietly turned itself
-    // on would make every session non reproducible.
     const plain = try parseOptions(arena, &.{"fix the parser"});
     try testing.expect(!plain.allow_dirty);
 
-    // It is a switch, not an option with a value: the word after it is part
-    // of the message, not something it swallowed.
     const with_flag = try parseOptions(arena, &.{ "--allow-dirty", "fix", "the", "parser" });
     try testing.expect(with_flag.allow_dirty);
     try testing.expectEqual(@as(usize, 3), with_flag.message_words.len);
@@ -16679,9 +10691,6 @@ test "--allow-dirty is off unless it is asked for, and it takes no value" {
 }
 
 test "the ref a session's work lands on is the session's own, never a branch of the user" {
-    // The worktree is detached so a session cannot move a branch of the user.
-    // Moving one here at the end would undo that: the user's own working tree
-    // would read as a large diff against a commit they never made.
     const gpa = testing.allocator;
     const ref = try applyRef(gpa, "01JQABCDEFGHJKMNPQRSTVWXYZ");
     defer gpa.free(ref);
@@ -16691,44 +10700,21 @@ test "the ref a session's work lands on is the session's own, never a branch of 
 }
 
 test "a session that finished but whose work was refused does not exit zero" {
-    // A script that read 0 there would carry on as though the change was in
-    // the repository. The work not landing is the thing the caller has to
-    // act on.
-    // **Every case here ships nothing**, which is every run of every
-    // installation that requires no sink, so the answers below are the answers
-    // this fold has always given.
     const quiet = ShippingReport{};
     try testing.expectEqual(Exit.refused, exitWithApply(.finished, .refused, &quiet));
     try testing.expectEqual(Exit.faulted, exitWithApply(.finished, .failed, &quiet));
 
-    // A session that wrote files and never committed them did work that
-    // Chock is about to throw away. A script that read 0 there would carry
-    // on as though the project had been changed. Measured on the first real
-    // run of the write tools: the agent edited a file, created another, and
-    // exited 0 with the project untouched.
     try testing.expectEqual(Exit.faulted, exitWithApply(.finished, .uncommitted, &quiet));
 
-    // A session that had nothing to carry back, or whose work landed, is a
-    // session that did what was asked.
     try testing.expectEqual(Exit.finished, exitWithApply(.finished, .nothing_to_apply, &quiet));
     try testing.expectEqual(Exit.finished, exitWithApply(.finished, .landed, &quiet));
 
-    // And the apply never hides the session's own outcome: a fault, a
-    // budget, or the agent giving up is the first thing to act on, whatever
-    // happened to the work afterwards.
     for ([_]Exit{ .faulted, .budget, .no_progress, .turn_limit, .refused }) |session_exit| {
         for ([_]Applied{ .nothing_to_apply, .landed, .refused, .failed, .uncommitted }) |applied| {
             try testing.expectEqual(session_exit, exitWithApply(session_exit, applied, &quiet));
         }
     }
 
-    // **The audit fold is inside this one, and this is what says so.** A `run`
-    // that folded the apply and forgot the record would pass every test of
-    // `exitWithAudit` on its own, which is the shape of fault this project has
-    // shipped three times.
-    //
-    // Mutation check: drop the `exitWithAudit` call from `exitWithApply` and
-    // this fails, and nothing else in the file does.
     var lost = ShippingReport{};
     lost.add(.{ .name = "/var/audit/chock/01JQ.jsonl", .required = true, .health = .{
         .delivered = 2,
@@ -16738,52 +10724,28 @@ test "a session that finished but whose work was refused does not exit zero" {
     } });
     try testing.expectEqual(Exit.audit_gap, exitWithApply(.finished, .landed, &lost));
     try testing.expectEqual(Exit.audit_gap, exitWithApply(.finished, .nothing_to_apply, &lost));
-    // A session whose work was refused says that first: the apply is the thing
-    // the person at the keyboard has to act on, and the record is the thing the
-    // organisation acts on, so the nearer fault wins.
     try testing.expectEqual(Exit.refused, exitWithApply(.finished, .refused, &lost));
     try testing.expectEqual(Exit.faulted, exitWithApply(.faulted, .landed, &lost));
 }
 
 test "only a clean ending removes the workspace, and every way a session can go wrong keeps it" {
-    // **The whole of the 2026-08-22 loss, as a decision.** A rate limit ended
-    // that session and the worktree came down with 105 changed files in it.
-    // Every one of these endings had the same cleanup before this existed.
-
-    // The two clean endings. The commit is in the user's repository, or there
-    // was never anything to carry back, so the workspace holds nothing that
-    // is not somewhere else.
     try testing.expectEqual(Cleanup.remove, cleanupFor(.finished, .landed));
     try testing.expectEqual(Cleanup.remove, cleanupFor(.finished, .nothing_to_apply));
 
-    // The measured one: the agent worked, never committed, and the workspace
-    // is now the only copy of what it did.
     try testing.expectEqual(Cleanup.keep, cleanupFor(.finished, .uncommitted));
-    // A refused or failed apply is the same fact from a different direction:
-    // the repository is unchanged and the work is still in the workspace.
     try testing.expectEqual(Cleanup.keep, cleanupFor(.finished, .refused));
     try testing.expectEqual(Cleanup.keep, cleanupFor(.finished, .failed));
 
-    // Every other way a session ends keeps it, whatever the apply said. A
-    // budget that stopped a session, a Ctrl-C, an agent that gave up, and a
-    // transport fault all leave work behind that nothing else holds.
     for ([_]Exit{ .faulted, .budget, .no_progress, .turn_limit, .refused, .usage }) |ended| {
         for ([_]Applied{ .nothing_to_apply, .landed, .refused, .failed, .uncommitted }) |applied| {
             try testing.expectEqual(Cleanup.keep, cleanupFor(ended, applied));
         }
     }
 
-    // And a run whose session could not say how it ended at all is the least
-    // safe case of the lot, so it keeps the workspace too.
     try testing.expectEqual(Cleanup.keep, cleanupFor(null, .landed));
 }
 
 test "the run keeps the workspace on an abnormal ending, with the agent's file still in it" {
-    // **The decision and the act, wired together.** `cleanupFor` above says
-    // which endings keep, and `Workspace.keep` says what keeping means. This
-    // is the one that proves `chock run` joins them: a switch that called
-    // `close` for both verdicts would pass every other test in this file and
-    // would still delete the work.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -16803,14 +10765,9 @@ test "the run keeps the workspace on an abnormal ending, with the agent's file s
     try std.Io.Dir.createDirAbsolute(io, scratch, .default_dir);
 
     var env = try std.testing.environ.createMap(arena);
-    // This project's own checkout is a git repository and `tmpDir` makes every
-    // scratch directory underneath it, so without a ceiling `git` walks up and
-    // finds the wrong repository. The same guard every workspace test uses.
     try env.put("GIT_CEILING_DIRECTORIES", tmp_path);
     try makeGitProject(arena, io, &env, project);
 
-    // What the teardown wrote, captured rather than let through: see
-    // `tty.Capture`, and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
@@ -16837,40 +10794,22 @@ test "the run keeps the workspace on an abnormal ending, with the agent's file s
             try handle.writeStreamingAll(io, "work nobody committed\n");
         }
 
-        // Copied before the teardown, because `keep` and `close` both free
-        // every string the workspace owns: see `takeDownWorkspace`.
         const work_path = try arena.dupe(u8, workspace.workPath());
         takeDownWorkspace(&workspace, verdict, arena, io, &env, scratch);
 
         switch (verdict) {
-            // The measured loss, prevented: the file is still where the agent
-            // left it, not merely a directory that still exists.
-            // **The same act for the same reason.** A handover leaves the
-            // workspace for the process that is about to work in it, so the
-            // file has to be there and have its bytes. Mutation check: make
-            // `hand_on` remove, and a handover throws away everything the agent
-            // had not committed, which is the loss the whole feature exists to
-            // avoid.
             .keep, .hand_on => {
                 const stat = try std.Io.Dir.cwd().statFile(io, written, .{});
                 try testing.expectEqual(@as(u64, "work nobody committed\n".len), stat.size);
-                // **A kept workspace says where the work is.** One nobody was
-                // told about is a directory a person never goes back to, which
-                // is the same loss as removing it. A handover says the same
-                // thing behind `--verbose`, because the next owner is about to
-                // work there and nobody has to go and look.
                 if (verdict == .keep) {
                     try testing.expect(std.mem.indexOf(u8, said.err(), work_path) != null);
                 }
             },
-            // And the clean ending is unchanged, or every session a user ever
-            // ran stays on their disk forever.
             .remove => {
                 try testing.expectError(
                     error.FileNotFound,
                     std.Io.Dir.cwd().statFile(io, written, .{}),
                 );
-                // A clean ending is quiet: there is nothing for a person to do.
                 try testing.expectEqualStrings("", said.err());
             },
         }
@@ -16878,7 +10817,6 @@ test "the run keeps the workspace on an abnormal ending, with the agent's file s
     }
 }
 
-/// A git repository with one commit in it, for the teardown test above.
 fn makeGitProject(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -16914,10 +10852,6 @@ fn makeGitProject(
     }
 }
 
-/// A `ToolRunner` that runs nothing and counts what reached it. Only the git
-/// shim tests below use it: what they pin is which calls get past
-/// `GitToolRunner`, so the inner runner has to be one that says whether it was
-/// called at all.
 const CountingToolRunner = struct {
     calls: usize = 0,
     last_arguments: []const u8 = "",
@@ -16947,20 +10881,10 @@ const CountingToolRunner = struct {
     }
 };
 
-/// An `Arbiter` that answers one way for everything and counts what it was
-/// asked. **The count is what most of the git shim tests below actually
-/// measure**: which subcommands reach a person at all is the whole of what
-/// wiring the approval half changed.
 const CountingArbiter = struct {
     permitted: bool,
     asks: usize = 0,
 
-    /// **Copied out, and never borrowed.** Every string in a
-    /// `chock_core.arbiter.Ask` belongs to the caller for the length of the
-    /// `decide` call and no longer: `GitToolRunner.gitAnswer` frees the action
-    /// name and both texts on the way out. A field that kept one of those
-    /// slices read freed memory the moment a test looked at it, which is how
-    /// this was written the first time and what it segfaulted on.
     action: Kept(64) = .{},
     tool: Kept(64) = .{},
     detail: Kept(512) = .{},
@@ -17011,8 +10935,6 @@ const CountingArbiter = struct {
     }
 };
 
-/// One git command line through a `GitToolRunner` whose arbiter answers
-/// `permitted` every time. The caller frees both fields of the result.
 fn driveGitRunner(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -17033,31 +10955,15 @@ fn driveGitRunner(
 }
 
 test "a subcommand the shim classifies reaches a person, and is refused when nobody can answer" {
-    // **The fault this closes.** `GitToolRunner` used to read the verdict and
-    // throw away everything that was not a subcommand needing a host, so a
-    // `git rebase` or a `git -c core.pager=sh log` went straight to the real
-    // git and nobody was ever told. The seam `6850dbb` built is what carries
-    // the question now, and a session that can reach nobody refuses rather
-    // than running.
-    //
-    // Mutation check: return `null` instead of `refusalText` in `gitAnswer`.
-    // The call then reaches the real git, and the first expectation below
-    // fails with "expected 0, found 1".
     const gpa = testing.allocator;
     const io = testing.io;
 
     for ([_][]const u8{
-        // A subcommand the shim knows changes state, with no shipped default.
         "{\"argv\":[\"git\",\"push\",\"origin\",\"main\"]}",
-        // A verb on neither of the shim's lists.
         "{\"argv\":[\"git\",\"frobnicate\"]}",
-        // An option this shim does not read, which stops it reading the
-        // subcommand at all. `-c` is the one that makes git run a program.
         "{\"argv\":[\"git\",\"-c\",\"core.pager=sh -c id\",\"log\"]}",
     }) |arguments| {
         var inner = CountingToolRunner{};
-        // **Nobody to ask**: the `Asker` itself is absent, which is the state
-        // a session whose wiring this file forgot is in.
         var shim = GitToolRunner{ .inner = inner.runner() };
 
         const result = try shim.runner().dispatch(gpa, io, .{
@@ -17070,8 +10976,6 @@ test "a subcommand the shim classifies reaches a person, and is refused when nob
 
         try testing.expectEqual(@as(usize, 0), inner.calls);
         try testing.expect(result.is_error);
-        // "nobody was there", and never "somebody said no": see
-        // `chock_core.arbiter.not_asked`.
         try testing.expect(std.mem.indexOf(
             u8,
             result.output,
@@ -17081,13 +10985,6 @@ test "a subcommand the shim classifies reaches a person, and is refused when nob
 }
 
 test "the question a git subcommand asks names the act, the tool that ran it, and the effect" {
-    // The four parts of the policy key a reader of the log rebuilds. The
-    // action is the act's own name, which for a push is the same `git.push`
-    // `lib/chock-broker/actions.zig` performs, and the tool is `run_command`
-    // and never the subcommand: the subcommand is already the action.
-    //
-    // Mutation check: send `ask.subcommand` as `.tool` and the third
-    // expectation fails.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -17107,46 +11004,24 @@ test "the question a git subcommand asks names the act, the tool that ran it, an
     try testing.expectEqualStrings("git.push", arbitrator.action.read());
     try testing.expectEqualStrings("run_command", arbitrator.tool.read());
     try testing.expectEqualStrings("git", arbitrator.source.read());
-    // The effect first, out of the shim's own text and not a second wording
-    // written here: see `chock_broker.git_shim.detailOf`.
     try testing.expect(std.mem.indexOf(
         u8,
         arbitrator.detail.read(),
         "the subcommand runs inside the sandbox",
     ) != null);
-    // And the refusal the agent reads names the act, not the tool.
     try testing.expect(std.mem.indexOf(u8, result.output, "git.push") != null);
     try testing.expect(std.mem.indexOf(u8, result.output, "refused_by_user") != null);
     try testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
 test "a subcommand that reaches another host is asked about, and an approved one still does not run" {
-    // The measured session: `git fetch` reached the real git, the real git
-    // forked `ssh`, and the model read `cannot run ssh: No such file or
-    // directory`, then spent turns looking for a proxy. What changed twice
-    // since: it is a real question now instead of a silent discard, and the
-    // answer no longer blames a network the sandbox has.
-    //
-    // **A yes does not make it run.** An act that leaves the sandbox is
-    // performed on the host out of a payload that names the effect, and
-    // nothing builds one for a git subcommand yet. The agent is told what is
-    // missing rather than told no.
-    //
-    // Mutation check: drop the `needsNetwork` branch from `gitAnswer` and
-    // `inner.calls` below reaches one.
     const gpa = testing.allocator;
     const io = testing.io;
 
-    // **`push` is no longer on this list**, and that is the change this whole
-    // task made: an approved push arms a credential and runs. See the tests
-    // below it. Every other host reaching subcommand is still asked about and
-    // still told what is missing.
     for ([_][]const u8{
         "{\"argv\":[\"git\",\"fetch\",\"origin\"]}",
         "{\"argv\":[\"git\",\"pull\"]}",
         "{\"argv\":[\"git\",\"clone\",\"https://example.invalid/x.git\"]}",
-        // An option before the subcommand is read the same way, so a fetch
-        // does not get through by being spelled with one.
         "{\"argv\":[\"git\",\"-C\",\"sub\",\"fetch\"]}",
     }) |arguments| {
         var arbitrator = CountingArbiter{ .permitted = true };
@@ -17155,27 +11030,16 @@ test "a subcommand that reaches another host is asked about, and an approved one
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
-        // Asked, and then still not run.
         try testing.expectEqual(@as(usize, 1), arbitrator.asks);
         try testing.expectEqual(@as(usize, 0), inner.calls);
         try testing.expect(result.is_error);
         try testing.expect(std.mem.indexOf(u8, result.output, "not built yet") != null);
-        // **Not read as a no, and never blaming the network.** A person may
-        // well have said yes, and the router gave the sandbox one.
         try testing.expect(std.mem.indexOf(u8, result.output, "not a refusal") != null);
         try testing.expect(std.mem.indexOf(u8, result.output, "has no network") == null);
     }
 }
 
 test "an approved push with no way to hold a credential is refused loudly, never run" {
-    // **A wiring this file forgot must be a loud failure and never a silent
-    // grant.** `GitToolRunner.credentials` is null here, which is what a runner
-    // built without one has, and the push is refused with a sentence that says
-    // the session is at fault rather than the person.
-    //
-    // Mutation check: make `armPush` answer null when `self.credentials` is
-    // null and `inner.calls` below reaches one, which is a push running with no
-    // credential surface and no socket.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -17199,14 +11063,6 @@ test "an approved push with no way to hold a credential is refused loudly, never
 }
 
 test "a read only subcommand reaches the real git and asks nobody at all" {
-    // **The cheap path, and the one a session spends most of its git calls
-    // on.** `classify` answers `run_the_real_git` for these, so `gitAnswer`
-    // returns before it reaches the seam: no question is written, nobody is
-    // interrupted, and the call costs exactly what it cost before the approval
-    // half existed.
-    //
-    // Mutation check: ask before the `run_the_real_git` arm and `asks` below
-    // is no longer zero.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -17216,8 +11072,6 @@ test "a read only subcommand reaches the real git and asks nobody at all" {
         "{\"argv\":[\"git\",\"diff\"]}",
         "{\"argv\":[\"git\",\"--version\"]}",
         "{\"argv\":[\"zig\",\"build\",\"test\"]}",
-        // A vector this runner cannot read is `run_command`'s own complaint to
-        // make, not this one's: see `GitToolRunner.gitAnswer`.
         "{\"argv\":[]}",
         "not json at all",
     }) |arguments| {
@@ -17232,8 +11086,6 @@ test "a read only subcommand reaches the real git and asks nobody at all" {
         try testing.expect(!result.is_error);
     }
 
-    // And a tool that is not `run_command` is not read as a git command line
-    // whatever its arguments hold.
     var arbitrator = CountingArbiter{ .permitted = false };
     var inner = CountingToolRunner{};
     var log = try PermittingLog.init(gpa);
@@ -17252,17 +11104,6 @@ test "a read only subcommand reaches the real git and asks nobody at all" {
 }
 
 test "an approved workspace subcommand reaches the real git, git commit included" {
-    // The other half, and the one that matters more: this runner sits in
-    // front of every tool call a session makes. A shim that quietly refused
-    // more than it says would break the session's own work, and `git commit`
-    // in particular is how that work reaches the user at all: see
-    // `GitToolRunner` and `applyWork`.
-    //
-    // Mutation check: drop the `!` from `if (!answer.permitted)` in
-    // `gitAnswer`, so a yes refuses. `inner.calls` below stops reaching one.
-    // Written as an inversion and not as an unconditional refusal, because an
-    // unconditional one does not compile: the `needsNetwork` branch after it
-    // becomes unreachable code.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -17285,18 +11126,8 @@ test "an approved workspace subcommand reaches the real git, git commit included
 }
 
 test "a project with no chock.zon answers allow for git commit and ask for a push" {
-    // **The promise `docs/status.md` makes, measured on the table itself.**
-    // Wiring the shim's approval half turned every subcommand it classifies
-    // into a key this table is asked about, and a key nobody named answers
-    // `ask`. Without the `git.*` block in `lib/chock-policy/defaults.zig` an
-    // ordinary session would stop at its first `git add`, and a piped one,
-    // which can ask nobody, would be refused outright.
-    //
-    // Mutation check: delete the `git.commit` line from
-    // `chock_policy.defaults.rules` and the first loop below answers `ask`.
     const gpa = testing.allocator;
 
-    // An empty project file, which is the project this test is about.
     const empty: [:0]const u8 = ".{}";
     const policy = try chock_policy.table.Table.parse(gpa, empty, null);
     defer chock_policy.table.Table.destroy(gpa, policy);
@@ -17312,8 +11143,6 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
         }
     };
 
-    // Everything the shim can classify that changes only this session's own
-    // workspace. No prompt, exactly as before the approval half was wired.
     for ([_][]const u8{
         "git.add",
         "git.commit",
@@ -17332,9 +11161,6 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
         );
     }
 
-    // And everything that reaches another host, plus the two names the shim
-    // builds when it could not read the command at all. Each of these is a
-    // key nobody named, which is `ask`.
     for ([_][]const u8{
         "git.push",
         "git.clone",
@@ -17349,9 +11175,6 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
         );
     }
 
-    // **And no write gained a prompt.** The two tool calls a session writes
-    // with are still allowed, and `file.write`, which is the broker's own act
-    // at a path outside the workspace, still asks.
     try testing.expectEqual(
         chock_policy.table.Decision.allow,
         policy.evaluateKindAlone(key.of("call.write_file")),
@@ -17366,16 +11189,6 @@ test "a project with no chock.zon answers allow for git commit and ask for a pus
     );
 }
 
-// `lib/chock-core/lsp.zig` holds the ranking, the bound and the say-once rule,
-// and its own tests pin all three. These pin the wiring: which calls the runner
-// looks at, and that the tool result is untouched for every other one.
-//
-// No test here starts a language server. See `chock_core.lsp.Server`, which is
-// the seam, and this file's own `DiagnosticToolRunner`.
-
-/// A `ToolRunner` that answers with whatever a test put in it, so a test can
-/// state a write that worked, a write that was refused, and what the tool's own
-/// text was, without a sandbox anywhere.
 const StubToolRunner = struct {
     output: []const u8 = "wrote src/main.zig, 12 bytes, file_hash 0123456789abcdef\n",
     is_error: bool = false,
@@ -17405,8 +11218,6 @@ const StubToolRunner = struct {
     }
 };
 
-/// A `chock_core.lsp.Server` that answers from a table and counts what reached
-/// it. The same shape that library's own tests use, and for the same reason.
 const StubServer = struct {
     diagnostic: chock_core.lsp.Diagnostic = .{
         .path = "src/main.zig",
@@ -17440,10 +11251,6 @@ const StubServer = struct {
 };
 
 test "a write that worked carries what the language server said, on the same result" {
-    // **The whole point of the timing**: the agent reads this on the turn it
-    // made the edit, not several turns later with more work built on top of the
-    // mistake. Mutation check: append the block anywhere but the write's own
-    // result and this fails.
     const gpa = testing.allocator;
 
     for ([_][]const u8{ "write_file", "edit_file" }) |tool| {
@@ -17464,9 +11271,6 @@ test "a write that worked carries what the language server said, on the same res
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
-        // The tool's own text is still there, whole and first. A runner that
-        // replaced it would take away the `file_hash` the next `edit_file`
-        // anchors on.
         try testing.expect(std.mem.startsWith(u8, result.output, "wrote src/main.zig"));
         try testing.expect(std.mem.indexOf(u8, result.output, "1 problem after this edit") != null);
         try testing.expect(std.mem.indexOf(u8, result.output, "src/main.zig:12:5: error:") != null);
@@ -17475,11 +11279,6 @@ test "a write that worked carries what the language server said, on the same res
 }
 
 test "a session with no language server hands back the tool result byte for byte" {
-    // A harness that gets worse when a server is missing is worse than no
-    // harness, and this is that rule at the one place a production session
-    // meets it. **This is also what every session Chock runs today does**: see
-    // `DiagnosticToolRunner`, which says plainly that nothing starts a server
-    // yet.
     const gpa = testing.allocator;
 
     var inner = StubToolRunner{};
@@ -17499,14 +11298,8 @@ test "a session with no language server hands back the tool result byte for byte
 }
 
 test "a refused write and a call that is not a write are both passed straight through" {
-    // Two different reasons for the same silence, and both matter. A write that
-    // was refused wrote nothing, so there is nothing new to say about the file
-    // and the refusal it carries is the whole answer. A `grep` or a
-    // `run_command` names no file at all: see
-    // `chock_core.tools.Tool.writesAProjectFile`.
     const gpa = testing.allocator;
 
-    // A write the tool refused.
     {
         var inner = StubToolRunner{
             .output = "old_string does not appear in src/main.zig, so nothing was written",
@@ -17526,12 +11319,9 @@ test "a refused write and a call that is not a write are both passed straight th
 
         try testing.expectEqualStrings(inner.output, result.output);
         try testing.expect(result.is_error);
-        // The server was never asked, so a refused edit costs exactly what it
-        // cost before this runner existed.
         try testing.expectEqual(@as(usize, 0), stub.calls);
     }
 
-    // Every call that is not a write, including the ones that name a path.
     for ([_][]const u8{ "read_file", "grep", "glob", "list_directory", "run_command" }) |tool| {
         var inner = StubToolRunner{ .output = "the tool's own answer" };
         var stub = StubServer{};
@@ -17551,9 +11341,6 @@ test "a refused write and a call that is not a write are both passed straight th
     }
 }
 
-/// Drive `Printer` over `events` and give back what a terminal would have
-/// shown. Only the tests below use this. `testing.io` is enough: a `Printer`
-/// with a buffer sink never touches a file.
 fn printedFor(gpa: std.mem.Allocator, events: []const chock_proto.event.Event) ![]u8 {
     var steps: std.ArrayList(PrinterStep) = .empty;
     defer steps.deinit(gpa);
@@ -17561,23 +11348,15 @@ fn printedFor(gpa: std.mem.Allocator, events: []const chock_proto.event.Event) !
     return printedForSteps(gpa, steps.items);
 }
 
-/// One thing `chock_core.Loop` tells an observer. The two arrive interleaved
-/// in a real session: pieces while a turn is running, events as it appends
-/// them. See `chock_core.Loop.Observer`.
 const PrinterStep = union(enum) {
     event: chock_proto.event.Event,
     piece: chock_core.Loop.Piece,
 };
 
-/// Drive `Printer` over `steps` and give back what a terminal would have
-/// shown.
 fn printedForSteps(gpa: std.mem.Allocator, steps: []const PrinterStep) ![]u8 {
     return printedForStepsPainted(gpa, steps, .off);
 }
 
-/// The same, with the painter stated. A test that wants to read escape
-/// sequences passes `.colour`, and one that wants the plain bytes passes
-/// `.off`, which is what a pipe and a file get.
 fn printedForStepsPainted(
     gpa: std.mem.Allocator,
     steps: []const PrinterStep,
@@ -17597,8 +11376,6 @@ fn printedForStepsPainted(
     return shown.toOwnedSlice(gpa);
 }
 
-/// Count the lines in `text`. A trailing newline closes the last line and does
-/// not open another.
 fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     var seen = std.mem.count(u8, text, "\n");
@@ -17607,20 +11384,12 @@ fn lineCount(text: []const u8) usize {
 }
 
 test "a quiet start says less than a verbose one and still names every instruction file" {
-    // The rule the whole triage rests on: nothing is deleted, it moves. A quiet
-    // run says which files went into the prompt, because those are untrusted
-    // input and a path is what somebody opens. The layer and the byte count are
-    // behind `--verbose`. Mutation check: turn the `tty.detail` calls in
-    // `reportInstructions` back into ordinary prints and the count comparison
-    // fails.
     const gpa = testing.allocator;
     const loaded = chock_core.instructions.Loaded{ .files = &.{
         .{ .layer = .operator, .path = "/home/a/.config/chock/AGENTS.md", .bytes = 900 },
         .{ .layer = .project, .path = "AGENTS.md", .bytes = 4096 },
     } };
 
-    // These lines are diagnostics, so they go to standard error, and that is
-    // the stream this reads.
     var quiet: std.Io.Writer.Allocating = .init(gpa);
     defer quiet.deinit();
     var loud: std.Io.Writer.Allocating = .init(gpa);
@@ -17640,28 +11409,14 @@ test "a quiet start says less than a verbose one and still names every instructi
     try testing.expect(lineCount(quiet.written()) < lineCount(loud.written()));
     try testing.expectEqual(@as(usize, 1), lineCount(quiet.written()));
 
-    // Every path is still on screen without the flag. That is the half of the
-    // rule that says a line was moved and not deleted.
     for (loaded.files) |file| {
         try testing.expect(std.mem.indexOf(u8, quiet.written(), file.path) != null);
     }
-    // And the sizes are only in the loud one.
     try testing.expect(std.mem.indexOf(u8, quiet.written(), "4096 bytes") == null);
     try testing.expect(std.mem.indexOf(u8, loud.written(), "4096 bytes") != null);
 }
 
 test "a display opens on the conversation the log already holds" {
-    // **A session that was taken up used to open on an empty transcript.** So a
-    // resume looked exactly like a fresh start, which is most of why `/resume`
-    // read as broken. `ui.Ui.replay` is the display's half of the answer and
-    // this function is the caller's half.
-    //
-    // **A real `ui.Ui` on no terminal at all**, because what is under test is
-    // the wiring between a log and a display, and a stand-in for either would
-    // prove neither.
-    //
-    // Mutation check: hand the events to nothing, or hand only the ones
-    // `foldEvent` already draws, and the person's own words go missing.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -17693,8 +11448,6 @@ test "a display opens on the conversation the log already holds" {
 
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
-    // `/dev/null` takes no raw mode and answers no capability query, so the
-    // whole path runs with no terminal anywhere.
     const device = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{});
     defer device.close(io);
 
@@ -17716,92 +11469,39 @@ test "a display opens on the conversation the log already holds" {
     try testing.expect(said_by_person);
     try testing.expect(said_by_model);
 
-    // **A log that read cleanly says nothing at all.** A warning from this
-    // function reaches the display's own transcript, because the display is up
-    // by the time it runs, so an empty transcript is what says no line was
-    // written. See `src/ui.zig`'s `Diagnostics`.
     try testing.expectEqualStrings("", screen.transcript.items);
 }
 
-/// This file's own source, so a test can say that a call exists and where it
-/// sits among its neighbours.
-///
-/// **A structural check, and it says so plainly.** What it stands in for is an
-/// end to end run of bare `chock` on a session that was taken up, and this
-/// suite cannot start one: a display needs a real terminal on three
-/// descriptors, `chock run` never opens one, and `test/cli` has no pseudo
-/// terminal to lend. The fault it does catch is the one no green unit test can
-/// see, which is a mechanism that works and that nothing calls.
 const own_source = @embedFile("run.zig");
 
-/// Where one call sits in this file, or an error naming the call that is gone.
-///
-/// **Each pattern opens with a real newline and the indent of the block**, so
-/// it matches the call itself and never the same words inside a comment or
-/// inside this test. The bytes of a pattern written here hold a backslash and
-/// an `n`, and not the newline the pattern is looking for, so this file cannot
-/// match itself either.
+/// Each pattern opens with a real newline and the indent of the block, so it
+/// matches the call itself and never the same words inside a comment. The bytes
+/// written here hold a backslash and an `n`, so this file cannot match itself.
 fn callAt(pattern: []const u8) error{CallIsGone}!usize {
     return std.mem.indexOf(u8, own_source, pattern) orelse error.CallIsGone;
 }
 
 test "an agent that has made no commit is answered before anything is put to anybody" {
-    // **Asking is not committing**, and this is the order that makes it true:
-    // `nothingCommitted` returns, and `carryCommit` is the only thing in this
-    // file that reaches the broker, so a session with no commit writes no
-    // `approval.request` and spends nobody's attention. It was measured by
-    // hand, on a real session that wrote a file and never committed it, and
-    // the answer named the count.
-    //
-    // A structural check, for the reason `own_source` gives: the end to end
-    // route needs a workspace, a policy table and a model, which this suite
-    // has none of. Mutation check: move the `carryCommit` call above the
-    // `nothingCommitted` one and this fails; delete either and it fails with
-    // `CallIsGone`.
     const counted = try callAt("\n            .output = try self.nothingCommitted(gpa, spawning_io, tree),");
     const asked = try callAt("\n        var carried = carryCommit(gpa, arena, spawning_io, .{");
 
     try testing.expect(counted < asked);
 
-    // And the same rule one step earlier: a workspace that is not a git
-    // worktree is refused before either, because there is no commit to carry
-    // and no ref to move.
     const no_worktree = try callAt("\n            .overlay => return .{ .carried = false, .output = try gpa.dupe(");
     try testing.expect(no_worktree < counted);
 }
 
 test "every ending of an apply writes down what it did to the branch" {
-    // **A session has to be distinguishable afterwards by what happened to
-    // somebody's branch.** A record written only when a branch moved is missing
-    // exactly where a reader needs it: they cannot tell a session the policy
-    // refused from one whose merge was refused by the working tree, or from a
-    // Chock too old to have modes at all.
-    //
-    // A structural check, for the reason `own_source` gives: the end to end
-    // route needs a workspace, a policy table and a model, which this suite has
-    // none of. Mutation check: delete any one of the three calls and this fails
-    // with `CallIsGone`.
     _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n            .park = .{ .wanted = wanted.landing(), .why = .already_there },");
     _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n                .park = .{ .wanted = wanted.landing(), .why = .apply_refused },");
     _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
 
-    // And the record is written before the answer goes back, so a crash between
-    // the two leaves the fact on disk rather than only in a return value.
     const recorded = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
     const answered = try callAt("\n            return .{ .landed = .{\n                .objects = carried.objects_moved,");
     try testing.expect(recorded < answered);
 }
 
 test "the log records the landing that happened, and not the mode the project configured" {
-    // **The outcome and not the plan**, the rule `chock_broker.actions.Result`
-    // already states about its own `integration` field. This row did not keep
-    // it: it wrote the mode `chock.zon` configured, which can be the word `ask`.
-    // A project configured `.ask`, where the person chose merge and the branch
-    // really merged, wrote "because this project asks for ask", and `ask` is a
-    // question, not a landing any apply can take.
-    //
-    // Mutation check: write `apply_mode.mode.wireName()` here again and the
-    // first two expectations below read `ask`.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -17821,12 +11521,9 @@ test "the log records the landing that happened, and not the mode the project co
     const store = backing.storage();
     defer store.close(io);
 
-    // A project that put the choice to the person, which is the configuration
-    // the measured example had.
     const asked_the_person = ApplyMode{ .mode = .ask, .decision = .allow, .asked_for = .ask };
 
     var locked = try store.lock(io);
-    // The person chose merge and the branch really merged.
     var branch = "refs/heads/main".*;
     var from = "1111111111111111111111111111111111111111".*;
     var to = "2222222222222222222222222222222222222222".*;
@@ -17836,21 +11533,15 @@ test "the log records the landing that happened, and not the mode the project co
         .from = &from,
         .to = &to,
     } });
-    // The person chose merge and the working tree would not take it, so the
-    // work waited at the ref. `wanted` is the honest answer for a park.
     recordIntegration(gpa, io, &locked, asked_the_person, "refs/chock/two", .{
         .park = .{ .wanted = .merge, .why = .dirty_tree },
     });
-    // And a session the policy refused a landing names no landing at all,
-    // rather than a word for an act nobody chose.
     recordIntegration(gpa, io, &locked, .{ .mode = null, .decision = .deny }, "refs/chock/three", .{
         .park = .{ .wanted = null, .why = .policy_refused },
     });
     try locked.unlock(io);
 
     const text = try std.Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(1 << 20));
-    // **The word a landing can never be.** `chock_policy.apply.Landing` has no
-    // `ask` member, so a row carrying one was written from the plan.
     if (std.mem.indexOf(u8, text, "\"mode\":\"ask\"") != null) {
         try std.testing.expectEqualStrings("no row saying the mode was ask", text);
         return error.TheRowRecordsThePlan;
@@ -17860,8 +11551,6 @@ test "the log records the landing that happened, and not the mode the project co
         std.mem.count(u8, text, "\"mode\":\"merge\""),
     );
     try std.testing.expect(std.mem.indexOf(u8, text, "\"mode\":\"\"") != null);
-    // The policy answer is still beside it, so a reader can still tell a
-    // project that asked from an installation that permitted.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"parked\":\"dirty_tree\"") != null);
@@ -17869,19 +11558,6 @@ test "the log records the landing that happened, and not the mode the project co
 }
 
 test "the line about a mode the policy took away is said again once the display is up" {
-    // **It was printed where nothing could read it.** `applyModeFor` runs in
-    // `start`, which is before `Ui.start`, so the display's alternate screen
-    // opened straight over the one line that says why no branch of the person's
-    // will move. The line is kept where it is, because a session with no
-    // display has no other way to hear it, and it is said again in the
-    // transcript once there is a screen to say it on.
-    //
-    // A structural check, for the reason `own_source` gives: the end to end
-    // route needs a terminal on three descriptors, which this suite has none
-    // of. Mutation check: delete either call and this fails with `CallIsGone`;
-    // move the block that opens the display below the block that says the line
-    // and the comparison fails, which is the fault itself, written the other
-    // way round.
     const printed = try callAt(
         "\n    if (bounded == null) tty.print(.warn, \"chock: \" ++ bounded_mode_fmt",
     );
@@ -17891,19 +11567,10 @@ test "the line about a mode the policy took away is said again once the display 
     );
 
     try std.testing.expect(opened < said_again);
-    // And the plain path still has its own line, for a run with no display at
-    // all.
     try std.testing.expect(printed != said_again);
 }
 
 test "the display is told what the session is, then filled from the log, then asked for a message" {
-    // **Getting the order wrong shows an empty header behind a full
-    // transcript**, and leaving the middle one out shows a session that was
-    // taken up as a fresh one, which is most of why `/resume` read as broken.
-    //
-    // Mutation check: delete the `replayInto` call and this fails with
-    // `CallIsGone`; move it above `one.describe` and the first comparison
-    // fails.
     const described = try callAt("\n        one.describe(.{");
     const replayed = try callAt("\n        replayInto(gpa, io, started.storage, one);");
     const primed = try callAt("\n        if (options.display.?.first_message.len != 0) one.prime(");
@@ -17913,16 +11580,12 @@ test "the display is told what the session is, then filled from the log, then as
 }
 
 test "no startup line carries an escape sequence when the stream is not a terminal" {
-    // The property a `chock run > log.txt 2>&1` needs, taken over the startup
-    // reporter rather than over the painter on its own.
     const gpa = testing.allocator;
     var shown: std.Io.Writer.Allocating = .init(gpa);
     defer shown.deinit();
 
     defer tty.configure(.{});
     defer tty.useStreams(testing.io, null, null);
-    // A terminal on the command line and a pipe on the stream: the pipe is what
-    // decides, so this comes out clean.
     tty.configure(.{ .verbose = true, .stderr_is_tty = false, .term = "xterm-256color" });
     tty.useStreams(testing.io, null, &shown.writer);
 
@@ -17936,10 +11599,6 @@ test "no startup line carries an escape sequence when the stream is not a termin
 }
 
 test "a printer that is not writing to a terminal emits no escape sequence at all" {
-    // The property a pipe and a file need. Every kind of event this printer
-    // knows goes through it, so a branch that painted unconditionally would be
-    // caught wherever it was. Mutation check: give `Printer.open` the body of
-    // `tty.Painter.colour.open` and this fails.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{.{ .text = "the answer" }};
     const shown = try printedForSteps(gpa, &.{
@@ -17963,9 +11622,6 @@ test "a printer that is not writing to a terminal emits no escape sequence at al
 }
 
 test "a printer writing to a terminal paints a failed tool result and leaves the answer alone" {
-    // Colour is rank. The model's own words are the program's answer and carry
-    // no rank Chock can know, so they stay plain even with colour on. What is
-    // painted is the line a person is scanning for.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{.{ .text = "the answer" }};
 
@@ -17975,15 +11631,12 @@ test "a printer writing to a terminal paints a failed tool result and leaves the
     defer gpa.free(failed);
     try testing.expectEqualStrings("\x1b[31m! no such file\n\x1b[0m", failed);
 
-    // A result that worked is ordinary output, and it gets what an ordinary
-    // line gets.
     const worked = try printedForStepsPainted(gpa, &.{
         .{ .event = .{ .tool_result = .{ .call_id = "1", .output = "ok", .is_error = false, .truncated = false } } },
     }, .colour);
     defer gpa.free(worked);
     try testing.expectEqualStrings("ok\n", worked);
 
-    // And the answer itself.
     const answer = try printedForStepsPainted(gpa, &.{
         .{ .event = .{ .message = .{ .role = .assistant, .content = &content } } },
     }, .colour);
@@ -17992,20 +11645,6 @@ test "a printer writing to a terminal paints a failed tool result and leaves the
 }
 
 test "a result's note is written above the result, in Chock's own voice" {
-    // **A tool result has two readers, and `chock run` shows both.** The
-    // result is written for the model: a refused fetch tells the agent that
-    // the policy file is the user's to write and not its own, which is what
-    // stops it retrying or looking for a way round. A person reading that same
-    // paragraph is reading a message about themselves in the third person, and
-    // the project owner did exactly that on 2026-08-25.
-    //
-    // So the note goes first, under Chock's own `chock: ` prefix, which is the
-    // same shape `onNoticeFn` uses and which the model can never produce: only
-    // `Printer` writes at column 0. See
-    // `chock_proto.event.ToolResult.note`.
-    //
-    // Mutation check: write the note after the output and the order assertion
-    // fails; drop it and the first assertion does.
     const gpa = testing.allocator;
     const shown = try printedForSteps(gpa, &.{
         .{ .event = .{ .tool_result = .{
@@ -18024,8 +11663,6 @@ test "a result's note is written above the result, in Chock's own voice" {
         shown,
     );
 
-    // An ordinary result gains no line of Chock's. A sentence under every
-    // result is a sentence nobody reads.
     const plain = try printedForSteps(gpa, &.{
         .{ .event = .{ .tool_result = .{ .call_id = "1", .output = "ok", .is_error = false, .truncated = false } } },
     });
@@ -18034,9 +11671,6 @@ test "a result's note is written above the result, in Chock's own voice" {
 }
 
 test "a session that finished and one that did not are painted differently" {
-    // The one line at the end that a script and a person both read. A run that
-    // ended badly has to look different from one that did not, or the colour
-    // has told the reader nothing.
     const gpa = testing.allocator;
 
     const clean = try printedForStepsPainted(gpa, &.{
@@ -18055,12 +11689,6 @@ test "a session that finished and one that did not are painted differently" {
 }
 
 test "the answer is on the screen before the turn ends, and the event that closes the turn does not print it again" {
-    // The measured silence: a session ran 5.3 minutes over about 57 model
-    // calls and printed nothing while any of them was in flight, because the
-    // `message` event is the end of a turn and there was nothing before it.
-    // Now the pieces are printed as they arrive, so what is left for the event
-    // is the newline that closes the line, and nothing else. A printer that
-    // printed both would show every answer twice.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{.{ .text = "Hello world" }};
     const shown = try printedForSteps(gpa, &.{
@@ -18074,10 +11702,6 @@ test "the answer is on the screen before the turn ends, and the event that close
 }
 
 test "what was streamed belongs to its own turn, and the next turn starts from nothing" {
-    // The counter has to be cleared by the event that closes a turn.
-    // Otherwise the second turn's `message` event, which streamed nothing of
-    // its own in this arrangement, would still be read as already printed and
-    // would show nothing at all.
     const gpa = testing.allocator;
     const first = [_]chock_proto.event.ContentPart{.{ .text = "first" }};
     const second = [_]chock_proto.event.ContentPart{.{ .text = "second" }};
@@ -18092,9 +11716,6 @@ test "what was streamed belongs to its own turn, and the next turn starts from n
 }
 
 test "the model's reasoning is not printed as it arrives, so the answer is not buried in it" {
-    // A model that thinks before it answers writes far more reasoning than
-    // answer. The reasoning is in the log, which is where a person who wants
-    // it looks. See `Printer.onPieceFn`.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{.{ .text = "42" }};
     const shown = try printedForSteps(gpa, &.{
@@ -18108,11 +11729,6 @@ test "the model's reasoning is not printed as it arrives, so the answer is not b
 }
 
 test "a turn that only reasoned prints nothing at all, and not a blank line" {
-    // Measured against claude-sonnet-5, which opens every turn with a
-    // thinking block. The reasoning is not shown, so the turn had nothing to
-    // print, and the newline that closed it had nothing to close. One blank
-    // line per turn, and the tool call after it opens with a newline of its
-    // own, so a session with many tool calls was mostly whitespace.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{
         .{ .reasoning = .{ .text = "weighing the approach", .signature = "SIG==" } },
@@ -18127,9 +11743,6 @@ test "a turn that only reasoned prints nothing at all, and not a blank line" {
 }
 
 test "a turn that said something keeps the newline that closes it" {
-    // The other half: the newline is not simply gone. A turn with words in it
-    // still ends its own line, so the next thing printed starts on a fresh
-    // one.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{
         .{ .reasoning = .{ .text = "weighing the approach", .signature = "SIG==" } },
@@ -18144,11 +11757,6 @@ test "a turn that said something keeps the newline that closes it" {
 }
 
 test "a reasoning only turn ahead of a tool call leaves one blank line and not two" {
-    // The whole shape, end to end, because the count is the fault: this is
-    // what a tool heavy session actually prints. The one blank line here is
-    // the `.tool_call` branch's own leading newline, which separates the
-    // command from whatever came before it. The turn that only reasoned adds
-    // nothing to it.
     const gpa = testing.allocator;
     const thinking = [_]chock_proto.event.ContentPart{
         .{ .reasoning = .{ .text = "weighing the approach", .signature = "SIG==" } },
@@ -18177,10 +11785,6 @@ test "a reasoning only turn ahead of a tool call leaves one blank line and not t
 }
 
 test "a user's own message is still not echoed, whatever the newline rule does" {
-    // The user just typed it, and the tool role's message is the same result
-    // the tool.result event already showed. Both branches return before the
-    // newline question is reached, so a change to that question must not
-    // start echoing either one.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{.{ .text = "list the files" }};
     const shown = try printedFor(gpa, &.{
@@ -18191,10 +11795,6 @@ test "a user's own message is still not echoed, whatever the newline rule does" 
 }
 
 test "a compaction says so on the terminal, and says the log kept everything" {
-    // **A compaction in silence is the five minute silence again.** The
-    // project owner once watched a session sit with no output and reasonably
-    // guessed it was compacting. It was not, because nothing compacted at
-    // all. Now that something does, the user hears it.
     const gpa = testing.allocator;
     const shown = try printedFor(gpa, &.{
         .{ .compaction = .{
@@ -18210,16 +11810,10 @@ test "a compaction says so on the terminal, and says the log kept everything" {
     try testing.expect(std.mem.indexOf(u8, shown, "folded into a summary") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "local") != null);
     try testing.expect(std.mem.indexOf(u8, shown, "still in the session log") != null);
-    // The summary itself is not printed. It is the model's context, not a
-    // report to the user, and it is in the log for anyone who wants it.
     try testing.expect(std.mem.indexOf(u8, shown, "the parser work") == null);
 }
 
 test "what the harness tells the model reaches the user too" {
-    // A session that quietly told the model something is a session the user
-    // cannot explain afterwards. The notice before a compaction is the first
-    // of these, and it arrives as a `system` role message, which the printer
-    // used to drop with the user's own echo.
     const gpa = testing.allocator;
     const content = [_]chock_proto.event.ContentPart{
         .{ .text = "[chock] Your context holds 40000 tokens of the 65536 this model can take" },
@@ -18233,13 +11827,6 @@ test "what the harness tells the model reaches the user too" {
 }
 
 test "a whole plan update is one row, and it names the step being worked on" {
-    // **The owner's own complaint.** One `update_plan` call wrote one row per
-    // step, so a list of four steps cost four rows every time any one of them
-    // moved, and a task list has one current state rather than one per event.
-    // `src/ui.zig` settled the shape and this writes the same one.
-    //
-    // Mutation check: put the per step loop back and this reads four rows
-    // rather than one.
     const gpa = testing.allocator;
     const shown = try printedFor(gpa, &.{
         .{ .plan_update = .{ .steps = &.{
@@ -18258,17 +11845,6 @@ test "a whole plan update is one row, and it names the step being worked on" {
 }
 
 test "a step starting work moves no count and is still reported by name" {
-    // **Why the row names the step and does not only count.** Pending to
-    // in_progress is the commonest move a task list makes, and it moves no
-    // count at all, so a row carrying only counts would repeat the row before
-    // it and read as nothing having happened.
-    //
-    // The second update carries no subject, which is what
-    // `chock_proto.state.Plan.apply` reads as "keep the words this step
-    // already has". The words come off the fold, so the row still has them.
-    //
-    // Mutation check: drop the `now on` clause and the two rows are the same
-    // bytes, which the comparison below refuses.
     const gpa = testing.allocator;
     const shown = try printedFor(gpa, &.{
         .{ .plan_update = .{ .steps = &.{
@@ -18287,19 +11863,6 @@ test "a step starting work moves no count and is still reported by name" {
 }
 
 test "a step given up keeps a row of its own, once, and rides the summary after" {
-    // **A state and an event are not the same thing.** `src/ui.zig` keeps the
-    // standing state in the plan sidebar, where a step that was dropped is a
-    // row a person can see for the rest of the session. `chock run` has no
-    // sidebar, so the same fact travels two ways: a row at the moment it
-    // happens, which is the only place the time of it can be read, and a count
-    // on every summary after, because `1 of 3 done` reads as two left when one
-    // of the three was given up.
-    //
-    // Mutation check: fire the row off the status rather than off the move and
-    // the repeated update writes "was given up" a second time.
-    //
-    // Mutation check: drop the `given up` clause from the summary and the last
-    // comparison fails.
     const gpa = testing.allocator;
     const shown = try printedFor(gpa, &.{
         .{ .plan_update = .{ .steps = &.{
@@ -18313,8 +11876,6 @@ test "a step given up keeps a row of its own, once, and rides the summary after"
     defer gpa.free(shown);
 
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, shown, "was given up"));
-    // The words are the fold's, because the update that dropped the step
-    // carried none of its own.
     try testing.expect(std.mem.indexOf(
         u8,
         shown,
@@ -18324,10 +11885,6 @@ test "a step given up keeps a row of its own, once, and rides the summary after"
 }
 
 test "a promise the agent makes is printed as it is made, with the reason it gave" {
-    // The promise holds for the rest of the session and nothing lifts it, so
-    // the person watching learns about it at the moment it happens rather than
-    // by reading the log afterwards. The record is surfaced rather than buried,
-    // and this is the earliest place it can be.
     const gpa = testing.allocator;
     const shown = try printedFor(gpa, &.{
         .{ .policy_self = .{ .restrictions = &.{.{
@@ -18343,8 +11900,6 @@ test "a promise the agent makes is printed as it is made, with the reason it gav
         shown,
     );
 
-    // A promise from a newer Chock keeps its own spelling here too, because
-    // the printer holds no list of ceilings of its own.
     const newer = try printedFor(gpa, &.{
         .{ .policy_self = .{ .restrictions = &.{.{
             .action = "git.*",
@@ -18356,13 +11911,6 @@ test "a promise the agent makes is printed as it is made, with the reason it gav
     try testing.expectEqualStrings("\nchock: the agent promised git.* at most ask_two_people\n", newer);
 }
 
-/// A `ToolRunner` that runs nothing and reports what the mount set and the
-/// `PATH` looked like when it was called.
-///
-/// **This is the only way to prove the fact that matters**: that a store path
-/// adopted between two tool calls is in the set the second one is built from.
-/// A test that read `ProvisionToolRunner`'s own fields would prove that the
-/// runner wrote them down, which is a different and much weaker statement.
 const RecordingToolRunner = struct {
     context: *const chock_core.tools.Context,
     tool_env: *const std.process.Environ.Map,
@@ -18397,12 +11945,6 @@ const RecordingToolRunner = struct {
 };
 
 test "a program taken into the toolchain is mounted by the next tool call, and not by the one before" {
-    // The question this whole feature turns on: can a store path become
-    // visible to a sandbox while the session is live? It can, and the reason
-    // is that there is no long lived sandbox. `Registry.dispatchWith` builds a
-    // `sandbox.Config` from `Context.store_paths` for **every** call, so the
-    // set is read once per call and never cached. This pins that, from the
-    // side that reads it.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18436,7 +11978,6 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
         .arguments = "{\"argv\":[\"rg\"]}",
     };
 
-    // Before: one store path, and the dev shell's own PATH.
     const before = try runner.dispatch(gpa, std.testing.io, call);
     gpa.free(before.call_id);
     gpa.free(before.output);
@@ -18455,9 +11996,6 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
         .store_paths = &store_paths,
     });
 
-    // After: the whole closure is mounted, the dev shell's own paths are
-    // still there, and the provisioned `bin` is ahead of them on the PATH so
-    // the program the agent just asked for is the one that is found.
     const after = try runner.dispatch(gpa, std.testing.io, call);
     gpa.free(after.call_id);
     gpa.free(after.output);
@@ -18469,15 +12007,10 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
         recorder.last_path,
     );
 
-    // And the pass through is really a pass through: both calls reached the
-    // runner below, so nothing about this wrapper swallows ordinary work.
     try std.testing.expectEqual(@as(usize, 2), recorder.calls);
 }
 
 test "what a build produced is mounted by the next tool call, and not by the one before" {
-    // The two runners write to one mount set. Give each a list of its own and
-    // the last one to adopt publishes a slice the other's additions are
-    // missing from, which is a mount set that quietly shrinks.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18525,8 +12058,6 @@ test "what a build produced is mounted by the next tool call, and not by the one
     gpa.free(before.output);
     try std.testing.expectEqual(@as(usize, 1), recorder.last_store_paths.len);
 
-    // What `chock_nix.build.realise` answers with: the outputs' own closure,
-    // and one `bin` per output.
     const closure = [_][]const u8{ "/nix/store/aaa-devshell", "/nix/store/bbb-myproject" };
     try mounts.adopt(.{
         .program = "/work#packages.x86_64-linux.default",
@@ -18539,8 +12070,6 @@ test "what a build produced is mounted by the next tool call, and not by the one
     gpa.free(after.call_id);
     gpa.free(after.output);
 
-    // Two paths and not three: the dev shell entry the closure repeats is
-    // mounted once.
     try std.testing.expectEqual(@as(usize, 2), recorder.last_store_paths.len);
     try std.testing.expectEqualStrings("/nix/store/bbb-myproject", recorder.last_store_paths[1]);
     try std.testing.expectEqualStrings(
@@ -18551,16 +12080,11 @@ test "what a build produced is mounted by the next tool call, and not by the one
 }
 
 test "a host a Nix build would fetch from is named under nix.net.build, labels reversed" {
-    // A build's egress is its own namespace, so a rule that lets a build
-    // reach a host does not also let the sandbox open a socket to it. The
-    // reversal is the one `net.connect` uses.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // No asker at all, so nothing is permitted and the refusal carries the
-    // name the question would have been put under.
     var gate = NixFetchGate{
         .gpa = gpa,
         .io = std.testing.io,
@@ -18579,14 +12103,9 @@ test "a host a Nix build would fetch from is named under nix.net.build, labels r
         std.mem.indexOf(u8, said, "nix.net.build.com.example.files.443") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, said, "net.connect") == null);
-    // The derivation and the host are both in the words, so the model can ask
-    // for that host rather than send the same attribute again.
     try std.testing.expect(std.mem.indexOf(u8, said, "b-src.drv") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "files.example.com") != null);
 
-    // **Reversal is what makes a class rule safe.** A name a derivation chose
-    // falls under the class an author wrote and never over it, so a rule for
-    // `nix.net.build.com.example.*` does not cover this one.
     const hostile = (try gate.gate().permitAll(arena, &.{.{
         .subject = "c-src.drv",
         .url = "https://evil.com.example.files/x",
@@ -18598,7 +12117,6 @@ test "a host a Nix build would fetch from is named under nix.net.build, labels r
     );
     try std.testing.expect(std.mem.indexOf(u8, hostile, "nix.net.build.com.example.") == null);
 
-    // A host no rule could ever have named is refused, and never reached.
     const unnameable = (try gate.gate().permitAll(arena, &.{.{
         .subject = "d-src.drv",
         .url = "https://a_b/x",
@@ -18610,8 +12128,6 @@ test "a host a Nix build would fetch from is named under nix.net.build, labels r
 }
 
 test "an input fetch is named under nix.net.eval, and the same host reads differently in each phase" {
-    // The startup fetch and the retry a build makes exist so an expression can
-    // evaluate, which is the whole of what `eval` means here.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18639,9 +12155,6 @@ test "an input fetch is named under nix.net.eval, and the same host reads differ
 }
 
 test "a build that fetches with no url is asked under fixed segments, and the words name it" {
-    // **Nothing a model chose is in the key.** An action built out of a
-    // derivation name could collide with an attribute path, and it would put
-    // one question per package where one covers the build.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18660,16 +12173,12 @@ test "a build that fetches with no url is asked under fixed segments, and the wo
         "furo-web-2025.12.19-npm-deps.drv",
     })).refused;
     try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.build.opaque") != null);
-    // Fixed segments and nothing else: no derivation name reaches the key.
     try std.testing.expect(std.mem.indexOf(u8, said, "zig-deps") == null);
     try std.testing.expect(std.mem.indexOf(u8, said, "net.connect") == null);
     try std.testing.expectEqualStrings("nix.net.build.opaque", NixFetchGate.opaque_action);
 }
 
 test "a flake input host is asked of the policy table at startup, and ask is off there" {
-    // **The same egress namespace a build's own fetches are asked under.**
-    // There is nobody to prompt while a session is starting up, so only
-    // `allow` fetches: the same rule `languageServerPermitted` keeps.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18701,9 +12210,6 @@ test "a flake input host is asked of the policy table at startup, and ask is off
     };
     try std.testing.expect(try gate.gate().permitAll(arena, &.{wanted}) == .permitted);
 
-    // A host the table says nothing about answers `ask`, and `ask` is off at
-    // startup. The words name the input, the host and the action, because the
-    // person who can change the rule is the one who reads them.
     const quiet = try chock_policy.table.Table.parse(arena, ".{}", null);
     var silent = StartupFetchGate{
         .policy = quiet,
@@ -18718,11 +12224,6 @@ test "a flake input host is asked of the policy table at startup, and ask is off
 }
 
 test "a startup refusal is not a permanent no, and a build asks about the input it wanted" {
-    // **The fault this replaced.** `fetchFlakeInputs` fetches only on `allow`,
-    // because a session start has nobody at the prompt, so a project that
-    // wrote no `nix.net` rule reached every build with its inputs
-    // missing and could never build anything. A build is a turn the model
-    // took, so there is somebody to ask.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18743,17 +12244,12 @@ test "a startup refusal is not a permanent no, and a build asks about the input 
         .port = 443,
     };
 
-    // No asker at all, so nothing is permitted. The words are the input's and
-    // never a derivation's, and the action is the ordinary one.
     const said = (try input_gate.gate().permitAll(arena, &.{wanted})).refused;
     try std.testing.expect(std.mem.indexOf(u8, said, "flake input flakever") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.eval.com.github.api.443") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "while it builds") == null);
 
-    // The sentence the model finally reads, joined to that refusal. **The
-    // seam has to read as prose**: the refusal ends on an action name, so
-    // without a full stop the next sentence ran straight into the port.
     const refusal = try chock_nix.inputs.missingRefusal(
         gpa,
         "/work#packages.aarch64-linux.default",
@@ -18763,16 +12259,10 @@ test "a startup refusal is not a permanent no, and a build asks about the input 
     defer gpa.free(refusal);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "443 The inputs") == null);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "flakever from api.github.com") != null);
-    // Nobody is told to ask for a host they have just been refused.
     try std.testing.expect(std.mem.indexOf(u8, refusal, "ask the user") == null);
 }
 
 test "a build whose inputs arrived at startup never reaches the question" {
-    // **What a project that wrote its rules pays at build time: nothing.** The
-    // question is put from one branch only, the one a missing input takes, and
-    // an input the session start fetched is one the seam calls valid, so the
-    // evaluation takes it out of the store and that branch is never entered.
-    // `test/nix/real.zig` pins the other half against a real store.
     var budget: chock_nix.build.Budget = .{};
     var nowhere = NowhereWriter{};
     var writing = chock_nix.build.Writing{
@@ -18786,8 +12276,6 @@ test "a build whose inputs arrived at startup never reaches the question" {
     try std.testing.expect(!try seam.vtable.is_valid_path.?(seam.context, "/nix/store/bbbb-source"));
 }
 
-/// A `chock_nix.build.StoreWriter` that writes nowhere, for a test that asks
-/// the seam a question and never writes an object.
 const NowhereWriter = struct {
     fn writer(self: *NowhereWriter) chock_nix.build.StoreWriter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -18818,12 +12306,6 @@ test "nix_build builds this project and refuses a flake reference that is not it
 }
 
 test "a program out of a build asks under exec.nix.store, and the dev shell's own still asks under exec.devshell" {
-    // **The split `Loop.Deps.store_closure` exists for.** That field is read
-    // from the toolchain the session started with, in `runSession`, and never
-    // from `chock_core.tools.Context.store_paths`, which a build grows. So a
-    // path the agent asked for keeps asking, while the toolchain the project
-    // declared keeps running with no prompt. Point that field at the grown
-    // list and the second expectation below becomes `exec.devshell`.
     const startup_closure = [_][]const u8{"/nix/store/aaa-devshell"};
 
     var buffer: [chock_core.tools.Tool.max_action_bytes]u8 = undefined;
@@ -18850,10 +12332,6 @@ test "a program out of a build asks under exec.nix.store, and the dev shell's ow
 }
 
 test "a session that cannot provision refuses the call and names no package manager as a way out" {
-    // The model is not offered `provide_tool` in this case, so this is a call
-    // that came out of nowhere. It still has to be answered with something
-    // the model can act on, and the one thing that is true is: use what is
-    // here, and do not reach for apt.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18889,13 +12367,9 @@ test "a session that cannot provision refuses the call and names no package mana
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "cannot add one") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "apt") != null);
-    // And nothing was run below: a call this runner answers never reaches the
-    // sandbox, so no `nix` was spawned to find out that there is no `nix`.
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
 }
 
-/// A `NixEvalToolRunner` over `inner`, reading the workspace at `root` and
-/// holding an evaluation to `caps`.
 fn testNixEvalRunner(
     inner: chock_core.Loop.ToolRunner,
     root: []const u8,
@@ -18904,15 +12378,11 @@ fn testNixEvalRunner(
     return .{ .inner = inner, .settings = .{ .workspace_root = root, .caps = caps } };
 }
 
-/// The caps a project that named nothing gets, for a test about something
-/// other than the fold.
 const default_nix_caps = chock_policy.nix.Resolved{
     .max_object_bytes = chock_policy.nix.default_max_object_bytes,
     .max_session_bytes = chock_policy.nix.default_max_session_bytes,
 };
 
-/// One `nix_eval` call through a runner, for a test that asks about the
-/// answer. The caller owns both halves of the result.
 fn evaluateThrough(
     gpa: std.mem.Allocator,
     runner: *NixEvalToolRunner,
@@ -18947,15 +12417,10 @@ test "an expression is evaluated in this process and the rendered value reaches 
 
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("{ a = 1; b = \"two\"; }", result.output);
-    // Nothing went to the sandbox: an evaluation runs here, and a call this
-    // runner answers never reaches the one below it.
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
 }
 
 test "a derivation answers its derivation path, and says that nothing was built" {
-    // The fact the eval and build split rests on, read from the tool the
-    // model actually calls: a derivation path is computed with no daemon and
-    // no store, and it is the name a later build would use.
     const gpa = std.testing.allocator;
 
     var context = chock_core.tools.Context{};
@@ -18977,18 +12442,11 @@ test "a derivation answers its derivation path, and says that nothing was built"
         result.output,
         "/nix/store/97qlv6h78lxlm9zc8849ahsbcklhsi2y-x.drv",
     ) != null);
-    // The model is told the answer is a derivation, because a derivation and
-    // a string of the same path render the same way.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "is a derivation") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "never builds") != null);
 }
 
 test "import from derivation is refused, and the refusal names the derivation" {
-    // Nix says very little when a build does not happen, so the derivation
-    // has to be in the words: a model that reads a refusal with no subject
-    // sends the same expression again. The driver is the only thing that
-    // knows the name, which is why one is installed for an evaluation that
-    // needs no store at all.
     const gpa = std.testing.allocator;
 
     var context = chock_core.tools.Context{};
@@ -19006,14 +12464,10 @@ test "import from derivation is refused, and the refusal names the derivation" {
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "-y.drv") != null);
-    // And it says what to do instead, so the next turn is not the same turn.
     try std.testing.expect(std.mem.indexOf(u8, result.output, "drvPath") != null);
 }
 
 test "an expression that reads a path outside the workspace is refused" {
-    // Pure evaluation plus one root is the whole of this, and the root is the
-    // workspace. Widen `roots` in `NixEval.run` and the second call below
-    // starts answering.
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -19045,15 +12499,10 @@ test "an expression that reads a path outside the workspace is refused" {
     defer gpa.free(outside.call_id);
     defer gpa.free(outside.output);
     try std.testing.expect(outside.is_error);
-    // The refusal names the one tree that can be read, so the model can act
-    // on it rather than trying another path outside.
     try std.testing.expect(std.mem.indexOf(u8, outside.output, root) != null);
 }
 
 test "the object cap a project names reaches the driver an evaluation answers through" {
-    // The wiring, and not the fold: `chock_policy.nix` has its own tests for
-    // which layer wins. Drop the `applyNixCaps` call in `NixEval.run` and the
-    // driver keeps `chock_nix.backend.default_max_object_bytes`.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -19092,16 +12541,11 @@ test "the object cap a project names reaches the driver an evaluation answers th
     try std.testing.expectEqual(@as(u64, 4 << 10), resolved.max_object_bytes);
     try std.testing.expectEqual(@as(u64, 8 << 20), resolved.max_session_bytes);
 
-    // Through the very call `NixEvalToolRunner` makes, so the number is
-    // followed from the file the user wrote to the driver the evaluation
-    // answers through.
     const settings = NixEval{ .workspace_root = "/nowhere", .caps = resolved };
     var driver = settings.driverFor(gpa);
     defer driver.deinit();
     try std.testing.expectEqual(@as(usize, 4 << 10), driver.max_object_bytes);
 
-    // And a session whose policy named nothing keeps the library's own bound,
-    // so the line above reads the file and not a constant.
     const quiet = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
     var quiet_driver = quiet.driverFor(gpa);
     defer quiet_driver.deinit();
@@ -19114,31 +12558,19 @@ test "the object cap a project names reaches the driver an evaluation answers th
 test "nix_eval answers through a store that takes no object, so it writes nothing to the host store" {
     const gpa = std.testing.allocator;
 
-    // **The one difference between the two Nix tools.** A build writes its
-    // derivation closure into the host store, because that is the object the
-    // host is then told to realise. An evaluation that only reads writes
-    // nothing: give this seam an `add_object` and every expression the model
-    // sends could put bytes in the store.
     const settings = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
     var driver = settings.driverFor(gpa);
     defer driver.deinit();
     try std.testing.expect(driver.seam.vtable.add_object == null);
     try std.testing.expect(driver.seam.vtable.build_paths == null);
 
-    // Store writes are off as well, so the two guards are apart: the seam
-    // could take nothing even if a caller turned writes on.
     try std.testing.expect(driver.seam.vtable.read_file == null);
-
-    // What one of these evaluations does answer for a derivation is pinned by
-    // "a derivation answers its derivation path, and says that nothing was
-    // built", which reads the path out of the tool the model calls.
 }
 
 test "a nix block that does not parse stops the session rather than evaluating under another number" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // A passing test may not let a line reach the real standard error.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
@@ -19171,17 +12603,12 @@ test "a nix block that does not parse stops the session rather than evaluating u
         null,
     ));
 
-    // The field, the text, and the file it is in. The error name alone
-    // carries none of the three.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "max_object_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "50%") != null);
 }
 
 test "a session that cannot evaluate refuses the call and never says it evaluated" {
-    // The model is not offered the tool in that case, so this is a call it
-    // made out of nowhere. The refusal has to be honest for the same reason
-    // `provisioning_is_off` is.
     const gpa = std.testing.allocator;
 
     var context = chock_core.tools.Context{};
@@ -19199,8 +12626,6 @@ test "a session that cannot evaluate refuses the call and never says it evaluate
     try std.testing.expectEqualStrings(nix_eval_is_off, result.output);
     try std.testing.expectEqual(@as(usize, 0), recorder.calls);
 
-    // And every other tool still goes straight through, whatever this
-    // session can do about Nix.
     const other = try nix_eval.runner().dispatch(gpa, std.testing.io, .{
         .call_id = "c2",
         .tool = "read_file",
@@ -19212,9 +12637,6 @@ test "a session that cannot evaluate refuses the call and never says it evaluate
 }
 
 test "the tool is offered only to a session that can evaluate" {
-    // The other half of the gate, from the side `src/run.zig` sets. A tool
-    // the model cannot use costs one turn to call and one to read the
-    // failure: see `chock_core.tools.Support`.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19237,9 +12659,6 @@ test "the tool is offered only to a session that can evaluate" {
 }
 
 test "asking twice for the same program builds nothing the second time" {
-    // A model that forgets it already asked would otherwise pay for a second
-    // resolution, which on a cache miss is minutes. The answer says the
-    // program is there, and it is not an error: the request is satisfied.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19256,8 +12675,6 @@ test "asking twice for the same program builds nothing the second time" {
         .context = &context,
         .tool_env = &tool_env,
     };
-    // `settings` names a `nix` that is not there. The point is that this test
-    // never reaches it: a repeat is answered before anything is spawned.
     var provisioning = ProvisionToolRunner{
         .inner = recorder.runner(),
         .settings = .{
@@ -19291,10 +12708,6 @@ test "asking twice for the same program builds nothing the second time" {
 }
 
 test "the policy key is the broker's own nix.build, and a project that said nothing cannot provision" {
-    // Provisioning runs `nix build` on the host, outside the sandbox, with the
-    // daemon, so it is measured against the action the broker already has for
-    // exactly that. A key spelled again here would silently stop matching a
-    // rule the user wrote.
     try std.testing.expectEqualStrings("nix.build", provision_action);
 
     const gpa = std.testing.allocator;
@@ -19302,11 +12715,6 @@ test "the policy key is the broker's own nix.build, and a project that said noth
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A project with no `chock.zon` gets the empty table, where every key
-    // answers `ask`. `ask` cannot be answered mid session, because `Loop.run`
-    // holds the log lock for the whole session, so the honest reading is that
-    // this project does not provision. **The safe direction, and the same one
-    // `applyWork` already takes.**
     const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
     defer chock_policy.table.Table.destroy(arena, empty);
     try std.testing.expectEqual(
@@ -19314,8 +12722,6 @@ test "the policy key is the broker's own nix.build, and a project that said noth
         try provisionDecision(arena, empty, &.{}, "main", "a-model"),
     );
 
-    // A project that said yes, in the file that is kept beyond the agent's
-    // reach.
     const allowed = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .action = "nix.build", .decision = .allow },
@@ -19327,10 +12733,6 @@ test "the policy key is the broker's own nix.build, and a project that said noth
         try provisionDecision(arena, allowed, &.{}, "main", "a-model"),
     );
 
-    // And a subagent holds no more than its parent, whatever the file says
-    // about the child alone. The decision is the intersection over the chain,
-    // so a `reviewer` allowed on its own still cannot provision under a `main`
-    // that is denied.
     const child_only = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .agent_kind = "reviewer", .action = "nix.build", .decision = .allow },
@@ -19346,23 +12748,13 @@ test "the policy key is the broker's own nix.build, and a project that said noth
 }
 
 test "the write and execute rule is on unless this project's policy says allow" {
-    // **The default is the whole point of the row.** Every other `chock.zon`
-    // knob narrows and this one widens, so a project that has never heard of it
-    // must be exactly as hardened as it was before the row existed.
-    //
-    // Mutation check: read `ask` as permission and the first case below turns
-    // the rule off for every project on earth.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The name is the one `chock_policy.hardening` owns. A key spelled again
-    // here would silently stop matching the rule a user wrote.
     try std.testing.expectEqualStrings("sandbox.jit", chock_policy.hardening.jit_action);
 
-    // A warning reaches standard error when the rule goes off, and a test may
-    // not let a line reach the terminal: see `tty.Capture`.
     var said: tty.Capture = undefined;
     said.start(std.testing.io, gpa);
     defer said.stop(std.testing.io);
@@ -19374,8 +12766,6 @@ test "the write and execute rule is on unless this project's policy says allow" 
     try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, kept.rule);
     try std.testing.expectEqualStrings("", said.err());
 
-    // A project that said yes, in the file that is kept beyond the agent's
-    // reach.
     const allowed = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .action = "sandbox.jit", .decision = .allow },
@@ -19384,14 +12774,9 @@ test "the write and execute rule is on unless this project's policy says allow" 
     defer chock_policy.table.Table.destroy(arena, allowed);
     const given_up = try hardeningDecision(arena, allowed, &.{}, "main", "a-model");
     try std.testing.expectEqual(chock_policy.hardening.WriteExecute.relaxed, given_up.rule);
-    // **And it is said out loud.** A person at the keyboard of a session that
-    // gave up a layer has to be able to see that they are.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "sandbox.jit") != null);
     try std.testing.expectEqualStrings("", said.out());
 
-    // An organisation forbids it with one rule in the bundle above the
-    // project, and the project cannot raise it back. That is not a check: the
-    // fold is a minimum over both layers.
     said.clear();
     const org_rules = [_]chock_policy.table.Rule{
         .{ .action = chock_policy.hardening.jit_action, .decision = .deny },
@@ -19407,8 +12792,6 @@ test "the write and execute rule is on unless this project's policy says allow" 
     try std.testing.expectEqual(chock_policy.hardening.WriteExecute.strict, refused.rule);
     try std.testing.expectEqualStrings("", said.err());
 
-    // And a subagent holds no more than its parent, whatever the file says
-    // about the child alone.
     const child_only = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .agent_kind = "reviewer", .action = "sandbox.jit", .decision = .allow },
@@ -19421,29 +12804,12 @@ test "the write and execute rule is on unless this project's policy says allow" 
 }
 
 test "the mode comes from chock.zon and the table above it, and nothing configured merges" {
-    // **Two files and one answer.** The project names the shape, and the
-    // `workspace.integrate` row says whether an approved apply may move a
-    // branch at all.
-    //
-    // **The whole chain for a project with no `chock.zon`**, measured end to
-    // end in the first case below: no file, so `apply.load` answers the
-    // `Settings` default, which is `merge`; no rule names the row, so
-    // `ceilingChain` answers `allow`; `boundBy(.merge, .allow)` is `merge`; and
-    // `chosenLanding` settles `merge` without asking anybody. The person is
-    // then shown a summary that names the branch and the merge before they
-    // answer.
-    //
-    // Mutation check: let `boundBy` answer `mode` for `deny` as well and the
-    // third case below lets an installation whose organisation said no move a
-    // branch, while the fourth lets a subagent move one its parent could not.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The row name is the one `chock_policy.apply` owns. A key spelled again
-    // here would silently stop matching the rule an organisation wrote.
     try std.testing.expectEqualStrings("workspace.integrate", chock_policy.apply.integrate_action);
 
     var said: tty.Capture = undefined;
@@ -19458,23 +12824,16 @@ test "the mode comes from chock.zon and the table above it, and nothing configur
     const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
     defer chock_policy.table.Table.destroy(arena, empty);
 
-    // No `chock.zon` at all: the work merges into the branch, and nothing is
-    // said, because nothing was taken away.
     const silent = try applyModeFor(arena, io, root, empty, &.{}, "main", "a-model");
     try std.testing.expectEqual(@as(?chock_policy.apply.Mode, .merge), silent.mode);
     try std.testing.expectEqual(chock_policy.table.Decision.allow, silent.decision);
     try std.testing.expectEqualStrings("", said.err());
 
-    // And the landing that mode settles on, with no display and no question
-    // put to anybody, because a settled mode needs nobody.
     try std.testing.expectEqual(
         chock_broker.integrate.Wanted{ .land = .merge },
         chosenLanding(gpa, io, silent.mode, null),
     );
 
-    // A project that asked for a merge, in the file that is kept beyond the
-    // agent's reach, and an installation whose organisation has never heard of
-    // the row.
     const zon_path = try std.fs.path.join(arena, &.{ root, "chock.zon" });
     var file = try std.Io.Dir.createFileAbsolute(io, zon_path, .{});
     try file.writeStreamingAll(io, ".{ .apply = .{ .mode = .merge } }\n");
@@ -19485,8 +12844,6 @@ test "the mode comes from chock.zon and the table above it, and nothing configur
     try std.testing.expectEqual(chock_policy.table.Decision.allow, asked.decision);
     try std.testing.expectEqualStrings("", said.err());
 
-    // The same project under an organisation that closed the road. One rule,
-    // and the project cannot raise it, because the fold is a minimum.
     said.clear();
     const org_rules = [_]chock_policy.table.Rule{
         .{ .action = chock_policy.apply.integrate_action, .decision = .deny },
@@ -19497,24 +12854,15 @@ test "the mode comes from chock.zon and the table above it, and nothing configur
     const refused = try applyModeFor(arena, io, root, under_org, &.{}, "main", "a-model");
     try std.testing.expectEqual(@as(?chock_policy.apply.Mode, null), refused.mode);
     try std.testing.expectEqual(chock_policy.table.Decision.deny, refused.decision);
-    // **And the apply that follows parks, and says the policy is why.** `deny`
-    // is the one decision that bounds the landing, and it still does.
     try std.testing.expectEqual(
         chock_broker.integrate.Wanted{ .none = .policy_refused },
         chosenLanding(gpa, io, refused.mode, null),
     );
-    // **And what the file asked for is kept beside what it got.** That is the
-    // half the line a person reads names, and `mode` alone cannot show it.
     try std.testing.expectEqual(chock_policy.apply.Mode.merge, refused.asked_for);
-    // **And the person hears about it before the session runs**, rather than at
-    // the end of it when nothing was integrated. The line names the landing and
-    // the row, and never the file, because a project with no `chock.zon` at all
-    // reaches this same line through the default.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "workspace.integrate") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "merge") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "chock.zon") == null);
 
-    // And a subagent moves no branch its parent could not.
     said.clear();
     const child_only = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
@@ -19532,10 +12880,6 @@ test "the mode comes from chock.zon and the table above it, and nothing configur
 }
 
 test "only a landing word moves a branch, whichever way the answer arrived" {
-    // The display and the console read one answer the same way, so a person who
-    // chose in the region and a person who typed at a prompt reach the same
-    // landing. Mutation check: make any arm below answer a landing and the half
-    // under it fails.
     const gpa = std.testing.allocator;
 
     for ([_][]const u8{ "merge", "rebase", "squash" }) |word| {
@@ -19547,14 +12891,10 @@ test "only a landing word moves a branch, whichever way the answer arrived" {
         );
     }
 
-    // The words a region shows are surrounded by what a terminal adds, and
-    // `fromAnswer` trims before it reads.
     const padded = try gpa.dupe(u8, " merge\r\n");
     defer gpa.free(padded);
     try std.testing.expectEqual(chock_policy.apply.Landing.merge, landingFor(.{ .answered = padded }));
 
-    // Anything that is not a landing word, and every answer that is not words
-    // at all, moves nothing.
     const nonsense = try gpa.dupe(u8, "yes please");
     defer gpa.free(nonsense);
     const Landing = chock_policy.apply.Landing;
@@ -19562,9 +12902,6 @@ test "only a landing word moves a branch, whichever way the answer arrived" {
     for ([_]chock_core.ask.Answer{ .declined, .nobody, .timed_out, .stopped }) |none| {
         try std.testing.expectEqual(@as(?Landing, null), landingFor(none));
     }
-    // **`ref` is not a word here any more.** It used to be the answer that
-    // moved nothing, and now nothing is that answer: a person who wants no
-    // branch moved says `n` to the apply itself.
     const old_word = try gpa.dupe(u8, "ref");
     defer gpa.free(old_word);
     try std.testing.expectEqual(@as(?Landing, null), landingFor(.{ .answered = old_word }));
@@ -19574,28 +12911,15 @@ test "only a landing word moves a branch, whichever way the answer arrived" {
 }
 
 test "a session with nobody at the keyboard never lands the work on a branch by itself" {
-    // `ask` puts the choice to a person, and a subagent, a daemon session and a
-    // `chock run` behind a pipe all have nobody to put it to. **The narrow
-    // answer is not negotiable**, and it survives the default becoming `merge`
-    // because a settled mode and an unanswered question are two different
-    // routes through this function.
-    //
-    // Mutation check: answer a landing when there is no terminal and a session
-    // nobody is watching starts moving branches on its own.
     const io = std.testing.io;
-    // The test binary's own standard input is the build runner's, and it is not
-    // a terminal, so this is the real reader answering for the real case.
     const nobody = chosenLanding(std.testing.allocator, io, .ask, null);
     try std.testing.expectEqual(@as(?chock_policy.apply.Landing, null), nobody.landing());
     try std.testing.expectEqual(chock_broker.integrate.Reason.nobody_answered, nobody.none);
 
-    // And a session the policy refused one moves no branch either, without
-    // asking anybody anything.
     const refused = chosenLanding(std.testing.allocator, io, null, null);
     try std.testing.expectEqual(@as(?chock_policy.apply.Landing, null), refused.landing());
     try std.testing.expectEqual(chock_broker.integrate.Reason.policy_refused, refused.none);
 
-    // A settled mode needs nobody and is answered without a question.
     for ([_]chock_policy.apply.Mode{ .merge, .rebase, .squash }) |mode| {
         try std.testing.expectEqualStrings(
             mode.wireName(),
@@ -19605,14 +12929,6 @@ test "a session with nobody at the keyboard never lands the work on a branch by 
 }
 
 test "the log says which sandbox one attempt ran under, and it says it either way" {
-    // **A session that gave up hardening must be distinguishable afterwards
-    // from one that did not.** This project has no silent degradation, so the
-    // event is written on every run and not only on the interesting one: a fold
-    // can rely on a fact that is always recorded.
-    //
-    // Mutation check: write the event only for `.relaxed` and the first half
-    // below fails, which is what stops a reader having to guess whether an
-    // absent line means strict or means an older Chock.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -19639,27 +12955,14 @@ test "the log says which sandbox one attempt ran under, and it says it either wa
     try recordSandbox(gpa, io, store, attempt, .{ .decision = .allow, .rule = .relaxed });
 
     const text = try std.Io.Dir.cwd().readFileAlloc(io, log_path, arena, .limited(1 << 20));
-    // The wire name is on the line, so a reader that has never heard of this
-    // kind still keeps it: see `event.Event.jsonParse`.
     try std.testing.expect(std.mem.indexOf(u8, text, "sandbox.open") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"write_execute\":\"strict\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"write_execute\":\"relaxed\"") != null);
-    // **The reason and not only the outcome.** A reader can otherwise not tell
-    // a project that asked for this from one whose organisation permitted it.
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, attempt) != null);
 }
 
 test "a project with no devices block builds no seam, no host, and names no tree" {
-    // **Task 6a's first property, proved and not asserted.** A session that
-    // never declared a device must cost exactly what it cost before this
-    // milestone existed: no tree bound, no watcher started, no helper
-    // forked, no extra descriptor polled. `devicesFor` is where every one of
-    // those starts, and this pins that a null `declared` produces a wholly
-    // empty `DeviceWiring` before any of it can happen.
-    //
-    // Mutation check: make `devicesFor` build the seam unconditionally
-    // before checking `declared`, and `wiring.seam` here reads non-null.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19673,9 +12976,6 @@ test "a project with no devices block builds no seam, no host, and names no tree
     try std.testing.expectEqual(@as(?*chock_core.devices.HostSource, null), wiring.host);
     try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
 
-    // The other half: a `recordDevices` given that same null seam takes no
-    // lock and writes no line at all, so a session with nothing declared
-    // never even opens the log for this.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -19692,18 +12992,11 @@ test "a project with no devices block builds no seam, no host, and names no tree
 }
 
 test "a named device whose rule says allow reaches the sandbox config" {
-    // Task 6a's second property: a device this project both declared in its
-    // `devices` block and permitted in its `policy` block is what
-    // `Sandbox.Config` actually carries, ready for `Sandbox.spawn` to bind.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The wildcard rule is what makes the assertion at the end of this test
-    // real: it would answer `allow` for any `device.*` action, named or not,
-    // so a pass that only checked the named action could not tell "the seam
-    // reads the declared list" from "the seam never reads it at all".
     const allowed = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .action = "device.usb.1d50.6018", .tool = "device", .decision = .allow },
@@ -19722,8 +13015,6 @@ test "a named device whose rule says allow reaches the sandbox config" {
     try std.testing.expectEqual(chock_policy.table.Decision.allow, seam.decisionFor("device.usb.1d50.6018"));
     try std.testing.expect(seam.seam().permitted("device.usb.1d50.6018"));
 
-    // Only a build whose driver can act on it ever names `device_tree` and
-    // `device_source`: see `chock_sandbox.Sandbox.expresses.device_passthrough`.
     if (sandbox.expresses.device_passthrough) {
         try std.testing.expect(wiring.host != null);
         try std.testing.expectEqualStrings("/dev", wiring.device_tree.?.host);
@@ -19733,18 +13024,10 @@ test "a named device whose rule says allow reaches the sandbox config" {
         try std.testing.expectEqual(@as(?sandbox.Config.DeviceTree, null), wiring.device_tree);
     }
 
-    // A real device is never named to the seam on its own: an identity this
-    // project never declared is refused even though the wildcard rule above
-    // would answer allow for it, because it was never asked.
     try std.testing.expect(!seam.seam().permitted("device.usb.dead.beef"));
 }
 
 test "a named device with no policy rule answers ask, is refused, and says to write a rule" {
-    // Task 6a's third property. `lib/chock-policy/devices.zig` ships no
-    // default for `device.*`, so a device this project only named in its
-    // `devices` block and never in a `policy` rule is exactly the project
-    // that has not yet said yes, and `ask` refuses here because there is
-    // nobody mid session to ask.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19779,18 +13062,12 @@ test "a named device with no policy rule answers ask, is refused, and says to wr
 
     try recordDevices(gpa, std.testing.io, store, "01JQATTEMPT", wiring.seam);
 
-    // The refusal is said out loud, and it says what a project has to do
-    // about it: write the rule, not merely that one is missing.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "device.tty.serial.DF62585783282137") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "policy.rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "allow") != null);
 }
 
 test "an org bundle that denies a device wins even when the project itself allows it" {
-    // Task 6a's fourth property. The same fold `hardeningDecision` and
-    // `languageServerPermitted` both rely on: the bundle above the project is
-    // one more term of the minimum, so a project's own `allow` cannot raise
-    // what an organisation closed.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19817,11 +13094,6 @@ test "an org bundle that denies a device wins even when the project itself allow
 }
 
 test "the device.exposed event records what was actually enforced, not what was asked for" {
-    // Task 6a's fifth property. `enforced` folds the policy decision with
-    // `chock_sandbox.Sandbox.expresses.device_passthrough`: a granted device
-    // on a build whose driver cannot act on it is not enforced, whatever
-    // `decision` says, and this is the one field that makes the gap
-    // checkable by somebody reading the log who was not there.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -19864,20 +13136,12 @@ test "the device.exposed event records what was actually enforced, not what was 
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"allow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"decision\":\"ask\"") != null);
 
-    // The allowed device is enforced only on a build whose driver can act on
-    // it; the one with no rule is never enforced on any build.
     const enforced_true = std.mem.indexOf(u8, text, "\"enforced\":true") != null;
     try std.testing.expectEqual(sandbox.expresses.device_passthrough, enforced_true);
     try std.testing.expect(std.mem.indexOf(u8, text, "\"enforced\":false") != null);
 }
 
 test "a promise the session made reaches the end of session approval, out of the log" {
-    // The ratchet, along the route `applyWork` takes. An agent that promised
-    // not to apply its work made that promise turns ago, in a `state.Session`
-    // that no longer exists: `Loop.run` has ended by the time this decision is
-    // made. So the promise has to come back out of the file, and this drives
-    // the whole of that: `foldSession`, the conversion in
-    // `chock_core.self_policy`, and `Broker.request`, which is what applies it.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -19885,8 +13149,6 @@ test "a promise the session made reaches the end of session approval, out of the
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A project that allows the apply outright, so the promise is the only
-    // thing that can refuse it.
     const allows_the_apply = try chock_policy.table.Table.parse(arena,
         \\.{ .policy = .{ .rules = .{
         \\    .{ .action = "workspace.apply", .decision = .allow },
@@ -19894,8 +13156,6 @@ test "a promise the session made reaches the end of session approval, out of the
     , null);
     defer chock_policy.table.Table.destroy(arena, allows_the_apply);
 
-    // A session whose agent bound itself part way through, written the way
-    // `Loop.runRestrictSelf` writes it.
     var backing = try chock_proto.storage.Memory.init(gpa, "01PROMISE");
     const storage = backing.storage();
     defer storage.close(io);
@@ -19910,8 +13170,6 @@ test "a promise the session made reaches the end of session approval, out of the
         try writing.unlock(io);
     }
 
-    // What `applyWork` does: fold the log that is left, and carry the promises
-    // into the request.
     var session = chock_proto.state.Session.init(gpa);
     defer session.deinit();
     foldSession(gpa, io, storage, &session);
@@ -19941,14 +13199,10 @@ test "a promise the session made reaches the end of session approval, out of the
         .self_policy = promised,
     };
 
-    // The promise decides, and nobody is asked. A refusal here is the agent's
-    // own word holding after the agent is gone.
     const outcome = try broker.request(gpa, io, storage, &locked, ask, null);
     try std.testing.expectEqual(chock_broker.Broker.Outcome.denied_by_policy, outcome);
     try std.testing.expect(!outcome.permits());
 
-    // The same request from a session that promised nothing is allowed, so the
-    // line above is about the promise and not about the table or the request.
     var without = ask;
     without.self_policy = &.{};
     try std.testing.expectEqual(
@@ -19957,11 +13211,6 @@ test "a promise the session made reaches the end of session approval, out of the
     );
 }
 
-/// A `chock_broker.Broker.Waiter` a test drives, over a real log: it answers
-/// the one open request the first time it is asked to wait, `for_session`,
-/// and counts how many times it was asked to wait at all. What
-/// `lib/chock-broker/network.zig`'s own `AnswerOnWait` is for that file, this
-/// is for this one.
 const GateWaiter = struct {
     gpa: std.mem.Allocator,
     store: chock_proto.storage.Storage,
@@ -19988,9 +13237,6 @@ const GateWaiter = struct {
         if (!self.answered) {
             self.answered = true;
             if (chock_broker.Broker.openRequest(self.gpa, io, self.store) catch null) |id| {
-                // The action is read back and echoed, not guessed: see
-                // `network.zig`'s own `requestActionFor` for why
-                // `SessionGrants.apply` needs it to be there at all.
                 if (gateRequestAction(self.gpa, io, self.store, id) catch null) |owned| {
                     defer self.gpa.free(owned);
                     _ = self.locked.append(self.gpa, io, .{ .approval_response = .{
@@ -20035,12 +13281,6 @@ fn gateCountApprovalRequests(gpa: std.mem.Allocator, io: std.Io, storage: chock_
     return count;
 }
 
-/// Every `approval.response` with `request_id` zero: the shape a remembered
-/// grant now writes when it serves an act with no fresh question asked. See
-/// `Broker.request`'s own `ask` branch. The caller frees the result with
-/// `gpa`, and owns nothing inside each entry: every slice still points into
-/// the parsed line, which is only valid for as long as the log holds these
-/// exact bytes, true of every test log in this file.
 fn gateGrantServedResponses(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -20075,17 +13315,6 @@ fn freeGrantServedResponses(gpa: std.mem.Allocator, responses: []chock_proto.eve
 }
 
 test "the loop's own tool gate remembers a for-session grant across separate questions" {
-    // `SessionArbiter.decideFn` folds a brand new `state.Session` from the
-    // log and builds a brand new `chock_broker.Broker` around it for every
-    // single question, because the session that asked the first question may
-    // be long gone by the time a later one arrives. Without `.grants =
-    // &session.grants` wired into that `Broker`, a person who answers "yes,
-    // for the rest of the session" to one tool call is asked again on the
-    // very next one, because nothing carries that answer from one `decideFn`
-    // call to the next except the log itself. This pins the fix at the level
-    // `decideFn` actually works at: fold, build, ask, fold again, ask again,
-    // with no `Started` or `SessionArbiter` needed to prove it, the same way
-    // the test above needs none to prove a promise reaches `applyWork`.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20113,9 +13342,6 @@ test "the loop's own tool gate remembers a for-session grant across separate que
 
     try std.testing.expectEqual(@as(usize, 0), try gateCountApprovalRequests(gpa, io, storage));
 
-    // The first tool call: `decideFn`'s own first question. Nobody has
-    // answered this action before, so the table's `ask` reaches a person,
-    // who says yes for the rest of the session.
     {
         var session = chock_proto.state.Session.init(gpa);
         defer session.deinit();
@@ -20136,18 +13362,12 @@ test "the loop's own tool gate remembers a for-session grant across separate que
         try std.testing.expectEqual(@as(usize, 1), waiter.waits);
     }
     try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
-    // The first answer came from a real question, so it carries its own
-    // request. Nothing has been served from memory yet.
     {
         const served = try gateGrantServedResponses(gpa, io, storage);
         defer freeGrantServedResponses(gpa, served);
         try std.testing.expectEqual(@as(usize, 0), served.len);
     }
 
-    // The second, identical tool call: `decideFn` runs again from nothing,
-    // exactly as it would for a later turn of the same session. It folds a
-    // fresh `Session` from the log, which already holds the answer above, and
-    // builds a fresh `Broker` around it. No second question reaches anybody.
     {
         var session = chock_proto.state.Session.init(gpa);
         defer session.deinit();
@@ -20165,17 +13385,9 @@ test "the loop's own tool gate remembers a for-session grant across separate que
 
         const outcome = try broker.request(session.arena.allocator(), io, storage, &locked, ask, null);
         try std.testing.expectEqual(chock_broker.Broker.Outcome.approved_by_user, outcome);
-        // No second question: the waiter was never asked to wait at all,
-        // because `Broker.request`'s own `ask` branch answered from memory
-        // before it ever called `askTheHuman`.
         try std.testing.expectEqual(@as(usize, 0), waiter.waits);
     }
     try std.testing.expectEqual(@as(usize, 1), try gateCountApprovalRequests(gpa, io, storage));
-    // **This is the fix.** No second question means no second
-    // `approval.request`, and it used to mean no record at all: the act a
-    // grant just served left nothing behind. It now leaves one compact
-    // `approval.response`, `request_id` zero, naming the exact action and
-    // tool call this milestone's own oracle attributes it by.
     {
         const served = try gateGrantServedResponses(gpa, io, storage);
         defer freeGrantServedResponses(gpa, served);
@@ -20191,12 +13403,6 @@ test "the loop's own tool gate remembers a for-session grant across separate que
 }
 
 test "foldSessionSince, resumed across many calls, reaches the same state a single fold would" {
-    // The whole reason `SessionArbiter.decideFn` can keep its `state.Session`
-    // live instead of rebuilding it from event 0 on every question: applying
-    // events 1 through k and then k+1 through n must leave `session` exactly
-    // where applying 1 through n in one call would. This pins that at the
-    // level `foldSessionSince` actually works at, with no `SessionArbiter`
-    // needed to prove it.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20204,9 +13410,6 @@ test "foldSessionSince, resumed across many calls, reaches the same state a sing
     const storage = backing.storage();
     defer storage.close(io);
 
-    // The same 30 events, folded ten at a time across three separate calls,
-    // the shape three separate gated tool calls actually take: append some,
-    // ask a question, append some more, ask again.
     var resumed = chock_proto.state.Session.init(gpa);
     defer resumed.deinit();
     var at: u64 = 0;
@@ -20221,7 +13424,6 @@ test "foldSessionSince, resumed across many calls, reaches the same state a sing
         foldSessionSince(gpa, io, storage, &resumed, &at);
     }
 
-    // One fold, start to finish, over the same finished log.
     var whole = chock_proto.state.Session.init(gpa);
     defer whole.deinit();
     foldSession(gpa, io, storage, &whole);
@@ -20232,19 +13434,6 @@ test "foldSessionSince, resumed across many calls, reaches the same state a sing
 }
 
 test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork keep one, agrees with a full Session fold on everything either caller reads" {
-    // **The property a bound must not break.** `SessionArbiter.decideFn` and
-    // `ToolNetwork.refreshToolPromises` used to keep a `chock_proto.state.Session`
-    // alive across every question, and now keep a `chock_proto.state.PolicyFold`
-    // instead, so that `Session.context` stops accumulating for a run's whole
-    // life: see `PolicyFold`'s own top comment. This proves the swap changes
-    // nothing about what those two callers actually read: a `PolicyFold`,
-    // caught up in three separate bursts the same piecemeal way `decideFn`
-    // catches one up between questions, agrees with a single, full `Session`
-    // fold of the identical log on grants, self promises, children, and
-    // spend, the four things either caller ever asks for. The log also
-    // carries three `message` events, which only `Session.context` reads, to
-    // show that `PolicyFold` disagreeing about `context` is not a gap this
-    // test missed: `PolicyFold` has no such field to disagree with.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20258,10 +13447,6 @@ test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork kee
     defer resumed.deinit();
     var at: u64 = 0;
 
-    // Three bursts, each followed by a fold, the same "append some, ask a
-    // question, append some more, ask again" shape a real session takes.
-    // Round 0 grants a connection, round 1 spawns a child and spends, round 2
-    // narrows the grant round 0 made.
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         var locked = try storage.lock(io);
@@ -20303,8 +13488,6 @@ test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork kee
             } }, 0);
         }
         if (round == 2) {
-            // Narrows the grant round 0 made: `SessionGrants.invalidate` must
-            // clear it in both folds alike.
             _ = try locked.append(gpa, io, .{ .policy_self = .{
                 .restrictions = &.{.{ .action = grant_action, .ceiling = .deny, .reason = "narrowed mid session" }},
                 .authorised = false,
@@ -20315,13 +13498,10 @@ test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork kee
         foldSessionSince(gpa, io, storage, &resumed, &at);
     }
 
-    // One fold, start to finish, over the same finished log: the ground
-    // truth `foldSession` already gives every other caller.
     var whole = chock_proto.state.Session.init(gpa);
     defer whole.deinit();
     foldSession(gpa, io, storage, &whole);
 
-    // The four things either caller reads.
     try std.testing.expectEqual(
         whole.self_policy.restrictions.items.len,
         resumed.self_policy.restrictions.items.len,
@@ -20334,25 +13514,13 @@ test "a PolicyFold, resumed the piecemeal way SessionArbiter and ToolNetwork kee
     try std.testing.expectEqualStrings(whole.children.items[0].session, resumed.children.items[0].session);
     try std.testing.expectEqual(whole.spend.turns, resumed.spend.turns);
     try std.testing.expectEqual(whole.spend.input_tokens, resumed.spend.input_tokens);
-    // The narrowing landed after the grant, so both folds have to have
-    // dropped it: `get` reads null on both, the same invalidated answer.
     try std.testing.expect(whole.grants.get(grant_action, true) == null);
     try std.testing.expect(resumed.grants.get(grant_action, true) == null);
 
-    // The one thing `PolicyFold` structurally cannot agree with `whole`
-    // about, because it carries no field to hold an answer in: the log wrote
-    // three `message` events, and `whole.context` has all three.
     try std.testing.expectEqual(@as(usize, 3), whole.context.items.len);
 }
 
 test "a mid session restrict_self invalidates a remembered grant on the very next question, and a cache that never refolds does not see it" {
-    // **The ratchet is load bearing.** `SessionGrants.invalidate` only runs
-    // when the log carrying a `policy.self` event is folded again, so a
-    // grant memory kept live but never refolded is exactly the bug
-    // `ToolNetwork` had once, before it started refolding before every call:
-    // see `SessionArbiter`'s own doc comment on `decideFn`. This proves the
-    // fix the other way around: it folds a narrowing in, and it shows what
-    // not folding it in would have looked like.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20362,8 +13530,6 @@ test "a mid session restrict_self invalidates a remembered grant on the very nex
 
     const action = "git.push";
 
-    // A person answers "yes, for the rest of the session" to the first
-    // question, the same record `Broker.request`'s own `.ask` branch writes.
     var locked = try storage.lock(io);
     const request_id = try locked.append(gpa, io, .{ .approval_request = .{
         .action = action,
@@ -20384,11 +13550,6 @@ test "a mid session restrict_self invalidates a remembered grant on the very nex
     } }, 0);
     try locked.unlock(io);
 
-    // Two sessions, each asked its first question right after the grant,
-    // from the same starting point: `stale` never folds again, the way
-    // `ToolNetwork` used to keep `session` live with no second fold at all.
-    // `live` is `decideFn`'s own shape, caught up again before its next
-    // answer.
     var stale = chock_proto.state.Session.init(gpa);
     defer stale.deinit();
     var stale_at: u64 = 0;
@@ -20401,9 +13562,6 @@ test "a mid session restrict_self invalidates a remembered grant on the very nex
     foldSessionSince(gpa, io, storage, &live, &live_at);
     try std.testing.expect(live.grants.get(action, true) != null);
 
-    // Mid session, the agent narrows itself: `restrict_self` writes a
-    // `policy.self` event putting this exact action under a ceiling below
-    // `ask`, which `SessionGrants.invalidate` reads as dropping the grant.
     var locked2 = try storage.lock(io);
     _ = try locked2.append(gpa, io, .{ .policy_self = .{
         .restrictions = &.{.{ .action = action, .ceiling = .deny, .reason = "narrowed mid session" }},
@@ -20411,23 +13569,13 @@ test "a mid session restrict_self invalidates a remembered grant on the very nex
     } }, 0);
     try locked2.unlock(io);
 
-    // **The naive cache never asks the log again**, so it still answers
-    // `true`: exactly the stale, unsafe read the measured fault produced.
     try std.testing.expect(stale.grants.get(action, true) != null);
 
-    // **The fix**: the very next question resumes the fold from where the
-    // last one stopped, reads the `policy.self` event that landed since, and
-    // the grant is gone before the broker is ever asked about it again.
     foldSessionSince(gpa, io, storage, &live, &live_at);
     try std.testing.expect(live.grants.get(action, true) == null);
 }
 
 test "a promise a parent made binds its subagents, out of the parent's own log" {
-    // **A promise a parent made has to reach its children, or it is worth
-    // nothing**: an agent that promises not to apply its work and then starts a
-    // subagent to apply it has kept the letter of the promise and none of it. A
-    // child holds no more than its parent, and this is that rule applied to the
-    // half of the policy the parent wrote itself.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20440,8 +13588,6 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const dir = dir_buffer[0..try tmp.dir.realPath(io, &dir_buffer)];
 
-    // Three sessions: a grandparent that promised, a parent that promised
-    // something else, and the child this decision is about.
     const grandparent = "01JQ" ++ "A" ** 22;
     const parent = "01JQ" ++ "B" ** 22;
 
@@ -20488,7 +13634,6 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
         }} } },
     });
 
-    // The child promised one thing of its own, and inherits both of theirs.
     var child = chock_proto.state.Session.init(gpa);
     defer child.deinit();
     try child.apply(.{ .id = 1, .session = "01CHILD", .time_ms = 1, .event = .{ .policy_self = .{
@@ -20502,9 +13647,6 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     const promised = try promisesFor(gpa, arena, io, dir, parent, &child);
     try std.testing.expectEqual(@as(usize, 3), promised.len);
 
-    // The grandparent's promise reaches the child, which is the escalation
-    // this closes: a promise that stopped at one level is a promise one spawn
-    // undoes.
     try std.testing.expectEqual(
         chock_policy.table.Decision.deny,
         chock_policy.ratchet.ceilingFor(promised, "workspace.apply"),
@@ -20517,16 +13659,11 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
         chock_policy.table.Decision.deny,
         chock_policy.ratchet.ceilingFor(promised, "git.push"),
     );
-    // And an act nobody in the chain promised anything about is untouched, so
-    // the three above are about the promises and not about a walk that denies
-    // everything it finds.
     try std.testing.expectEqual(
         chock_policy.table.Decision.allow,
         chock_policy.ratchet.ceilingFor(promised, "nix.build"),
     );
 
-    // A root session reads nothing above it and keeps its own promise, which
-    // is every session a person starts.
     const alone = try promisesFor(gpa, arena, io, dir, "", &child);
     try std.testing.expectEqual(@as(usize, 1), alone.len);
     try std.testing.expectEqual(
@@ -20534,17 +13671,10 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
         chock_policy.ratchet.ceilingFor(alone, "workspace.apply"),
     );
 
-    // **A walk that stopped short says so.** A promise that was not read is a
-    // permission this session may hold and should not, so silence there would
-    // be the worst kind. Captured rather than let through: see `tty.Capture`,
-    // and `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
 
-    // A parent whose log is not there stops the walk rather than ending the
-    // session, and the promises read up to that point still hold. The child's
-    // own promise is one of them.
     const gone = "01JQ" ++ "Z" ** 22;
     const missing = try promisesFor(gpa, arena, io, dir, gone, &child);
     try std.testing.expectEqual(@as(usize, 1), missing.len);
@@ -20555,9 +13685,6 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     try std.testing.expect(std.mem.indexOf(u8, said.err(), gone) != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "may not be applied") != null);
 
-    // A parent identifier that is not an identifier at all is refused before
-    // any path is built from it, and it is refused as that rather than as a
-    // session that is simply missing.
     said.clear();
     const bad = try promisesFor(gpa, arena, io, dir, "../../etc", &child);
     try std.testing.expectEqual(@as(usize, 1), bad.len);
@@ -20565,29 +13692,9 @@ test "a promise a parent made binds its subagents, out of the parent's own log" 
     try std.testing.expectEqualStrings("", said.out());
 }
 
-/// The agent `test/core/tree.zig` builds a real tree out of. Read here as a
-/// build time constant for the same reason it is read there: Zig 0.16's test
-/// runner panics on an argv it does not recognize, so the path cannot come in
-/// as an argument.
-///
-/// **This module exists in the test build and not in the binary.** Nothing but
-/// the test below names it, and a container level declaration is analysed only
-/// where it is used, so `chock` itself still compiles with no such module. See
-/// `build.zig`, which says why the two modules are apart.
 const tree_child_path = @import("tree_child_path").tree_child_path;
 
 test "a promise a grandparent made binds a grandchild of a tree that really ran" {
-    // The test above builds three logs by hand. **This one builds them by
-    // running three processes**, which is the difference that matters: the
-    // identifiers are the ones an agent really chose, the links are the ones a
-    // real `session.start` really wrote, and the logs sit where a real session
-    // directory puts them. A walk that worked against a fixture and not against
-    // a tree would pass there and fail here.
-    //
-    // What is still not a real grandchild's own doing is the walk itself: it
-    // runs in this process, because `promisesFor` is program code and the agents
-    // of the tree are a test helper. Everything it reads was written by the
-    // tree.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20605,8 +13712,6 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
     const project = try std.fmt.allocPrint(arena, "{s}/project", .{root_dir});
     const dir = try std.fmt.allocPrint(arena, "{s}/sessions", .{root_dir});
 
-    // Three agents, each promising something of its own, each one starting the
-    // next. The root is at the top of the tree, so nobody is above it.
     const root_session = "01JQ" ++ "A" ** 22;
     try runTreeAgent(arena, io, project, dir, root_session,
         \\promise workspace.apply deny the user asked for a read only review
@@ -20617,8 +13722,6 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
         \\> > say I read the parser
     );
 
-    // Down the tree the way a person reading the logs would: each level's own
-    // `session.spawn` names the level below it.
     var top = chock_proto.state.Session.init(gpa);
     defer top.deinit();
     try std.testing.expect(foldSessionById(gpa, io, dir, root_session, &top));
@@ -20634,15 +13737,10 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
     defer bottom.deinit();
     const bottom_id = try arena.dupe(u8, middle.children.items[0].session);
     try std.testing.expect(foldSessionById(gpa, io, dir, bottom_id, &bottom));
-    // The identifiers a real agent chose are ones this walk will build a path
-    // from. An agent that chose a name of another shape would stop the walk at
-    // its own level, and nothing else here would say so.
     try std.testing.expect(session_paths.isValidId(middle_id));
     try std.testing.expect(session_paths.isValidId(bottom_id));
     try std.testing.expectEqualStrings(middle_id, bottom.parent_session);
 
-    // **The whole point.** The grandchild's own decision is bound by all three
-    // promises, and the one at the top of the tree is two links away.
     const promised = try promisesFor(gpa, arena, io, dir, bottom.parent_session, &bottom);
     try std.testing.expectEqual(@as(usize, 3), promised.len);
     try std.testing.expectEqual(
@@ -20657,18 +13755,11 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
         chock_policy.table.Decision.deny,
         chock_policy.ratchet.ceilingFor(promised, "git.push"),
     );
-    // An act nobody in the tree promised anything about is untouched, so the
-    // three above are about the promises and not about a walk that denies
-    // whatever it finds.
     try std.testing.expectEqual(
         chock_policy.table.Decision.allow,
         chock_policy.ratchet.ceilingFor(promised, "nix.build"),
     );
 
-    // **And the promise really did have to travel.** The middle agent's own
-    // session holds two of the three and not the grandparent's, and the
-    // grandchild's own log holds one. So the answer above came off the logs
-    // above it and not out of its own.
     const at_the_middle = try promisesFor(gpa, arena, io, dir, middle.parent_session, &middle);
     try std.testing.expectEqual(@as(usize, 2), at_the_middle.len);
     try std.testing.expectEqual(
@@ -20683,9 +13774,6 @@ test "a promise a grandparent made binds a grandchild of a tree that really ran"
     );
 }
 
-/// Start one agent of a real tree and wait for the whole tree below it. The
-/// argument vector is the real one `commandLine` builds, and the agent below it
-/// builds its own with the same function.
 fn runTreeAgent(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -20724,19 +13812,11 @@ fn runTreeAgent(
 }
 
 test "a review that this session cannot pay for or start is refused, never skipped" {
-    // A review is a whole subagent, so it is measured against the same two
-    // limits every other agent is, and **a review that cannot run must not
-    // become an allow**: `reviewFn` turns each of the answers below into
-    // `error.ReviewNotRun`, and the broker turns that into
-    // `review_unavailable`, which does not permit.
     const cap = chock_cost.budget.Budget{ .max_cost = 5.0, .currency = "USD" };
     const limits = chock_policy.subagents.Limits{ .max_depth = 3, .max_width = 2 };
     const fresh = chock_proto.state.Spend{ .amount = 1.0, .currency = "USD", .turns = 3 };
     const first = chock_policy.subagents.Standing{ .depth = 1, .width = 0 };
 
-    // The ordinary case: a reviewer may be started, and it gets what is left
-    // of the cap. Without this line every check below would pass against a
-    // function that refused everything.
     {
         const bounds = reviewBounds(limits, first, cap, fresh, &.{});
         try std.testing.expectEqual(@as(?chock_policy.subagents.Refusal, null), bounds.refused_by_limits);
@@ -20745,8 +13825,6 @@ test "a review that this session cannot pay for or start is refused, never skipp
         try std.testing.expectEqualStrings("USD", bounds.budget.?.currency);
     }
 
-    // A session that has spent its whole cap. The two nulls are different
-    // facts, and this is the one that must refuse.
     {
         const gone = chock_proto.state.Spend{ .amount = 5.5, .currency = "USD", .turns = 9 };
         const bounds = reviewBounds(limits, first, cap, gone, &.{});
@@ -20754,8 +13832,6 @@ test "a review that this session cannot pay for or start is refused, never skipp
         try std.testing.expect(bounds.nothing_left);
     }
 
-    // A session that spent little and promised all of it to children. Measured
-    // against spending alone, this one would hand the same money out twice.
     {
         const promised = [_]chock_proto.state.Child{
             .{ .session = "01A", .agent_kind = "worker", .reason = "one", .budget_max_cost = 4.0, .budget_currency = "USD" },
@@ -20765,28 +13841,18 @@ test "a review that this session cannot pay for or start is refused, never skipp
         try std.testing.expect(bounds.nothing_left);
     }
 
-    // Depth: a session already at the bottom of the tree starts no reviewer.
-    // Without this a tree would grow one level per approval, because every
-    // reviewer's own end of session apply would ask for one too.
     {
         const deep = chock_policy.subagents.Standing{ .depth = 3, .width = 0 };
         const bounds = reviewBounds(limits, deep, cap, fresh, &.{});
         try std.testing.expectEqual(chock_policy.subagents.Refusal.depth, bounds.refused_by_limits.?);
     }
 
-    // Width, and the setting that turns subagents off entirely. A project that
-    // wrote `max_width = 0` gets no reviewer, which is the right reading of a
-    // project that said it wants no subagents.
     {
         const none_allowed = chock_policy.subagents.Limits{ .max_depth = 6, .max_width = 0 };
         const bounds = reviewBounds(none_allowed, first, cap, fresh, &.{});
         try std.testing.expectEqual(chock_policy.subagents.Refusal.width, bounds.refused_by_limits.?);
     }
 
-    // A session with no cap at all gives the reviewer no cap, and that is not
-    // the same as having nothing left: the reviewer runs. The honest reading
-    // of a project that set no budget, and the same answer the session itself
-    // already runs under.
     {
         const bounds = reviewBounds(limits, first, null, fresh, &.{});
         try std.testing.expectEqual(@as(?chock_cost.budget.Budget, null), bounds.budget);
@@ -20796,14 +13862,6 @@ test "a review that this session cannot pay for or start is refused, never skipp
 }
 
 test "the reviewer this run wires in is the kind the policy table names, and it gets no scratchpad" {
-    // Two facts about the wiring, both of which a comment alone would let
-    // decay. The kind is what selects the reviewer's own row of `chock.zon`,
-    // so a name spelled twice is a rule that quietly stops matching. And the
-    // scratchpad is the leak: `chock_core.scratchpad` lets a parent read a
-    // child's, and the parent of a reviewer is the agent being reviewed.
-    // The real child, built the way both callers build it. Nothing here is
-    // dereferenced: `reviewChild` stores what it is given and this test never
-    // starts anything.
     var child = reviewChild(std.testing.allocator, .empty, undefined, undefined, .{});
     var spawner = ReviewSpawner{
         .child = child.spawner(),
@@ -20818,9 +13876,6 @@ test "the reviewer this run wires in is the kind the policy table names, and it 
     try std.testing.expect(child.no_scratchpad);
 }
 
-/// A child that answers without starting anything, so a test can run the whole
-/// of `ReviewSpawner.reviewFn`. The real one is `SubagentSpawner`, which needs
-/// a session directory, a credential and a process.
 const FakeReviewChild = struct {
     prepared: usize = 0,
     ran: usize = 0,
@@ -20866,7 +13921,6 @@ const FakeReviewChild = struct {
     }
 };
 
-/// The case every reviewer test below is put.
 const a_case = chock_broker.review.Case{
     .action = "workspace.apply",
     .summary = "move 3 objects and one ref",
@@ -20877,11 +13931,6 @@ const a_case = chock_broker.review.Case{
 };
 
 test "a reviewer is a child in its parent's log, so the width bound can see it" {
-    // The fault this closes: a reviewer was a real process that nothing
-    // counted, so a session could pass its own width bound with nothing
-    // noticing. The link existed from the child's side, because the reviewer's
-    // own `session.start` names its parent, but the parent's own log said
-    // nothing, and the width is folded from the parent's log.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20902,8 +13951,6 @@ test "a reviewer is a child in its parent's log, so the width bound can see it" 
 
     const report = try spawner.reviewer().review(gpa, io, a_case);
     defer chock_broker.review.freeReport(gpa, report);
-    // The review really happened, so what follows is about a reviewer that
-    // ran and not about one that was refused before it started.
     try std.testing.expectEqual(@as(usize, 1), child.ran);
     try std.testing.expectEqual(chock_broker.review.Verdict.approved, report.verdict);
 
@@ -20920,10 +13967,6 @@ test "a reviewer is a child in its parent's log, so the width bound can see it" 
         if (parsed.value.event == .session_spawn) spawn_events += 1;
     }
 
-    // One event, and it is the one the fold counts. The kind is the reviewer's
-    // own, so a person reading the log in the morning sees which child this
-    // was, and the slice it was given is there too, so a parent that resumes
-    // does not hand the same money out twice.
     try std.testing.expectEqual(@as(usize, 1), spawn_events);
     try std.testing.expectEqual(@as(usize, 1), session.children.items.len);
     try std.testing.expectEqualStrings(
@@ -20933,9 +13976,6 @@ test "a reviewer is a child in its parent's log, so the width bound can see it" 
     try std.testing.expectEqualStrings("01REVIEWCHILD", session.children.items[0].session);
     try std.testing.expectEqual(@as(f64, 4.0), session.children.items[0].budget_max_cost);
 
-    // **And the count is what the limit reads.** A project that allows one
-    // child has none left after this reviewer, which is the whole point: the
-    // fold `reviewBounds` measures is the fold the event above changed.
     const one_child = chock_policy.subagents.Limits{ .max_depth = 6, .max_width = 1 };
     const standing = chock_policy.subagents.Standing{
         .depth = 1,
@@ -20944,19 +13984,11 @@ test "a reviewer is a child in its parent's log, so the width bound can see it" 
     const after = reviewBounds(one_child, standing, null, session.spend, session.children.items);
     try std.testing.expectEqual(chock_policy.subagents.Refusal.width, after.refused_by_limits.?);
 
-    // Against the standing this session had before the reviewer, the same
-    // limit allows one. Without this line the check above would pass against a
-    // bound that refused everything.
     const before = reviewBounds(one_child, .{ .depth = 1, .width = 0 }, null, session.spend, &.{});
     try std.testing.expectEqual(@as(?chock_policy.subagents.Refusal, null), before.refused_by_limits);
 }
 
 test "a reviewer nothing can record does not run, and that is a refusal" {
-    // The safe direction, and the reason the append is not best effort. A child
-    // the width bound cannot see is the fault this whole arrangement closes, so
-    // a spawn that cannot be written starts nothing at all. Every other way a
-    // review fails to happen is already `error.ReviewNotRun`, and the broker
-    // turns each one into `review_unavailable`, which does not permit.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -20966,12 +13998,9 @@ test "a reviewer nothing can record does not run, and that is a refusal" {
         .budget = null,
         .nothing_left = false,
         .refused_by_limits = null,
-        // No handle, which is a caller that cannot record a child.
         .locked = null,
     };
 
-    // What it said, captured rather than let through: see `tty.Capture`, and
-    // `test/proto/lock.zig`.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
@@ -20980,31 +14009,19 @@ test "a reviewer nothing can record does not run, and that is a refusal" {
         error.ReviewNotRun,
         spawner.reviewer().review(gpa, io, a_case),
     );
-    // The session was prepared and the child was never run, so nothing was
-    // started that nothing counted.
     try std.testing.expectEqual(@as(usize, 1), child.prepared);
     try std.testing.expectEqual(@as(usize, 0), child.ran);
-    // **And it says a reviewer did not run, and why.** A review that silently
-    // did not happen reads to the person afterwards exactly like a review that
-    // said no, and the two are different outcomes.
     try std.testing.expect(std.mem.indexOf(u8, said.err(), "no reviewer was started") != null);
     try std.testing.expect(std.mem.indexOf(u8, said.err(), a_case.action) != null);
     try std.testing.expectEqualStrings("", said.out());
 }
 
 test "a reviewer child reads its own command line and holds no tools because of what it reads" {
-    // **The wiring, end to end across the process boundary**, and it is the
-    // half a test of `agentRole` alone would miss. `ReviewSpawner` starts a
-    // `chock run` of its own, so the parent's decision reaches the child as one
-    // word on a command line, and the child asks the question again. A rule
-    // that held in the parent and was never read in the child would be a rule
-    // nothing enforced: the child is what builds the tool list.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Exactly the request `ReviewSpawner.reviewFn` builds.
     const argv = try chock_core.subagent.commandLine(arena, .{
         .exe_path = "/nix/store/aaa-chock/bin/chock",
         .project_root = "/home/someone/project",
@@ -21018,18 +14035,13 @@ test "a reviewer child reads its own command line and holds no tools because of 
     }, .{
         .child_session = try arena.dupe(u8, "01REVIEWER"),
         .log_path = try arena.dupe(u8, "/tmp/chock/01REVIEWER/log.jsonl"),
-        // No scratchpad, which is what the reviewer really gets.
         .scratchpad_path = try arena.dupe(u8, ""),
     });
 
-    // `argv[0]` is the program and `argv[1]` is the verb, which the child's
-    // own `main` takes off before the options are parsed.
     const options = try parseOptions(arena, argv[2..]);
     try std.testing.expectEqualStrings(chock_broker.review.default_kind, options.agent_kind);
     try std.testing.expectEqual(chock_core.tools.Role.arbitrator, agentRole(options));
 
-    // And the tool list that role builds is empty, which is the thing the
-    // child then puts in its request and in its prompt.
     const support = chock_core.tools.Support{
         .adapter = .openai_compatible,
         .memory = true,
@@ -21041,8 +14053,6 @@ test "a reviewer child reads its own command line and holds no tools because of 
     const prompt = try chock_core.prompt.build(arena, .{}, definitions, .{});
     try std.testing.expect(std.mem.indexOf(u8, prompt, "you have no tools") != null);
 
-    // An ordinary child of the same shape is not an arbitrator, so every line
-    // above is a fact about the reviewer's kind and not about every subagent.
     const worker_argv = try chock_core.subagent.commandLine(arena, .{
         .exe_path = "/nix/store/aaa-chock/bin/chock",
         .project_root = "/home/someone/project",
@@ -21068,82 +14078,39 @@ test "a reviewer child reads its own command line and holds no tools because of 
 }
 
 test "the end of session approval waits for a person, and agent_then_human can therefore run" {
-    // The wall, and the one place `chock run` now goes through it. `applyWork`
-    // asked with a timeout of zero, because nothing could append an
-    // `approval.response` while this process held the session lock, and two
-    // things followed from that number:
-    //
-    // 1. Every `ask` expired unanswered.
-    // 2. `Broker.reviewed` reads the same number, and refuses an
-    //    `agent_then_human` **before paying for a review**, because it knows
-    //    the person half cannot happen. So a project that wrote that decision
-    //    got a refusal with no review at all.
-    //
-    // `src/approval.zig` answers inside the wait, so a session at a terminal
-    // now asks for real, and both of those stop being true. What this pins is
-    // the number itself, on both sides, because it is the number the broker
-    // branches on.
     try std.testing.expect(approval.timeoutMs(true) > 0);
     try std.testing.expectEqual(chock_broker.Broker.default_timeout_ms, approval.timeoutMs(true));
 
-    // And the other half stays true, which is what keeps a subagent and a
-    // daemon session honest: a zero here is what makes the broker refuse at
-    // once instead of holding the log lock for a question nobody can answer.
     try std.testing.expectEqual(@as(i64, 0), approval.timeoutMs(false));
 }
 
 test "a session with a display asks in it, and never at the prompt as well" {
-    // **Two readers on one descriptor race for every byte.** A display holds
-    // standard input in raw mode and keeps a copy of every cell, and
-    // `approval.Terminal` reads that same descriptor and writes a prompt across
-    // those cells. A session with a display is a session at a terminal too, so
-    // the two conditions overlap and only one of them may win.
-    //
-    // Mutation check: answer `.terminal` when both are true and a question is
-    // asked twice, once in a region and once over the top of it, with two
-    // readers taking each other's keys.
     try std.testing.expectEqual(.display, asksHere(true, true));
     try std.testing.expectEqual(.display, asksHere(true, false));
     try std.testing.expectEqual(.terminal, asksHere(false, true));
     try std.testing.expectEqual(.nobody, asksHere(false, false));
 
-    // And a display is a person watching, so the question waits for one rather
-    // than expiring at once the way a session nobody can answer does.
     try std.testing.expect(chock_broker.socket.timeoutMs(true, 0) > 0);
     try std.testing.expectEqual(@as(i64, 0), chock_broker.socket.timeoutMs(false, 0));
 }
 
 test "the header names every sandbox layer the driver gives, and says the word off for one it does not" {
-    // **The one part of the header a person is there to see.** What is pinned
-    // is that the answer comes from the driver's own declaration and from this
-    // session's own config, and from nothing about the platform: this drives
-    // `sandboxLayers` with a guarantee set of its own, which is a thing
-    // `builtin` cannot produce.
-    //
-    // Mutation check: answer `.on` for a guarantee the driver does not give and
-    // the second block below claims a sandbox layer that is not there, which is
-    // the "never quiet" rule turned into a lie.
     const every = sandbox.Sandbox.Guarantees.initFull();
     const all_seen = LayerWitness{ .probed = every };
     const on = sandboxLayers(every, all_seen, .none, "worktree");
     try std.testing.expectEqual(@as(usize, 6), on.len);
     for (on) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
-    // The header and the layer states both write these two words.
     try std.testing.expectEqualStrings("net", on[0].name);
     try std.testing.expectEqualStrings("none", on[0].note);
     try std.testing.expectEqualStrings("fs", on[1].name);
     try std.testing.expectEqualStrings("worktree", on[1].note);
 
-    // A driver that gives nothing, which is the Darwin driver today: every
-    // layer says so, and none of them is quietly left on.
     const none = sandboxLayers(sandbox.Sandbox.Guarantees.initEmpty(), all_seen, .none, "worktree");
     for (none) |one| {
         try std.testing.expectEqual(ui.Layer.State.unsupported, one.state);
         try std.testing.expect(one.state.word().len != 0);
     }
 
-    // A driver that gives every layer but one. The one it does not is the only
-    // one that says so, and it is the layer this asked about.
     var short = every;
     short.remove(.path_restricted);
     const missing = sandboxLayers(short, all_seen, .none, "worktree");
@@ -21157,15 +14124,6 @@ test "the header names every sandbox layer the driver gives, and says the word o
 }
 
 test "a layer the driver gives but this run could not get reads unavailable, not on" {
-    // **The third state, at last given something to produce it.** `given`
-    // alone cannot tell an on session from one Landlock refused for reasons
-    // of its own: a build that carries the driver is not the same claim as
-    // this process getting the layer today. A caller that measured that and
-    // found it missing marks it in `unavailable`, and the header must read
-    // that over `.on`, not beside it.
-    //
-    // Mutation check: read `.unavailable` as `.on` and a Landlock this
-    // machine just refused draws the same check mark as one that is holding.
     const every = sandbox.Sandbox.Guarantees.initFull();
     var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
     landlock_only.insert(.path_restricted);
@@ -21180,8 +14138,6 @@ test "a layer the driver gives but this run could not get reads unavailable, not
         }
     }
 
-    // A guarantee the driver never gave is `.unsupported` first: `unavailable`
-    // only narrows a layer that was there to begin with.
     var short = every;
     short.remove(.path_restricted);
     const never_had = sandboxLayers(short, .{ .probed = every, .unavailable = landlock_only }, .none, "worktree");
@@ -21193,23 +14149,13 @@ test "a layer the driver gives but this run could not get reads unavailable, not
 }
 
 test "a layer nothing probed still reads on, because the driver dies rather than run without it" {
-    // **A layer whose failure is fatal needs no pre-flight probe to earn its
-    // tick.** Every step of `applyLayers` in `lib/chock-sandbox/linux/driver.zig`
-    // ends in `die`: the mount tree, the pivot, the capabilities, Landlock, the
-    // session keyring and the filter. `enterNamespaces` dies as well. Darwin's
-    // own driver dies when Seatbelt refuses the profile. So there is no path
-    // where a layer quietly fails to apply and the tool call still runs, and a
-    // tick means "this is enforced, or the call dies".
-    //
-    // Mutation check: answer a state of its own for a layer nothing probed and
-    // the first block below reads that state for all six.
+    // Every step of `applyLayers` in `lib/chock-sandbox/linux/driver.zig` ends in
+    // `die`, so no layer can quietly fail to apply and still let the tool call
+    // run. A tick means the layer is enforced, or the call dies.
     const every = sandbox.Sandbox.Guarantees.initFull();
     const unprobed = sandboxLayers(every, .{}, .none, "worktree");
     for (unprobed) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
 
-    // A probe that came back refused still outranks the tick. That is a
-    // measured answer about this machine, and it is what the two probes are
-    // kept for.
     var landlock_only = sandbox.Sandbox.Guarantees.initEmpty();
     landlock_only.insert(.path_restricted);
     const refused = sandboxLayers(
@@ -21228,13 +14174,6 @@ test "a layer nothing probed still reads on, because the driver dies rather than
 }
 
 test "the header of a normal linux session is six ticks and no other mark" {
-    // **The literal row a person reads.** Nothing here probes anything, which
-    // is what a Darwin session and a Linux session with an unrunnable probe
-    // both look like, and the row is still six ticks because every one of the
-    // six is fatal to fail.
-    //
-    // Mutation check: answer a state of its own for a layer nothing probed and
-    // this row grows a mark that is neither a tick nor a cross.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -21253,16 +14192,9 @@ test "the header of a normal linux session is six ticks and no other mark" {
 }
 
 test "a layer this platform never applies is drawn as missing and never as on" {
-    // **Darwin measures nothing here and it must still read true.** Its driver
-    // declares four guarantees, which are the network, the signals, the IPC and
-    // the paths, and it declares neither a system call filter nor a mounted
-    // workspace. `witnessLayers` names Linux mechanisms, so on Darwin it
-    // returns an empty witness. The four the profile applies read on, because
-    // `darwin/driver.zig` dies when Seatbelt refuses the profile, and the two
-    // it never applies read `NONE`.
-    //
-    // Mutation check: read a guarantee the driver does not give as on and the
-    // two `NONE` rows below claim a layer this platform has never had.
+    // Darwin's driver declares four guarantees, the network, the signals, the IPC
+    // and the paths, and declares neither a system call filter nor a mounted
+    // workspace.
     const darwin = sandbox.Sandbox.Guarantees.initMany(&.{
         .network_isolated,
         .signal_isolated,
@@ -21282,19 +14214,8 @@ test "a layer this platform never applies is drawn as missing and never as on" {
 }
 
 test "this machine really answers for the layers the witness claims to measure" {
-    // **A probe that never ran is the failure this whole change is about**, so
-    // this runs the real ones against the real machine rather than stating
-    // what they would say. Every test above builds the witness by hand, which
-    // is exactly the shape that lets a mechanism ship untested.
-    //
-    // **What is asserted is the shape and not the verdict.** A kernel that
-    // refuses Landlock is a real machine and this must not fail on it. What
-    // may never happen is a guarantee marked unavailable that was never
-    // probed, or a guarantee the driver does not give being answered for at
-    // all.
-    //
-    // Mutation check: insert into `unavailable` without inserting into
-    // `probed` in `LayerWitness.saw` and the subset check below fails.
+    // A kernel that refuses Landlock is a real machine, so this asserts the shape
+    // and not the verdict.
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const given = sandbox.Sandbox.guarantees;
     const seen = witnessLayers(std.testing.allocator, given);
@@ -21307,9 +14228,6 @@ test "this machine really answers for the layers the witness claims to measure" 
     uninvited = uninvited.differenceWith(given);
     try std.testing.expectEqual(@as(usize, 0), uninvited.count());
 
-    // The four layers this process really can ask about are asked about. A
-    // machine that answers none of them has a probe that stopped running,
-    // which is the fault that has no other detector.
     for ([_]sandbox.Sandbox.Guarantee{
         .path_restricted,
         .syscall_restricted,
@@ -21320,21 +14238,10 @@ test "this machine really answers for the layers the witness claims to measure" 
         try std.testing.expect(seen.probed.contains(guarantee));
     }
 
-    // **And the workspace layer is not claimed.** The namespace probe enters a
-    // mount namespace and builds no root, so crediting `workspace_mounted`
-    // from it would be the same overclaim in a new place.
     try std.testing.expect(!seen.probed.contains(.workspace_mounted));
 }
 
 test "a session that gave the network layer up says so, and a filtered one does not" {
-    // A config may give the network namespace up only for an act a user
-    // approved, and `Sandbox.Guarantee.network_isolated` is explicit that
-    // `.filtered` keeps the namespace and `.host` does not. The header has to
-    // tell those two apart, because one of them is the sandbox still holding
-    // and the other is it let go.
-    //
-    // Mutation check: read `.filtered` as `.off` and a session whose MCP server
-    // may reach one named host reads as a session with no network layer at all.
     const every = sandbox.Sandbox.Guarantees.initFull();
 
     const seen = LayerWitness{ .probed = every };
@@ -21346,27 +14253,12 @@ test "a session that gave the network layer up says so, and a filtered one does 
     try std.testing.expectEqual(ui.Layer.State.off, host[0].state);
     try std.testing.expectEqualStrings("host", host[0].note);
     try std.testing.expectEqualStrings("OFF", host[0].state.word());
-    // And only that layer: giving the network up takes nothing else with it.
     for (host[1..]) |one| try std.testing.expectEqual(ui.Layer.State.on, one.state);
 
-    // The workspace kind travels through as the word beside the fs layer, so a
-    // person can see which of the two they are working in.
     try std.testing.expectEqualStrings("overlay", host[1].note);
 }
 
 test "the word beside the net layer is the name of the mode, for every mode there is" {
-    // **The header and the code must say the same word for the same thing.**
-    // The header used to say "off" for the mode the code called `isolated`,
-    // which is two vocabularies for one fact, and the project owner read the
-    // code's word as the opposite of what it meant. Nothing catches a third
-    // word appearing here except this test, because the note is a free string.
-    //
-    // The loop is over `std.enums.values`, so a fourth mode added to
-    // `namespace.Network` and given a note of its own invention fails here
-    // rather than reaching a person's screen.
-    //
-    // Mutation check: answer "off" for `.none` again and this fails, while
-    // every other test of `sandboxLayers` still passes.
     const every = sandbox.Sandbox.Guarantees.initFull();
     for (std.enums.values(sandbox.namespace.Network)) |mode| {
         const built = sandboxLayers(every, .{ .probed = every }, mode, "worktree");
@@ -21375,11 +14267,6 @@ test "the word beside the net layer is the name of the mode, for every mode ther
 }
 
 test "a provisioned closure that overlaps the dev shell's is mounted once and not twice" {
-    // Two closures that start at the same libc share nearly all of
-    // themselves, so this is the ordinary case and not an edge one.
-    // `withStore` builds one bind mount and one Landlock rule per entry, so a
-    // repeat here is the same source bound on the same target, on every tool
-    // call, for the rest of the session.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -21410,8 +14297,6 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
     };
     try mounts.start(&dev_shell);
 
-    // ripgrep's closure: one path of its own, and the libc the dev shell
-    // already carries.
     const closure = [_][]const u8{
         "/nix/store/aaa-glibc",
         "/nix/store/ccc-ripgrep",
@@ -21423,7 +14308,6 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
         .store_paths = &closure,
     });
 
-    // Three paths, not four, and the same libc entry it always was.
     try std.testing.expectEqual(@as(usize, 3), context.store_paths.len);
     var glibc: usize = 0;
     for (context.store_paths) |path| {
@@ -21431,7 +14315,6 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
     }
     try std.testing.expectEqual(@as(usize, 1), glibc);
 
-    // And a second program that needs the same libc again adds only its own.
     const second = [_][]const u8{ "/nix/store/aaa-glibc", "/nix/store/ddd-fd" };
     try provisioning.adopt("fd", .{
         .program = "fd",
@@ -21443,11 +14326,6 @@ test "a provisioned closure that overlaps the dev shell's is mounted once and no
 }
 
 test "two provisioned programs get two sets of garbage collector roots, and the dev shell releases both" {
-    // `nix-store --add-root` names its links after the prefix it is given, so
-    // one prefix for every program would have the second provision replace
-    // the first one's links. The program is still mounted after that, and it
-    // is no longer held: a `nix-collect-garbage` then takes a toolchain the
-    // agent has already been told it has.
     const gpa = std.testing.allocator;
 
     const first = try providedRootPrefix(gpa, "/state/dev-shell/proj", "ripgrep");
@@ -21456,23 +14334,12 @@ test "two provisioned programs get two sets of garbage collector roots, and the 
     defer gpa.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
 
-    // And both are released by the one thing that releases the dev shell:
-    // `DevShell`'s own `removeOldRoots` takes off every link whose name
-    // starts with this word. The word is read from there, so a rename there
-    // moves these too.
     const leaf = std.fs.path.basename(first);
     try std.testing.expect(std.mem.startsWith(u8, leaf, chock_nix.DevShell.root_link_name));
     try std.testing.expectEqualStrings("gcroot-provided-ripgrep", leaf);
 }
 
 test "a session with no MCP server passes every tool call through, byte for byte" {
-    // **The property a project that named no server has to keep.** This runner
-    // sits in front of every tool call a session makes, so a session with no
-    // MCP block must reach the runner below it with the call exactly as it
-    // arrived, and must add nothing to the result.
-    //
-    // Mutation check: answer a result of this runner's own for an unknown name
-    // and every built-in tool of every project stops working.
     const gpa = std.testing.allocator;
 
     var state = McpState.init(gpa);
@@ -21491,22 +14358,13 @@ test "a session with no MCP server passes every tool call through, byte for byte
         defer gpa.free(result.output);
 
         try std.testing.expectEqual(@as(usize, 1), inner.calls);
-        // The result is the one the runner below built, untouched.
         try std.testing.expectEqualStrings("the real git ran", result.output);
         try std.testing.expect(!result.is_error);
-        // And the arguments crossed unchanged.
         try std.testing.expectEqualStrings("{\"argv\":[\"git\",\"status\"]}", inner.last_arguments);
     }
 }
 
 test "a call to an MCP tool is answered here and never reaches the runners below" {
-    // The other half. A name a third party program chose must not reach the
-    // git shim, the provisioner or the sandbox runner: every one of them reads
-    // `call.tool` and acts on it, and none has any reason to see a name Chock
-    // does not own.
-    //
-    // Mutation check: pass the call on to `inner` after `dispatch` answered
-    // and the sandbox runner is handed a tool name it has never heard of.
     const gpa = std.testing.allocator;
 
     var host = ProbeHost{ .text = "the server answered", .is_error = false };
@@ -21537,21 +14395,10 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
     try std.testing.expectEqual(@as(usize, 1), host.calls);
     try std.testing.expectEqualStrings("the server answered", result.output);
-    // The call id is the model's own, so the loop can pair the result with the
-    // call that caused it.
     try std.testing.expectEqualStrings("call7", result.call_id);
 }
 
 test "one locked handle reaches all four askers, and one that missed it runs nothing" {
-    // **The wiring that is easy to build and easy to leave half done.**
-    // `chock_core.Loop.Deps.give_locked` carries one handle and five parties
-    // need it, so the fan out is this file's. One that keeps a null handle
-    // asks nobody and refuses every call it gates, which is the safe direction
-    // and a silent loss of a supplier's tools, or of `git add`, if only some
-    // of them are reached.
-    //
-    // Mutation check: drop any one line of `giveLockedToAskers` and the
-    // matching third below stops running.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -21577,8 +14424,6 @@ test "one locked handle reaches all four askers, and one that missed it runs not
     var loaded = [_]chock_core.plugin.Loaded{.{ .name = "hello", .host = plugin_probe.host() }};
     plugin_state.session.plugins = &loaded;
 
-    // An arbiter each, and no handle yet: the state every session is in
-    // between this file naming an arbiter and `Loop.run` taking the lock.
     var log = try PermittingLog.init(gpa);
     defer log.deinit(io);
     try log.arm(io);
@@ -21619,10 +14464,6 @@ test "one locked handle reaches all four askers, and one that missed it runs not
             chock_core.arbiter.not_asked.outcome,
         ) != null);
     }
-    // **And the git shim is the third of them.** `git add` changes only the
-    // session's own workspace and `lib/chock-policy/defaults.zig` allows it,
-    // but a runner whose handle has not arrived has nowhere to write the
-    // question, so it refuses and says nobody was asked rather than running.
     {
         const early = try plugin_aware.runner().dispatch(gpa, io, .{
             .call_id = "call1",
@@ -21642,10 +14483,6 @@ test "one locked handle reaches all four askers, and one that missed it runs not
     try std.testing.expectEqual(@as(usize, 0), plugin_probe.calls);
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 
-    // The handle arrives once, and all three work.
-    // **And the Nix build runner is the fourth.** It has no tool call to run
-    // here, so what is asked of it is the handle itself: without one, every
-    // build whose closure fetches is refused for want of anybody to ask.
     try std.testing.expect(nix_build.asker.?.locked == null);
 
     giveLockedToAskers(
@@ -21691,12 +14528,6 @@ test "one locked handle reaches all four askers, and one that missed it runs not
 }
 
 test "the policy this wiring builds names the action, folds the chain, and refuses a child its parent lacks" {
-    // The subagent limits, on the one question this wiring answers. **The chain
-    // is what makes it an intersection**, and a wiring that asked about this
-    // session's kind alone would give a subagent a tool its parent cannot hold.
-    //
-    // Mutation check: swap `evaluateChain` for `evaluateKindAlone` in
-    // `TablePolicy.answer` and the second half of this test allows.
     const gpa = std.testing.allocator;
     const source: [:0]const u8 =
         \\.{
@@ -21715,8 +14546,6 @@ test "the policy this wiring builds names the action, folds the chain, and refus
     const action = chock_core.mcp.actionInto(&action_buffer, "time", "get_current_time").?;
     try std.testing.expectEqualStrings("mcp.time.tool.get_current_time", action);
 
-    // The subagent on its own kind alone is permitted, so the refusal below is
-    // the fold and not a missing rule.
     {
         var policy = TablePolicy{
             .policy = table,
@@ -21730,7 +14559,6 @@ test "the policy this wiring builds names the action, folds the chain, and refus
         );
     }
 
-    // Under the parent that cannot hold it, it cannot either.
     {
         var policy = TablePolicy{
             .policy = table,
@@ -21746,12 +14574,6 @@ test "the policy this wiring builds names the action, folds the chain, and refus
 }
 
 test "a server reaches the network only when a rule says so, and never by default" {
-    // **`none` is the default and it is not a flag.** A project that says
-    // nothing about a server's network gets the sandbox a tool call gets, and
-    // the empty table answers `ask`, which is not permission.
-    //
-    // Mutation check: read `decision != .deny` in `startMcp` and the first two
-    // cases below hand a third party program a channel out.
     const gpa = std.testing.allocator;
 
     var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
@@ -21759,7 +14581,6 @@ test "a server reaches the network only when a rule says so, and never by defaul
     try std.testing.expectEqualStrings("mcp.github.network", action);
 
     const cases = [_]struct { source: [:0]const u8, filtered: bool }{
-        // No rule at all, which is what nearly every project has.
         .{ .source = ".{ .policy = .{ .rules = .{} } }", .filtered = false },
         .{
             .source = ".{ .policy = .{ .rules = .{ .{ .action = \"mcp.github.network\", .decision = .ask } } } }",
@@ -21769,15 +14590,10 @@ test "a server reaches the network only when a rule says so, and never by defaul
             .source = ".{ .policy = .{ .rules = .{ .{ .action = \"mcp.github.network\", .decision = .deny } } } }",
             .filtered = false,
         },
-        // The one spelling that lets a server out, and it has to be written on
-        // purpose or the three cases above are vacuous.
         .{
             .source = ".{ .policy = .{ .rules = .{ .{ .action = \"mcp.github.network\", .decision = .allow } } } }",
             .filtered = true,
         },
-        // **A rule about the tools is not a rule about the network.** A
-        // project that allowed every tool of a server must not have given it a
-        // socket by doing so.
         .{
             .source = ".{ .policy = .{ .rules = .{ .{ .action = \"mcp.github.tool.*\", .decision = .allow } } } }",
             .filtered = false,
@@ -21798,9 +14614,6 @@ test "a server reaches the network only when a rule says so, and never by defaul
     }
 }
 
-/// An `mcp.Host` that answers from a field and counts what it was asked. The
-/// tests above measure the wiring, and `lib/chock-core/mcp.zig` is where the
-/// host behaviour itself is tested.
 const ProbeHost = struct {
     text: []const u8,
     is_error: bool,
@@ -21845,13 +14658,6 @@ const ProbeHost = struct {
 };
 
 test "a session with no plugin passes every tool call through, byte for byte" {
-    // **The property a project that named no plugin has to keep**, and it is
-    // every project today. This runner is the outermost of them all, so a
-    // session with no `plugins` block must reach the runner below it with the
-    // call exactly as it arrived, and must add nothing to the result.
-    //
-    // Mutation check: answer a result of this runner's own for an unknown name
-    // and every built-in tool of every project stops working.
     const gpa = std.testing.allocator;
 
     var state = PluginState.init(gpa);
@@ -21870,23 +14676,13 @@ test "a session with no plugin passes every tool call through, byte for byte" {
         defer gpa.free(result.output);
 
         try std.testing.expectEqual(@as(usize, 1), inner.calls);
-        // The result is the one the runner below built, untouched.
         try std.testing.expectEqualStrings("the real git ran", result.output);
         try std.testing.expect(!result.is_error);
-        // And the arguments crossed unchanged.
         try std.testing.expectEqualStrings("{\"argv\":[\"git\",\"status\"]}", inner.last_arguments);
     }
 }
 
 test "a call to a plugin tool is answered here, with the guest's own words, and never reaches the runners below" {
-    // **The wiring this whole file was missing**: a tool a plugin declares is
-    // offered to the model, and a call to it reaches the plugin and comes back
-    // with what the plugin said. `test/plugin/engine.zig` is where the answer
-    // really comes out of guest code; this pins that the runner chain carries
-    // it to the loop.
-    //
-    // Mutation check: pass the call on to `inner` after `dispatch` answered and
-    // the sandbox runner is handed a tool name it has never heard of.
     const gpa = std.testing.allocator;
 
     var host = PluginProbeHost{ .text = "Hello, world!", .is_error = false };
@@ -21913,8 +14709,6 @@ test "a call to a plugin tool is answered here, with the guest's own words, and 
     try log.arm(std.testing.io);
     state.session.asker = log.asker();
 
-    // The model is offered it, which is the half a dispatch cannot show: a tool
-    // nobody is told about is never called.
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
     defer offered.deinit(gpa);
     try state.session.appendDefinitions(gpa, &offered);
@@ -21936,22 +14730,11 @@ test "a call to a plugin tool is answered here, with the guest's own words, and 
     try std.testing.expectEqual(@as(usize, 1), host.calls);
     try std.testing.expectEqualStrings("Hello, world!", result.output);
     try std.testing.expect(!result.is_error);
-    // The call id is the model's own, so the loop can pair the result with the
-    // call that caused it.
     try std.testing.expectEqualStrings("call9", result.call_id);
-    // The position in the plugin's own tool list, which is what the guest ABI
-    // takes. A name on that wire would be a second thing the two sides have to
-    // agree about.
     try std.testing.expectEqual(@as(u32, 0), host.last_index);
 }
 
 test "a plugin tool this project's policy refuses is refused before the plugin is reached" {
-    // A plugin tool is an action on the policy table like every other, and a
-    // refused one costs no process at all: the model is not offered it, and a
-    // model that names it anyway is told why rather than "unknown tool".
-    //
-    // Mutation check: read the policy after the host in
-    // `plugin.Session.dispatch` and a denied tool runs and then is refused.
     const gpa = std.testing.allocator;
     const source: [:0]const u8 =
         \\.{
@@ -21965,8 +14748,6 @@ test "a plugin tool this project's policy refuses is refused before the plugin i
     const table = try chock_policy.table.Table.parse(gpa, source, null);
     defer chock_policy.table.Table.destroy(gpa, table);
 
-    // The action the table is asked about is the one an author writes in the
-    // file, or the rule above would be measuring nothing.
     var action_buffer: [chock_core.plugin.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "plugin.hello.tool.hello",
@@ -22011,21 +14792,11 @@ test "a plugin tool this project's policy refuses is refused before the plugin i
 
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not offered") != null);
-    // **The plugin was never asked.** A refused tool must cost no process.
     try std.testing.expectEqual(@as(usize, 0), host.calls);
-    // And it did not fall through to the runners below either: a refusal is an
-    // answer, not a name this chain does not know.
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
 test "a plugin whose tool is named after a built-in loads none of its tools, and the built-in still runs" {
-    // The project owner's own rule, read from this side of the wiring: the
-    // whole plugin fails to load, so the good tool it declared first is not
-    // offered either, and `read_file` still reaches the runner that owns it.
-    //
-    // Mutation check: refuse the one tool and keep the rest in
-    // `plugin.Session.admit`, and `harmless` below is offered by a plugin that
-    // tried to take a built-in's name.
     const gpa = std.testing.allocator;
 
     var host = PluginProbeHost{ .text = "the plugin answered", .is_error = false };
@@ -22052,7 +14823,6 @@ test "a plugin whose tool is named after a built-in loads none of its tools, and
     var inner = CountingToolRunner{};
     var plugin_aware = PluginToolRunner{ .inner = inner.runner(), .state = &state };
 
-    // Chock's own tool goes where it always went.
     const built_in = try plugin_aware.runner().dispatch(gpa, std.testing.io, .{
         .call_id = "call11",
         .tool = "read_file",
@@ -22063,8 +14833,6 @@ test "a plugin whose tool is named after a built-in loads none of its tools, and
     try std.testing.expectEqual(@as(usize, 1), inner.calls);
     try std.testing.expectEqualStrings("the real git ran", built_in.output);
 
-    // And the tool the plugin declared before the collision is not this
-    // session's either: it falls through as a name nothing here knows.
     const other = try plugin_aware.runner().dispatch(gpa, std.testing.io, .{
         .call_id = "call12",
         .tool = "harmless",
@@ -22077,16 +14845,6 @@ test "a plugin whose tool is named after a built-in loads none of its tools, and
 }
 
 test "a plugin tool cannot take a name an MCP server already declared" {
-    // Two suppliers of tools reach one model through one name space. Without
-    // this the model would hold one name that means two things, and which one
-    // it reached would be decided by the order of the runner chain.
-    //
-    // **The MCP server is admitted first and keeps its name**, because it is
-    // already in the session: `startPlugins` runs after `startMcp` and hands
-    // this list over. See `chock_core.plugin.Session.reserved`.
-    //
-    // Mutation check: answer an empty list from `reservedNames` and the plugin
-    // tool below is offered too, so the model is told about `shared` twice.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -22104,7 +14862,6 @@ test "a plugin tool cannot take a name an MCP server already declared" {
     var plugin_state = PluginState.init(gpa);
     defer plugin_state.deinit(std.testing.io);
 
-    // The line `startPlugins` runs, and not a copy of it written here.
     plugin_state.session.reserved = try reservedNames(arena_state.allocator(), &mcp_state.session);
     _ = try plugin_state.session.admit("hello", .{
         .name = "written by the author",
@@ -22126,8 +14883,6 @@ test "a plugin tool cannot take a name an MCP server already declared" {
         plugin_state.session.find("own").?.refused,
     );
 
-    // And the whole chain answers the way the list says: `shared` is the
-    // server's, and the plugin's own tool is the plugin's.
     var log = try PermittingLog.init(gpa);
     defer log.deinit(std.testing.io);
     try log.arm(std.testing.io);
@@ -22162,20 +14917,10 @@ test "a plugin tool cannot take a name an MCP server already declared" {
 }
 
 test "the sandbox a plugin host gets carries its program, its module and nothing writable" {
-    // **A guest owns the address space of the process that runs it**, so this
-    // config is the whole of what a hostile plugin reaches. Two facts have to
-    // hold at once, and they pull against each other: the process must be able
-    // to start at all, and it must reach nothing of the session.
-    //
-    // Mutation checks. Carry `workspace_config.rules` through and a plugin
-    // reads the project. Drop the execute right on the program and the process
-    // cannot be started at all, which `test/plugin/engine.zig` reaches for real.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
-    // The shape a tool call's own config has: the workspace, writable, and a
-    // network somebody was given.
     const workspace: sandbox.Config = .{
         .root = "/tmp/session-root",
         .mounts = &.{
@@ -22200,19 +14945,15 @@ test "the sandbox a plugin host gets carries its program, its module and nothing
     );
 
     try std.testing.expect(config.network == .none);
-    // Not the project directory: a plugin host opens one file, by an absolute
-    // path, and has no rule for the workspace anyway.
     try std.testing.expectEqualStrings("/", config.cwd);
 
     var reaches_program = false;
     var reaches_module = false;
     for (config.rules) |rule| {
-        // **Nothing writable, whatever the rule is about.**
         try std.testing.expect(!rule.access.write_file);
         try std.testing.expect(!rule.access.make_reg);
         try std.testing.expect(!rule.access.remove_file);
         try std.testing.expect(!rule.access.truncate);
-        // And nothing about the workspace at all.
         try std.testing.expect(!std.mem.eql(u8, rule.path, "/home/someone/work"));
 
         if (std.mem.eql(u8, rule.path, plugin_host_target)) {
@@ -22225,9 +14966,6 @@ test "the sandbox a plugin host gets carries its program, its module and nothing
     try std.testing.expect(reaches_program);
     try std.testing.expect(reaches_module);
 
-    // The mount tree still carries the workspace, and that is not a hole: a
-    // mount with no rule is present and unreachable. What the two mounts below
-    // add is the program and the module, at fixed targets, read only.
     var binds_program = false;
     var binds_module = false;
     for (config.mounts) |mount| {
@@ -22249,15 +14987,6 @@ test "the sandbox a plugin host gets carries its program, its module and nothing
 }
 
 test "a plugin host is started as chock itself, under the word that is not a command" {
-    // **The fold to one binary, pinned where the command line is built.** The
-    // plugin host was a second installed program that `chock` looked for beside
-    // itself, so an install that copied one file lost every plugin. It is now
-    // this program, re-execed under a hidden word, which is what
-    // `chock_core.subagent.commandLine` already does for a subagent.
-    //
-    // Mutation check: drop the verb and the child parses the module path as a
-    // command name, prints "there is no command named", and exits 1, which the
-    // harness reads as a plugin host that died on the first call.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -22268,13 +14997,9 @@ test "a plugin host is started as chock itself, under the word that is not a com
     try std.testing.expectEqualStrings(plugin_host_target, argv[0]);
     try std.testing.expectEqualStrings(chock_core.plugin_host.verb, argv[1]);
     try std.testing.expectEqualStrings(plugin_module_target, argv[2]);
-    // The capabilities come last and nothing is inserted after them.
     try std.testing.expectEqualStrings("read_file", argv[3]);
 }
 
-/// A `plugin.Host` that answers from a field and counts what it was asked. The
-/// tests above measure the wiring, and `test/plugin/engine.zig` is where a real
-/// guest really answers.
 const PluginProbeHost = struct {
     text: []const u8,
     is_error: bool,
@@ -22308,16 +15033,9 @@ const PluginProbeHost = struct {
     }
 };
 
-/// A policy that says yes, so the two runner tests measure the wiring and not
-/// the table. The table itself is measured by the two tests above it.
 /// A real session log, locked the way `Loop.run` locks one, beside an arbiter
-/// that permits every act.
-///
-/// **A session with no asker runs no MCP and no plugin tool at all**, which is
-/// the rule `chock_core.mcp.Session.dispatch` keeps: a tool a third party
-/// supplies is decided one call at a time, and a caller that named nobody to
-/// ask refuses. `GiveLockedToAll` is the production wiring. A test that
-/// measures the runner chain rather than the policy says so with this.
+/// that permits every act. A session with no asker runs no MCP and no plugin tool
+/// at all.
 const PermittingLog = struct {
     var anchor: u8 = 0;
 
@@ -22329,8 +15047,6 @@ const PermittingLog = struct {
         return .{ .backing = try chock_proto.storage.Memory.init(gpa, "01RUNTEST") };
     }
 
-    /// Separate from `init` because the handle points at the storage beside it,
-    /// and a struct returned by value moves.
     fn arm(self: *PermittingLog, io: std.Io) !void {
         self.store = self.backing.storage();
         self.locked = try self.store.lock(io);
@@ -22382,21 +15098,10 @@ const AllowEverything = struct {
 };
 
 test "the interface asks again after a turn that finished, and after nothing else" {
-    // **The conversation, and where it ends.** Bare `chock` runs a turn, asks
-    // for the next message and runs another, for as long as the turns finish.
-    // Every other ending is the session saying it is over, and a field drawn on
-    // a session that is ending would ask for work that nothing would do.
-    //
-    // Mutation check: drop the `interrupted` arm and a Ctrl-C that landed after
-    // the `session.end` was written puts the field back up on a session that is
-    // already stopping. Return true for every ending and a session that ran out
-    // of money is asked for more work.
     try testing.expect(keepAsking(.finished, false));
 
-    // Ctrl-C, whatever this turn's own ending was.
     try testing.expect(!keepAsking(.finished, true));
 
-    // And every other way a turn can end.
     for ([_]Exit{
         .usage,
         .faulted,
@@ -22412,8 +15117,6 @@ test "the interface asks again after a turn that finished, and after nothing els
     }
 }
 
-/// Write a bundle file into `dir` and give the absolute path of it. For the
-/// tests below, which read one off a disk the way `start` does.
 fn writeBundle(gpa: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, source: []const u8) ![]u8 {
     const io = testing.io;
     try dir.writeFile(io, .{ .sub_path = name, .data = source });
@@ -22423,9 +15126,6 @@ fn writeBundle(gpa: std.mem.Allocator, dir: std.Io.Dir, name: []const u8, source
 }
 
 test "an installation with no org bundle reads no layer above the project and says nothing" {
-    // The property that decides whether this may ship. Every installation that
-    // has never heard of a bundle has to behave exactly as it did, and that
-    // starts with the load answering null rather than reporting anything.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -22436,8 +15136,6 @@ test "an installation with no org bundle reads no layer above the project and sa
     const written = try tmp.dir.realPath(testing.io, &buffer);
     const data_dir = buffer[0..written];
 
-    // Nothing may reach standard error or standard output. See `tty.Capture`,
-    // and `test/proto/lock.zig` for why a test may not let a line through.
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
@@ -22447,8 +15145,6 @@ test "an installation with no org bundle reads no layer above the project and sa
     try testing.expectEqualStrings("", said.err());
     try testing.expectEqualStrings("", said.out());
 
-    // And the table such an installation builds answers exactly what the plain
-    // reader answers, for the acts and for the provider rows alike.
     const org_rules: []const chock_policy.table.Rule = if (none) |b| b.rules else &.{};
     try testing.expectEqual(@as(usize, 0), org_rules.len);
     const source = ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .allow } } } }";
@@ -22471,9 +15167,6 @@ test "an installation with no org bundle reads no layer above the project and sa
 }
 
 test "a bundle the caller named and Chock cannot find is a fault, and a broken one names why" {
-    // A path somebody typed is a request for that file. The installed bundle
-    // being absent is the ordinary case; the one on the command line being
-    // absent is a mistake the caller has to hear about.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -22496,9 +15189,6 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
     try testing.expect(std.mem.indexOf(u8, said.err(), "no org policy bundle") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), missing) != null);
 
-    // A bundle that is there and cannot be read stops the session as well,
-    // with the reason the reader gave rather than an error name. Falling back
-    // to no bundle here would be falling open on a file an organisation wrote.
     said.clear();
     const broken = try writeBundle(arena, tmp.dir, "broken.zon", ".{ .rules = ");
     try testing.expectError(
@@ -22507,7 +15197,6 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "not valid") != null);
 
-    // And a bundle from a newer Chock is refused rather than applied in part.
     said.clear();
     const newer = try writeBundle(arena, tmp.dir, "newer.zon", ".{ .version = 99, .rules = .{} }");
     try testing.expectError(
@@ -22516,7 +15205,6 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "version 99") != null);
 
-    // A good one at a named path reads, and its rules reach the caller.
     said.clear();
     const good = try writeBundle(
         arena,
@@ -22527,16 +15215,9 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
     const bundle = try loadOrgBundle(arena, testing.io, data_dir, .{ .org_bundle = good });
     try testing.expectEqualStrings("ross@example.org", bundle.?.subject);
     try testing.expectEqual(@as(usize, 1), bundle.?.rules.len);
-    // The subject is said, and nothing about it is a fault. `tty.print` writes
-    // the stream every other line of `chock run` writes, which is the same one
-    // the session line beside it uses.
     try testing.expect(std.mem.indexOf(u8, said.err(), "org policy for ross@example.org") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "could not") == null);
 
-    // The same good file is refused to a subagent. A parent writes its child's
-    // command line and carries no bundle on it, so a child that took a path
-    // here would run under an org policy its parent never read, which is the
-    // one direction the subagent limits exist to prevent.
     said.clear();
     try testing.expectError(error.Reported, loadOrgBundle(arena, testing.io, data_dir, .{
         .org_bundle = good,
@@ -22544,8 +15225,6 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
     }));
     try testing.expect(std.mem.indexOf(u8, said.err(), "subagent takes") != null);
 
-    // And a subagent with no flag reads the installed bundle exactly as its
-    // parent did, which is why the flag is not needed for one.
     said.clear();
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = chock_policy.org.file_name,
@@ -22558,12 +15237,6 @@ test "a bundle the caller named and Chock cannot find is a fault, and a broken o
 }
 
 test "an installed bundle that expired still binds, and the session is told how stale it is" {
-    // The expiry decision `chock_policy.org` states, at the one place a person
-    // meets it. Neither failing shut nor falling open: the rules are still
-    // read, and the staleness is on the screen.
-    //
-    // The time is a parameter here, so this asserts nothing about a wall
-    // clock. `loadOrgBundle` reads the one clock and hands the number in.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -22582,32 +15255,23 @@ test "an installed bundle that expired still binds, and the session is told how 
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    // Three days and a bit past the date.
     const three_days_later: i64 = 5000 + 3 * std.time.ms_per_day + 1;
     reportOrgBundle(bundle, three_days_later);
     try testing.expect(std.mem.indexOf(u8, said.err(), "org policy for ross@example.org") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "issued by example.org") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "expired 3 days ago") != null);
-    // The sentence has to say the bundle is still binding, or a reader takes
-    // the warning for a bundle that has been dropped.
     try testing.expect(std.mem.indexOf(u8, said.err(), "still binds") != null);
 
-    // One day reads as one day, so the plural is not a guess.
     said.clear();
     reportOrgBundle(bundle, 5000 + std.time.ms_per_day);
     try testing.expect(std.mem.indexOf(u8, said.err(), "expired 1 day ago") != null);
 
-    // Before the date there is no warning at all, and the subject is still
-    // said, because who the policy belongs to is not a fault.
     said.clear();
     reportOrgBundle(bundle, 4000);
     try testing.expect(std.mem.indexOf(u8, said.err(), "expired") == null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "org policy for ross@example.org") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "1 rule") != null);
 
-    // And the rules survive the date, which is the half of the decision that
-    // is not a message: the table built from an expired bundle refuses what
-    // the bundle refused.
     const under = try chock_policy.table.Table.parseUnder(arena, ".{}", bundle.rules, null);
     const rows = try chock_policy.access.rowsFor("public", "gpt-5");
     try testing.expectEqual(chock_policy.table.Decision.deny, chock_policy.access.ceiling(under, .{
@@ -22616,8 +15280,6 @@ test "an installed bundle that expired still binds, and the session is told how 
         .model_alias = "public",
     }, &rows, null));
 
-    // The one thing the date does act on: a file already past it may not be
-    // handed to Chock now.
     said.clear();
     try testing.expectError(
         error.Reported,
@@ -22625,15 +15287,12 @@ test "an installed bundle that expired still binds, and the session is told how 
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "expired before it was given") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "/somewhere/org-policy.zon") != null);
-    // And one that is still current installs with nothing said.
     said.clear();
     try refuseUninstallableBundle(bundle, 4000, "/somewhere/org-policy.zon");
     try testing.expectEqualStrings("", said.err());
 }
 
 test "a project cannot widen the models its org narrowed, and the refusal names the row" {
-    // The end to end shape: a `chock.zon` that says a model is allowed, a
-    // bundle above it that says it is not, and a session that does not start.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -22657,10 +15316,6 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
     said.start(testing.io, testing.allocator);
     defer said.stop(testing.io);
 
-    // The table this run would really build, off a real `chock.zon` and
-    // through the one function `start` calls. A `loadPolicyUnder` that dropped
-    // the bundle would pass every test of the layers themselves, so this is
-    // the one that holds the wiring.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -22682,16 +15337,12 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
         chock_policy.table.Decision.deny,
         chock_policy.access.ceiling(wired, asking, &rows, null),
     );
-    // And the same directory with no bundle above it keeps what the file
-    // wrote, so the refusal above is the bundle reaching the table.
     const unwired = try loadPolicyUnder(arena, testing.io, project_root, null);
     try testing.expectEqual(
         chock_policy.table.Decision.allow,
         chock_policy.access.ceiling(unwired, asking, &rows, null),
     );
 
-    // With the bundle above it the session is refused, and the message names
-    // both rows so the reader knows which line to go and read.
     const bound = try chock_policy.table.Table.parseUnder(arena, project_allows, org_refuses.rules, null);
     try testing.expectError(
         error.Reported,
@@ -22701,22 +15352,16 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
     try testing.expect(std.mem.indexOf(u8, said.err(), "provider.public.gpt-5") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "deny") != null);
 
-    // The same project with no bundle above it starts, so the refusal is the
-    // organisation's and not something the file did to itself.
     said.clear();
     const alone = try chock_policy.table.Table.parse(arena, project_allows, null);
     try refuseProviderAndModel(arena, alone, &.{}, .{}, "public", "gpt-5");
     try testing.expectEqualStrings("", said.err());
 
-    // A project that names no provider row at all is refused nothing, which is
-    // every project that predates these names.
     const silent = try chock_policy.table.Table.parse(arena, ".{}", null);
     try refuseProviderAndModel(arena, silent, &.{}, .{}, "public", "gpt-5");
     try refuseProviderAndModel(arena, silent, &.{}, .{}, "local", "glm4.7-flash");
     try testing.expectEqualStrings("", said.err());
 
-    // A provider name that could never be a row is a refusal of its own, with
-    // the reason, rather than a decision taken over a name nobody could write.
     said.clear();
     try testing.expectError(
         error.Reported,
@@ -22726,9 +15371,6 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
 }
 
 test "a subagent is refused a model its parent could not use" {
-    // The fold that makes this more than a checkbox, at the level a session
-    // meets it: the child's own row says `allow` and the answer is still
-    // `deny`, because the minimum is taken over every link of the chain.
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -22760,17 +15402,12 @@ test "a subagent is refused a model its parent could not use" {
         refuseProviderAndModel(arena, policy, under_main, as_worker, "hub", "big"),
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "may not use the model big") != null);
-    // The refusal says the answer came from the chain, because a reader
-    // looking at the `worker` row alone would see `allow` and be baffled.
     try testing.expect(std.mem.indexOf(u8, said.err(), "spawn chain") != null);
 
-    // The cheap model is there for the child, so the fold narrowed rather than
-    // switched the child off.
     said.clear();
     try refuseProviderAndModel(arena, policy, under_main, as_worker, "hub", "small");
     try testing.expectEqualStrings("", said.err());
 
-    // A grandchild holds no more than the link above it either.
     const under_worker: []const chock_proto.event.SpawnLink = &.{
         .{ .agent_kind = "main", .reason = "" },
         .{ .agent_kind = "worker", .reason = "" },
@@ -22780,8 +15417,6 @@ test "a subagent is refused a model its parent could not use" {
         refuseProviderAndModel(arena, policy, under_worker, .{ .agent_kind = "helper" }, "hub", "big"),
     );
 
-    // And the root itself is refused the model its own row denies, so the
-    // rules are being read and not merely folded.
     said.clear();
     try testing.expectError(
         error.Reported,
@@ -22790,8 +15425,6 @@ test "a subagent is refused a model its parent could not use" {
     try testing.expect(std.mem.indexOf(u8, said.err(), "spawn chain") == null);
 }
 
-/// An observer that keeps what it was told, so a test can compare two
-/// observers call for call.
 const RecordingObserver = struct {
     gpa: std.mem.Allocator,
     said: std.ArrayList(u8) = .empty,
@@ -22830,11 +15463,6 @@ const RecordingObserver = struct {
 };
 
 test "the two export options are off unless asked for, and each takes a value" {
-    // **A session that names no sink is a session that opens no file and makes
-    // no socket**: `runSession` puts every line of the export behind
-    // `sink_count`, and this is where that count starts at zero. Mutation check:
-    // default either of these to a path and every session in this project starts
-    // writing somewhere nobody asked for.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -22851,11 +15479,8 @@ test "the two export options are off unless asked for, and each takes a value" {
     });
     try testing.expectEqualStrings("/var/audit/chock", both.export_dir.?);
     try testing.expectEqualStrings("/dev/log", both.export_syslog.?);
-    // The message survives, so an option that takes a value did not swallow it.
     try testing.expectEqual(@as(usize, 1), both.message_words.len);
 
-    // Each needs a value, and the fault says which option rather than sending a
-    // reader looking for the right value.
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
@@ -22867,13 +15492,6 @@ test "the two export options are off unless asked for, and each takes a value" {
 }
 
 test "an exporter with no sink passes every call through byte for byte" {
-    // **The property a session that exports nothing depends on.** The exporter
-    // wraps rather than replaces, so a run with no sink has to reach the printer
-    // with exactly the calls it would have reached it with before the exporter
-    // existed.
-    //
-    // Mutation check: have `onPieceFn` drop a piece, or have `onEventFn` push
-    // before it forwards, and the two recordings below stop matching.
     const gpa = testing.allocator;
 
     var direct = RecordingObserver{ .gpa = gpa };
@@ -22912,21 +15530,14 @@ test "an exporter with no sink passes every call through byte for byte" {
     }
 
     try testing.expectEqualStrings(direct.said.items, wrapped_inner.said.items);
-    // And it really ran: an empty comparison would pass against an exporter that
-    // forwarded nothing at all.
     try testing.expect(direct.said.items.len != 0);
 
-    // Nothing was shipped and nothing is reported, so a run with no sink says
-    // nothing about export at all.
     var report: ShippingReport = .{};
     exporter.finish(&report);
     try testing.expectEqual(@as(usize, 0), report.count);
 }
 
 test "a session that exported nothing says nothing about export" {
-    // The other half of "byte for byte as today": the end of a run is silent
-    // when nobody asked for a sink. A line here would appear on every session
-    // this project has ever run.
     const gpa = testing.allocator;
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
@@ -22939,14 +15550,6 @@ test "a session that exported nothing says nothing about export" {
 }
 
 test "a sink that worked says one line, and a sink that went down says the whole state" {
-    // **An audit trail that silently stops arriving is worse than one that never
-    // started.** So the ordinary run says one plain line, which is what makes
-    // the absence of that line mean something, and a run whose sink went down
-    // says how many lines went, why it stopped, and from which byte of the log
-    // nothing has left this machine.
-    //
-    // Mutation check: drop the `wantsSaying` branch and a session whose sink was
-    // down all along reports the same line as one whose sink worked.
     const gpa = testing.allocator;
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
@@ -22957,7 +15560,6 @@ test "a sink that worked says one line, and a sink that went down says the whole
     reportShipping(&worked);
     try testing.expect(std.mem.indexOf(u8, said.err(), "12 lines") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "/var/audit/chock/01JQ.jsonl") != null);
-    // Nothing about a fault, because there was none.
     try testing.expect(std.mem.indexOf(u8, said.err(), "could not be reached") == null);
 
     said.clear();
@@ -22972,21 +15574,11 @@ test "a sink that worked says one line, and a sink that went down says the whole
     const warned = said.err();
     try testing.expect(std.mem.indexOf(u8, warned, "/dev/log") != null);
     try testing.expect(std.mem.indexOf(u8, warned, "ConnectionRefused") != null);
-    // The byte the tail begins at, which is what makes the warning actionable
-    // rather than a shrug.
     try testing.expect(std.mem.indexOf(u8, warned, "512") != null);
     try testing.expect(std.mem.indexOf(u8, warned, "on this machine and nowhere else") != null);
 }
 
 test "the first time a sink cannot be reached, whoever is watching is told at once" {
-    // **Not only at the end.** A session runs for minutes, and a person watching
-    // it has to learn that the trail stopped while there is still something they
-    // can do about it. It goes through the observer this one wraps, because a
-    // display may be up and a line written straight to standard error would land
-    // behind an alternate screen.
-    //
-    // Mutation check: drop `said` and a sink that is down puts one line on the
-    // screen per event, which buries the session the lines are about.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -23002,7 +15594,6 @@ test "the first time a sink cannot be reached, whoever is watching is told at on
     var watching = RecordingObserver{ .gpa = gpa };
     defer watching.deinit();
 
-    // A sink that is not there: a socket path with nothing bound to it.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -23029,7 +15620,6 @@ test "the first time a sink cannot be reached, whoever is watching is told at on
     try testing.expect(std.mem.indexOf(u8, watching.said.items, "could not be reached") != null);
     try testing.expect(std.mem.indexOf(u8, watching.said.items, "The session carries on") != null);
 
-    // Said once. Three more events with the sink still gone add no second line.
     const after_first = std.mem.count(u8, watching.said.items, "could not be reached");
     try testing.expectEqual(@as(usize, 1), after_first);
     for (0..3) |_| watcher.onEvent(16, .{ .session_end = .{ .reason = .finished, .detail = "" } });
@@ -23038,8 +15628,6 @@ test "the first time a sink cannot be reached, whoever is watching is told at on
         std.mem.count(u8, watching.said.items, "could not be reached"),
     );
 
-    // And the session was never stopped: every event still reached the observer
-    // this one wraps.
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, watching.said.items, "event 16"));
 
     var report: ShippingReport = .{};
@@ -23050,9 +15638,6 @@ test "the first time a sink cannot be reached, whoever is watching is told at on
 }
 
 test "a session's log reaches the file drop line by line, and verifies there" {
-    // The whole point, driven through the exporter a session really uses rather
-    // than through the shipper alone: an event that the loop appended has left
-    // this machine by the time the next one lands.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -23089,8 +15674,6 @@ test "a session's log reaches the file drop line by line, and verifies there" {
     };
     const watcher = exporter.observer();
 
-    // Two turns, each appended and then announced, which is the order
-    // `Loop.appendAndApply` uses.
     var locked = try store.lock(io);
     for ([_]chock_proto.event.Event{
         .{ .session_start = .{
@@ -23102,8 +15685,6 @@ test "a session's log reaches the file drop line by line, and verifies there" {
     }, 0..) |ev, index| {
         const id = try locked.append(gpa, io, ev, @intCast(1000 + index));
         watcher.onEvent(id, ev);
-        // Each event has left the machine before the next one is written, which
-        // is the whole argument for shipping live rather than at the end.
         const so_far = try std.Io.Dir.cwd().readFileAlloc(io, drop_path, gpa, .limited(1 << 20));
         defer gpa.free(so_far);
         try testing.expect(std.mem.count(u8, so_far, "\n") == index + 2);
@@ -23115,8 +15696,6 @@ test "a session's log reaches the file drop line by line, and verifies there" {
     try testing.expectEqual(@as(usize, 1), report.count);
     try testing.expect(!report.entries[0].health.wantsSaying());
 
-    // The copy is the log, so the far end verifies it with the code that wrote
-    // it. Read after `finish`, which is what flushes.
     const original = try std.Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .limited(1 << 20));
     defer gpa.free(original);
     const copy = try std.Io.Dir.cwd().readFileAlloc(io, drop_path, gpa, .limited(1 << 20));
@@ -23125,13 +15704,6 @@ test "a session's log reaches the file drop line by line, and verifies there" {
 }
 
 test "the two export options really build the two sinks, and neither builds none" {
-    // **The wiring, and not only the pieces.** Three mechanisms in this project
-    // have shipped with green tests and no real caller, and no test of a shipper
-    // or a sink on its own could catch a fourth.
-    //
-    // Mutation check: drop either branch of `Sinks.open` and the count below
-    // falls to one; drop both and every session exports nothing however it was
-    // asked.
     const gpa = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -23145,9 +15717,6 @@ test "the two export options really build the two sinks, and neither builds none
     const wanted = try std.fmt.allocPrint(arena, "{s}/audit", .{dir_path});
     const id = "01JQ" ++ "A" ** 22;
 
-    // Neither option and no bundle: no path is built, and no sink either.
-    // **This is what makes a session that asked for no sink the session it was
-    // before export existed.**
     {
         try testing.expectEqual(
             @as(usize, 0),
@@ -23162,18 +15731,12 @@ test "the two export options really build the two sinks, and neither builds none
 
     const from_flags = try auditSinks(arena, io, .{ .export_dir = wanted }, null, id);
     const drop_path = from_flags[0].path;
-    // One file per session, named after it, so a collector knows which session a
-    // file holds without opening it.
     try testing.expect(std.mem.startsWith(u8, drop_path, wanted));
     try testing.expect(std.mem.endsWith(u8, drop_path, "/" ++ id ++ ".jsonl"));
-    // Nobody required it, so it is optional and nothing about it is loud.
     try testing.expect(!from_flags[0].required);
-    // The directory was made rather than required, so an operator naming one
-    // that does not exist yet still gets a session.
     var made = try std.Io.Dir.cwd().openDir(io, wanted, .{});
     made.close(io);
 
-    // Both: one file drop, one syslog socket.
     var both = Sinks{};
     defer both.close(io);
     both.open(
@@ -23191,13 +15754,9 @@ test "the two export options really build the two sinks, and neither builds none
     try testing.expectEqualStrings(id, named[0].shipper.session);
     try testing.expectEqualStrings("/dev/log", named[1].name);
     try testing.expectEqualStrings(id, named[1].shipper.session);
-    // A fresh session took up nobody's log, so a forgetful sink is not told that
-    // it may hold some of this twice.
     try testing.expect(!named[0].shipper.continued);
     try testing.expect(!named[1].shipper.continued);
 
-    // And a run that carried one on is. Each of the three ways of saying so
-    // counts, because each one takes up a log another run already wrote.
     for ([_]Options{
         .{ .export_syslog = "/dev/log", .adopt = true },
         .{ .export_syslog = "/dev/log", .continue_newest = true },
@@ -23210,10 +15769,6 @@ test "the two export options really build the two sinks, and neither builds none
         try testing.expect(again.slice()[0].shipper.continued);
     }
 
-    // **The names a `ShippingReport` keeps outlive the sinks.** A real run
-    // crashed here: the path was allocated on the session's own path and freed
-    // by `Sinks.close`, and phase 3 then read it. Nothing here owns a string, so
-    // closing every sink leaves each name exactly as it was.
     var report: ShippingReport = .{};
     for (named) |one| report.add(.{ .name = one.name, .health = one.shipper.health });
     both.close(io);
@@ -23222,16 +15777,6 @@ test "the two export options really build the two sinks, and neither builds none
 }
 
 test "a project cannot drop a sink its installation required, and can add one of its own" {
-    // **The ratchet, in the shape a sink can take it.** An organisation says
-    // where every session sends its log; a project may add a place of its own,
-    // because more of the record reaching more places narrows nothing, and it
-    // may not take one away. Removal is not something a command line can
-    // express, which is stronger than a check somebody has to remember.
-    //
-    // Mutation check: drop the org loop in `auditSinks` and the required sink
-    // is gone whenever a developer names one of their own, which is the whole
-    // control evaporating on the machines that use export at all. Drop the two
-    // option branches and a project can no longer add one.
     const gpa = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -23256,9 +15801,6 @@ test "a project cannot drop a sink its installation required, and can add one of
     );
     const bundle = try chock_policy.org.parse(arena, source, null);
 
-    // The developer names neither option. **The trail still leaves the
-    // machine**, which is the difference between a control and an option and
-    // the whole reason this field exists.
     {
         const only_required = try auditSinks(arena, io, .{}, bundle, id);
         try testing.expectEqual(@as(usize, 2), only_required.len);
@@ -23268,25 +15810,13 @@ test "a project cannot drop a sink its installation required, and can add one of
         try testing.expectEqualStrings("/dev/log", only_required[1].path);
     }
 
-    // The developer names one of their own. Both are used: a project adds and
-    // never replaces, and the required ones come first because nobody typed
-    // them.
     const both = try auditSinks(arena, io, .{ .export_dir = own_dir }, bundle, id);
     try testing.expectEqual(@as(usize, 3), both.len);
     try testing.expect(both[0].required and both[1].required);
     try testing.expect(!both[2].required);
     try testing.expect(std.mem.startsWith(u8, both[2].path, own_dir));
-    // And the required directory is still in the list, which is the assertion
-    // the mutation above breaks.
     try testing.expect(std.mem.startsWith(u8, both[0].path, required_dir));
 
-    // A sink both of them named is opened once, and it stays required. Two
-    // `FileDrop`s over one file would write the same bytes at the same offsets
-    // from two counts and leave a copy that verifies as broken, and a
-    // duplicate on a command line must not be able to demote a sink either.
-    //
-    // Mutation check: drop `addPlannedSink`'s loop and this reads 3 rather
-    // than 2, with two drops aimed at one file.
     const same = try auditSinks(
         arena,
         io,
@@ -23298,8 +15828,6 @@ test "a project cannot drop a sink its installation required, and can add one of
     try testing.expect(same[0].required);
     try testing.expect(same[1].required);
 
-    // And every planned sink really becomes a shipper, which is the wiring no
-    // test of `auditSinks` alone would catch.
     var sinks = Sinks{};
     defer sinks.close(io);
     sinks.open(.{}, both, id);
@@ -23307,8 +15835,6 @@ test "a project cannot drop a sink its installation required, and can add one of
     try testing.expect(sinks.anyRequired());
     try testing.expectEqual(@as(usize, 2), sinks.drop_count);
     try testing.expectEqual(@as(usize, 1), sinks.syslog_count);
-    // **Each drop has a transport of its own.** One `FileDrop` shared by two
-    // required directories would send the second one's lines to the first.
     for (sinks.slice(), both) |sending, planned| {
         try testing.expectEqualStrings(planned.path, sending.name);
         try testing.expectEqual(planned.required, sending.required);
@@ -23317,14 +15843,6 @@ test "a project cannot drop a sink its installation required, and can add one of
 }
 
 test "an installation with no bundle plans exactly the sinks the command line named" {
-    // **Byte for byte as today.** Every installation that has never seen a
-    // bundle has to reach the same sinks, in the same order, with nothing
-    // required, and has to skip the start-time probe entirely so that not one
-    // extra byte moves at a different moment.
-    //
-    // Mutation check: default `PlannedSink.required` to true and the probe
-    // below runs on every session in the world, and every optional sink starts
-    // reporting an exit code an organisation never asked for.
     const gpa = testing.allocator;
     const io = testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -23353,7 +15871,6 @@ test "an installation with no bundle plans exactly the sinks the command line na
     );
     try testing.expectEqual(chock_policy.org.RequiredSink.Kind.syslog, planned[1].kind);
     try testing.expectEqualStrings("/dev/log", planned[1].path);
-    // Nothing is required, so nothing probes and nothing reaches the exit code.
     try testing.expect(!planned[0].required);
     try testing.expect(!planned[1].required);
 
@@ -23362,8 +15879,6 @@ test "an installation with no bundle plans exactly the sinks the command line na
     sinks.open(.{}, planned, id);
     try testing.expect(!sinks.anyRequired());
 
-    // A bundle that requires no sink is the same as no bundle at all, which is
-    // what every bundle written before this field is.
     const older = try chock_policy.org.parse(arena, ".{ .subject = \"ross\", .rules = .{} }", null);
     var under_older = Sinks{};
     defer under_older.close(io);
@@ -23371,9 +15886,6 @@ test "an installation with no bundle plans exactly the sinks the command line na
     try testing.expectEqual(@as(usize, 0), under_older.count);
     try testing.expect(!under_older.anyRequired());
 
-    // And the exit code of such a run is untouched, however badly its own
-    // optional sink went. A `--export-dir` on a full disk is that person's own
-    // business and must not turn their run red.
     var optional_gap = ShippingReport{};
     optional_gap.add(.{ .name = "/tmp/audit", .health = .{
         .faults = 3,
@@ -23385,16 +15897,6 @@ test "an installation with no bundle plans exactly the sinks the command line na
 }
 
 test "a required sink that cannot be reached is said at the start, and leaves the exit code" {
-    // **The decision `chock_policy.org` writes out, measured.** A session must
-    // not fail because an audit sink is down, so this one runs; and a required
-    // sink is not an optional one, so it says so before the first turn, it says
-    // who required it, and the gap it left is in the exit status.
-    //
-    // Mutation check: make an unreachable required sink return an error out of
-    // `probe` and the session cannot start, which is the answer that turns an
-    // organisation's control into an outage. Drop the `required` branch of
-    // `sayFault` and the line names a path nobody typed with no way to find out
-    // who did.
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -23411,9 +15913,6 @@ test "a required sink that cannot be reached is said at the start, and leaves th
     const store = backing.storage();
     defer store.close(io);
 
-    // A directory that cannot be made, because a file of that name is in the
-    // way. This is the shape of a real collector directory on a machine that
-    // was set up wrong, and nothing here needs a network.
     try tmp.dir.writeFile(io, .{ .sub_path = "blocked", .data = "not a directory" });
     const unreachable_path = try std.fmt.allocPrint(gpa, "{s}/blocked/audit/s.jsonl", .{dir_path});
     defer gpa.free(unreachable_path);
@@ -23435,19 +15934,12 @@ test "a required sink that cannot be reached is said at the start, and leaves th
         .sinks = &sending,
     };
 
-    // **Before the first turn, and it returns nothing at all.** There is no
-    // path out of `probe` that stops a session.
     exporter.probe();
     const at_start = watching.said.items;
     try testing.expect(std.mem.indexOf(u8, at_start, unreachable_path) != null);
-    // Who required it, because nobody at this keyboard did, and a reader told
-    // only a path goes looking through a command line that does not hold it.
     try testing.expect(std.mem.indexOf(u8, at_start, "org policy requires") != null);
-    // And that the session carries on, or the line reads as a session that has
-    // already stopped.
     try testing.expect(std.mem.indexOf(u8, at_start, "carries on") != null);
 
-    // The session runs. The log gains its events and none of them leave.
     {
         var locked = try store.lock(io);
         defer locked.unlock(io) catch {};
@@ -23469,13 +15961,9 @@ test "a required sink that cannot be reached is said at the start, and leaves th
     try testing.expect(report.entries[0].required);
     try testing.expect(report.entries[0].gap());
 
-    // **The teeth.** The session finished and did what it was asked to do, and
-    // the run says the record did not get out.
     try testing.expect(report.requiredGap());
     try testing.expectEqual(Exit.audit_gap, exitWithAudit(.finished, &report));
 
-    // The end of the run says it where a person reads, with the exit code in
-    // the sentence so the number is not a riddle.
     var said: tty.Capture = undefined;
     said.start(io, gpa);
     defer said.stop(io);
@@ -23488,14 +15976,6 @@ test "a required sink that cannot be reached is said at the start, and leaves th
 }
 
 test "a required sink that came back leaves no gap, and a broken session keeps its own code" {
-    // **How narrow `Exit.audit_gap` is, which is what stops it being the
-    // refuse-to-start answer wearing a different hat.** The log on disk is the
-    // queue, so a sink that was down for a minute is given every line it
-    // missed, and a run like that ends exactly as it would have.
-    //
-    // Mutation check: read `faults` instead of `stalled_at` in `Entry.gap` and
-    // the first case below turns red, which is every daemon restart in an
-    // organisation failing somebody's build.
     var recovered = ShippingReport{};
     recovered.add(.{ .name = "/var/audit/chock/01JQ.jsonl", .required = true, .health = .{
         .delivered = 40,
@@ -23508,9 +15988,6 @@ test "a required sink that came back leaves no gap, and a broken session keeps i
     try testing.expect(!recovered.requiredGap());
     try testing.expectEqual(Exit.finished, exitWithAudit(.finished, &recovered));
 
-    // A line the sink was there for and would not carry is a gap, because a
-    // second attempt would send the same bytes to the same sink for ever. That
-    // hole is as permanent as a tail that never left.
     var refused = ShippingReport{};
     refused.add(.{ .name = "/dev/log", .required = true, .health = .{
         .delivered = 39,
@@ -23520,28 +15997,16 @@ test "a required sink that came back leaves no gap, and a broken session keeps i
     try testing.expect(refused.requiredGap());
     try testing.expectEqual(Exit.audit_gap, exitWithAudit(.finished, &refused));
 
-    // **It never raises anything**, the same rule `exitWithApply` keeps. A
-    // session that faulted or was refused reports that, because a broken
-    // session is the first thing to act on and a script reading `audit_gap`
-    // there would look at the wrong problem.
     for ([_]Exit{ .faulted, .refused, .budget, .no_progress, .turn_limit, .handed_over }) |ended| {
         try testing.expectEqual(ended, exitWithAudit(ended, &refused));
     }
 
-    // And a run that required nothing is never touched, which is every run of
-    // every installation with no bundle.
     const nothing = ShippingReport{};
     try testing.expect(!nothing.requiredGap());
     try testing.expectEqual(Exit.finished, exitWithAudit(.finished, &nothing));
 }
 
 test "a required sink that worked says so, and names the installation rather than a flag" {
-    // The ordinary day. A required sink that is doing its job still says one
-    // plain line, which is what makes the absence of that line mean something,
-    // and it says who required it so a reader does not go looking for a flag.
-    //
-    // Mutation check: drop the required half of `reportShipping` and a sink
-    // nobody typed is reported as though somebody had.
     const gpa = testing.allocator;
     var said: tty.Capture = undefined;
     said.start(testing.io, gpa);
@@ -23556,19 +16021,10 @@ test "a required sink that worked says so, and names the installation rather tha
     reportShipping(&worked);
     try testing.expect(std.mem.indexOf(u8, said.err(), "12 lines") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "this installation requires") != null);
-    // Nothing about an exit code, because there is no gap to explain.
     try testing.expect(std.mem.indexOf(u8, said.err(), "exit 9") == null);
 }
 
 test "this session's own credential is what the redactor is given" {
-    // **The wiring, which is the whole point.** `chock_core.redact.Policy`
-    // defaults inert, so nothing redacts anything until a caller fills it in,
-    // and this project has shipped mechanisms with no caller before. The line
-    // that matters is `Loop.Deps.redact = started.redact`, and this is the
-    // function behind `started.redact`.
-    //
-    // Mutation check: return `.{}` from `redactionFor` and this fails, while
-    // every other test in this file still passes.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23581,39 +16037,19 @@ test "this session's own credential is what the redactor is given" {
     const token = "sk-not-a-real-key-0123456789";
     const policy = try redactionFor(arena, "hub", token, &.{});
 
-    // **One credential, plus the empty slot a live git password goes in.** See
-    // `redactionFor`: an empty value is inert, which is what keeps a session
-    // that never pushes exactly as it was.
-    //
-    // Mutation check: drop the reserved slot from `redactionFor` and this is 1
-    // rather than 2, and the push path then has nothing to write into.
     try testing.expectEqual(@as(usize, 2), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
-    // The source and not a guess, so an agent reading a marker can tell a
-    // credential Chock holds from a pattern that fired.
     try testing.expectEqual(chock_core.redact.Source.credential, policy.secrets[0].source);
-    // And it really would change a request.
     try testing.expect(!policy.isEmpty());
     try testing.expectEqual(@as(usize, 0), policy.tooShort());
-    // The heuristics stay off, which is `redact.zig`'s own default and its own
-    // argument: they have false positives and a caller must choose them.
     try testing.expect(!policy.heuristics);
 
-    // An ordinary credential says nothing at all. A line on every run is a line
-    // nobody reads.
     try testing.expectEqualStrings("", said.err());
     try testing.expectEqualStrings("", said.out());
 }
 
 test "a credential nobody could match is skipped and said out loud, and an absent one is silent" {
-    // `redact.min_secret_bytes` exists for this: a short value appears inside
-    // ordinary words, inside hashes and inside base64, so matching it would fill
-    // every request with markers and teach an agent to distrust every marker it
-    // sees. Skipping is right and silence about skipping is not.
-    //
-    // Mutation check: drop the `tooShort` branch and a person with a four
-    // character credential believes it is protected when it is not.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23626,24 +16062,15 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     const short = "abc";
     const policy = try redactionFor(arena, "hub", short, &.{});
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
-    // Skipped means skipped: the policy changes no request at all, so nothing
-    // is half protected.
     try testing.expect(policy.isEmpty());
 
     const warned = said.err();
     try testing.expect(std.mem.indexOf(u8, warned, "hub") != null);
     try testing.expect(std.mem.indexOf(u8, warned, "not kept out") != null);
-    // **And it never prints the value.** A diagnostic carrying the credential
-    // would put it in the very place this exists to keep it out of.
     try testing.expect(std.mem.indexOf(u8, warned, short) == null);
 
-    // **An empty token is not a short credential.** An instance that needs no
-    // credential at all, which is every local provider somebody runs without
-    // auth, has nothing to protect and nothing to say about it.
     said.clear();
     const none = try redactionFor(arena, "local", "", &.{});
-    // The reserved slot alone, and it is empty, so this policy still changes
-    // nothing and warns about nothing.
     try testing.expectEqual(@as(usize, 1), none.secrets.len);
     try testing.expectEqualStrings("", none.secrets[0].value);
     try testing.expectEqual(@as(usize, 0), none.tooShort());
@@ -23652,14 +16079,6 @@ test "a credential nobody could match is skipped and said out loud, and an absen
 }
 
 test "no line this file writes about redaction can hold a credential" {
-    // The rule stated as a property rather than as one assertion about one
-    // sentence: whatever `redactionFor` says, and for whatever token, the token
-    // is not in it.
-    //
-    // **Every token below is a run of letters no English word holds**, and that
-    // is not fussiness: a one character token of `q` is inside the word
-    // "request", so a test using it would fail on a sentence that leaks nothing.
-    // The property is about the credential appearing, not about a letter.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23686,13 +16105,6 @@ test "no line this file writes about redaction can hold a credential" {
 }
 
 test "every credential the configuration holds is in the set, and not only the one in use" {
-    // A machine set up for a comparison run holds two live provider
-    // credentials, and only one of them is the one this session sends with.
-    // The other is just as real, and a tool result can echo it just as easily.
-    //
-    // Mutation check: drop the loop over `instances` in `redactionFor` and the
-    // second credential below is missing from the set, so it would reach the
-    // log whole.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23710,8 +16122,6 @@ test "every credential the configuration holds is in the set, and not only the o
             .name = "hub",
             .kind = .anthropic,
             .base_url = "https://example.invalid",
-            // The same session, reached through the store rather than the
-            // file, so this entry is a duplicate and must not be counted twice.
             .credential = .{ .token = in_use },
             .context_tokens = null,
             .capabilities = .{},
@@ -23728,7 +16138,6 @@ test "every credential the configuration holds is in the set, and not only the o
             .name = "by-path",
             .kind = .anthropic,
             .base_url = "https://example.invalid",
-            // A path and not a value. There is nothing here to add.
             .credential = .{ .token_file = "/run/secrets/spare" },
             .context_tokens = null,
             .capabilities = .{},
@@ -23744,7 +16153,6 @@ test "every credential the configuration holds is in the set, and not only the o
     };
 
     const policy = try redactionFor(arena, "hub", in_use, &instances);
-    // Two credentials, plus the reserved slot. See `redactionFor`.
     try testing.expectEqual(@as(usize, 3), policy.secrets.len);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
 
@@ -23758,17 +16166,10 @@ test "every credential the configuration holds is in the set, and not only the o
     try testing.expect(saw_in_use);
     try testing.expect(saw_idle);
 
-    // Two ordinary credentials say nothing at all.
     try testing.expectEqualStrings("", said.err());
 }
 
 test "a short credential on another provider is named, and the good one still works" {
-    // The short value rule holds over the whole set and not over the first
-    // entry alone. A value nobody can match safely is skipped, and the person
-    // who wrote it is told which provider it belongs to.
-    //
-    // Mutation check: warn on `policy.tooShort() != 0` with one line that names
-    // `instance_name` and the line names the wrong provider.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23792,26 +16193,16 @@ test "a short credential on another provider is named, and the good one still wo
 
     const policy = try redactionFor(arena, "hub", good, &instances);
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
-    // The one that can be matched still is, so a short value on one provider
-    // does not turn the whole policy off.
     try testing.expect(!policy.isEmpty());
 
     const warned = said.err();
     try testing.expect(std.mem.indexOf(u8, warned, "spare") != null);
     try testing.expect(std.mem.indexOf(u8, warned, "not kept out of this session's log") != null);
-    // The provider that is fine is not named, because nothing is wrong with it.
     try testing.expect(std.mem.indexOf(u8, warned, "hub") == null);
     try testing.expect(std.mem.indexOf(u8, warned, good) == null);
 }
 
 test "the broker is given the same values, without the ones nobody can match" {
-    // **The broker is a second writer into the one log**, and the loop's own
-    // funnel cannot reach it: `chock-broker` imports no `chock-core`. So the
-    // values travel, and `chock_broker.Broker.redaction` is what takes them.
-    //
-    // Mutation check: return `&.{}` from `brokerRedaction` and the count below
-    // fails. Drop the `min_secret_bytes` test there and the short value reaches
-    // a set that would fill every approval record with markers.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23836,42 +16227,25 @@ test "the broker is given the same values, without the ones nobody can match" {
     const policy = try redactionFor(arena, "hub", good, &instances);
     const values = try brokerRedaction(arena, policy);
 
-    // The one that can be matched, and only it. The short one was already said
-    // out loud by `redactionFor`, by the name of the provider it belongs to, so
-    // dropping it here is silent on purpose and not silent about nothing.
     try testing.expectEqual(@as(usize, 1), values.len);
     try testing.expect(std.mem.eql(u8, values[0], good));
     for (values) |value| try testing.expect(!std.mem.eql(u8, value, tiny));
     try testing.expect(std.mem.indexOf(u8, said.err(), "spare") != null);
 
-    // A session that resolved no credential hands the broker nothing, and a
-    // broker with nothing replaces nothing and copies nothing.
     const empty = try brokerRedaction(arena, .{});
     try testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "an org subagent ceiling binds this session, and it is the session's own limits that carry it" {
-    // **The wiring, and not only the fold.** `chock_policy.subagents` has its
-    // own tests for the minimum. What this one says is that the value a
-    // session runs on has been through it, which no test of the fold alone can
-    // say: see this project's own record of mechanisms that shipped with green
-    // tests and no caller.
-    //
-    // Mutation check: make `subagentsUnderOrg` answer `from_file` and the
-    // first two expectations fail.
     const capped: chock_policy.org.Bundle = .{ .subagents = .{ .max_depth = 3, .max_width = 2 } };
     const greedy = chock_policy.subagents.Limits{ .max_depth = 9, .max_width = 9 };
 
     const held = subagentsUnderOrg(greedy, &capped);
     try testing.expectEqual(@as(u16, 3), held.max_depth);
     try testing.expectEqual(@as(u16, 2), held.max_width);
-    // The source travels with the number, so the refusal a spawn reads names
-    // the bundle and not a file that does not hold this limit.
     try testing.expect(held.depth_from_org);
     try testing.expect(held.width_from_org);
 
-    // A bundle that sets no ceiling, and no bundle at all, both leave the
-    // project's own block exactly as it was written.
     const rules_only: chock_policy.org.Bundle = .{};
     const untouched = subagentsUnderOrg(greedy, &rules_only);
     try testing.expectEqual(@as(u16, 9), untouched.max_depth);
@@ -23883,17 +16257,6 @@ test "an org subagent ceiling binds this session, and it is the session's own li
 }
 
 test "an org bundle can stop every project starting a language server" {
-    // **The gap this closes.** `language_servers` was the one block of
-    // `chock.zon` with no lever at all: the command was read and started, and
-    // no rule and no bundle could refuse it. An organisation that had narrowed
-    // every other path had no say over which program ran beside its agent.
-    //
-    // **And it took no new bundle field.** Giving the act an action name is the
-    // whole of it, because the bundle's rules already fold over every action
-    // name there is. See `chock_core.lsp_driver.actionInto`.
-    //
-    // Mutation check: make `languageServerPermitted` answer true before it
-    // reads the table, and the second expectation fails.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23901,15 +16264,10 @@ test "an org bundle can stop every project starting a language server" {
 
     const zls: []const []const u8 = &.{"/nix/store/aaa/bin/zls"};
 
-    // A project with no `chock.zon` at all still starts its server, because
-    // `defaults.zig` ships `lsp.*` as `allow`. **Nothing changed for anybody**
-    // who already had one, which is what makes this safe to land.
     const own = try chock_policy.table.Table.parse(arena, ".{}", null);
     defer chock_policy.table.Table.destroy(arena, own);
     try testing.expect(try languageServerPermitted(arena, own, &.{}, "main", "a-model", zls));
 
-    // The same project, under an organisation that said no. The bundle is one
-    // more term of the minimum, so the project's own file cannot answer it.
     const bundle: []const chock_policy.table.Rule = &.{
         .{ .action = "lsp.*", .decision = .deny },
     };
@@ -23917,8 +16275,6 @@ test "an org bundle can stop every project starting a language server" {
     defer chock_policy.table.Table.destroy(arena, under);
     try testing.expect(!try languageServerPermitted(arena, under, &.{}, "main", "a-model", zls));
 
-    // And an organisation may permit one server and not another, which is what
-    // a label buys over a single on and off switch.
     const only_zls: []const chock_policy.table.Rule = &.{
         .{ .action = "lsp.*", .decision = .deny },
         .{ .action = "lsp.zls", .decision = .allow },
@@ -23937,12 +16293,6 @@ test "an org bundle can stop every project starting a language server" {
 }
 
 test "a language server whose program cannot be named in a rule does not start" {
-    // **Null from `actionInto` is a refusal and never a pass.** A caller that
-    // cannot build an action name cannot ask the table, and starting the
-    // program anyway would run something no rule could ever have named.
-    //
-    // Mutation check: make `languageServerPermitted` return true on the null
-    // arm and this fails.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23963,13 +16313,9 @@ test "a language server whose program cannot be named in a rule does not start" 
         "a-model",
         &.{"/opt/weird/node.js"},
     ));
-    // And the person is told why, rather than left with a server that quietly
-    // never started.
     try testing.expect(std.mem.indexOf(u8, said.err(), "cannot be one label") != null);
 }
 
-/// A closure that fetches from `count` distinct hosts, for a test that reads
-/// how many questions one build puts.
 fn manyHosts(arena: std.mem.Allocator, count: usize) ![]chock_nix.fetch.Fetch {
     const found = try arena.alloc(chock_nix.fetch.Fetch, count);
     for (found, 0..) |*slot, index| {
@@ -23985,15 +16331,11 @@ fn manyHosts(arena: std.mem.Allocator, count: usize) ![]chock_nix.fetch.Fetch {
 }
 
 test "a build that reaches many hosts puts one question, and one host reads as it always did" {
-    // **The fault this closes.** A nixpkgs closure reaches a hundred hosts,
-    // and a hundred questions is one decision and ninety nine keystrokes.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // No asker, so nothing is permitted and the refusal carries the words the
-    // question was put in.
     var gate = NixFetchGate{
         .gpa = gpa,
         .io = std.testing.io,
@@ -24003,14 +16345,10 @@ test "a build that reaches many hosts puts one question, and one host reads as i
     };
 
     const many = (try gate.gate().permitAll(arena, try manyHosts(arena, 12))).refused;
-    // One question, under two fixed segments, and it says how many.
     try std.testing.expect(std.mem.indexOf(u8, many, "nix.net.hosts") != null);
     try std.testing.expect(std.mem.indexOf(u8, many, "12 hosts") != null);
-    // And it names what was refused, so the model can ask for those hosts.
     try std.testing.expect(std.mem.indexOf(u8, many, "mirror0.example.com") != null);
 
-    // One host reads the way it always did: a list of one is a worse question
-    // than the sentence it replaces.
     const alone = (try gate.gate().permitAll(arena, try manyHosts(arena, 1))).refused;
     try std.testing.expect(
         std.mem.indexOf(u8, alone, "nix.net.build.com.example.mirror0.443") != null,
@@ -24060,32 +16398,21 @@ test "a host a rule allows is not in the question, and a host a rule denies need
         },
     };
 
-    // **Twelve hosts, two of which a rule already allows.** Those two are
-    // settled under their own names and never reach the question, so the
-    // question names ten.
     const all = try manyHosts(arena, 12);
     const without_denied = try arena.alloc(chock_nix.fetch.Fetch, 11);
     @memcpy(without_denied[0..2], all[0..2]);
     @memcpy(without_denied[2..], all[3..]);
 
     try std.testing.expect(try gate.gate().permitAll(arena, without_denied) == .permitted);
-    // One decision per host: two the table settled, and one question for the
-    // nine no rule covered.
     try std.testing.expectEqual(@as(usize, 3), arbitrator.asks);
     try std.testing.expectEqualStrings("nix.net.hosts", arbitrator.action.read());
-    // The detail carries the rule a project would write for each of them, so
-    // a person can stop being asked. Never in the prompt itself.
     try std.testing.expect(std.mem.indexOf(
         u8,
         arbitrator.detail.read(),
         ".{ .action = \"nix.net.build.com.example.mirror3.443\", .decision = .allow },",
     ) != null);
-    // And a host the table already allowed is not among them.
     try std.testing.expect(std.mem.indexOf(u8, arbitrator.detail.read(), "mirror0") == null);
 
-    // **A rule that denies is decided under its own name and never in the
-    // batch.** The words name the host the rule refused, so the model can ask
-    // for that one host rather than send the same attribute again.
     var refusing = CountingArbiter{ .permitted = false };
     gate.asker = refusing.asker(&log.locked);
     const denied = (try gate.gate().permitAll(arena, all[2..4])).refused;
@@ -24099,10 +16426,6 @@ test "a host a rule allows is not in the question, and a host a rule denies need
 }
 
 test "a nix host is read under two names, most specific first" {
-    // One rule can cover both phases and a phase rule can still narrow it.
-    // The table matches a name against itself or a trailing `.*`, so
-    // `nix.net.*.com.example.both.443` is a parse error and two lookups are
-    // what make a phase free rule possible at all.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -24164,7 +16487,6 @@ test "a nix host is read under two names, most specific first" {
         .port = 443,
     };
 
-    // The phase free name answers when no phase rule settles the host.
     try std.testing.expectEqual(
         chock_nix.fetch.RuleAnswer.allow,
         building.gate().ruleFor(wide),
@@ -24174,28 +16496,20 @@ test "a nix host is read under two names, most specific first" {
         evaluating.gate().ruleFor(wide),
     );
 
-    // The more specific wins when both match, in the narrowing direction.
     try std.testing.expectEqual(
         chock_nix.fetch.RuleAnswer.deny,
         building.gate().ruleFor(both),
     );
-    // And the build rule covers no eval fetch of the same host.
     try std.testing.expectEqual(
         chock_nix.fetch.RuleAnswer.allow,
         evaluating.gate().ruleFor(both),
     );
 
-    // A host neither name reaches is still a question.
     try std.testing.expectEqual(
         chock_nix.fetch.RuleAnswer.unsettled,
         building.gate().ruleFor(unnamed),
     );
 
-    // **An explicit `ask` is a decision and never a fall through.** The table
-    // answers `ask` both for a rule that says so and for a key nobody wrote
-    // about, and reading the wider name past the first would hand a silent
-    // yes to an author who asked to be prompted. `decideChain` is what tells
-    // the two apart.
     const reader = NixTableReader{
         .policy = table,
         .chain = &.{"main"},
@@ -24215,8 +16529,6 @@ test "a nix host is read under two names, most specific first" {
     ).?;
     try std.testing.expectEqual(chock_policy.table.Decision.ask, reader.decide(asked));
 
-    // The same order the other way: a narrow `allow` beats a wide `deny`,
-    // because the more specific name is the one the author meant.
     const narrow = chock_broker.network.nixActionsInto(
         &scoped,
         &either,
@@ -24235,8 +16547,6 @@ test "a nix host is read under two names, most specific first" {
         }),
     );
 
-    // Neither name is written, so the answer is the `ask` every uncovered key
-    // gets.
     const nobody = chock_broker.network.nixActionsInto(
         &scoped,
         &either,
@@ -24246,8 +16556,6 @@ test "a nix host is read under two names, most specific first" {
     ).?;
     try std.testing.expectEqual(chock_policy.table.Decision.ask, reader.decide(nobody));
 
-    // And the shipped defaults count as rules that name a key, so a project
-    // with no `chock.zon` is still decided rather than asked.
     const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
     const shipped = empty.decideChain(&.{"main"}, .{
         .agent_kind = "main",
@@ -24301,8 +16609,6 @@ test "a phase free rule settles a host before the batch question, and never afte
     try std.testing.expect(
         try gate.gate().permitAll(arena, try manyHosts(arena, 4)) == .permitted,
     );
-    // One decision for the host the phase free rule settled, and one question
-    // for the three no rule covered.
     try std.testing.expectEqual(@as(usize, 2), arbitrator.asks);
     try std.testing.expect(std.mem.indexOf(u8, arbitrator.detail.read(), "mirror0") == null);
 }
@@ -24356,8 +16662,6 @@ test "nix.net at deny stops an eval fetch, a build fetch, a mirror set and an op
         evaluating.gate().ruleFor(one),
     );
 
-    // The mirror set, the batch question and the fetch with no url are names
-    // under the same class, so one rule covers every request a build can make.
     const mirrors = [_]chock_nix.fetch.Mirror{
         .{ .base = "https://ftpmirror.gnu.org/", .url = "https://ftpmirror.gnu.org/a", .target = null },
     };
@@ -24384,8 +16688,6 @@ test "nix.net at deny stops an eval fetch, a build fetch, a mirror set and an op
 }
 
 test "a question carries the part of Chock that asked it" {
-    // An action name says what is wanted and never who wanted it, and a person
-    // answering `net.cyberelk` wants to know which it was.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -24425,15 +16727,11 @@ test "a question carries the part of Chock that asked it" {
     }});
     try std.testing.expectEqualStrings("a Nix flake input", arbitrator.source.read());
 
-    // The sandbox's own connections and the git shim each name themselves, and
-    // the three words are written in one place each.
     try std.testing.expectEqualStrings("the sandbox", chock_broker.network.request_source);
     try std.testing.expectEqualStrings("git", chock_broker.git_shim.request_source);
 }
 
 test "a git daemon host is named in the build namespace, with its own port" {
-    // `nix.net.build.org.sourceware.9418`, built by the same namer every other
-    // host goes through.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
