@@ -40,6 +40,14 @@
 //! are the ordinary `net.connect` ones: see `lib/chock-nix/fetch.zig` for what
 //! the reader finds and what it refuses to name.
 //!
+//! **A `mirror://` URL names a site, and the answer about it is pinned.** The
+//! site is turned into the mirrors the derivation's own mirrors file names,
+//! one of them is allowed, and `NIX_MIRRORS_<site>` in the environment `nix`
+//! runs with holds that one. Without the pin the build would ask about one
+//! host and the builder would walk its own list. `NIX_HASHED_MIRRORS` is
+//! pinned beside it, because the builder reaches a hashed mirror whatever the
+//! URLs say.
+//!
 //! **What is still not proven.** The builder runs on the host, under the
 //! host's Nix, and what it makes is its own business: this says what goes in,
 //! and never what comes out. A substituter may answer for an output path
@@ -55,6 +63,21 @@
 //! did not find is a host nobody was asked about. A host's Nix with `sandbox`
 //! off gives every builder the network, not only a fixed output one, and
 //! nothing here reads that setting.
+//!
+//! **A mirror pin holds because the builder reads it, and for no other
+//! reason.** `NIX_MIRRORS_<site>` and `NIX_HASHED_MIRRORS` are what the two
+//! nixpkgs `fetchurl` builders read, and both variables are in the
+//! derivation's own `impureEnvVars`. A fetcher that is not one of those two
+//! builders, or a later one that reads the variables differently, would walk
+//! its own list, and nothing here would know. `NIX_HASHED_MIRRORS` is turned
+//! off with a space rather than an empty string, which rests on the shell
+//! splitting that value into no words: see `fetch.hashed_mirrors_off`.
+//!
+//! **One answer covers a site for the whole closure.** Two derivations of one
+//! closure can name the same site and two different mirrors files, and the
+//! first file read is the one that answers. The pin is then a mirror the
+//! second derivation's own file may not hold, which can stop that fetch. It
+//! cannot widen one: every pinned mirror was allowed.
 //!
 //! **A store that cannot take the derivation stops the build.** The write
 //! goes through the host's Nix daemon, so a machine with no daemon builds
@@ -448,6 +471,10 @@ pub const Host = struct {
     refusal: []const u8 = "",
     /// The outputs the build produced, empty until it has.
     out_paths: []const []const u8 = &.{},
+    /// What `nix` is given on top of its own environment, so a builder cannot
+    /// walk a mirror list past the one host that was allowed. Filled by
+    /// `askAboutFetches` and read by `buildPaths`.
+    pins: []const provision.Variable = &.{},
 
     pub fn seam(self: *Host) backend.Seam {
         return .{ .context = self, .vtable = &vtable };
@@ -463,16 +490,13 @@ pub const Host = struct {
     /// hash is integrity and never egress, and this is where egress is
     /// decided.
     fn askAboutFetches(self: *Host, derivation_path: []const u8) anyerror!void {
-        switch (try fetch.fetchesOf(self.allocator, self.io, self.runner, derivation_path)) {
-            .fetches => |list| for (list) |one| {
-                switch (try self.gate.permit(self.allocator, one)) {
-                    .permitted => {},
-                    .refused => |why| {
-                        self.refusal = why;
-                        return FetchRefused.FetchNotPermitted;
-                    },
-                }
-            },
+        const reached = switch (try fetch.fetchesOf(
+            self.allocator,
+            self.io,
+            self.runner,
+            derivation_path,
+        )) {
+            .reached => |one| one,
             .unreadable => |one| {
                 self.refusal = try fetch.unreadableRefusal(self.allocator, one);
                 return FetchRefused.FetchNotPermitted;
@@ -481,7 +505,109 @@ pub const Host = struct {
                 self.refusal = try fetch.closureRefusal(self.allocator, derivation_path, said);
                 return FetchRefused.FetchNotPermitted;
             },
+        };
+
+        for (reached.hosts) |one| {
+            switch (try self.gate.permit(self.allocator, one)) {
+                .permitted => {},
+                .refused => |why| {
+                    self.refusal = why;
+                    return FetchRefused.FetchNotPermitted;
+                },
+            }
         }
+
+        var pins: std.ArrayList(provision.Variable) = .empty;
+        for (reached.sites) |one| {
+            const allowed = try self.chooseMirror(one);
+            try pins.append(self.allocator, .{
+                .name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "NIX_MIRRORS_{s}",
+                    .{one.site},
+                ),
+                .value = allowed,
+            });
+        }
+
+        // **Pinned for every closure that reads mirrors, whatever its URLs
+        // say.** The builder tries a hashed mirror on its own, so a value left
+        // alone is a host nobody named and nobody allowed.
+        if (reached.reads_mirrors) try pins.append(self.allocator, .{
+            .name = "NIX_HASHED_MIRRORS",
+            .value = try self.chooseHashedMirror(reached.hashed),
+        });
+
+        self.pins = try pins.toOwnedSlice(self.allocator);
+    }
+
+    /// The one mirror of `one` this build may use, as the file writes it.
+    ///
+    /// The mirrors are taken in the file's own order. A mirror a rule already
+    /// permits is taken with nobody asked, and otherwise the first mirror that
+    /// has a host at all is what is asked about. **One question for a site and
+    /// never one for each of its ten mirrors**, which is the same reason one
+    /// host is answered once however many derivations fetch it.
+    fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror![]const u8 {
+        for (one.mirrors) |mirror| {
+            const target = mirror.target orelse continue;
+            const asking = fetchOfMirror(one, mirror, target);
+            if (!self.gate.allowsByRule(asking)) continue;
+            switch (try self.gate.permit(self.allocator, asking)) {
+                .permitted => return mirror.base,
+                .refused => break,
+            }
+        }
+
+        for (one.mirrors) |mirror| {
+            const target = mirror.target orelse continue;
+            const asking = fetchOfMirror(one, mirror, target);
+            switch (try self.gate.permit(self.allocator, asking)) {
+                .permitted => return mirror.base,
+                .refused => |why| {
+                    self.refusal = try fetch.mirrorRefusal(
+                        self.allocator,
+                        one,
+                        target.host,
+                        why,
+                    );
+                    return FetchRefused.FetchNotPermitted;
+                },
+            }
+        }
+
+        self.refusal = try fetch.unreadableRefusal(self.allocator, .{
+            .subject = one.subject,
+            .url = one.url,
+            .site = one.site,
+            .why = .mirror_not_nameable,
+        });
+        return FetchRefused.FetchNotPermitted;
+    }
+
+    /// What `NIX_HASHED_MIRRORS` is pinned to.
+    ///
+    /// **Nobody is asked here, and a build is never refused for this.** No URL
+    /// of the derivation names a hashed mirror, so the model asked for nothing
+    /// that needs one, and a question about a host the request never mentioned
+    /// is a question with no answer a person can weigh. A rule that already
+    /// permits the host pins it, and everything else turns it off.
+    fn chooseHashedMirror(self: *Host, mirrors: []const fetch.Mirror) anyerror![]const u8 {
+        for (mirrors) |mirror| {
+            const target = mirror.target orelse continue;
+            const asking = fetch.Fetch{
+                .subject = "the hashed mirrors of this build",
+                .url = mirror.url,
+                .host = target.host,
+                .port = target.port,
+            };
+            if (!self.gate.allowsByRule(asking)) continue;
+            switch (try self.gate.permit(self.allocator, asking)) {
+                .permitted => return mirror.base,
+                .refused => break,
+            }
+        }
+        return fetch.hashed_mirrors_off;
     }
 
     fn buildPaths(
@@ -495,7 +621,7 @@ pub const Host = struct {
         // read below is of that object and of nothing the model named.
         try self.askAboutFetches(paths[0]);
 
-        const built = try self.runner.run(self.allocator, self.io, &.{
+        const built = try self.runner.runPinned(self.allocator, self.io, &.{
             "build",
             // No result symbolic link, for the reason `provision.resolve`
             // gives: the root a session needs is made by its caller, and a
@@ -503,7 +629,7 @@ pub const Host = struct {
             "--no-link",
             "--print-out-paths",
             self.derivation_outputs,
-        });
+        }, self.pins);
         if (!built.succeeded()) {
             self.said = provision.lastLine(built.stderr);
             return NixRefused.NixRefusedTheBuild;
@@ -511,6 +637,21 @@ pub const Host = struct {
         self.out_paths = try store.parsePathList(self.allocator, built.stdout);
     }
 };
+
+/// The question one mirror of a site puts: the derivation that fetches, the
+/// URL the builder would really use, and the host of it.
+fn fetchOfMirror(
+    site: fetch.MirrorSite,
+    mirror: fetch.Mirror,
+    target: fetch.Target,
+) fetch.Fetch {
+    return .{
+        .subject = site.subject,
+        .url = mirror.url,
+        .host = target.host,
+        .port = target.port,
+    };
+}
 
 /// One thing to realise.
 pub const Request = struct {
@@ -730,6 +871,12 @@ const AnsweringGate = struct {
     gpa: std.mem.Allocator,
     permitted: bool = true,
     asked: std.ArrayList([]const u8) = .empty,
+    /// The hosts a rule permits with nobody asked, which is what picks one
+    /// mirror of a site out of ten.
+    by_rule: []const []const u8 = &.{},
+    /// How many of the questions reached somebody, which is every one a rule
+    /// did not already answer.
+    prompted: usize = 0,
 
     fn deinit(self: *AnsweringGate) void {
         for (self.asked.items) |one| self.gpa.free(one);
@@ -740,7 +887,10 @@ const AnsweringGate = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: fetch.Gate.VTable = .{ .permit = permitFn };
+    const vtable: fetch.Gate.VTable = .{
+        .permit = permitFn,
+        .allows_by_rule = allowsByRuleFn,
+    };
 
     fn permitFn(
         ptr: *anyopaque,
@@ -749,12 +899,22 @@ const AnsweringGate = struct {
     ) std.mem.Allocator.Error!fetch.Verdict {
         const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
         try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
+        if (allowsByRuleFn(ptr, one)) return .permitted;
+        self.prompted += 1;
         if (self.permitted) return .permitted;
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s}, and this project allows no connection to it",
             .{ one.subject, one.url, one.host },
         ) };
+    }
+
+    fn allowsByRuleFn(ptr: *anyopaque, one: fetch.Fetch) bool {
+        const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
+        for (self.by_rule) |host| {
+            if (std.mem.eql(u8, host, one.host)) return true;
+        }
+        return false;
     }
 };
 
@@ -778,6 +938,9 @@ const FakeRunner = struct {
     replies: []const Reply,
     calls: usize = 0,
     seen: std.ArrayList([]const []const u8) = .empty,
+    /// What the last call was given on top of `nix`'s own environment, so a
+    /// test reads the pins rather than trusting that they were set.
+    seen_pins: std.ArrayList(provision.Variable) = .empty,
 
     const Reply = struct {
         code: u8 = 0,
@@ -791,6 +954,20 @@ const FakeRunner = struct {
             self.gpa.free(args);
         }
         self.seen.deinit(self.gpa);
+        for (self.seen_pins.items) |one| {
+            self.gpa.free(one.name);
+            self.gpa.free(one.value);
+        }
+        self.seen_pins.deinit(self.gpa);
+    }
+
+    /// The value pinned under `name` on the last call, or null when the last
+    /// call pinned nothing under it.
+    fn pin(self: *const FakeRunner, name: []const u8) ?[]const u8 {
+        for (self.seen_pins.items) |one| {
+            if (std.mem.eql(u8, one.name, name)) return one.value;
+        }
+        return null;
     }
 
     fn runner(self: *FakeRunner) provision.Runner {
@@ -804,6 +981,7 @@ const FakeRunner = struct {
         allocator: std.mem.Allocator,
         _: std.Io,
         args: []const []const u8,
+        pins: []const provision.Variable,
     ) provision.Error!proc.Output {
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
 
@@ -811,6 +989,11 @@ const FakeRunner = struct {
         errdefer self.gpa.free(copy);
         for (args, copy) |one, *slot| slot.* = try self.gpa.dupe(u8, one);
         try self.seen.append(self.gpa, copy);
+
+        for (pins) |one| try self.seen_pins.append(self.gpa, .{
+            .name = try self.gpa.dupe(u8, one.name),
+            .value = try self.gpa.dupe(u8, one.value),
+        });
 
         const reply = self.replies[self.calls];
         self.calls += 1;
@@ -1281,4 +1464,269 @@ test "a fixed output derivation with a scheme nothing can name refuses the build
     try testing.expect(std.mem.indexOf(u8, answer.refused, "ftp://files.example.com") != null);
     try testing.expectEqual(@as(usize, 1), fake.calls);
     try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
+}
+
+/// Write the real nixpkgs mirrors list into `tmp` and answer its absolute
+/// path, which the derivation of a test names as its own `mirrorsFile`.
+fn writeMirrorsList(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "mirrors-list",
+        .data = fetch.nixpkgs_mirrors_sample,
+    });
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(testing.io, &buffer);
+    return std.fmt.allocPrint(allocator, "{s}/mirrors-list", .{buffer[0..len]});
+}
+
+/// A closure of one `fetchurl` derivation that fetches from the `gnu` mirror
+/// site and names `mirrors_path`. The shape nixpkgs writes today, trimmed.
+fn closureFetchingAMirror(allocator: std.mem.Allocator, mirrors_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        \\{{"derivations":{{"b-src.drv":{{"env":{{"out":"/nix/store/x-src"}},
+        \\ "outputs":{{"out":{{"hash":"sha256-A","method":"flat"}}}},
+        \\ "structuredAttrs":{{"urls":["mirror://gnu/hello/hello-2.12.3.tar.gz"],
+        \\ "mirrorsFile":"{s}"}}}}}}}}
+    ,
+        .{mirrors_path},
+    );
+}
+
+/// Everything a mirror test needs: an evaluated derivation this session
+/// produced, and the closure `nix derivation show` answers for it.
+const MirrorCase = struct {
+    budget: Budget = .{},
+    recording: RecordingWriter,
+    writing: Writing = undefined,
+    driver: backend.Driver = undefined,
+    tmp: std.testing.TmpDir,
+    drv: []const u8 = "",
+    closure: []u8 = "",
+
+    fn start(gpa: std.mem.Allocator, arena: std.mem.Allocator) !*MirrorCase {
+        const self = try arena.create(MirrorCase);
+        self.* = .{ .recording = .{ .gpa = gpa }, .tmp = std.testing.tmpDir(.{}) };
+        self.writing = .{ .writer = self.recording.writer(), .budget = &self.budget };
+        self.driver = backend.Driver.init(gpa, self.writing.seam());
+        try evaluateDerivation(gpa, &self.driver);
+        self.drv = drvPathOf(&self.driver).?;
+        self.closure = try closureFetchingAMirror(arena, try writeMirrorsList(arena, &self.tmp));
+        return self;
+    }
+
+    fn deinit(self: *MirrorCase) void {
+        self.driver.deinit();
+        self.tmp.cleanup();
+    }
+};
+
+test "the mirror a rule already permits is the one taken, and nobody is asked about the site" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var case = try MirrorCase.start(gpa, arena);
+    defer case.deinit();
+
+    // The third mirror the file names for `gnu`, so taking it proves the whole
+    // list was read and not only its head.
+    var gate = AnsweringGate{
+        .gpa = gpa,
+        .permitted = false,
+        .by_rule = &.{"mirrors.kernel.org"},
+    };
+    defer gate.deinit();
+
+    var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+        .{ .stdout = case.closure },
+        .{ .stdout = example_out ++ "\n" },
+        .{ .stdout = example_out ++ "\n" },
+    } };
+    defer fake.deinit();
+
+    const answer = try realise(arena, testing.io, fake.runner(), &case.driver, gate.gate(), .{
+        .derivation_path = case.drv,
+        .installable = "/work#packages.x86_64-linux.default",
+    });
+
+    try testing.expect(answer == .built);
+    try testing.expectEqual(@as(usize, 0), gate.prompted);
+    try testing.expectEqualStrings(
+        "https://mirrors.kernel.org/gnu/",
+        fake.pin("NIX_MIRRORS_gnu").?,
+    );
+}
+
+test "with no rule the first mirror that can be named is asked about, and a no names the site" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var case = try MirrorCase.start(gpa, arena);
+    defer case.deinit();
+
+    var gate = AnsweringGate{ .gpa = gpa, .permitted = false };
+    defer gate.deinit();
+
+    var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+        .{ .stdout = case.closure },
+        .{ .stdout = example_out ++ "\n" },
+        .{ .stdout = example_out ++ "\n" },
+    } };
+    defer fake.deinit();
+
+    const answer = try realise(arena, testing.io, fake.runner(), &case.driver, gate.gate(), .{
+        .derivation_path = case.drv,
+        .installable = "/work#packages.x86_64-linux.default",
+    });
+
+    try testing.expect(answer == .refused);
+    // One question for the site and never one for each of its eight mirrors.
+    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    try testing.expectEqualStrings("ftpmirror.gnu.org", gate.asked.items[0]);
+    // The site and the host, because the person who can write the rule needs
+    // both: the site is what the derivation wrote.
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "gnu") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "ftpmirror.gnu.org") != null);
+    // One call, and it is the read. `nix` was never told to build.
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "the environment nix is given pins the site to the allowed mirror and nothing else" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var case = try MirrorCase.start(gpa, arena);
+    defer case.deinit();
+
+    var gate = AnsweringGate{ .gpa = gpa, .permitted = true };
+    defer gate.deinit();
+
+    var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+        .{ .stdout = case.closure },
+        .{ .stdout = example_out ++ "\n" },
+        .{ .stdout = example_out ++ "\n" },
+    } };
+    defer fake.deinit();
+
+    const answer = try realise(arena, testing.io, fake.runner(), &case.driver, gate.gate(), .{
+        .derivation_path = case.drv,
+        .installable = "/work#packages.x86_64-linux.default",
+    });
+
+    try testing.expect(answer == .built);
+    // The site and the hashed mirrors, and no other variable: this widens
+    // nothing the build did not already need decided.
+    try testing.expectEqual(@as(usize, 2), fake.seen_pins.items.len);
+    try testing.expectEqualStrings(
+        "https://ftpmirror.gnu.org/",
+        fake.pin("NIX_MIRRORS_gnu").?,
+    );
+}
+
+test "the hashed mirrors are turned off unless a rule allows their own host" {
+    // **A host that appears in no url of the derivation.** The builder tries a
+    // hashed mirror for every fetch, so a variable left alone reaches
+    // tarballs.nixos.org with nobody asked. It is never a question either: the
+    // model asked for nothing that names it.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    {
+        var case = try MirrorCase.start(gpa, arena);
+        defer case.deinit();
+
+        var gate = AnsweringGate{ .gpa = gpa, .permitted = true };
+        defer gate.deinit();
+
+        var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+            .{ .stdout = case.closure },
+            .{ .stdout = example_out ++ "\n" },
+            .{ .stdout = example_out ++ "\n" },
+        } };
+        defer fake.deinit();
+
+        const answer = try realise(arena, testing.io, fake.runner(), &case.driver, gate.gate(), .{
+            .derivation_path = case.drv,
+            .installable = "/work#a",
+        });
+        try testing.expect(answer == .built);
+        // Not the empty string: both builder shapes read this variable only
+        // when it is not empty, so empty would leave the file's own list in
+        // force. See `fetch.hashed_mirrors_off`.
+        try testing.expectEqualStrings(
+            fetch.hashed_mirrors_off,
+            fake.pin("NIX_HASHED_MIRRORS").?,
+        );
+        try testing.expect(fetch.hashed_mirrors_off.len != 0);
+    }
+
+    {
+        var case = try MirrorCase.start(gpa, arena);
+        defer case.deinit();
+
+        var gate = AnsweringGate{
+            .gpa = gpa,
+            .permitted = true,
+            .by_rule = &.{"tarballs.nixos.org"},
+        };
+        defer gate.deinit();
+
+        var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+            .{ .stdout = case.closure },
+            .{ .stdout = example_out ++ "\n" },
+            .{ .stdout = example_out ++ "\n" },
+        } };
+        defer fake.deinit();
+
+        const answer = try realise(arena, testing.io, fake.runner(), &case.driver, gate.gate(), .{
+            .derivation_path = case.drv,
+            .installable = "/work#a",
+        });
+        try testing.expect(answer == .built);
+        try testing.expectEqualStrings(
+            "https://tarballs.nixos.org",
+            fake.pin("NIX_HASHED_MIRRORS").?,
+        );
+    }
+}
+
+test "a closure that reads no mirrors file pins nothing at all" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+    try evaluateDerivation(gpa, &driver);
+    const drv = drvPathOf(&driver).?;
+
+    var gate = AnsweringGate{ .gpa = gpa, .permitted = true };
+    defer gate.deinit();
+
+    var fake = FakeRunner{ .gpa = gpa, .replies = &.{
+        .{ .stdout = closure_that_fetches },
+        .{ .stdout = example_out ++ "\n" },
+        .{ .stdout = example_out ++ "\n" },
+    } };
+    defer fake.deinit();
+
+    const answer = try realise(arena, testing.io, fake.runner(), &driver, gate.gate(), .{
+        .derivation_path = drv,
+        .installable = "/work#a",
+    });
+
+    try testing.expect(answer == .built);
+    try testing.expectEqual(@as(usize, 0), fake.seen_pins.items.len);
 }

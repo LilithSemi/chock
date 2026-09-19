@@ -231,9 +231,20 @@ that host rather than try the same attribute again. A URL whose scheme is not
 will not guess a port, and a fetch nobody can name is a fetch nobody can rule
 on.
 
-A `mirror://` URL is a refusal as well, and nixpkgs writes plenty of them. The
-real host is chosen from a list of mirrors while the build runs, so the
-derivation names no host at all, and Chock will not pick one for you.
+A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
+them. The derivation also names its own mirrors file, a store path that holds
+the mirrors of every site, so Chock reads that file and turns the site into the
+hosts it really names. One site is one question: the mirrors are taken in the
+file's own order, one your rules already allow is taken with nothing asked, and
+otherwise you are asked about the first of them. A site the file does not name,
+and a derivation with no mirrors file, stay refusals.
+
+The answer is then pinned into the environment `nix` runs with, as
+`NIX_MIRRORS_<site>`, so the builder uses the mirror you allowed instead of
+walking its own list. `NIX_HASHED_MIRRORS` is pinned beside it, because a
+nixpkgs fetcher tries a hashed mirror for every fetch and would otherwise reach
+a host that appears in no URL of the derivation. Only a rule can turn that one
+on, and it is off for every other build.
 
 A fixed output derivation that says nowhere it fetches from is a refusal for
 the same reason. Some fetchers read their URLs out of a lock file at build

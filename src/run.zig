@@ -4974,7 +4974,10 @@ const StartupFetchGate = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+    const vtable = chock_nix.fetch.Gate.VTable{
+        .permit = permitFn,
+        .allows_by_rule = allowsByRuleFn,
+    };
 
     fn permitFn(
         ptr: *anyopaque,
@@ -4992,6 +4995,28 @@ const StartupFetchGate = struct {
                 .{ one.subject, one.host },
             ) };
 
+        const decision = self.decisionFor(action);
+        if (decision == .allow) return .permitted;
+
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "the input {s} comes from {s}, and this project's policy answers {t} for {s}.",
+            .{ one.subject, one.host, decision, action },
+        ) };
+    }
+
+    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+        const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return false;
+        return self.decisionFor(action) == .allow;
+    }
+
+    fn decisionFor(
+        self: *const StartupFetchGate,
+        action: []const u8,
+    ) chock_policy.table.Decision {
         var fault: ?chock_policy.table.ChainFault = null;
         const decision = self.policy.evaluateChain(self.chain, .{
             .agent_kind = self.agent_kind,
@@ -5000,13 +5025,7 @@ const StartupFetchGate = struct {
             .action = action,
         }, &fault);
         if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
-        if (decision == .allow) return .permitted;
-
-        return .{ .refused = try std.fmt.allocPrint(
-            allocator,
-            "the input {s} comes from {s}, and this project's policy answers {t} for {s}.",
-            .{ one.subject, one.host, decision, action },
-        ) };
+        return decision;
     }
 };
 
@@ -11373,6 +11392,25 @@ const NixFetchGate = struct {
     /// the two questions this gate puts. The hosts, the namespace and the
     /// rules are the same for both.
     kind: Kind = .derivation,
+    /// The policy table, for the one question that must not prompt: which
+    /// mirror of a site a rule already permits. **Null answers no**, so a
+    /// session that wired none asks about the first mirror of the file rather
+    /// than taking one nobody answered for. See `Rule`.
+    rule: ?Rule = null,
+
+    /// What reads a rule without asking anybody.
+    ///
+    /// **The same table the arbiter reads, and never a second answer to the
+    /// same question.** What this picks still goes through `permit`, so the
+    /// broker decides and the log holds the answer. The shape is
+    /// `DevicePolicySeam`'s, and for the same reason: a decision this cheap
+    /// needs no question.
+    const Rule = struct {
+        policy: *const chock_policy.table.Table,
+        chain: []const []const u8,
+        agent_kind: []const u8,
+        model: []const u8,
+    };
 
     /// Which of a build's two fetches this question is about.
     const Kind = enum {
@@ -11388,7 +11426,29 @@ const NixFetchGate = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+    const vtable = chock_nix.fetch.Gate.VTable{
+        .permit = permitFn,
+        .allows_by_rule = allowsByRuleFn,
+    };
+
+    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+        const rule = self.rule orelse return false;
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return false;
+
+        var fault: ?chock_policy.table.ChainFault = null;
+        const decision = rule.policy.evaluateChain(rule.chain, .{
+            .agent_kind = rule.agent_kind,
+            .model = rule.model,
+            .tool = self.call.tool,
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        return decision == .allow;
+    }
 
     fn permitFn(
         ptr: *anyopaque,
@@ -11555,6 +11615,10 @@ const NixBuildToolRunner = struct {
     /// takes: a wiring this file forgot is a loud failure and never a silent
     /// connection. See `NixFetchGate`.
     asker: ?chock_core.arbiter.Asker = null,
+    /// What picks one mirror of a site out of the ten a mirrors file names,
+    /// with nobody asked. Null asks about the first of them instead, which is
+    /// safe and noisier. See `NixFetchGate.Rule`.
+    rule: ?NixFetchGate.Rule = null,
 
     fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
@@ -11690,6 +11754,7 @@ const NixBuildToolRunner = struct {
             .asker = self.asker,
             .installable = installable,
             .call = call,
+            .rule = self.rule,
         };
         var input_gate = NixFetchGate{
             .gpa = gpa,
@@ -11698,6 +11763,7 @@ const NixBuildToolRunner = struct {
             .installable = installable,
             .call = call,
             .kind = .flake_input,
+            .rule = self.rule,
         };
 
         const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
@@ -13634,6 +13700,14 @@ fn runSession(
     // happens inside the tool call. A runner left with no arbiter refuses
     // every build whose closure fetches anything. See `NixFetchGate`.
     nix_build.asker = .{ .arbiter = session_arbiter.arbiter() };
+    // And the table itself, for the one question that must not prompt: which
+    // mirror of a site a rule already permits. See `NixFetchGate.Rule`.
+    nix_build.rule = .{
+        .policy = started.policy,
+        .chain = try policyChain(provision_arena.allocator(), started, options),
+        .agent_kind = options.agent_kind,
+        .model = started.model,
+    };
 
     // **And what one approved push may reach.** Built here because it needs the
     // display, which is not known where `git_aware` itself is built, and it is

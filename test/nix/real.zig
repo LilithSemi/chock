@@ -108,7 +108,15 @@ const RecordingGate = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+    const vtable = chock_nix.fetch.Gate.VTable{
+        .permit = permitFn,
+        .allows_by_rule = allowsNothing,
+    };
+
+    /// This gate reads no rule, so every host it is given is asked about.
+    fn allowsNothing(_: *anyopaque, _: chock_nix.fetch.Fetch) bool {
+        return false;
+    }
 
     fn permitFn(
         ptr: *anyopaque,
@@ -340,6 +348,147 @@ test "a real closure holding a fixed output derivation names its host, and a no 
     // send the same attribute again.
     try testing.expect(std.mem.indexOf(u8, answer.refused, probe_host) != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, installable) != null);
+}
+
+/// A real mirrors list of this machine's own store, and the first `https`
+/// mirror it names for the `gnu` site. Null when the store holds none, which
+/// is a reason to skip: a file nothing read is not a file that was read.
+///
+/// **Found and not written.** A mirrors list this test made up would pin what
+/// somebody thought nixpkgs writes, and the whole point of this file is that
+/// the bytes are nixpkgs' own.
+fn findMirrorsList(arena: std.mem.Allocator, io: std.Io) !?struct {
+    path: []const u8,
+    first_gnu_host: []const u8,
+} {
+    var store = std.Io.Dir.cwd().openDir(io, "/nix/store", .{ .iterate = true }) catch return null;
+    defer store.close(io);
+
+    var walk = store.iterate();
+    while (walk.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, "-mirrors-list")) continue;
+
+        const path = try std.fmt.allocPrint(arena, "/nix/store/{s}", .{entry.name});
+        const text = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            arena,
+            .limited(chock_nix.fetch.max_mirrors_bytes),
+        ) catch continue;
+
+        const host = firstGnuHost(text) orelse continue;
+        return .{ .path = path, .first_gnu_host = host };
+    }
+    return null;
+}
+
+/// The host of the first `https` mirror the `gnu` site names in `text`, read
+/// by hand so that this test does not answer with the very parser it checks.
+fn firstGnuHost(text: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "_mirror_gnu=") == null and
+            !std.mem.startsWith(u8, line, "gnu=")) continue;
+
+        const mark = std.mem.indexOf(u8, line, "https://") orelse continue;
+        const rest = line[mark + "https://".len ..];
+        const end = std.mem.indexOfAny(u8, rest, "/ )") orelse rest.len;
+        if (end == 0) continue;
+        return rest[0..end];
+    }
+    return null;
+}
+
+/// One fixed output derivation that fetches through the `gnu` mirror site and
+/// names a real mirrors list of this machine.
+fn evaluateMirrorDerivation(
+    allocator: std.mem.Allocator,
+    driver: *chock_nix.backend.Driver,
+    mirrors_path: []const u8,
+) ![]const u8 {
+    var session = try chock_nix.eval.Session.init(allocator, .{
+        .store_writes = true,
+        .store_backend = driver.backend(),
+    });
+    defer session.deinit();
+
+    const expression = try std.fmt.allocPrint(
+        allocator,
+        "derivation {{ name = \"chock-mirror-probe\"; builder = \"/bin/sh\"; " ++
+            "system = \"{s}\"; outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; " ++
+            "outputHash = \"{s}\"; url = \"mirror://gnu/hello/hello-2.12.3.tar.gz\"; " ++
+            "mirrorsFile = \"{s}\"; }}",
+        .{ no_such_system, "0" ** 64, mirrors_path },
+    );
+    defer allocator.free(expression);
+
+    var buffer: [512]u8 = undefined;
+    const answer = try session.answer(&buffer, expression);
+    try session.ensureDerivation(answer.derivation_path.?);
+    return drvPathOf(driver).?;
+}
+
+test "a real mirrors list of this store turns the gnu site into one host, and a no names both" {
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const found = (try findMirrorsList(arena, io)) orelse return error.SkipZigTest;
+
+    var store_writer = chock_nix.build.DaemonWriter.connect(
+        gpa,
+        io,
+        chock_nix.build.default_daemon_socket,
+    ) catch return error.SkipZigTest;
+    defer store_writer.deinit();
+
+    var budget: chock_nix.build.Budget = .{};
+    var writing = chock_nix.build.Writing{
+        .writer = store_writer.writer(),
+        .budget = &budget,
+    };
+
+    var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+    const drv = evaluateMirrorDerivation(gpa, &driver, found.path) catch
+        return error.SkipZigTest;
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+
+    var gate = RecordingGate{ .gpa = gpa, .permitted = false };
+    defer gate.deinit();
+
+    const installable = "/nonexistent-flake-for-this-test#packages.x86_64-linux.default";
+    const answer = chock_nix.build.realise(
+        arena,
+        io,
+        host.runner(),
+        &driver,
+        gate.gate(),
+        .{ .derivation_path = drv, .installable = installable },
+    ) catch |err| switch (err) {
+        error.RunnerFailed => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // One question for a site that names eight mirrors, and it is the first
+    // one the real file holds.
+    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    try testing.expectEqualStrings(found.first_gnu_host, gate.asked.items[0]);
+
+    try testing.expect(answer == .refused);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, "gnu") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, found.first_gnu_host) != null);
 }
 
 /// Run `nix` with these arguments on this machine and answer what it wrote on

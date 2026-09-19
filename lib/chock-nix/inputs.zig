@@ -610,6 +610,7 @@ const FakeRunner = struct {
         allocator: std.mem.Allocator,
         _: std.Io,
         args: []const []const u8,
+        _: []const provision.Variable,
     ) provision.Error!@import("proc.zig").Output {
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
         const copy = try self.gpa.alloc([]const u8, args.len);
@@ -642,7 +643,16 @@ const AnsweringGate = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: fetch.Gate.VTable = .{ .permit = permitFn };
+    const vtable: fetch.Gate.VTable = .{
+        .permit = permitFn,
+        .allows_by_rule = allowsNothing,
+    };
+
+    /// No rule here at all, so no mirror of a site is taken without a
+    /// question. A flake input names a host and never a site.
+    fn allowsNothing(_: *anyopaque, _: fetch.Fetch) bool {
+        return false;
+    }
 
     fn permitFn(
         ptr: *anyopaque,

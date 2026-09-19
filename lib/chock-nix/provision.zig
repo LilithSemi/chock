@@ -115,6 +115,19 @@ pub fn installableFor(
     return std.fmt.allocPrint(allocator, "{s}#{s}", .{ registry, program });
 }
 
+/// One variable added to the environment of the `nix` this library runs.
+///
+/// **What makes an answer about a fetch true rather than advisory.** A
+/// nixpkgs `fetchurl` builder reads `NIX_MIRRORS_<site>` and
+/// `NIX_HASHED_MIRRORS` out of the environment `nix` itself runs with,
+/// because both are in the derivation's own `impureEnvVars`. So a mirror the
+/// policy allowed can be pinned there, and the builder cannot walk its own
+/// list past it. See `lib/chock-nix/fetch.zig`.
+pub const Variable = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 /// What runs `nix`.
 ///
 /// **A seam, because the thing on the other side of it is the Nix daemon.**
@@ -127,13 +140,15 @@ pub const Runner = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Run `nix` with these arguments and answer what it produced. The
-        /// output is owned by `allocator`.
+        /// Run `nix` with these arguments and these variables on top of its
+        /// own environment, and answer what it produced. The output is owned
+        /// by `allocator`.
         run: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
             io: std.Io,
             args: []const []const u8,
+            pins: []const Variable,
         ) Error!proc.Output,
     };
 
@@ -143,7 +158,19 @@ pub const Runner = struct {
         io: std.Io,
         args: []const []const u8,
     ) Error!proc.Output {
-        return self.vtable.run(self.ptr, allocator, io, args);
+        return self.vtable.run(self.ptr, allocator, io, args, &.{});
+    }
+
+    /// Run `nix` with `pins` in its environment. Every other variable is the
+    /// runner's own, and a pin with the name of one of those replaces it.
+    pub fn runPinned(
+        self: Runner,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        args: []const []const u8,
+        pins: []const Variable,
+    ) Error!proc.Output {
+        return self.vtable.run(self.ptr, allocator, io, args, pins);
     }
 };
 
@@ -177,6 +204,7 @@ pub const Host = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         args: []const []const u8,
+        pins: []const Variable,
     ) Error!proc.Output {
         const self: *Host = @ptrCast(@alignCast(ptr));
 
@@ -190,9 +218,19 @@ pub const Host = struct {
         try argv.append(allocator, self.nix_program);
         try argv.appendSlice(allocator, args);
 
+        // The host's own environment stays whole, so `nix` still reads the
+        // user's configuration and registry. A pin is added on top of it and
+        // lives only as long as this one call.
+        var pinned: ?std.process.Environ.Map = if (pins.len == 0) null else try pinnedEnv(
+            allocator,
+            self.env,
+            pins,
+        );
+        defer if (pinned) |*one| one.deinit();
+
         return proc.run(allocator, io, .{
             .argv = argv.items,
-            .env = self.env,
+            .env = if (pinned) |*one| one else self.env,
             // The same bound `store.closureOf` gives its own `nix path-info`:
             // a closure of thirty thousand paths is far below this, and a
             // `nix` that writes without end must not take the session's
@@ -208,6 +246,20 @@ pub const Host = struct {
         };
     }
 };
+
+/// A copy of `base` with `pins` written over it. The caller owns it and frees
+/// it with `deinit`.
+fn pinnedEnv(
+    allocator: std.mem.Allocator,
+    base: *const std.process.Environ.Map,
+    pins: []const Variable,
+) std.mem.Allocator.Error!std.process.Environ.Map {
+    var copy = std.process.Environ.Map.init(allocator);
+    errdefer copy.deinit();
+    for (base.keys(), base.values()) |name, value| try copy.put(name, value);
+    for (pins) |one| try copy.put(one.name, one.value);
+    return copy;
+}
 
 /// One program to provision.
 pub const Request = struct {
@@ -546,6 +598,9 @@ const FakeRunner = struct {
     seen: std.ArrayList([]const []const u8) = .empty,
     gpa: std.mem.Allocator,
     calls: usize = 0,
+    /// How many variables the last call pinned, which is what a test reads to
+    /// see that a caller that pins nothing really pins nothing.
+    last_pins: usize = 0,
 
     const Reply = struct {
         code: u8 = 0,
@@ -564,10 +619,12 @@ const FakeRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         args: []const []const u8,
+        pins: []const Variable,
     ) Error!proc.Output {
         _ = io;
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
         std.debug.assert(self.calls < self.replies.len);
+        self.last_pins = pins.len;
 
         const copy = try self.gpa.alloc([]const u8, args.len);
         for (args, copy) |from, *to| to.* = try self.gpa.dupe(u8, from);
