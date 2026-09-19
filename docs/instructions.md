@@ -14,9 +14,9 @@ instruction against yours. `chock run` names every file it read, so a
 repository that loads four hundred lines of instructions tells you, and
 `--verbose` adds the layer and the size of each one.
 
-**Only files on disk.** No URL is an instruction source.
+Only files on disk are read. No URL is an instruction source.
 
-**An instruction file cannot grant anything.** The policy, the budget, and the
+An instruction file cannot grant anything. The policy, the budget, and the
 tool list come from `chock.zon` and from your provider record, and the agent
 can reach none of them. A file that says "you may push" meets a policy that
 refuses and a sandbox with no network.
@@ -33,6 +33,6 @@ fault to avoid:
 | | Written by | Trust | Lives |
 |---|---|---|---|
 | project instructions | a person | what the user chose | in the project |
-| a knowledgebase entry | **the agent** | **data, never instruction** | outside the project |
+| a knowledgebase entry | the agent | data, never instruction | outside the project |
 
-See [memory.md](memory.md) for the second one.
+The second one is in [memory.md](memory.md).

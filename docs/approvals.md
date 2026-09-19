@@ -5,28 +5,23 @@ there is a moment at which a person can be asked. The broker knows eight
 actions: `git.commit`, `git.push`, `git.branch.delete`, `net.fetch`,
 `nix.build`, `file.write`, `workspace.apply` and `model.select`. It answers one
 more, `policy.widen`, which is a session asking to be let out of a promise it
-made to itself. What each one is allowed, denied or asked is the policy table
-in `chock.zon`. See [policy.md](policy.md).
+made to itself. The [policy table](policy.md) in `chock.zon` says which of them
+is allowed, denied or asked.
 
-**Two of these nine really put a question to a person in this release, and no
-more.** `workspace.apply` is asked at the end of a session, and again during
-one when the agent asks for it with `request_action`. `policy.widen` is asked
-during one. `net.fetch`, `nix.build` and `model.select` are each read before
-the work they govern, at a moment when nobody is waiting to answer, so `ask`
-is a refusal for all three. `git.commit`, `git.push`, `git.branch.delete` and
-`file.write` are rows the table can answer and nothing in a session asks them
-yet. See [status.md](status.md).
+Three of those are read before the work they govern, at a moment when nobody is
+waiting to answer, so `ask` is a refusal for `net.fetch`, `nix.build` and
+`model.select`. `workspace.apply` is asked at the end of a session, and again
+during one when the agent asks for it with `request_action`. `policy.widen` is
+asked during one.
 
-**A tool call is a different question, and it is gated too.** `gateToolCall`
-asks the same arbiter about every ordinary tool call now, so a project rule of
-`ask` on `call.write_file`, `exec.*`, or any other action `Tool.actionInto`
-names reaches a person mid session, not only `workspace.apply` and
-`policy.widen`. See [policy.md](policy.md) for the actions a tool call itself
-can name. A filtered tool call's own `net.connect.*` question reaches the same
-person too: a host no rule names answers `ask`, and that `ask` is a live
-question, not the refusal `net.fetch` still is. See
-[threat-model.md](threat-model.md) for the network descriptor every foreground
-tool call now holds, whether or not any host has been named.
+An ordinary tool call is gated as well. `gateToolCall` asks the same arbiter
+about every one, so a project rule of `ask` on `call.write_file`, `exec.*`, or
+any other action `Tool.actionInto` names reaches a person mid session. A
+filtered tool call's own `net.connect.*` question reaches the same person: a
+host no rule names answers `ask`, and that `ask` is a live question, not the
+refusal `net.fetch` is. [threat-model.md](threat-model.md) describes the
+network descriptor every foreground tool call holds, whether or not any host
+has been named.
 
 ## The one every project meets
 
@@ -65,8 +60,8 @@ refusal, and keeps the workspace.
 
 ### Where the work lands, and how to change it
 
-**By default an approved apply merges the work into the branch you have checked
-out**, and your working tree is updated to the result. The work is parked at
+By default an approved apply merges the work into the branch you have checked
+out, and your working tree is updated to the result. The work is parked at
 `refs/chock/<session>` first, always, so the ref is there whatever else happens
 and `git merge refs/chock/...` is always available to you.
 
@@ -87,13 +82,11 @@ Three modes and one question:
 | `squash` | parks the work, then puts all of it on that branch as one commit. |
 | `ask` | Chock asks you which of the three, at the moment of the apply. |
 
-**There is no mode that means "move nothing".** You already have two ways to say
-that, and both are better than a setting: answer `n` to the apply, or write
+There is no mode that means "move nothing". There are two ways to say that:
+answer `n` to the apply, or write
 `.{ .action = "workspace.integrate", .decision = .deny }` on the policy table.
-A mode of that name let you approve an apply and get less than the prompt had
-offered, which is how one session produced six approvals and six parks.
 
-**The prompt says which one you are approving.** The `summary` line names the
+The prompt says which one you are approving. The `summary` line names the
 landing and the branch, and the detail has a paragraph of its own about your
 branch: which branch, where it is, where it moves to, and what happens to your
 working tree. An apply that moves no branch says so in the same place, and says
@@ -104,26 +97,24 @@ Every mode parks the work at the ref first, so the ref is there whatever else
 happened. That is why `merge` is safe as the default: nothing is ever lost, and
 the fallback is one `git reset --hard` away.
 
-**Chock never leaves your repository in the middle of a merge.** The merge, the
+Chock never leaves your repository in the middle of a merge. The merge, the
 rebase and the squash are all built inside the session's own object store, with
 no index and no working tree involved, and the only thing that ever runs in your
 repository is a fast forward onto a clean tree. There is nothing to abort,
 because nothing was started.
 
-That means Chock decides **before it asks you** whether the integration is
-possible at all. When it is not, the prompt says so and the work waits at the
-ref instead. It refuses for these reasons, and each one is named in the prompt
-and in the log:
+So Chock decides before it asks you whether the integration is possible at all.
+When it is not, the prompt says so and the work waits at the ref instead. It
+refuses for these reasons, and each one is named in the prompt and in the log:
 
 - your working tree holds changes that are not committed, or files that are not
-  tracked;
-- the work and your branch change the same lines, so it would stop on a
-  conflict;
-- no branch is checked out;
-- a merge, a rebase, a cherry pick or a revert is unfinished there;
-- your branch moved between the question and your answer.
+  tracked
+- the work and your branch change the same lines, so it would stop on a conflict
+- no branch is checked out
+- a merge, a rebase, a cherry pick or a revert is unfinished there
+- your branch moved between the question and your answer
 
-**A refusal never loses the work and never refuses the apply.** The objects and
+A refusal never loses the work and never refuses the apply. The objects and
 the ref land exactly as they always do, which is the behaviour you already have
 a `git merge` for. Chock checks the same facts again immediately before it moves
 your branch, so a working tree you dirtied while reading the question parks the
@@ -146,11 +137,10 @@ chock run: put it back with `git reset --hard a1b2c3d...`.
 
 The session log carries the same fact as a `workspace.integrate` record: the
 mode, the policy answer that permitted it, the branch, where it moved from and
-to, and, when no branch moved, why. **A session is distinguishable afterwards by
-what happened to your branch.**
+to, and, when no branch moved, why.
 
-An organisation can close this road for every project at once with one policy
-rule. See [policy.md](policy.md).
+An organisation can close this road for every project at once with one
+[policy rule](policy.md#the-actions).
 
 ### The agent can ask for the same thing
 
@@ -159,8 +149,8 @@ rule. See [policy.md](policy.md).
 it, and you get the question above, with the agent's own reason in it, without
 waiting for the session to end. Everything else is identical: the same table
 decides, the same diff is shown, and the work lands on the same
-`refs/chock/<session>` ref. **An agent gains nothing by asking**, and in
-particular **it cannot choose how the work lands**. The mode comes from
+`refs/chock/<session>` ref. An agent gains nothing by asking, and it cannot
+choose how the work lands. The mode comes from
 `chock.zon` and from the policy row above it, both read outside the sandbox, and
 the one thing an agent fills in for an apply is its reason. There is no field of
 the request a mode could arrive in, and the build fails if one is ever added.
@@ -175,19 +165,19 @@ The session log is the truth of a session, and the loop holds that log's
 exclusive lock from the first turn to the last. So an answer cannot be
 appended by another process, and for a long time that meant no question could
 be asked while a session ran at all. The way through is the seam the broker
-already has: the wait for an answer happens **inside** the process that holds
-the lock, and the answer is appended through the same handle the question was
+already has: the wait for an answer happens inside the process that holds the
+lock, and the answer is appended through the same handle the question was
 written with. There is no second lock and no second open of the log.
 
 Three things can answer, and a session may have more than one of them:
 
-- **The terminal.** An interactive `chock run` prompts, as above.
-- **A unix socket beside the log.** `chock approve <session id>` attaches to a
+- The terminal. An interactive `chock run` prompts, as above.
+- A unix socket beside the log. `chock approve <session id>` attaches to a
   running session and answers what it asks. The socket serves the user that
   started the session and refuses every other peer, by the credential the
   kernel puts on the connection.
-- **The display.** Bare `chock` brings up a full screen interface, which reads
-  the log and writes the answer the same way the terminal path does.
+- The display. Bare `chock` brings up a full screen interface, which reads the
+  log and writes the answer the same way the terminal path does.
 
 ```
 chock approve                 # the newest session of this project
@@ -199,16 +189,15 @@ so and exits.
 
 ## Nobody at all is a refusal
 
-**A session with nobody at the keyboard and nobody attached is refused instead
-of asked.** A subagent and a session the daemon started are both spawned with
-no terminal, and a `chock run` whose standard input is a pipe has none either.
-With no client attached to its socket, such a session gets no waiting period
-at all: the question is refused at once rather than held open for five
-minutes. A hang would be worse than any of the available answers, because the
-session lock is held while it hangs.
+A session with nobody at the keyboard and nobody attached is refused instead of
+asked. A subagent and a session the daemon started are both spawned with no
+terminal, and a `chock run` whose standard input is a pipe has none either. With
+no client attached to its socket, such a session gets no waiting period at all:
+the question is refused at once rather than held open for five minutes. A hang
+would be worse than any of the available answers, because the session lock is
+held while it hangs.
 
-The rule holds throughout: **an approval nobody answers
-is a refusal.**
+An approval nobody answers is a refusal, everywhere.
 
 The way to say yes without a person there is a rule in `chock.zon`:
 

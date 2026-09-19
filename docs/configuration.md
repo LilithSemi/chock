@@ -1,7 +1,7 @@
 # Configuration
 
-Chock reads `~/.config/chock/config.zon` and **never writes it**, so you can
-give the whole directory to home-manager.
+Chock reads `~/.config/chock/config.zon` and never writes it, so you can give
+the whole directory to home-manager.
 
 ```zon
 .{
@@ -18,11 +18,11 @@ instance also needs a `base_url`.
 
 ## The name is the identity
 
-The **name** is the key and the kind is a property, so two accounts of one
-kind sit side by side with different names. Leave `.name` out and the kind
-becomes the name. **Two instances of one kind with no name are refused**, and
-the message says a name is needed, because silently replacing the first is how
-somebody loses a credential they cannot get back.
+The name is the key and the kind is a property, so two accounts of one kind sit
+side by side with different names. Leave `.name` out and the kind becomes the
+name. Two instances of one kind with no name are refused, and the message says a
+name is needed, because silently replacing the first is how somebody loses a
+credential they cannot get back.
 
 ## How much the model holds
 
@@ -34,8 +34,8 @@ Add `.context_tokens` to say how much the model behind an instance can hold:
 
 Chock then folds the middle of the context into a summary at three quarters
 of that, before a turn is sent. It tells the agent at three fifths, which is a
-turn or more earlier, so the agent can save what it learned first. **Leave it
-out and only the backstop runs**: a provider that refuses a request as too
+turn or more earlier, so the agent can save what it learned first. Leave it out
+and only the backstop runs: a provider that refuses a request as too
 large is compacted and the turn is taken again, rather than ending the
 session. Either way the session log keeps every turn, so a compaction shortens
 what the model reads and nothing else.
@@ -49,8 +49,8 @@ Every field of it defaults to false, and two instances of one kind may differ:
 .{ .name = "personal", .kind = "aiand", .capabilities = .{ .images = true } }
 ```
 
-A tool is offered to the model only when the adapter can express it **and**
-the provider instance does it.
+A tool is offered to the model only when the adapter can express it and the
+provider instance does it.
 
 ## Naming a credential
 
@@ -73,8 +73,8 @@ own address, because those two refuse every request that carries no
 credential. It refuses before it builds anything, so no workspace and no log
 are left behind.
 
-See [credentials.md](credentials.md) for where a lookup goes and what
-`chock login` writes.
+Where a lookup goes, and what `chock login` writes, is in
+[credentials.md](credentials.md).
 
 ## The machine's own resource limits
 
@@ -153,34 +153,33 @@ is a complete `chock.zon` with every block a first project needs:
 `.subagents` also takes `.max_depth`. Both default to 6. See
 [subagents.md](subagents.md).
 
-`.apply.mode` says how an approved apply lands. **It defaults to `merge`**,
-which parks the work at `refs/chock/<session>` and then merges it into the
-branch you have checked out. The approval prompt names the branch and the
-landing before you answer, so the `y` you give is a `y` to that act. There is no
-mode that means "move nothing": say `n` to the apply, or write the policy row
-below. See [approvals.md](approvals.md).
+`.apply.mode` says how an approved apply lands. It defaults to `merge`, which
+parks the work at `refs/chock/<session>` and then merges it into the branch you
+have checked out. The approval prompt names the branch and the landing before
+you answer, so the `y` you give is a `y` to that act. There is no mode that
+means "move nothing": say `n` to the apply, or write the policy row below.
+[approvals.md](approvals.md) shows both prompts.
 
-**A rule goes under `.policy.rules`, and never directly under `.policy`.**
+A rule goes under `.policy.rules`, and never directly under `.policy`.
 `.policy` is a struct with named fields, so a rule written beside `.agents` is
 a syntax error and the session does not start. Every block is optional: leave
 out the ones you do not want.
 
-**Every block of this file narrows what an agent may do, and two rows of the
-policy table widen.** `.{ .action = "sandbox.jit", .decision = .allow }` turns
-off the sandbox rule that refuses a page which is writable and executable, which
-a run time with a just in time compiler needs. It is a policy row and not a
-block of its own precisely because it widens: the table is where an organisation
-can forbid it and a project cannot take that back. See
-[sandbox.md](sandbox.md).
+Every block of this file narrows what an agent may do, and two rows of the
+policy table widen. `.{ .action = "sandbox.jit", .decision = .allow }` turns
+off the sandbox rule that refuses a page which is writable and executable,
+which a run time with a just in time compiler needs. It is a policy row and not
+a block of its own because it widens: the table is where an organisation can
+forbid it and a project cannot take that back.
 
 `workspace.integrate` is the other. `.apply.mode` above is the project's own
-taste, and this row is what says whether an approved apply may move a branch at
-all. An organisation that wants "never touch my branch automatically" writes
+taste, and this row says whether an approved apply may move a branch at all. An
+organisation that wants no branch touched automatically writes
 `.{ .action = "workspace.integrate", .decision = .deny }` once, in its bundle,
 and no project under it can move a branch whatever `.apply.mode` says. A row
 nobody wrote permits the mode, so a project on an installation with no bundle
-gets the mode it configured, and the default `merge` where it configured none.
-See [approvals.md](approvals.md).
+gets the mode it configured, and the default `merge` where it configured
+none.
 
 - [policy.md](policy.md) for the policy table and the denied paths.
 - [subagents.md](subagents.md) for the subagent limits.
@@ -188,7 +187,7 @@ See [approvals.md](approvals.md).
 
 ### When Chock refuses the file
 
-**A fault in `chock.zon` stops the session before the agent runs.** The message
+A fault in `chock.zon` stops the session before the agent runs. The message
 names the file, the line and the column.
 
 Chock reads the file as a whole, and reads the `deny_read` block, before it
@@ -209,12 +208,12 @@ block is not valid:
 1:18: error: unexpected field
 ```
 
-A message that says **`chock.zon is not valid`** is about the whole file, and
+A message that says `chock.zon is not valid` is about the whole file, and
 the fault can be in any block of it. A message that names a block, such as
 `the deny_read block is not valid` or `the budget block is not valid`, is
 about that block alone.
 
-**A project with no `chock.zon` has no spend cap.** The two defaults run in
+A project with no `chock.zon` has no spend cap. The two defaults run in
 opposite directions on purpose. An action no rule names resolves to `ask`, so a
 project that wrote no policy permits nothing by itself. A budget nobody wrote is
 no budget, so a session runs until it finishes. Write a `budget` block to bound

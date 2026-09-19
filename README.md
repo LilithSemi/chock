@@ -8,8 +8,8 @@ Zig 0.16 and builds with `zig build`.
 ## Why
 
 A coding agent runs commands, writes files, and wants to reach the network.
-Most harnesses ask the agent to be careful. **Chock takes the boundary out of
-the agent's hands.** On Linux a tool call gets a user namespace, a mount
+Most harnesses ask the agent to be careful. Chock takes the boundary out of the
+agent's hands. On Linux a tool call gets a user namespace, a mount
 namespace, a PID namespace, an IPC namespace and an empty network namespace,
 under Landlock and a system call filter, in a workspace that is a copy. On
 macOS it gets Seatbelt for paths, for the network and for signals, and Darwin's
@@ -18,7 +18,7 @@ filter, so Chock does not claim those two layers there. Your real project is
 never written by a tool call. A layer that fails to apply fails the tool call,
 and is never quietly skipped.
 
-The other half is that **every action is reviewable**. The session log is the
+The other half is that every action is reviewable. The session log is the
 session: every turn, every tool call, every approval and every cost is an
 event in it. What an agent may do is a static table in `chock.zon`. Chock reads
 that table from your project before the sandbox exists, and binds the file into
@@ -64,15 +64,15 @@ chock -- add a test for the parser  # the same task, with no subcommand
 chock                               # the interface, which asks for the task
 ```
 
-`chock doctor` measures each sandbox layer for real and says which are on.
+`chock doctor` tries each sandbox layer for real and says which are on.
 `chock run` names the session before it starts, and `chock run --verbose` adds
 the session log's path. Bare `chock` brings up a full screen interface and asks
 for the task in it.
 
-**A first word is read as a command name**, so a task given on the line goes
-after `--`. `chock fix the parser` is refused, because a typed `chock rnu`
-that quietly became a task would spend money on a typo. `chock -- fix the
-parser` runs, and so does `echo "fix the parser" | chock`.
+A first word is read as a command name, so a task given on the line goes after
+`--`. `chock fix the parser` is refused, because a typed `chock rnu` that
+quietly became a task would spend money on a typo. `chock -- fix the parser`
+runs, and so does `echo "fix the parser" | chock`.
 
 Name your providers in `~/.config/chock/config.zon`, which Chock reads and
 never writes. See [docs/configuration.md](docs/configuration.md).

@@ -1,6 +1,6 @@
 # The threat model
 
-**Chock assumes a hostile model, not a careless one.** `SECURITY.md` says it in
+Chock assumes a hostile model and not a careless one. `SECURITY.md` says it in
 one line: "Chock runs a language model that writes and runs code. The model is
 not trusted." The sandbox is not built to catch a mistake. It is built for a
 model that means to escape, whatever put that intent there: a prompt hidden in
@@ -9,17 +9,17 @@ behaviour with no outside cause at all. The document does not try to tell those
 apart, and neither does the sandbox. It treats every tool call as if it might
 be adversarial and holds the same layers either way.
 
-**A hostile repository is in scope only through the model.** Chock does not
-defend a maintainer against a pull request. It defends the rest of the machine,
-and the user's real project, against what a model does after it reads one. The
+A hostile repository is in scope only through the model. Chock does not defend
+a maintainer against a pull request. It defends the rest of the machine, and the
+user's real project, against what a model does after it reads one. The
 repository itself is never trusted with more than the workspace copy it is
 given, and the real project is never the thing a tool call writes to. See
 "Where the boundary is" in `SECURITY.md` and "The workspace" in
-`docs/sandbox.md`.
+[sandbox.md](sandbox.md).
 
-**A person approving an action is trusted, and the log that records the
-approval is the evidence, not the model's account of what happened.** See "A
-model's own statement about what it did is not evidence" in `SECURITY.md`.
+A person approving an action is trusted, and the log that records the approval
+is the evidence, not the model's account of what happened. See "A model's own
+statement about what it did is not evidence" in `SECURITY.md`.
 
 ## One attack, walked end to end
 
@@ -38,8 +38,8 @@ The function used to do this in two steps, each one by name:
    something is there and what kind it is.
 2. Call `mountCall` to bind the notice file onto that same path, again by name.
 
-**The window is between those two calls, and `mount` is what makes it
-dangerous.** `mount` follows a symbolic link at its target the same way `open`
+The window is between those two calls, and `mount` is what makes it dangerous.
+`mount` follows a symbolic link at its target the same way `open`
 does. If `.env` is a symlink whose target lies outside the workspace, either
 because the project shipped it that way or because a tool call earlier in the
 same session created it, the bind lands on whatever that link points to, not
@@ -49,7 +49,7 @@ being sequential does not by itself create the hole. What creates it is that
 each call resolves the name freshly, so nothing guarantees the second
 resolution lands on what the first one inspected.
 
-**Checking twice does not close this.** A caller might try `statx` before the
+Checking twice does not close this. A caller might try `statx` before the
 mount and `lstat` after, comparing the two, and conclude the mount is safe
 because both readings agree. That comparison only detects a change that
 already happened. It cannot stop the mount from being issued in the first
@@ -58,13 +58,13 @@ runs, independent of either check. Two name based checks around a
 name based mount are three name resolutions of the same mutable path, not one.
 Nothing pins any of them to the same inode.
 
-**The fix pins the inode before the mount, and never resolves the name
-again.** `pinDenyTarget` opens the target once with
+The fix pins the inode before the mount, and never resolves the name again.
+`pinDenyTarget` opens the target once with
 `O_PATH | O_CLOEXEC | O_NOFOLLOW`. `O_PATH` gets a descriptor without reading
 through the file. `O_NOFOLLOW` is supposed to refuse a symlink, and mostly
 does, but not at the last path component when `O_PATH` is also set:
 
-**`open` with `O_PATH | O_NOFOLLOW` on a symlink leaf succeeds.** It hands back
+`open` with `O_PATH | O_NOFOLLOW` on a symlink leaf succeeds. It hands back
 a descriptor on the link itself, not on whatever the link points to, and it
 does not fail. A caller that treats a clean return from that `open` as proof
 the target is an ordinary file is wrong, because a symlink leaf gives a clean
@@ -81,7 +81,7 @@ the original path string. `/proc/self/fd/N` names the exact inode the
 descriptor holds, so whatever the path `.env` resolves to by the time `mount`
 actually runs, the bind lands on the file that was checked and nothing else.
 
-**The source has no second name. The target still does.** `applyDenyMounts`
+The source has no second name. The target still does. `applyDenyMounts`
 passes the target path as a name, both to the `mount` call that makes the
 bind and again to `markReadOnly`, which remounts it read only afterward. A
 target renamed between those two calls does not reopen the hole this section
@@ -104,7 +104,7 @@ a relaxed hardening setting is a known, named trade a project made on purpose,
 not a broken sandbox.
 
 The write-and-execute rule in the seccomp filter is hardening, and
-`docs/sandbox.md` and `SECURITY.md`'s own scope list say so directly: a page
+[sandbox.md](sandbox.md) and `SECURITY.md`'s own scope list say so directly: a page
 that is both writable and executable is not, by itself, an escape. `chock
 doctor` reports a `write^execute` row in state `OFF`, with a note that this
 project's policy allowed it, when a project turns the rule off for a JIT
@@ -125,37 +125,37 @@ Landlock ruleset failed to load has no sandbox at all.
 
 ## What is not covered
 
-A threat model that only lists what holds is marketing. These are measured
-gaps, not a hedge.
+A threat model that only lists what holds is marketing. These are gaps that
+were found by trying, and not a hedge.
 
-**macOS has no system call filter, and this is permanent, not a missing
-feature.** `(deny syscall-unix (syscall-number 26))` compiles in a Seatbelt
+macOS has no system call filter, and this is permanent rather than a missing
+feature. `(deny syscall-unix (syscall-number 26))` compiles in a Seatbelt
 profile, applies with no error, and `ptrace` still returns 0. Only the
 blanket `(deny syscall-unix)` has any effect, and that also blocks `execve`,
-which every tool call needs to start a program at all. So the layer that
-caught an io_uring bypass on Linux, `docs/sandbox.md`'s own seccomp section,
-has nothing that plays its role on macOS.
+which every tool call needs to start a program at all. So the layer that caught
+an io_uring bypass on Linux, the seccomp section of
+[sandbox.md](sandbox.md), has nothing that plays its role on macOS.
 
-**macOS has no bind mount, so there is no capped scratch area.** Every path
+macOS has no bind mount, so there is no capped scratch area. Every path
 Chock would place under a mount point on Linux instead appears at its own
 real host path on macOS, because there is no `pivot_root` and no ordinary
 user can mount a filesystem to cap it. A file a tool call writes through
 `TMPDIR` or `CHOCK_SCRATCHPAD` survives the call. `lib/chock-core/scratchpad.zig`
 names both.
 
-**`sysctl-read` is granted by default on macOS, and a program can read the
-host process table through it.** `KERN_PROC_ALL` names every process on the
+`sysctl-read` is granted by default on macOS, and a program can read the host
+process table through it. `KERN_PROC_ALL` names every process on the
 machine, in one call, and the answer runs to roughly 192 kilobytes on an
 ordinary desktop. Darwin has no PID namespace to hide that table behind, and
 taking `sysctl-read` away breaks ordinary software that expects to enumerate
 processes, so it stays granted. The program still cannot act on any process
 it sees this way. It can only see that the process exists, under what name.
 
-**An MCP or plugin tool is decided twice: once at session start, and then on
-every call.** `chock_core.mcp.Session.admit` and
+An MCP or plugin tool is decided twice: once at session start, and then on
+every call. `chock_core.mcp.Session.admit` and
 `chock_core.plugin.Session.admit` read the policy table once, before
 `Loop.run` takes the session log's lock, against `mcp.<server>.tool.<tool>`
-and `plugin.<plugin>.tool.<tool>`. **Only a `deny` is spent there**, and it
+and `plugin.<plugin>.tool.<tool>`. Only a `deny` is spent there, and it
 keeps the tool out of the session entirely, so a denied tool costs no context
 and asks nobody. Every other answer leaves the tool offered and decided one
 call at a time: `chock_core.mcp.Session.dispatch` and
@@ -167,14 +167,14 @@ question is asked again on each call, `Broker.request` folds this session's
 own `restrict_self` promises in with `chock_policy.ratchet.narrow`, and a
 promise made half way through a session binds the very next call.
 
-**A session with nobody to ask runs no such tool at all.** The asker is
+A session with nobody to ask runs no such tool at all. The asker is
 filled in by `src/run.zig`, and the session log handle inside it arrives from
 `chock_core.Loop.GiveLocked` once the loop holds the lock. Until both are
 there, `chock_core.arbiter.Asker.decide` answers `not_asked`, which does not
 permit. So a wiring nobody finished is a supplier of tools that stops
 working, and never a tool that runs ungated.
 
-**Two limits stay.** A plugin tool's declared capabilities decide the import
+Two limits stay. A plugin tool's declared capabilities decide the import
 set the whole plugin is instantiated with, once, before any guest code runs,
 so a capability the table does not allow outright refuses the tool at load
 time rather than asking per call: an import cannot be taken back once
@@ -182,8 +182,8 @@ supplied. And the set of tools a session holds is still fixed at the start,
 so a server that gains a tool mid session is proposing a widening with
 nowhere to land.
 
-**As of this milestone, a foreground tool call holds a network descriptor
-whether or not any policy rule grants a host.** `lib/chock-core/tools.zig`
+A foreground tool call holds a network descriptor whether or not any policy
+rule grants a host. `lib/chock-core/tools.zig`
 gives every foreground tool call `Network.filtered` unconditionally, so the
 sandboxed process always has the one connected descriptor a filtered process
 uses to ask for a connection, even in a session whose policy table grants no
@@ -201,6 +201,6 @@ is reset to `Network.none` before it starts, because nothing today can carry
 an `ask` question out of a task with no turn of the loop waiting on it, and a
 language server gets `Network.none` because nothing it does needs a socket.
 
-If any of the five points above stop being true, this document is wrong until
-it is corrected. Each one was checked against the code, not carried forward
-from an earlier note.
+If any point above stops being true, this document is wrong until it is
+corrected. Each one was checked against the code, not carried forward from an
+earlier note.

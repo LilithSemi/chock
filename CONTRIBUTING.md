@@ -31,22 +31,22 @@ Chock runs a language model that writes and runs code. Four rules keep that
 safe, and a change that breaks one of them is wrong even when it compiles and
 passes.
 
-**A library never prints.** Nothing under `lib/` writes to a terminal. A library
+A library never prints. Nothing under `lib/` writes to a terminal. A library
 carries detail back through a `diag: ?*?Diagnostic` out parameter, and only
 `src/` prints, through the writers threaded down from `std.process.Init`. A
 library that prints cannot be used by the daemon, by a subagent, or by a test
 that must keep the build log silent.
 
-**The log is the truth.** The session log is append only. Each record carries a
+The log is the truth. The session log is append only. Each record carries a
 hash of the bytes of the record before it. Code that records what happened must
 write it before it is used, because a record written afterwards is a claim and
 not evidence.
 
-**A refusal is the safe answer.** An approval nobody answers is a refusal. A
+A refusal is the safe answer. An approval nobody answers is a refusal. A
 policy that cannot be read is a refusal. When you add a decision, make the
 failure path the one that does less.
 
-**Narrowing is free and widening is not.** The policy ratchet lets an agent give
+Narrowing is free and widening is not. The policy ratchet lets an agent give
 up permission by itself. Taking permission back needs authorisation. Keep that
 direction.
 
@@ -79,9 +79,9 @@ driver is selected at compile time on `builtin.os.tag`. Both drivers expose the
 same interface, so a caller never asks which platform it is on.
 
 A layer a platform cannot give answers `unsupported`, and a layer that is
-present but off answers `off`. **Never report that a layer holds when it does
-not.** A false report is worse than an honest refusal, because a refusal cannot
-mislead anybody.
+present but off answers `off`. Never report that a layer holds when it does not.
+A false report is worse than an honest refusal, because a refusal cannot mislead
+anybody.
 
 ### Documentation and comments: ASD-STE100
 
@@ -99,21 +99,21 @@ defence industry's Simplified Technical English standard:
 Chock has caught the same few faults many times. Each one passed review and
 passed its tests. Read this section before you write a test.
 
-**A test that asserts nothing.** More than a dozen have been found here. Prove
+A test that asserts nothing. More than a dozen have been found here. Prove
 your test can fail: break the behaviour, watch the test fail, name it, then put
 the behaviour back. Put that mapping in your pull request.
 
-**A fake that is too kind.** Chock once shipped a client that had never worked
+A fake that is too kind. Chock once shipped a client that had never worked
 against a real server, because both test servers accepted what no real one
 would. Test against the real thing where a real thing exists. A loopback server,
 a real language server, or a real card is worth more than a stand-in that agrees
 with you.
 
-**Built, tested, never wired.** A mechanism ships with green tests and no caller.
+Built, tested, never wired. A mechanism ships with green tests and no caller.
 No test catches this, because the tests all pass. When you add something, show
 where it is reached from.
 
-**Prose that expired.** A comment that was true when written and is false now.
+Prose that expired. A comment that was true when written and is false now.
 `test/docs/claims.zig` catches the mechanical half of this in the
 documentation: a command, an option, a subcommand word, a repository path, a
 name or a count that the code has not got. It reads the truth out of the code

@@ -1,8 +1,7 @@
 # A program the agent has not got
 
-An agent in a sandbox that wants a program it has not got runs `apt install` or
-`npm install -g`. Neither can work here, and the agent spends turns finding
-that out. Chock is built on Nix, so it answers the question instead: the agent
+An agent in a sandbox that wants a program it has not got runs `apt install`
+or `npm install -g`. Neither can work here. Chock is built on Nix, so the agent
 names a package, Chock realises it, and the program is on the `PATH` of every
 tool call after that one.
 
@@ -19,12 +18,11 @@ $ run_command {"argv":["rg","token","notes.txt"]}
 ## It is off until you turn it on
 
 Realising a package runs `nix build` on your machine, outside the sandbox, so
-it is checked against the same policy key the broker already has for that,
-`nix.build`. The answer decides whether the tool exists at all, so it is read
-before the tool list the model sees is built, which is before the session
-starts. A project with no `chock.zon` answers `ask` for every key, and
-an `ask` at that moment reaches nobody, so the tool is not offered. Turn it on
-with a rule:
+it is checked against the `nix.build` policy key. The answer decides whether
+the tool exists at all, so it is read before the tool list the model sees is
+built, which is before the session starts. A project with no `chock.zon`
+answers `ask` for every key, and an `ask` at that moment reaches nobody, so the
+tool is not offered. Turn it on with a rule:
 
 ```zon
 .{
@@ -56,7 +54,7 @@ minutes, and the turn waits for it, because the answer has to reach the mount
 set the very next tool call is built from and not the model. A line is printed
 before the wait so the terminal is not silent, and Ctrl-C reaches the `nix`
 child the same way it reaches a subagent. A build that never ends holds the
-session. See [status.md](status.md).
+session, which [status.md](status.md) lists as an open item.
 
 # Asking Nix what something is
 
@@ -71,12 +69,19 @@ $ nix_eval {"expression":"builtins.attrNames { a = 1; b = 2; }"}
   [ "a" "b" ]
 ```
 
+Chock evaluates with `fix`, which is a second implementation of the Nix
+language, and only a build uses the system's own Nix. So a value here can
+differ from the one `nix eval` gives. One difference to know about: a flake's
+own source, `self`, keeps the `.git` entry that Nix drops, so a derivation that
+runs git on `self` fails in the build with "not a git repository", and
+`lib.cleanSource self` avoids it.
+
 ## Nothing is built
 
-The expression is evaluated inside Chock, by the Nix evaluator it is built
-with, so no `nix` process starts and no store is opened. A derivation answers
-what it is and where its derivation file would be, because that path is
-computed from the derivation itself and is not looked up anywhere.
+The expression is evaluated inside Chock, by its own evaluator, so no `nix`
+process starts and no store is opened. A derivation answers what it is and
+where its derivation file would be, because that path is computed from the
+derivation itself and is not looked up anywhere.
 
 A build is a different act, and this tool does none. An expression that needs
 the result of a build, such as an import of a derivation, is refused, and the
@@ -166,17 +171,15 @@ and both have to be allowed before anything is built:
 
 A reference that is not your project is refused whatever those rules say, so
 the second rule narrows a subdirectory of your own tree and never widens to a
-foreign flake. One name holding both questions would not be a name: an
-attribute path and a flake reference are both dotted paths, and joined into one
-string a reference of four parts with an attribute of two writes exactly what a
-reference of three with an attribute of three writes.
+foreign flake. The two questions keep two names, because an attribute path and
+a flake reference are both dotted paths, and one joined string cannot say where
+the first ends.
 
-The derivation hash is in neither name. It changes on every edit of the Nix,
-so a rule keyed on one would be rewritten daily and everybody would write
-`nix.build.*` within a week. The rows answer the questions a person keeps: may
-this agent build this attribute, and from where.
-A revision or a `#fragment` on the reference is dropped before the name is
-built, because what a row grants is the repository and never the content.
+The derivation hash is in neither name, because it changes on every edit of the
+Nix. The rows answer the two questions a person keeps: may this agent build
+this attribute, and from where. A revision or a `#fragment` on the reference is
+dropped before the name is built, because what a row grants is the repository
+and never the content.
 
 ## What stops a build of anything else
 
@@ -228,19 +231,18 @@ A host nobody allowed refuses the build before `nix` is told to build anything,
 and the refusal names the host and the derivation, so the agent can ask you for
 that host rather than try the same attribute again.
 
-You are asked once for a build, not once per host. A nixpkgs closure reaches
-a hundred of them, and a hundred questions is one decision and ninety nine
-keystrokes. So Chock reads your rules for every host first: a host a rule
-allows is decided there and never appears in the question, and a host a rule
-denies refuses the build with nobody asked. Only the hosts no rule covers are
-left, and those go into one question, under `nix.fetch.hosts`, that says how
-many there are and names the first few. The detail key shows every one of them
+You are asked once for a build and not once per host, because a nixpkgs
+closure reaches a hundred of them. Chock reads your rules for every host first:
+a host a rule allows is decided there and never appears in the question, and a
+host a rule denies refuses the build with nobody asked. Only the hosts no rule
+covers are left, and those go into one question, under `nix.fetch.hosts`, that
+says how many there are and names the first few. The detail key shows every one of them
 beside the exact rule you would write to stop being asked. A yes covers the
 hosts of that question for that build and nothing after it.
 
 A URL whose scheme Chock does not read, and one with no host in it, are both
-refusals: Chock will not guess a port, and a fetch nobody can name is a fetch
-nobody can rule on. The schemes it reads, with the port each names when the URL
+refusals: Chock guesses no port, and a fetch nobody can name is a fetch nobody
+can rule on. The schemes it reads, with the port each names when the URL
 gives none, are `https` 443, `http` 80, `ftp` 21, `git` 9418 and `ssh` 22. A
 transport written in front of a URL, `git+https://` and `hg+https://` among
 them, is taken off and the URL behind it is read. So a rule for any of them
@@ -350,9 +352,9 @@ by every tool call after that one and is on their `PATH`, which is the same road
 a provisioned program takes. A background task or a subagent that was already
 running does not get it, and nothing survives the session.
 
-A program out of a build still asks under `exec.nix.store.*` when the agent runs
-it, and not under `exec.devshell.*`. The dev shell is the toolchain your project
-declared; a build is something the agent asked for, and the two are not the same
-class. See [policy.md](policy.md).
+A program out of a build asks under `exec.nix.store.*` when the agent runs it,
+and not under `exec.devshell.*`. The dev shell is the toolchain your project
+declared. A build is something the agent asked for, and the two are not the
+same class. [policy.md](policy.md) has both rows.
 
 The turn waits for the build, with no deadline, exactly as `provide_tool` does.

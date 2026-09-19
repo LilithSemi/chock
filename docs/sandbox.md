@@ -4,16 +4,15 @@ Every tool call runs inside a sandbox, in a throwaway copy of the project. Your
 real project is never written by a tool call. This page says what the boundary
 is made of.
 
-**The layers below are the Linux ones.** macOS builds the boundary a different
-way, out of Seatbelt, and it gives less. See
-[The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do) for what
-it holds and what it cannot.
+The layers below are the Linux ones. macOS builds the boundary out of Seatbelt,
+and it gives less. [The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do)
+says what it holds and what it cannot.
 
-**The layers are separate on purpose.** Each one is measured, each one can be
-absent on a given machine, and `chock doctor` says which are on. A red team run
-on 2026-08-22 set up an io_uring ring inside a tool call, which is the classic
-way past a system call filter, and the paths were still refused by Landlock and
-the network was still unreachable. That is what layers are for.
+The layers are separate on purpose. Each one is tested, each one can be absent
+on a given machine, and `chock doctor` says which are on. A red team run on
+2026-08-22 set up an io_uring ring inside a tool call, which is the classic way
+past a system call filter, and the paths were still refused by Landlock and the
+network was still unreachable. That is what layers are for.
 
 ## Namespaces
 
@@ -31,7 +30,7 @@ There is no UTS namespace and no cgroup namespace. `sethostname` is refused by
 the seccomp filter instead.
 
 After the `unshare`, Chock writes `setgroups=deny`, then maps your uid to
-itself and your gid to itself. **Nothing maps to root.**
+itself and your gid to itself. Nothing maps to root.
 
 The mount namespace is what lets the workspace appear at the project's own
 path, so a compiler that writes an absolute path into an error message writes
@@ -39,27 +38,27 @@ the path you would expect, and nothing else of the machine is in the tree.
 
 ## The network
 
-A tool call gets a fresh network namespace. **Nothing brings an interface up in
-it.** Chock configures no interface at all, so a call reaches no host.
+A tool call gets a fresh network namespace. Nothing brings an interface up in
+it. Chock configures no interface at all, so a call reaches no host.
 
 There are three modes, and a tool call gets the first:
 
 - `none`, the default. No route out at all.
-- `filtered`. The same closed namespace, plus one descriptor to a broker
-  passed in over a socket, so a named connection can be brokered against the
-  policy table. In practice this is set only when a rule allows an MCP
-  server's `net.connect`.
+- `filtered`. The same closed namespace, plus one descriptor to a broker passed
+  in over a socket, so a named connection can be brokered against the policy
+  table. In practice this is set only when a rule allows an MCP server's
+  `net.connect`.
 - `host`. The host's own namespace, with nothing removed. `chock doctor` uses
   this for its own probes.
 
 `fetch_url` does not work by opening the sandbox. The broker reads the page in
-a process the agent cannot reach, and the host is a row on the policy table.
-See [policy.md](policy.md).
+a process the agent cannot reach, and the host is a row on the
+[policy table](policy.md).
 
 So a program that opens a socket in a tool call fails. `ping` answers
-`socktype: SOCK_RAW` and exits 2, and `curl` cannot resolve a name. **That is
-the boundary and not a fault in the command.** Chock says so in a line of its
-own beside the result, because the program's own words do not.
+`socktype: SOCK_RAW` and exits 2, and `curl` cannot resolve a name. That is the
+boundary and not a fault in the command. Chock says so in a line of its own
+beside the result, because the program's own words do not.
 
 ## Landlock
 
@@ -67,8 +66,8 @@ Landlock is the kernel naming which paths a tool call may open, in the kernel
 rather than in Chock.
 
 Chock asks the kernel which ABI it has and takes the answer, rather than
-requesting a version. The ruleset then handles **every filesystem right that
-kernel knows**, masked to the ABI it reported, because an unhandled right stays
+requesting a version. The ruleset then handles every filesystem right that
+kernel knows, masked to the ABI it reported, because an unhandled right stays
 permitted everywhere. Rights the running kernel does not have are masked out of
 each rule and reported back, so a session on an older kernel says what it did
 not get.
@@ -77,7 +76,7 @@ Three grant sets are used: read only, read only for one regular file, and read
 and write. Only `LANDLOCK_RULE_PATH_BENEATH` rules are written.
 `PR_SET_NO_NEW_PRIVS` is set first.
 
-**A kernel with no Landlock is a hard failure, and not a quiet downgrade.**
+A kernel with no Landlock is a hard failure and not a quiet downgrade.
 `Sandbox.spawn` refuses rather than running a tool call with one layer silently
 missing.
 
@@ -87,7 +86,7 @@ The filter is a denylist. It reads the audit architecture first and kills a
 foreign one before it reads a system call number, and on x86_64 it kills an x32
 call as well.
 
-**31 calls are blocked, and a blocked call kills the process.** Not an errno: a
+31 calls are blocked, and a blocked call kills the process. Not an errno: a
 program that meant to escape does not get to handle the failure. The groups
 are:
 
@@ -101,64 +100,60 @@ are:
 - process introspection and injection: `ptrace`, `process_vm_readv`,
   `process_vm_writev`, `bpf`, `userfaultfd`
 - the machine: `reboot`, `syslog`, `sethostname`
-- `open_by_handle_at`. This one is measured belt and braces, not a hole
-  closed on faith: it reaches the kernel today and is already refused with
-  `EPERM` by the kernel's own capability check, because it needs
-  `CAP_DAC_READ_SEARCH` in the user namespace that owns the target
-  filesystem's superblock, and a process born from `CLONE_NEWUSER`, which
-  every sandboxed process here is, never holds a capability in an ancestor
-  namespace over an object that namespace owns. Measured directly, with a
-  small program run outside Chock entirely and again as a probe inside a
-  real sandbox: `EPERM`, both times, whether the caller is an ordinary user
-  or `root` inside a fresh `unshare -U -r`. `name_to_handle_at`, the call
-  that only encodes a handle and grants nothing on its own, is left
-  reachable.
+- `open_by_handle_at`. This one is belt and braces rather than a hole closed on
+  faith. It reaches the kernel today and is already refused with `EPERM` by the
+  kernel's own capability check, because it needs `CAP_DAC_READ_SEARCH` in the
+  user namespace that owns the target filesystem's superblock, and a process
+  born from `CLONE_NEWUSER`, which every sandboxed process here is, never holds
+  a capability in an ancestor namespace over an object that namespace owns. A
+  small program run outside Chock entirely, and again as a probe inside a real
+  sandbox, gets `EPERM` both times, whether the caller is an ordinary user or
+  `root` inside a fresh `unshare -U -r`. `name_to_handle_at`, the call that
+  only encodes a handle and grants nothing on its own, is left reachable.
 
-Two more rules inspect an argument and kill rather than answer `EPERM`,
-because each closes a boundary and not a cost:
+Two more rules inspect an argument and kill rather than answer `EPERM`, because
+each closes a boundary and not a cost:
 
-- `execveat`, when its `flags` argument sets `AT_EMPTY_PATH`. This is the
-  step that runs a file with no path at all: `memfd_create` makes an
-  anonymous file with no directory entry, and `execveat` with
-  `AT_EMPTY_PATH` can run it without ever naming one, so Landlock's
-  execute right, which attaches only to a path, has nothing to check.
-  Measured: before this rule existed, a ruleset granting a directory every
-  ordinary right except execute still let a process write those bytes into
-  a memfd and run them, right after the identical bytes on disk were
-  refused. `memfd_create` itself is left reachable: it grants nothing by
-  itself, and `strace` against Node, Python and Go each running an
-  ordinary program shows none of them calling either `memfd_create` or
-  `execveat` at all.
+- `execveat`, when its `flags` argument sets `AT_EMPTY_PATH`. This is the step
+  that runs a file with no path at all: `memfd_create` makes an anonymous file
+  with no directory entry, and `execveat` with `AT_EMPTY_PATH` can run it
+  without ever naming one, so Landlock's execute right, which attaches only to
+  a path, has nothing to check. Without this rule, a ruleset granting a
+  directory every ordinary right except execute still lets a process write
+  those bytes into a memfd and run them, right after the identical bytes on
+  disk are refused. `memfd_create` itself is left reachable: it grants nothing
+  by itself, and `strace` against Node, Python and Go each running an ordinary
+  program shows none of them calling either `memfd_create` or `execveat` at
+  all.
 - `socket`, when its `domain` argument is `AF_VSOCK`. Every other address
   family a tool call can reach answers to the network namespace
-  `namespace.enter` always builds. A vsock address names a hypervisor CID,
-  and the kernel does not consult the calling process's network namespace
-  to decide whether one is reachable, so on a host where the sandbox is
-  itself a VM guest, this is a channel to the hypervisor with no
-  `Network` mode and no policy rule in front of it. Codex already refuses
-  `AF_VSOCK` for the same reason, even when its own network policy allows
-  a connection.
+  `namespace.enter` always builds. A vsock address names a hypervisor CID, and
+  the kernel does not consult the calling process's network namespace to decide
+  whether one is reachable, so on a host where the sandbox is itself a VM
+  guest, this is a channel to the hypervisor with no `Network` mode and no
+  policy rule in front of it. Codex also refuses `AF_VSOCK` for this reason,
+  even when its own network policy allows a connection.
 
-**Three more calls are refused with `EPERM`, and io_uring is all three:**
+Three more are refused with `EPERM`, and io_uring is all three:
 `io_uring_setup`, `io_uring_enter`, `io_uring_register`. A ring lets a kernel
 worker perform the operation, so the filter never sees the system call at all.
 The refusal makes no ring, submits no operation, and gives no ring a buffer, so
-io_uring is exactly as unavailable as it was on the kill list. **The only thing
-that changed is that the process learns it was refused.**
+io_uring is exactly as unavailable as it was on the kill list. The one
+difference is that the process learns it was refused.
 
-The reason is measured on Node v24.19.0. libuv calls `io_uring_setup` six times
-while Node starts, before it runs one line, and `UV_USE_IO_URING=0` does not
-stop it. The probe is meant to fail on a kernel older than 5.1, and libuv then
-falls back to its thread pool. So Node does not need a ring: it needs the probe
-to fail survivably. A kill ended every Node, Deno and Bun program at startup and
-bought nothing, because a hostile program can simply not call io_uring.
+The reason is Node v24.19.0. libuv calls `io_uring_setup` six times while Node
+starts, before it runs one line, and `UV_USE_IO_URING=0` does not stop it. The
+probe is meant to fail on a kernel older than 5.1, and libuv then falls back to
+its thread pool. So Node does not need a ring: it needs the probe to fail
+survivably. A kill ended every Node, Deno and Bun program at startup and bought
+nothing, because a hostile program can simply not call io_uring.
 
 Four rules inspect an argument and answer `EPERM` instead of killing, so a
 program can recover: `personality` asking for `READ_IMPLIES_EXEC`, `shmat` with
 `SHM_EXEC`, and `mmap`, `mprotect` or `pkey_mprotect` asking for a page that is
-both writable and executable. **That last one raises a cost and is not a
-boundary**, and the code says so with three measured ways past it. io_uring
-being refused is the stronger statement.
+both writable and executable. That last one raises a cost and is not a
+boundary, and the code names three ways past it. io_uring being refused is the
+stronger statement.
 
 ### A project that needs a just in time compiler
 
@@ -177,42 +172,41 @@ policy table:
 }
 ```
 
-**It is a policy row and not a `chock.zon` key of its own, because it is the
-first setting that widens.** Every other knob on this page narrows. The table
-already folds an organisation's bundle over a project and a parent over a child,
-and that is exactly the question "who may widen this, and who authorises it". So
-three things come free:
+It is a policy row and not a `chock.zon` key of its own, because it is the one
+setting that widens. The table already folds an organisation's bundle over a
+project and a parent over a child, so three things come free:
 
 - An organisation forbids it for every project at once with
   `.{ .action = "sandbox.jit", .decision = .deny }` in its policy bundle. A
-  project cannot raise what the bundle lowered, because the answer is a minimum.
+  project cannot raise what the bundle lowered, because the answer is a
+  minimum.
 - A subagent holds no more than its parent.
 - `allow` and nothing else turns the rule off. An action nobody named answers
   `ask`, so a project that has never heard of this row keeps the hardening.
 
-**A session that gave the rule up says so, three times.** `chock run` prints a
+A session that gave the rule up says so, three times. `chock run` prints a
 warning at start, the session log carries a `sandbox.open` event naming
 `relaxed` and the policy answer behind it, and `chock doctor` reads the same
 rules and prints `write^execute OFF` before a session starts. Nothing else in
-the filter moves: every blocked call still kills, io_uring is still refused, and
-Landlock and the network namespace are untouched.
+the filter moves: every blocked call still kills, io_uring is still refused,
+and Landlock and the network namespace are untouched.
 
 ## The workspace
 
 The workspace is a throwaway copy, and the caller never chooses which kind it
 gets:
 
-- **A git project gets a linked git worktree**, detached at HEAD. A linked
-  worktree records nothing about the process that made it, so it costs no git
-  command to hand one to another process.
-- **Anything else gets an overlay**, with your project as the read only lower
+- A git project gets a linked git worktree, detached at HEAD. A linked worktree
+  records nothing about the process that made it, so it costs no git command to
+  hand one to another process.
+- Anything else gets an overlay, with your project as the read only lower
   layer. On Linux that is overlayfs. On Darwin it is a `clonefile` copy.
 
 By default the agent sees the committed state. `chock run --allow-dirty` copies
 your uncommitted work in as well.
 
-Work reaches your project only when the agent commits it in the workspace
-**and** the policy permits the apply. See [approvals.md](approvals.md).
+Work reaches your project only when the agent commits it in the workspace and
+the policy permits the apply, which [approvals.md](approvals.md) describes.
 
 ## What is in the tree, and what is not
 
@@ -222,48 +216,47 @@ path at its own path, so the rest of the Nix store is not there. `/proc` is a
 fresh procfs, read only, with 20 entries masked. `/run/chock/tasks` is read
 only, so an agent cannot edit its own evidence.
 
-**The credential store is never mounted in.** It is a file in the data
-directory, and no mount ever names that directory. Two per project
-subdirectories below it are mounted, the knowledgebase and the toolchain cache,
-and binding a subdirectory does not expose its parent. The knowledgebase is
-mounted for `read_memory` and `write_memory` and for no other call, so it is
-not merely read only to the rest of the sandbox: it is not there.
+The credential store is never mounted in. It is a file in the data directory,
+and no mount ever names that directory. Two per project subdirectories below it
+are mounted, the knowledgebase and the toolchain cache, and binding a
+subdirectory does not expose its parent. The knowledgebase is mounted for
+`read_memory` and `write_memory` and for no other call, so it is not merely
+read only to the rest of the sandbox: it is not there.
 
-**A tool call with a network takes `/etc` for itself.** The sandbox has a
-resolver of its own, and a program only finds it through `/etc/resolv.conf`, so
-Chock writes that file and two more. On a machine with no Nix the host's own
-`/etc` is in the mount set, because the CA certificates are there, and Chock
-does not own it. So a routed call puts an overlay on that directory: everything
-the host has stays readable at the same path with the same bytes, the three
-files Chock writes go into a layer the sandbox made, and nothing reaches the
-host. This is the one place a tool call needs rootless overlayfs on such a
-machine, and `chock doctor` says so on the `resolver files` row.
+A tool call with a network takes `/etc` for itself. The sandbox has a resolver
+of its own, and a program only finds it through `/etc/resolv.conf`, so Chock
+writes that file and two more. On a machine with no Nix the host's own `/etc`
+is in the mount set, because the CA certificates are there, and Chock does not
+own it. So a routed call puts an overlay on that directory: everything the host
+has stays readable at the same path with the same bytes, the three files Chock
+writes go into a layer the sandbox made, and nothing reaches the host. This is
+the one place a tool call needs rootless overlayfs on such a machine, and
+`chock doctor` says so on the `resolver files` row.
 
 The full list is in [toolchains.md](toolchains.md). Paths a project denies by
 name are covered before the workspace is built, and their bytes are not in the
-tree at all. See [policy.md](policy.md).
+tree at all.
 
 ## Limits
 
 Two mechanisms, and the smaller one always applies.
 
-**cgroup v2** is the better answer, and it needs the `memory` and `pids`
-controllers, both, delegated to a directory Chock can make its own below.
-Chock never writes `subtree_control` itself. It sets `memory.max`,
-`memory.swap.max` to zero, and `pids.max`. After a call ends it reads
-`memory.events` and `pids.events`, so a bare SIGKILL can be named for what it
-was.
+cgroup v2 is the better answer, and it needs the `memory` and `pids`
+controllers, both, delegated to a directory Chock can make its own below. Chock
+never writes `subtree_control` itself. It sets `memory.max`, `memory.swap.max`
+to zero, and `pids.max`. After a call ends it reads `memory.events` and
+`pids.events`, so a bare SIGKILL can be named for what it was.
 
 `cpu.max` is deliberately not set. It throttles rather than refuses, which
 turns a clear failure into a slow program that dies on the wall clock deadline
 instead.
 
-**cgroups are best effort and never a refusal to run.** A machine without them
+cgroups are best effort and never a refusal to run. A machine without them
 still gets the second mechanism, and `chock doctor` says which half it did not
 get.
 
-**The rlimit floor** needs nothing at all, so it always applies. It is set last
-in the child, immediately before the program runs.
+The rlimit floor needs nothing at all, so it always applies. It is set last in
+the child, immediately before the program runs.
 
 | Limit | Default |
 |---|---|
@@ -287,10 +280,9 @@ written next to it in the code.
 A project's `chock.zon` can lower any of these and can never raise one. It is
 the same ratchet the policy table keeps.
 
-**One setting widens, and it is not one of these.** The write and execute rule
-is given up with a row on the policy table and never with a key in this file:
-see "A project that needs a just in time compiler" above. That is where the
-ratchet already has an answer for who may widen a thing and who authorises it.
+One setting widens, and it is not one of these. The write and execute rule is
+given up with a row on the policy table and never with a key in this file. See
+"A project that needs a just in time compiler" above.
 
 ### A cgroup the caller made
 
@@ -303,21 +295,21 @@ Everything above is for the cgroup Chock makes. A program that embeds
 | the default | Chock | Chock | after the fork, first act of the child | the program runs with the rlimit floor |
 | a supplied cgroup | the caller | the caller | at creation | `spawn` refuses |
 
-**Chock writes no limit file into a cgroup it was given.** Not `memory.max`,
-not `memory.swap.max`, not `pids.max`. The caller owns that tree and the
-numbers in it, and a second writer is how two numbers stop agreeing. Chock
-reads nothing out of it either, so a program the caller's own `memory.max`
-killed arrives as a bare SIGKILL that Chock does not name. The caller holds
-that cgroup and can read its own `memory.events`.
+Chock writes no limit file into a cgroup it was given. Not `memory.max`, not
+`memory.swap.max`, not `pids.max`. The caller owns that tree and the numbers in
+it, and a second writer is how two numbers stop agreeing. Chock reads nothing
+out of it either, so a program the caller's own `memory.max` killed arrives as
+a bare SIGKILL that Chock does not name. The caller holds that cgroup and can
+read its own `memory.events`.
 
-**The process is created inside it, and is never outside it.** Linux does that
-with `clone3` and `CLONE_INTO_CGROUP`, which charges the new task to the
-destination cgroup as it makes it. The alternative, a write to `cgroup.procs`
-after the fork, leaves a window in which the child is in the caller's own
-cgroup, and a process that runs even briefly outside its cgroup can fork faster
-than the write that would contain it.
+The process is created inside it, and is never outside it. Linux does that with
+`clone3` and `CLONE_INTO_CGROUP`, which charges the new task to the destination
+cgroup as it makes it. The alternative, a write to `cgroup.procs` after the
+fork, leaves a window in which the child is in the caller's own cgroup, and a
+process that runs even briefly outside its cgroup can fork faster than the
+write that would contain it.
 
-**It refuses rather than degrades.** `CLONE_INTO_CGROUP` needs Linux 5.7. On an
+It refuses rather than degrades. `CLONE_INTO_CGROUP` needs Linux 5.7. On an
 older kernel, on a descriptor that is not a cgroup v2 directory, or where a
 seccomp filter answers `ENOSYS` for `clone3`, `spawn` answers
 `error.CgroupPlacementUnsupported` or `error.CgroupPlacementRefused` and starts
@@ -326,46 +318,43 @@ all and refuses such a config before it allocates anything.
 
 The limits report then reads `supplied` for the cgroup row, which says exactly
 what happened: the program is contained, and Chock wrote none of what contains
-it. Nothing in Chock itself uses this today. A tool call takes the default.
+it. Nothing in Chock itself uses this. A tool call takes the default.
 
 ## Device passthrough
 
-**Linux only.** `Sandbox.expresses.device_passthrough` answers `true` on
-Linux and `false` on macOS, and it stays that way: Darwin's driver reads the
-same config a device asks through and applies none of it, so a project that
-names a device on macOS gets no device and no crash, and no row for it in
-`chock doctor` either. See [The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do)
-below for what that build has instead.
+Device passthrough is Linux only.
+`Sandbox.expresses.device_passthrough` answers `true` on Linux and `false` on
+macOS, and it stays that way. Darwin's driver reads the same config a device
+asks through and applies none of it, so a project that names a device on macOS
+gets no device and no crash, and no row for it in `chock doctor` either.
 
 When a device is named in a project's `devices` block and let through by a
 `policy` rule, Chock binds its node into the sandbox by the same mechanism a
 workspace path gets: `mknodat` makes a placeholder and a bind mount lands the
-real node on top of it, read and write. See [policy.md](policy.md) for the
+real node on top of it, read and write. [policy.md](policy.md) has the
 two-block shape that has to agree before any of this runs.
 
-**The grant is the whole device, and never a part of it.** A device node is a
+The grant is the whole device, and never a part of it. A device node is a
 direct channel to a kernel driver, and most of what the sandbox reasons about
 does not reach past it. seccomp filters `ioctl` by its request number, and a
-filter has no way to read which file descriptor a call was made on, so "let
-the programmer's own ioctls through and refuse the disk's" is not a rule
-Chock, or seccomp itself, can write. A policy that allows
-`device.usb.1d50.6018` allows every operation that node's driver answers to,
-not a chosen subset of them.
+filter has no way to read which file descriptor a call was made on, so "let the
+programmer's own ioctls through and refuse the disk's" is not a rule Chock, or
+seccomp itself, can write. A policy that allows `device.usb.1d50.6018` allows
+every operation that node's driver answers to, not a chosen subset of them.
 
-**Chock grants nothing the person at the keyboard could not already open.**
-The node is bound in and the sandboxed program opens it under the same uid
-and the same file mode bits the node already has on the host. If the person
-running Chock is not in the `dialout` group, a program in the sandbox is not
-either, and no policy rule changes that: this is ordinary Unix file
-permission, working exactly as it does outside the sandbox, and it is not a
-control Chock adds.
+Chock grants nothing the person at the keyboard could not already open. The
+node is bound in and the sandboxed program opens it under the same uid and the
+same file mode bits the node already has on the host. If the person running
+Chock is not in the `dialout` group, a program in the sandbox is not either,
+and no policy rule changes that. This is ordinary Unix file permission, working
+exactly as it does outside the sandbox, and it is not a control Chock adds.
 
 ## The sandbox on macOS, and what it does not do
 
-**A session runs on macOS, with four layers on.** Seatbelt holds the paths, the
+A session runs on macOS, with four layers on. Seatbelt holds the paths, the
 network including unix sockets, the signals and shared memory. Darwin's own
 resource limits bound what a program can consume. The driver declares exactly
-four guarantees, and a test on a real Mac tries to break each one. See
+four guarantees, and a test on a real Mac tries to break each one, in
 `test/sandbox/darwin_escape.zig`:
 
 | Guarantee | On macOS |
@@ -374,34 +363,34 @@ four guarantees, and a test on a real Mac tries to break each one. See
 | `signal_isolated` | yes |
 | `ipc_isolated` | yes |
 | `path_restricted` | yes |
-| `syscall_restricted` | **no, and it is permanent** |
-| `workspace_mounted` | **no, and it is permanent** |
+| `syscall_restricted` | no, and it is permanent |
+| `workspace_mounted` | no, and it is permanent |
 | Mach services (`mach-lookup`) | yes, no opt in list needed |
 
-**The Mach services row is not one of the four declared guarantees, and it is
-in this table anyway.** No program a session starts can look up a Mach
-service by name, launchd's own bootstrap namespace included, unless a caller
-later widens `Options.mach_services`, which nothing does today. Measured on
-Apple Silicon, macOS 15.7.9, arm64, on 2026-09-05: a profile holding
-`(deny default)` and nothing naming `mach-lookup` at all already refuses a
-real, registered service, the same answer a profile spelling out
-`(deny mach-lookup)` gives, where the identical lookup outside any profile
-succeeds. See `test/sandbox/darwin_escape.zig`'s own mach-lookup tests.
+The Mach services row is not one of the four declared guarantees, and it is in
+this table anyway. No program a session starts can look up a Mach service by
+name, launchd's own bootstrap namespace included, unless a caller later widens
+`Options.mach_services`, which nothing does today. On Apple Silicon, macOS
+15.7.9, arm64, on 2026-09-05: a profile holding `(deny default)` and nothing
+naming `mach-lookup` at all already refuses a real, registered service, the
+same answer a profile spelling out `(deny mach-lookup)` gives, where the
+identical lookup outside any profile succeeds. See
+`test/sandbox/darwin_escape.zig`'s own mach-lookup tests.
 
-**A layer this driver reports as on, and does not enforce, is worse than a
-refusal.** A refusal cannot mislead anybody. Chock compares a policy against a
-driver and refuses a driver that claims too little, but it trusts a driver that
-claims too much. So every claim above comes from a measurement on Apple
-Silicon, macOS 15.7.9, arm64. Two layers were tried and then dropped:
+A layer this driver reports as on, and does not enforce, is worse than a
+refusal. Chock compares a policy against a driver and refuses a driver that
+claims too little, but it trusts a driver that claims too much. So every claim
+above comes from a run on Apple Silicon, macOS 15.7.9, arm64. Two layers were
+tried and then dropped:
 
-- **There is no system call filter.** `(deny syscall-unix (syscall-number 26))`
+- There is no system call filter. `(deny syscall-unix (syscall-number 26))`
   compiles, applies, and `ptrace` still returns 0. Only the blanket
   `(deny syscall-unix)` has an effect, and that stops `execve`, so it cannot be
   used.
-- **The other processes of the machine are not hidden.** A sandboxed program
-  reads the whole host process table through `sysctl KERN_PROC_ALL`, and taking
+- The other processes of the machine are not hidden. A sandboxed program reads
+  the whole host process table through `sysctl KERN_PROC_ALL`, and taking
   `sysctl-read` away stops ordinary software starting. Darwin has no PID
-  namespace. The program still cannot **act** on any process it sees.
+  namespace. The program still cannot act on any process it sees.
 
 ### What `spawn` refuses, and why a session still runs
 
@@ -418,11 +407,11 @@ before it allocates anything and before it forks:
 | a procfs mount | macOS has no procfs, and no PID namespace |
 | a capped scratch area | an ordinary user cannot mount a filesystem, so there is nothing to cap |
 
-The capped scratch area is refused and not quietly left out. A caller that asked
-for a bounded writable area and got an unbounded one would learn nothing until
-the disk filled.
+The capped scratch area is refused and not quietly left out. A caller that
+asked for a bounded writable area and got an unbounded one would learn nothing
+until the disk filled.
 
-**A config whose every path stays where it is does run.** That is what
+A config whose every path stays where it is does run. That is what
 `Layout.in_place` builds in `lib/chock-workspace/layout.zig`: the checkout, the
 project's own `.git` and the scratch object store each keep their real path, so
 the workspace becomes a set of rules instead of a set of mounts. This is why
@@ -439,9 +428,9 @@ survives the call. `chock doctor` reports both.
 chock doctor
 ```
 
-`chock doctor` measures each layer for real, in a forked child, because a user
-namespace and a seccomp filter cannot be undone. It does not infer anything
-from a kernel version.
+`chock doctor` tries each layer for real, in a forked child, because a user
+namespace and a seccomp filter cannot be undone. It infers nothing from a
+kernel version.
 
 | Row | Blocks a session |
 |---|---|
@@ -458,9 +447,9 @@ from a kernel version.
 | write^execute | no, it is hardening and not a boundary |
 | pidfd | yes |
 | disk cap tmpfs | yes |
-| overlayfs | no on its own; the resolver files row is where it stops a tool call |
+| overlayfs | no on its own. The resolver files row is where it stops a tool call |
 | cgroup v2, with the vantage it found | no, it degrades |
-| device passthrough | no; absent outright on a build with none, rather than reading unsupported |
+| device passthrough | no, and it is absent outright on a build with none rather than reading unsupported |
 | nix | no |
 | dev shell | no |
 | credential | yes, when one is configured and unreadable |
