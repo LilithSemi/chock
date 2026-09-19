@@ -883,6 +883,20 @@ test "a routed tool call gives the program a resolver it can read" {
     try std.testing.expect(std.mem.indexOf(u8, outcome.output, "nameserver ") != null);
 }
 
+/// Whether this machine has a trust store of its own to give a sandbox.
+fn hostHasTrustStore() bool {
+    for ([_][]const u8{
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    }) |candidate| {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        _ = std.Io.Dir.cwd().realPathFile(std.testing.io, candidate, &buffer) catch continue;
+        return true;
+    }
+    return false;
+}
+
 test "a routed tool call can read the trust store it was given" {
     // **A network it cannot verify anybody over is worse than no network.**
     // On a machine with Nix the sandbox binds `/nix/store` and no `/etc`, so
@@ -897,6 +911,13 @@ test "a routed tool call can read the trust store it was given" {
     // opened with `O_NOFOLLOW` and the usual path is a link.
     const allocator = std.testing.allocator;
     if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+    // **A machine with no bundle of its own has nothing to place.** A Nix
+    // build sandbox is such a machine: it holds no `/etc/ssl`, so this
+    // measures nothing there, and says so rather than reading its own empty
+    // hands as a fault of the code. The paths are spelled below, and not read
+    // from the code under test, for the reason the second half of this test
+    // gives about spelling a path here on purpose.
+    if (!hostHasTrustStore()) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
