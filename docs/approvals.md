@@ -55,6 +55,12 @@ line printed after a refusal says where. `chock approve`, answering over a
 socket instead of a keyboard, is never offered the session letter: only the
 terminal that holds the session's own lock can keep that promise.
 
+A question that comes from a part of Chock rather than from the agent's own
+tool call carries a `source` line naming it: the sandbox, a Nix build, a Nix
+flake input, git, an MCP server or a plugin. An action name alone does not say
+who wanted it, and the answer can turn on that. A host a Nix build wants is not
+a host your agent wants.
+
 Ctrl-C at the prompt ends the run with the question unanswered, which is a
 refusal, and keeps the workspace.
 

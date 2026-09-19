@@ -91,9 +91,16 @@ path it made that way is not the toolchain it was given. `exec.path.*`, a bare
 name looked up on `PATH`, and `exec.workspace.*`, a path inside the project,
 both answer `allow`.
 
-`net.connect.*` and `net.fetch.*` hold no shipped default, so a project that
-named nothing about a host meets `ask` there and never `allow`. What an `ask`
-on `net.connect.*` can reach is in [threat-model.md](threat-model.md).
+`net.connect.*`, `net.fetch.*` and `nix.net.*` hold no shipped default, so a
+project that named nothing about a host meets `ask` there and never `allow`.
+What an `ask` on `net.connect.*` can reach is in
+[threat-model.md](threat-model.md).
+
+Each of the three names one source. `net.connect` is the sandbox opening a
+socket, `net.fetch` is the `fetch_url` tool, and `nix.net` is a Nix build,
+which runs on your machine rather than in the sandbox. A host allowed for one
+is not allowed for the others. See [tools.md](tools.md) for the phases a build
+fetches in.
 
 ## Whether a session has a network at all
 

@@ -211,17 +211,37 @@ the hash of an innocuous file, passes the check, and the request has already
 gone out.
 
 So Chock reads the whole derivation closure first, finds every fixed output
-derivation in it, and asks about each host under the same `net.connect` rules
-every other connection uses:
+derivation in it, and asks about each host under `nix.net`:
 
 ```zon
-.{ .action = "net.connect.org.nixos.cache.*", .decision = .allow },
+.{ .action = "nix.net.org.nixos.cache.*", .decision = .allow },
 ```
 
-The labels are reversed there for the reason [policy.md](policy.md) gives,
-and there is no second namespace for a fetch: one rule says whether your
-agent may reach a host, whether a tool call, an MCP server or a build is what
-reaches it.
+The labels are reversed for the reason [policy.md](policy.md) gives. A build
+gets its own namespace because it is not your agent opening a socket.
+`net.connect` stays the sandbox's own connections and `net.fetch` stays the
+fetch tool, so a host you allow for a build is not a host your agent may reach.
+
+A build fetches in two phases. An input fetched so an expression can evaluate
+is `nix.net.eval`, and a derivation fetching while it builds is
+`nix.net.build`. A rule naming the phase decides for that phase alone, and a
+rule naming `nix.net` covers both:
+
+```zon
+.{ .action = "nix.net.com.github.443", .decision = .allow },
+.{ .action = "nix.net.eval.*", .decision = .allow },
+.{ .action = "nix.net.build.*", .decision = .ask },
+.{ .action = "nix.net.*", .decision = .deny },
+```
+
+The first names one host in either phase. The second lets inputs resolve. The
+third asks for everything a derivation fetches. The last turns off every
+network request a build can make, including the two below.
+
+The phase word sits where a reversed host's last label sits, so a host under a
+top level domain called `build` or `eval` shares a name with an ordinary host
+in that phase. `build` is delegated today. Chock accepts this rather than
+preventing it.
 
 This is the rule and not the router. A build runs on your machine, outside the
 sandbox, so `.policy.net.router` says nothing about it: the rules are what
@@ -235,7 +255,7 @@ You are asked once for a build and not once per host, because a nixpkgs
 closure reaches a hundred of them. Chock reads your rules for every host first:
 a host a rule allows is decided there and never appears in the question, and a
 host a rule denies refuses the build with nobody asked. Only the hosts no rule
-covers are left, and those go into one question, under `nix.fetch.hosts`, that
+covers are left, and those go into one question, under `nix.net.hosts`, that
 says how many there are and names the first few. The detail key shows every one of them
 beside the exact rule you would write to stop being asked. A yes covers the
 hosts of that question for that build and nothing after it.
@@ -246,8 +266,8 @@ can rule on. The schemes it reads, with the port each names when the URL
 gives none, are `https` 443, `http` 80, `ftp` 21, `git` 9418 and `ssh` 22. A
 transport written in front of a URL, `git+https://` and `hg+https://` among
 them, is taken off and the URL behind it is read. So a rule for any of them
-looks like any other: `net.connect.org.gmplib.ftp.21`,
-`net.connect.org.sourceware.9418`.
+looks like any other: `nix.net.org.gmplib.ftp.21`,
+`nix.net.org.sourceware.9418`.
 
 A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
 them. The derivation also names its own mirrors file, a store path that holds
@@ -262,6 +282,18 @@ file's own order, one your rules already allow is taken with nothing asked, and
 otherwise you are asked about the first of them. A site the file does not name,
 and a derivation with no mirrors file, stay refusals.
 
+A site is named with the hash of its own mirror list, so a rule says which
+mirrors you agreed to and not merely which site:
+
+```zon
+.{ .action = "nix.net.build.mirrors.gnu.*", .decision = .allow },
+```
+
+The wildcard trusts gnu's mirrors across revisions of the list. Naming the hash
+instead pins the rule to one list, and a nixpkgs that changes gnu's mirrors
+asks again. The hash covers that site alone, so changing another site's mirrors
+leaves this rule alone.
+
 The answer is then pinned into the environment `nix` runs with, as
 `NIX_MIRRORS_<site>`, so the builder uses the mirror you allowed instead of
 walking its own list. `NIX_HASHED_MIRRORS` is pinned beside it, because a
@@ -270,10 +302,10 @@ a host that appears in no URL of the derivation. Only a rule can turn that one
 on, and it is off for every other build.
 
 A fixed output derivation that says nowhere it fetches from is a different
-question, `nix.fetch.opaque`. Some fetchers read their URLs out of a lock file
+question, `nix.net.build.opaque`. Some fetchers read their URLs out of a lock file
 at build time, `zig.fetchDeps`, npm deps and `fetchCargoVendor` among them, and
 those hold no URL anywhere in the derivation. There is no host, so there is
-nothing `net.connect` can name.
+nothing a rule could name.
 
 Chock ships that one as `allow`, because that is how every vendored
 dependency fetch works: refusing them refuses nearly every Rust, Node and Zig
@@ -286,11 +318,11 @@ ones the derivation expected, and proves nothing about where the request went.
 If you want the question back, write it in your own `chock.zon`:
 
 ```zon
-.{ .action = "nix.fetch.opaque", .decision = .ask },
+.{ .action = "nix.net.build.opaque", .decision = .ask },
 ```
 
 `.deny` refuses such a build outright. Every derivation that does name a URL is
-unaffected either way and still goes to `net.connect` per host.
+unaffected either way and still goes to `nix.net` per host.
 
 The rule is all of it, and there is no backstop under it. Nix has no flag
 that keeps a fixed output builder off the network. `--offline` turns your
@@ -308,7 +340,7 @@ expression asks for, so a flake input reaches it one way: it is in your store
 before the session starts.
 
 `chock run` reads your project's `flake.lock` at startup, names every host the
-inputs would be fetched from, and puts each one to the same `net.connect` rules
+inputs would be fetched from, and puts each one to the `nix.net.eval` rules
 above. One question per host, whatever number of inputs share it. A `github`
 input with no host of its own is fetched from `api.github.com`, which redirects
 to `codeload.github.com`, so both are named. A lock file sits in your project
@@ -325,10 +357,10 @@ a port.
 
 A startup `ask` is not a permanent no. A build is a turn the agent took, so
 there is somebody at the prompt. When the evaluation for a build finds an input
-missing, Chock puts that input's hosts to you under the same `net.connect`
+missing, Chock puts that input's hosts to you under the same `nix.net.eval`
 rules, fetches what you allow, and evaluates once more. One retry, never a
 loop: a second miss is the answer. That is why a project that has written no
-`net.connect` rule can still build, and why one that has written its rules pays
+`nix.net` rule can still build, and why one that has written its rules pays
 nothing at build time, because its inputs arrived at startup and the build never
 asks.
 
