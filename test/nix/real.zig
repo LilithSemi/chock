@@ -59,6 +59,73 @@ fn evaluateDerivation(
     return drvPathOf(driver).?;
 }
 
+/// One fixed output derivation, which is the kind Nix builds with the network
+/// open to it. The URL is a host nothing here ever reaches: the point is that
+/// the real `nix derivation show -r` names it and the reader finds it.
+fn evaluateFetchDerivation(
+    allocator: std.mem.Allocator,
+    driver: *chock_nix.backend.Driver,
+    name: []const u8,
+) ![]const u8 {
+    var session = try chock_nix.eval.Session.init(allocator, .{
+        .store_writes = true,
+        .store_backend = driver.backend(),
+    });
+    defer session.deinit();
+
+    const expression = try std.fmt.allocPrint(
+        allocator,
+        "derivation {{ name = \"{s}\"; builder = \"/bin/sh\"; system = \"{s}\"; " ++
+            "outputHashMode = \"flat\"; outputHashAlgo = \"sha256\"; " ++
+            "outputHash = \"{s}\"; url = \"{s}\"; }}",
+        .{ name, no_such_system, "0" ** 64, probe_url },
+    );
+    defer allocator.free(expression);
+
+    var buffer: [512]u8 = undefined;
+    const answer = try session.answer(&buffer, expression);
+    try session.ensureDerivation(answer.derivation_path.?);
+    return drvPathOf(driver).?;
+}
+
+/// The URL the fixed output probe fetches from, and the host inside it.
+const probe_url = "https://files.chock-test.invalid/probe.tar.gz";
+const probe_host = "files.chock-test.invalid";
+
+/// A `chock_nix.fetch.Gate` that answers the same way about every host and
+/// records what it was asked.
+const RecordingGate = struct {
+    gpa: std.mem.Allocator,
+    permitted: bool,
+    asked: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *RecordingGate) void {
+        for (self.asked.items) |one| self.gpa.free(one);
+        self.asked.deinit(self.gpa);
+    }
+
+    fn gate(self: *RecordingGate) chock_nix.fetch.Gate {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+
+    fn permitFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        one: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *RecordingGate = @ptrCast(@alignCast(ptr));
+        try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
+        if (self.permitted) return .permitted;
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} fetches {s} from {s}, and no rule allows it",
+            .{ one.derivation, one.url, one.host },
+        ) };
+    }
+};
+
 /// The one derivation path `driver` holds.
 fn drvPathOf(driver: *chock_nix.backend.Driver) ?[]const u8 {
     var keys = driver.paths.keyIterator();
@@ -141,11 +208,21 @@ test "a real nix that will not build answers in its own words, and the model rea
 
     var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
 
+    // Nothing of this closure fetches, so this gate is never asked. It is here
+    // rather than the refusing one so that a reader that found a host would
+    // fail the test below rather than pass it for the wrong reason.
+    var gate = RecordingGate{ .gpa = gpa, .permitted = true };
+    defer gate.deinit();
+
     const installable = "/nonexistent-flake-for-this-test#packages.x86_64-linux.default";
-    const answer = chock_nix.build.realise(arena, io, host.runner(), &driver, .{
-        .derivation_path = drv,
-        .installable = installable,
-    }) catch |err| switch (err) {
+    const answer = chock_nix.build.realise(
+        arena,
+        io,
+        host.runner(),
+        &driver,
+        gate.gate(),
+        .{ .derivation_path = drv, .installable = installable },
+    ) catch |err| switch (err) {
         // This machine has a `nix` that will not start. Nothing was tried, so
         // nothing is claimed.
         error.RunnerFailed => return error.SkipZigTest,
@@ -157,6 +234,7 @@ test "a real nix that will not build answers in its own words, and the model rea
     // would leave it sending the same attribute again.
     try testing.expect(std.mem.indexOf(u8, answer.refused, installable) != null);
     try testing.expect(answer.refused.len > installable.len);
+    try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
 }
 
 test "a build of a path this session never produced never reaches the nix on this machine" {
@@ -181,10 +259,17 @@ test "a build of a path this session never produced never reaches the nix on thi
     var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
 
     const other = "/nix/store/11111111111111111111111111111111-other.drv";
-    const answer = try chock_nix.build.realise(arena, io, host.runner(), &driver, .{
-        .derivation_path = other,
-        .installable = "/nonexistent-flake-for-this-test#packages.x86_64-linux.default",
-    });
+    const answer = try chock_nix.build.realise(
+        arena,
+        io,
+        host.runner(),
+        &driver,
+        chock_nix.fetch.Gate.refusing,
+        .{
+            .derivation_path = other,
+            .installable = "/nonexistent-flake-for-this-test#packages.x86_64-linux.default",
+        },
+    );
 
     try testing.expect(answer == .refused);
     // The driver's own words, which name the path and say what was wrong with
@@ -192,4 +277,67 @@ test "a build of a path this session never produced never reaches the nix on thi
     // process was never started.
     try testing.expect(std.mem.indexOf(u8, answer.refused, other) != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "did not produce") != null);
+}
+
+test "a real closure holding a fixed output derivation names its host, and a no stops the build" {
+    if (nix_path.len == 0) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store_writer = chock_nix.build.DaemonWriter.connect(
+        gpa,
+        io,
+        chock_nix.build.default_daemon_socket,
+    ) catch return error.SkipZigTest;
+    defer store_writer.deinit();
+
+    var budget: chock_nix.build.Budget = .{};
+    var writing = chock_nix.build.Writing{
+        .writer = store_writer.writer(),
+        .budget = &budget,
+    };
+
+    var driver = chock_nix.backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+    const drv = evaluateFetchDerivation(gpa, &driver, "chock-fetch-probe") catch
+        return error.SkipZigTest;
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var host = chock_nix.provision.Host{ .nix_program = nix_path, .env = &env };
+
+    // **What a table cannot pin.** The JSON is written by the `nix` on this
+    // machine, and the reader has to find the output hash and the URL in the
+    // shape that `nix` really writes.
+    var gate = RecordingGate{ .gpa = gpa, .permitted = false };
+    defer gate.deinit();
+
+    const installable = "/nonexistent-flake-for-this-test#packages.x86_64-linux.default";
+    const answer = chock_nix.build.realise(
+        arena,
+        io,
+        host.runner(),
+        &driver,
+        gate.gate(),
+        .{ .derivation_path = drv, .installable = installable },
+    ) catch |err| switch (err) {
+        error.RunnerFailed => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    try testing.expectEqualStrings(probe_host, gate.asked.items[0]);
+
+    try testing.expect(answer == .refused);
+    // The host is in the words, so the model can ask for that host rather than
+    // send the same attribute again.
+    try testing.expect(std.mem.indexOf(u8, answer.refused, probe_host) != null);
+    try testing.expect(std.mem.indexOf(u8, answer.refused, installable) != null);
 }

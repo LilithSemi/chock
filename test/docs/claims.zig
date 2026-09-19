@@ -73,10 +73,12 @@ const refused_examples = [_][]const u8{ "fix", "rnu" };
 /// Options the documentation names that belong to another program.
 ///
 /// `docs/sandbox.md` says that Node is started with `--jitless`, which is
-/// Node's option and not Chock's. Both ends are checked here too: an entry
-/// that Chock starts to accept fails its test, and so does one that no
-/// documentation names any more.
-const foreign_options = [_][]const u8{"--jitless"};
+/// Node's option and not Chock's. `docs/tools.md` says that Nix's `--offline`
+/// turns a substituter off without stopping a fixed output build from
+/// fetching, which is why Chock does not pass it. Both ends are checked here
+/// too: an entry that Chock starts to accept fails its test, and so does one
+/// that no documentation names any more.
+const foreign_options = [_][]const u8{ "--jitless", "--offline" };
 
 /// One documentation file, with its path relative to the root of the
 /// repository.

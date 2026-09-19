@@ -193,8 +193,56 @@ Nix and Chock's evaluator cannot read one expression differently between the
 two moments, and an unpinned reference cannot move between them.
 
 It says what goes into the build, and never what comes out. The builder runs
-under your Nix: a fixed output derivation still fetches over the network while
-it builds, and a substituter may answer for an output instead of building it.
+under your Nix, and a substituter may answer for an output instead of building
+it.
+
+## What a build may fetch while it runs
+
+A fixed output derivation builds with the network open to it, because Nix
+checks its output hash afterwards. That check is worth something for integrity
+and nothing for egress: a URL that carries a secret in its query string, with
+the hash of an innocuous file, passes the check, and the request has already
+gone out.
+
+So Chock reads the whole derivation closure first, finds every fixed output
+derivation in it, and asks about each host under the same `net.connect` rules
+every other connection uses:
+
+```zon
+.{ .action = "net.connect.org.nixos.cache.*", .decision = .allow },
+```
+
+The labels are reversed there for the reason [policy.md](policy.md) gives,
+and there is no second namespace for a fetch: one rule says whether your
+agent may reach a host, whether a tool call, an MCP server or a build is what
+reaches it.
+
+This is the rule and not the router. A build runs on your machine, outside the
+sandbox, so `.policy.net.router` says nothing about it: the rules are what
+answer.
+
+A host nobody allowed refuses the build before `nix` is told to build anything,
+and the refusal names the host and the derivation, so the agent can ask you for
+that host rather than try the same attribute again. A URL whose scheme is not
+`http` or `https`, and one with no host in it, are both refusals too: Chock
+will not guess a port, and a fetch nobody can name is a fetch nobody can rule
+on.
+
+A `mirror://` URL is a refusal as well, and nixpkgs writes plenty of them. The
+real host is chosen from a list of mirrors while the build runs, so the
+derivation names no host at all, and Chock will not pick one for you.
+
+A fixed output derivation that says nowhere it fetches from is a refusal for
+the same reason. Some fetchers read their URLs out of a lock file at build
+time, `fetchCargoVendor` and `npmDeps` among them, and those hold no URL
+anywhere in the derivation. The network is open to them and no rule can cover
+them, so Chock refuses rather than lets them run.
+
+**The rule is all of it, and there is no backstop under it.** Nix has no flag
+that keeps a fixed output builder off the network. `--offline` turns your
+substituters off and a fixed output derivation still fetches with it set, so
+Chock does not pass it and your binary cache keeps working. A host Chock's
+reader did not find is a host nobody was asked about.
 
 A build needs your Nix daemon, because that is what takes the derivation in. A
 machine with no daemon builds nothing here and says so.

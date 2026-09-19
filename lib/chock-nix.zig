@@ -42,6 +42,7 @@ pub const build = @import("chock-nix/build.zig");
 pub const DevShell = @import("chock-nix/DevShell.zig");
 pub const dev_env = @import("chock-nix/dev_env.zig");
 pub const eval = @import("chock-nix/eval.zig");
+pub const fetch = @import("chock-nix/fetch.zig");
 pub const proc = @import("chock-nix/proc.zig");
 pub const provision = @import("chock-nix/provision.zig");
 pub const store = @import("chock-nix/store.zig");
@@ -53,6 +54,7 @@ test {
     _ = DevShell;
     _ = dev_env;
     _ = eval;
+    _ = fetch;
     _ = proc;
     _ = provision;
     _ = store;

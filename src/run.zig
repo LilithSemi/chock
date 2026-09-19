@@ -6480,6 +6480,11 @@ const GiveLockedToAll = struct {
     /// 2026-09-15: a git subcommand the shim classifies is decided one call at
     /// a time, mid turn, through the same arbiter. See `GitToolRunner`.
     git: *GitToolRunner,
+    /// The Nix build runner. **Fifth party**: a build's closure says which
+    /// hosts it would fetch from only after the attribute is evaluated, which
+    /// happens inside the tool call, so the question is asked mid turn too.
+    /// See `NixFetchGate`.
+    nix: *NixBuildToolRunner,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
         return .{ .ptr = self, .vtable = &vtable };
@@ -6490,26 +6495,29 @@ const GiveLockedToAll = struct {
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
-        giveLockedToAskers(self.mcp, self.plugins, self.git, locked);
+        giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, locked);
     }
 };
 
-/// Hand the handle to the three askers that are not the network broker.
+/// Hand the handle to the four askers that are not the network broker.
 ///
 /// **A free function, so a test can drive the fan out without a `ToolNetwork`,
-/// which needs a whole started session behind it.** All three have to be
+/// which needs a whole started session behind it.** All four have to be
 /// reached from the one seam: one that keeps a null handle asks nobody and
 /// refuses everything it gates, so a half wired fan out is a supplier of tools
-/// that quietly stops working, and a git shim that refuses `git add`.
+/// that quietly stops working, a git shim that refuses `git add`, and a build
+/// that refuses every attribute whose closure fetches.
 fn giveLockedToAskers(
     mcp_session: *chock_core.mcp.Session,
     plugin_session: *chock_core.plugin.Session,
     git_runner: *GitToolRunner,
+    nix_runner: *NixBuildToolRunner,
     locked: *chock_core.arbiter.Locked,
 ) void {
     mcp_session.giveLocked(locked);
     plugin_session.giveLocked(locked);
     git_runner.giveLocked(locked);
+    nix_runner.giveLocked(locked);
 }
 
 /// Write one `network.summary` event, when there is one to write. Best
@@ -11133,6 +11141,100 @@ fn nixBuildFor(
     };
 }
 
+/// Who answers for a host a Nix build would fetch from while it runs.
+///
+/// ## A fetch is a connection, and there is one egress namespace
+///
+/// A fixed output derivation builds with the network open to it, because its
+/// output hash is checked afterwards. That check is integrity and never
+/// egress: a URL carrying a secret of the workspace in its query string, with
+/// the hash of an innocuous file, passes it, and the request has already gone
+/// out. So every host the closure would reach is named and put to the policy
+/// before `nix` is told to build.
+///
+/// **The name is the ordinary `net.connect` one**, from
+/// `chock_broker.network.actionInto`, which reverses the labels so
+/// `evil.com.example.files` cannot match a rule an author wrote for
+/// `net.connect.com.example.*`. There is no second namespace for a fetch: a
+/// second one would need that reversal written and tested again, and would let
+/// a project allow a host in one namespace while denying it in the other.
+///
+/// **A host that cannot be named is a refusal.** A caller that cannot build an
+/// action name cannot ask the table, and fetching anyway would reach a host no
+/// rule could ever have named.
+const NixFetchGate = struct {
+    /// This tool call's own, for the question and for nothing that outlives
+    /// it. A refusal comes from the allocator `permit` is given, which is the
+    /// session's, because the build reads it after this call is over.
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    asker: ?chock_core.arbiter.Asker,
+    /// The `<flake ref>#<attribute>` the model asked for, which is what a
+    /// person reading the question wants to see.
+    installable: []const u8,
+    call: chock_proto.event.ToolCall,
+
+    fn gate(self: *NixFetchGate) chock_nix.fetch.Gate {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_nix.fetch.Gate.VTable{ .permit = permitFn };
+
+    fn permitFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        one: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+
+        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
+            return .{ .refused = try std.fmt.allocPrint(
+                allocator,
+                "{s} fetches {s}, and \"{s}\" is not a host name a rule can be written for, so " ++
+                    "nothing was fetched. Use an input whose host is an ordinary name.",
+                .{ one.derivation, one.url, one.host },
+            ) };
+
+        const summary = try std.fmt.allocPrint(
+            self.gpa,
+            "a Nix build fetches from {s}",
+            .{one.host},
+        );
+        defer self.gpa.free(summary);
+        const detail = try std.fmt.allocPrint(
+            self.gpa,
+            "{s} fetches {s} while it builds, over port {d}. The build is {s}.",
+            .{ one.derivation, one.url, one.port, self.installable },
+        );
+        defer self.gpa.free(detail);
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, self.gpa, self.io, .{
+            .action = action,
+            .summary = summary,
+            .detail = detail,
+            // A `nix_build` call carries no reason of its own, the same empty
+            // reason `GitToolRunner` sends.
+            .reason = "",
+            .tool = self.call.tool,
+            .tool_call_id = self.call.call_id,
+        });
+        if (answer.permitted) return .permitted;
+
+        // **The host and the derivation, then the one refusal sentence every
+        // other refused act in this project gives.** A model that reads a
+        // refusal with no subject asks for the same attribute again, and the
+        // host is what it has to ask for instead.
+        const said = try chock_core.arbiter.refusalText(self.gpa, action, answer);
+        defer self.gpa.free(said);
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} fetches {s} from {s} while it builds. {s}",
+            .{ one.derivation, one.url, one.host, said },
+        ) };
+    }
+};
+
 /// Answers `nix_build` and passes every other call straight through.
 ///
 /// ## Why this is a wrapper and not a tool of the registry
@@ -11205,9 +11307,23 @@ const NixBuildToolRunner = struct {
     /// of it. The cap on it comes from `NixBuild.caps` on each call, so what
     /// survives between calls is the count.
     budget: chock_nix.build.Budget = .{},
+    /// Who answers for a host a build would fetch from, and the log handle
+    /// that question and its answer travel through.
+    ///
+    /// **Null refuses every build whose closure fetches anything, and says
+    /// nobody could be asked.** The same direction `GitToolRunner.asker`
+    /// takes: a wiring this file forgot is a loud failure and never a silent
+    /// connection. See `NixFetchGate`.
+    asker: ?chock_core.arbiter.Asker = null,
 
     fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Take the session's own locked handle. **Called by `GiveLockedToAll`**,
+    /// once, before the first turn.
+    fn giveLocked(self: *NixBuildToolRunner, locked: *chock_core.arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
     }
 
     const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
@@ -11324,7 +11440,17 @@ const NixBuildToolRunner = struct {
         // terminal looks like a session that has stopped.
         tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
 
-        const answer = self.realiseWithNix(host_io, settings, &driver, .{
+        // What answers for every host the closure would fetch from, before
+        // `nix` is told to build anything. See `NixFetchGate`.
+        var gate = NixFetchGate{
+            .gpa = gpa,
+            .io = host_io,
+            .asker = self.asker,
+            .installable = installable,
+            .call = call,
+        };
+
+        const answer = self.realiseWithNix(host_io, settings, &driver, gate.gate(), .{
             .derivation_path = drv_path,
             .installable = installable,
         }) catch |err| return .{
@@ -11415,6 +11541,7 @@ const NixBuildToolRunner = struct {
         io: std.Io,
         settings: NixBuild,
         driver: *chock_nix.backend.Driver,
+        gate: chock_nix.fetch.Gate,
         request: chock_nix.build.Request,
     ) chock_nix.build.Error!chock_nix.build.Answer {
         var run_diag: ?chock_nix.Diagnostic = null;
@@ -11433,6 +11560,7 @@ const NixBuildToolRunner = struct {
             io,
             host.runner(),
             driver,
+            gate,
             request,
         ) catch |err| {
             if (run_diag) |*fault| tty.print(.warn, "chock: {f}\n", .{fault});
@@ -13087,6 +13215,13 @@ fn runSession(
     // every subcommand the shim classifies, `git add` included.
     git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
 
+    // **And a Nix build, for the hosts its closure would fetch from.** A
+    // fixed output derivation builds with the network open to it, and which
+    // hosts it reaches is known only once the attribute is evaluated, which
+    // happens inside the tool call. A runner left with no arbiter refuses
+    // every build whose closure fetches anything. See `NixFetchGate`.
+    nix_build.asker = .{ .arbiter = session_arbiter.arbiter() };
+
     // **And what one approved push may reach.** Built here because it needs the
     // display, which is not known where `git_aware` itself is built, and it is
     // ended with this frame: `disarm` runs on every path out of a tool call, so
@@ -13169,13 +13304,14 @@ fn runSession(
     // `context.idle` already are. See `chock_core.tools.Context.credentials`.
     tool_runner.context.credentials = git_credentials.seam();
 
-    // The handle each of those four needs, handed over once by `Loop.run`.
+    // The handle each of those five needs, handed over once by `Loop.run`.
     // See `GiveLockedToAll`.
     var give_locked = GiveLockedToAll{
         .network = &tool_network,
         .mcp = &mcp_state.session,
         .plugins = &plugin_state.session,
         .git = &git_aware,
+        .nix = &nix_build,
     };
 
     // What carries the agent's own work back when it says it is finished.
@@ -17474,6 +17610,62 @@ test "what a build produced is mounted by the next tool call, and not by the one
     try std.testing.expectEqual(@as(usize, 2), recorder.calls);
 }
 
+test "a host a Nix build would fetch from is named in the one egress namespace, labels reversed" {
+    // **A fetch is a connection, and there is no second namespace for one.**
+    // `chock_broker.network.actionInto` writes the name, reversal and all, so
+    // one rule an author wrote covers a host however it is reached.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // No asker at all, so nothing is permitted and the refusal carries the
+    // name the question would have been put under.
+    var gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+    };
+
+    const said = (try gate.gate().permit(arena, .{
+        .derivation = "b-src.drv",
+        .url = "https://files.example.com/src.tar.gz",
+        .host = "files.example.com",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.example.files.443") != null);
+    // The derivation and the host are both in the words, so the model can ask
+    // for that host rather than send the same attribute again.
+    try std.testing.expect(std.mem.indexOf(u8, said, "b-src.drv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "files.example.com") != null);
+
+    // **Reversal is what makes a class rule safe.** A name a derivation chose
+    // falls under the class an author wrote and never over it, so a rule for
+    // `net.connect.com.example.*` does not cover this one.
+    const hostile = (try gate.gate().permit(arena, .{
+        .derivation = "c-src.drv",
+        .url = "https://evil.com.example.files/x",
+        .host = "evil.com.example.files",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(
+        std.mem.indexOf(u8, hostile, "net.connect.files.example.com.evil.443") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, hostile, "net.connect.com.example.") == null);
+
+    // A host no rule could ever have named is refused, and never reached.
+    const unnameable = (try gate.gate().permit(arena, .{
+        .derivation = "d-src.drv",
+        .url = "https://a_b/x",
+        .host = "a_b",
+        .port = 443,
+    })).refused;
+    try std.testing.expect(std.mem.indexOf(u8, unnameable, "net.connect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unnameable, "d-src.drv") != null);
+}
+
 test "a program out of a build asks under exec.nix.store, and the dev shell's own still asks under exec.devshell" {
     // **The split `Loop.Deps.store_closure` exists for.** That field is read
     // from the toolchain the session started with, in `runSession`, and never
@@ -20199,9 +20391,9 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     try std.testing.expectEqualStrings("call7", result.call_id);
 }
 
-test "one locked handle reaches all three askers, and one that missed it runs nothing" {
+test "one locked handle reaches all four askers, and one that missed it runs nothing" {
     // **The wiring that is easy to build and easy to leave half done.**
-    // `chock_core.Loop.Deps.give_locked` carries one handle and four parties
+    // `chock_core.Loop.Deps.give_locked` carries one handle and five parties
     // need it, so the fan out is this file's. One that keeps a null handle
     // asks nobody and refuses every call it gates, which is the safe direction
     // and a silent loss of a supplier's tools, or of `git add`, if only some
@@ -20247,6 +20439,20 @@ test "one locked handle reaches all three askers, and one that missed it runs no
     var mcp_aware = McpToolRunner{ .inner = git_aware.runner(), .state = &mcp_state };
     var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
 
+    var tool_env = std.process.Environ.Map.init(gpa);
+    defer tool_env.deinit();
+    var context = chock_core.tools.Context{};
+    var mounts = SessionMounts{ .arena = gpa, .context = &context, .tool_env = &tool_env };
+    var nix_build = NixBuildToolRunner{
+        .inner = inner.runner(),
+        .settings = null,
+        .arena = gpa,
+        .host_env = &tool_env,
+        .environ = .empty,
+        .mounts = &mounts,
+        .asker = .{ .arbiter = log.asker().arbiter },
+    };
+
     for ([_][]const u8{ "server_tool", "plugin_tool" }) |name| {
         const early = try plugin_aware.runner().dispatch(gpa, io, .{
             .call_id = "call1",
@@ -20286,7 +20492,19 @@ test "one locked handle reaches all three askers, and one that missed it runs no
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 
     // The handle arrives once, and all three work.
-    giveLockedToAskers(&mcp_state.session, &plugin_state.session, &git_aware, &log.locked);
+    // **And the Nix build runner is the fourth.** It has no tool call to run
+    // here, so what is asked of it is the handle itself: without one, every
+    // build whose closure fetches is refused for want of anybody to ask.
+    try std.testing.expect(nix_build.asker.?.locked == null);
+
+    giveLockedToAskers(
+        &mcp_state.session,
+        &plugin_state.session,
+        &git_aware,
+        &nix_build,
+        &log.locked,
+    );
+    try std.testing.expect(nix_build.asker.?.locked != null);
 
     const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
         .call_id = "call2",
