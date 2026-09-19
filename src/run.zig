@@ -12524,6 +12524,13 @@ fn runSession(
         // where it points and not from how it is spelled: see that
         // function's own doc.
         .project_root = started.sandbox_config.cwd,
+        // The toolchain phase 1 decided, so a program inside it names
+        // `exec.devshell.*` and every other store path names
+        // `exec.nix.store.*`. **Read from `Toolchain` and not from
+        // `tools.Context.store_paths`**, which grows when `provide_tool`
+        // realises a package: a store path this session caused to exist is
+        // the one thing the split is for. See `chock_core.Loop.Deps.store_closure`.
+        .store_closure = started.toolchain.store_paths,
         // What answers a `request_action` call. **This line is the difference
         // between a tool the model is offered and a tool that does
         // something**: `chock_core.Loop.Deps.handback` defaults to null, and a

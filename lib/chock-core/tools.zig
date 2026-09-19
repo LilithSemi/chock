@@ -831,8 +831,27 @@ pub const Tool = enum {
     const exec_prefix = "exec";
 
     /// The class segment for a program `run_command` would resolve inside the
-    /// Nix store.
+    /// Nix store, and which the session's own startup closure does not hold.
+    /// See `devshell_class` for the half that split off this one.
     const store_class = "nix.store";
+
+    /// The class segment for a program inside a store path the session
+    /// mounted when it started.
+    ///
+    /// **A store path is immutable, but the set of store paths is not.** The
+    /// reason `store_class` once shipped a default of `allow` is that a
+    /// content addressed path names one program forever, unlike `./thing`,
+    /// which the agent can rewrite between two turns. That holds only while
+    /// the agent cannot put a new path in the store. It can: it evaluates an
+    /// expression, Chock registers the result, and a build makes store paths
+    /// that did not exist when the session started. A blanket allow written
+    /// for "the toolchain you were given" would then cover them too.
+    ///
+    /// So the two are separate classes. This one is the dev shell closure,
+    /// known at startup and mounted at startup, and nothing a session does
+    /// later joins it. Every other store path, a provisioned program and a
+    /// built one alike, keeps `store_class`.
+    const devshell_class = "devshell";
 
     /// The class segment for a program named by a path relative to the
     /// workspace. A path here carries at least one `/`: a bare name with
@@ -842,9 +861,10 @@ pub const Tool = enum {
     /// The class segment for a bare name, one with no `/` anywhere in it.
     /// `run_command`'s own description says a name like this is looked up on
     /// the host `PATH`, not read as a path inside the project. **Kept apart
-    /// from both other classes on purpose.** It cannot share `store_class`,
-    /// because nothing here resolves `PATH`, so this file never learns which
-    /// store entry, if any, the name would reach. It cannot share
+    /// from every other class on purpose.** It cannot share `store_class` or
+    /// `devshell_class`, because nothing here resolves `PATH`, so this file
+    /// never learns which store entry, if any, the name would reach. It
+    /// cannot share
     /// `workspace_class` either: `jq` almost always resolves off the project
     /// entirely, and a rule an author wrote to gate workspace programs must
     /// not silently also match it. `runInSandbox` is what resolves `PATH`,
@@ -880,8 +900,8 @@ pub const Tool = enum {
     ///
     /// `run_command`'s is the long one: the prefix, a separator, the class,
     /// a separator, and the path. `nix.store` and `workspace` are both nine
-    /// bytes long, `path` is shorter, and the bound below is sized for
-    /// either of the two nine byte classes.
+    /// bytes long, `devshell` and `path` are shorter, and the bound below is
+    /// sized for either of the two nine byte classes.
     ///
     /// **The path term is three times its own length and not one times
     /// it**, because of the escape below: a byte that is a dot or a percent
@@ -960,12 +980,30 @@ pub const Tool = enum {
         return at;
     }
 
+    /// Whether `path`, an absolute path under the Nix store, is inside one of
+    /// the store paths in `closure`. See `devshell_class` and
+    /// `runCommandActionInto`'s own doc for what `closure` holds and why an
+    /// entry that is not a store path is skipped.
+    fn closureHolds(closure: []const []const u8, path: []const u8) bool {
+        for (closure) |raw| {
+            var entry = raw;
+            while (entry.len != 0 and entry[entry.len - 1] == '/') entry = entry[0 .. entry.len - 1];
+            if (entry.len <= store_prefix.len) continue;
+            if (!std.mem.startsWith(u8, entry, store_prefix)) continue;
+            if (!std.mem.startsWith(u8, path, entry)) continue;
+            if (path.len == entry.len or path[entry.len] == '/') return true;
+        }
+        return false;
+    }
+
     /// The action name for a `run_command` call whose first `argv` element,
     /// already read out by the real parser, is `argv0`. `project_root` is
-    /// `sandbox.Config.cwd`, the same value `leavesProject` reads. Written
-    /// into `buffer`. See `actionInto`.
+    /// `sandbox.Config.cwd`, the same value `leavesProject` reads. `closure`
+    /// is the set of store paths the session mounted at its start, empty for
+    /// a caller that knows none. Written into `buffer`. See `actionInto`.
     ///
     /// ```
+    /// /nix/store/dev-zig/bin/zig            ->  exec.devshell.dev-zig.bin.zig
     /// /nix/store/abc-jq/bin/jq              ->  exec.nix.store.abc-jq.bin.jq
     /// ./build.sh                            ->  exec.workspace.build%2Esh
     /// <project_root>/build.sh               ->  exec.workspace.build%2Esh
@@ -974,6 +1012,29 @@ pub const Tool = enum {
     /// jq                                    ->  exec.path.jq
     /// a/../b                                ->  exec.unparsed
     /// ```
+    ///
+    /// The first two lines differ only in the closure: `/nix/store/dev-zig`
+    /// is in it and `/nix/store/abc-jq` is not.
+    ///
+    /// **The closure is read dynamically and the classes stay static data.**
+    /// Which store paths a session mounted is known only at run time, so the
+    /// caller that knows gives it here, the same way it gives `project_root`
+    /// so an in-project absolute path can be told from one outside. What
+    /// `lib/chock-policy/defaults.zig` ships is still four fixed names.
+    ///
+    /// **An empty `closure` names every store path `store_class`.** That is
+    /// the answer for a session with no dev shell, and it is what this
+    /// function did before the class split. An entry that is not itself a
+    /// store path is skipped for the same reason: a plain `/nix/store` names
+    /// the whole store rather than a closure, and reading it as one would
+    /// put every store path in the store into `devshell_class`, which is the
+    /// hazard the split exists to close. See `Context.store_paths`, whose
+    /// own default is exactly that bare path.
+    ///
+    /// **A program is `<store path>/bin/<name>`, so being under a closure
+    /// entry counts and not only being equal to one.** The boundary is a
+    /// whole path component: `/nix/store/abc` does not hold
+    /// `/nix/store/abcd/bin/x`.
     ///
     /// **A path keeps its own order, and is never reversed.** Unlike
     /// `chock_broker.network.actionInto`'s host name, a path is already
@@ -1059,7 +1120,12 @@ pub const Tool = enum {
     /// ever a boundary this function wrote between two segments, never a
     /// byte a segment held, so no two distinct paths can ever share a built
     /// name.
-    fn runCommandActionInto(buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+    fn runCommandActionInto(
+        buffer: []u8,
+        argv0: ?[]const u8,
+        project_root: []const u8,
+        closure: []const []const u8,
+    ) ?[]const u8 {
         if (buffer.len < max_action_bytes) return null;
 
         var path = argv0 orelse return writeWhole(buffer, unparsed_action);
@@ -1114,7 +1180,7 @@ pub const Tool = enum {
         }
 
         const class: []const u8 = if (is_store)
-            store_class
+            (if (closureHolds(closure, path)) devshell_class else store_class)
         else if (has_slash)
             workspace_class
         else
@@ -1147,7 +1213,9 @@ pub const Tool = enum {
     /// the same as an element this file's own bound rejects. `project_root`
     /// is `sandbox.Config.cwd` and is read only for `run_command`: see
     /// `runCommandActionInto`'s own doc for why an absolute `argv0` inside
-    /// the project needs it.
+    /// the project needs it. `closure` is the session's own startup store
+    /// paths, read only for `run_command` as well, and an empty one is the
+    /// answer for a session that mounted no dev shell.
     ///
     /// Null when the name would not fit. See `runCommandActionInto`'s own
     /// doc for why nothing else answers null. `buffer` must hold
@@ -1160,7 +1228,8 @@ pub const Tool = enum {
     /// ```zon
     /// .{ .action = "call.write_file", .decision = .ask }     // every write asks
     /// .{ .action = "exec.workspace.*", .decision = .allow }  // a program the project built
-    /// .{ .action = "exec.nix.store.*", .decision = .ask }    // a program the store provides
+    /// .{ .action = "exec.devshell.*", .decision = .allow }   // the toolchain this session got
+    /// .{ .action = "exec.nix.store.*", .decision = .ask }    // any other store path
     /// ```
     ///
     /// Only `run_command` reads `argv0` at all: every other tool is named
@@ -1170,9 +1239,15 @@ pub const Tool = enum {
     ///
     /// No `else`: a tool added to the enum and forgotten here fails the build
     /// rather than being named by accident.
-    pub fn actionInto(self: Tool, buffer: []u8, argv0: ?[]const u8, project_root: []const u8) ?[]const u8 {
+    pub fn actionInto(
+        self: Tool,
+        buffer: []u8,
+        argv0: ?[]const u8,
+        project_root: []const u8,
+        closure: []const []const u8,
+    ) ?[]const u8 {
         return switch (self) {
-            .run_command => runCommandActionInto(buffer, argv0, project_root),
+            .run_command => runCommandActionInto(buffer, argv0, project_root, closure),
             .read_file,
             .read_image,
             .list_directory,
@@ -7657,7 +7732,7 @@ test "a tool with no argument to read is named after itself, once each" {
         if (tool == .run_command) continue;
         try std.testing.expectEqualStrings(
             "call." ++ f.name,
-            tool.actionInto(&buffer, null, "").?,
+            tool.actionInto(&buffer, null, "", &.{}).?,
         );
     }
 }
@@ -7670,8 +7745,86 @@ test "run_command on a program under the Nix store names the program, left to ri
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "exec.nix.store.abc-jq.bin.jq",
-        Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "").?,
+        Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "", &.{}).?,
     );
+}
+
+test "a program inside the session's startup closure is its own class" {
+    // The split the store needed. A store path is immutable, but the set of
+    // store paths is not: the agent can evaluate an expression and Chock can
+    // build the result, so a path that exists now did not exist when the
+    // session started. The closure is what the session mounted at its start,
+    // and a program in it is the toolchain the session was given.
+    //
+    // The program is `<store path>/bin/<name>`, so it is under a closure
+    // entry and never equal to one. The name still reads left to right, the
+    // same as the store class it split off.
+    const closure = [_][]const u8{
+        "/nix/store/dev-zig",
+        "/nix/store/dev-jq",
+    };
+    var buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.dev-zig.bin.zig",
+        Tool.run_command.actionInto(&buffer, "/nix/store/dev-zig/bin/zig", "", &closure).?,
+    );
+
+    // The entry itself, with nothing under it, is in the closure too.
+    var entry_buffer: [Tool.max_action_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "exec.devshell.dev-jq",
+        Tool.run_command.actionInto(&entry_buffer, "/nix/store/dev-jq", "", &closure).?,
+    );
+}
+
+test "a store path the startup closure does not hold keeps the store class" {
+    // The whole point of the split: a path this session caused to exist is
+    // not the toolchain it was given, so it keeps the name Chock ships as
+    // `ask`. The sibling case is checked here as well, because a prefix
+    // compare with no component boundary would read `/nix/store/dev-zigzag`
+    // as inside `/nix/store/dev-zig`.
+    const closure = [_][]const u8{"/nix/store/dev-zig"};
+    const outside = [_][]const u8{
+        "/nix/store/built-by-the-agent/bin/thing",
+        "/nix/store/dev-zigzag/bin/zig",
+    };
+    const expected = [_][]const u8{
+        "exec.nix.store.built-by-the-agent.bin.thing",
+        "exec.nix.store.dev-zigzag.bin.zig",
+    };
+    for (outside, expected) |path, want| {
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            want,
+            Tool.run_command.actionInto(&buffer, path, "", &closure).?,
+        );
+    }
+}
+
+test "a session with no closure names every store path the store class" {
+    // Today's behaviour, unchanged. A session with no dev shell knows no
+    // closure, and the bare `/nix/store` that `Context.store_paths` defaults
+    // to names the whole store rather than a closure: reading it as one
+    // would put every store path there is into the dev shell class, which is
+    // the hazard the split exists to close.
+    const nothing: []const []const u8 = &.{};
+    const whole_store = [_][]const u8{"/nix/store"};
+    const with_slash = [_][]const u8{"/nix/store/"};
+    const not_a_store_path = [_][]const u8{ "/usr/bin", "/bin", "/etc" };
+
+    const closures = [_][]const []const u8{
+        nothing,
+        &whole_store,
+        &with_slash,
+        &not_a_store_path,
+    };
+    for (closures) |closure| {
+        var buffer: [Tool.max_action_bytes]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "exec.nix.store.abc-jq.bin.jq",
+            Tool.run_command.actionInto(&buffer, "/nix/store/abc-jq/bin/jq", "", closure).?,
+        );
+    }
 }
 
 test "a dot a path already carried is never read as a boundary between segments" {
@@ -7692,8 +7845,8 @@ test "a dot a path already carried is never read as a boundary between segments"
     var one_segment: [Tool.max_action_bytes]u8 = undefined;
     var two_segments: [Tool.max_action_bytes]u8 = undefined;
 
-    const from_one_segment = Tool.run_command.actionInto(&one_segment, "./build.sh", "").?;
-    const from_two_segments = Tool.run_command.actionInto(&two_segments, "./build/sh", "").?;
+    const from_one_segment = Tool.run_command.actionInto(&one_segment, "./build.sh", "", &.{}).?;
+    const from_two_segments = Tool.run_command.actionInto(&two_segments, "./build/sh", "", &.{}).?;
 
     try std.testing.expectEqualStrings("exec.workspace.build%2Esh", from_one_segment);
     try std.testing.expectEqualStrings("exec.workspace.build.sh", from_two_segments);
@@ -7712,8 +7865,8 @@ test "a dot at a segment boundary never reads as the same name from either side"
     var a_dot_slash_b: [Tool.max_action_bytes]u8 = undefined;
     var a_slash_dot_b: [Tool.max_action_bytes]u8 = undefined;
 
-    const from_a_dot_slash_b = Tool.run_command.actionInto(&a_dot_slash_b, "a./b", "").?;
-    const from_a_slash_dot_b = Tool.run_command.actionInto(&a_slash_dot_b, "a/.b", "").?;
+    const from_a_dot_slash_b = Tool.run_command.actionInto(&a_dot_slash_b, "a./b", "", &.{}).?;
+    const from_a_slash_dot_b = Tool.run_command.actionInto(&a_slash_dot_b, "a/.b", "", &.{}).?;
 
     try std.testing.expectEqualStrings("exec.workspace.a%2E.b", from_a_dot_slash_b);
     try std.testing.expectEqualStrings("exec.workspace.a.%2Eb", from_a_slash_dot_b);
@@ -7738,11 +7891,11 @@ test "two spellings of the same program build the same name" {
     };
 
     var buffer: [Tool.max_action_bytes]u8 = undefined;
-    const a0 = Tool.run_command.actionInto(&buffer, group_a[0], "").?;
+    const a0 = Tool.run_command.actionInto(&buffer, group_a[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.workspace.build%2Esh", a0);
     for (group_a[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(a0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(a0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 
     // The bare `build.sh` normalises to the same one segment as
@@ -7751,22 +7904,22 @@ test "two spellings of the same program build the same name" {
     // a script the agent just wrote, and a rule for one must never also
     // cover the other.
     var bare_build: [Tool.max_action_bytes]u8 = undefined;
-    const bare_build_action = Tool.run_command.actionInto(&bare_build, "build.sh", "").?;
+    const bare_build_action = Tool.run_command.actionInto(&bare_build, "build.sh", "", &.{}).?;
     try std.testing.expectEqualStrings("exec.path.build%2Esh", bare_build_action);
     try std.testing.expect(!std.mem.eql(u8, a0, bare_build_action));
 
-    const b0 = Tool.run_command.actionInto(&buffer, group_b[0], "").?;
+    const b0 = Tool.run_command.actionInto(&buffer, group_b[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.workspace.a.b", b0);
     for (group_b[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(b0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(b0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 
-    const c0 = Tool.run_command.actionInto(&buffer, group_c[0], "").?;
+    const c0 = Tool.run_command.actionInto(&buffer, group_c[0], "", &.{}).?;
     try std.testing.expectEqualStrings("exec.nix.store.x.bin.jq", c0);
     for (group_c[1..]) |path| {
         var other: [Tool.max_action_bytes]u8 = undefined;
-        try std.testing.expectEqualStrings(c0, Tool.run_command.actionInto(&other, path, "").?);
+        try std.testing.expectEqualStrings(c0, Tool.run_command.actionInto(&other, path, "", &.{}).?);
     }
 }
 
@@ -7804,8 +7957,8 @@ test "an absolute path inside the project and its relative spelling build the sa
 
         var rel_buffer: [Tool.max_action_bytes]u8 = undefined;
         var abs_buffer: [Tool.max_action_bytes]u8 = undefined;
-        const rel_name = Tool.run_command.actionInto(&rel_buffer, rel, project_root).?;
-        const abs_name = Tool.run_command.actionInto(&abs_buffer, abs, project_root).?;
+        const rel_name = Tool.run_command.actionInto(&rel_buffer, rel, project_root, &.{}).?;
+        const abs_name = Tool.run_command.actionInto(&abs_buffer, abs, project_root, &.{}).?;
         try std.testing.expectEqualStrings(rel_name, abs_name);
     }
 }
@@ -7823,8 +7976,8 @@ test "an absolute path outside the project keeps the name it already had" {
 
     var outside_buffer: [Tool.max_action_bytes]u8 = undefined;
     var inside_buffer: [Tool.max_action_bytes]u8 = undefined;
-    const outside_name = Tool.run_command.actionInto(&outside_buffer, "/etc/passwd", project_root).?;
-    const inside_name = Tool.run_command.actionInto(&inside_buffer, "etc/passwd", project_root).?;
+    const outside_name = Tool.run_command.actionInto(&outside_buffer, "/etc/passwd", project_root, &.{}).?;
+    const inside_name = Tool.run_command.actionInto(&inside_buffer, "etc/passwd", project_root, &.{}).?;
     try std.testing.expectEqualStrings(outside_name, inside_name);
 }
 
@@ -7841,6 +7994,12 @@ test "no two paths in a table built to confuse the encoding share a name" {
     // second carries a slash and the first does not, so a scheme that
     // classed them by segment count rather than by that slash would have
     // named them alike.
+    //
+    // The last four are the store, read against a closure that holds the
+    // first two entries and not the last two. A dev shell path and a store
+    // path that only differs from it by its class must stay apart, and so
+    // must a closure entry and its sibling with a longer name.
+    const closure = [_][]const u8{ "/nix/store/dev-zig", "/nix/store/dev-jq" };
     const paths = [_][]const u8{
         "./build.sh",
         "./build/sh",
@@ -7852,12 +8011,16 @@ test "no two paths in a table built to confuse the encoding share a name" {
         "a/b.c",
         "jq",
         "build.sh",
+        "/nix/store/dev-zig/bin/zig",
+        "/nix/store/dev-jq/bin/jq",
+        "/nix/store/dev-zigzag/bin/zig",
+        "/nix/store/built/bin/zig",
     };
 
     var buffers: [paths.len][Tool.max_action_bytes]u8 = undefined;
     var actions: [paths.len][]const u8 = undefined;
     for (paths, 0..) |path, i| {
-        actions[i] = Tool.run_command.actionInto(&buffers[i], path, "").?;
+        actions[i] = Tool.run_command.actionInto(&buffers[i], path, "", &closure).?;
     }
 
     for (actions, 0..) |a, i| {
@@ -7884,7 +8047,7 @@ test "a path with a .. component is never resolved, and answers unparsed instead
         var buffer: [Tool.max_action_bytes]u8 = undefined;
         try std.testing.expectEqualStrings(
             "exec.unparsed",
-            Tool.run_command.actionInto(&buffer, path, "").?,
+            Tool.run_command.actionInto(&buffer, path, "", &.{}).?,
         );
     }
 }
@@ -7900,7 +8063,7 @@ test "a bare name run_command would resolve on PATH is its own class, neither st
     var buffer: [Tool.max_action_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "exec.path.jq",
-        Tool.run_command.actionInto(&buffer, "jq", "").?,
+        Tool.run_command.actionInto(&buffer, "jq", "", &.{}).?,
     );
 }
 
@@ -7914,7 +8077,7 @@ test "run_command with no argv element to read still gets a name, and never null
     // for a buffer that is too small. The rot test below is what makes this
     // the rule for every tool and not just this one.
     var buffer: [Tool.max_action_bytes]u8 = undefined;
-    try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "").?);
+    try std.testing.expectEqualStrings("exec.unparsed", Tool.run_command.actionInto(&buffer, null, "", &.{}).?);
 }
 
 test "a name too long for the buffer is a refusal, and never a truncated key" {
@@ -7924,7 +8087,7 @@ test "a name too long for the buffer is a refusal, and never a truncated key" {
     // fill in full gets `null` and nothing else.
     var small: [8]u8 = undefined;
     try std.testing.expect(
-        Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "") == null,
+        Tool.run_command.actionInto(&small, "/nix/store/abc-jq/bin/jq", "", &.{}) == null,
     );
 }
 
@@ -7936,7 +8099,7 @@ test "every tool has an action name, and every name reaches the table" {
     inline for (@typeInfo(Tool).@"enum".fields) |f| {
         const tool: Tool = @enumFromInt(f.value);
         var buffer: [Tool.max_action_bytes]u8 = undefined;
-        const action = tool.actionInto(&buffer, null, "") orelse
+        const action = tool.actionInto(&buffer, null, "", &.{}) orelse
             return error.ToolHasNoActionName;
         try std.testing.expect(action.len > 0);
     }

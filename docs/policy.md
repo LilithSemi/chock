@@ -84,6 +84,17 @@ did not. Writing `.{ .action = "call.write_file", .decision = .ask }` in your
 own `chock.zon` puts that call back behind a prompt, even though a shipped
 default would otherwise let it through.
 
+**A store path the session did not start with asks.** `run_command` names a
+program by the class it belongs to, and the store is two of those classes.
+`exec.devshell.*` is a program inside the Nix dev shell closure this session
+mounted at its start, and it is allowed: the toolchain was known before the
+model said anything. `exec.nix.store.*` is every other store path, and it is
+the one shipped rule that is not an `allow`. A store path is immutable, so it
+names one program forever, but the set of store paths is not: the agent can
+have an expression evaluated and the result built, and a path it made this way
+is not the toolchain it was given. `exec.path.*`, a bare name looked up on
+`PATH`, and `exec.workspace.*`, a path inside the project, are both unchanged.
+
 `net.connect.*` and `net.fetch.*` hold no shipped default, on purpose: a
 project that named nothing about a host still meets `ask` there, never
 `allow`. See [threat-model.md](threat-model.md) for what an `ask` on

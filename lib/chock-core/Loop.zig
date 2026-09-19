@@ -702,6 +702,19 @@ pub const Deps = struct {
     /// is read exactly as written, which still names a real, if less
     /// specific, action. Nothing here ever falls back to `allow`.
     project_root: []const u8 = "",
+    /// The store paths this session mounted when it started, or empty for a
+    /// caller that knows none. Read only by `gateToolCall`, which hands it
+    /// straight to `tools.Tool.actionInto` as the closure.
+    ///
+    /// **The same list `tools.Context.store_paths` was given at startup, and
+    /// never the list as it stands now.** `src/run.zig` grows that one when
+    /// `provide_tool` realises a package, and a program the session itself
+    /// put in the store is exactly what must keep asking. See
+    /// `tools.Tool` and its `devshell_class`.
+    ///
+    /// **Empty is safe and not a bypass.** Every store path then names
+    /// `exec.nix.store.*`, which Chock ships as `ask`.
+    store_closure: []const []const u8 = &.{},
     /// What reads a URL for the agent, or null for a session that can read
     /// none. See `lib/chock-core/fetch.zig`.
     ///
@@ -2329,7 +2342,12 @@ fn gateToolCall(
     if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
 
     var action_buffer: [tools.Tool.max_action_bytes]u8 = undefined;
-    const action = tool.actionInto(&action_buffer, argv0_owned, deps.project_root) orelse
+    const action = tool.actionInto(
+        &action_buffer,
+        argv0_owned,
+        deps.project_root,
+        deps.store_closure,
+    ) orelse
         return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
 
     // `Ask.detail` is the whole effect and never a command string: `action`

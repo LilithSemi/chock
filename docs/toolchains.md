@@ -6,6 +6,11 @@ its own path. So the agent gets the project's own compiler, and it gets nothing
 else from the store. What a project needs every time belongs in `flake.nix`.
 For one program in one session, see [tools.md](tools.md).
 
+**The closure is also a policy class.** A program inside it names
+`exec.devshell.*`, which Chock ships as `allow`, so the project's own
+toolchain runs with no prompt. Any other store path names `exec.nix.store.*`,
+which ships as `ask`. See [policy.md](policy.md).
+
 **The answer does not depend on the caller.** Chock reads the dev shell the way
 nix-direnv does, and it takes the difference between two shells rather than one
 shell's whole environment. So a person whose direnv has already loaded the dev
