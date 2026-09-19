@@ -9,6 +9,14 @@
 //! attribute path and a flake reference are dotted paths too, so this file
 //! reuses that same escape rather than writing a second one.
 //!
+//! ## There is no run namespace, on purpose
+//!
+//! A build followed by running the result is two acts this table already
+//! names: `nix.build.flake.*` says which repository a session may build from,
+//! and `exec.nix.store.*` says whether a program that came out of it may run,
+//! which it answers with `ask`. A third name for the pair would let a project
+//! allow in one namespace what it denied in the other.
+//!
 //! ## Why an attribute path needs escaping at all
 //!
 //! Nix lets an attribute name hold a dot, written quoted. `packages."a.b"`
@@ -22,9 +30,6 @@ const tools = @import("tools.zig");
 
 /// What every build action name starts with.
 pub const build_prefix = "nix.build";
-
-/// What every run action name starts with.
-pub const run_prefix = "nix.run";
 
 /// What the action for a named flake reference starts with. See
 /// `flakeActionInto`.
@@ -47,7 +52,7 @@ pub const max_segment_bytes = 128;
 /// The cast is not decoration: `@max` of comptime integers answers the
 /// smallest type that holds them, and the sum does not fit that.
 pub const max_action_bytes: usize =
-    @as(usize, @max(@max(build_prefix.len, run_prefix.len), flake_prefix.len)) +
+    @as(usize, @max(build_prefix.len, flake_prefix.len)) +
     max_segments * (1 + 3 * max_segment_bytes);
 
 /// The policy action for building `attr_path`, written into `buffer`. Null
@@ -70,31 +75,8 @@ pub fn buildActionInto(buffer: []u8, attr_path: []const []const u8) ?[]const u8 
     return writeAction(buffer, build_prefix, attr_path);
 }
 
-/// The policy action for running `flake_ref`, written into `buffer`. Null for
-/// the same reasons `buildActionInto` answers null.
-///
-/// ```
-/// github:NixOS/nixpkgs  ->  nix.run.github.NixOS.nixpkgs
-/// ```
-///
-/// `flake_ref` is split on `:` and `/` into dotted segments, each escaped the
-/// same way `buildActionInto` escapes an attribute name.
-///
-/// **A revision or a fragment names content, not the repository, and is cut
-/// off before anything is split.** `github:NixOS/nixpkgs?ref=some-branch` and
-/// `github:NixOS/nixpkgs#hello` both build the same name a bare
-/// `github:NixOS/nixpkgs` does. The policy row a project writes grants the
-/// org or the repository, never a revision pinned in a query string or an
-/// output named after `#`, so none of that belongs in the name the row is
-/// written against.
-///
-/// `buffer` must hold `max_action_bytes`.
-pub fn runActionInto(buffer: []u8, flake_ref: []const u8) ?[]const u8 {
-    return referenceActionInto(buffer, run_prefix, flake_ref);
-}
-
 /// The policy action for building **from** `flake_ref`, written into
-/// `buffer`. Null for the same reasons `runActionInto` answers null.
+/// `buffer`. Null for the same reasons `buildActionInto` answers null.
 ///
 /// ```
 /// github:NixOS/nixpkgs  ->  nix.build.flake.github.NixOS.nixpkgs
@@ -150,7 +132,7 @@ fn referenceActionInto(buffer: []u8, prefix: []const u8, flake_ref: []const u8) 
 }
 
 /// The part of `flake_ref` that names the repository, with a query string or
-/// an output fragment dropped. See `runActionInto`'s own doc for why.
+/// an output fragment dropped. See `flakeActionInto`'s own doc for why.
 fn identityPart(flake_ref: []const u8) []const u8 {
     const cut = std.mem.indexOfAny(u8, flake_ref, "#?") orelse flake_ref.len;
     return flake_ref[0..cut];
@@ -245,12 +227,6 @@ test "an attribute path builds a dotted build action" {
     try testing.expectEqualStrings("nix.build.packages.x86_64-linux.default", action);
 }
 
-test "a flake reference builds a dotted run action" {
-    var buffer: [max_action_bytes]u8 = undefined;
-    const action = runActionInto(&buffer, "github:NixOS/nixpkgs").?;
-    try testing.expectEqualStrings("nix.run.github.NixOS.nixpkgs", action);
-}
-
 test "an attribute name holding a dot is escaped so it cannot forge a level boundary" {
     // `packages."foo.bar"` is two segments, the second of which holds a
     // literal dot. A naive join would write the same bytes a three segment
@@ -276,9 +252,9 @@ test "a flake reference's revision and fragment are dropped, since a policy row 
     var with_ref: [max_action_bytes]u8 = undefined;
     var with_fragment: [max_action_bytes]u8 = undefined;
 
-    const bare_action = runActionInto(&bare, "github:NixOS/nixpkgs").?;
-    const ref_action = runActionInto(&with_ref, "github:NixOS/nixpkgs?ref=some-branch").?;
-    const fragment_action = runActionInto(&with_fragment, "github:NixOS/nixpkgs#hello").?;
+    const bare_action = flakeActionInto(&bare, "github:NixOS/nixpkgs").?;
+    const ref_action = flakeActionInto(&with_ref, "github:NixOS/nixpkgs?ref=some-branch").?;
+    const fragment_action = flakeActionInto(&with_fragment, "github:NixOS/nixpkgs#hello").?;
 
     try testing.expectEqualStrings(bare_action, ref_action);
     try testing.expectEqualStrings(bare_action, fragment_action);
@@ -325,7 +301,6 @@ test "a call that names a flake asks a second action for the reference itself" {
 }
 
 test "a flake action drops a revision and a fragment, since the rule grants the repository" {
-    // Read from the same splitter `runActionInto` uses, so the two names a
     // reference can carry cannot come to mean different repositories.
     var buffer: [max_action_bytes]u8 = undefined;
     var pinned: [max_action_bytes]u8 = undefined;
@@ -369,5 +344,5 @@ test "arguments that name no attribute path and a reference that cannot be named
 test "a buffer too small to hold the action answers null" {
     var too_small: [4]u8 = undefined;
     try testing.expect(buildActionInto(&too_small, &.{"default"}) == null);
-    try testing.expect(runActionInto(&too_small, "github:NixOS/nixpkgs") == null);
+    try testing.expect(flakeActionInto(&too_small, "github:NixOS/nixpkgs") == null);
 }
