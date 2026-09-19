@@ -812,7 +812,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const nix_tests = b.addTest(.{ .root_module = chock_nix });
+    // fix's evaluator dispatches one opcode to the next with
+    // `@call(.always_tail)`, and the self-hosted x86_64 backend cannot emit a
+    // tail call, so every artifact holding the evaluator asks for LLVM on that
+    // one target. fix's own build asks for it everywhere; this asks only where
+    // the backend cannot do the work, so an aarch64 build keeps the faster
+    // path. Null means "whatever this target's default is".
+    const evaluator_llvm: ?bool = if (target.result.cpu.arch == .x86_64) true else null;
+
+    const nix_tests = b.addTest(.{ .root_module = chock_nix, .use_llvm = evaluator_llvm });
     const run_nix_tests = b.addRunArtifact(nix_tests);
     // Same reasoning as run_sandbox_tests above.
     run_nix_tests.skip_foreign_checks = true;
@@ -835,6 +843,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const nix_real_tests = b.addTest(.{
+        .use_llvm = evaluator_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/nix/real.zig"),
             .target = target,
@@ -1444,7 +1453,11 @@ pub fn build(b: *std.Build) void {
         .imports = &exe_imports,
     });
 
-    const exe = b.addExecutable(.{ .name = "chock", .root_module = chock_exe_module });
+    const exe = b.addExecutable(.{
+        .name = "chock",
+        .root_module = chock_exe_module,
+        .use_llvm = evaluator_llvm,
+    });
     b.installArtifact(exe);
 
     // **Its own step, and never on `test_step`.** This is not a test that
@@ -1494,6 +1507,7 @@ pub fn build(b: *std.Build) void {
         const redteam_exe = b.addExecutable(.{
             .name = "chock-redteam",
             .root_module = redteam_module,
+            .use_llvm = evaluator_llvm,
         });
         // **Never installed.** `test/plugin/one_binary.zig` measures the
         // install list and fails on a second artifact, and it is right to:
@@ -1532,7 +1546,10 @@ pub fn build(b: *std.Build) void {
         // The harness's own unit tests: the manifest arithmetic, the scope
         // list, and the log reader. Separate from the oracle proof above,
         // and on `test_step`, because none of these starts a session.
-        const redteam_tests = b.addTest(.{ .root_module = redteam_module });
+        const redteam_tests = b.addTest(.{
+            .root_module = redteam_module,
+            .use_llvm = evaluator_llvm,
+        });
         const run_redteam_tests = b.addRunArtifact(redteam_tests);
         run_redteam_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_redteam_tests.step);
@@ -1558,7 +1575,10 @@ pub fn build(b: *std.Build) void {
     });
     chock_exe_test_module.addImport("tree_child_path", tree_child_path);
 
-    const exe_tests = b.addTest(.{ .root_module = chock_exe_test_module });
+    const exe_tests = b.addTest(.{
+        .root_module = chock_exe_test_module,
+        .use_llvm = evaluator_llvm,
+    });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     // Same reasoning as run_sandbox_tests above.
     run_exe_tests.skip_foreign_checks = true;
