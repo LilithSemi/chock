@@ -155,6 +155,18 @@ pub const Session = struct {
     /// This says which one it was.
     pub fn answer(self: *Session, buffer: []u8, source: []const u8) !Answer {
         const value = try self.engine.evaluate(source);
+        // Forced first, because a renderer writes `<CODE>` for a thunk it was
+        // not asked to force, and a model that reads `<CODE>` learns nothing
+        // about the value it asked for. This is what `nix eval --strict`
+        // does.
+        //
+        // **A value that will not force deeply is still rendered.** A
+        // derivation is such a value: forcing all of it reaches attributes
+        // that fail on their own, and refusing the whole answer over one of
+        // them would answer nothing about the derivation the caller asked
+        // for. So the shallow render is the fallback, and it is what the repl
+        // would have printed anyway.
+        self.engine.forceDeep(value) catch {};
         var writer: std.Io.Writer = .fixed(buffer);
         try self.engine.writeValue(&writer, value);
         return .{
@@ -201,6 +213,20 @@ test "an expression evaluates in this process, with no nix binary" {
     try testing.expectEqualStrings(
         "{ a = 1; b = \"two\"; }",
         try evaluateText(&buffer, "{ a = 1; b = \"two\"; }"),
+    );
+}
+
+test "a nested value comes back rendered, and never as <CODE>" {
+    // What an unforced thunk renders as, and what a model then reads: the
+    // repl writes `{ z = <CODE>; }` for this, which answers nothing.
+    var buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "{ z = \"ab\"; }",
+        try evaluateText(&buffer, "{ z = \"a\" + \"b\"; }"),
+    );
+    try testing.expectEqualStrings(
+        "{ a = { b = [ 1 2 ]; }; }",
+        try evaluateText(&buffer, "{ a = { b = [ 1 (1 + 1) ]; }; }"),
     );
 }
 
