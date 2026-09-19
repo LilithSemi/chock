@@ -1611,6 +1611,7 @@ pub fn build(b: *std.Build) void {
     );
 
     const cli_tests = b.addTest(.{
+        .use_llvm = evaluator_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/cli/streams.zig"),
             .target = target,
@@ -1640,6 +1641,7 @@ pub fn build(b: *std.Build) void {
     repo_root_options.addOptionPath("repo_root", b.path("."));
 
     const docs_tests = b.addTest(.{
+        .use_llvm = evaluator_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/docs/claims.zig"),
             .target = target,
