@@ -1,31 +1,6 @@
-//! A Nix store for an evaluation that may not have one.
-//!
-//! fix asks a store backend seven questions, and a real backend answers them
-//! against the host's `/nix/store` and its daemon. This driver answers none of
-//! them itself. Every question goes to a seam the caller supplies, so the
-//! caller, and not the expression under evaluation, decides what a Nix
-//! evaluation may do. It is the shape `chock_core.tools.NetSeam` already has
-//! for the network.
-//!
-//! ## A build is refused, and import from derivation with it
-//!
-//! `build_paths` is the one operation that runs somebody else's code. An
-//! expression can reach it without a caller ever asking for a build: import
-//! from derivation is an evaluation that stops, builds a derivation, and reads
-//! the result back as Nix source. fix routes that through this same operation.
-//! Chock authorises no build here, so both refuse, and the refusal names the
-//! path. Nix says very little when a build does not happen, and a model that
-//! reads "refused" with no subject retries the same expression.
-//!
-//! ## Why the produced set exists
-//!
-//! A build request names a store path. A hand written derivation can name any
-//! builder and any input, so a build of a path this evaluation did not itself
-//! produce is host code execution with a content hash in front of it. The
-//! driver therefore records what `add_object` put in the store and refuses a
-//! build of anything else, before the seam is asked at all. The seam then
-//! answers the narrower question of whether this particular request is
-//! allowed.
+//! A Nix store for an evaluation that may not have one. Every question fix
+//! asks a store backend goes to a seam the caller supplies, so the caller and
+//! not the expression decides what an evaluation may do.
 
 const std = @import("std");
 const expr = @import("expr");
@@ -37,30 +12,21 @@ pub const BuildSink = store.backend.BuildSink;
 pub const MissingPlan = store.backend.MissingPlan;
 
 pub const Error = error{
-    /// The seam has no answer for this operation, so the driver refuses it
-    /// rather than inventing one.
+    /// The seam has no answer for this operation.
     OperationRefused,
     /// A build named a path this driver did not produce, or the seam
     /// authorises no build at all.
     BuildRefused,
-    /// The object is longer than `Driver.max_object_bytes`.
     ObjectTooLarge,
 };
 
-/// The most bytes one store object may carry.
-///
-/// A Nix source file or a derivation text is a few kilobytes. Sixteen
-/// mebibytes is far above anything an evaluation writes and far below the
-/// memory a single object could otherwise take, because the whole object is
-/// held as bytes while it is added.
+/// The most bytes one store object may carry. A source file or a derivation
+/// text is a few kilobytes, and the whole object is held while it is added.
 pub const default_max_object_bytes: usize = 16 << 20;
 
-/// Where a store operation really happens.
-///
-/// Every function pointer is optional and every absent one refuses. A caller
-/// that sets nothing gets an evaluation that can compute a derivation path and
-/// do nothing else, which is what `eval.Session` already does with no driver
-/// at all.
+/// Where a store operation really happens. Every function pointer is optional
+/// and every absent one refuses, so a caller that sets nothing gets an
+/// evaluation that can compute a derivation path and do nothing else.
 pub const Seam = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -72,8 +38,8 @@ pub const Seam = struct {
         add_object: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, object: AddObject) anyerror![]u8 = null,
         read_file: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, path: []const u8) anyerror![]u8 = null,
         /// Asked only after the driver has checked that this evaluation
-        /// produced every path in the request. Import from derivation arrives
-        /// here too, so a seam that sets this runs code the model chose.
+        /// produced every path in the request. Import from derivation
+        /// arrives here too, so a seam that sets this runs the model's code.
         build_paths: ?*const fn (context: *anyopaque, paths: []const []const u8, sink: ?BuildSink, mode: BuildMode) anyerror!void = null,
         query_missing: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, paths: []const []const u8) anyerror!MissingPlan = null,
         add_indirect_root: ?*const fn (context: *anyopaque, link_path: []const u8, target: []const u8) anyerror!void = null,
@@ -85,20 +51,16 @@ pub const Seam = struct {
 
 const no_context: u8 = 0;
 
-/// A `store.backend.Driver` over a `Seam`.
+/// A `store.backend.Driver` over a `Seam`. Hand `backend()` to
+/// `expr.Engine.setStoreBackend` and keep it alive as long as the engine is.
 ///
-/// Build it, hand `backend()` to `expr.Engine.setStoreBackend`, and keep it
-/// alive for as long as the engine is. It owns the set of paths it produced
-/// and the text of its last refusal, so it holds an allocator.
-///
-/// **One engine, and one worker in it.** `run` and `submit` execute on the
-/// thread that asked, and nothing here is locked, so the engine this is given
-/// to is the engine `eval.Options.workers` builds with a count of one.
+/// One engine, and one worker in it. `run` and `submit` execute on the thread
+/// that asked and nothing here is locked.
 pub const Driver = struct {
     allocator: std.mem.Allocator,
     seam: Seam = Seam.refusing,
     /// A bound and not a rule. Whether an object may be added is the seam's
-    /// answer. This is only how much of it there may be.
+    /// answer.
     max_object_bytes: usize = default_max_object_bytes,
 
     paths: std.StringHashMapUnmanaged(void) = .empty,
@@ -127,23 +89,18 @@ pub const Driver = struct {
         return self.paths.contains(path);
     }
 
-    /// Why the last operation refused, in words that name the path. Borrowed
-    /// until the next operation on this driver.
+    /// Borrowed until the next operation on this driver.
     pub fn lastError(self: *Driver) ?[]const u8 {
         return self.message;
     }
 
     /// Build `paths`, if this driver produced every one of them.
     ///
-    /// **The same function the engine's own build goes through**, so a
-    /// caller outside the engine reaches no build the engine would be
-    /// refused. A second check written beside this one could answer
-    /// differently, and then the weaker of the two would be the real rule.
-    ///
-    /// The seam decides where the build happens, and a seam with no
-    /// `build_paths` refuses. See `lib/chock-nix/build.zig`, which installs
-    /// one only after a person or the policy has answered, so an evaluation
-    /// can never reach it.
+    /// A hand written derivation can name any builder, so a build of a path
+    /// this evaluation did not produce is host code execution with a hash in
+    /// front of it. The refusal names the path, because a model that reads
+    /// "refused" with no subject retries. The engine's own build goes
+    /// through here too, so a second check cannot answer differently.
     pub fn build(self: *Driver, paths: []const []const u8, mode: BuildMode) anyerror!void {
         return buildPaths(self, paths, null, mode);
     }
@@ -169,9 +126,8 @@ pub const Driver = struct {
         return @ptrCast(@alignCast(raw));
     }
 
-    /// The driver, with the last refusal dropped. `last_error` is borrowed
-    /// until the next operation, so an operation that starts ends the loan
-    /// rather than leaving an older refusal for a later failure to wear.
+    /// The driver, with the last refusal dropped, so an operation that starts
+    /// ends the loan on `last_error`.
     fn begin(raw: *anyopaque) *Driver {
         const self = from(raw);
         if (self.message) |old| {
@@ -184,7 +140,7 @@ pub const Driver = struct {
     fn start(_: *anyopaque) !void {}
 
     /// On the calling thread. A tool call runs inside a sandbox whose io
-    /// cannot start a thread, so this driver starts none either.
+    /// cannot start a thread.
     fn run(raw: *anyopaque, work: store.backend.WorkFn, context: *anyopaque) !void {
         work(raw, context);
     }
@@ -292,8 +248,8 @@ pub const Driver = struct {
         try self.paths.put(self.allocator, owned, {});
     }
 
-    /// The refusal a caller reads back. A driver that cannot allocate the text
-    /// still refuses: the error is the answer, and the words are the detail.
+    /// A driver that cannot allocate the text still refuses: the error is the
+    /// answer, and the words are the detail.
     fn refuse(self: *Driver, comptime format: []const u8, args: anytype) void {
         const text = std.fmt.allocPrint(self.allocator, format, args) catch return;
         if (self.message) |old| self.allocator.free(old);
@@ -303,8 +259,7 @@ pub const Driver = struct {
 
 const testing = std.testing;
 
-/// A store that keeps its objects in memory, for a test that asks what the
-/// driver does and not what a store does.
+/// A store that keeps its objects in memory.
 const FakeStore = struct {
     allocator: std.mem.Allocator,
     objects: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -367,7 +322,6 @@ const FakeStore = struct {
     }
 };
 
-/// The connection of `driver`, which is what every operation is asked through.
 fn connectionOf(driver: store.backend.Driver) !store.backend.Connection {
     const Capture = struct {
         driver: store.backend.Driver,
@@ -400,8 +354,7 @@ test "an object the driver added may then be built" {
     } });
     defer testing.allocator.free(written);
 
-    // Drop the `record` call in `addObject` and the build below is refused,
-    // because the produced set is the only thing that authorises it.
+    // Drop the `record` call in `addObject` and the build below is refused.
     try testing.expect(driver.produced(example_path));
     try connection.buildPaths(&.{example_path}, null, .normal);
     try testing.expectEqual(@as(usize, 1), fake.builds);
@@ -433,8 +386,7 @@ test "a build is refused when the session authorises none, and the refusal names
     var driver = Driver.init(testing.allocator, seam);
     defer driver.deinit();
 
-    // Import from derivation reaches this operation, so this is the case that
-    // stops an evaluation from building its own input.
+    // Import from derivation reaches this operation.
     const connection = try connectionOf(driver.backend());
     const written = try connection.addObject(testing.allocator, .{ .text = .{
         .expected_path = example_path,
@@ -463,8 +415,7 @@ test "an object over the cap is refused before the store sees it" {
         .references = &.{},
     } }));
 
-    // Refused before the seam, so nothing reached the store and nothing was
-    // recorded. Move the cap check after the `add` call and both fail.
+    // Move the cap check after the `add` call and both assertions fail.
     try testing.expectEqual(@as(usize, 0), fake.objects.count());
     try testing.expect(!driver.produced(example_path));
 
@@ -483,8 +434,8 @@ test "an empty seam refuses every operation rather than answering a wrong one" {
     defer driver.deinit();
 
     const connection = try connectionOf(driver.backend());
-    // `is_valid_path` is the one that shows why an absent function may not
-    // answer: false is a plausible answer and it is not this driver's to give.
+    // `is_valid_path` shows why an absent function may not answer: false is
+    // plausible and it is not this driver's to give.
     try testing.expectError(Error.OperationRefused, connection.isValidPath(example_path));
     try testing.expectError(Error.OperationRefused, connection.addObject(testing.allocator, .{ .text = .{
         .expected_path = example_path,
@@ -517,9 +468,8 @@ test "a real engine with this driver installed writes its derivation through the
     const path = (try engine.derivationDrvPath(value)).?;
     try engine.ensureDerivationClosure(path);
 
-    // The derivation text went to the seam and not to the host store, and it
-    // went through this driver, so the produced set now authorises a build of
-    // it. Nothing here needs a daemon, a store mount or a network.
+    // The derivation text went to the seam and not to the host store, so the
+    // produced set now authorises a build of it.
     try testing.expect(fake.objects.contains(path));
     try testing.expect(driver.produced(path));
 }
@@ -544,9 +494,8 @@ test "import from derivation through a real engine is refused by name" {
     ;
     try testing.expectError(Error.BuildRefused, engine.evaluate(source));
 
-    // The refusal names the derivation the evaluation asked to build, which
-    // is the only signal a reader gets: fix reports the store error text and
-    // nothing else about why the import stopped.
+    // fix reports the store error text and nothing else about why the import
+    // stopped, so the refusal has to name the derivation.
     const said = driver.lastError().?;
     try testing.expect(std.mem.indexOf(u8, said, ".drv") != null);
     try testing.expect(std.mem.startsWith(u8, said, "a build of "));

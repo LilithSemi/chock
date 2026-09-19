@@ -84,14 +84,14 @@ did not. Writing `.{ .action = "call.write_file", .decision = .ask }` in your
 own `chock.zon` puts that call back behind a prompt, even though a shipped
 default would otherwise let it through.
 
-**A store path the session did not start with asks.** `run_command` names a
+A store path the session did not start with asks. `run_command` names a
 program by the class it belongs to, and the store is two of those classes.
 `exec.devshell.*` is a program inside the Nix dev shell closure this session
 mounted at its start, and it is allowed: the toolchain was known before the
 model said anything. `exec.nix.store.*` is every other store path, and it is
 the one shipped rule that is not an `allow`. A store path is immutable, so it
 names one program forever, but the set of store paths is not: the agent can
-have an expression evaluated and the result built, and a path it made this way
+have an expression evaluated and the result built, and a path it made that way
 is not the toolchain it was given. `exec.path.*`, a bare name looked up on
 `PATH`, and `exec.workspace.*`, a path inside the project, are both unchanged.
 
@@ -621,13 +621,12 @@ object, and every build of one session spends against the same number. A
 build whose derivation would pass it is refused while it is being written, so
 nothing is built.
 
-**Neither field takes a percentage.** `limits.processes` and `limits.memory`
-each resolve a percentage against something the machine reports, a cpu count
-or a total. A store object has no such quantity to be a share of, so a
-percentage here is refused when the file is read, with a message that says
-why, rather than resolved against a number invented for the occasion. Each
-field is a bare number, or a number with a unit this reader knows: `B`,
-`KiB`, `MiB`, `GiB`, `TiB`.
+Neither field takes a percentage. `limits.processes` and `limits.memory`
+each resolve one against something the machine reports, a cpu count or a
+total, and a store object has no such quantity to be a share of. A percentage
+here is refused when the file is read, with a message that says why. Each
+field is a bare number, or a number with a unit this reader knows: `B`, `KiB`,
+`MiB`, `GiB`, `TiB`.
 
 The fold is the same order `limits` uses:
 

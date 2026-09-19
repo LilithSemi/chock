@@ -1,46 +1,9 @@
 //! A flake's inputs are fetched on the host, once, before anything evaluates.
 //!
-//! ## Why the fetch cannot happen inside the evaluator
-//!
-//! `lib/chock-nix/eval.zig` runs fix in Chock's own process. fix can fetch a
-//! flake input for itself, over its own connection, and no rule of this
-//! project would see it. So the evaluator is given no fetcher at all, and a
-//! flake input reaches it one way: it is already in the host store when the
-//! evaluation starts.
-//!
-//! fix reads it from there. A locked input carries a `narHash`, the store
-//! path of a fetched input is that hash, and fix takes the path when the store
-//! says it is valid rather than downloading the tree again. `nix flake
-//! archive` is what puts it there. Both halves are pinned in
-//! `test/nix/real.zig`, because both are claims about somebody else's code.
-//!
-//! ## The lock is a file of the project, so it is read as one
-//!
-//! `flake.lock` sits in the project directory beside `chock.zon`, and this
-//! project reads a file there as something an attacker may have written. So
-//! every host the lock names goes to the same `fetch.Gate` a build's own
-//! fetches go to, and a host nobody permitted stops the fetch. One question
-//! per host, whatever number of inputs share it.
-//!
-//! **A node whose host cannot be named is a refusal**, the rule
-//! `lib/chock-nix/fetch.zig` already keeps. An `indirect` node names a
-//! registry rather than a host, an `ssh` URL is not a scheme this can turn
-//! into a host and a port, and a guess would put a question to the policy
-//! about a connection that never happens while the real one goes unasked.
-//!
-//! **A forge node names no URL, so the host comes from the type.** `github`
-//! with no `host` of its own is fetched from `api.github.com`, which redirects
-//! to `codeload.github.com`, so both are named and both are asked about.
-//! `gitlab` is `gitlab.com` and `sourcehut` is `git.sr.ht`. A node with a
-//! `host` of its own names that one and nothing else.
-//!
-//! ## A session whose inputs did not arrive still starts
-//!
-//! Nothing else a session start does refuses the session because an optional
-//! thing was missing, and a project with no flake at all is the ordinary case.
-//! What this owes instead is a later failure somebody can act on: `refusal`
-//! writes the sentence a build reads when it wanted an input this session does
-//! not have, and it names the input and the host it would have come from.
+//! fix can fetch an input for itself over its own connection, which no rule of
+//! this project would see, so the evaluator is given no fetcher at all. `nix
+//! flake archive` puts every input in the host store first, and fix takes a
+//! locked input from there when the store says its path is valid.
 
 const std = @import("std");
 
@@ -49,16 +12,13 @@ const provision = @import("provision.zig");
 
 pub const Error = provision.Error;
 
-/// The longest `flake.lock` this reads. A lock for a flake with many inputs is
-/// a few hundred kilobytes.
+/// The longest `flake.lock` this reads.
 pub const max_lock_bytes: usize = 4 << 20;
 
 /// The most nodes one lock may hold. A real lock holds tens.
 pub const max_nodes: usize = 1024;
 
-/// Why a lock node could not be turned into a host and a port.
 pub const Unreadable = struct {
-    /// The node the lock calls it.
     input: []const u8,
     /// What the node says it is, or its URL when it has one. Empty when the
     /// node carries neither.
@@ -68,8 +28,10 @@ pub const Unreadable = struct {
     pub const Why = enum {
         /// The node holds no `locked` object, or no `type` in it.
         not_a_node,
-        /// A type this file will not turn into a host: `indirect`, which names
-        /// a registry rather than a host, and anything nobody has taught it.
+        /// A type this file will not turn into a host: `indirect`, which
+        /// names a registry rather than a host, and anything nobody has
+        /// taught it. A guess would ask about a connection that never
+        /// happens while the real one goes unasked.
         type_unknown,
         /// A node of a type that fetches, with no `url` to fetch.
         no_url,
@@ -79,21 +41,17 @@ pub const Unreadable = struct {
     };
 };
 
-/// What one lock says about the network.
 pub const Wants = union(enum) {
     /// One entry per host and port, in the order they were found.
     hosts: []const fetch.Fetch,
-    /// The first node this file could not name. **A refusal and never a
-    /// skip**: a fetch nobody can name is a fetch nobody can rule on.
+    /// The first node this file could not name. A refusal and never a skip,
+    /// because a fetch nobody can name is a fetch nobody can rule on.
     unreadable: Unreadable,
-    /// Why the bytes are not a lock at all.
     not_a_lock: []const u8,
 };
 
-/// Every host the inputs of `lock_bytes` would be fetched from.
-///
-/// **Give this an arena**: every string of the answer comes from `allocator`,
-/// and so does the parsed JSON.
+/// Every host the inputs of `lock_bytes` would be fetched from. Give it an
+/// arena.
 pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.Allocator.Error!Wants {
     if (lock_bytes.len > max_lock_bytes) return .{ .not_a_lock = "the lock file is too long to read" };
 
@@ -120,8 +78,7 @@ pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.All
     var each = nodes.iterator();
     while (each.next()) |entry| {
         const name = entry.key_ptr.*;
-        // The root node is the flake itself. It has no `locked` reference to
-        // fetch, because it is the tree the lock lives in.
+        // The root node is the tree the lock lives in, so it fetches nothing.
         if (std.mem.eql(u8, name, root_name)) continue;
 
         const targets = switch (try targetsOf(allocator, name, entry.value_ptr.*)) {
@@ -139,7 +96,6 @@ pub fn wantsOf(allocator: std.mem.Allocator, lock_bytes: []const u8) std.mem.All
     return .{ .hosts = try found.toOwnedSlice(allocator) };
 }
 
-/// What one node of a lock wants.
 const Targets = union(enum) {
     targets: []const fetch.Fetch,
     /// A node that fetches nothing, which is what a `path` node is.
@@ -182,10 +138,8 @@ fn targetsOf(
     const url = stringOf(locked.object, "url") orelse return .{
         .unreadable = .{ .input = name, .reference = try allocator.dupe(u8, kind), .why = .no_url },
     };
-    // `git+https://…` and `hg+https://…` are one transport written in front of
-    // one URL. `fetch.targetOf` takes the prefix off, so the strip lives in
-    // one place and a lock node and a derivation read the same URL the same
-    // way.
+    // `fetch.targetOf` takes a `git+` or `hg+` prefix off, so a lock node and
+    // a derivation read the same URL the same way.
     const target = fetch.targetOf(url) catch |err| return .{ .unreadable = .{
         .input = name,
         .reference = try allocator.dupe(u8, url),
@@ -207,10 +161,8 @@ fn targetsOf(
 }
 
 /// The hosts a forge node is fetched from, or null when `kind` is not a forge.
-///
 /// `github` with no host of its own is fetched from the API host, which
-/// redirects to the download host, so both are named. A node that states a
-/// host states the whole answer.
+/// redirects to the download host, so both are named.
 fn forgeHosts(
     kind: []const u8,
     host: ?[]const u8,
@@ -235,7 +187,6 @@ fn forgeHosts(
     return buffer[0..1];
 }
 
-/// True when a node of this type carries the URL it is fetched from.
 fn fetchesByUrl(kind: []const u8) bool {
     for ([_][]const u8{ "tarball", "file", "git", "mercurial" }) |one| {
         if (std.mem.eql(u8, kind, one)) return true;
@@ -249,21 +200,15 @@ fn stringOf(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     return value.string;
 }
 
-/// What one fetch of a flake's inputs came to.
 pub const Answer = union(enum) {
-    /// Every store path the fetch put there: the flake's own tree and every
-    /// input of it, at every depth.
+    /// The flake's own tree and every input of it, at every depth.
     fetched: []const []const u8,
-    /// Why nothing was fetched, in one sentence a person and a model both
-    /// read.
     refused: []const u8,
 };
 
 /// Fetch every input of `reference` into the host store, after the gate has
-/// answered for every host `lock_bytes` names.
-///
-/// **On the host, outside every sandbox**, the same place the rest of this
-/// library runs `nix`. **Give it an arena.**
+/// answered for every host `lock_bytes` names. On the host, and give it an
+/// arena.
 pub fn fetchAll(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -273,8 +218,7 @@ pub fn fetchAll(
     lock_bytes: []const u8,
 ) Error!Answer {
     switch (try wantsOf(allocator, lock_bytes)) {
-        // One call for every host the lock names, the same way a build puts
-        // every host of its closure at once.
+        // One call for every host the lock names, as a build does.
         .hosts => |list| switch (try gate.permitAll(allocator, list)) {
             .permitted => {},
             .refused => |why| return .{ .refused = why },
@@ -290,7 +234,7 @@ pub fn fetchAll(
 }
 
 /// Run `nix flake archive` for `reference` and answer every store path it
-/// named. **The caller has already put every host to the gate.**
+/// named. The caller has already put every host to the gate.
 pub fn archive(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -349,7 +293,6 @@ fn collectPaths(
     while (each.next()) |entry| try collectPaths(allocator, entry.value_ptr.*, into);
 }
 
-/// One sentence for a lock node this file could not name. The caller owns it.
 pub fn unreadableRefusal(
     allocator: std.mem.Allocator,
     one: Unreadable,
@@ -394,11 +337,8 @@ pub fn unreadableRefusal(
     };
 }
 
-/// True when `text` already ends a sentence.
-///
-/// **A refusal is written by whoever refused**, so a caller that joins one to a
-/// sentence of its own cannot know how it ends. `endSentence` is what keeps the
-/// seam reading as prose rather than running one sentence into the next.
+/// A refusal is written by whoever refused, so a caller that joins one to a
+/// sentence of its own cannot know how it ends.
 fn endsSentence(text: []const u8) bool {
     if (text.len == 0) return true;
     return switch (text[text.len - 1]) {
@@ -407,8 +347,6 @@ fn endsSentence(text: []const u8) bool {
     };
 }
 
-/// Append `said` to `text` as a whole sentence, with the full stop it may not
-/// carry itself.
 fn endSentence(
     allocator: std.mem.Allocator,
     text: *std.ArrayList(u8),
@@ -418,17 +356,12 @@ fn endSentence(
     if (!endsSentence(said)) try text.append(allocator, '.');
 }
 
-/// What a build reads when an input it needed is still not there.
+/// What a build reads when an input it needed is still not there. A session
+/// whose inputs did not arrive still starts, because a project with no flake
+/// is the ordinary case, so this is the failure somebody acts on instead.
 ///
-/// **It names the input and the host**, because a model that reads a refusal
-/// with no subject builds the same attribute again. `why` is what the fetch
-/// itself said, which is the part a person acts on.
-///
-/// **The advice is what is true by the time this is written.** A build fetches
-/// a missing input through the gate that can ask, so reaching here means
-/// somebody was asked and said no, or the fetch itself failed. Telling the
-/// model to ask for a host it has just been refused would send the same
-/// attribute back a second time.
+/// It never tells the model to ask for a host: reaching here means somebody
+/// was asked and said no, or the fetch itself failed.
 pub fn missingRefusal(
     allocator: std.mem.Allocator,
     installable: []const u8,
@@ -488,8 +421,7 @@ test "two inputs from one forge are two hosts and never two questions each" {
 
     const wants = try wantsOf(arena, one_github_input);
     try testing.expect(wants == .hosts);
-    // Two inputs, one forge, and the two hosts that forge is really fetched
-    // from. Not four.
+    // Two hosts for the one forge, and not four.
     try testing.expectEqual(@as(usize, 2), wants.hosts.len);
     for (wants.hosts) |one| {
         try testing.expect(std.mem.endsWith(u8, one.host, ".github.com"));
@@ -558,8 +490,6 @@ test "a node nothing can name is a refusal that names the input" {
     const said = try unreadableRefusal(arena, indirect.unreadable);
     try testing.expect(std.mem.indexOf(u8, said, "dep") != null);
 
-    // `ssh` names a host at 22 like any other scheme with one, so a node that
-    // uses it is asked about rather than refused.
     const ssh = try wantsOf(arena,
         \\{"nodes":{"dep":{"locked":{"type":"git","url":"ssh://git@example.com/a.git"}},
         \\ "root":{"inputs":{"dep":"dep"}}},"root":"root","version":7}
@@ -568,7 +498,6 @@ test "a node nothing can name is a refusal that names the input" {
     try testing.expectEqualStrings("example.com", ssh.hosts[0].host);
     try testing.expectEqual(@as(u16, 22), ssh.hosts[0].port);
 
-    // A scheme with no port this file may invent is still a refusal.
     const unknown = try wantsOf(arena,
         \\{"nodes":{"dep":{"locked":{"type":"git","url":"s3://example.com/a.git"}},
         \\ "root":{"inputs":{"dep":"dep"}}},"root":"root","version":7}
@@ -587,7 +516,6 @@ test "bytes that are not a lock answer one sentence and never a host" {
     try testing.expect(try wantsOf(arena, "[]") == .not_a_lock);
 }
 
-/// A `provision.Runner` that runs nothing and records what it was asked.
 const FakeRunner = struct {
     gpa: std.mem.Allocator,
     code: u8 = 0,
@@ -632,8 +560,7 @@ const FakeRunner = struct {
 };
 
 /// A `fetch.Gate` that answers the same way about every host and records what
-/// it was asked. **Not a policy table**: what the real one answers is the
-/// project's own rules, and no test here claims otherwise.
+/// it was asked. Not a policy table.
 const AnsweringGate = struct {
     gpa: std.mem.Allocator,
     permitted: bool = true,
@@ -664,8 +591,7 @@ const AnsweringGate = struct {
         return .{ .refused = "a flake input is fetched by host and never without one" };
     }
 
-    /// No rule here at all, so no mirror of a site is taken without a
-    /// question. A flake input names a host and never a site.
+    /// A flake input names a host and never a mirror site.
     fn allowsNothing(_: *anyopaque, _: fetch.Fetch) bool {
         return false;
     }
@@ -707,8 +633,6 @@ test "every host of the lock is asked about once, and then the inputs are fetche
     const answer = try fetchAll(arena, testing.io, fake.runner(), gate.gate(), "/work", one_github_input);
     try testing.expect(answer == .fetched);
 
-    // Every path of the tree, at every depth, which is what a later evaluation
-    // reads from the store instead of fetching.
     try testing.expectEqual(@as(usize, 4), answer.fetched.len);
     try testing.expectEqualStrings("/nix/store/aaaa-source", answer.fetched[0]);
     try testing.expectEqualStrings("/nix/store/dddd-source", answer.fetched[3]);
@@ -735,8 +659,6 @@ test "a host nobody allowed refuses the fetch, and nix is never run" {
     try testing.expect(answer == .refused);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "github.com") != null);
 
-    // Every host the lock names goes to the gate in one call, and a no there
-    // stops the fetch, so nothing was fetched.
     try testing.expectEqual(@as(usize, 2), gate.asked.items.len);
     try testing.expectEqual(@as(usize, 0), fake.calls);
 }
@@ -767,8 +689,7 @@ test "the sentence a later build reads names the input and the host, and reads a
         .{ .subject = "nixpkgs", .url = "https://api.github.com", .host = "api.github.com", .port = 443 },
     };
 
-    // **The seam is the point.** A refusal is written by whoever refused, and
-    // one that ends on an action name ran straight into the next sentence.
+    // A refusal that ends on an action name ran into the next sentence.
     const said = try missingRefusal(
         gpa,
         "/work#packages.default",
@@ -783,12 +704,10 @@ test "the sentence a later build reads names the input and the host, and reads a
     try testing.expect(std.mem.indexOf(u8, said, "api.github.api.443. The") != null or
         std.mem.indexOf(u8, said, "net.connect.com.github.api.443. The") != null);
 
-    // A refusal that ends its own sentence keeps the one full stop it wrote.
     const already = try missingRefusal(gpa, "/work#a", "no rule allows it.", &.{});
     defer gpa.free(already);
     try testing.expect(std.mem.indexOf(u8, already, "allows it.. ") == null);
     try testing.expect(std.mem.indexOf(u8, already, "allows it. Nothing was fetched") != null);
 
-    // The model is never told to ask for a host it has just been refused.
     try testing.expect(std.mem.indexOf(u8, said, "ask the user") == null);
 }

@@ -1,106 +1,61 @@
 //! Nix evaluation inside Chock's own process, through fix rather than through
-//! the `nix` binary the rest of this library spawns.
-//!
-//! **An evaluation needs nothing from the host.** Store writes stay off until
-//! a caller asks for them, so an engine built here reaches no daemon, no
-//! store mount and no network. Even a derivation's own path is computed, not
-//! looked up: see this file's own test. What needs the host is a build, and a
-//! build is brokered rather than done here.
-//!
-//! **The evaluator has no fetcher, whatever io a caller passes.** fix can
-//! download a flake input over a connection of its own, and no rule of this
-//! project would see it, so `Options.io` reaches the file reader and the
-//! store and never the fetcher. A flake input is fetched on the host first,
-//! where the policy answers, and the evaluation reads it out of the store:
-//! see `lib/chock-nix/inputs.zig`.
-//!
-//! **Pure evaluation is the default, and the roots are the flake's own source
-//! tree.** Impure evaluation reads the environment and any path on the
-//! machine, which is the whole surface Chock exists to close, so a caller
-//! that wants it says so and names what it may read.
-//!
-//! **An evaluation runs in Chock's own process, so it is bounded here.**
-//! `Options.max_call_depth` stops a runaway recursion and
-//! `Options.gc_budget_bytes` is the line the collector defends. **Nothing
-//! here bounds wall clock time**, and fix offers no deadline to pass on, so
-//! an expression that loops without recursing runs until the process is
-//! stopped. That gap is open.
+//! the `nix` binary the rest of this library spawns. Store writes stay off
+//! until a caller asks for them, so an engine built here reaches no daemon, no
+//! store mount and no network.
 
 const std = @import("std");
 const expr = @import("expr");
 const store = @import("store");
 
-/// What one evaluation may see, and how much of the machine it may take.
 pub const Options = struct {
     /// Whether `getEnv`, `<nixpkgs>` and out of tree reads are refused.
     pure: bool = true,
-    /// The directories a pure evaluation may still read, which is the source
-    /// tree of the flake being evaluated. The store is always readable.
+    /// The directories a pure evaluation may still read. The store is always
+    /// readable.
     roots: []const []const u8 = &.{},
-    /// How many threads the evaluator may use. One is the whole engine on the
-    /// calling thread, which is what a tool call inside a sandbox gets: see
-    /// `src/run.zig`, whose phase 2 io cannot start a thread.
+    /// One is the whole engine on the calling thread, which is what a tool
+    /// call gets: the phase 2 io of `src/run.zig` cannot start a thread.
     workers: u8 = 1,
-    /// How deep a call may nest before the evaluation stops. The expression
-    /// can come from a model, and a recursion nobody bounded is an
-    /// allocation nobody bounded, in Chock's own process rather than in a
-    /// sandbox.
+    /// The expression can come from a model, and a recursion nobody bounded
+    /// is an allocation nobody bounded, in Chock's own process.
     max_call_depth: u32 = default_call_depth,
-    /// The bytes of garbage the engine may hold before it collects. Null
-    /// lets fix size the line from the machine's own memory, which is what a
-    /// caller with no number of its own wants.
+    /// The bytes of garbage the engine may hold before it collects. Null lets
+    /// fix size the line from the machine's own memory.
     ///
-    /// **This is a collection line and not a refusal.** It bounds how much is
-    /// held at once. Nothing here bounds how long an evaluation runs: see
-    /// this file's own top comment.
+    /// Nothing bounds how long an evaluation runs, because fix offers no
+    /// deadline to pass on, so an expression that loops without recursing
+    /// runs until the process is stopped. That gap is open.
     gc_budget_bytes: ?u64 = null,
     /// What reads a file for `builtins.readFile` and the rest. Null gives an
-    /// engine that evaluates but reads nothing, which every caller that only
-    /// computes wants.
+    /// engine that evaluates but reads nothing.
     io: ?std.Io = null,
-    /// Whether the evaluator may open a connection of its own.
-    ///
-    /// **Off, and it stays off.** fix has a fetcher, and an expression that
-    /// reaches it would fetch over a socket no rule of this project ever saw.
-    /// So the `io` above reaches the file reader and the store and never the
-    /// fetcher, and a fetch answers `FetchIoUnavailable` instead. What a flake
-    /// really needs is fetched on the host first, where the policy answers:
-    /// see `lib/chock-nix/inputs.zig`.
+    /// Off, and it stays off. fix has a fetcher, and an expression that
+    /// reached it would fetch over a socket no rule of this project ever saw,
+    /// so the `io` above reaches the file reader and the store and never the
+    /// fetcher. A fetch answers `FetchIoUnavailable`. What a flake really
+    /// needs is fetched on the host first: see `inputs.zig`.
     network: bool = false,
-    /// Whether `builtins.getFlake` works.
-    ///
-    /// **Off, because most expressions are not a flake.** fix keeps flakes
-    /// behind the same experimental feature Nix does, so a caller that
-    /// evaluates an attribute of a flake says so. An evaluation with this off
-    /// answers `MissingExperimentalFeature` for `builtins.getFlake`.
+    /// Off. fix keeps flakes behind the same experimental feature Nix does,
+    /// so an evaluation with this off answers `MissingExperimentalFeature`.
     flakes: bool = false,
     /// Where a store operation goes, or null for an engine with no store
-    /// behind it at all. See `chock-nix/backend.zig`: a driver over a
-    /// refusing seam answers every store question with a refusal that names
-    /// the path, which is the answer a reader can act on.
+    /// behind it at all.
     store_backend: ?store.backend.Driver = null,
     /// Whether the evaluation may put an object in the store behind
-    /// `store_backend`.
-    ///
-    /// **Off, because an evaluation that only says what a value is needs no
-    /// store at all.** A caller turns it on when the derivation must be
-    /// registered through the driver, which is what makes
-    /// `chock-nix/backend.zig`'s produced set able to authorise a build of
-    /// it. Nothing is written when `store_backend` is null.
+    /// `store_backend`. A caller turns it on when the derivation must be
+    /// registered through the driver, which is what lets the produced set of
+    /// `backend.zig` authorise a build of it.
     store_writes: bool = false,
 };
 
-/// The call depth this library keeps when a caller names none. fix's own
-/// default, read from fix rather than written out a second time.
+/// fix's own default, read from fix rather than written out a second time.
 pub const default_call_depth: u32 = (expr.LanguagePolicy{}).max_call_depth;
 
-/// What one evaluation came to.
 pub const Answer = struct {
-    /// The value rendered the way the repl renders it, borrowed from the
-    /// buffer the caller passed to `answer`.
+    /// Rendered the way the repl renders it, borrowed from the buffer the
+    /// caller passed to `answer`.
     text: []const u8,
-    /// The derivation path, when the value is a derivation, and null for
-    /// every other value. Borrowed from the session.
+    /// Null for a value that is not a derivation. Borrowed from the session.
     derivation_path: ?[]const u8 = null,
 };
 
@@ -126,8 +81,7 @@ pub const Session = struct {
             if (options.network) {
                 engine.setFileIo(io);
             } else {
-                // The file reader and the store, and never the fetcher. See
-                // `Options.network`.
+                // The file reader and the store, and never the fetcher.
                 engine.sources.files.setIo(io);
                 engine.store.realization.setIo(io);
             }
@@ -142,56 +96,41 @@ pub const Session = struct {
         self.engine.deinit();
     }
 
-    /// `source` evaluated, and the answer rendered the way the repl renders
-    /// it. The text is written into `buffer` and borrowed from it.
+    /// The text is written into `buffer` and borrowed from it.
     pub fn evaluate(self: *Session, buffer: []u8, source: []const u8) ![]const u8 {
         return (try self.answer(buffer, source)).text;
     }
 
-    /// `evaluate`, with the derivation path beside the rendered text.
-    ///
-    /// **A derivation renders as its own path and a string renders as a
-    /// quoted path**, so a reader cannot tell the two apart from the text.
-    /// This says which one it was.
+    /// `evaluate`, with the derivation path beside the rendered text. A
+    /// derivation renders as its own path and a string renders as a quoted
+    /// path, so the text alone cannot tell the two apart.
     pub fn answer(self: *Session, buffer: []u8, source: []const u8) !Answer {
         const value = try self.engine.evaluate(source);
         // Forced first, because a renderer writes `<CODE>` for a thunk it was
-        // not asked to force, and a model that reads `<CODE>` learns nothing
-        // about the value it asked for. This is what `nix eval --strict`
-        // does.
-        //
-        // **A value that will not force deeply is still rendered.** A
-        // derivation is such a value: forcing all of it reaches attributes
-        // that fail on their own, and refusing the whole answer over one of
-        // them would answer nothing about the derivation the caller asked
-        // for. So the shallow render is the fallback, and it is what the repl
-        // would have printed anyway.
+        // not asked to force. This is what `nix eval --strict` does. A value
+        // that will not force deeply is still rendered: forcing all of a
+        // derivation reaches attributes that fail on their own.
         self.engine.forceDeep(value) catch {};
         var writer: std.Io.Writer = .fixed(buffer);
         try self.engine.writeValue(&writer, value);
         return .{
             .text = writer.buffered(),
-            // A value that renders but will not force as an attribute set is
-            // not a derivation, which is an answer and not a fault.
+            // A value that will not force as an attribute set is not a
+            // derivation, which is an answer and not a fault.
             .derivation_path = self.engine.derivationDrvPath(value) catch null,
         };
     }
 
     /// Write the derivation at `drv_path`, and everything it is built from,
-    /// through the store backend.
-    ///
-    /// **This is what puts the derivation in the driver's produced set**, so
-    /// a build of it is one the driver can authorise. An evaluation alone
-    /// computes the path and writes nothing: see this file's own test.
-    /// `Options.store_writes` must be on, and the session must have a store
-    /// backend, or this refuses.
+    /// through the store backend. This is what puts it in the driver's
+    /// produced set, so a build of it is one the driver can authorise.
+    /// `Options.store_writes` must be on, or this refuses.
     pub fn ensureDerivation(self: *Session, drv_path: []const u8) !void {
         return self.engine.ensureDerivationClosure(drv_path);
     }
 
-    /// Why the last evaluation failed, in fix's own words, written into
-    /// `writer`. Empty when nothing was recorded, which is what a runtime
-    /// fault rather than a parse fault leaves behind.
+    /// Why the last evaluation failed, in fix's own words. Empty for a
+    /// runtime fault rather than a parse fault.
     pub fn writeDiagnostics(self: *const Session, writer: *std.Io.Writer, source: []const u8) !void {
         try self.engine.writeDiagnostics(writer, source, false);
     }
@@ -199,8 +138,6 @@ pub const Session = struct {
 
 const testing = std.testing;
 
-/// `source` through a whole session, for a test that asks about the answer
-/// and not about the engine.
 fn evaluateText(buffer: []u8, source: []const u8) ![]const u8 {
     var session = try Session.init(testing.allocator, .{});
     defer session.deinit();
@@ -217,8 +154,8 @@ test "an expression evaluates in this process, with no nix binary" {
 }
 
 test "a nested value comes back rendered, and never as <CODE>" {
-    // What an unforced thunk renders as, and what a model then reads: the
-    // repl writes `{ z = <CODE>; }` for this, which answers nothing.
+    // The repl writes `{ z = <CODE>; }` for an unforced thunk, which answers
+    // nothing to a model.
     var buffer: [256]u8 = undefined;
     try testing.expectEqualStrings(
         "{ z = \"ab\"; }",
@@ -231,9 +168,8 @@ test "a nested value comes back rendered, and never as <CODE>" {
 }
 
 test "a derivation path computes with no store behind the engine" {
-    // The fact the eval and build split rests on. Store writes are off until
-    // a caller enables them, so an evaluation that asks only what a
-    // derivation is needs no daemon, no store mount and no backend driver.
+    // What the eval and build split rests on: an evaluation that asks only
+    // what a derivation is needs no daemon, no store mount and no driver.
     var buffer: [256]u8 = undefined;
     try testing.expectEqualStrings(
         "\"/nix/store/97qlv6h78lxlm9zc8849ahsbcklhsi2y-x.drv\"",
@@ -248,8 +184,7 @@ test "a pure evaluation cannot read the environment, and cannot read a path outs
     try testing.expectEqualStrings("\"\"", try evaluateText(&buffer, "builtins.getEnv \"PATH\""));
 
     // An engine is given no environment map either way, so `getEnv` is empty
-    // in both modes. What purity really decides is the filesystem: a path
-    // outside every root is refused rather than read.
+    // in both modes. What purity decides is the filesystem.
     var session = try Session.init(testing.allocator, .{});
     defer session.deinit();
     try testing.expectError(error.RestrictedInPureEval, session.evaluate(&buffer, "builtins.readFile /etc/hostname"));
@@ -277,8 +212,7 @@ test "a file inside a root is read, and the same file outside every root is not"
         try testing.expectEqualStrings("\"hello\"", try session.evaluate(&buffer, source));
     }
 
-    // The same expression, the same file, and no root naming it. Drop `roots`
-    // from the call above and the read below is what every path gets.
+    // Drop `roots` from the call above and this read is what every path gets.
     var without = try Session.init(testing.allocator, .{ .io = testing.io });
     defer without.deinit();
     try testing.expectError(error.RestrictedInPureEval, without.evaluate(&buffer, source));
@@ -294,8 +228,6 @@ test "a recursion deeper than the call depth stops rather than taking the proces
         "let f = n: if n == 0 then 0 else 1 + f (n - 1); in f 10000",
     ));
 
-    // The same expression under the default depth, so the test measures the
-    // bound and not the expression.
     var deeper = try Session.init(testing.allocator, .{});
     defer deeper.deinit();
     try testing.expectEqualStrings("1000", try deeper.evaluate(
@@ -331,9 +263,8 @@ test "an evaluation cannot reach a flake until a caller asks for one" {
 test "an evaluation with a flake cannot open a connection of its own" {
     var buffer: [256]u8 = undefined;
 
-    // The whole of the wall. fix has a fetcher, this session gives it no io,
-    // and a flake reference that would be downloaded stops here rather than
-    // reaching a host nobody was asked about.
+    // fix has a fetcher, this session gives it no io, and a flake reference
+    // that would be downloaded stops here.
     var session = try Session.init(testing.allocator, .{ .io = testing.io, .flakes = true });
     defer session.deinit();
     try testing.expectError(

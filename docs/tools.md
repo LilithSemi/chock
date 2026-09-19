@@ -19,10 +19,10 @@ $ run_command {"argv":["rg","token","notes.txt"]}
 ## It is off until you turn it on
 
 Realising a package runs `nix build` on your machine, outside the sandbox, so
-it is measured against the same policy key the broker already has for that,
-`nix.build`. **The answer decides whether the tool exists at all**, so it has
-to be read before the tool list the model sees is built, which is before the
-session starts. A project with no `chock.zon` answers `ask` for every key, and
+it is checked against the same policy key the broker already has for that,
+`nix.build`. The answer decides whether the tool exists at all, so it is read
+before the tool list the model sees is built, which is before the session
+starts. A project with no `chock.zon` answers `ask` for every key, and
 an `ask` at that moment reaches nobody, so the tool is not offered. Turn it on
 with a rule:
 
@@ -95,8 +95,8 @@ reads the same tree every other tool call reads.
 An evaluation runs in Chock's own process and not in the sandbox, so it is
 bounded where it runs. A recursion deeper than the call depth stops with an
 error, the collector holds the memory an evaluation keeps, and the rendered
-answer stops at 16384 bytes. **Nothing bounds how long an evaluation runs**,
-so an expression that loops runs until the session is stopped with Ctrl-C.
+answer stops at 16384 bytes. Nothing bounds how long an evaluation runs, so
+an expression that loops runs until the session is stopped with Ctrl-C.
 
 ## The store caps
 
@@ -135,7 +135,7 @@ A Nix attribute name may itself hold a dot, so one string would leave the tool
 guessing where a level ends. `flake` is optional: left out, the build is of the
 workspace the agent is already working in.
 
-**A `flake` that is not your project is refused.** The agent may write any
+A `flake` that is not your project is refused. The agent may write any
 reference, and fetching one means fetching its whole input graph. What that
 graph reaches is written in a lock file inside the flake, which nobody can read
 until the flake has already been fetched, so there is no moment at which your
@@ -158,7 +158,7 @@ A build of your own project asks that and nothing else:
 ```
 
 A call that names a `flake` asks a second question, for the reference itself,
-and **both have to be allowed before anything is built**:
+and both have to be allowed before anything is built:
 
 ```zon
 .{ .action = "nix.build.flake.github.NixOS.*", .decision = .allow },
@@ -171,10 +171,10 @@ attribute path and a flake reference are both dotted paths, and joined into one
 string a reference of four parts with an attribute of two writes exactly what a
 reference of three with an attribute of three writes.
 
-**The derivation hash is deliberately in neither name.** It changes on every
-edit of the Nix, so a rule keyed on one would have to be rewritten daily, and
-within a week everybody would write `nix.build.*` instead. The rows answer the
-questions a person keeps: may this agent build this attribute, and from where.
+The derivation hash is in neither name. It changes on every edit of the Nix,
+so a rule keyed on one would be rewritten daily and everybody would write
+`nix.build.*` within a week. The rows answer the questions a person keeps: may
+this agent build this attribute, and from where.
 A revision or a `#fragment` on the reference is dropped before the name is
 built, because what a row grants is the repository and never the content.
 
@@ -187,10 +187,10 @@ because a hand written derivation can name any builder, so building a path
 nobody evaluated here would be running a program of the model's choosing on
 your machine with a content hash in front of it.
 
-**What that evaluation authorised is what your machine builds.** The
-derivation it computed is written into your own store first, through your Nix
-daemon, and the store is asked where it put it: an answer that is not the path
-Chock computed is refused there and then. Chock then hands `nix` that
+What that evaluation authorised is what your machine builds. The derivation
+it computed is written into your own store first, through your Nix daemon, and
+the store is asked where it put it: an answer that is not the path Chock
+computed is refused there and then. Chock then hands `nix` that
 derivation path and never the attribute, so the attribute is read once. Your
 Nix and Chock's evaluator cannot read one expression differently between the
 two moments, and an unpinned reference cannot move between them.
@@ -228,23 +228,24 @@ A host nobody allowed refuses the build before `nix` is told to build anything,
 and the refusal names the host and the derivation, so the agent can ask you for
 that host rather than try the same attribute again.
 
-**You are asked once for a build, not once per host.** A nixpkgs closure
-reaches a hundred of them, and a hundred questions is one decision and ninety
-nine keystrokes. So Chock reads your rules for every host first: a host a rule
+You are asked once for a build, not once per host. A nixpkgs closure reaches
+a hundred of them, and a hundred questions is one decision and ninety nine
+keystrokes. So Chock reads your rules for every host first: a host a rule
 allows is decided there and never appears in the question, and a host a rule
 denies refuses the build with nobody asked. Only the hosts no rule covers are
 left, and those go into one question, under `nix.fetch.hosts`, that says how
 many there are and names the first few. The detail key shows every one of them
 beside the exact rule you would write to stop being asked. A yes covers the
-hosts of that question for that build and nothing after it. A build that
-reaches one host asks the way it always did. A URL whose scheme Chock does not
-read, and one with no host in it, are both refusals too: Chock will not guess a
-port, and a fetch nobody can name is a fetch nobody can rule on. The schemes it
-reads, with the port each names when the URL gives none, are `https` 443,
-`http` 80, `ftp` 21, `git` 9418 and `ssh` 22. A transport written in front of a
-URL, `git+https://` and `hg+https://` among them, is taken off and the URL
-behind it is read. So a rule for any of them looks like any other:
-`net.connect.org.gmplib.ftp.21`, `net.connect.org.sourceware.9418`.
+hosts of that question for that build and nothing after it.
+
+A URL whose scheme Chock does not read, and one with no host in it, are both
+refusals: Chock will not guess a port, and a fetch nobody can name is a fetch
+nobody can rule on. The schemes it reads, with the port each names when the URL
+gives none, are `https` 443, `http` 80, `ftp` 21, `git` 9418 and `ssh` 22. A
+transport written in front of a URL, `git+https://` and `hg+https://` among
+them, is taken off and the URL behind it is read. So a rule for any of them
+looks like any other: `net.connect.org.gmplib.ftp.21`,
+`net.connect.org.sourceware.9418`.
 
 A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
 them. The derivation also names its own mirrors file, a store path that holds
@@ -272,7 +273,7 @@ at build time, `zig.fetchDeps`, npm deps and `fetchCargoVendor` among them, and
 those hold no URL anywhere in the derivation. There is no host, so there is
 nothing `net.connect` can name.
 
-**Chock ships that one as `allow`**, because that is how every vendored
+Chock ships that one as `allow`, because that is how every vendored
 dependency fetch works: refusing them refuses nearly every Rust, Node and Zig
 package. The question is one per build and never one per derivation, and the
 derivation names go in the words you read, never in the action, so one answer
@@ -289,7 +290,7 @@ If you want the question back, write it in your own `chock.zon`:
 `.deny` refuses such a build outright. Every derivation that does name a URL is
 unaffected either way and still goes to `net.connect` per host.
 
-**The rule is all of it, and there is no backstop under it.** Nix has no flag
+The rule is all of it, and there is no backstop under it. Nix has no flag
 that keeps a fixed output builder off the network. `--offline` turns your
 substituters off and a fixed output derivation still fetches with it set, so
 Chock does not pass it and your binary cache keeps working. A host Chock's
@@ -320,7 +321,7 @@ a refusal rather than a guess: an `indirect` input names a registry entry and
 not a host, and an `ssh://` URL is not a scheme that can be named as a host and
 a port.
 
-**A startup `ask` is not a permanent no.** A build is a turn the agent took, so
+A startup `ask` is not a permanent no. A build is a turn the agent took, so
 there is somebody at the prompt. When the evaluation for a build finds an input
 missing, Chock puts that input's hosts to you under the same `net.connect`
 rules, fetches what you allow, and evaluates once more. One retry, never a
@@ -329,11 +330,12 @@ loop: a second miss is the answer. That is why a project that has written no
 nothing at build time, because its inputs arrived at startup and the build never
 asks.
 
-**A session whose inputs did not arrive still starts.** A project with no flake
+A session whose inputs did not arrive still starts. A project with no flake
 at all is the ordinary case, and nothing else a session start does refuses the
 session because an optional thing was missing. A build that then wants an input
-you said no to says which input and which host, and tells the agent to work with
-what is there rather than to ask you again for the host you just refused.
+you said no to says which input and which host, and tells the agent to work
+with what is there rather than to ask you again for the host you just
+refused.
 
 Import from derivation stays refused, here as in `nix_eval`. A build the agent
 asked for is not the same act as an evaluation that quietly needs one.

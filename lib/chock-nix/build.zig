@@ -1,145 +1,6 @@
-//! The agent names an attribute to build, and the host builds it.
-//!
-//! ## A build is brokered, and it never happens inside the sandbox
-//!
-//! The sandbox has no daemon socket, no network and no writable cache
-//! directory, so a real build cannot run there at all. What runs there is the
-//! program afterwards. So the shape is the one `provision.zig` already has:
-//! `nix` runs on the host, outside every sandbox, and answers with store
-//! paths and `bin` directories, which is what a sandbox mounts and what goes
-//! on the `PATH` of the next tool call.
-//!
-//! ## The produced set, and the one object it names
-//!
-//! A hand written derivation can name any builder, so a build of a path
-//! nobody evaluated here would be host code execution with a content hash in
-//! front of it. `backend.Driver` answers that: it records what an evaluation
-//! put in the store and refuses a build of anything else.
-//!
-//! **The object the driver authorised is the object the host builds.** An
-//! evaluation for a build runs against `Writing`, which puts the whole
-//! derivation closure in the host's own store and records the path the store
-//! itself answered with. A path that is not the one fix computed is refused
-//! there, so every path in the produced set is one the host store confirmed.
-//! `realise` then tells the host to build `<derivation path>^*`. The
-//! attribute path and the flake reference are still what the policy was asked
-//! about and what the model is told, because those are the words a person
-//! reads, and they are no longer what `nix` resolves. So fix and the host's
-//! Nix cannot read one attribute differently between the two moments, and an
-//! unpinned reference cannot move between them: there is one object.
-//!
-//! ## A fetch is a connection, and it is decided before the build
-//!
-//! A fixed output derivation builds with the network open to it, on purpose,
-//! because its output hash is checked afterwards. That check is integrity and
-//! never egress: a URL that carries a secret in its query string with the hash
-//! of an innocuous file passes it, and the request already happened. So
-//! `Host.buildPaths` reads the whole derivation closure first, names every
-//! host it would reach, and puts each one to `fetch.Gate`. A host nobody
-//! allowed refuses the build before `nix` is told to build anything. The names
-//! are the ordinary `net.connect` ones: see `lib/chock-nix/fetch.zig` for what
-//! the reader finds and what it refuses to name.
-//!
-//! **A `mirror://` URL names a site, and the answer about it is pinned.** The
-//! site is turned into the mirrors the derivation's own mirrors file names,
-//! one of them is allowed, and `NIX_MIRRORS_<site>` in the environment `nix`
-//! runs with holds that one. Without the pin the build would ask about one
-//! host and the builder would walk its own list. `NIX_HASHED_MIRRORS` is
-//! pinned beside it, because the builder reaches a hashed mirror whatever the
-//! URLs say.
-//!
-//! **What is still not proven.** The builder runs on the host, under the
-//! host's Nix, and what it makes is its own business: this says what goes in,
-//! and never what comes out. A substituter may answer for an output path
-//! instead of building it. Nothing here says the attribute is the one the
-//! person meant, or that the derivation is safe to run. And the write is a
-//! real capability: the derivation stays in the host store after the session,
-//! until the host collects it.
-//!
-//! **The fetch gate is a rule and it has no backstop under it.** `nix` on this
-//! machine has no flag that keeps a fixed output builder off the network:
-//! `--offline` turns the substituters off and a fixed output derivation still
-//! fetches with it set. So the gate is the whole of it, and a host the reader
-//! did not find is a host nobody was asked about. A host's Nix with `sandbox`
-//! off gives every builder the network, not only a fixed output one, and
-//! nothing here reads that setting.
-//!
-//! **One yes covers every host of a build that no rule named.** The question
-//! is put once, under `nix.fetch.hosts`, and the hosts it covers are in its
-//! detail rather than in its name, so a person who answers without reading the
-//! detail has permitted more than they read. That is the trade against a
-//! hundred questions nobody reads either, and a project narrows it by writing
-//! a `net.connect` rule per host, which is read first and takes that host out
-//! of the question. A host a rule allows or denies is still decided under its
-//! own name.
-//!
-//! **A fetch nobody named is allowed by default, and that is the widest thing
-//! in this list.** A fixed output derivation that says nowhere it fetches from
-//! has no host any rule could cover, and `zig.fetchDeps`, npm deps and
-//! `fetchCargoVendor` are all that shape. `nix.fetch.opaque` is the one
-//! question about them, and `lib/chock-policy/defaults.zig` ships it as
-//! `allow`, because a default that refused them refuses nearly every Rust,
-//! Node and Zig package. So the output hash proves the bytes are the ones the
-//! derivation expected, nothing proves where the request went, and a build
-//! allowed by that default can reach a host nobody named. A project takes it
-//! back with one rule of its own.
-//!
-//! **A mirrors file is realised before any rule has answered.** It is a
-//! derivation output, so on an ordinary store it is not there yet. The realise
-//! runs with local and remote builds both off, so Nix substitutes the output
-//! or refuses and no builder runs, which is what keeps a path an expression
-//! named from being built here. A substituter answers over the network, and
-//! that is the same channel a build's own substitution already uses.
-//!
-//! **A mirror pin holds because the builder reads it, and for no other
-//! reason.** `NIX_MIRRORS_<site>` and `NIX_HASHED_MIRRORS` are what the two
-//! nixpkgs `fetchurl` builders read, and both variables are in the
-//! derivation's own `impureEnvVars`. A fetcher that is not one of those two
-//! builders, or a later one that reads the variables differently, would walk
-//! its own list, and nothing here would know. `NIX_HASHED_MIRRORS` is turned
-//! off with a space rather than an empty string, which rests on the shell
-//! splitting that value into no words: see `fetch.hashed_mirrors_off`.
-//!
-//! **One answer covers a site for the whole closure.** Two derivations of one
-//! closure can name the same site and two different mirrors files, and the
-//! first file read is the one that answers. The pin is then a mirror the
-//! second derivation's own file may not hold, which can stop that fetch. It
-//! cannot widen one: every pinned mirror was allowed.
-//!
-//! **A store that cannot take the derivation stops the build.** The write
-//! goes through the host's Nix daemon, so a machine with no daemon builds
-//! nothing here and is told so. Refusing is the answer, because the older
-//! shape, handing `nix` the attribute instead, is the gap this closes.
-//!
-//! **This file adds no second check.** It calls `Driver.build`, which is the
-//! same function the evaluator's own build goes through, so there is one
-//! answer to what this session produced. A check written beside that one
-//! could answer differently, and the weaker of the two would then be the real
-//! rule.
-//!
-//! ## The seam that can build is installed last
-//!
-//! `Writing` writes objects and authorises no build, so import from
-//! derivation is refused during an evaluation exactly as it is for an
-//! ordinary `nix_eval`. `realise` installs the seam that runs `nix` only
-//! after a person or the policy has answered, and takes it off again when the
-//! build is over. An evaluation therefore cannot reach a build, whatever the
-//! expression says.
-//!
-//! ## What one session may write
-//!
-//! `backend.Driver.max_object_bytes` bounds one object, and it is checked
-//! before the seam, so an object over it never reaches the store. `Budget`
-//! bounds the whole session across every object and every build, and it is
-//! checked inside the seam, where the bytes are. Both numbers come from the
-//! project, the operator and the org policy bundle.
-//!
-//! ## Nothing here talks to Nix
-//!
-//! `provision.Runner` and `StoreWriter` are the two seams: the real ones
-//! spawn `nix` and talk to the host's daemon, and the ones the tests use
-//! answer from a table. A test that builds a derivation is not a test, it is
-//! a build, and a test against a real store is in `test/nix/real.zig`.
+//! The agent names an attribute to build, and the host builds it. The build
+//! runs on the host, outside every sandbox, because a sandbox has no daemon
+//! socket, no network and no writable cache directory.
 
 const std = @import("std");
 
@@ -152,29 +13,26 @@ const store = @import("store.zig");
 
 pub const Error = provision.Error;
 
-/// What `nix` said when it would not build. Never leaves this file: `realise`
-/// turns it into a sentence the model reads.
+/// What `nix` said when it would not build. `realise` turns it into words.
 const NixRefused = error{NixRefusedTheBuild};
 
 /// A host the build would reach that nobody permitted, or one nothing could
-/// name. Never leaves this file either: `Host.refusal` holds the words.
+/// name. `Host.refusal` holds the words.
 const FetchRefused = error{FetchNotPermitted};
 
-/// The most attributes one path may hold, and the longest one attribute may
-/// be. A real path is three deep and its names are words.
+/// The most attributes one path may hold, and the longest one may be. A real
+/// path is three deep and its names are words.
 pub const max_segments: usize = 8;
 pub const max_segment_bytes: usize = 128;
 
-/// The longest flake reference this accepts. A reference is a URL, and one
-/// far longer than this names nothing a project really has.
+/// The longest flake reference this accepts.
 pub const max_flake_ref_bytes: usize = 512;
 
-/// Why a request was refused before anything was evaluated or built.
 pub const RequestError = error{
     AttrPathEmpty,
     AttrPathTooDeep,
-    /// A segment is empty, too long, or holds a character an attribute name
-    /// may not have here. See `checkSegment`.
+    /// A segment is empty, too long, or holds a character `checkSegment`
+    /// refuses.
     AttrNotAName,
     FlakeRefEmpty,
     FlakeRefTooLong,
@@ -183,13 +41,9 @@ pub const RequestError = error{
     FlakeRefNotAReference,
 };
 
-/// True when `character` may appear in an attribute name here.
-///
-/// Letters, digits, `-`, `_` and `+`. **A dot is refused, and that is the one
-/// exclusion worth stating**: the same attribute path is written twice, once
-/// as an expression and once as the fragment of an installable, and a dot in
-/// a name is a level boundary in the second spelling. A name that means two
-/// things in two places is a name this file will not build.
+/// A dot is refused because the path is written twice, as an expression and as
+/// the fragment of an installable, and a dot is a level boundary in the second
+/// spelling.
 fn isNameCharacter(character: u8) bool {
     if (std.ascii.isAlphanumeric(character)) return true;
     return switch (character) {
@@ -198,7 +52,6 @@ fn isNameCharacter(character: u8) bool {
     };
 }
 
-/// Check one attribute name.
 fn checkSegment(segment: []const u8) RequestError!void {
     if (segment.len == 0 or segment.len > max_segment_bytes) return error.AttrNotAName;
     if (!std.ascii.isAlphanumeric(segment[0])) return error.AttrNotAName;
@@ -207,19 +60,15 @@ fn checkSegment(segment: []const u8) RequestError!void {
     }
 }
 
-/// Check the whole attribute path the model sent.
 pub fn checkAttrPath(attr_path: []const []const u8) RequestError!void {
     if (attr_path.len == 0) return error.AttrPathEmpty;
     if (attr_path.len > max_segments) return error.AttrPathTooDeep;
     for (attr_path) |segment| try checkSegment(segment);
 }
 
-/// Check a flake reference.
-///
 /// A reference is written into a Nix string literal and into an argument of
 /// `nix`, so a quote, a backslash, a dollar sign, a `#` and any whitespace are
-/// refused. What is left is a URL: letters, digits, and the punctuation a
-/// reference really uses.
+/// refused.
 pub fn checkFlakeRef(flake_ref: []const u8) RequestError!void {
     if (flake_ref.len == 0) return error.FlakeRefEmpty;
     if (flake_ref.len > max_flake_ref_bytes) return error.FlakeRefTooLong;
@@ -233,14 +82,10 @@ pub fn checkFlakeRef(flake_ref: []const u8) RequestError!void {
     }
 }
 
-/// The installable `<flake ref>#<attribute>.<attribute>`, which names the
-/// request for a person: the policy question, the log and what the model is
-/// told. **Never an argument of `nix`**, which is given the derivation path
-/// instead. The caller owns the result.
-///
-/// **Both arguments must already have passed their check**, which is
-/// asserted: this is the one place they become arguments to `nix`, and a
-/// caller that skipped the check is a programmer error.
+/// The installable `<flake ref>#<attribute>.<attribute>`: the policy question,
+/// the log and what the model is told. Never an argument of `nix`, which is
+/// given the derivation path instead. The caller owns the result, and both
+/// arguments must already have passed their check.
 pub fn installableFor(
     allocator: std.mem.Allocator,
     flake_ref: []const u8,
@@ -260,15 +105,9 @@ pub fn installableFor(
     return text.toOwnedSlice(allocator);
 }
 
-/// The expression that evaluates to the same thing the installable names, for
-/// the evaluator inside Chock. The caller owns the result.
-///
-/// ```
-/// (builtins.getFlake "/work")."packages"."x86_64-linux"."default"
-/// ```
-///
-/// Every attribute is quoted, so the expression selects exactly the names the
-/// caller sent and never reads a dot as a boundary of its own.
+/// The expression that evaluates to what the installable names, for the
+/// evaluator inside Chock. Every attribute is quoted, so it selects the names
+/// the caller sent and reads no dot as a boundary of its own.
 pub fn expressionFor(
     allocator: std.mem.Allocator,
     flake_ref: []const u8,
@@ -284,16 +123,13 @@ pub fn expressionFor(
     return text.toOwnedSlice(allocator);
 }
 
-/// Where the host's Nix daemon listens when nobody named another socket.
 pub const default_daemon_socket = daemon.default_socket_path;
 
-/// The most one session may put in the host store when nothing named a
-/// number. The same number as `chock_policy.nix.default_max_session_bytes`,
-/// written a second time because this library imports no other chock library:
-/// see `lib/chock-nix.zig`.
+/// The most one session may put in the host store when nothing named a number.
+/// The same number as `chock_policy.nix.default_max_session_bytes`, written
+/// twice because this library imports no other chock library.
 pub const default_max_session_bytes: u64 = 256 << 20;
 
-/// Why an object of an evaluation did not reach the host store.
 pub const WriteError = error{
     /// This session has already written `Budget.max_bytes`.
     SessionStoreFull,
@@ -304,10 +140,8 @@ pub const WriteError = error{
 
 /// How much of the host store one session has taken, and the most it may.
 ///
-/// **One per session and never one per call**, so a session that builds twice
-/// counts the second build against the first. Every write counts, which means
-/// an object written a second time is counted a second time: the store keeps
-/// one copy, and this bounds the work asked of it rather than the disk.
+/// One per session and never one per call. Every write counts, so this bounds
+/// the work asked of the store rather than the disk it keeps.
 pub const Budget = struct {
     max_bytes: u64 = default_max_session_bytes,
     written_bytes: u64 = 0,
@@ -321,11 +155,8 @@ pub const Budget = struct {
     }
 };
 
-/// Where an object of an evaluation for a build is really written.
-///
-/// A seam for the same reason `provision.Runner` is one: what is on the other
-/// side of it is the host's Nix daemon, and a test that writes to a real
-/// store is not a test. `DaemonWriter` is the real one.
+/// Where an object of an evaluation for a build is really written. A seam for
+/// the same reason `provision.Runner` is one. `DaemonWriter` is the real one.
 pub const StoreWriter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -350,18 +181,12 @@ pub const StoreWriter = struct {
 };
 
 /// The `StoreWriter` that writes to the host's own store, through its Nix
-/// daemon.
-///
-/// **On the host, outside every sandbox**, the same place `provision.Host`
-/// runs `nix`: a sandbox has no daemon socket. The three kinds of object are
-/// the three the daemon has operations for, and the daemon computes the path
-/// of each from its content, which is what makes the answer worth checking.
+/// daemon, on the host. A machine with no daemon builds nothing here.
 pub const DaemonWriter = struct {
     store: *daemon.DaemonStore,
 
-    /// Connect to the daemon at `endpoint`, which is a socket path or
-    /// `default_daemon_socket`. The `io` must be one that can open a socket,
-    /// and it must outlive this.
+    /// Connect to the daemon at `endpoint`, a socket path or
+    /// `default_daemon_socket`. The `io` must open a socket and outlive this.
     pub fn connect(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -402,21 +227,15 @@ pub const DaemonWriter = struct {
 
 /// The store seam an evaluation for a build runs against.
 ///
-/// Every object goes to the host store, and the path the store answers with
-/// is checked against the path fix computed before the driver records it. So
-/// a path in the produced set is a path the host store holds, which is what
-/// lets `realise` name the derivation rather than an installable.
-///
-/// **There is no `build_paths` here**, so an evaluation that reaches for one,
-/// which is what import from derivation does, is refused with the path named,
-/// exactly as an ordinary evaluation is.
+/// Every object goes to the host store, and the path the store answers with is
+/// checked against the path fix computed before the driver records it. There
+/// is no `build_paths` here, so import from derivation is refused.
 pub const Writing = struct {
     writer: StoreWriter,
     /// This session's own, shared with every other build of it.
     budget: *Budget,
     /// The store paths this session fetched on the host, before the
-    /// evaluation, after the policy answered for every host they came from.
-    /// See `lib/chock-nix/inputs.zig`.
+    /// evaluation. See `lib/chock-nix/inputs.zig`.
     fetched_paths: []const []const u8 = &.{},
 
     pub fn seam(self: *Writing) backend.Seam {
@@ -430,17 +249,11 @@ pub const Writing = struct {
 
     /// True for a path of `fetched_paths` and false for every other path.
     ///
-    /// **False is the answer that keeps the produced set whole**, so it is the
-    /// default: the evaluation then writes each object of the closure rather
-    /// than taking one the store holds already, and a write it skips is a path
-    /// the produced set never records, which would refuse the build of it.
-    /// Writing an object the store already holds answers the same path and
-    /// changes nothing else.
-    ///
-    /// **A flake input is the one thing that must answer true.** fix takes a
-    /// locked input from the store when the store says its path is valid, and
-    /// fetches the tree itself when it does not. Nothing is built out of these
-    /// paths, so none of them ever has to be in the produced set.
+    /// False keeps the produced set whole: a write the evaluation skips is a
+    /// path the produced set never records, and the build of it would be
+    /// refused. A flake input must answer true, because fix takes a locked
+    /// input from the store when the store says its path is valid. Nothing is
+    /// built out of those.
     fn isValidPath(context: *anyopaque, path: []const u8) anyerror!bool {
         const self: *Writing = @ptrCast(@alignCast(context));
         for (self.fetched_paths) |one| {
@@ -462,9 +275,8 @@ pub const Writing = struct {
 
         const written = try self.writer.addObject(allocator, object);
         errdefer allocator.free(written);
-        // The whole worth of writing to the host store: the store computes
-        // the path from the content it took, so an answer that is not the
-        // path fix computed means the two do not hold the same object.
+        // The store computes the path from the content it took, so another
+        // answer means the two do not hold the same object.
         if (!std.mem.eql(u8, written, object.expectedPath())) {
             return WriteError.StorePathNotExpected;
         }
@@ -474,23 +286,17 @@ pub const Writing = struct {
 
 /// The store seam that really builds, on the host.
 ///
-/// **It builds the derivation the driver authorised**, and never the
-/// installable: `<derivation path>^*`, which is every output of that one
-/// derivation. The evaluation put that derivation in the host store, so there
-/// is a path for `nix` to name and nothing is instantiated a second time.
-///
-/// **The hosts the build would reach are asked about here, and not before.**
-/// The driver has already checked that this session produced the path by the
-/// time this runs, so `nix derivation show` is never run for a path the model
-/// made up. See `askAboutFetches`.
+/// It builds `<derivation path>^*`, every output of the derivation the driver
+/// authorised, and never the installable. The hosts it would reach are asked
+/// about here, after the driver has checked the path. See `askAboutFetches`.
 pub const Host = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     runner: provision.Runner,
     /// `<derivation path>^*`, from `realise`.
     derivation_outputs: []const u8,
-    /// Who answers for a host the build would reach. The default permits
-    /// nothing, so a caller that wired none builds nothing that fetches.
+    /// The default permits nothing, so a caller that wired none builds nothing
+    /// that fetches.
     gate: fetch.Gate = fetch.Gate.refusing,
     /// What `nix` wrote when it would not build, borrowed from `allocator`.
     said: []const u8 = "",
@@ -499,8 +305,12 @@ pub const Host = struct {
     /// The outputs the build produced, empty until it has.
     out_paths: []const []const u8 = &.{},
     /// What `nix` is given on top of its own environment, so a builder cannot
-    /// walk a mirror list past the one host that was allowed. Filled by
-    /// `askAboutFetches` and read by `buildPaths`.
+    /// walk a mirror list past the one host that was allowed.
+    ///
+    /// A pin holds because the two nixpkgs `fetchurl` builders read
+    /// `NIX_MIRRORS_<site>` and `NIX_HASHED_MIRRORS`, both of which are in the
+    /// derivation's own `impureEnvVars`. Another fetcher would walk its own
+    /// list and nothing here would know.
     pins: []const provision.Variable = &.{},
 
     pub fn seam(self: *Host) backend.Seam {
@@ -509,13 +319,14 @@ pub const Host = struct {
 
     const vtable: backend.Seam.VTable = .{ .build_paths = buildPaths };
 
-    /// Put every host the closure of `derivation_path` would reach to the
-    /// gate, and answer `FetchNotPermitted` on the first one nobody allowed.
+    /// Put every host the closure of `derivation_path` would reach to the gate,
+    /// and answer `FetchNotPermitted` on the first one nobody allowed.
     ///
-    /// A fixed output derivation builds with the network open to it, and its
-    /// output hash is checked after the request has already gone out. So the
-    /// hash is integrity and never egress, and this is where egress is
-    /// decided.
+    /// A fixed output derivation builds with the network open to it and its
+    /// output hash is checked after the request has gone out, so the hash is
+    /// integrity and never egress. There is no backstop under this: `nix` has
+    /// no flag that keeps such a builder off the network, `--offline` does not,
+    /// and a host whose Nix has `sandbox` off gives every builder the network.
     fn askAboutFetches(self: *Host, derivation_path: []const u8) anyerror!void {
         const reached = switch (try fetch.fetchesOf(
             self.allocator,
@@ -534,10 +345,6 @@ pub const Host = struct {
             },
         };
 
-        // **Every host of the build, gathered before anybody is asked.** The
-        // named URLs and the one mirror chosen for each site go into the same
-        // question, because they are the same decision: what this build may
-        // reach. See `fetch.Gate.permit_all`.
         var wanted: std.ArrayList(fetch.Fetch) = .empty;
         try wanted.appendSlice(self.allocator, reached.hosts);
 
@@ -553,6 +360,9 @@ pub const Host = struct {
             });
         }
 
+        // One yes under `nix.fetch.hosts` covers every host no rule named. A
+        // project narrows it with a `net.connect` rule per host, which is read
+        // first and takes that host out of the question.
         switch (try self.gate.permitAll(self.allocator, wanted.items)) {
             .permitted => {},
             .refused => |why| {
@@ -561,10 +371,11 @@ pub const Host = struct {
             },
         }
 
-        // **One question for the whole build, and only when there is one to
-        // ask.** A closure with no such derivation never reaches this, so a
-        // project that wrote a rule for it is never asked about a build that
-        // has none.
+        // A fixed output derivation that says nowhere it fetches from has no
+        // host a rule could cover, and `zig.fetchDeps`, npm deps and
+        // `fetchCargoVendor` all take that shape. `chock-policy/defaults.zig`
+        // ships `nix.fetch.opaque` as allow, because refusing them refuses
+        // nearly every Rust, Node and Zig package.
         if (reached.opaque_subjects.len != 0) {
             switch (try self.gate.permitOpaque(self.allocator, reached.opaque_subjects)) {
                 .permitted => {},
@@ -579,9 +390,8 @@ pub const Host = struct {
             }
         }
 
-        // **Pinned for every closure that reads mirrors, whatever its URLs
-        // say.** The builder tries a hashed mirror on its own, so a value left
-        // alone is a host nobody named and nobody allowed.
+        // The builder tries a hashed mirror on its own whatever the URLs say,
+        // so a value left alone is a host nobody named and nobody allowed.
         if (reached.reads_mirrors) try pins.append(self.allocator, .{
             .name = "NIX_HASHED_MIRRORS",
             .value = try self.chooseHashedMirror(reached.hashed),
@@ -590,8 +400,6 @@ pub const Host = struct {
         self.pins = try pins.toOwnedSlice(self.allocator);
     }
 
-    /// Which host one mirror site was put to the policy as, for the words a
-    /// refusal uses.
     const Chosen = struct {
         site: []const u8,
         host: []const u8,
@@ -599,11 +407,11 @@ pub const Host = struct {
 
     /// The mirror of `one` this build would use, and the question it puts.
     ///
-    /// The mirrors are taken in the file's own order. A mirror a rule already
-    /// permits is taken outright, and otherwise the first mirror that has a
-    /// host at all is the one that goes into the build's question. **One
-    /// mirror for a site and never ten**, which is the same reason one host is
-    /// answered once however many derivations fetch it.
+    /// A mirror a rule already permits is taken outright, and otherwise the
+    /// first mirror of the file's own order that has a host at all is asked
+    /// about. Two derivations of one closure can name the same site and two
+    /// mirrors files, and the first file read answers for both, which can stop
+    /// the second fetch. It cannot widen one: every pinned mirror was allowed.
     fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror!struct {
         base: []const u8,
         asking: fetch.Fetch,
@@ -628,13 +436,10 @@ pub const Host = struct {
         return FetchRefused.FetchNotPermitted;
     }
 
-    /// What `NIX_HASHED_MIRRORS` is pinned to.
-    ///
-    /// **Nobody is asked here, and a build is never refused for this.** No URL
-    /// of the derivation names a hashed mirror, so the model asked for nothing
-    /// that needs one, and a question about a host the request never mentioned
-    /// is a question with no answer a person can weigh. A rule that already
-    /// permits the host pins it, and everything else turns it off.
+    /// What `NIX_HASHED_MIRRORS` is pinned to. Nobody is asked, because no URL
+    /// of the derivation names a hashed mirror and a question about a host the
+    /// request never mentioned has no answer a person can weigh. A rule that
+    /// already permits the host pins it, and everything else turns it off.
     fn chooseHashedMirror(self: *Host, mirrors: []const fetch.Mirror) anyerror![]const u8 {
         for (mirrors) |mirror| {
             const target = mirror.target orelse continue;
@@ -660,15 +465,14 @@ pub const Host = struct {
         _: backend.BuildMode,
     ) anyerror!void {
         const self: *Host = @ptrCast(@alignCast(context));
-        // `paths` is what the driver authorised a moment ago, so the closure
-        // read below is of that object and of nothing the model named.
+        // `paths` is what the driver authorised, so the closure read below is
+        // of that object and of nothing the model named.
         try self.askAboutFetches(paths[0]);
 
         const built = try self.runner.runPinned(self.allocator, self.io, &.{
             "build",
-            // No result symbolic link, for the reason `provision.resolve`
-            // gives: the root a session needs is made by its caller, and a
-            // `result` link in the user's project directory is litter.
+            // No result symbolic link: a `result` in the user's project
+            // directory is litter. See `provision.resolve`.
             "--no-link",
             "--print-out-paths",
             self.derivation_outputs,
@@ -681,9 +485,9 @@ pub const Host = struct {
     }
 };
 
-/// `why`, with the mirror sites of the build named after it. **A refusal about
-/// a mirror has to name the site as well as the host**: the site is what the
-/// derivation wrote and the host is what a rule would have to cover.
+/// `why`, with the mirror sites of the build named after it. A refusal has to
+/// name the site as well as the host: the site is what the derivation wrote,
+/// and the host is what a rule would have to cover.
 fn withSites(
     allocator: std.mem.Allocator,
     why: []const u8,
@@ -702,8 +506,6 @@ fn withSites(
     return text.toOwnedSlice(allocator);
 }
 
-/// The question one mirror of a site puts: the derivation that fetches, the
-/// URL the builder would really use, and the host of it.
 fn fetchOfMirror(
     site: fetch.MirrorSite,
     mirror: fetch.Mirror,
@@ -717,42 +519,38 @@ fn fetchOfMirror(
     };
 }
 
-/// One thing to realise.
 pub const Request = struct {
-    /// The derivation the evaluation of this very attribute produced and put
-    /// in the host store. It is what the driver checks against its produced
-    /// set and what `nix` is told to build.
+    /// The derivation this attribute's own evaluation put in the host store.
+    /// The driver checks it against its produced set.
     derivation_path: []const u8,
-    /// `<flake ref>#<attribute path>`, from `installableFor`. What the policy
-    /// was asked about and what the model is told, and never an argument of
-    /// `nix`: see this file's own top comment.
+    /// `<flake ref>#<attribute path>`. What the policy was asked about and what
+    /// the model is told, and never an argument of `nix`.
     installable: []const u8,
 };
 
 /// A build that happened.
+///
+/// It does not prove what came out. The builder ran under the host's Nix, a
+/// substituter may have answered for an output path instead of building it,
+/// and nothing says the attribute is the one the person meant or that the
+/// derivation is safe to run. The write is a capability of its own: the
+/// derivation stays in the host store until the host collects it.
 pub const Built = struct {
-    /// What the sandbox mounts and what goes on the `PATH`, in the shape a
-    /// provisioned program already answers with, so a built package joins the
-    /// session's toolchain by the road that is already there.
+    /// The shape a provisioned program already answers with, so a built
+    /// package joins the toolchain by the road that is already there.
     provided: provision.Provided,
-    /// The build's own outputs, which is what the model is told about.
     out_paths: []const []const u8,
 };
 
 /// What one `realise` produced: a build, or one sentence saying why not.
-///
-/// A refusal is a fact about the request that the model reads and can act on,
-/// the same way `provision.Answer` treats a package that is not there.
 pub const Answer = union(enum) {
     built: Built,
     refused: []const u8,
 };
 
-/// Build `request` on the host, if `driver` produced its derivation.
-///
-/// **Give this an arena**, the same convention `provision.resolve` follows:
-/// every string of the answer comes from `allocator`, and so does everything
-/// the `nix` commands wrote.
+/// Build `request` on the host, if `driver` produced its derivation. It calls
+/// `Driver.build`, the same function the evaluator's own build goes through,
+/// so there is one answer to what this session produced. Give it an arena.
 pub fn realise(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -762,8 +560,7 @@ pub fn realise(
     request: Request,
 ) Error!Answer {
     // Every output of that one derivation. `nix` reads a bare derivation path
-    // as a request for its default output, and a package with more than one
-    // would then lose the rest of what the model was told about.
+    // as a request for its default output.
     var host: Host = .{
         .allocator = allocator,
         .io = io,
@@ -776,15 +573,14 @@ pub fn realise(
         ),
     };
 
-    // Installed here and taken off below, so nothing that runs before or
-    // after this call can reach a build through this driver.
+    // Installed here and taken off below, so an evaluation cannot reach a
+    // build whatever the expression says.
     driver.seam = host.seam();
     defer driver.seam = backend.Seam.refusing;
 
     driver.build(&.{request.derivation_path}, .normal) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.RunnerFailed => return error.RunnerFailed,
-        // The driver's own words, which name the path. Nothing ran.
         error.BuildRefused => return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} was not built, and nothing ran: {s}",
@@ -793,9 +589,6 @@ pub fn realise(
         NixRefused.NixRefusedTheBuild => return .{
             .refused = try explainFailure(allocator, request.installable, host.said),
         },
-        // Nothing was fetched and nothing was built: the words name the host
-        // and the derivation, so the model can ask for that host rather than
-        // send the same attribute again.
         FetchRefused.FetchNotPermitted => return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} was not built and nothing was fetched: {s}",
@@ -831,7 +624,6 @@ pub fn realise(
     } };
 }
 
-/// One sentence for a request this file refuses before it evaluates anything.
 pub fn requestRefusal(
     allocator: std.mem.Allocator,
     err: RequestError,
@@ -869,8 +661,7 @@ pub fn requestRefusal(
 }
 
 /// One sentence for an evaluation the host store would not take. Null when
-/// `err` is not a `WriteError`, which leaves the caller's own words for
-/// everything else an evaluation can fail with.
+/// `err` is not a `WriteError`.
 pub fn writeRefusal(
     allocator: std.mem.Allocator,
     installable: []const u8,
@@ -895,12 +686,9 @@ pub fn writeRefusal(
     };
 }
 
-/// Why `nix` would not build, in the words of what to do next.
-///
-/// The two machine faults are told apart from a request fault, because they
-/// are not the model's to fix and a model that reads them as its own mistake
-/// sends a second attribute. Anything else is the last line Nix wrote, which
-/// is where Nix puts its own message.
+/// Why `nix` would not build, in the words of what to do next. The two machine
+/// faults are told apart from a request fault, because a model that reads them
+/// as its own mistake sends a second attribute.
 fn explainFailure(
     allocator: std.mem.Allocator,
     installable: []const u8,
@@ -927,10 +715,8 @@ fn explainFailure(
 }
 
 /// A `fetch.Gate` that answers the same way about every host and records what
-/// it was asked. **Not a policy table**: what the real one answers is
-/// `lib/chock-broker/network.zig` and the project's own rules, and no test
-/// here claims otherwise. What these tests pin is that the question is asked,
-/// and that a no stops the build before `nix` is told to build.
+/// it was asked. Not a policy table: the real answers come from
+/// `lib/chock-broker/network.zig` and the project's own rules.
 const AnsweringGate = struct {
     gpa: std.mem.Allocator,
     permitted: bool = true,
@@ -938,8 +724,7 @@ const AnsweringGate = struct {
     /// The hosts a rule permits with nobody asked, which is what picks one
     /// mirror of a site out of ten.
     by_rule: []const []const u8 = &.{},
-    /// How many of the questions reached somebody, which is every one a rule
-    /// did not already answer.
+    /// How many questions reached somebody.
     prompted: usize = 0,
     /// Whether a build may fetch with no URL, and how often that was asked.
     opaque_permitted: bool = true,
@@ -988,8 +773,6 @@ const AnsweringGate = struct {
         }
         if (refusing == null) return .permitted;
 
-        // One question for every host no rule answered, which is what the
-        // real gate puts and what these tests count.
         self.prompted += 1;
         if (self.permitted) return .permitted;
         const one = refusing.?;
@@ -1009,8 +792,8 @@ const AnsweringGate = struct {
     }
 };
 
-/// What `nix derivation show -r` writes for a closure whose one input
-/// fetches, and for one where nothing does.
+/// What `nix derivation show -r` writes for a closure whose one input fetches,
+/// and for one where nothing does.
 const closure_that_fetches =
     \\{"derivations":{"b-src.drv":{"env":{"url":"https://files.example.com/src.tar.gz"},
     \\ "outputs":{"out":{"hash":"sha256-A","method":"flat"}}}}}
@@ -1029,8 +812,6 @@ const FakeRunner = struct {
     replies: []const Reply,
     calls: usize = 0,
     seen: std.ArrayList([]const []const u8) = .empty,
-    /// What the last call was given on top of `nix`'s own environment, so a
-    /// test reads the pins rather than trusting that they were set.
     seen_pins: std.ArrayList(provision.Variable) = .empty,
 
     const Reply = struct {
@@ -1052,8 +833,6 @@ const FakeRunner = struct {
         self.seen_pins.deinit(self.gpa);
     }
 
-    /// The value pinned under `name` on the last call, or null when the last
-    /// call pinned nothing under it.
     fn pin(self: *const FakeRunner, name: []const u8) ?[]const u8 {
         for (self.seen_pins.items) |one| {
             if (std.mem.eql(u8, one.name, name)) return one.value;
@@ -1099,13 +878,8 @@ const FakeRunner = struct {
 const example_drv = "/nix/store/00000000000000000000000000000000-example.drv";
 const example_out = "/nix/store/11111111111111111111111111111111-example";
 
-/// A `StoreWriter` that writes nowhere and answers the path the object says
-/// it expects.
-///
-/// **It is not a store and no test here claims it is.** It records what the
-/// evaluation handed it, so a test can ask what was written and how much,
-/// while no test in this file reaches a daemon. What a real store does with a
-/// real derivation is pinned in `test/nix/real.zig`.
+/// A `StoreWriter` that writes nowhere and answers the path the object says it
+/// expects. What a real store does is pinned in `test/nix/real.zig`.
 const RecordingWriter = struct {
     gpa: std.mem.Allocator,
     /// Answered instead of the expected path, for the one test about a store
@@ -1135,7 +909,7 @@ const RecordingWriter = struct {
 };
 
 /// A real evaluation of one derivation, through the seam an evaluation for a
-/// build runs against. The driver is left holding what the evaluation wrote.
+/// build runs against.
 fn evaluateDerivation(allocator: std.mem.Allocator, driver: *backend.Driver) !void {
     const expr_mod = @import("expr");
     var engine = try expr_mod.Engine.init(allocator, .{ .worker_count = 1 });
@@ -1231,13 +1005,10 @@ test "the host is told to realise the derivation this session wrote, and never a
     try testing.expectEqual(@as(usize, 2), built.provided.store_paths.len);
     try testing.expectEqualStrings(example_out ++ "/bin", built.provided.bin_dirs[0]);
 
-    // Nothing of this closure fetches, so nobody was asked about a host.
     try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
 
-    // What was really asked of `nix`, rather than that something was. The
-    // last argument is the object the driver authorised, with every output of
-    // it, and no argument holds the attribute the model named: an installable
-    // would let the host resolve the attribute a second time.
+    // The last argument is the object the driver authorised, and no argument
+    // holds the attribute: an installable would let the host resolve it twice.
     try testing.expectEqualStrings("derivation", fake.seen.items[0][0]);
     try testing.expectEqualStrings("build", fake.seen.items[1][0]);
     try testing.expectEqualStrings("--no-link", fake.seen.items[1][1]);
@@ -1250,7 +1021,6 @@ test "the host is told to realise the derivation this session wrote, and never a
     }
     try testing.expectEqualStrings("path-info", fake.seen.items[2][0]);
 
-    // The model still reads the attribute it asked for.
     try testing.expectEqualStrings("/work#packages.x86_64-linux.default", built.provided.installable);
 
     // The seam that can build is off again, so nothing after this reaches one.
@@ -1267,8 +1037,6 @@ test "a derivation the store puts at another path is refused, and nothing is pro
     var driver = backend.Driver.init(gpa, writing.seam());
     defer driver.deinit();
 
-    // A store that answers a path of its own is a store holding something
-    // other than what this session evaluated, so the evaluation stops there.
     try testing.expectError(WriteError.StorePathNotExpected, evaluateDerivation(gpa, &driver));
     try testing.expect(!driver.produced(example_drv));
     try testing.expectEqual(@as(usize, 0), driver.paths.count());
@@ -1301,8 +1069,8 @@ test "the object cap refuses a write, and the session total refuses a later writ
     const first = budget.written_bytes;
     try testing.expect(first != 0);
 
-    // The session total is what the second build spends against, and this
-    // one has one byte less than it needs.
+    // The session total is what the second build spends against, and this one
+    // has one byte less than it needs.
     budget.max_bytes = first * 2 - 1;
     var second = backend.Driver.init(gpa, writing.seam());
     defer second.deinit();
@@ -1314,8 +1082,7 @@ test "the object cap refuses a write, and the session total refuses a later writ
     try testing.expect(std.mem.indexOf(u8, said, "max_session_bytes") != null);
 }
 
-/// The one path `driver` produced, for a test that needs the derivation path
-/// the evaluator computed rather than one written out by hand.
+/// The one path `driver` produced, rather than one written out by hand.
 fn drvPathOf(driver: *backend.Driver) ?[]const u8 {
     var keys = driver.paths.keyIterator();
     while (keys.next()) |key| {
@@ -1331,12 +1098,10 @@ test "a build of a store path this session never produced is refused by name, an
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // A driver that evaluated nothing, so its produced set is empty.
     var driver = backend.Driver.init(gpa, backend.Seam.refusing);
     defer driver.deinit();
 
-    // A reply is here so that a runner that was reached would answer rather
-    // than trap, and the assertion below is that it was not reached.
+    // A reply so that a runner that was reached would answer rather than trap.
     var fake = FakeRunner{ .gpa = gpa, .replies = &.{.{ .stdout = example_out ++ "\n" }} };
     defer fake.deinit();
 
@@ -1352,13 +1117,9 @@ test "a build of a store path this session never produced is refused by name, an
         },
     );
 
-    // Not one `nix`, and the closure of a path nobody produced is not read
-    // either: the driver answers first, so nothing this file runs takes a
-    // path the model made up.
+    // Not one `nix`: the driver answers before any closure is read.
     try testing.expectEqual(@as(usize, 0), fake.calls);
     try testing.expect(answer == .refused);
-    // A model that reads a refusal with no subject sends the same request
-    // again, so the path it asked for has to be in the words.
     try testing.expect(std.mem.indexOf(u8, answer.refused, example_drv) != null);
 }
 
@@ -1419,8 +1180,7 @@ test "the seam an evaluation runs against authorises no build and reads no store
     var driver = backend.Driver.init(gpa, seam);
     defer driver.deinit();
 
-    // Import from derivation reaches `build_paths`, and this seam has none,
-    // so an evaluation cannot build its own input however it is written.
+    // Import from derivation reaches `build_paths`, and this seam has none.
     try testing.expect(seam.vtable.build_paths == null);
     try testing.expect(seam.vtable.read_file == null);
     try testing.expectError(
@@ -1448,8 +1208,6 @@ test "a build whose fetch host nobody allowed is refused, and nix is never told 
     var gate = AnsweringGate{ .gpa = gpa, .permitted = false };
     defer gate.deinit();
 
-    // Only the closure is answered. A reply for the build is here so that a
-    // runner that was reached would answer rather than trap.
     var fake = FakeRunner{ .gpa = gpa, .replies = &.{
         .{ .stdout = closure_that_fetches },
         .{ .stdout = example_out ++ "\n" },
@@ -1462,8 +1220,6 @@ test "a build whose fetch host nobody allowed is refused, and nix is never told 
     });
 
     try testing.expect(answer == .refused);
-    // The host and the derivation are both in the words, so the model can ask
-    // for that host rather than send the same attribute again.
     try testing.expect(std.mem.indexOf(u8, answer.refused, "files.example.com") != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "b-src.drv") != null);
 
@@ -1557,8 +1313,7 @@ test "a fixed output derivation with a scheme nothing can name refuses the build
     try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
 }
 
-/// Write the real nixpkgs mirrors list into `tmp` and answer its absolute
-/// path, which the derivation of a test names as its own `mirrorsFile`.
+/// Write the real nixpkgs mirrors list into `tmp` and answer its absolute path.
 fn writeMirrorsList(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "mirrors-list",
@@ -1570,7 +1325,7 @@ fn writeMirrorsList(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u
 }
 
 /// A closure of one `fetchurl` derivation that fetches from the `gnu` mirror
-/// site and names `mirrors_path`. The shape nixpkgs writes today, trimmed.
+/// site. The shape nixpkgs writes today, trimmed.
 fn closureFetchingAMirror(allocator: std.mem.Allocator, mirrors_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -1583,8 +1338,8 @@ fn closureFetchingAMirror(allocator: std.mem.Allocator, mirrors_path: []const u8
     );
 }
 
-/// Everything a mirror test needs: an evaluated derivation this session
-/// produced, and the closure `nix derivation show` answers for it.
+/// Everything a mirror test needs, with the closure `nix derivation show`
+/// answers for it.
 const MirrorCase = struct {
     budget: Budget = .{},
     recording: RecordingWriter,
@@ -1677,11 +1432,8 @@ test "with no rule the first mirror that can be named is asked about, and a no n
     // One question for the site and never one for each of its eight mirrors.
     try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
     try testing.expectEqualStrings("ftpmirror.gnu.org", gate.asked.items[0]);
-    // The site and the host, because the person who can write the rule needs
-    // both: the site is what the derivation wrote.
     try testing.expect(std.mem.indexOf(u8, answer.refused, "gnu") != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "ftpmirror.gnu.org") != null);
-    // One call, and it is the read. `nix` was never told to build.
     try testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
@@ -1710,8 +1462,7 @@ test "the environment nix is given pins the site to the allowed mirror and nothi
     });
 
     try testing.expect(answer == .built);
-    // The site and the hashed mirrors, and no other variable: this widens
-    // nothing the build did not already need decided.
+    // The site and the hashed mirrors, and no other variable.
     try testing.expectEqual(@as(usize, 2), fake.seen_pins.items.len);
     try testing.expectEqualStrings(
         "https://ftpmirror.gnu.org/",
@@ -1720,10 +1471,9 @@ test "the environment nix is given pins the site to the allowed mirror and nothi
 }
 
 test "the hashed mirrors are turned off unless a rule allows their own host" {
-    // **A host that appears in no url of the derivation.** The builder tries a
+    // A host that appears in no url of the derivation. The builder tries a
     // hashed mirror for every fetch, so a variable left alone reaches
-    // tarballs.nixos.org with nobody asked. It is never a question either: the
-    // model asked for nothing that names it.
+    // tarballs.nixos.org with nobody asked.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1823,8 +1573,7 @@ test "a closure that reads no mirrors file pins nothing at all" {
 }
 
 /// A closure whose one fixed output derivation says nowhere it fetches from,
-/// which is the shape `zig.fetchDeps` and npm deps take, and one that holds
-/// three of them.
+/// the shape `zig.fetchDeps` and npm deps take, and one that holds three.
 const closure_that_fetches_opaquely =
     \\{"derivations":{"b-zig-deps.drv":{"env":{"name":"b"},
     \\ "outputs":{"out":{"hash":"sha256-A","method":"recursive"}}}}}
@@ -1837,8 +1586,7 @@ const closure_with_three_opaque_fetches =
     \\}}
 ;
 
-/// Everything `realise` needs for a closure a test supplies: an evaluated
-/// derivation this session produced, and the replies `nix` gives.
+/// Everything `realise` needs for a closure a test supplies.
 fn realiseClosure(
     arena: std.mem.Allocator,
     fake: *FakeRunner,
@@ -1877,17 +1625,13 @@ test "a build that fetches with no url asks once, and a no names a derivation" {
     const answer = try realiseClosure(arena, &fake, &gate, &driver);
 
     try testing.expect(answer == .refused);
-    // One question for the three, because there is no host to tell them apart
-    // by and three questions with one answer is a person trained to say yes.
+    // One question for the three, because there is no host to tell them apart.
     try testing.expectEqual(@as(usize, 1), gate.opaque_asks);
     try testing.expectEqual(@as(usize, 3), gate.opaque_count);
-    // A derivation and the count, which is the only handle a person has here.
     try testing.expect(std.mem.indexOf(u8, answer.refused, "deps.drv") != null);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "3 derivations") != null);
-    // Nothing was built: one call, and it is the closure read.
     try testing.expectEqual(@as(usize, 1), fake.calls);
     try testing.expectEqualStrings("derivation", fake.seen.items[0][0]);
-    // No host was ever put to `net.connect`: there was none to put.
     try testing.expectEqual(@as(usize, 0), gate.asked.items.len);
 }
 
@@ -1920,9 +1664,6 @@ test "a yes to a fetch with no url builds, and a closure with none never asks it
         try testing.expectEqual(@as(usize, 1), gate.opaque_asks);
     }
 
-    // **A closure with no such derivation never reaches the question.** A
-    // project that wrote a rule for it is not asked about a build that has
-    // none.
     {
         var budget: Budget = .{};
         var recording: RecordingWriter = .{ .gpa = gpa };
@@ -1944,7 +1685,6 @@ test "a yes to a fetch with no url builds, and a closure with none never asks it
         const answer = try realiseClosure(arena, &fake, &gate, &driver);
         try testing.expect(answer == .built);
         try testing.expectEqual(@as(usize, 0), gate.opaque_asks);
-        // And the one that does name a url went to `net.connect` as before.
         try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
         try testing.expectEqualStrings("files.example.com", gate.asked.items[0]);
     }

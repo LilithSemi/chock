@@ -1,96 +1,9 @@
 //! Every host a build would reach while it runs, named before it runs.
 //!
-//! ## Why a fixed output derivation is not safe by itself
-//!
 //! Nix gives a fixed output derivation's builder the network, because the
-//! output hash is checked afterwards. That check is worth something for
-//! integrity and nothing at all for egress: a URL of
-//! `https://somewhere/?d=<a secret of the workspace>` with the hash of an
-//! innocuous file passes the check, and the request already happened. So "it
-//! is fixed output, therefore the network is safe" is wrong, and a build that
-//! reached the network with no rule consulted was a hole.
-//!
-//! ## A fetch is a connection
-//!
-//! There is one egress namespace, `net.connect`, and this library does not
-//! build its names: `lib/chock-broker/network.zig` holds the builder, because
-//! it holds the label reversal that makes a class rule safe. This file reads
-//! the closure and answers a host and a port. The caller names it and asks.
-//!
-//! A second namespace would need that reversal written and tested again, and
-//! would let a project allow a host in one namespace while denying it in the
-//! other.
-//!
-//! ## The closure is read with `nix derivation show`
-//!
-//! The derivation closure is already in the host store by the time a build is
-//! asked for, so it can be read. `nix derivation show -r` answers the whole
-//! closure as JSON, through the same `provision.Runner` seam every other
-//! command of this library goes through, so a test reads the argument vector
-//! and reaches no store.
-//!
-//! **The alternative was reading the `.drv` files.** fix models a derivation
-//! and writes the ATerm form, and it parses none, so that route needs a
-//! parser of its own for a format Nix already reads. A parser that disagreed
-//! with Nix about one field would name the wrong host, which is the one
-//! failure this file must not have.
-//!
-//! ## What it asks about, and what it over asks
-//!
-//! Every fixed output derivation of the closure, whether or not its output is
-//! in the store already. A derivation whose output is there fetches nothing,
-//! so a question about it is a question nobody had to answer. Asking is the
-//! safe direction: the store can lose that output between the question and
-//! the build, and a reader that skipped it would then have let a fetch
-//! through.
-//!
-//! Hosts are answered once each. One closure can hold twenty derivations that
-//! fetch from the same host, and twenty questions with one answer is a person
-//! trained to say yes.
-//!
-//! **A fixed output derivation that says nowhere it fetches from is a
-//! refusal.** Some fetchers read their URLs out of a lock file while they
-//! build, so they hold no `url` anywhere. The network is open to them and no
-//! rule can name what they reach, so they are refused rather than run.
-//!
-//! ## `mirror://` names a site, and the derivation says where the sites are
-//!
-//! nixpkgs writes `mirror://hackage/...`, which names a site and not a host.
-//! The derivation also carries `mirrorsFile`, a store path of its own closure
-//! that holds one shell array per site:
-//!
-//!     declare -a _mirror_hackage=(https://hackage.haskell.org/package/)
-//!
-//! So the candidates are read out of that file rather than guessed, and the
-//! site becomes a host the policy can answer for. **A site the file does not
-//! name, and a derivation with no mirrors file, stay refusals**: this reads
-//! what is there and invents nothing.
-//!
-//! **The file is a derivation output, so it is usually not there yet.** The
-//! closure is `.drv` files, and the mirrors list is itself a derivation. It is
-//! realised before it is read, and no builder may run for it. See
-//! `MirrorFiles`, which holds the whole of why that is safe.
-//!
-//! One site becomes one question. The candidates are taken in the file's own
-//! order, a candidate the policy already allows by rule is taken with nobody
-//! asked, and otherwise the first candidate that can be named is what a person
-//! is asked about. Twenty questions with one answer is a person trained to say
-//! yes.
-//!
-//! ## The answer is pinned into the builder's environment
-//!
-//! Every `NIX_MIRRORS_<site>` is in the derivation's own `impureEnvVars`, so a
-//! value in the environment `nix` runs with reaches the builder, and the
-//! builder then uses that one mirror instead of walking its own list. Without
-//! the pin the answer would be advisory: the build would ask about one host
-//! and reach another. `build.Host` sets it.
-//!
-//! **`NIX_HASHED_MIRRORS` is pinned as well, and it must never be left
-//! empty.** The builder tries a hashed mirror for every fetch, before all the
-//! URLs or after them, so it can reach a host that appears in no URL of the
-//! derivation at all. Both builder shapes read the variable only when it is
-//! not empty, so an empty value leaves the list the mirrors file itself names
-//! in force. See `hashed_mirrors_off`.
+//! output hash is checked afterwards. That check is integrity and never
+//! egress: a URL that carries a secret in its query string, with the hash of
+//! an innocuous file, passes it and the request already happened.
 
 const std = @import("std");
 
@@ -98,19 +11,15 @@ const provision = @import("provision.zig");
 
 pub const Error = provision.Error;
 
-/// One host a build would reach.
 pub const Fetch = struct {
-    /// What asked for the host: the derivation that fetches it, or the
-    /// input a lock names. Part of every refusal, because a person reading one
-    /// wants to know what asked.
+    /// The derivation that fetches it, or the input a lock names. Part of
+    /// every refusal.
     subject: []const u8,
     url: []const u8,
     host: []const u8,
     port: u16,
 };
 
-/// A URL of a fixed output derivation that could not be turned into a host
-/// and a port.
 pub const Unreadable = struct {
     subject: []const u8,
     /// Empty when the derivation carried no URL at all.
@@ -141,22 +50,19 @@ pub const Unreadable = struct {
     };
 };
 
-/// One mirror of a site, read out of a mirrors file.
 pub const Mirror = struct {
-    /// The mirror as the file writes it, which is what pins the builder. It
-    /// carries no file path of its own: the builder appends that.
+    /// The mirror as the file writes it, which is what pins the builder. The
+    /// builder appends the file path.
     base: []const u8,
     /// `base` with the derivation's own path on the end, which is the URL a
     /// person is asked about.
     url: []const u8,
-    /// Null when the mirror names no host a rule can be written for. Such a
-    /// mirror is passed over rather than refused, because the file holds an
-    /// `ftp://` entry beside the `https://` ones for many sites.
+    /// Null when the mirror names no host a rule can be written for. Passed
+    /// over rather than refused: the file holds an `ftp://` entry beside the
+    /// `https://` ones for many sites.
     target: ?Target,
 };
 
-/// One `mirror://` URL of the closure, and every mirror the file names for
-/// its site.
 pub const MirrorSite = struct {
     subject: []const u8,
     /// The `mirror://` URL as the derivation writes it.
@@ -166,52 +72,41 @@ pub const MirrorSite = struct {
     mirrors: []const Mirror,
 };
 
-/// Every way this closure reaches the network.
 pub const Reached = struct {
     /// One entry per host and port, in the order they were found.
     hosts: []const Fetch = &.{},
-    /// One entry per `mirror://` site, in the order they were found, each
-    /// answered once however many derivations name it.
+    /// One entry per `mirror://` site, each answered once however many
+    /// derivations name it.
     sites: []const MirrorSite = &.{},
     /// The hashed mirrors of the first mirrors file this closure names. The
-    /// builder tries these whatever the URLs say, so they are a host nobody
-    /// named and they still have to be answered for.
+    /// builder tries these whatever the URLs say.
     hashed: []const Mirror = &.{},
-    /// Every fixed output derivation of the closure that says nowhere it
-    /// fetches from, in the order they were found. **One question covers all
-    /// of them**: there is no host to tell them apart by, so a question each
-    /// would be the same question asked again.
+    /// Every fixed output derivation that says nowhere it fetches from. One
+    /// question covers all of them: there is no host to tell them apart by.
     opaque_subjects: []const []const u8 = &.{},
-    /// True when any fixed output derivation of the closure names a mirrors
-    /// file. The builder then reaches a hashed mirror whatever it fetches, so
-    /// `NIX_HASHED_MIRRORS` has to be pinned.
+    /// True when any fixed output derivation names a mirrors file. The
+    /// builder then reaches a hashed mirror whatever it fetches.
     reads_mirrors: bool = false,
 };
 
-/// What one closure says about the network.
 pub const Closure = union(enum) {
     reached: Reached,
-    /// The first URL this file could not name. **A refusal and never a skip**:
-    /// a fetch nobody can name is a fetch nobody can rule on.
+    /// The first URL this file could not name. A refusal and never a skip,
+    /// because a fetch nobody can name is a fetch nobody can rule on.
     unreadable: Unreadable,
     /// What `nix` wrote when it would not read the closure.
     nix_said: []const u8,
 };
 
-/// The value that turns the hashed mirrors off.
-///
-/// **One space, and never the empty string.** Both nixpkgs builder shapes read
+/// One space, and never the empty string. Both nixpkgs builder shapes read
 /// `NIX_HASHED_MIRRORS` only when it is not empty, so an empty value leaves
-/// the list the mirrors file names in force and the builder reaches a host
-/// nobody allowed. A space is not empty and it splits into no words, so both
-/// builders loop over nothing.
+/// the file's own list in force. A space splits into no words.
 pub const hashed_mirrors_off = " ";
 
 /// The site whose mirrors the builder tries for every fetch.
 pub const hashed_mirrors_site = "hashedMirrors";
 
-/// The most bytes a mirrors file may be. The nixpkgs one is near thirteen
-/// thousand, and a file far over this is not the list this reads.
+/// The nixpkgs one is near thirteen thousand bytes.
 pub const max_mirrors_bytes: usize = 256 * 1024;
 
 pub const UrlError = error{
@@ -220,21 +115,15 @@ pub const UrlError = error{
     UrlPortNotAPort,
 };
 
-/// Where a URL points.
 pub const Target = struct {
     host: []const u8,
     port: u16,
 };
 
-/// Every scheme this reads, and the port each one connects on when the URL
-/// names none of its own.
-///
-/// **One table, so adding a scheme is a line of data.** A scheme that is not
-/// here is a refusal and never a guess: a wrong port would put a question to
-/// the policy about a connection that never happens while the real one goes
-/// unasked. Every entry is here because nixpkgs writes it. `ftp` is in the
-/// mirrors file beside `https` for many sites and is how `gmp` is fetched,
-/// and `git` at 9418 is how `systemtap` is.
+/// A scheme that is not here is a refusal and never a guess: a wrong port
+/// would ask the policy about a connection that never happens while the real
+/// one goes unasked. Every entry is here because nixpkgs writes it, `ftp` for
+/// `gmp` and `git` at 9418 for `systemtap` among them.
 pub const schemes = [_]struct { name: []const u8, port: u16 }{
     .{ .name = "https", .port = 443 },
     .{ .name = "http", .port = 80 },
@@ -243,7 +132,6 @@ pub const schemes = [_]struct { name: []const u8, port: u16 }{
     .{ .name = "ssh", .port = 22 },
 };
 
-/// The port `scheme` connects on, or null when this does not read it.
 pub fn portOf(scheme: []const u8) ?u16 {
     for (schemes) |one| {
         if (std.ascii.eqlIgnoreCase(scheme, one.name)) return one.port;
@@ -251,22 +139,17 @@ pub fn portOf(scheme: []const u8) ?u16 {
     return null;
 }
 
-/// `url` with a transport prefix taken off, or `url` itself.
-///
-/// `git+https://…`, `git+ssh://…` and `hg+https://…` are one transport
-/// written in front of one URL, and the URL behind the `+` is what carries
-/// the host and the port. **The one place this is done**: `inputs.zig` reads
-/// the same shape out of a lock node and calls `targetOf`, which calls this.
+/// `url` with a transport prefix taken off, or `url` itself. `git+https://…`
+/// and `hg+https://…` are one transport in front of one URL, and the URL
+/// behind the `+` carries the host and the port.
 pub fn withoutTransport(url: []const u8) []const u8 {
     const mark = std.mem.indexOf(u8, url, "://") orelse return url;
     const plus = std.mem.lastIndexOfScalar(u8, url[0..mark], '+') orelse return url;
     return url[plus + 1 ..];
 }
 
-/// The host and the port of `url`, both borrowed from it.
-///
-/// **A scheme this does not know is a refusal and never a guess.** See
-/// `schemes` for the table and for what a wrong port would cost.
+/// The host and the port of `url`, both borrowed from it. A scheme this does
+/// not know is a refusal. See `schemes`.
 pub fn targetOf(given: []const u8) UrlError!Target {
     const url = withoutTransport(given);
     const mark = std.mem.indexOf(u8, url, "://") orelse return error.UrlSchemeUnknown;
@@ -274,8 +157,7 @@ pub fn targetOf(given: []const u8) UrlError!Target {
 
     const rest = url[mark + 3 ..];
     const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
-    // A user name and a password belong to nobody's policy key, and the `@`
-    // is what tells the host apart from them.
+    // A user name and a password belong to nobody's policy key.
     const after_user = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at|
         authority[at + 1 ..]
     else
@@ -283,8 +165,7 @@ pub fn targetOf(given: []const u8) UrlError!Target {
     if (after_user.len == 0) return error.UrlHasNoHost;
     // An address in brackets is the one host shape whose colons are not a
     // port boundary. Refused rather than parsed: the action namer takes
-    // letters, digits, hyphen and dot, so a name it cannot build is a
-    // question nobody can answer.
+    // letters, digits, hyphen and dot.
     if (after_user[0] == '[') return error.UrlHasNoHost;
 
     if (std.mem.lastIndexOfScalar(u8, after_user, ':')) |colon| {
@@ -298,8 +179,7 @@ pub fn targetOf(given: []const u8) UrlError!Target {
     return .{ .host = after_user, .port = default_port };
 }
 
-/// The site and the path of a `mirror://` URL, both borrowed from it. Null
-/// when the URL is not one, or names no site or no path.
+/// The site and the path of a `mirror://` URL, both borrowed from it.
 pub fn mirrorOf(url: []const u8) ?struct { site: []const u8, path: []const u8 } {
     const prefix = "mirror://";
     if (!std.mem.startsWith(u8, url, prefix)) return null;
@@ -312,8 +192,8 @@ pub fn mirrorOf(url: []const u8) ?struct { site: []const u8, path: []const u8 } 
     return .{ .site = site, .path = path };
 }
 
-/// True when `name` is a mirror site name. Letters and digits, which is what
-/// nixpkgs writes and what a shell variable name may hold here.
+/// Letters and digits, which is what nixpkgs writes and what a shell variable
+/// name may hold here.
 fn isSiteName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |character| {
@@ -322,18 +202,15 @@ fn isSiteName(name: []const u8) bool {
     return true;
 }
 
-/// What one mirrors file says, site by site. Every string is borrowed from
-/// the file text.
+/// What one mirrors file says, site by site. Borrowed from the file text.
 const SiteMap = std.StringHashMapUnmanaged([]const []const u8);
 
 /// Read `text` as a mirrors file.
 ///
-/// **Two shapes, because nixpkgs has written both.** The one in use today is
-/// one bash array per site, `declare -a _mirror_<site>=(<url> <url>)`. The
-/// older one is what `set | grep` wrote, `<site>=<url> <url>`, with the value
-/// quoted when it holds a space. A line of neither shape is passed over, so a
-/// file this does not understand names no site and every site of it is a
-/// refusal.
+/// Two shapes, because nixpkgs has written both. The one in use today is one
+/// bash array per site, `declare -a _mirror_gnu=(https://ftpmirror.gnu.org/)`.
+/// The older one is what `set | grep` wrote, `<site>=<url> <url>`, quoted when
+/// the value holds a space. A line of neither shape is passed over.
 fn parseMirrors(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -372,38 +249,11 @@ fn parseMirrors(
 
 /// The mirrors files one closure names, read once each.
 ///
-/// ## The file is a derivation output, so it is often not there yet
-///
-/// A closure is `.drv` files. The mirrors list is itself a derivation, and its
-/// output exists only once something realises it, so on an ordinary store the
-/// path a derivation names is simply absent. A reader that treated that as a
-/// refusal refuses nearly every real build.
-///
-/// ## So it is realised, and no builder may run for it
-///
-/// A derivation may name any path as its mirrors file, so realising whatever
-/// it named would let an expression have a derivation of its own choosing
-/// built before any gate answered. Two things stop that.
-///
-/// **The path must be an output of the closure being read**, which is what
-/// `producers` holds, so the path is one Nix itself put there.
-///
-/// **No builder runs.** The realise is asked for with `max-jobs` at zero and
-/// no remote builders, so Nix will take the output from a substituter and
-/// refuses to run any builder at all, fixed output or not. Nix enforces that
-/// and this file does not model it. A realise that would have needed a
-/// builder is a refusal, in those words.
-///
-/// **A closure scan would not do instead.** Reading the mirrors list's own
-/// closure and refusing when it holds a fixed output derivation refuses every
-/// real build: the list is built with `stdenv`, whose closure holds every
-/// bootstrap source tarball. On this machine that is sixty eight of them, and
-/// none of their outputs is in the store, so the scan can never pass. What
-/// makes the realise safe is that nothing is built, not that its closure is
-/// free of fetchers.
-///
-/// A substituter answers over the network, and that is the same channel every
-/// `nix build` of this library already uses. See `lib/chock-nix/build.zig`.
+/// A mirrors file is itself a derivation output, so on an ordinary store it is
+/// absent and a reader that refused would refuse nearly every real build. It
+/// is realised before it is read. A derivation may name any path, so the path
+/// must be an output of the closure being read, which is what `producers`
+/// holds, and `realise` runs no builder.
 const MirrorFiles = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -446,14 +296,19 @@ const MirrorFiles = struct {
     }
 
     /// Take `path` from a substituter, and refuse rather than build it.
+    ///
+    /// A scan of the list's own closure would not do instead: the list is
+    /// built with `stdenv`, whose closure holds every bootstrap source
+    /// tarball, and none of those outputs is in the store, so the scan can
+    /// never pass.
     fn realise(self: *MirrorFiles, path: []const u8) ReadError!void {
         const drv = self.producers.get(path) orelse return error.MirrorsNotProduced;
         const outputs = try std.fmt.allocPrint(self.allocator, "{s}^*", .{drv});
         const built = try self.runner.run(self.allocator, self.io, &.{
             "build",
             "--no-link",
-            // **The whole of what makes this safe.** No local builder and no
-            // remote one, so Nix substitutes the output or refuses.
+            // No local builder and no remote one, so Nix substitutes the
+            // output or refuses.
             "--max-jobs",
             "0",
             "--builders",
@@ -463,12 +318,10 @@ const MirrorFiles = struct {
         if (!built.succeeded()) return error.MirrorsNeedsABuilder;
     }
 
-    /// Record which derivation of the closure makes which output path.
-    ///
-    /// **Both spellings, because one Nix writes each.** `outputs.<name>.path`
-    /// can be the bare store name, and `env.<name>` is the absolute path. A
-    /// bare one is joined onto the store directory of the derivation this
-    /// closure was read for, so no store directory is assumed.
+    /// Both spellings, because one Nix writes each. `outputs.<name>.path` can
+    /// be the bare store name and `env.<name>` is the absolute path, so a
+    /// bare one is joined onto the store directory of this closure's own
+    /// derivation.
     fn learn(
         self: *MirrorFiles,
         drv_name: []const u8,
@@ -506,7 +359,6 @@ const MirrorFiles = struct {
     }
 };
 
-/// Why a mirrors file could not be read, in the words a refusal uses.
 fn whyOfMirrors(err: MirrorFiles.ReadError) Unreadable.Why {
     return switch (err) {
         error.MirrorsNotProduced => .mirrors_not_produced,
@@ -515,12 +367,9 @@ fn whyOfMirrors(err: MirrorFiles.ReadError) Unreadable.Why {
     };
 }
 
-/// The mirrors file a derivation names, or null when it names none. Read from
-/// `structuredAttrs` first and from the environment after it, the same two
-/// places `urlsOf` reads.
-///
-/// **Two names, because the builder has been renamed once.** The builder in
-/// use today reads `mirrorsListFile` and the older one reads `mirrorsFile`.
+/// The mirrors file a derivation names. Read from `structuredAttrs` first and
+/// from the environment after it, the same two places `urlsOf` reads. Two
+/// names, because the builder has been renamed once.
 fn mirrorsFileOf(one: std.json.ObjectMap) ?[]const u8 {
     const names = [_][]const u8{ "mirrorsListFile", "mirrorsFile" };
     if (one.get("structuredAttrs")) |attrs| {
@@ -540,7 +389,6 @@ fn mirrorsFileOf(one: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
-/// Every mirror the file names for `site`, with `path` on the end of each.
 fn mirrorsFor(
     allocator: std.mem.Allocator,
     sites: SiteMap,
@@ -557,10 +405,13 @@ fn mirrorsFor(
     return found;
 }
 
-/// Every host the closure of `derivation_path` would reach.
+/// Every host the closure of `derivation_path` would reach. Give it an arena.
 ///
-/// **Give this an arena**: every string of the answer comes from `allocator`,
-/// and so does the JSON `nix` wrote.
+/// `nix derivation show -r` reads the closure rather than a `.drv` parser of
+/// our own, because a parser that disagreed with Nix about one field would
+/// name the wrong host. Every fixed output derivation is asked about, even
+/// one whose output the store already holds: the store can lose that output
+/// between the question and the build.
 pub fn fetchesOf(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -603,9 +454,8 @@ pub fn fetchesOf(
         .store_dir = std.fs.path.dirname(derivation_path) orelse "/nix/store",
     };
 
-    // Every output of the closure, before any of them is wanted: a mirrors
-    // file is made by a derivation the closure holds, and this is what lets it
-    // be realised by that one derivation and by nothing else.
+    // A mirrors file is made by a derivation the closure holds, and this is
+    // what lets it be realised by that one derivation and by nothing else.
     var producing = listed.iterator();
     while (producing.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
@@ -620,18 +470,15 @@ pub fn fetchesOf(
 
         const name = try allocator.dupe(u8, entry.key_ptr.*);
 
-        // **A fetch with no URL is a question and no longer a refusal.** Some
-        // fetchers read their URLs out of a lock file while they build, so the
-        // derivation holds none. No rule can name a host for one, which is
-        // exactly what the caller asks about instead. See `Reached`.
+        // Some fetchers read their URLs out of a lock file while they build,
+        // so the derivation holds none and no rule can name a host for one.
         const urls = try urlsOf(allocator, one.object) orelse {
             try opaque_subjects.append(allocator, name);
             continue;
         };
 
-        // **Read before the URLs and not because of one.** The builder tries
-        // a hashed mirror whether or not any URL names a mirror site, so a
-        // derivation that reads mirrors at all reaches that host.
+        // Read before the URLs and not because of one. The builder tries a
+        // hashed mirror whether or not any URL names a mirror site.
         const mirrors_path = mirrorsFileOf(one.object);
         if (mirrors_path) |path| {
             reached.reads_mirrors = true;
@@ -720,11 +567,8 @@ pub fn fetchesOf(
     return .{ .reached = reached };
 }
 
-/// The map of derivations, whichever shape this `nix` wrote.
-///
 /// Nix 2.36 and later wrap the map in a `derivations` member beside a version
-/// number, and every earlier one puts the map at the top. Both are read,
-/// because the Nix on a user's machine is theirs and not ours.
+/// number, and every earlier one puts the map at the top. Both are read.
 fn derivationsOf(root: std.json.Value) ?std.json.ObjectMap {
     if (root != .object) return null;
     if (root.object.get("derivations")) |wrapped| {
@@ -734,9 +578,8 @@ fn derivationsOf(root: std.json.Value) ?std.json.ObjectMap {
     return root.object;
 }
 
-/// True when one output of this derivation carries an output hash, which is
-/// what makes a derivation fixed output and what gives its builder the
-/// network.
+/// True when one output carries an output hash, which is what makes a
+/// derivation fixed output and what gives its builder the network.
 fn isFixedOutput(one: std.json.ObjectMap) bool {
     const outputs = one.get("outputs") orelse return false;
     if (outputs != .object) return false;
@@ -744,9 +587,8 @@ fn isFixedOutput(one: std.json.ObjectMap) bool {
     while (each.next()) |entry| {
         const output = entry.value_ptr.*;
         if (output != .object) continue;
-        // `hash` is what every Nix writes. `hashAlgo` is there as well on the
-        // older shape, and a derivation with one and not the other is still
-        // fixed output.
+        // `hashAlgo` is there as well on the older shape, and a derivation
+        // with one and not the other is still fixed output.
         if (output.object.contains("hash")) return true;
         if (output.object.contains("hashAlgo")) return true;
     }
@@ -756,13 +598,11 @@ fn isFixedOutput(one: std.json.ObjectMap) bool {
 /// What the builder will fetch, in the order the derivation writes them, each
 /// borrowed from the parsed JSON. Null when it says nowhere it fetches from.
 ///
-/// **Two places hold this, and both are read.** An ordinary derivation puts
-/// `url` or `urls` in its environment, where a list is one string joined with
-/// spaces. A derivation with structured attributes puts them in
-/// `structuredAttrs` instead, where a list is a real JSON array, and its
-/// environment then holds only the output names. nixpkgs builds `fetchurl`
-/// the second way today, so a reader of the environment alone finds no URL on
-/// the very derivation a person asked to build.
+/// Two places hold this and both are read. An ordinary derivation puts `url`
+/// or `urls` in its environment, joined with spaces. A derivation with
+/// structured attributes puts them in `structuredAttrs` as a JSON array and
+/// leaves only the output names in the environment, which is how nixpkgs
+/// builds `fetchurl` today.
 fn urlsOf(
     allocator: std.mem.Allocator,
     one: std.json.ObjectMap,
@@ -800,7 +640,6 @@ fn urlsOf(
     return null;
 }
 
-/// One sentence for a URL this file could not name. The caller owns it.
 pub fn unreadableRefusal(
     allocator: std.mem.Allocator,
     one: Unreadable,
@@ -863,11 +702,7 @@ pub fn unreadableRefusal(
     };
 }
 
-/// One sentence for a build that fetches without saying where. The caller owns
-/// it.
-///
-/// **It names a derivation**, because that is the only handle a person has on
-/// one of these: there is no host and no URL to name instead.
+/// It names a derivation, because there is no host and no URL to name.
 pub fn opaqueRefusal(
     allocator: std.mem.Allocator,
     subjects: []const []const u8,
@@ -888,11 +723,8 @@ pub fn opaqueRefusal(
     );
 }
 
-/// One sentence for a mirror site nobody permitted. The caller owns it.
-///
-/// **It names the site and the host**, because a person reading it has to
-/// know both: the site is what the derivation wrote and the host is what the
-/// rule would have to cover.
+/// It names the site and the host: the site is what the derivation wrote, and
+/// the host is what a rule would have to cover.
 pub fn mirrorRefusal(
     allocator: std.mem.Allocator,
     one: MirrorSite,
@@ -906,7 +738,6 @@ pub fn mirrorRefusal(
     );
 }
 
-/// One sentence for a closure `nix` would not read. The caller owns it.
 pub fn closureRefusal(
     allocator: std.mem.Allocator,
     derivation_path: []const u8,
@@ -919,55 +750,43 @@ pub fn closureRefusal(
     );
 }
 
-/// Whether one fetch may happen.
 pub const Verdict = union(enum) {
     permitted,
-    /// Why not, in words the model reads. Borrowed from the allocator the
-    /// gate was given.
+    /// Borrowed from the allocator the gate was given.
     refused: []const u8,
 };
 
 /// Who answers for a host a build would reach.
 ///
-/// **A seam, because the answer is the policy table's and this library holds
-/// no policy.** `src/run.zig` fills it in with the action name
-/// `chock_broker.network.actionInto` writes and the arbiter every other
-/// mid-call question goes through.
+/// A seam, because the answer belongs to the policy table and this library
+/// holds none. There is one egress namespace, `net.connect`, and its names are
+/// built in `chock_broker.network` because that is where the label reversal a
+/// class rule needs is written and tested.
 pub const Gate = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Decide every host of one build, in one call.
-        ///
-        /// **One call and not one per host**, because a nixpkgs closure
-        /// reaches a hundred of them. A hundred questions is not a hundred
-        /// decisions, it is one decision and ninety nine keystrokes, and
-        /// nobody reads the tenth host name. The rules are not collapsed:
-        /// each host is still decided under its own
-        /// `net.connect.<host>.<port>` name, and a project rule still names
-        /// one host. What is collapsed is the asking.
+        /// Decide every host of one build, in one call, because a nixpkgs
+        /// closure reaches a hundred and nobody reads the tenth host name.
+        /// The rules are not collapsed: each host is still decided under its
+        /// own `net.connect.<host>.<port>` name. What is collapsed is asking.
         permit_all: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
             wanted: []const Fetch,
         ) std.mem.Allocator.Error!Verdict,
-        /// Whether this build may fetch without saying where it goes.
-        ///
-        /// **One call for the whole build**, with every derivation of the
-        /// closure that says nowhere it fetches from. There is no host to tell
-        /// them apart by, so there is nothing a second question could ask.
+        /// Whether this build may fetch without saying where it goes. One
+        /// call for the whole build: there is no host to tell the derivations
+        /// apart by, so there is nothing a second question could ask.
         permit_opaque: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
             subjects: []const []const u8,
         ) std.mem.Allocator.Error!Verdict,
-        /// True when a rule already permits this host, with nobody asked.
-        ///
-        /// **A choice and never the decision.** It picks which mirror of a
-        /// site is put to `permit`, and `permit` is still what says yes and
-        /// what writes the answer into the log. A gate that reads no rule
-        /// answers false, so the first mirror is asked about instead.
+        /// True when a rule already permits this host, with nobody asked. A
+        /// choice and never the decision: it picks which mirror of a site goes
+        /// to `permit_all`. A gate that reads no rule answers false.
         allows_by_rule: *const fn (ptr: *anyopaque, one: Fetch) bool,
     };
 
@@ -993,8 +812,7 @@ pub const Gate = struct {
     }
 
     /// The gate a caller that wired none gets. It permits nothing, so a
-    /// wiring somebody forgot refuses a build that fetches rather than
-    /// letting it reach a host.
+    /// wiring somebody forgot refuses a build that fetches.
     pub const refusing: Gate = .{ .ptr = undefined, .vtable = &refusing_vtable };
 
     const refusing_vtable: VTable = .{
@@ -1039,13 +857,11 @@ test "a url becomes a host and a port, and a scheme this does not know is refuse
     try testing.expectEqualStrings("example.com", named.host);
     try testing.expectEqual(@as(u16, 8443), named.port);
 
-    // A user name is not part of the host, so it is not part of the key.
     const with_user = try targetOf("https://someone:secret@example.com/a");
     try testing.expectEqualStrings("example.com", with_user.host);
 
     // Every scheme nixpkgs writes that names a host carries its port in the
-    // action name like any other, so all of them are named rather than
-    // refused.
+    // action name like any other.
     const plain_ftp = try targetOf("ftp://ftp.gmplib.org/pub/gmp-6.3.0/gmp-6.3.0.tar.bz2");
     try testing.expectEqualStrings("ftp.gmplib.org", plain_ftp.host);
     try testing.expectEqual(@as(u16, 21), plain_ftp.port);
@@ -1058,8 +874,6 @@ test "a url becomes a host and a port, and a scheme this does not know is refuse
     try testing.expectEqualStrings("example.com", secure_shell.host);
     try testing.expectEqual(@as(u16, 22), secure_shell.port);
 
-    // A transport written in front of a URL is taken off, and the URL behind
-    // it is what carries the host and the port.
     const over_https = try targetOf("git+https://git.example.com/a/b.git");
     try testing.expectEqualStrings("git.example.com", over_https.host);
     try testing.expectEqual(@as(u16, 443), over_https.port);
@@ -1090,11 +904,9 @@ const FakeRunner = struct {
     code: u8 = 0,
     stdout: []const u8 = "",
     stderr: []const u8 = "",
-    /// What a `build` call answers, when it differs from the first call's.
     build_code: u8 = 0,
-    /// What a `build` call writes, which is how a test stands in for a store
-    /// that gained the output. Null writes nothing, which is a `nix` that
-    /// realised nothing.
+    /// What a `build` call writes, which stands in for a store that gained
+    /// the output. Null is a `nix` that realised nothing.
     realises: ?struct { path: []const u8, data: []const u8 } = null,
     seen: std.ArrayList([]const []const u8) = .empty,
 
@@ -1106,7 +918,6 @@ const FakeRunner = struct {
         self.seen.deinit(self.gpa);
     }
 
-    /// How many calls named `command` as their first argument.
     fn callsOf(self: *const FakeRunner, command: []const u8) usize {
         var count: usize = 0;
         for (self.seen.items) |args| {
@@ -1115,7 +926,6 @@ const FakeRunner = struct {
         return count;
     }
 
-    /// True when the last call carried `flag` as one of its arguments.
     fn lastCarried(self: *const FakeRunner, flag: []const u8) bool {
         const args = self.seen.items[self.seen.items.len - 1];
         for (args) |one| {
@@ -1165,8 +975,7 @@ const FakeRunner = struct {
     }
 };
 
-/// What `nix derivation show -r` writes for a closure of two derivations, one
-/// of which fetches. The shape Nix 2.36 writes, with the map wrapped.
+/// The shape Nix 2.36 writes, with the map wrapped.
 const closure_with_one_fetch =
     \\{"version":4,"derivations":{
     \\ "a-top.drv":{"env":{"name":"top"},"outputs":{"out":{"path":"/nix/store/x-top"}}},
@@ -1196,8 +1005,7 @@ test "a closure that holds a fixed output derivation answers its host and its po
     try testing.expectEqual(@as(u16, 443), closure.reached.hosts[0].port);
     try testing.expectEqualStrings("b-src.drv", closure.reached.hosts[0].subject);
 
-    // The whole closure and not the one derivation, so an input that fetches
-    // is found however deep it is.
+    // The whole closure and not the one derivation.
     try testing.expectEqualStrings("derivation", fake.seen.items[0][0]);
     try testing.expectEqualStrings("show", fake.seen.items[0][1]);
     try testing.expectEqualStrings("-r", fake.seen.items[0][2]);
@@ -1301,10 +1109,8 @@ test "a fetch this cannot name is a refusal, and it names the derivation and the
 }
 
 test "a fixed output derivation that says nowhere it fetches from is named, not refused" {
-    // **The shape every vendored dependency fetch takes.** `zig.fetchDeps`,
-    // npm deps and `fetchCargoVendor` read their URLs out of a lock file while
-    // they build, so the derivation holds none and there is no host any rule
-    // could name. The caller asks one question about the lot of them.
+    // `zig.fetchDeps`, npm deps and `fetchCargoVendor` read their URLs out of
+    // a lock file while they build, so the derivation holds none.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1327,12 +1133,10 @@ test "a fixed output derivation that says nowhere it fetches from is named, not 
     try testing.expect(closure == .reached);
     try testing.expectEqual(@as(usize, 2), closure.reached.opaque_subjects.len);
 
-    // A derivation that does name a URL is unaffected and stays a host.
     try testing.expectEqual(@as(usize, 1), closure.reached.hosts.len);
     try testing.expectEqualStrings("files.example.com", closure.reached.hosts[0].host);
 
-    // The words name a derivation and say how many there are, because that is
-    // the only handle a person has on one of these.
+    // The derivation names are the only handle a person has on one of these.
     const said = try opaqueRefusal(gpa, closure.reached.opaque_subjects, "nothing ran.");
     defer gpa.free(said);
     try testing.expect(std.mem.indexOf(u8, said, "deps.drv") != null);
@@ -1377,10 +1181,8 @@ test "the gate a caller wired none of permits nothing" {
 }
 
 test "a derivation with structured attributes holds its urls there, and they are read" {
-    // **The shape nixpkgs writes for `fetchurl` today.** Its environment holds
-    // the output name and nothing else, and a reader of the environment alone
-    // finds no URL on the very derivation a person asked to build. Trimmed
-    // from what `nix derivation show` really answers.
+    // The shape nixpkgs writes for `fetchurl` today: its environment holds the
+    // output name and nothing else.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1410,14 +1212,9 @@ test "a derivation with structured attributes holds its urls there, and they are
     try testing.expectEqualStrings("backup.example.org", closure.reached.hosts[1].host);
 }
 
-/// Three lines of a real nixpkgs mirrors list, byte for byte from the file a
-/// `fetchurl` derivation names. The order inside each one is the file's own
-/// order, which is the order a build tries them in, so a test that reads this
-/// reads what nixpkgs really says.
-///
-/// **Public for the tests of this library and for nothing else.**
-/// `lib/chock-nix/build.zig` gates a mirror and needs the same real list, and
-/// two copies of it would be two things to keep true.
+/// Three lines of a real nixpkgs mirrors list, byte for byte, in the file's
+/// own order, which is the order a build tries them in. Public because
+/// `lib/chock-nix/build.zig` needs the same real list.
 pub const nixpkgs_mirrors_sample =
     \\declare -a _mirror_gnu=(https://ftpmirror.gnu.org/ https://ftp.nluug.nl/pub/gnu/ https://mirrors.kernel.org/gnu/ https://mirror.ibcp.fr/pub/gnu/ https://mirror.dogado.de/gnu/ https://mirror.tochlab.net/pub/gnu/ https://ftp.gnu.org/pub/gnu/ ftp://ftp.funet.fi/pub/mirrors/ftp.gnu.org/gnu/)
     \\declare -a _mirror_hackage=(https://hackage.haskell.org/package/)
@@ -1425,17 +1222,15 @@ pub const nixpkgs_mirrors_sample =
     \\
 ;
 
-/// Where a test's mirrors list is, written or not. The path is under a
-/// temporary directory, which stands in for a store path: what the code under
-/// test does with it turns on whether the file is there.
+/// Where a test's mirrors list is, written or not. What the code under test
+/// does with it turns on whether the file is there.
 fn mirrorsListPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(testing.io, &buffer);
     return std.fmt.allocPrint(allocator, "{s}/mirrors-list", .{buffer[0..len]});
 }
 
-/// Put `nixpkgs_mirrors_sample` where `mirrorsListPath` says, which stands in
-/// for a store that already holds the output.
+/// Stand in for a store that already holds the output.
 fn writeMirrorsList(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     try tmp.dir.writeFile(testing.io, .{
         .sub_path = "mirrors-list",
@@ -1445,10 +1240,8 @@ fn writeMirrorsList(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u
 }
 
 /// A closure of one `fetchurl` derivation that fetches `url` and names
-/// `mirrors_path`. The shape nixpkgs writes today, trimmed.
-///
-/// `produced` adds the derivation that makes the mirrors list, which is what a
-/// real closure holds and what says the path is Nix's own.
+/// `mirrors_path`. `produced` adds the derivation that makes the mirrors
+/// list, which is what says the path is Nix's own.
 fn closureFetching(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -1480,8 +1273,7 @@ fn closureFetching(
 }
 
 test "a git daemon url is a host and a port like any other, and the action carries it" {
-    // A real refusal the owner hit: `systemtap` is fetched over the git daemon
-    // protocol, which names a host and has a well known port.
+    // `systemtap` is really fetched over the git daemon protocol.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1534,7 +1326,6 @@ test "a mirror url expands to the mirrors the file names, in the file's own orde
     try testing.expectEqualStrings("a-src.drv", site.subject);
     try testing.expectEqual(@as(usize, 8), site.mirrors.len);
 
-    // The file's own order, and the derivation's own path on the end of each.
     try testing.expectEqualStrings("https://ftpmirror.gnu.org/", site.mirrors[0].base);
     try testing.expectEqualStrings(
         "https://ftpmirror.gnu.org/hello/hello-2.12.3.tar.gz",
@@ -1543,13 +1334,11 @@ test "a mirror url expands to the mirrors the file names, in the file's own orde
     try testing.expectEqualStrings("ftpmirror.gnu.org", site.mirrors[0].target.?.host);
     try testing.expectEqualStrings("mirrors.kernel.org", site.mirrors[2].target.?.host);
 
-    // The last one is `ftp://`, which names a host at port 21 like any other,
-    // so it is a candidate rather than a mirror that is passed over.
+    // The last one is `ftp://`, a candidate like any other.
     try testing.expectEqualStrings("ftp.funet.fi", site.mirrors[7].target.?.host);
     try testing.expectEqual(@as(u16, 21), site.mirrors[7].target.?.port);
 
-    // The builder reaches a hashed mirror whatever the urls say, so the file's
-    // own hashed mirrors are read as well.
+    // The builder reaches a hashed mirror whatever the urls say.
     try testing.expect(closure.reached.reads_mirrors);
     try testing.expectEqual(@as(usize, 1), closure.reached.hashed.len);
     try testing.expectEqualStrings("tarballs.nixos.org", closure.reached.hashed[0].target.?.host);
@@ -1581,7 +1370,7 @@ test "a site the mirrors file does not name is a refusal, and so is a url with n
     try testing.expect(std.mem.indexOf(u8, said, "sourceforge") != null);
 
     // nixpkgs writes `mirror://` on a derivation that always names a mirrors
-    // file. One that does not says nowhere its site is, so it is refused.
+    // file. One that does not says nowhere its site is.
     var nameless = FakeRunner{
         .gpa = gpa,
         .stdout = try closureFetching(arena, "mirror://gnu/hello/hello-2.12.3.tar.gz", null, false),
@@ -1592,9 +1381,8 @@ test "a site the mirrors file does not name is a refusal, and so is a url with n
     try testing.expect(no_file == .unreadable);
     try testing.expectEqual(Unreadable.Why.no_mirrors_file, no_file.unreadable.why);
 
-    // And a mirrors file nothing of the closure makes, which is the shape an
-    // expression naming a path of its own would take. Nothing is realised for
-    // one of those.
+    // A mirrors file nothing of the closure makes is the shape an expression
+    // naming a path of its own would take.
     var gone = FakeRunner{
         .gpa = gpa,
         .stdout = try closureFetching(
@@ -1636,16 +1424,12 @@ test "a mirrors list already in the store is read, and nothing is realised for i
     const closure = try fetchesOf(arena, testing.io, fake.runner(), "/nix/store/a-src.drv");
     try testing.expect(closure == .reached);
     try testing.expectEqual(@as(usize, 8), closure.reached.sites[0].mirrors.len);
-    // One call, and it is the closure read. A store that has the output is
-    // never asked to make it again.
+    // A store that has the output is never asked to make it again.
     try testing.expectEqual(@as(usize, 1), fake.seen.items.len);
     try testing.expectEqual(@as(usize, 0), fake.callsOf("build"));
 }
 
 test "a mirrors list that is absent is realised without a builder, and then read" {
-    // **The closure is drv files.** The mirrors list is itself a derivation,
-    // so its output is there only once something realises it, and on an
-    // ordinary store the path a derivation names is simply absent.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1675,14 +1459,12 @@ test "a mirrors list that is absent is realised without a builder, and then read
         closure.reached.sites[0].mirrors[0].base,
     );
 
-    // The derivation of the closure that makes the file, and never the path
-    // itself or an installable.
+    // The derivation that makes the file, and never the path itself.
     try testing.expectEqual(@as(usize, 1), fake.callsOf("build"));
     const built = fake.seen.items[1];
     try testing.expectEqualStrings("build", built[0]);
     try testing.expectEqualStrings("/nix/store/m-mirrors-list.drv^*", built[built.len - 1]);
-    // **What makes the realise safe**: no builder may run for it, local or
-    // remote, so a derivation an expression named cannot be built here.
+    // No builder may run for it, local or remote.
     try testing.expect(fake.lastCarried("--max-jobs"));
     try testing.expect(fake.lastCarried("0"));
     try testing.expect(fake.lastCarried("--builders"));
@@ -1698,8 +1480,7 @@ test "a mirrors list that needs a builder is refused, and the words say so" {
     defer tmp.cleanup();
     const mirrors_path = try mirrorsListPath(arena, &tmp);
 
-    // `nix` refused, which is what it does when no substituter has the output
-    // and `max-jobs` is zero.
+    // What `nix` does when no substituter has the output and `max-jobs` is 0.
     var fake = FakeRunner{
         .gpa = gpa,
         .stdout = try closureFetching(
@@ -1723,8 +1504,8 @@ test "a mirrors list that needs a builder is refused, and the words say so" {
 }
 
 test "a scheme that is still unknown after a mirror is expanded stays a refusal" {
-    // The mirror expansion widens `mirror://` and nothing else. An `s3://`
-    // url the derivation writes itself names a port this file may not invent.
+    // An `s3://` url the derivation writes itself names a port this file may
+    // not invent.
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1744,8 +1525,7 @@ test "a scheme that is still unknown after a mirror is expanded stays a refusal"
     try testing.expect(closure == .unreadable);
     try testing.expectEqual(Unreadable.Why.scheme_unknown, closure.unreadable.why);
 
-    // A `mirror://` url with no path is not one this reads either, so it
-    // reaches the ordinary scheme check and is refused there.
+    // A `mirror://` url with no path reaches the ordinary scheme check.
     var siteless = FakeRunner{
         .gpa = gpa,
         .stdout = try closureFetching(arena, "mirror://gnu", mirrors_path, true),
@@ -1769,8 +1549,7 @@ test "a mirrors file is read in both shapes nixpkgs has written, and nothing els
     try testing.expectEqualStrings("https://hackage.haskell.org/package/", sites.get("hackage").?[0]);
     try testing.expectEqualStrings("https://tarballs.nixos.org", sites.get("hashedMirrors").?[0]);
 
-    // What `set | grep` wrote before the arrays: one scalar per site, quoted
-    // when it holds more than one mirror.
+    // What `set | grep` wrote before the arrays.
     var older = try parseMirrors(arena,
         \\hackage='https://hackage.haskell.org/package/ https://hackage.example.org/'
         \\hashedMirrors=https://tarballs.nixos.org
@@ -1780,8 +1559,7 @@ test "a mirrors file is read in both shapes nixpkgs has written, and nothing els
     try testing.expectEqual(@as(usize, 2), older.get("hackage").?.len);
     try testing.expectEqualStrings("https://tarballs.nixos.org", older.get("hashedMirrors").?[0]);
 
-    // A line of neither shape names no site, so every site of such a file is
-    // a refusal rather than a guess.
+    // A line of neither shape names no site.
     var strange = try parseMirrors(arena, "_mirror_gnu: https://ftpmirror.gnu.org/\n");
     defer strange.deinit(arena);
     try testing.expectEqual(@as(u32, 0), strange.count());
