@@ -796,10 +796,20 @@ pub fn build(b: *std.Build) void {
     // chock-io, chock-policy and chock-auth, it imports no other chock library:
     // a dev shell is evaluated before a session, a workspace, or a sandbox
     // exists, so it must not need any of them.
+    //
+    // fix, the Nix evaluator in Zig, is the one dependency it takes: an
+    // evaluation then needs no `nix` process, and no store, because store
+    // writes stay off until a caller asks for them. See
+    // `lib/chock-nix/eval.zig`.
+    const fix = b.dependency("fix", .{ .target = target, .optimize = optimize });
     const chock_nix = b.addModule("chock-nix", .{
         .root_source_file = b.path("lib/chock-nix.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "expr", .module = fix.module("expr") },
+            .{ .name = "store", .module = fix.module("store") },
+        },
     });
 
     const nix_tests = b.addTest(.{ .root_module = chock_nix });
