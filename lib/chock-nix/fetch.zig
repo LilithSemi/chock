@@ -226,29 +226,51 @@ pub const Target = struct {
     port: u16,
 };
 
+/// Every scheme this reads, and the port each one connects on when the URL
+/// names none of its own.
+///
+/// **One table, so adding a scheme is a line of data.** A scheme that is not
+/// here is a refusal and never a guess: a wrong port would put a question to
+/// the policy about a connection that never happens while the real one goes
+/// unasked. Every entry is here because nixpkgs writes it. `ftp` is in the
+/// mirrors file beside `https` for many sites and is how `gmp` is fetched,
+/// and `git` at 9418 is how `systemtap` is.
+pub const schemes = [_]struct { name: []const u8, port: u16 }{
+    .{ .name = "https", .port = 443 },
+    .{ .name = "http", .port = 80 },
+    .{ .name = "ftp", .port = 21 },
+    .{ .name = "git", .port = 9418 },
+    .{ .name = "ssh", .port = 22 },
+};
+
+/// The port `scheme` connects on, or null when this does not read it.
+pub fn portOf(scheme: []const u8) ?u16 {
+    for (schemes) |one| {
+        if (std.ascii.eqlIgnoreCase(scheme, one.name)) return one.port;
+    }
+    return null;
+}
+
+/// `url` with a transport prefix taken off, or `url` itself.
+///
+/// `git+https://…`, `git+ssh://…` and `hg+https://…` are one transport
+/// written in front of one URL, and the URL behind the `+` is what carries
+/// the host and the port. **The one place this is done**: `inputs.zig` reads
+/// the same shape out of a lock node and calls `targetOf`, which calls this.
+pub fn withoutTransport(url: []const u8) []const u8 {
+    const mark = std.mem.indexOf(u8, url, "://") orelse return url;
+    const plus = std.mem.lastIndexOfScalar(u8, url[0..mark], '+') orelse return url;
+    return url[plus + 1 ..];
+}
+
 /// The host and the port of `url`, both borrowed from it.
 ///
-/// **A scheme this does not know is a refusal and never a guess.** `https` is
-/// 443, `http` is 80 and `ftp` is 21. Anything else, `mirror:` included, has
-/// no port this file may invent, and a wrong port would put a question to the
-/// policy about a connection that never happens while the real one goes
-/// unasked.
-///
-/// `ftp` is here because nixpkgs writes it. A mirrors file holds `ftp://`
-/// beside `https://` for many sites, and `gmp` is fetched over it, so leaving
-/// it out refused real builds for a host the action name can carry as well as
-/// any other.
-pub fn targetOf(url: []const u8) UrlError!Target {
+/// **A scheme this does not know is a refusal and never a guess.** See
+/// `schemes` for the table and for what a wrong port would cost.
+pub fn targetOf(given: []const u8) UrlError!Target {
+    const url = withoutTransport(given);
     const mark = std.mem.indexOf(u8, url, "://") orelse return error.UrlSchemeUnknown;
-    const scheme = url[0..mark];
-    const default_port: u16 = if (std.ascii.eqlIgnoreCase(scheme, "https"))
-        443
-    else if (std.ascii.eqlIgnoreCase(scheme, "http"))
-        80
-    else if (std.ascii.eqlIgnoreCase(scheme, "ftp"))
-        21
-    else
-        return error.UrlSchemeUnknown;
+    const default_port = portOf(url[0..mark]) orelse return error.UrlSchemeUnknown;
 
     const rest = url[mark + 3 ..];
     const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
@@ -916,10 +938,19 @@ pub const Gate = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        permit: *const fn (
+        /// Decide every host of one build, in one call.
+        ///
+        /// **One call and not one per host**, because a nixpkgs closure
+        /// reaches a hundred of them. A hundred questions is not a hundred
+        /// decisions, it is one decision and ninety nine keystrokes, and
+        /// nobody reads the tenth host name. The rules are not collapsed:
+        /// each host is still decided under its own
+        /// `net.connect.<host>.<port>` name, and a project rule still names
+        /// one host. What is collapsed is the asking.
+        permit_all: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
-            one: Fetch,
+            wanted: []const Fetch,
         ) std.mem.Allocator.Error!Verdict,
         /// Whether this build may fetch without saying where it goes.
         ///
@@ -940,12 +971,13 @@ pub const Gate = struct {
         allows_by_rule: *const fn (ptr: *anyopaque, one: Fetch) bool,
     };
 
-    pub fn permit(
+    pub fn permitAll(
         self: Gate,
         allocator: std.mem.Allocator,
-        one: Fetch,
+        wanted: []const Fetch,
     ) std.mem.Allocator.Error!Verdict {
-        return self.vtable.permit(self.ptr, allocator, one);
+        if (wanted.len == 0) return .permitted;
+        return self.vtable.permit_all(self.ptr, allocator, wanted);
     }
 
     pub fn permitOpaque(
@@ -966,7 +998,7 @@ pub const Gate = struct {
     pub const refusing: Gate = .{ .ptr = undefined, .vtable = &refusing_vtable };
 
     const refusing_vtable: VTable = .{
-        .permit = refuseFn,
+        .permit_all = refuseFn,
         .permit_opaque = refuseOpaqueFn,
         .allows_by_rule = allowsNothing,
     };
@@ -974,7 +1006,7 @@ pub const Gate = struct {
     fn refuseFn(
         _: *anyopaque,
         _: std.mem.Allocator,
-        _: Fetch,
+        _: []const Fetch,
     ) std.mem.Allocator.Error!Verdict {
         return .{ .refused = "this session can ask nobody about a host" };
     }
@@ -1011,16 +1043,38 @@ test "a url becomes a host and a port, and a scheme this does not know is refuse
     const with_user = try targetOf("https://someone:secret@example.com/a");
     try testing.expectEqualStrings("example.com", with_user.host);
 
-    // nixpkgs writes this one, and the action name carries its port like any
-    // other, so it is named rather than refused.
+    // Every scheme nixpkgs writes that names a host carries its port in the
+    // action name like any other, so all of them are named rather than
+    // refused.
     const plain_ftp = try targetOf("ftp://ftp.gmplib.org/pub/gmp-6.3.0/gmp-6.3.0.tar.bz2");
     try testing.expectEqualStrings("ftp.gmplib.org", plain_ftp.host);
     try testing.expectEqual(@as(u16, 21), plain_ftp.port);
 
+    const git_daemon = try targetOf("git://sourceware.org/git/systemtap.git");
+    try testing.expectEqualStrings("sourceware.org", git_daemon.host);
+    try testing.expectEqual(@as(u16, 9418), git_daemon.port);
+
+    const secure_shell = try targetOf("ssh://git@example.com/a.git");
+    try testing.expectEqualStrings("example.com", secure_shell.host);
+    try testing.expectEqual(@as(u16, 22), secure_shell.port);
+
+    // A transport written in front of a URL is taken off, and the URL behind
+    // it is what carries the host and the port.
+    const over_https = try targetOf("git+https://git.example.com/a/b.git");
+    try testing.expectEqualStrings("git.example.com", over_https.host);
+    try testing.expectEqual(@as(u16, 443), over_https.port);
+
+    const over_ssh = try targetOf("git+ssh://git@example.com/a.git");
+    try testing.expectEqualStrings("example.com", over_ssh.host);
+    try testing.expectEqual(@as(u16, 22), over_ssh.port);
+
+    const over_http = try targetOf("git+http://git.example.com/a.git");
+    try testing.expectEqual(@as(u16, 80), over_http.port);
+
     // No port this file may invent, so none is invented.
     try testing.expectError(error.UrlSchemeUnknown, targetOf("sftp://example.com/a"));
+    try testing.expectError(error.UrlSchemeUnknown, targetOf("s3://example.com/a"));
     try testing.expectError(error.UrlSchemeUnknown, targetOf("mirror://gnu/a.tar.gz"));
-    try testing.expectError(error.UrlSchemeUnknown, targetOf("git+ssh://example.com/a"));
     try testing.expectError(error.UrlSchemeUnknown, targetOf("example.com/a"));
 
     try testing.expectError(error.UrlHasNoHost, targetOf("https:///a/b"));
@@ -1313,12 +1367,12 @@ test "a nix that would not read the closure answers its own last line" {
 }
 
 test "the gate a caller wired none of permits nothing" {
-    const answer = try Gate.refusing.permit(testing.allocator, .{
+    const answer = try Gate.refusing.permitAll(testing.allocator, &.{.{
         .subject = "a.drv",
         .url = "https://example.com/a",
         .host = "example.com",
         .port = 443,
-    });
+    }});
     try testing.expect(answer == .refused);
 }
 
@@ -1423,6 +1477,30 @@ fn closureFetching(
             maker,
         },
     );
+}
+
+test "a git daemon url is a host and a port like any other, and the action carries it" {
+    // A real refusal the owner hit: `systemtap` is fetched over the git daemon
+    // protocol, which names a host and has a well known port.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var fake = FakeRunner{
+        .gpa = gpa,
+        .stdout =
+        \\{"derivations":{"a-systemtap.drv":
+        \\ {"env":{"url":"git://sourceware.org/git/systemtap.git"},
+        \\  "outputs":{"out":{"hash":"sha256-A"}}}}}
+        ,
+    };
+    defer fake.deinit();
+
+    const closure = try fetchesOf(arena, testing.io, fake.runner(), "/nix/store/a.drv");
+    try testing.expect(closure == .reached);
+    try testing.expectEqualStrings("sourceware.org", closure.reached.hosts[0].host);
+    try testing.expectEqual(@as(u16, 9418), closure.reached.hosts[0].port);
 }
 
 test "a mirror url expands to the mirrors the file names, in the file's own order" {

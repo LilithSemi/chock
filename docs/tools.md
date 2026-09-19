@@ -226,11 +226,25 @@ answer.
 
 A host nobody allowed refuses the build before `nix` is told to build anything,
 and the refusal names the host and the derivation, so the agent can ask you for
-that host rather than try the same attribute again. A URL whose scheme is not
-`http`, `https` or `ftp`, and one with no host in it, are both refusals too:
-Chock will not guess a port, and a fetch nobody can name is a fetch nobody can
-rule on. An `ftp://` URL is named at port 21, so a rule for it looks like any
-other: `net.connect.org.gmplib.ftp.21`.
+that host rather than try the same attribute again.
+
+**You are asked once for a build, not once per host.** A nixpkgs closure
+reaches a hundred of them, and a hundred questions is one decision and ninety
+nine keystrokes. So Chock reads your rules for every host first: a host a rule
+allows is decided there and never appears in the question, and a host a rule
+denies refuses the build with nobody asked. Only the hosts no rule covers are
+left, and those go into one question, under `nix.fetch.hosts`, that says how
+many there are and names the first few. The detail key shows every one of them
+beside the exact rule you would write to stop being asked. A yes covers the
+hosts of that question for that build and nothing after it. A build that
+reaches one host asks the way it always did. A URL whose scheme Chock does not
+read, and one with no host in it, are both refusals too: Chock will not guess a
+port, and a fetch nobody can name is a fetch nobody can rule on. The schemes it
+reads, with the port each names when the URL gives none, are `https` 443,
+`http` 80, `ftp` 21, `git` 9418 and `ssh` 22. A transport written in front of a
+URL, `git+https://` and `hg+https://` among them, is taken off and the URL
+behind it is read. So a rule for any of them looks like any other:
+`net.connect.org.gmplib.ftp.21`, `net.connect.org.sourceware.9418`.
 
 A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
 them. The derivation also names its own mirrors file, a store path that holds

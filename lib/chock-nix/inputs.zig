@@ -183,16 +183,10 @@ fn targetsOf(
         .unreadable = .{ .input = name, .reference = try allocator.dupe(u8, kind), .why = .no_url },
     };
     // `git+https://…` and `hg+https://…` are one transport written in front of
-    // one URL, and the URL is what carries the host.
-    const plain = if (std.mem.indexOfScalar(u8, url, '+')) |mark|
-        (if (std.mem.indexOf(u8, url, "://") != null and mark < std.mem.indexOf(u8, url, "://").?)
-            url[mark + 1 ..]
-        else
-            url)
-    else
-        url;
-
-    const target = fetch.targetOf(plain) catch |err| return .{ .unreadable = .{
+    // one URL. `fetch.targetOf` takes the prefix off, so the strip lives in
+    // one place and a lock node and a derivation read the same URL the same
+    // way.
+    const target = fetch.targetOf(url) catch |err| return .{ .unreadable = .{
         .input = name,
         .reference = try allocator.dupe(u8, url),
         .why = switch (err) {
@@ -279,11 +273,11 @@ pub fn fetchAll(
     lock_bytes: []const u8,
 ) Error!Answer {
     switch (try wantsOf(allocator, lock_bytes)) {
-        .hosts => |list| for (list) |one| {
-            switch (try gate.permit(allocator, one)) {
-                .permitted => {},
-                .refused => |why| return .{ .refused = why },
-            }
+        // One call for every host the lock names, the same way a build puts
+        // every host of its closure at once.
+        .hosts => |list| switch (try gate.permitAll(allocator, list)) {
+            .permitted => {},
+            .refused => |why| return .{ .refused = why },
         },
         .unreadable => |one| return .{ .refused = try unreadableRefusal(allocator, one) },
         .not_a_lock => |said| return .{ .refused = try std.fmt.allocPrint(
@@ -564,12 +558,23 @@ test "a node nothing can name is a refusal that names the input" {
     const said = try unreadableRefusal(arena, indirect.unreadable);
     try testing.expect(std.mem.indexOf(u8, said, "dep") != null);
 
+    // `ssh` names a host at 22 like any other scheme with one, so a node that
+    // uses it is asked about rather than refused.
     const ssh = try wantsOf(arena,
         \\{"nodes":{"dep":{"locked":{"type":"git","url":"ssh://git@example.com/a.git"}},
         \\ "root":{"inputs":{"dep":"dep"}}},"root":"root","version":7}
     );
-    try testing.expect(ssh == .unreadable);
-    try testing.expectEqual(Unreadable.Why.scheme_unknown, ssh.unreadable.why);
+    try testing.expect(ssh == .hosts);
+    try testing.expectEqualStrings("example.com", ssh.hosts[0].host);
+    try testing.expectEqual(@as(u16, 22), ssh.hosts[0].port);
+
+    // A scheme with no port this file may invent is still a refusal.
+    const unknown = try wantsOf(arena,
+        \\{"nodes":{"dep":{"locked":{"type":"git","url":"s3://example.com/a.git"}},
+        \\ "root":{"inputs":{"dep":"dep"}}},"root":"root","version":7}
+    );
+    try testing.expect(unknown == .unreadable);
+    try testing.expectEqual(Unreadable.Why.scheme_unknown, unknown.unreadable.why);
 }
 
 test "bytes that are not a lock answer one sentence and never a host" {
@@ -644,7 +649,7 @@ const AnsweringGate = struct {
     }
 
     const vtable: fetch.Gate.VTable = .{
-        .permit = permitFn,
+        .permit_all = permitAllFn,
         .permit_opaque = permitNothing,
         .allows_by_rule = allowsNothing,
     };
@@ -665,14 +670,15 @@ const AnsweringGate = struct {
         return false;
     }
 
-    fn permitFn(
+    fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
-        one: fetch.Fetch,
+        wanted: []const fetch.Fetch,
     ) std.mem.Allocator.Error!fetch.Verdict {
         const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
-        try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
+        for (wanted) |one| try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
         if (self.permitted) return .permitted;
+        const one = wanted[0];
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} would be fetched from {s}, and this project allows no connection to it",
@@ -729,8 +735,9 @@ test "a host nobody allowed refuses the fetch, and nix is never run" {
     try testing.expect(answer == .refused);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "github.com") != null);
 
-    // The first no stops it, so one question was put and nothing was fetched.
-    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    // Every host the lock names goes to the gate in one call, and a no there
+    // stops the fetch, so nothing was fetched.
+    try testing.expectEqual(@as(usize, 2), gate.asked.items.len);
     try testing.expectEqual(@as(usize, 0), fake.calls);
 }
 

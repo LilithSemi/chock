@@ -114,7 +114,7 @@ const RecordingGate = struct {
     }
 
     const vtable = chock_nix.fetch.Gate.VTable{
-        .permit = permitFn,
+        .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsNothing,
     };
@@ -135,14 +135,15 @@ const RecordingGate = struct {
         return false;
     }
 
-    fn permitFn(
+    fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
-        one: chock_nix.fetch.Fetch,
+        wanted: []const chock_nix.fetch.Fetch,
     ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
         const self: *RecordingGate = @ptrCast(@alignCast(ptr));
-        try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
+        for (wanted) |one| try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
         if (self.permitted) return .permitted;
+        const one = wanted[0];
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s}, and no rule allows it",
@@ -879,7 +880,7 @@ test "an evaluation that wanted an input asks about its hosts, and evaluates aft
     try testing.expect(evaluated.derivation_path != null);
 }
 
-test "a no refuses the fetch, and no second host is asked about" {
+test "a no refuses the fetch, and every host of the lock was in the one question" {
     if (nix_path.len == 0) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -911,10 +912,11 @@ test "a no refuses the fetch, and no second host is asked about" {
         lock_bytes,
     );
 
-    // **The first no is the answer.** Nothing was fetched, and the second host
-    // of the same input is never put to anybody: a person who said no is not
-    // asked again inside one call.
+    // **One question, and a no to it is the answer.** Nothing was fetched, and
+    // the hosts of the lock were put to the gate together rather than one at a
+    // time: a person answers once for the lot.
     try testing.expect(answer == .refused);
-    try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
+    try testing.expect(gate.asked.items.len > 1);
+    try testing.expectEqualStrings("api.github.com", gate.asked.items[0]);
     try testing.expect(std.mem.indexOf(u8, answer.refused, "api.github.com") != null);
 }

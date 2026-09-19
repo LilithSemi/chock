@@ -64,6 +64,15 @@
 //! off gives every builder the network, not only a fixed output one, and
 //! nothing here reads that setting.
 //!
+//! **One yes covers every host of a build that no rule named.** The question
+//! is put once, under `nix.fetch.hosts`, and the hosts it covers are in its
+//! detail rather than in its name, so a person who answers without reading the
+//! detail has permitted more than they read. That is the trade against a
+//! hundred questions nobody reads either, and a project narrows it by writing
+//! a `net.connect` rule per host, which is read first and takes that host out
+//! of the question. A host a rule allows or denies is still decided under its
+//! own name.
+//!
 //! **A fetch nobody named is allowed by default, and that is the widest thing
 //! in this list.** A fixed output derivation that says nowhere it fetches from
 //! has no host any rule could cover, and `zig.fetchDeps`, npm deps and
@@ -525,14 +534,31 @@ pub const Host = struct {
             },
         };
 
-        for (reached.hosts) |one| {
-            switch (try self.gate.permit(self.allocator, one)) {
-                .permitted => {},
-                .refused => |why| {
-                    self.refusal = why;
-                    return FetchRefused.FetchNotPermitted;
-                },
-            }
+        // **Every host of the build, gathered before anybody is asked.** The
+        // named URLs and the one mirror chosen for each site go into the same
+        // question, because they are the same decision: what this build may
+        // reach. See `fetch.Gate.permit_all`.
+        var wanted: std.ArrayList(fetch.Fetch) = .empty;
+        try wanted.appendSlice(self.allocator, reached.hosts);
+
+        var pins: std.ArrayList(provision.Variable) = .empty;
+        var chosen: std.ArrayList(Chosen) = .empty;
+        for (reached.sites) |one| {
+            const mirror = try self.chooseMirror(one);
+            try wanted.append(self.allocator, mirror.asking);
+            try chosen.append(self.allocator, .{ .site = one.site, .host = mirror.asking.host });
+            try pins.append(self.allocator, .{
+                .name = try std.fmt.allocPrint(self.allocator, "NIX_MIRRORS_{s}", .{one.site}),
+                .value = mirror.base,
+            });
+        }
+
+        switch (try self.gate.permitAll(self.allocator, wanted.items)) {
+            .permitted => {},
+            .refused => |why| {
+                self.refusal = try withSites(self.allocator, why, chosen.items);
+                return FetchRefused.FetchNotPermitted;
+            },
         }
 
         // **One question for the whole build, and only when there is one to
@@ -553,19 +579,6 @@ pub const Host = struct {
             }
         }
 
-        var pins: std.ArrayList(provision.Variable) = .empty;
-        for (reached.sites) |one| {
-            const allowed = try self.chooseMirror(one);
-            try pins.append(self.allocator, .{
-                .name = try std.fmt.allocPrint(
-                    self.allocator,
-                    "NIX_MIRRORS_{s}",
-                    .{one.site},
-                ),
-                .value = allowed,
-            });
-        }
-
         // **Pinned for every closure that reads mirrors, whatever its URLs
         // say.** The builder tries a hashed mirror on its own, so a value left
         // alone is a host nobody named and nobody allowed.
@@ -577,39 +590,33 @@ pub const Host = struct {
         self.pins = try pins.toOwnedSlice(self.allocator);
     }
 
-    /// The one mirror of `one` this build may use, as the file writes it.
+    /// Which host one mirror site was put to the policy as, for the words a
+    /// refusal uses.
+    const Chosen = struct {
+        site: []const u8,
+        host: []const u8,
+    };
+
+    /// The mirror of `one` this build would use, and the question it puts.
     ///
     /// The mirrors are taken in the file's own order. A mirror a rule already
-    /// permits is taken with nobody asked, and otherwise the first mirror that
-    /// has a host at all is what is asked about. **One question for a site and
-    /// never one for each of its ten mirrors**, which is the same reason one
-    /// host is answered once however many derivations fetch it.
-    fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror![]const u8 {
+    /// permits is taken outright, and otherwise the first mirror that has a
+    /// host at all is the one that goes into the build's question. **One
+    /// mirror for a site and never ten**, which is the same reason one host is
+    /// answered once however many derivations fetch it.
+    fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror!struct {
+        base: []const u8,
+        asking: fetch.Fetch,
+    } {
         for (one.mirrors) |mirror| {
             const target = mirror.target orelse continue;
             const asking = fetchOfMirror(one, mirror, target);
-            if (!self.gate.allowsByRule(asking)) continue;
-            switch (try self.gate.permit(self.allocator, asking)) {
-                .permitted => return mirror.base,
-                .refused => break,
-            }
+            if (self.gate.allowsByRule(asking)) return .{ .base = mirror.base, .asking = asking };
         }
 
         for (one.mirrors) |mirror| {
             const target = mirror.target orelse continue;
-            const asking = fetchOfMirror(one, mirror, target);
-            switch (try self.gate.permit(self.allocator, asking)) {
-                .permitted => return mirror.base,
-                .refused => |why| {
-                    self.refusal = try fetch.mirrorRefusal(
-                        self.allocator,
-                        one,
-                        target.host,
-                        why,
-                    );
-                    return FetchRefused.FetchNotPermitted;
-                },
-            }
+            return .{ .base = mirror.base, .asking = fetchOfMirror(one, mirror, target) };
         }
 
         self.refusal = try fetch.unreadableRefusal(self.allocator, .{
@@ -638,7 +645,7 @@ pub const Host = struct {
                 .port = target.port,
             };
             if (!self.gate.allowsByRule(asking)) continue;
-            switch (try self.gate.permit(self.allocator, asking)) {
+            switch (try self.gate.permitAll(self.allocator, &.{asking})) {
                 .permitted => return mirror.base,
                 .refused => break,
             }
@@ -673,6 +680,27 @@ pub const Host = struct {
         self.out_paths = try store.parsePathList(self.allocator, built.stdout);
     }
 };
+
+/// `why`, with the mirror sites of the build named after it. **A refusal about
+/// a mirror has to name the site as well as the host**: the site is what the
+/// derivation wrote and the host is what a rule would have to cover.
+fn withSites(
+    allocator: std.mem.Allocator,
+    why: []const u8,
+    chosen: []const Host.Chosen,
+) std.mem.Allocator.Error![]const u8 {
+    if (chosen.len == 0) return why;
+
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(allocator, why);
+    try text.appendSlice(allocator, " The mirror sites of this build were put to the policy as");
+    for (chosen, 0..) |one, index| {
+        try text.appendSlice(allocator, if (index == 0) " " else ", ");
+        try text.print(allocator, "{s} at {s}", .{ one.site, one.host });
+    }
+    try text.append(allocator, '.');
+    return text.toOwnedSlice(allocator);
+}
 
 /// The question one mirror of a site puts: the derivation that fetches, the
 /// URL the builder would really use, and the host of it.
@@ -928,7 +956,7 @@ const AnsweringGate = struct {
     }
 
     const vtable: fetch.Gate.VTable = .{
-        .permit = permitFn,
+        .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
         .allows_by_rule = allowsByRuleFn,
     };
@@ -945,16 +973,26 @@ const AnsweringGate = struct {
         return .{ .refused = try allocator.dupe(u8, "this project answers deny for it") };
     }
 
-    fn permitFn(
+    fn permitAllFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
-        one: fetch.Fetch,
+        wanted: []const fetch.Fetch,
     ) std.mem.Allocator.Error!fetch.Verdict {
         const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
-        try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
-        if (allowsByRuleFn(ptr, one)) return .permitted;
+
+        var refusing: ?fetch.Fetch = null;
+        for (wanted) |one| {
+            try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
+            if (allowsByRuleFn(ptr, one)) continue;
+            if (refusing == null) refusing = one;
+        }
+        if (refusing == null) return .permitted;
+
+        // One question for every host no rule answered, which is what the
+        // real gate puts and what these tests count.
         self.prompted += 1;
         if (self.permitted) return .permitted;
+        const one = refusing.?;
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "{s} fetches {s} from {s}, and this project allows no connection to it",
