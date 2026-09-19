@@ -47,6 +47,9 @@ pub const Unreadable = struct {
         mirror_site_unknown,
         /// Every mirror of the site names a host no rule can be written for.
         mirror_not_nameable,
+        /// A rule denies every mirror of the site that has a host at all, so
+        /// there is no candidate left to put to a question.
+        mirror_every_host_denied,
     };
 };
 
@@ -70,7 +73,35 @@ pub const MirrorSite = struct {
     site: []const u8,
     /// In the mirrors file's own order.
     mirrors: []const Mirror,
+
+    /// What names this set apart from the same site's list at another
+    /// revision. See `mirrorSetHash`.
+    pub fn hash(self: MirrorSite) [mirror_hash_bytes]u8 {
+        return mirrorSetHash(self.mirrors);
+    }
 };
+
+/// Lower case hex of SHA-256.
+pub const mirror_hash_bytes = 64;
+
+/// The hash of one site's own list: each URL as the mirrors file writes it,
+/// in the file's order, one per line, each line newline terminated.
+///
+/// The parsed list and never the file text. nixpkgs has written the mirrors
+/// file in two shapes, so hashing the bytes would give one site's own mirrors
+/// two different hashes and would quietly stop matching a rule somebody had
+/// already written. Hashing this site's list alone means a bump to another
+/// site leaves this one's rule where it was.
+pub fn mirrorSetHash(mirrors: []const Mirror) [mirror_hash_bytes]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (mirrors) |one| {
+        hasher.update(one.base);
+        hasher.update("\n");
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
 
 pub const Reached = struct {
     /// One entry per host and port, in the order they were found.
@@ -699,6 +730,12 @@ pub fn unreadableRefusal(
                 "for, so nothing was built.",
             .{ one.subject, one.url, one.site },
         ),
+        .mirror_every_host_denied => std.fmt.allocPrint(
+            allocator,
+            "{s} fetches {s}, and this project denies every mirror of the site {s}, so nothing " ++
+                "was built.",
+            .{ one.subject, one.url, one.site },
+        ),
     };
 }
 
@@ -756,10 +793,18 @@ pub const Verdict = union(enum) {
     refused: []const u8,
 };
 
+/// What a rule already says about one host, with nobody asked.
+pub const RuleAnswer = enum {
+    allow,
+    deny,
+    /// No rule settles it, so a question is what decides.
+    unsettled,
+};
+
 /// Who answers for a host a build would reach.
 ///
 /// A seam, because the answer belongs to the policy table and this library
-/// holds none. There is one egress namespace, `net.connect`, and its names are
+/// holds none. Nix egress has its own namespace, `nix.net`, and its names are
 /// built in `chock_broker.network` because that is where the label reversal a
 /// class rule needs is written and tested.
 pub const Gate = struct {
@@ -770,7 +815,8 @@ pub const Gate = struct {
         /// Decide every host of one build, in one call, because a nixpkgs
         /// closure reaches a hundred and nobody reads the tenth host name.
         /// The rules are not collapsed: each host is still decided under its
-        /// own `net.connect.<host>.<port>` name. What is collapsed is asking.
+        /// own `nix.net.<phase>.<host>.<port>` name. What is collapsed is
+        /// asking.
         permit_all: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
@@ -784,10 +830,19 @@ pub const Gate = struct {
             allocator: std.mem.Allocator,
             subjects: []const []const u8,
         ) std.mem.Allocator.Error!Verdict,
-        /// True when a rule already permits this host, with nobody asked. A
-        /// choice and never the decision: it picks which mirror of a site goes
-        /// to `permit_all`. A gate that reads no rule answers false.
-        allows_by_rule: *const fn (ptr: *anyopaque, one: Fetch) bool,
+        /// What a rule already says about this host, with nobody asked. A
+        /// choice and never the decision: it picks which mirror of a site is
+        /// used. A gate that reads no rule answers `unsettled`.
+        rule_for: *const fn (ptr: *anyopaque, one: Fetch) RuleAnswer,
+        /// Whether this build may fetch from the mirror set `site` names.
+        /// `chosen` is the mirror it would use, which is the first of the
+        /// file's own order that no rule denies.
+        permit_site: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            site: MirrorSite,
+            chosen: Fetch,
+        ) std.mem.Allocator.Error!Verdict,
     };
 
     pub fn permitAll(
@@ -807,8 +862,21 @@ pub const Gate = struct {
         return self.vtable.permit_opaque(self.ptr, allocator, subjects);
     }
 
+    pub fn ruleFor(self: Gate, one: Fetch) RuleAnswer {
+        return self.vtable.rule_for(self.ptr, one);
+    }
+
     pub fn allowsByRule(self: Gate, one: Fetch) bool {
-        return self.vtable.allows_by_rule(self.ptr, one);
+        return self.ruleFor(one) == .allow;
+    }
+
+    pub fn permitSite(
+        self: Gate,
+        allocator: std.mem.Allocator,
+        site: MirrorSite,
+        chosen: Fetch,
+    ) std.mem.Allocator.Error!Verdict {
+        return self.vtable.permit_site(self.ptr, allocator, site, chosen);
     }
 
     /// The gate a caller that wired none gets. It permits nothing, so a
@@ -818,7 +886,8 @@ pub const Gate = struct {
     const refusing_vtable: VTable = .{
         .permit_all = refuseFn,
         .permit_opaque = refuseOpaqueFn,
-        .allows_by_rule = allowsNothing,
+        .rule_for = settlesNothing,
+        .permit_site = refuseSiteFn,
     };
 
     fn refuseFn(
@@ -837,8 +906,17 @@ pub const Gate = struct {
         return .{ .refused = "this session can ask nobody about a fetch" };
     }
 
-    fn allowsNothing(_: *anyopaque, _: Fetch) bool {
-        return false;
+    fn refuseSiteFn(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: MirrorSite,
+        _: Fetch,
+    ) std.mem.Allocator.Error!Verdict {
+        return .{ .refused = "this session can ask nobody about a mirror set" };
+    }
+
+    fn settlesNothing(_: *anyopaque, _: Fetch) RuleAnswer {
+        return .unsettled;
     }
 };
 
@@ -1535,6 +1613,82 @@ test "a scheme that is still unknown after a mirror is expanded stays a refusal"
     const no_path = try fetchesOf(arena, testing.io, siteless.runner(), "/nix/store/a-src.drv");
     try testing.expect(no_path == .unreadable);
     try testing.expectEqual(Unreadable.Why.scheme_unknown, no_path.unreadable.why);
+}
+
+/// The mirrors of `site` in `text`, as `fetchesOf` would build them.
+fn mirrorsOf(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    site: []const u8,
+) ![]const Mirror {
+    var sites = try parseMirrors(allocator, text);
+    defer sites.deinit(allocator);
+    return (try mirrorsFor(allocator, sites, site, "hello/hello-2.12.3.tar.gz")).?;
+}
+
+test "a mirror set hashes its own parsed list, so the file's shape and another site cannot move it" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const declared = try mirrorsOf(arena, nixpkgs_mirrors_sample, "gnu");
+    const hash = mirrorSetHash(declared);
+    try testing.expectEqual(@as(usize, mirror_hash_bytes), hash.len);
+    for (hash) |character| try testing.expect(std.ascii.isHex(character) and !std.ascii.isUpper(character));
+
+    // The parsed list and never the bytes. nixpkgs has written the file in
+    // two shapes, and the same mirrors in the other shape must be the same set
+    // or every rule written against this site would stop matching on a day
+    // nobody changed a mirror.
+    const older = try mirrorsOf(
+        arena,
+        \\gnu='https://ftpmirror.gnu.org/ https://ftp.nluug.nl/pub/gnu/ https://mirrors.kernel.org/gnu/ https://mirror.ibcp.fr/pub/gnu/ https://mirror.dogado.de/gnu/ https://mirror.tochlab.net/pub/gnu/ https://ftp.gnu.org/pub/gnu/ ftp://ftp.funet.fi/pub/mirrors/ftp.gnu.org/gnu/'
+        \\hackage=https://hackage.haskell.org/package/
+        \\
+    ,
+        "gnu",
+    );
+    try testing.expectEqualStrings(&hash, &mirrorSetHash(older));
+
+    // Another site's list moving leaves this one's rule where it was.
+    const hackage_bumped = try mirrorsOf(
+        arena,
+        \\declare -a _mirror_gnu=(https://ftpmirror.gnu.org/ https://ftp.nluug.nl/pub/gnu/ https://mirrors.kernel.org/gnu/ https://mirror.ibcp.fr/pub/gnu/ https://mirror.dogado.de/gnu/ https://mirror.tochlab.net/pub/gnu/ https://ftp.gnu.org/pub/gnu/ ftp://ftp.funet.fi/pub/mirrors/ftp.gnu.org/gnu/)
+        \\declare -a _mirror_hackage=(https://hackage.haskell.org/package/ https://hackage.example.org/)
+        \\declare -a _mirror_hashedMirrors=(https://tarballs.nixos.org)
+        \\
+    ,
+        "gnu",
+    );
+    try testing.expectEqualStrings(&hash, &mirrorSetHash(hackage_bumped));
+
+    // This site's own list moving does move it, which is the point.
+    const one_gone = try mirrorsOf(
+        arena,
+        \\declare -a _mirror_gnu=(https://ftpmirror.gnu.org/ https://ftp.nluug.nl/pub/gnu/)
+        \\
+    ,
+        "gnu",
+    );
+    try testing.expect(!std.mem.eql(u8, &hash, &mirrorSetHash(one_gone)));
+
+    // Order is part of the set, because it is the order a build tries them in.
+    const reordered = try mirrorsOf(
+        arena,
+        \\declare -a _mirror_gnu=(https://ftp.nluug.nl/pub/gnu/ https://ftpmirror.gnu.org/)
+        \\
+    ,
+        "gnu",
+    );
+    const same_two = try mirrorsOf(
+        arena,
+        \\declare -a _mirror_gnu=(https://ftpmirror.gnu.org/ https://ftp.nluug.nl/pub/gnu/)
+        \\
+    ,
+        "gnu",
+    );
+    try testing.expect(!std.mem.eql(u8, &mirrorSetHash(reordered), &mirrorSetHash(same_two)));
 }
 
 test "a mirrors file is read in both shapes nixpkgs has written, and nothing else" {

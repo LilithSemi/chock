@@ -268,7 +268,7 @@ pub const rules: []const table.Rule = &.{
     // **A fixed output derivation that names no URL at all.** `zig.fetchDeps`,
     // npm deps and `fetchCargoVendor` read their URLs out of a lock file while
     // they build, so the derivation holds no URL anywhere and there is no host
-    // for a `net.connect` rule to cover. There never was one.
+    // for a `nix.net` rule to cover. There never was one.
     //
     // Shipped `allow` because that is how every vendored dependency fetch
     // works. A default that refuses them refuses nearly every Rust, Node and
@@ -278,11 +278,11 @@ pub const rules: []const table.Rule = &.{
     // **What it costs.** The output hash proves the bytes are what the
     // derivation expected and proves nothing about where the request went, so
     // a build allowed here can reach a host nobody named. The row exists so a
-    // project can take it back: `.{ .action = "nix.fetch.opaque", .decision =
-    // .ask }` in its own `chock.zon` puts the question to a person, and
-    // `.deny` refuses such a build outright. Every derivation that does name a
-    // URL is unaffected and still goes to `net.connect` per host.
-    .{ .action = "nix.fetch.opaque", .decision = .allow },
+    // project can take it back: `.{ .action = "nix.net.build.opaque",
+    // .decision = .ask }` in its own `chock.zon` puts the question to a
+    // person, and `.deny` refuses such a build outright. Every derivation that
+    // does name a URL is unaffected and still goes to `nix.net` per host.
+    .{ .action = "nix.net.build.opaque", .decision = .allow },
     // **A language server, which every project that has one already runs.**
     // Shipped `allow` so that giving this act a name changes nothing for
     // anybody: a project with a `language_servers` block behaves exactly as it
@@ -490,7 +490,7 @@ test "a build that fetches with no url is allowed by default, and a project can 
     defer table.Table.destroy(gpa, empty);
     try std.testing.expectEqual(
         table.Decision.allow,
-        empty.evaluateKindAlone(key("nix.fetch.opaque")),
+        empty.evaluateKindAlone(key("nix.net.build.opaque")),
     );
 
     // **And the whole reason the row is here rather than absent.** A project
@@ -501,7 +501,7 @@ test "a build that fetches with no url is allowed by default, and a project can 
         \\.{
         \\    .policy = .{
         \\        .rules = .{
-        \\            .{ .action = "nix.fetch.opaque", .decision = .ask },
+        \\            .{ .action = "nix.net.build.opaque", .decision = .ask },
         \\        },
         \\    },
         \\}
@@ -511,7 +511,7 @@ test "a build that fetches with no url is allowed by default, and a project can 
     defer table.Table.destroy(gpa, asking);
     try std.testing.expectEqual(
         table.Decision.ask,
-        asking.evaluateKindAlone(key("nix.fetch.opaque")),
+        asking.evaluateKindAlone(key("nix.net.build.opaque")),
     );
 
     const denying = try table.Table.parse(
@@ -519,7 +519,7 @@ test "a build that fetches with no url is allowed by default, and a project can 
         \\.{
         \\    .policy = .{
         \\        .rules = .{
-        \\            .{ .action = "nix.fetch.opaque", .decision = .deny },
+        \\            .{ .action = "nix.net.build.opaque", .decision = .deny },
         \\        },
         \\    },
         \\}
@@ -529,7 +529,7 @@ test "a build that fetches with no url is allowed by default, and a project can 
     defer table.Table.destroy(gpa, denying);
     try std.testing.expectEqual(
         table.Decision.deny,
-        denying.evaluateKindAlone(key("nix.fetch.opaque")),
+        denying.evaluateKindAlone(key("nix.net.build.opaque")),
     );
 
     // A derivation that names a URL is unaffected: it still goes to

@@ -578,7 +578,8 @@ const AnsweringGate = struct {
     const vtable: fetch.Gate.VTable = .{
         .permit_all = permitAllFn,
         .permit_opaque = permitNothing,
-        .allows_by_rule = allowsNothing,
+        .rule_for = settlesNothing,
+        .permit_site = permitNoSite,
     };
 
     /// A lock node names a host or it is refused, so nothing here reaches the
@@ -592,8 +593,17 @@ const AnsweringGate = struct {
     }
 
     /// A flake input names a host and never a mirror site.
-    fn allowsNothing(_: *anyopaque, _: fetch.Fetch) bool {
-        return false;
+    fn settlesNothing(_: *anyopaque, _: fetch.Fetch) fetch.RuleAnswer {
+        return .unsettled;
+    }
+
+    fn permitNoSite(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: fetch.MirrorSite,
+        _: fetch.Fetch,
+    ) std.mem.Allocator.Error!fetch.Verdict {
+        return .{ .refused = "a flake input names no mirror site" };
     }
 
     fn permitAllFn(
@@ -693,7 +703,7 @@ test "the sentence a later build reads names the input and the host, and reads a
     const said = try missingRefusal(
         gpa,
         "/work#packages.default",
-        "the answer was no for net.connect.com.github.api.443",
+        "the answer was no for nix.net.eval.com.github.api.443",
         &wanted,
     );
     defer gpa.free(said);
@@ -702,7 +712,7 @@ test "the sentence a later build reads names the input and the host, and reads a
     try testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
     try testing.expect(std.mem.indexOf(u8, said, "api.github.com.443 The") == null);
     try testing.expect(std.mem.indexOf(u8, said, "api.github.api.443. The") != null or
-        std.mem.indexOf(u8, said, "net.connect.com.github.api.443. The") != null);
+        std.mem.indexOf(u8, said, "nix.net.eval.com.github.api.443. The") != null);
 
     const already = try missingRefusal(gpa, "/work#a", "no rule allows it.", &.{});
     defer gpa.free(already);

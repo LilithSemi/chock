@@ -4955,15 +4955,60 @@ const FlakeInputs = struct {
     wanted: []const chock_nix.fetch.Fetch = &.{},
 };
 
+/// Reads this project's table about one request a Nix build would make.
+///
+/// Two names for one host, most specific first. The phase scoped name
+/// `nix.net.eval.com.github.443` is read, and then `nix.net.com.github.443`,
+/// which covers the same host in either phase. The table matches a name
+/// against itself or a trailing `.*` and `patternIsWellFormed` refuses a
+/// wildcard in the middle, so `nix.net.*.com.github.443` is a parse error and
+/// there is no one name that would do instead. `nix_build` already asks two
+/// actions for one call, the attribute and the flake, and this reads the same
+/// way.
+///
+/// **A rule that names the phase scoped key decides, whatever it says.** The
+/// wider name is read only when no rule names the narrow one, which is what
+/// `decideChain` reports and `evaluateChain` cannot: an author who wrote `ask`
+/// for `nix.net.build.com.github.443` beside `allow` for
+/// `nix.net.com.github.443` asked to be prompted for that build, and falling
+/// through would hand it a silent yes.
+const NixTableReader = struct {
+    policy: *const chock_policy.table.Table,
+    chain: []const []const u8,
+    agent_kind: []const u8,
+    model: []const u8,
+    tool: []const u8,
+
+    fn decide(
+        self: NixTableReader,
+        names: chock_broker.network.NixActions,
+    ) chock_policy.table.Decision {
+        if (self.answer(names.phase)) |settled| return settled;
+        return self.answer(names.either_phase) orelse .ask;
+    }
+
+    /// Null when no rule of the project, of the shipped defaults or of the org
+    /// bundle names `action`.
+    fn answer(self: NixTableReader, action: []const u8) ?chock_policy.table.Decision {
+        var fault: ?chock_policy.table.ChainFault = null;
+        const answered = self.policy.decideChain(self.chain, .{
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = self.tool,
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+        return if (answered.named) answered.decision else null;
+    }
+};
+
 /// Who answers for a host this project's flake inputs would be fetched from.
 ///
 /// **The policy table and nobody else.** A session is starting up, so there is
 /// nobody to prompt, and `ask` is off here for the reason
 /// `languageServerPermitted` states: a question with no one to answer it is a
-/// question that times out. The action name is the ordinary `net.connect` one,
-/// from `chock_broker.network.actionInto`, which is the same namespace a
-/// build's own fetches are asked under. There is no second namespace for a
-/// fetch.
+/// question that times out. This fetch exists so an expression can evaluate,
+/// so its names are the `eval` ones. See `NixTableReader`.
 const StartupFetchGate = struct {
     policy: *const chock_policy.table.Table,
     chain: []const []const u8,
@@ -4977,8 +5022,19 @@ const StartupFetchGate = struct {
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
-        .allows_by_rule = allowsByRuleFn,
+        .rule_for = ruleForFn,
+        .permit_site = permitSiteFn,
     };
+
+    fn reader(self: *const StartupFetchGate) NixTableReader {
+        return .{
+            .policy = self.policy,
+            .chain = self.chain,
+            .agent_kind = self.agent_kind,
+            .model = self.model,
+            .tool = @tagName(chock_core.tools.Tool.nix_build),
+        };
+    }
 
     /// Nobody is at the prompt during a session start, so this reads the table
     /// for each host in turn and the first one it does not allow refuses the
@@ -5008,6 +5064,17 @@ const StartupFetchGate = struct {
         return .{ .refused = "a flake input is fetched by host and never without one" };
     }
 
+    /// A flake input names a host and never a mirror site, so this too is
+    /// unreachable and refuses rather than permits.
+    fn permitSiteFn(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: chock_nix.fetch.MirrorSite,
+        _: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        return .{ .refused = "a flake input names no mirror set" };
+    }
+
     fn permitFn(
         ptr: *anyopaque,
         allocator: std.mem.Allocator,
@@ -5015,48 +5082,58 @@ const StartupFetchGate = struct {
     ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
         const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
 
-        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return .{ .refused = try std.fmt.allocPrint(
-                allocator,
-                "{s} would be fetched from \"{s}\", which is not a host name a rule can be " ++
-                    "written for",
-                .{ one.subject, one.host },
-            ) };
+        var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+        var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const names = chock_broker.network.nixActionsInto(
+            &scoped,
+            &either,
+            phase,
+            one.host,
+            one.port,
+        ) orelse return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} would be fetched from \"{s}\", which is not a host name a rule can be " ++
+                "written for",
+            .{ one.subject, one.host },
+        ) };
 
-        const decision = self.decisionFor(action);
+        const decision = self.reader().decide(names);
         if (decision == .allow) return .permitted;
 
         return .{ .refused = try std.fmt.allocPrint(
             allocator,
             "the input {s} comes from {s}, and this project's policy answers {t} for {s}.",
-            .{ one.subject, one.host, decision, action },
+            .{ one.subject, one.host, decision, names.phase },
         ) };
     }
 
-    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+    fn ruleForFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) chock_nix.fetch.RuleAnswer {
         const self: *StartupFetchGate = @ptrCast(@alignCast(ptr));
-        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return false;
-        return self.decisionFor(action) == .allow;
+        var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+        var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const names = chock_broker.network.nixActionsInto(
+            &scoped,
+            &either,
+            phase,
+            one.host,
+            one.port,
+        ) orelse return .unsettled;
+        return ruleAnswerOf(self.reader().decide(names));
     }
 
-    fn decisionFor(
-        self: *const StartupFetchGate,
-        action: []const u8,
-    ) chock_policy.table.Decision {
-        var fault: ?chock_policy.table.ChainFault = null;
-        const decision = self.policy.evaluateChain(self.chain, .{
-            .agent_kind = self.agent_kind,
-            .model = self.model,
-            .tool = @tagName(chock_core.tools.Tool.nix_build),
-            .action = action,
-        }, &fault);
-        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
-        return decision;
-    }
+    /// An input fetch exists so an expression can evaluate.
+    const phase: chock_broker.network.NixPhase = .eval;
 };
+
+/// What a table decision means to a caller choosing a mirror. Everything that
+/// is neither `allow` nor `deny` still needs a question, so it is unsettled.
+fn ruleAnswerOf(decision: chock_policy.table.Decision) chock_nix.fetch.RuleAnswer {
+    return switch (decision) {
+        .allow => .allow,
+        .deny => .deny,
+        .ask, .agent_review, .agent_then_human => .unsettled,
+    };
+}
 
 /// Fetch this project's flake inputs into the host store, once, before
 /// anything evaluates.
@@ -6356,6 +6433,7 @@ const SessionArbiter = struct {
             .model_alias = self.started.model_alias,
             .tool = ask.tool,
             .tool_call_id = ask.tool_call_id,
+            .source = ask.source,
             // The decision is the intersection over the whole chain, so a
             // subagent holds no permission its parent lacks.
             .spawn_chain = self.started.spawn_chain,
@@ -9461,6 +9539,7 @@ const GitToolRunner = struct {
             // already the action.
             .tool = call.tool,
             .tool_call_id = call.call_id,
+            .source = chock_broker.git_shim.request_source,
         });
 
         // **One refusal sentence, written in one place.**
@@ -11385,9 +11464,9 @@ fn nixBuildFor(
     };
 }
 
-/// Who answers for a host a Nix build would fetch from while it runs.
+/// Who answers for a host a Nix build would fetch from.
 ///
-/// ## A fetch is a connection, and there is one egress namespace
+/// ## A build's egress has a namespace of its own
 ///
 /// A fixed output derivation builds with the network open to it, because its
 /// output hash is checked afterwards. That check is integrity and never
@@ -11396,27 +11475,30 @@ fn nixBuildFor(
 /// out. So every host the closure would reach is named and put to the policy
 /// before `nix` is told to build.
 ///
-/// **The name is the ordinary `net.connect` one**, from
-/// `chock_broker.network.actionInto`, which reverses the labels so
-/// `evil.com.example.files` cannot match a rule an author wrote for
-/// `net.connect.com.example.*`. There is no second namespace for a fetch: a
-/// second one would need that reversal written and tested again, and would let
-/// a project allow a host in one namespace while denying it in the other.
+/// The names are `nix.net` and never `net.connect`, from
+/// `chock_broker.network.nixActionsInto`, which reverses the labels through
+/// the same code `net.connect` uses so `evil.com.example.files` cannot match a
+/// rule an author wrote for `nix.net.com.example.*`. A separate namespace is
+/// what keeps a rule that lets a build fetch from a host from also letting the
+/// agent's own sandbox open a socket to it.
 ///
 /// **A host that cannot be named is a refusal.** A caller that cannot build an
 /// action name cannot ask the table, and fetching anyway would reach a host no
 /// rule could ever have named.
 const NixFetchGate = struct {
-    /// What a build that fetches with no URL is asked under. **Two fixed
-    /// segments**, so nothing a model chose is ever part of the key and one
-    /// answer covers a session rather than one package.
-    const opaque_action = "nix.fetch.opaque";
+    /// What a build that fetches with no URL is asked under. Fixed segments,
+    /// so nothing a model chose is ever part of the key and one answer covers
+    /// a session rather than one package.
+    const opaque_action = chock_broker.network.nix_opaque_action;
 
-    /// What the one question about a build's hosts is asked under. **Only the
-    /// hosts no `net.connect` rule covers are ever in it**: a rule that allows
-    /// or denies a host is read first, under that host's own name, so this
-    /// never stands in for a decision a project already wrote down.
-    const many_action = "nix.fetch.hosts";
+    /// What the one question about a build's hosts is asked under. Only the
+    /// hosts no `nix.net` rule covers are ever in it: a rule that allows or
+    /// denies a host is read first, under that host's own name, so this never
+    /// stands in for a decision a project already wrote down.
+    ///
+    /// It has no port, and every host name this file builds ends in one, so
+    /// no host can ever write this name.
+    const many_action = chock_broker.network.nix_action_prefix ++ ".hosts";
 
     /// This tool call's own, for the question and for nothing that outlives
     /// it. A refusal comes from the allocator `permit` is given, which is the
@@ -11428,9 +11510,8 @@ const NixFetchGate = struct {
     /// person reading the question wants to see.
     installable: []const u8,
     call: chock_proto.event.ToolCall,
-    /// What is being fetched, which is the whole of the difference between
-    /// the two questions this gate puts. The hosts, the namespace and the
-    /// rules are the same for both.
+    /// What is being fetched. It picks the phase half of every name and the
+    /// words a person reads, and nothing else differs between the two.
     kind: Kind = .derivation,
     /// The policy table, for the one question that must not prompt: which
     /// mirror of a site a rule already permits. **Null answers no**, so a
@@ -11462,6 +11543,31 @@ const NixFetchGate = struct {
         flake_input,
     };
 
+    /// The half of the namespace this gate's questions are named under.
+    fn phase(self: *const NixFetchGate) chock_broker.network.NixPhase {
+        return switch (self.kind) {
+            .derivation => .build,
+            .flake_input => .eval,
+        };
+    }
+
+    /// Both names for one host, borrowed from the buffers. Null when the host
+    /// is not a name a rule can be written for.
+    fn namesOf(
+        self: *const NixFetchGate,
+        scoped: []u8,
+        either: []u8,
+        one: chock_nix.fetch.Fetch,
+    ) ?chock_broker.network.NixActions {
+        return chock_broker.network.nixActionsInto(
+            scoped,
+            either,
+            self.phase(),
+            one.host,
+            one.port,
+        );
+    }
+
     fn gate(self: *NixFetchGate) chock_nix.fetch.Gate {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -11469,7 +11575,8 @@ const NixFetchGate = struct {
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
-        .allows_by_rule = allowsByRuleFn,
+        .rule_for = ruleForFn,
+        .permit_site = permitSiteFn,
     };
 
     /// Decide every host of one build.
@@ -11481,9 +11588,9 @@ const NixFetchGate = struct {
     /// reading the host name, which is worse for safety than one question
     /// somebody actually reads.
     ///
-    /// So the table is read for every host first, under that host's own
-    /// `net.connect.<host>.<port>` name. **A host a rule already allows is
-    /// decided there and never appears in the question**, and a host a rule
+    /// So the table is read for every host first, under that host's own two
+    /// `nix.net` names. **A host a rule already allows is decided there and
+    /// never appears in the question**, and a host a rule
     /// denies refuses the build with nobody asked. Only the hosts no rule
     /// covers are left, and those go into one question that names them all.
     /// A project rule therefore still names one host and still does exactly
@@ -11503,8 +11610,9 @@ const NixFetchGate = struct {
         defer asking.deinit(self.gpa);
 
         for (wanted) |one| {
-            var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-            if (chock_broker.network.actionInto(&buffer, one.host, one.port) == null) {
+            var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+            var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+            if (self.namesOf(&scoped, &either, one) == null) {
                 return .{ .refused = try self.unnameable(allocator, one) };
             }
 
@@ -11583,6 +11691,7 @@ const NixFetchGate = struct {
             .reason = "",
             .tool = self.call.tool,
             .tool_call_id = self.call.call_id,
+            .source = self.requestSource(),
         });
         if (answer.permitted) return .permitted;
 
@@ -11591,23 +11700,9 @@ const NixFetchGate = struct {
         return .{ .refused = try allocator.dupe(u8, said) };
     }
 
-    fn allowsByRuleFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) bool {
+    fn ruleForFn(ptr: *anyopaque, one: chock_nix.fetch.Fetch) chock_nix.fetch.RuleAnswer {
         const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
-        const rule = self.rule orelse return false;
-
-        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return false;
-
-        var fault: ?chock_policy.table.ChainFault = null;
-        const decision = rule.policy.evaluateChain(rule.chain, .{
-            .agent_kind = rule.agent_kind,
-            .model = rule.model,
-            .tool = self.call.tool,
-            .action = action,
-        }, &fault);
-        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
-        return decision == .allow;
+        return ruleAnswerOf(self.decisionFor(one) orelse return .unsettled);
     }
 
     /// One sentence for a host no rule could ever name.
@@ -11633,26 +11728,106 @@ const NixFetchGate = struct {
     }
 
     /// What this project's table answers for `one`, or null when this gate
-    /// was wired no table to read.
+    /// was wired no table to read. Two names, most specific first: see
+    /// `NixTableReader`.
     fn decisionFor(
         self: *NixFetchGate,
         one: chock_nix.fetch.Fetch,
     ) ?chock_policy.table.Decision {
         const rule = self.rule orelse return null;
 
-        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return null;
+        var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+        var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+        const names = self.namesOf(&scoped, &either, one) orelse return null;
+        return self.readerFor(rule).decide(names);
+    }
 
-        var fault: ?chock_policy.table.ChainFault = null;
-        const decision = rule.policy.evaluateChain(rule.chain, .{
+    fn readerFor(self: *const NixFetchGate, rule: Rule) NixTableReader {
+        return .{
+            .policy = rule.policy,
+            .chain = rule.chain,
             .agent_kind = rule.agent_kind,
             .model = rule.model,
             .tool = self.call.tool,
+        };
+    }
+
+    /// Whether this build may fetch from a mirror set.
+    ///
+    /// One question for the set and never one per mirror. The key is the
+    /// site and the hash of that site's own list, so a rule somebody wrote
+    /// survives a bump to another site's mirrors and stops covering this one
+    /// the moment its list changes. `chooseMirror` has already taken a mirror
+    /// a rule allows and passed over every mirror a rule denies, so what
+    /// reaches here is the candidate nothing settled.
+    fn permitSiteFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        site: chock_nix.fetch.MirrorSite,
+        chosen: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *NixFetchGate = @ptrCast(@alignCast(ptr));
+
+        var buffer: [chock_broker.network.max_mirror_action_bytes]u8 = undefined;
+        const action = chock_broker.network.mirrorActionInto(
+            &buffer,
+            site.site,
+            &site.hash(),
+        ) orelse return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "{s} fetches {s}, and the site {s} is not a name a rule can be written for, so " ++
+                "nothing was built.",
+            .{ site.subject, site.url, site.site },
+        ) };
+
+        const summary = try std.fmt.allocPrint(
+            self.gpa,
+            "a Nix build fetches from the {s} mirrors, starting at {s}",
+            .{ site.site, chosen.host },
+        );
+        defer self.gpa.free(summary);
+
+        var detail: std.ArrayList(u8) = .empty;
+        defer detail.deinit(self.gpa);
+        try detail.print(
+            self.gpa,
+            "{s} fetches {s}. The mirrors file names {d} mirrors for the site {s}, and {s} is " ++
+                "the one this build would use. Yes covers this list, and a bump to it asks " ++
+                "again. The build is {s}. Every mirror of the site:\n",
+            .{
+                site.subject,
+                site.url,
+                site.mirrors.len,
+                site.site,
+                chosen.url,
+                self.installable,
+            },
+        );
+        for (site.mirrors) |mirror| try detail.print(self.gpa, "  {s}\n", .{mirror.base});
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, self.gpa, self.io, .{
             .action = action,
-        }, &fault);
-        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
-        return decision;
+            .summary = summary,
+            .detail = detail.items,
+            .reason = "",
+            .tool = self.call.tool,
+            .tool_call_id = self.call.call_id,
+            .source = self.requestSource(),
+        });
+        if (answer.permitted) return .permitted;
+
+        const said = try chock_core.arbiter.refusalText(self.gpa, action, answer);
+        defer self.gpa.free(said);
+        return .{ .refused = try allocator.dupe(u8, said) };
+    }
+
+    /// What a person reads about who asked. See
+    /// `chock_proto.event.ApprovalRequest.source`.
+    fn requestSource(self: *const NixFetchGate) []const u8 {
+        return switch (self.kind) {
+            .derivation => "a Nix build",
+            .flake_input => "a Nix flake input",
+        };
     }
 
     /// The most hosts one question names in its own summary line, before it
@@ -11695,13 +11870,13 @@ const NixFetchGate = struct {
             .{ self.installable, wanted.len, wanted.len },
         );
         for (wanted) |one| {
-            var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-            const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-                continue;
+            var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+            var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+            const names = self.namesOf(&scoped, &either, one) orelse continue;
             try detail.print(
                 self.gpa,
                 "  {s}  .{{ .action = \"{s}\", .decision = .allow }},\n",
-                .{ one.host, action },
+                .{ one.host, names.phase },
             );
         }
 
@@ -11712,6 +11887,7 @@ const NixFetchGate = struct {
             .reason = "",
             .tool = self.call.tool,
             .tool_call_id = self.call.call_id,
+            .source = self.requestSource(),
         });
         if (answer.permitted) return .permitted;
 
@@ -11740,9 +11916,12 @@ const NixFetchGate = struct {
         allocator: std.mem.Allocator,
         one: chock_nix.fetch.Fetch,
     ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
-        var buffer: [chock_broker.network.max_action_bytes]u8 = undefined;
-        const action = chock_broker.network.actionInto(&buffer, one.host, one.port) orelse
-            return .{ .refused = try self.unnameable(allocator, one) };
+        var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+        var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+        // The phase scoped name is what the question is put under, because it
+        // is the more specific of the two a rule may cover this host with.
+        const action = (self.namesOf(&scoped, &either, one) orelse
+            return .{ .refused = try self.unnameable(allocator, one) }).phase;
 
         const summary = switch (self.kind) {
             .derivation => try std.fmt.allocPrint(
@@ -11781,6 +11960,7 @@ const NixFetchGate = struct {
             .reason = "",
             .tool = self.call.tool,
             .tool_call_id = self.call.call_id,
+            .source = self.requestSource(),
         });
         if (answer.permitted) return .permitted;
 
@@ -12131,8 +12311,8 @@ const NixBuildToolRunner = struct {
     /// **This is where a startup `ask` stops being a permanent no.**
     /// `fetchFlakeInputs` fetches only on `allow`, because a session that is
     /// starting up has nobody at the prompt. A build is a turn the model took,
-    /// so there is somebody to ask, and the question is the ordinary
-    /// `net.connect` one under the same namespace and the same arbiter as the
+    /// so there is somebody to ask, and the question is the `nix.net.eval`
+    /// one, through the same arbiter as the
     /// build's own fetches. One question per host, a host that cannot be named
     /// is a refusal, and the fetch still happens on the host through `nix
     /// flake archive`: fix never reaches the network itself.
@@ -16784,6 +16964,7 @@ const CountingArbiter = struct {
     action: Kept(64) = .{},
     tool: Kept(64) = .{},
     detail: Kept(512) = .{},
+    source: Kept(64) = .{},
 
     fn Kept(comptime size: usize) type {
         return struct {
@@ -16822,6 +17003,7 @@ const CountingArbiter = struct {
         self.action.set(ask.action);
         self.tool.set(ask.tool);
         self.detail.set(ask.detail);
+        self.source.set(ask.source);
         return .{
             .permitted = self.permitted,
             .outcome = if (self.permitted) "allowed_by_policy" else "refused_by_user",
@@ -16924,6 +17106,7 @@ test "the question a git subcommand asks names the act, the tool that ran it, an
     try testing.expectEqual(@as(usize, 1), arbitrator.asks);
     try testing.expectEqualStrings("git.push", arbitrator.action.read());
     try testing.expectEqualStrings("run_command", arbitrator.tool.read());
+    try testing.expectEqualStrings("git", arbitrator.source.read());
     // The effect first, out of the shim's own text and not a second wording
     // written here: see `chock_broker.git_shim.detailOf`.
     try testing.expect(std.mem.indexOf(
@@ -18367,10 +18550,10 @@ test "what a build produced is mounted by the next tool call, and not by the one
     try std.testing.expectEqual(@as(usize, 2), recorder.calls);
 }
 
-test "a host a Nix build would fetch from is named in the one egress namespace, labels reversed" {
-    // **A fetch is a connection, and there is no second namespace for one.**
-    // `chock_broker.network.actionInto` writes the name, reversal and all, so
-    // one rule an author wrote covers a host however it is reached.
+test "a host a Nix build would fetch from is named under nix.net.build, labels reversed" {
+    // A build's egress is its own namespace, so a rule that lets a build
+    // reach a host does not also let the sandbox open a socket to it. The
+    // reversal is the one `net.connect` uses.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -18392,7 +18575,10 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
         .host = "files.example.com",
         .port = 443,
     }})).refused;
-    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.example.files.443") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, said, "nix.net.build.com.example.files.443") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect") == null);
     // The derivation and the host are both in the words, so the model can ask
     // for that host rather than send the same attribute again.
     try std.testing.expect(std.mem.indexOf(u8, said, "b-src.drv") != null);
@@ -18400,7 +18586,7 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
 
     // **Reversal is what makes a class rule safe.** A name a derivation chose
     // falls under the class an author wrote and never over it, so a rule for
-    // `net.connect.com.example.*` does not cover this one.
+    // `nix.net.build.com.example.*` does not cover this one.
     const hostile = (try gate.gate().permitAll(arena, &.{.{
         .subject = "c-src.drv",
         .url = "https://evil.com.example.files/x",
@@ -18408,9 +18594,9 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
         .port = 443,
     }})).refused;
     try std.testing.expect(
-        std.mem.indexOf(u8, hostile, "net.connect.files.example.com.evil.443") != null,
+        std.mem.indexOf(u8, hostile, "nix.net.build.files.example.com.evil.443") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, hostile, "net.connect.com.example.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hostile, "nix.net.build.com.example.") == null);
 
     // A host no rule could ever have named is refused, and never reached.
     const unnameable = (try gate.gate().permitAll(arena, &.{.{
@@ -18419,11 +18605,40 @@ test "a host a Nix build would fetch from is named in the one egress namespace, 
         .host = "a_b",
         .port = 443,
     }})).refused;
-    try std.testing.expect(std.mem.indexOf(u8, unnameable, "net.connect") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unnameable, "nix.net") == null);
     try std.testing.expect(std.mem.indexOf(u8, unnameable, "d-src.drv") != null);
 }
 
-test "a build that fetches with no url is asked under two fixed segments, and the words name it" {
+test "an input fetch is named under nix.net.eval, and the same host reads differently in each phase" {
+    // The startup fetch and the retry a build makes exist so an expression can
+    // evaluate, which is the whole of what `eval` means here.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var input_gate = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .kind = .flake_input,
+    };
+
+    const said = (try input_gate.gate().permitAll(arena, &.{.{
+        .subject = "nixpkgs",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    }})).refused;
+    try std.testing.expect(
+        std.mem.indexOf(u8, said, "nix.net.eval.com.github.api.443") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.build.") == null);
+}
+
+test "a build that fetches with no url is asked under fixed segments, and the words name it" {
     // **Nothing a model chose is in the key.** An action built out of a
     // derivation name could collide with an attribute path, and it would put
     // one question per package where one covers the build.
@@ -18444,11 +18659,11 @@ test "a build that fetches with no url is asked under two fixed segments, and th
         "chock-0.1.0-zig-deps.drv",
         "furo-web-2025.12.19-npm-deps.drv",
     })).refused;
-    try std.testing.expect(std.mem.indexOf(u8, said, "nix.fetch.opaque") != null);
-    // Two segments and nothing else: no derivation name ever reaches the key.
+    try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.build.opaque") != null);
+    // Fixed segments and nothing else: no derivation name reaches the key.
     try std.testing.expect(std.mem.indexOf(u8, said, "zig-deps") == null);
     try std.testing.expect(std.mem.indexOf(u8, said, "net.connect") == null);
-    try std.testing.expectEqualStrings("nix.fetch.opaque", NixFetchGate.opaque_action);
+    try std.testing.expectEqualStrings("nix.net.build.opaque", NixFetchGate.opaque_action);
 }
 
 test "a flake input host is asked of the policy table at startup, and ask is off there" {
@@ -18465,7 +18680,7 @@ test "a flake input host is asked of the policy table at startup, and ask is off
         \\.{
         \\    .policy = .{
         \\        .rules = .{
-        \\            .{ .action = "net.connect.com.github.api.443", .decision = .allow },
+        \\            .{ .action = "nix.net.eval.com.github.api.443", .decision = .allow },
         \\        },
         \\    },
         \\}
@@ -18499,13 +18714,13 @@ test "a flake input host is asked of the policy table at startup, and ask is off
     const said = (try silent.gate().permitAll(arena, &.{wanted})).refused;
     try std.testing.expect(std.mem.indexOf(u8, said, "nixpkgs") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.eval.com.github.api.443") != null);
 }
 
 test "a startup refusal is not a permanent no, and a build asks about the input it wanted" {
     // **The fault this replaced.** `fetchFlakeInputs` fetches only on `allow`,
     // because a session start has nobody at the prompt, so a project that
-    // wrote no `net.connect` rule reached every build with its inputs
+    // wrote no `nix.net` rule reached every build with its inputs
     // missing and could never build anything. A build is a turn the model
     // took, so there is somebody to ask.
     const gpa = std.testing.allocator;
@@ -18533,7 +18748,7 @@ test "a startup refusal is not a permanent no, and a build asks about the input 
     const said = (try input_gate.gate().permitAll(arena, &.{wanted})).refused;
     try std.testing.expect(std.mem.indexOf(u8, said, "flake input flakever") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "api.github.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.com.github.api.443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, said, "nix.net.eval.com.github.api.443") != null);
     try std.testing.expect(std.mem.indexOf(u8, said, "while it builds") == null);
 
     // The sentence the model finally reads, joined to that refusal. **The
@@ -23789,7 +24004,7 @@ test "a build that reaches many hosts puts one question, and one host reads as i
 
     const many = (try gate.gate().permitAll(arena, try manyHosts(arena, 12))).refused;
     // One question, under two fixed segments, and it says how many.
-    try std.testing.expect(std.mem.indexOf(u8, many, "nix.fetch.hosts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, many, "nix.net.hosts") != null);
     try std.testing.expect(std.mem.indexOf(u8, many, "12 hosts") != null);
     // And it names what was refused, so the model can ask for those hosts.
     try std.testing.expect(std.mem.indexOf(u8, many, "mirror0.example.com") != null);
@@ -23797,8 +24012,10 @@ test "a build that reaches many hosts puts one question, and one host reads as i
     // One host reads the way it always did: a list of one is a worse question
     // than the sentence it replaces.
     const alone = (try gate.gate().permitAll(arena, try manyHosts(arena, 1))).refused;
-    try std.testing.expect(std.mem.indexOf(u8, alone, "net.connect.com.example.mirror0.443") != null);
-    try std.testing.expect(std.mem.indexOf(u8, alone, "nix.fetch.hosts") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, alone, "nix.net.build.com.example.mirror0.443") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, alone, "nix.net.hosts") == null);
     try std.testing.expect(std.mem.indexOf(u8, alone, "hosts") == null);
 }
 
@@ -23814,9 +24031,9 @@ test "a host a rule allows is not in the question, and a host a rule denies need
         \\.{
         \\    .policy = .{
         \\        .rules = .{
-        \\            .{ .action = "net.connect.com.example.mirror0.443", .decision = .allow },
-        \\            .{ .action = "net.connect.com.example.mirror1.443", .decision = .allow },
-        \\            .{ .action = "net.connect.com.example.mirror2.443", .decision = .deny },
+        \\            .{ .action = "nix.net.build.com.example.mirror0.443", .decision = .allow },
+        \\            .{ .action = "nix.net.com.example.mirror1.443", .decision = .allow },
+        \\            .{ .action = "nix.net.build.com.example.mirror2.443", .decision = .deny },
         \\        },
         \\    },
         \\}
@@ -23855,13 +24072,13 @@ test "a host a rule allows is not in the question, and a host a rule denies need
     // One decision per host: two the table settled, and one question for the
     // nine no rule covered.
     try std.testing.expectEqual(@as(usize, 3), arbitrator.asks);
-    try std.testing.expectEqualStrings("nix.fetch.hosts", arbitrator.action.read());
+    try std.testing.expectEqualStrings("nix.net.hosts", arbitrator.action.read());
     // The detail carries the rule a project would write for each of them, so
     // a person can stop being asked. Never in the prompt itself.
     try std.testing.expect(std.mem.indexOf(
         u8,
         arbitrator.detail.read(),
-        ".{ .action = \"net.connect.com.example.mirror3.443\", .decision = .allow },",
+        ".{ .action = \"nix.net.build.com.example.mirror3.443\", .decision = .allow },",
     ) != null);
     // And a host the table already allowed is not among them.
     try std.testing.expect(std.mem.indexOf(u8, arbitrator.detail.read(), "mirror0") == null);
@@ -23873,15 +24090,350 @@ test "a host a rule allows is not in the question, and a host a rule denies need
     gate.asker = refusing.asker(&log.locked);
     const denied = (try gate.gate().permitAll(arena, all[2..4])).refused;
     try std.testing.expect(std.mem.indexOf(u8, denied, "mirror2.example.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, denied, "nix.fetch.hosts") == null);
-    try std.testing.expectEqualStrings("net.connect.com.example.mirror2.443", refusing.action.read());
+    try std.testing.expect(std.mem.indexOf(u8, denied, "nix.net.hosts") == null);
+    try std.testing.expectEqualStrings(
+        "nix.net.build.com.example.mirror2.443",
+        refusing.action.read(),
+    );
     try std.testing.expectEqual(@as(usize, 1), refusing.asks);
 }
 
-test "a git daemon host is named in the one egress namespace, with its own port" {
-    // `net.connect.org.sourceware.9418`, built by the same namer every other
-    // host goes through, so one rule an author wrote covers a host however it
-    // is reached.
+test "a nix host is read under two names, most specific first" {
+    // One rule can cover both phases and a phase rule can still narrow it.
+    // The table matches a name against itself or a trailing `.*`, so
+    // `nix.net.*.com.example.both.443` is a parse error and two lookups are
+    // what make a phase free rule possible at all.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const table = try chock_policy.table.Table.parse(
+        arena,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "nix.net.com.example.wide.443", .decision = .allow },
+        \\            .{ .action = "nix.net.com.example.both.443", .decision = .allow },
+        \\            .{ .action = "nix.net.build.com.example.both.443", .decision = .deny },
+        \\            .{ .action = "nix.net.com.example.asked.443", .decision = .allow },
+        \\            .{ .action = "nix.net.build.com.example.asked.443", .decision = .ask },
+        \\            .{ .action = "nix.net.com.example.narrow.443", .decision = .deny },
+        \\            .{ .action = "nix.net.build.com.example.narrow.443", .decision = .allow },
+        \\            .{ .action = "nix.net.eval.*", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+
+    const rule = NixFetchGate.Rule{
+        .policy = table,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "test-model",
+    };
+    var building = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .rule = rule,
+    };
+    var evaluating = building;
+    evaluating.kind = .flake_input;
+
+    const wide = chock_nix.fetch.Fetch{
+        .subject = "a.drv",
+        .url = "https://wide.example.com/a",
+        .host = "wide.example.com",
+        .port = 443,
+    };
+    const both = chock_nix.fetch.Fetch{
+        .subject = "b.drv",
+        .url = "https://both.example.com/a",
+        .host = "both.example.com",
+        .port = 443,
+    };
+    const unnamed = chock_nix.fetch.Fetch{
+        .subject = "c.drv",
+        .url = "https://other.example.com/a",
+        .host = "other.example.com",
+        .port = 443,
+    };
+
+    // The phase free name answers when no phase rule settles the host.
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.allow,
+        building.gate().ruleFor(wide),
+    );
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.allow,
+        evaluating.gate().ruleFor(wide),
+    );
+
+    // The more specific wins when both match, in the narrowing direction.
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.deny,
+        building.gate().ruleFor(both),
+    );
+    // And the build rule covers no eval fetch of the same host.
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.allow,
+        evaluating.gate().ruleFor(both),
+    );
+
+    // A host neither name reaches is still a question.
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.unsettled,
+        building.gate().ruleFor(unnamed),
+    );
+
+    // **An explicit `ask` is a decision and never a fall through.** The table
+    // answers `ask` both for a rule that says so and for a key nobody wrote
+    // about, and reading the wider name past the first would hand a silent
+    // yes to an author who asked to be prompted. `decideChain` is what tells
+    // the two apart.
+    const reader = NixTableReader{
+        .policy = table,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "test-model",
+        .tool = "nix_build",
+    };
+    var scoped: [chock_broker.network.max_action_bytes]u8 = undefined;
+    var either: [chock_broker.network.max_action_bytes]u8 = undefined;
+
+    const asked = chock_broker.network.nixActionsInto(
+        &scoped,
+        &either,
+        .build,
+        "asked.example.com",
+        443,
+    ).?;
+    try std.testing.expectEqual(chock_policy.table.Decision.ask, reader.decide(asked));
+
+    // The same order the other way: a narrow `allow` beats a wide `deny`,
+    // because the more specific name is the one the author meant.
+    const narrow = chock_broker.network.nixActionsInto(
+        &scoped,
+        &either,
+        .build,
+        "narrow.example.com",
+        443,
+    ).?;
+    try std.testing.expectEqual(chock_policy.table.Decision.allow, reader.decide(narrow));
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.allow,
+        building.gate().ruleFor(.{
+            .subject = "d.drv",
+            .url = "https://narrow.example.com/a",
+            .host = "narrow.example.com",
+            .port = 443,
+        }),
+    );
+
+    // Neither name is written, so the answer is the `ask` every uncovered key
+    // gets.
+    const nobody = chock_broker.network.nixActionsInto(
+        &scoped,
+        &either,
+        .build,
+        "other.example.com",
+        443,
+    ).?;
+    try std.testing.expectEqual(chock_policy.table.Decision.ask, reader.decide(nobody));
+
+    // And the shipped defaults count as rules that name a key, so a project
+    // with no `chock.zon` is still decided rather than asked.
+    const empty = try chock_policy.table.Table.parse(arena, ".{}", null);
+    const shipped = empty.decideChain(&.{"main"}, .{
+        .agent_kind = "main",
+        .model = "test-model",
+        .tool = "nix_build",
+        .action = NixFetchGate.opaque_action,
+    }, null);
+    try std.testing.expect(shipped.named);
+    try std.testing.expectEqual(chock_policy.table.Decision.allow, shipped.decision);
+}
+
+test "a phase free rule settles a host before the batch question, and never after it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const table = try chock_policy.table.Table.parse(
+        arena,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{
+        \\            .{ .action = "nix.net.com.example.mirror0.443", .decision = .allow },
+        \\        },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var arbitrator = CountingArbiter{ .permitted = true };
+    var gate = NixFetchGate{
+        .gpa = gpa,
+        .io = io,
+        .asker = arbitrator.asker(&log.locked),
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .rule = .{
+            .policy = table,
+            .chain = &.{"main"},
+            .agent_kind = "main",
+            .model = "test-model",
+        },
+    };
+
+    try std.testing.expect(
+        try gate.gate().permitAll(arena, try manyHosts(arena, 4)) == .permitted,
+    );
+    // One decision for the host the phase free rule settled, and one question
+    // for the three no rule covered.
+    try std.testing.expectEqual(@as(usize, 2), arbitrator.asks);
+    try std.testing.expect(std.mem.indexOf(u8, arbitrator.detail.read(), "mirror0") == null);
+}
+
+test "nix.net at deny stops an eval fetch, a build fetch, a mirror set and an opaque fetch" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const table = try chock_policy.table.Table.parse(
+        arena,
+        \\.{
+        \\    .policy = .{
+        \\        .rules = .{ .{ .action = "nix.net.*", .decision = .deny } },
+        \\    },
+        \\}
+    ,
+        null,
+    );
+
+    const rule = NixFetchGate.Rule{
+        .policy = table,
+        .chain = &.{"main"},
+        .agent_kind = "main",
+        .model = "test-model",
+    };
+    var building = NixFetchGate{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .asker = null,
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+        .rule = rule,
+    };
+    var evaluating = building;
+    evaluating.kind = .flake_input;
+
+    const one = chock_nix.fetch.Fetch{
+        .subject = "a.drv",
+        .url = "https://files.example.com/a",
+        .host = "files.example.com",
+        .port = 443,
+    };
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.deny,
+        building.gate().ruleFor(one),
+    );
+    try std.testing.expectEqual(
+        chock_nix.fetch.RuleAnswer.deny,
+        evaluating.gate().ruleFor(one),
+    );
+
+    // The mirror set, the batch question and the fetch with no url are names
+    // under the same class, so one rule covers every request a build can make.
+    const mirrors = [_]chock_nix.fetch.Mirror{
+        .{ .base = "https://ftpmirror.gnu.org/", .url = "https://ftpmirror.gnu.org/a", .target = null },
+    };
+    var buffer: [chock_broker.network.max_mirror_action_bytes]u8 = undefined;
+    const site_action = chock_broker.network.mirrorActionInto(
+        &buffer,
+        "gnu",
+        &chock_nix.fetch.mirrorSetHash(&mirrors),
+    ).?;
+
+    const covered = [_][]const u8{
+        site_action,
+        NixFetchGate.opaque_action,
+        NixFetchGate.many_action,
+    };
+    for (covered) |action| {
+        try std.testing.expectEqual(chock_policy.table.Decision.deny, table.evaluateKindAlone(.{
+            .agent_kind = "main",
+            .model = "test-model",
+            .tool = "nix_build",
+            .action = action,
+        }));
+    }
+}
+
+test "a question carries the part of Chock that asked it" {
+    // An action name says what is wanted and never who wanted it, and a person
+    // answering `net.cyberelk` wants to know which it was.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var arbitrator = CountingArbiter{ .permitted = true };
+    var gate = NixFetchGate{
+        .gpa = gpa,
+        .io = io,
+        .asker = arbitrator.asker(&log.locked),
+        .installable = "/work#packages.x86_64-linux.default",
+        .call = .{ .call_id = "call1", .tool = "nix_build", .arguments = "{}" },
+    };
+
+    _ = try gate.gate().permitAll(arena, &.{.{
+        .subject = "a.drv",
+        .url = "https://files.example.com/a",
+        .host = "files.example.com",
+        .port = 443,
+    }});
+    try std.testing.expectEqualStrings("a Nix build", arbitrator.source.read());
+
+    _ = try gate.gate().permitOpaque(arena, &.{"a-zig-deps.drv"});
+    try std.testing.expectEqualStrings("a Nix build", arbitrator.source.read());
+
+    gate.kind = .flake_input;
+    _ = try gate.gate().permitAll(arena, &.{.{
+        .subject = "nixpkgs",
+        .url = "https://api.github.com",
+        .host = "api.github.com",
+        .port = 443,
+    }});
+    try std.testing.expectEqualStrings("a Nix flake input", arbitrator.source.read());
+
+    // The sandbox's own connections and the git shim each name themselves, and
+    // the three words are written in one place each.
+    try std.testing.expectEqualStrings("the sandbox", chock_broker.network.request_source);
+    try std.testing.expectEqualStrings("git", chock_broker.git_shim.request_source);
+}
+
+test "a git daemon host is named in the build namespace, with its own port" {
+    // `nix.net.build.org.sourceware.9418`, built by the same namer every other
+    // host goes through.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -23901,5 +24453,7 @@ test "a git daemon host is named in the one egress namespace, with its own port"
         .host = "sourceware.org",
         .port = 9418,
     }})).refused;
-    try std.testing.expect(std.mem.indexOf(u8, said, "net.connect.org.sourceware.9418") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, said, "nix.net.build.org.sourceware.9418") != null,
+    );
 }

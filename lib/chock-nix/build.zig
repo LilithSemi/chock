@@ -345,36 +345,33 @@ pub const Host = struct {
             },
         };
 
-        var wanted: std.ArrayList(fetch.Fetch) = .empty;
-        try wanted.appendSlice(self.allocator, reached.hosts);
+        // One yes under `nix.net.hosts` covers every host no rule named. A
+        // project narrows it with a `nix.net` rule per host, which is read
+        // first and takes that host out of the question.
+        switch (try self.gate.permitAll(self.allocator, reached.hosts)) {
+            .permitted => {},
+            .refused => |why| {
+                self.refusal = why;
+                return FetchRefused.FetchNotPermitted;
+            },
+        }
 
+        // A mirror set is one question of its own, keyed on the site and the
+        // hash of that site's list, because no per host rule covers the ten
+        // hosts one site names.
         var pins: std.ArrayList(provision.Variable) = .empty;
-        var chosen: std.ArrayList(Chosen) = .empty;
         for (reached.sites) |one| {
             const mirror = try self.chooseMirror(one);
-            try wanted.append(self.allocator, mirror.asking);
-            try chosen.append(self.allocator, .{ .site = one.site, .host = mirror.asking.host });
             try pins.append(self.allocator, .{
                 .name = try std.fmt.allocPrint(self.allocator, "NIX_MIRRORS_{s}", .{one.site}),
                 .value = mirror.base,
             });
         }
 
-        // One yes under `nix.fetch.hosts` covers every host no rule named. A
-        // project narrows it with a `net.connect` rule per host, which is read
-        // first and takes that host out of the question.
-        switch (try self.gate.permitAll(self.allocator, wanted.items)) {
-            .permitted => {},
-            .refused => |why| {
-                self.refusal = try withSites(self.allocator, why, chosen.items);
-                return FetchRefused.FetchNotPermitted;
-            },
-        }
-
         // A fixed output derivation that says nowhere it fetches from has no
         // host a rule could cover, and `zig.fetchDeps`, npm deps and
         // `fetchCargoVendor` all take that shape. `chock-policy/defaults.zig`
-        // ships `nix.fetch.opaque` as allow, because refusing them refuses
+        // ships `nix.net.build.opaque` as allow, because refusing them refuses
         // nearly every Rust, Node and Zig package.
         if (reached.opaque_subjects.len != 0) {
             switch (try self.gate.permitOpaque(self.allocator, reached.opaque_subjects)) {
@@ -400,38 +397,57 @@ pub const Host = struct {
         self.pins = try pins.toOwnedSlice(self.allocator);
     }
 
-    const Chosen = struct {
-        site: []const u8,
-        host: []const u8,
-    };
-
-    /// The mirror of `one` this build would use, and the question it puts.
-    ///
-    /// A mirror a rule already permits is taken outright, and otherwise the
-    /// first mirror of the file's own order that has a host at all is asked
-    /// about. Two derivations of one closure can name the same site and two
-    /// mirrors files, and the first file read answers for both, which can stop
-    /// the second fetch. It cannot widen one: every pinned mirror was allowed.
-    fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror!struct {
+    /// One mirror of a site, and the question that would be put about it.
+    const Picked = struct {
         base: []const u8,
         asking: fetch.Fetch,
-    } {
-        for (one.mirrors) |mirror| {
-            const target = mirror.target orelse continue;
-            const asking = fetchOfMirror(one, mirror, target);
-            if (self.gate.allowsByRule(asking)) return .{ .base = mirror.base, .asking = asking };
-        }
+    };
+
+    /// The mirror of `one` this build will use.
+    ///
+    /// A mirror a rule already permits is taken with nobody asked. A mirror a
+    /// rule denies is passed over and the next candidate tried. What is left
+    /// goes to one question about the set itself. Two derivations of one
+    /// closure can name the same site and two mirrors files, and the first
+    /// file read answers for both, which can stop the second fetch. It cannot
+    /// widen one: every pinned mirror was allowed.
+    fn chooseMirror(self: *Host, one: fetch.MirrorSite) anyerror!Picked {
+        var nameable = false;
+        var candidate: ?Picked = null;
 
         for (one.mirrors) |mirror| {
             const target = mirror.target orelse continue;
-            return .{ .base = mirror.base, .asking = fetchOfMirror(one, mirror, target) };
+            nameable = true;
+            const asking = fetchOfMirror(one, mirror, target);
+            switch (self.gate.ruleFor(asking)) {
+                .allow => return .{ .base = mirror.base, .asking = asking },
+                .deny => continue,
+                .unsettled => if (candidate == null) {
+                    candidate = .{ .base = mirror.base, .asking = asking };
+                },
+            }
+        }
+
+        if (candidate) |picked| {
+            switch (try self.gate.permitSite(self.allocator, one, picked.asking)) {
+                .permitted => return picked,
+                .refused => |why| {
+                    self.refusal = try fetch.mirrorRefusal(
+                        self.allocator,
+                        one,
+                        picked.asking.host,
+                        why,
+                    );
+                    return FetchRefused.FetchNotPermitted;
+                },
+            }
         }
 
         self.refusal = try fetch.unreadableRefusal(self.allocator, .{
             .subject = one.subject,
             .url = one.url,
             .site = one.site,
-            .why = .mirror_not_nameable,
+            .why = if (nameable) .mirror_every_host_denied else .mirror_not_nameable,
         });
         return FetchRefused.FetchNotPermitted;
     }
@@ -484,27 +500,6 @@ pub const Host = struct {
         self.out_paths = try store.parsePathList(self.allocator, built.stdout);
     }
 };
-
-/// `why`, with the mirror sites of the build named after it. A refusal has to
-/// name the site as well as the host: the site is what the derivation wrote,
-/// and the host is what a rule would have to cover.
-fn withSites(
-    allocator: std.mem.Allocator,
-    why: []const u8,
-    chosen: []const Host.Chosen,
-) std.mem.Allocator.Error![]const u8 {
-    if (chosen.len == 0) return why;
-
-    var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(allocator, why);
-    try text.appendSlice(allocator, " The mirror sites of this build were put to the policy as");
-    for (chosen, 0..) |one, index| {
-        try text.appendSlice(allocator, if (index == 0) " " else ", ");
-        try text.print(allocator, "{s} at {s}", .{ one.site, one.host });
-    }
-    try text.append(allocator, '.');
-    return text.toOwnedSlice(allocator);
-}
 
 fn fetchOfMirror(
     site: fetch.MirrorSite,
@@ -724,8 +719,14 @@ const AnsweringGate = struct {
     /// The hosts a rule permits with nobody asked, which is what picks one
     /// mirror of a site out of ten.
     by_rule: []const []const u8 = &.{},
+    /// The hosts a rule denies, which are passed over.
+    denied: []const []const u8 = &.{},
     /// How many questions reached somebody.
     prompted: usize = 0,
+    /// The mirror set names this was asked about, and how many times.
+    site_asks: usize = 0,
+    site_action: [128]u8 = undefined,
+    site_action_len: usize = 0,
     /// Whether a build may fetch with no URL, and how often that was asked.
     opaque_permitted: bool = true,
     opaque_asks: usize = 0,
@@ -743,8 +744,41 @@ const AnsweringGate = struct {
     const vtable: fetch.Gate.VTable = .{
         .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
-        .allows_by_rule = allowsByRuleFn,
+        .rule_for = ruleForFn,
+        .permit_site = permitSiteFn,
     };
+
+    /// The name a real gate would build, written the same way
+    /// `chock_broker.network.mirrorActionInto` writes it. This library imports
+    /// no broker, so the shape is spelled out here.
+    fn permitSiteFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        site: fetch.MirrorSite,
+        chosen: fetch.Fetch,
+    ) std.mem.Allocator.Error!fetch.Verdict {
+        const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
+        self.site_asks += 1;
+        self.prompted += 1;
+        try self.asked.append(self.gpa, try self.gpa.dupe(u8, chosen.host));
+
+        const name = std.fmt.bufPrint(&self.site_action, "nix.net.build.mirrors.{s}.{s}", .{
+            site.site,
+            &site.hash(),
+        }) catch return .{ .refused = "the mirror set could not be named" };
+        self.site_action_len = name.len;
+
+        if (self.permitted) return .permitted;
+        return .{ .refused = try std.fmt.allocPrint(
+            allocator,
+            "this project answers no for {s}",
+            .{name},
+        ) };
+    }
+
+    fn siteAction(self: *const AnsweringGate) []const u8 {
+        return self.site_action[0..self.site_action_len];
+    }
 
     fn permitOpaqueFn(
         ptr: *anyopaque,
@@ -768,7 +802,7 @@ const AnsweringGate = struct {
         var refusing: ?fetch.Fetch = null;
         for (wanted) |one| {
             try self.asked.append(self.gpa, try self.gpa.dupe(u8, one.host));
-            if (allowsByRuleFn(ptr, one)) continue;
+            if (ruleForFn(ptr, one) == .allow) continue;
             if (refusing == null) refusing = one;
         }
         if (refusing == null) return .permitted;
@@ -783,12 +817,15 @@ const AnsweringGate = struct {
         ) };
     }
 
-    fn allowsByRuleFn(ptr: *anyopaque, one: fetch.Fetch) bool {
+    fn ruleForFn(ptr: *anyopaque, one: fetch.Fetch) fetch.RuleAnswer {
         const self: *AnsweringGate = @ptrCast(@alignCast(ptr));
         for (self.by_rule) |host| {
-            if (std.mem.eql(u8, host, one.host)) return true;
+            if (std.mem.eql(u8, host, one.host)) return .allow;
         }
-        return false;
+        for (self.denied) |host| {
+            if (std.mem.eql(u8, host, one.host)) return .deny;
+        }
+        return .unsettled;
     }
 };
 

@@ -116,7 +116,8 @@ const RecordingGate = struct {
     const vtable = chock_nix.fetch.Gate.VTable{
         .permit_all = permitAllFn,
         .permit_opaque = permitOpaqueFn,
-        .allows_by_rule = allowsNothing,
+        .rule_for = settlesNothing,
+        .permit_site = permitSiteFn,
     };
 
     fn permitOpaqueFn(
@@ -131,8 +132,20 @@ const RecordingGate = struct {
     }
 
     /// This gate reads no rule, so every host it is given is asked about.
-    fn allowsNothing(_: *anyopaque, _: chock_nix.fetch.Fetch) bool {
-        return false;
+    fn settlesNothing(_: *anyopaque, _: chock_nix.fetch.Fetch) chock_nix.fetch.RuleAnswer {
+        return .unsettled;
+    }
+
+    fn permitSiteFn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: chock_nix.fetch.MirrorSite,
+        chosen: chock_nix.fetch.Fetch,
+    ) std.mem.Allocator.Error!chock_nix.fetch.Verdict {
+        const self: *RecordingGate = @ptrCast(@alignCast(ptr));
+        try self.asked.append(self.gpa, try self.gpa.dupe(u8, chosen.host));
+        if (self.permitted) return .permitted;
+        return .{ .refused = try allocator.dupe(u8, "no rule allows this mirror set") };
     }
 
     fn permitAllFn(

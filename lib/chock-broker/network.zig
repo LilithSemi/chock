@@ -50,6 +50,14 @@
 //! `evil.com.anthropic.api` becomes `net.connect.api.anthropic.com.evil.443`,
 //! which `net.connect.com.anthropic.*` does not match.
 //!
+//! ## A Nix build reaches a host under `nix.net` and never under this one
+//!
+//! `net.connect` names what the sandbox itself opens. What a Nix build fetches
+//! is named `nix.net.eval.<host>.<port>` or `nix.net.build.<host>.<port>`, and
+//! `nixActionsInto` writes both those and the phase free `nix.net.<host>.<port>`
+//! through the same reversal. So a rule that lets a build fetch from a host
+//! does not also let the agent open a socket to it.
+//!
 //! ## Only `allow` grants outright, and `ask` may now ask
 //!
 //! `evaluateChain` gives one of five decisions. `allow` grants at once,
@@ -221,9 +229,22 @@ pub const action_prefix = "net.connect";
 /// uses, and the same one DNS itself has.
 pub const max_host_bytes = chock_sandbox.net_broker.max_host_bytes;
 
-/// The longest action name `actionInto` can build: the prefix, a separator,
-/// the reversed name, a separator, and a port of at most five digits.
-pub const max_action_bytes = action_prefix.len + 1 + max_host_bytes + 1 + 5;
+/// What a person reads on a question this file put. See
+/// `event.ApprovalRequest.source`.
+pub const request_source = "the sandbox";
+
+/// What a request a Nix build makes is named under. A separate class from
+/// `action_prefix`, so a rule that lets a build fetch from a host does not
+/// also let the agent's own sandbox open a socket to it.
+pub const nix_action_prefix = "nix.net";
+
+/// The longest prefix any name here starts with, which is what the one buffer
+/// size has to cover.
+const longest_prefix = @max(action_prefix.len, NixPhase.build.prefix().len);
+
+/// The longest action name this file can build: the prefix, a separator, the
+/// reversed name, a separator, and a port of at most five digits.
+pub const max_action_bytes = longest_prefix + 1 + max_host_bytes + 1 + 5;
 
 /// The action name for reaching `host` on `port`, written into `buffer`.
 /// Null when the name is not a name this file will build a key out of, or
@@ -235,7 +256,109 @@ pub const max_action_bytes = action_prefix.len + 1 + max_host_bytes + 1 + 5;
 /// Allocates nothing: `NetBroker.connect` has no allocator and no error to
 /// give back, so every step of answering one request runs in a fixed buffer.
 pub fn actionInto(buffer: []u8, host: []const u8, port: u16) ?[]const u8 {
-    const written = hostActionInto(buffer, host) orelse return null;
+    return portedActionInto(buffer, action_prefix, host, port);
+}
+
+/// Which half of a Nix build a request belongs to.
+///
+/// The phase word sits where a reversed host's last label sits, so a host
+/// under a top level domain named `build` or `eval` shares a name with an
+/// ordinary host in that phase. `build` is delegated today. Accepted rather
+/// than prevented: see the test that records it.
+pub const NixPhase = enum {
+    /// Fetching an input so an expression can evaluate. Both the startup
+    /// flake input fetch and the retry a build makes are this.
+    eval,
+    /// A fixed output derivation fetching while it builds.
+    build,
+
+    pub fn prefix(self: NixPhase) []const u8 {
+        return switch (self) {
+            .eval => nix_action_prefix ++ ".eval",
+            .build => nix_action_prefix ++ ".build",
+        };
+    }
+};
+
+/// The two names one Nix request is put to the table under, most specific
+/// first. Each is borrowed from the buffer it was written into.
+pub const NixActions = struct {
+    /// `nix.net.eval.com.github.443`, the phase and the host.
+    phase: []const u8,
+    /// `nix.net.com.github.443`, the same host in either phase.
+    either_phase: []const u8,
+};
+
+/// Both names for reaching `host` on `port` during `phase`. Each buffer must
+/// hold `max_action_bytes`.
+///
+/// Two names because the table matches a name against itself or a trailing
+/// `.*` and nothing else, so `nix.net.*.com.github.443` is a parse error and
+/// one rule cannot cover both phases on its own.
+pub fn nixActionsInto(
+    phase_buffer: []u8,
+    either_buffer: []u8,
+    phase: NixPhase,
+    host: []const u8,
+    port: u16,
+) ?NixActions {
+    return .{
+        .phase = portedActionInto(phase_buffer, phase.prefix(), host, port) orelse return null,
+        .either_phase = portedActionInto(
+            either_buffer,
+            nix_action_prefix,
+            host,
+            port,
+        ) orelse return null,
+    };
+}
+
+/// What a build that fetches and names no URL anywhere is asked under. No
+/// host and no port, because there is nothing to tell one such derivation
+/// from another.
+pub const nix_opaque_action = nix_action_prefix ++ ".build.opaque";
+
+/// What a mirror set is named under, before the site and the hash of that
+/// site's own list.
+pub const nix_mirrors_prefix = nix_action_prefix ++ ".build.mirrors";
+
+/// The longest site name a mirror set action carries. A real one is a word.
+pub const max_site_bytes = 64;
+
+/// Lower case hex of SHA-256.
+const digest_bytes = 64;
+
+pub const max_mirror_action_bytes =
+    nix_mirrors_prefix.len + 1 + max_site_bytes + 1 + digest_bytes;
+
+/// The action name for the mirror set `site` names, keyed on `digest`, the
+/// lower case hex hash of that site's own list. Null when the site is not a
+/// name a key can hold, when the digest is not that hash, or when `buffer` is
+/// too small.
+pub fn mirrorActionInto(buffer: []u8, site: []const u8, digest: []const u8) ?[]const u8 {
+    if (buffer.len < max_mirror_action_bytes) return null;
+    if (site.len == 0 or site.len > max_site_bytes) return null;
+    for (site) |character| {
+        if (!std.ascii.isAlphanumeric(character)) return null;
+    }
+    if (digest.len != digest_bytes) return null;
+    for (digest) |character| {
+        if (!std.ascii.isHex(character) or std.ascii.isUpper(character)) return null;
+    }
+    return std.fmt.bufPrint(
+        buffer,
+        nix_mirrors_prefix ++ ".{s}.{s}",
+        .{ site, digest },
+    ) catch null;
+}
+
+fn portedActionInto(
+    buffer: []u8,
+    prefix: []const u8,
+    host: []const u8,
+    port: u16,
+) ?[]const u8 {
+    const written = hostActionInto(buffer, prefix, host) orelse return null;
     const tail = std.fmt.bufPrint(buffer[written..], ".{d}", .{port}) catch return null;
     return buffer[0 .. written + tail.len];
 }
@@ -251,18 +374,20 @@ pub fn actionInto(buffer: []u8, host: []const u8, port: u16) ?[]const u8 {
 /// key. See `Network.resolveName` for the reading this is used with, which is
 /// a ceiling and not an act.
 pub fn classActionInto(buffer: []u8, host: []const u8) ?[]const u8 {
-    const written = hostActionInto(buffer, host) orelse return null;
+    const written = hostActionInto(buffer, action_prefix, host) orelse return null;
     return buffer[0..written];
 }
 
-/// The prefix and the reversed labels, and how many bytes that took.
-fn hostActionInto(buffer: []u8, host: []const u8) ?usize {
+/// The prefix and the reversed labels, and how many bytes that took. One
+/// reversal for every namespace this file writes, so two namespaces cannot
+/// drift apart on what a class rule covers.
+fn hostActionInto(buffer: []u8, prefix: []const u8, host: []const u8) ?usize {
     if (buffer.len < max_action_bytes) return null;
     if (!chock_sandbox.net_broker.hostBytesAreUsable(host)) return null;
 
     var written: usize = 0;
-    @memcpy(buffer[0..action_prefix.len], action_prefix);
-    written += action_prefix.len;
+    @memcpy(buffer[0..prefix.len], prefix);
+    written += prefix.len;
 
     // The labels, last one first. `hostBytesAreUsable` has already refused an
     // empty label, a leading dot and a trailing dot, so every step here has
@@ -851,6 +976,9 @@ pub const Network = struct {
             // turned two boundaries `inconclusive` for a session that ever
             // asked about a connection.
             .tool_call_id = self.tool_call_id,
+            // A host name says nothing about who wanted it, and a Nix build
+            // reaches hosts too. See `event.ApprovalRequest.source`.
+            .source = request_source,
             .spawn_chain = links[0..parents.len],
             // **The same promise `answer`'s own fast path already applied.**
             // Passing it again here is not a second evaluation: `Broker.request`
@@ -1250,6 +1378,87 @@ const allow_anthropic: [:0]const u8 =
     \\    },
     \\}
 ;
+
+test "each Nix phase builds its own name, through the same reversal net.connect uses" {
+    var scoped: [max_action_bytes]u8 = undefined;
+    var either: [max_action_bytes]u8 = undefined;
+
+    const evaluating = nixActionsInto(&scoped, &either, .eval, "api.github.com", 443).?;
+    try testing.expectEqualStrings("nix.net.eval.com.github.api.443", evaluating.phase);
+    try testing.expectEqualStrings("nix.net.com.github.api.443", evaluating.either_phase);
+
+    const building = nixActionsInto(&scoped, &either, .build, "API.GitHub.com", 443).?;
+    try testing.expectEqualStrings("nix.net.build.com.github.api.443", building.phase);
+    try testing.expectEqualStrings("nix.net.com.github.api.443", building.either_phase);
+
+    // A build's egress and the sandbox's own are different keys for one host,
+    // which is the whole reason there are two namespaces.
+    var connect: [max_action_bytes]u8 = undefined;
+    try testing.expect(!std.mem.eql(
+        u8,
+        actionInto(&connect, "api.github.com", 443).?,
+        building.phase,
+    ));
+
+    // The reversal is the same one, so a name a derivation chose falls under
+    // an author's class and never over it.
+    const hostile = nixActionsInto(&scoped, &either, .build, "evil.com.github.api", 443).?;
+    try testing.expectEqualStrings("nix.net.build.api.github.com.evil.443", hostile.phase);
+
+    // A port that is not the default is part of both names.
+    const daemon = nixActionsInto(&scoped, &either, .build, "sourceware.org", 9418).?;
+    try testing.expectEqualStrings("nix.net.build.org.sourceware.9418", daemon.phase);
+    try testing.expectEqualStrings("nix.net.org.sourceware.9418", daemon.either_phase);
+
+    // A name that is not a name builds no key at all.
+    try testing.expect(nixActionsInto(&scoped, &either, .eval, "a b.com", 443) == null);
+    try testing.expect(nixActionsInto(&scoped, &either, .eval, "", 443) == null);
+}
+
+test "known limitation: a host under a build or eval top level domain shares a phase name" {
+    // The phase word sits where a reversed host's last label sits, so one rule
+    // covers both names, in both directions. `build` is delegated today.
+    var scoped: [max_action_bytes]u8 = undefined;
+    var either: [max_action_bytes]u8 = undefined;
+    var other: [max_action_bytes]u8 = undefined;
+    var spare: [max_action_bytes]u8 = undefined;
+
+    for ([_][]const u8{ "build", "eval" }) |label| {
+        var host_buffer: [64]u8 = undefined;
+        const suffixed = try std.fmt.bufPrint(&host_buffer, "example.{s}", .{label});
+        const phase: NixPhase = if (std.mem.eql(u8, label, "build")) .build else .eval;
+
+        const under_the_domain = nixActionsInto(&scoped, &either, phase, suffixed, 443).?;
+        const ordinary = nixActionsInto(&other, &spare, phase, "example", 443).?;
+        try testing.expectEqualStrings(ordinary.phase, under_the_domain.either_phase);
+    }
+
+    // The phase scoped names still differ, so only the phase free reading of
+    // the longer host reaches the shorter host's phase name.
+    const longer = nixActionsInto(&scoped, &either, .build, "example.build", 443).?;
+    const shorter = nixActionsInto(&other, &spare, .build, "example", 443).?;
+    try testing.expect(!std.mem.eql(u8, longer.phase, shorter.phase));
+}
+
+test "a mirror set is named by its site and the hash of that site's list" {
+    var buffer: [max_mirror_action_bytes]u8 = undefined;
+    const digest = "a" ** 64;
+
+    try testing.expectEqualStrings(
+        "nix.net.build.mirrors.gnu." ++ digest,
+        mirrorActionInto(&buffer, "gnu", digest).?,
+    );
+
+    // A site that is not a word, and a digest that is not one, build nothing.
+    try testing.expect(mirrorActionInto(&buffer, "gnu.evil", digest) == null);
+    try testing.expect(mirrorActionInto(&buffer, "", digest) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", "a" ** 63) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", "A" ** 64) == null);
+    try testing.expect(mirrorActionInto(&buffer, "gnu", "z" ** 64) == null);
+
+    var small: [8]u8 = undefined;
+    try testing.expect(mirrorActionInto(&small, "gnu", digest) == null);
+}
 
 test "a host name becomes an action whose labels run the other way" {
     // **This is what makes a class rule mean what a reader takes it to mean.**
@@ -2382,6 +2591,12 @@ test "askPermits writes the real tool call id, not an empty one, into the reques
         if (parsed.value.event != .approval_request) continue;
         found_request = true;
         try testing.expectEqualStrings("call_123", parsed.value.event.approval_request.tool_call_id);
+        // The question says the sandbox asked, because a host name alone reads
+        // the same whether this or a Nix build wanted it.
+        try testing.expectEqualStrings(
+            request_source,
+            parsed.value.event.approval_request.source,
+        );
     }
     try testing.expect(found_request);
 }
