@@ -17,11 +17,9 @@
 //! object longer than this before it is held in memory at all.
 //!
 //! `max_session_bytes` bounds the total a whole session may add across every
-//! object. **Nothing reads it yet.** This file is only the reader and the
-//! fold: a caller that wants to stop a session partway through still has to
-//! be written, and count what `add_object` already accepted against this
-//! number. Reading it in here now means a project can write the field today
-//! and have it mean the same thing once that caller exists.
+//! object. It feeds `chock_nix.build.Budget`, which one session holds and
+//! every build of it spends against: a build whose evaluation would pass this
+//! number is refused while it is being written, and nothing is built.
 //!
 //! ## No percentage, because a store cap has no machine quantity to share
 //!

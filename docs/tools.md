@@ -114,7 +114,8 @@ A `nix` block in `chock.zon` bounds what an evaluation may put in a store.
 `max_object_bytes` bounds one object. The operator's own `config.zon` names
 the same block and the project wins over it, and an organisation's policy
 bundle is the last word over both. `max_session_bytes` is read and folded the
-same way, and nothing enforces it yet.
+same way, and it bounds what every build of one session puts in your store
+between them.
 
 # Building one attribute
 
@@ -183,15 +184,25 @@ because a hand written derivation can name any builder, so building a path
 nobody evaluated here would be running a program of the model's choosing on
 your machine with a content hash in front of it.
 
-**It proves the request came from an evaluation of this session's own, and not
-that the host builds what this session evaluated.** Chock hands `nix` the
-attribute, and `nix` reads that attribute for itself, so the two can differ:
-Chock's evaluator and yours can read one expression differently, and an
-unpinned reference can move between the two moments. Closing that needs the
-derivation written into your store first, which Chock does not do yet.
+**What that evaluation authorised is what your machine builds.** The
+derivation it computed is written into your own store first, through your Nix
+daemon, and the store is asked where it put it: an answer that is not the path
+Chock computed is refused there and then. Chock then hands `nix` that
+derivation path and never the attribute, so the attribute is read once. Your
+Nix and Chock's evaluator cannot read one expression differently between the
+two moments, and an unpinned reference cannot move between them.
+
+It says what goes into the build, and never what comes out. The builder runs
+under your Nix: a fixed output derivation still fetches over the network while
+it builds, and a substituter may answer for an output instead of building it.
+
+A build needs your Nix daemon, because that is what takes the derivation in. A
+machine with no daemon builds nothing here and says so.
 
 Import from derivation stays refused, here as in `nix_eval`. A build the agent
 asked for is not the same act as an evaluation that quietly needs one.
+`nix_eval` itself still writes nothing at all: it answers through a store that
+takes no object.
 
 ## Where it runs, and what it costs
 

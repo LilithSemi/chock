@@ -9,26 +9,38 @@
 //! paths and `bin` directories, which is what a sandbox mounts and what goes
 //! on the `PATH` of the next tool call.
 //!
-//! ## The produced set, and what it is worth
+//! ## The produced set, and the one object it names
 //!
 //! A hand written derivation can name any builder, so a build of a path
 //! nobody evaluated here would be host code execution with a content hash in
 //! front of it. `backend.Driver` answers that: it records what an evaluation
 //! put in the store and refuses a build of anything else.
 //!
-//! **What that proves is that this session evaluated this attribute**, so the
-//! request did not arrive out of nowhere and the model cannot name a store
-//! path of its own choosing.
+//! **The object the driver authorised is the object the host builds.** An
+//! evaluation for a build runs against `Writing`, which puts the whole
+//! derivation closure in the host's own store and records the path the store
+//! itself answered with. A path that is not the one fix computed is refused
+//! there, so every path in the produced set is one the host store confirmed.
+//! `realise` then tells the host to build `<derivation path>^*`. The
+//! attribute path and the flake reference are still what the policy was asked
+//! about and what the model is told, because those are the words a person
+//! reads, and they are no longer what `nix` resolves. So fix and the host's
+//! Nix cannot read one attribute differently between the two moments, and an
+//! unpinned reference cannot move between them: there is one object.
 //!
-//! **What it does not prove is that the host builds the bytes this session
-//! evaluated.** The driver is handed a derivation path, and the host is then
-//! told to realise `<reference>#<attribute>`. Those are two objects. fix and
-//! the host's own Nix can read one attribute differently, and a reference
-//! that is not pinned can move between the moment of the evaluation and the
-//! moment of the build. Closing that means realising the derivation path
-//! itself, which needs the derivation written into the host's store first,
-//! and nothing here does that. The gap is open and it is stated rather than
-//! papered over.
+//! **What is still not proven.** The builder runs on the host, under the
+//! host's Nix, and what it makes is its own business: this says what goes in,
+//! and never what comes out. A fixed output derivation fetches over the
+//! network while it builds, and a substituter may answer for an output path
+//! instead of building it. Nothing here says the attribute is the one the
+//! person meant, or that the derivation is safe to run. And the write is a
+//! real capability: the derivation stays in the host store after the session,
+//! until the host collects it.
+//!
+//! **A store that cannot take the derivation stops the build.** The write
+//! goes through the host's Nix daemon, so a machine with no daemon builds
+//! nothing here and is told so. Refusing is the answer, because the older
+//! shape, handing `nix` the attribute instead, is the gap this closes.
 //!
 //! **This file adds no second check.** It calls `Driver.build`, which is the
 //! same function the evaluator's own build goes through, so there is one
@@ -38,22 +50,32 @@
 //!
 //! ## The seam that can build is installed last
 //!
-//! An evaluation runs against `evaluating`, which writes no object and
-//! authorises no build, so import from derivation is refused there exactly as
-//! it is for an ordinary `nix_eval`. `realise` installs the seam that runs
-//! `nix` only after a person or the policy has answered, and takes it off
-//! again when the build is over. An evaluation therefore cannot reach a
-//! build, whatever the expression says.
+//! `Writing` writes objects and authorises no build, so import from
+//! derivation is refused during an evaluation exactly as it is for an
+//! ordinary `nix_eval`. `realise` installs the seam that runs `nix` only
+//! after a person or the policy has answered, and takes it off again when the
+//! build is over. An evaluation therefore cannot reach a build, whatever the
+//! expression says.
+//!
+//! ## What one session may write
+//!
+//! `backend.Driver.max_object_bytes` bounds one object, and it is checked
+//! before the seam, so an object over it never reaches the store. `Budget`
+//! bounds the whole session across every object and every build, and it is
+//! checked inside the seam, where the bytes are. Both numbers come from the
+//! project, the operator and the org policy bundle.
 //!
 //! ## Nothing here talks to Nix
 //!
-//! `provision.Runner` is the seam, and the same one: the real runner spawns
-//! `nix`, and the one the tests use answers from a table. A test that builds
-//! a derivation is not a test, it is a build.
+//! `provision.Runner` and `StoreWriter` are the two seams: the real ones
+//! spawn `nix` and talk to the host's daemon, and the ones the tests use
+//! answer from a table. A test that builds a derivation is not a test, it is
+//! a build, and a test against a real store is in `test/nix/real.zig`.
 
 const std = @import("std");
 
 const backend = @import("backend.zig");
+const daemon = @import("store").daemon;
 const proc = @import("proc.zig");
 const provision = @import("provision.zig");
 const store = @import("store.zig");
@@ -137,8 +159,10 @@ pub fn checkFlakeRef(flake_ref: []const u8) RequestError!void {
     }
 }
 
-/// The installable `<flake ref>#<attribute>.<attribute>`, which is what `nix`
-/// realises. The caller owns the result.
+/// The installable `<flake ref>#<attribute>.<attribute>`, which names the
+/// request for a person: the policy question, the log and what the model is
+/// told. **Never an argument of `nix`**, which is given the derivation path
+/// instead. The caller owns the result.
 ///
 /// **Both arguments must already have passed their check**, which is
 /// asserted: this is the one place they become arguments to `nix`, and a
@@ -186,55 +210,190 @@ pub fn expressionFor(
     return text.toOwnedSlice(allocator);
 }
 
-const no_context: u8 = 0;
+/// Where the host's Nix daemon listens when nobody named another socket.
+pub const default_daemon_socket = daemon.default_socket_path;
+
+/// The most one session may put in the host store when nothing named a
+/// number. The same number as `chock_policy.nix.default_max_session_bytes`,
+/// written a second time because this library imports no other chock library:
+/// see `lib/chock-nix.zig`.
+pub const default_max_session_bytes: u64 = 256 << 20;
+
+/// Why an object of an evaluation did not reach the host store.
+pub const WriteError = error{
+    /// This session has already written `Budget.max_bytes`.
+    SessionStoreFull,
+    /// The store put the object somewhere other than the path fix computed
+    /// for it, so the two do not hold the same object.
+    StorePathNotExpected,
+};
+
+/// How much of the host store one session has taken, and the most it may.
+///
+/// **One per session and never one per call**, so a session that builds twice
+/// counts the second build against the first. Every write counts, which means
+/// an object written a second time is counted a second time: the store keeps
+/// one copy, and this bounds the work asked of it rather than the disk.
+pub const Budget = struct {
+    max_bytes: u64 = default_max_session_bytes,
+    written_bytes: u64 = 0,
+
+    /// Take `bytes` out of what is left. A refusal takes nothing.
+    pub fn take(self: *Budget, bytes: u64) WriteError!void {
+        const total = std.math.add(u64, self.written_bytes, bytes) catch
+            return error.SessionStoreFull;
+        if (total > self.max_bytes) return error.SessionStoreFull;
+        self.written_bytes = total;
+    }
+};
+
+/// Where an object of an evaluation for a build is really written.
+///
+/// A seam for the same reason `provision.Runner` is one: what is on the other
+/// side of it is the host's Nix daemon, and a test that writes to a real
+/// store is not a test. `DaemonWriter` is the real one.
+pub const StoreWriter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Write `object` and answer the path the store itself computed for
+        /// it, owned by `allocator`.
+        add_object: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            object: backend.AddObject,
+        ) anyerror![]u8,
+    };
+
+    pub fn addObject(
+        self: StoreWriter,
+        allocator: std.mem.Allocator,
+        object: backend.AddObject,
+    ) anyerror![]u8 {
+        return self.vtable.add_object(self.ptr, allocator, object);
+    }
+};
+
+/// The `StoreWriter` that writes to the host's own store, through its Nix
+/// daemon.
+///
+/// **On the host, outside every sandbox**, the same place `provision.Host`
+/// runs `nix`: a sandbox has no daemon socket. The three kinds of object are
+/// the three the daemon has operations for, and the daemon computes the path
+/// of each from its content, which is what makes the answer worth checking.
+pub const DaemonWriter = struct {
+    store: *daemon.DaemonStore,
+
+    /// Connect to the daemon at `endpoint`, which is a socket path or
+    /// `default_daemon_socket`. The `io` must be one that can open a socket,
+    /// and it must outlive this.
+    pub fn connect(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        endpoint: []const u8,
+    ) !DaemonWriter {
+        return .{ .store = try daemon.DaemonStore.connect(allocator, io, endpoint) };
+    }
+
+    pub fn deinit(self: *DaemonWriter) void {
+        self.store.deinit();
+        self.* = undefined;
+    }
+
+    pub fn writer(self: *DaemonWriter) StoreWriter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: StoreWriter.VTable = .{ .add_object = addObject };
+
+    fn addObject(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        object: backend.AddObject,
+    ) anyerror![]u8 {
+        const self: *DaemonWriter = @ptrCast(@alignCast(ptr));
+        return switch (object) {
+            .text => |text| self.store.addTextToStore(
+                allocator,
+                text.name,
+                text.bytes,
+                text.references,
+            ),
+            .nar => |nar| self.store.addPath(allocator, nar.name, nar.bytes, &.{}),
+            .flat => |flat| self.store.addFlatFile(allocator, flat.name, flat.bytes, &.{}),
+        };
+    }
+};
 
 /// The store seam an evaluation for a build runs against.
 ///
-/// `add_object` answers the path the store itself computed and keeps no
-/// bytes. That is all the produced set needs, and the host's own `nix` writes
-/// the real object when it builds. **There is no `build_paths` here**, so an
-/// evaluation that reaches for one, which is what import from derivation
-/// does, is refused with the path named, exactly as an ordinary evaluation
-/// is.
-pub const evaluating: backend.Seam = .{
-    .context = @constCast(&no_context),
-    .vtable = &evaluating_vtable,
+/// Every object goes to the host store, and the path the store answers with
+/// is checked against the path fix computed before the driver records it. So
+/// a path in the produced set is a path the host store holds, which is what
+/// lets `realise` name the derivation rather than an installable.
+///
+/// **There is no `build_paths` here**, so an evaluation that reaches for one,
+/// which is what import from derivation does, is refused with the path named,
+/// exactly as an ordinary evaluation is.
+pub const Writing = struct {
+    writer: StoreWriter,
+    /// This session's own, shared with every other build of it.
+    budget: *Budget,
+
+    pub fn seam(self: *Writing) backend.Seam {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable: backend.Seam.VTable = .{
+        .is_valid_path = isValidPath,
+        .add_object = addObject,
+    };
+
+    /// False for every path, so the evaluation writes each object of the
+    /// closure rather than taking one the store holds already. A write it
+    /// skips is a path the produced set never records, and a build of that
+    /// path would then be refused. Writing an object the store already holds
+    /// answers the same path and changes nothing else.
+    fn isValidPath(_: *anyopaque, _: []const u8) anyerror!bool {
+        return false;
+    }
+
+    fn addObject(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        object: backend.AddObject,
+    ) anyerror![]u8 {
+        const self: *Writing = @ptrCast(@alignCast(context));
+        const bytes = switch (object) {
+            inline else => |one| one.bytes,
+        };
+        try self.budget.take(bytes.len);
+
+        const written = try self.writer.addObject(allocator, object);
+        errdefer allocator.free(written);
+        // The whole worth of writing to the host store: the store computes
+        // the path from the content it took, so an answer that is not the
+        // path fix computed means the two do not hold the same object.
+        if (!std.mem.eql(u8, written, object.expectedPath())) {
+            return WriteError.StorePathNotExpected;
+        }
+        return written;
+    }
 };
-
-const evaluating_vtable: backend.Seam.VTable = .{
-    .is_valid_path = evaluatingIsValidPath,
-    .add_object = evaluatingAddObject,
-};
-
-/// This store holds nothing, which is the truth about a seam that keeps no
-/// bytes. An evaluation that asks then writes the object rather than assuming
-/// it is there already, which is the answer that fills the produced set.
-fn evaluatingIsValidPath(_: *anyopaque, _: []const u8) anyerror!bool {
-    return false;
-}
-
-fn evaluatingAddObject(
-    _: *anyopaque,
-    allocator: std.mem.Allocator,
-    object: backend.AddObject,
-) anyerror![]u8 {
-    return allocator.dupe(u8, object.expectedPath());
-}
 
 /// The store seam that really builds, on the host.
 ///
-/// **It builds the installable and not the derivation path it is handed.**
-/// The evaluation that produced that path kept no bytes, so the derivation is
-/// not in the host's store to name, and `nix` instantiates the same attribute
-/// of the same flake for itself. So what `nix` builds here is not proven to
-/// be what this session evaluated: see this file's own top comment, which
-/// says what the produced set is worth and what it is not.
+/// **It builds the derivation the driver authorised**, and never the
+/// installable: `<derivation path>^*`, which is every output of that one
+/// derivation. The evaluation put that derivation in the host store, so there
+/// is a path for `nix` to name and nothing is instantiated a second time.
 pub const Host = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     runner: provision.Runner,
-    /// `<flake ref>#<attribute path>`, from `installableFor`.
-    installable: []const u8,
+    /// `<derivation path>^*`, from `realise`.
+    derivation_outputs: []const u8,
     /// What `nix` wrote when it would not build, borrowed from `allocator`.
     said: []const u8 = "",
     /// The outputs the build produced, empty until it has.
@@ -260,7 +419,7 @@ pub const Host = struct {
             // `result` link in the user's project directory is litter.
             "--no-link",
             "--print-out-paths",
-            self.installable,
+            self.derivation_outputs,
         });
         if (!built.succeeded()) {
             self.said = provision.lastLine(built.stderr);
@@ -272,13 +431,13 @@ pub const Host = struct {
 
 /// One thing to realise.
 pub const Request = struct {
-    /// The derivation the evaluation of this very attribute produced. The
-    /// driver refuses a build of anything it did not produce, which is what
-    /// says this request came from an evaluation of this session's own. It is
-    /// not a promise about the bytes the host then builds: see this file's
-    /// own top comment.
+    /// The derivation the evaluation of this very attribute produced and put
+    /// in the host store. It is what the driver checks against its produced
+    /// set and what `nix` is told to build.
     derivation_path: []const u8,
-    /// What `nix` realises, from `installableFor`.
+    /// `<flake ref>#<attribute path>`, from `installableFor`. What the policy
+    /// was asked about and what the model is told, and never an argument of
+    /// `nix`: see this file's own top comment.
     installable: []const u8,
 };
 
@@ -313,11 +472,18 @@ pub fn realise(
     driver: *backend.Driver,
     request: Request,
 ) Error!Answer {
+    // Every output of that one derivation. `nix` reads a bare derivation path
+    // as a request for its default output, and a package with more than one
+    // would then lose the rest of what the model was told about.
     var host: Host = .{
         .allocator = allocator,
         .io = io,
         .runner = runner,
-        .installable = request.installable,
+        .derivation_outputs = try std.fmt.allocPrint(
+            allocator,
+            "{s}^*",
+            .{request.derivation_path},
+        ),
     };
 
     // Installed here and taken off below, so nothing that runs before or
@@ -401,6 +567,33 @@ pub fn requestRefusal(
             "flake reference. A reference is a URL such as \"github:NixOS/nixpkgs\" or a path, " ++
             "with no quote, no space and no \"#\": name the attribute in the attribute path " ++
             "instead."),
+    };
+}
+
+/// One sentence for an evaluation the host store would not take. Null when
+/// `err` is not a `WriteError`, which leaves the caller's own words for
+/// everything else an evaluation can fail with.
+pub fn writeRefusal(
+    allocator: std.mem.Allocator,
+    installable: []const u8,
+    err: anyerror,
+) std.mem.Allocator.Error!?[]u8 {
+    return switch (err) {
+        WriteError.SessionStoreFull => try std.fmt.allocPrint(
+            allocator,
+            "{s} was not built: this session has put as much in the Nix store as it may, so " ++
+                "the derivation could not be written and nothing ran. Build fewer attributes " ++
+                "in one session, or ask the user to raise max_session_bytes.",
+            .{installable},
+        ),
+        WriteError.StorePathNotExpected => try std.fmt.allocPrint(
+            allocator,
+            "{s} was not built: the Nix store put the derivation at a path other than the one " ++
+                "this session computed for it, so the two are not the same object. Nothing " ++
+                "ran. Tell the user, because this is the machine and not your request.",
+            .{installable},
+        ),
+        else => null,
     };
 }
 
@@ -491,12 +684,44 @@ const FakeRunner = struct {
 const example_drv = "/nix/store/00000000000000000000000000000000-example.drv";
 const example_out = "/nix/store/11111111111111111111111111111111-example";
 
-/// A driver that produced `example_drv`, through the seam an evaluation for a
-/// build really runs against.
-fn producingDriver(allocator: std.mem.Allocator) !backend.Driver {
-    var driver = backend.Driver.init(allocator, evaluating);
-    errdefer driver.deinit();
+/// A `StoreWriter` that writes nowhere and answers the path the object says
+/// it expects.
+///
+/// **It is not a store and no test here claims it is.** It records what the
+/// evaluation handed it, so a test can ask what was written and how much,
+/// while no test in this file reaches a daemon. What a real store does with a
+/// real derivation is pinned in `test/nix/real.zig`.
+const RecordingWriter = struct {
+    gpa: std.mem.Allocator,
+    /// Answered instead of the expected path, for the one test about a store
+    /// that puts an object somewhere else.
+    answer: ?[]const u8 = null,
+    objects: usize = 0,
+    bytes: usize = 0,
 
+    fn writer(self: *RecordingWriter) StoreWriter {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: StoreWriter.VTable = .{ .add_object = addObject };
+
+    fn addObject(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        object: backend.AddObject,
+    ) anyerror![]u8 {
+        const self: *RecordingWriter = @ptrCast(@alignCast(ptr));
+        self.objects += 1;
+        self.bytes += switch (object) {
+            inline else => |one| one.bytes.len,
+        };
+        return allocator.dupe(u8, self.answer orelse object.expectedPath());
+    }
+};
+
+/// A real evaluation of one derivation, through the seam an evaluation for a
+/// build runs against. The driver is left holding what the evaluation wrote.
+fn evaluateDerivation(allocator: std.mem.Allocator, driver: *backend.Driver) !void {
     const expr_mod = @import("expr");
     var engine = try expr_mod.Engine.init(allocator, .{ .worker_count = 1 });
     defer engine.deinit();
@@ -509,7 +734,6 @@ fn producingDriver(allocator: std.mem.Allocator) !backend.Driver {
     );
     const path = (try engine.derivationDrvPath(value)).?;
     try engine.ensureDerivationClosure(path);
-    return driver;
 }
 
 test "an attribute path and a flake reference build one installable and one expression" {
@@ -550,20 +774,26 @@ test "a flake reference that would break out of a string or an argument is refus
     try checkFlakeRef("/home/someone/project");
 }
 
-test "a build of a derivation this session evaluated runs, and the produced set is what authorised it" {
+test "the host is told to realise the derivation this session wrote, and never an installable" {
     const gpa = testing.allocator;
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var driver = try producingDriver(gpa);
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
     defer driver.deinit();
+    try evaluateDerivation(gpa, &driver);
 
     // The whole of the gate: drop the `ensureDerivationClosure` call in
-    // `producingDriver` and this build is refused instead of run.
+    // `evaluateDerivation` and this build is refused instead of run.
     const drv = drvPathOf(&driver).?;
     try testing.expect(driver.produced(drv));
+    try testing.expect(recording.objects != 0);
 
     var fake = FakeRunner{ .gpa = gpa, .replies = &.{
         .{ .stdout = example_out ++ "\n" },
@@ -582,14 +812,83 @@ test "a build of a derivation this session evaluated runs, and the produced set 
     try testing.expectEqual(@as(usize, 2), built.provided.store_paths.len);
     try testing.expectEqualStrings(example_out ++ "/bin", built.provided.bin_dirs[0]);
 
-    // What was really asked of `nix`, rather than that something was.
+    // What was really asked of `nix`, rather than that something was. The
+    // last argument is the object the driver authorised, with every output of
+    // it, and no argument holds the attribute the model named: an installable
+    // would let the host resolve the attribute a second time.
     try testing.expectEqualStrings("build", fake.seen.items[0][0]);
+    try testing.expectEqualStrings("--no-link", fake.seen.items[0][1]);
     try testing.expectEqualStrings("--print-out-paths", fake.seen.items[0][2]);
-    try testing.expectEqualStrings("/work#packages.x86_64-linux.default", fake.seen.items[0][3]);
+    const realised = fake.seen.items[0][3];
+    try testing.expect(std.mem.startsWith(u8, realised, drv));
+    try testing.expectEqualStrings("^*", realised[drv.len..]);
+    for (fake.seen.items[0]) |argument| {
+        try testing.expect(std.mem.indexOfScalar(u8, argument, '#') == null);
+    }
     try testing.expectEqualStrings("path-info", fake.seen.items[1][0]);
+
+    // The model still reads the attribute it asked for.
+    try testing.expectEqualStrings("/work#packages.x86_64-linux.default", built.provided.installable);
 
     // The seam that can build is off again, so nothing after this reaches one.
     try testing.expect(driver.seam.vtable.build_paths == null);
+}
+
+test "a derivation the store puts at another path is refused, and nothing is produced" {
+    const gpa = testing.allocator;
+
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa, .answer = example_drv };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+
+    // A store that answers a path of its own is a store holding something
+    // other than what this session evaluated, so the evaluation stops there.
+    try testing.expectError(WriteError.StorePathNotExpected, evaluateDerivation(gpa, &driver));
+    try testing.expect(!driver.produced(example_drv));
+    try testing.expectEqual(@as(usize, 0), driver.paths.count());
+
+    const said = (try writeRefusal(gpa, "/work#a", WriteError.StorePathNotExpected)).?;
+    defer gpa.free(said);
+    try testing.expect(std.mem.indexOf(u8, said, "/work#a") != null);
+    try testing.expectEqual(@as(?[]u8, null), try writeRefusal(gpa, "/work#a", error.OutOfMemory));
+}
+
+test "the object cap refuses a write, and the session total refuses a later write after earlier ones passed" {
+    const gpa = testing.allocator;
+
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
+    defer driver.deinit();
+    // Smaller than one derivation text, so the object cap is what answers.
+    driver.max_object_bytes = 8;
+
+    try testing.expectError(backend.Error.ObjectTooLarge, evaluateDerivation(gpa, &driver));
+    // The cap is checked before the seam, so the write never happened.
+    try testing.expectEqual(@as(usize, 0), recording.objects);
+    try testing.expectEqual(@as(u64, 0), budget.written_bytes);
+
+    driver.max_object_bytes = backend.default_max_object_bytes;
+    try evaluateDerivation(gpa, &driver);
+    const first = budget.written_bytes;
+    try testing.expect(first != 0);
+
+    // The session total is what the second build spends against, and this
+    // one has one byte less than it needs.
+    budget.max_bytes = first * 2 - 1;
+    var second = backend.Driver.init(gpa, writing.seam());
+    defer second.deinit();
+    try testing.expectError(WriteError.SessionStoreFull, evaluateDerivation(gpa, &second));
+    try testing.expect(budget.written_bytes <= budget.max_bytes);
+
+    const said = (try writeRefusal(gpa, "/work#a", WriteError.SessionStoreFull)).?;
+    defer gpa.free(said);
+    try testing.expect(std.mem.indexOf(u8, said, "max_session_bytes") != null);
 }
 
 /// The one path `driver` produced, for a test that needs the derivation path
@@ -609,7 +908,8 @@ test "a build of a store path this session never produced is refused by name, an
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var driver = backend.Driver.init(gpa, evaluating);
+    // A driver that evaluated nothing, so its produced set is empty.
+    var driver = backend.Driver.init(gpa, backend.Seam.refusing);
     defer driver.deinit();
 
     // A reply is here so that a runner that was reached would answer rather
@@ -636,8 +936,13 @@ test "a nix that refused the build answers one sentence, and the machine faults 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var driver = try producingDriver(gpa);
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+
+    var driver = backend.Driver.init(gpa, writing.seam());
     defer driver.deinit();
+    try evaluateDerivation(gpa, &driver);
     const drv = drvPathOf(&driver).?;
 
     var fake = FakeRunner{ .gpa = gpa, .replies = &.{
@@ -665,15 +970,21 @@ test "a nix that refused the build answers one sentence, and the machine faults 
     try testing.expect(std.mem.indexOf(u8, stopped.refused, "daemon could not be reached") != null);
 }
 
-test "the seam an evaluation runs against writes no object and authorises no build" {
+test "the seam an evaluation runs against authorises no build and reads no store file" {
     const gpa = testing.allocator;
-    var driver = backend.Driver.init(gpa, evaluating);
+
+    var budget: Budget = .{};
+    var recording: RecordingWriter = .{ .gpa = gpa };
+    var writing: Writing = .{ .writer = recording.writer(), .budget = &budget };
+    const seam = writing.seam();
+
+    var driver = backend.Driver.init(gpa, seam);
     defer driver.deinit();
 
     // Import from derivation reaches `build_paths`, and this seam has none,
     // so an evaluation cannot build its own input however it is written.
-    try testing.expect(evaluating.vtable.build_paths == null);
-    try testing.expect(evaluating.vtable.read_file == null);
+    try testing.expect(seam.vtable.build_paths == null);
+    try testing.expect(seam.vtable.read_file == null);
     try testing.expectError(
         backend.Error.BuildRefused,
         driver.build(&.{example_drv}, .normal),

@@ -614,11 +614,12 @@ store:
 ```
 
 `max_object_bytes` bounds one object the store accepts: a Nix source file, a
-derivation, or a build output. `max_session_bytes` bounds the total a whole
-session may add across every object. **Only `max_object_bytes` is enforced
-today**, against `chock_nix.backend.Driver`. `max_session_bytes` is read and
-folded the same way, so a project may write it now and have it take effect
-once a caller counts a session's own total against it.
+derivation, or a build output. It is checked against
+`chock_nix.backend.Driver` before the object reaches a store at all.
+`max_session_bytes` bounds the total a whole session may add across every
+object, and every build of one session spends against the same number. A
+build whose derivation would pass it is refused while it is being written, so
+nothing is built.
 
 **Neither field takes a percentage.** `limits.processes` and `limits.memory`
 each resolve a percentage against something the machine reports, a cpu count

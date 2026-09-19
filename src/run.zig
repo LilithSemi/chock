@@ -3028,9 +3028,10 @@ fn applyLimits(config: *sandbox.Config, resolved: chock_policy.limits.Resolved) 
 /// in default, held last under the org policy bundle's ceiling. The same
 /// shape `resolveLimits` above has, and the same three layers.
 ///
-/// The number lands on `chock_nix.backend.Driver.max_object_bytes` through
-/// `applyNixCaps`. `max_session_bytes` is folded here and nothing reads it
-/// yet: see `chock_policy.nix`'s own top comment.
+/// `max_object_bytes` lands on `chock_nix.backend.Driver.max_object_bytes`
+/// through `applyNixCaps`, and `max_session_bytes` on
+/// `NixBuildToolRunner.budget`, which every build of the session spends
+/// against.
 fn resolveNixCaps(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -11085,6 +11086,9 @@ const NixBuild = struct {
     /// Where the garbage collector root links go, or null when this session
     /// has no directory of its own for them.
     root_dir: ?[]const u8,
+    /// The Nix daemon socket the derivation of a build is written to, before
+    /// the host is told to realise it. See `chock_nix.build.Writing`.
+    store_endpoint: []const u8,
 };
 
 /// Whether this session can build a Nix attribute on the host, and what it
@@ -11122,6 +11126,10 @@ fn nixBuildFor(
         .nix_program = nix_program,
         .nix_store_program = nix_store_program,
         .root_dir = dev_shell_dir,
+        // The host's own answer, so a machine that moved its socket is
+        // reached at the place its `nix` reads too.
+        .store_endpoint = env.get("NIX_DAEMON_SOCKET_PATH") orelse
+            chock_nix.build.default_daemon_socket,
     };
 }
 
@@ -11138,21 +11146,23 @@ fn nixBuildFor(
 ///
 /// ## The three steps, and what each one answers
 ///
-/// 1. **Evaluate the attribute**, in this process, with store writes on. That
-///    is what registers the derivation through `chock_nix.backend.Driver`, so
-///    its produced set can authorise a build of it. The seam it evaluates
-///    against writes no object and authorises no build, so import from
-///    derivation is refused here exactly as it is for `nix_eval`.
+/// 1. **Evaluate the attribute**, in this process, with store writes on, and
+///    write the derivation closure into the host store through its daemon.
+///    That is what registers the derivation through
+///    `chock_nix.backend.Driver`, so its produced set can authorise a build
+///    of it, and it is what gives `nix` a path to name. The seam it evaluates
+///    against authorises no build, so import from derivation is refused here
+///    exactly as it is for `nix_eval`.
 /// 2. **The policy has already answered.** `Loop.gateToolCall` put this call
 ///    to the policy under `nix.build.<attribute path>`, and under
 ///    `nix.build.flake.<reference>` as well when the call named a flake,
 ///    before the dispatch reached this file. A call that arrives here was
 ///    permitted on every name it carries, and nothing asks a second time.
 /// 3. **Realise on the host**, through `chock_nix.build.realise`, which goes
-///    through the driver's own check and never around it. That check says
-///    this session evaluated this attribute. It does not say the host builds
-///    the bytes this session evaluated: see `lib/chock-nix/build.zig`'s own
-///    top comment for the gap and why it is not closed here.
+///    through the driver's own check and never around it. What the host is
+///    told to build is the derivation path that check authorised, so the
+///    attribute is read once, here. See `lib/chock-nix/build.zig`'s own top
+///    comment for what that proves and what it still does not.
 ///
 /// ## What it produced reaches the agent the way a provisioned program does
 ///
@@ -11191,6 +11201,10 @@ const NixBuildToolRunner = struct {
     /// How many builds this session has taken in, which names their garbage
     /// collector root links apart. See `builtRootPrefix`.
     builds: usize = 0,
+    /// How much of the host store this session has taken, across every build
+    /// of it. The cap on it comes from `NixBuild.caps` on each call, so what
+    /// survives between calls is the count.
+    budget: chock_nix.build.Budget = .{},
 
     fn runner(self: *NixBuildToolRunner) chock_core.Loop.ToolRunner {
         return .{ .ptr = self, .vtable = &vtable };
@@ -11263,9 +11277,43 @@ const NixBuildToolRunner = struct {
 
         // The evaluation holds every value it answered, so it is dropped
         // before the build, which is the long part.
-        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.build.evaluating);
+        var driver = chock_nix.backend.Driver.init(gpa, chock_nix.backend.Seam.refusing);
         defer driver.deinit();
         applyNixCaps(&driver, settings.caps);
+
+        // One `Io` for the whole call: the daemon the evaluation writes
+        // through and the `nix` the build runs both need one that can open a
+        // socket and spawn a process, which phase 2's own cannot. See
+        // `ProvisionToolRunner.resolveWithNix`, which says why it is built
+        // here and why it is backed by the page allocator.
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
+        defer threaded.deinit();
+        const host_io = threaded.io();
+
+        // The derivation has to be in the host store before `nix` can be
+        // asked to realise it by name, and this is what puts it there.
+        var store_writer = chock_nix.build.DaemonWriter.connect(
+            gpa,
+            host_io,
+            settings.store_endpoint,
+        ) catch |err| return .{
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "{s} was not built: the Nix daemon at {s} could not be reached ({t}), and a " ++
+                    "build puts the derivation it evaluated in the store through it. Do the " ++
+                    "work with what the toolchain already has, and tell the user.",
+                .{ installable, settings.store_endpoint, err },
+            ),
+            .refused = true,
+        };
+        defer store_writer.deinit();
+
+        self.budget.max_bytes = settings.caps.max_session_bytes;
+        var writing = chock_nix.build.Writing{
+            .writer = store_writer.writer(),
+            .budget = &self.budget,
+        };
+        driver.seam = writing.seam();
 
         const drv_path = switch (try self.derivationOf(gpa, io, settings, &driver, expression, installable)) {
             .refused => |text| return .{ .text = text, .refused = true },
@@ -11276,7 +11324,7 @@ const NixBuildToolRunner = struct {
         // terminal looks like a session that has stopped.
         tty.print(.plain, "chock: building {s} with nix, which can take some time\n", .{installable});
 
-        const answer = self.realiseWithNix(settings, &driver, .{
+        const answer = self.realiseWithNix(host_io, settings, &driver, .{
             .derivation_path = drv_path,
             .installable = installable,
         }) catch |err| return .{
@@ -11360,19 +11408,15 @@ const NixBuildToolRunner = struct {
         return .{ .found = try self.arena.dupe(u8, drv_path) };
     }
 
-    /// Run the `nix` commands on an `Io` of this call's own. See
-    /// `ProvisionToolRunner.resolveWithNix`, which says why the `Io` is built
-    /// here and why it is backed by the page allocator.
+    /// Run the `nix` commands on the `Io` this call built, which is the one
+    /// the derivation was written to the store through.
     fn realiseWithNix(
         self: *NixBuildToolRunner,
+        io: std.Io,
         settings: NixBuild,
         driver: *chock_nix.backend.Driver,
         request: chock_nix.build.Request,
     ) chock_nix.build.Error!chock_nix.build.Answer {
-        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{ .environ = self.environ });
-        defer threaded.deinit();
-        const io = threaded.io();
-
         var run_diag: ?chock_nix.Diagnostic = null;
         defer if (run_diag) |*d| d.deinit(self.arena);
         var host = chock_nix.provision.Host{
@@ -11494,6 +11538,10 @@ fn nixBuildRefusal(
     expression: []const u8,
     err: anyerror,
 ) std.mem.Allocator.Error![]u8 {
+    // The store faults are the evaluation's own and the driver records none
+    // of them, so they are read before its last refusal rather than after.
+    if (try chock_nix.build.writeRefusal(gpa, installable, err)) |said| return said;
+
     if (driver.lastError()) |said| return std.fmt.allocPrint(
         gpa,
         "{s} was not built, because evaluating it asked a store for something this session " ++
@@ -17718,6 +17766,29 @@ test "the object cap a project names reaches the driver an evaluation answers th
         chock_nix.backend.default_max_object_bytes,
         quiet_driver.max_object_bytes,
     );
+}
+
+test "nix_eval answers through a store that takes no object, so it writes nothing to the host store" {
+    const gpa = std.testing.allocator;
+
+    // **The one difference between the two Nix tools.** A build writes its
+    // derivation closure into the host store, because that is the object the
+    // host is then told to realise. An evaluation that only reads writes
+    // nothing: give this seam an `add_object` and every expression the model
+    // sends could put bytes in the store.
+    const settings = NixEval{ .workspace_root = "/nowhere", .caps = default_nix_caps };
+    var driver = settings.driverFor(gpa);
+    defer driver.deinit();
+    try std.testing.expect(driver.seam.vtable.add_object == null);
+    try std.testing.expect(driver.seam.vtable.build_paths == null);
+
+    // Store writes are off as well, so the two guards are apart: the seam
+    // could take nothing even if a caller turned writes on.
+    try std.testing.expect(driver.seam.vtable.read_file == null);
+
+    // What one of these evaluations does answer for a derivation is pinned by
+    // "a derivation answers its derivation path, and says that nothing was
+    // built", which reads the path out of the tool the model calls.
 }
 
 test "a nix block that does not parse stops the session rather than evaluating under another number" {
