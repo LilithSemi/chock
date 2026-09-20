@@ -174,12 +174,13 @@ there, `chock_core.arbiter.Asker.decide` answers `not_asked`, which does not
 permit. So a wiring nobody finished is a supplier of tools that stops
 working, and never a tool that runs ungated.
 
-Two limits stay. A plugin tool's declared capabilities decide the import
-set the whole plugin is instantiated with, once, before any guest code runs,
-so a capability the table does not allow outright refuses the tool at load
-time rather than asking per call: an import cannot be taken back once
-supplied. And the set of tools a session holds is still fixed at the start,
-so a server that gains a tool mid session is proposing a widening with
+Two limits stay. A plugin tool's declared capabilities decide the import set
+the whole plugin is instantiated with, once, before any guest code runs, so a
+capability the table does not allow outright refuses the tool at load time: an
+import cannot be taken back once supplied. Each call still asks about the
+tool's own action and about every capability it declared, so a narrowing mid
+session still bites. And the set of tools a session holds is fixed at the
+start, so a server that gains a tool mid session is proposing a widening with
 nowhere to land.
 
 A foreground tool call holds a network descriptor whether or not any policy
