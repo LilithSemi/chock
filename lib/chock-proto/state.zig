@@ -1,138 +1,66 @@
-//! The fold that turns a session log into the state of a session. The log is
-//! the truth, and a session's state, the context the model reads included, is a
-//! view built by folding the log forward one event at a time. `Session.apply`
-//! does that folding. It never reads storage itself, so this file does not
-//! depend on `storage.zig`. A caller can drive it from any source of envelopes:
-//! a live `Storage.Replay`, a plain `log.Replay`, or a test that builds
-//! envelopes by hand.
-//!
-//! That gives this file its two most important rules:
-//!
-//! * Compaction is an event in the log, not an edit to the log. Applying it
-//!   shortens `Session.context`, the model's view, but the log itself, and any
-//!   fresh replay of it, still holds every event that was ever appended.
-//! * A `session.spawn` event records that a child session exists. It never pulls
-//!   the child's own events into the parent: the parent receives the result of
-//!   a child, never its transcript, and the child keeps its own log for that.
-//!
-//! A session mixes models freely: the roster maps `main`, `subagent`, and
-//! `compact` to different aliases. `Message.model_alias` names which alias
-//! wrote a given turn, and `Session.apply` carries that alias into the matching
-//! `ContextEntry`, so a later reader can say which model produced which part of
-//! the context.
-//!
-//! `apply` takes an `Envelope` by value and does not keep a reference into it. A
-//! caller is free to `deinit` the envelope right after the call returns, for
-//! example a `Replay` result freed at the end of a loop body. Almost everything
-//! this file keeps past the call is copied into `Session`'s own arena first. The
-//! one exception is the raw JSON of an unrecognized content part: `apply` keeps
-//! the field name but drops the value. See `dupeContentParts` for why.
+//! The fold that turns a session log into the state of a session. It never
+//! reads storage itself. Compaction is an event in the log, not an edit to it:
+//! applying one shortens the model's view and never the log.
 
 const std = @import("std");
 const event = @import("event.zig");
 const log = @import("log.zig");
 
-/// A `Message`, deep copied into `Session`'s own arena so it survives past the
-/// envelope `apply` was given.
 pub const OwnedMessage = struct {
     role: event.Role,
     content: []const event.ContentPart,
 };
 
-/// What one entry of the model context holds. A compaction replaces a run of
-/// `.message` entries with one `.summary` entry. Nothing else changes the shape
-/// of an entry once `apply` has added it.
 pub const ContextData = union(enum) {
     message: OwnedMessage,
-    /// The text of a compaction's summary, standing in for every entry it
-    /// folded.
     summary: []const u8,
 };
 
-/// One entry of the model context. `id` is the id of the event this entry came
-/// from, kept so a later compaction can find which entries its
-/// `[from_id, through_id]` range covers.
 pub const ContextEntry = struct {
     id: u64,
     data: ContextData,
-    /// The alias of the model that produced this entry. Copied from
-    /// `Message.model_alias` for a `.message` entry, and from
-    /// `Compaction.model_alias` for a `.summary` entry. Empty when no model
-    /// wrote the turn, for example a user message.
     model_alias: []const u8 = "",
 };
 
-/// A child session this session spawned. Holds only what `SessionSpawn` records:
-/// the child's id, its agent kind, and the reason given for the spawn. Never the
-/// child's own events. See this file's top comment.
 pub const Child = struct {
     session: []const u8,
     agent_kind: []const u8,
     reason: []const u8,
-    /// The slice of the parent's budget this child was given when it started.
-    /// Zero for a child that was given no cap, which is what a parent with no
-    /// cap of its own hands out. See `event.SessionSpawn.budget_max_cost`.
     budget_max_cost: f64 = 0,
     budget_currency: []const u8 = "",
 };
 
-/// The workspace one attempt at a session opened, folded from `workspace.open`.
-/// Holds only what the event records. See `event.WorkspaceOpen`.
 pub const Workspace = struct {
     kind: event.WorkspaceKind,
     attempt: []const u8,
     path: []const u8,
-    /// Empty for the overlay kind, which has no commit of its own. A reader
-    /// must never treat that empty string as a commit.
+    /// Empty for the overlay kind. Never treat that empty string as a commit.
     base_commit: []const u8,
 };
 
-/// The state of one session, folded from its log one event at a time.
-/// What a session has spent, folded from its `usage` events. A cap is enforced
-/// against this, and only against this: ai&'s own analytics API is rate limited
-/// and cached for 120 seconds, and a cap checked against a number that can be
-/// two minutes stale is not a cap.
+/// A cap is enforced against this and only against this: ai&'s analytics API is
+/// rate limited and cached for 120 seconds, so a cap checked against it is not
+/// a cap.
 pub const Spend = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     cache_creation_input_tokens: u64 = 0,
     cache_read_input_tokens: u64 = 0,
-    /// The money, summed over every turn that could be priced. Meaningless on
-    /// its own: read `enforceable` first.
     amount: f64 = 0,
-    /// The currency of `amount`. Empty when no priced turn has landed yet.
     currency: []const u8 = "",
-    /// How many `usage` events folded in. Zero means nothing has been
-    /// counted, which is not the same as a session that cost nothing.
     turns: u64 = 0,
-    /// Turns whose cost was `unknown`. **A total with one of these in it is
-    /// not a total**, and a cap over an unknown cost cannot be enforced: it
-    /// warns once and runs.
+    /// A total with one of these in it is not a total.
     unpriced_turns: u64 = 0,
-    /// Turns whose cost was `free`. **Counted apart from `unpriced_turns`,
-    /// because free and unknown are different facts**: a local llama.cpp server
-    /// costs nothing, and a model with no price entry costs a number nobody
-    /// knows. A reader that had only `unpriced_turns` could tell a free turn
-    /// from a priced one, since both leave `amount` where it was, only by
-    /// reading the log again. The two are reported apart, and `chock usage` is
-    /// what reports them.
+    /// Apart from `unpriced_turns`: free and unknown are different facts.
     free_turns: u64 = 0,
-    /// Two turns reported money in different currencies. Adding those gives a
-    /// number in no currency at all, so the total stops being enforceable
-    /// rather than quietly becoming wrong.
+    /// Two currencies add up to a number in no currency at all, so the total
+    /// stops being enforceable rather than quietly becoming wrong.
     mixed_currency: bool = false,
 
-    /// Whether `amount` is a total a cap can be compared against. False as
-    /// soon as one turn could not be priced, or two turns disagreed about the
-    /// currency.
     pub fn enforceable(self: Spend) bool {
         return self.unpriced_turns == 0 and !self.mixed_currency;
     }
 
-    /// Fold one turn's usage in. `free` adds nothing and leaves the total
-    /// enforceable, which is what makes a session against a local model
-    /// runnable under a cap. `unknown` adds nothing either, but records that
-    /// the total is no longer complete.
     pub fn add(self: *Spend, usage: event.Usage) void {
         self.turns += 1;
         self.input_tokens += usage.input_tokens;
@@ -149,38 +77,17 @@ pub const Spend = struct {
                 }
                 self.amount += money.value;
             },
-            // An unrecognized state came from a writer this reader is older
-            // than. It is not free and it is not a number, so it counts as
-            // unknown, which is the answer that refuses to enforce a cap
-            // rather than the one that enforces a wrong one.
             .unknown, .unrecognized => self.unpriced_turns += 1,
         }
     }
 
-    /// Turns that were priced: the ones that put money into `amount`. The
-    /// three states of `Cost` together make up every turn, so this is what is
-    /// left after the free ones and the unknown ones are taken out.
-    ///
-    /// Saturating, so a `Spend` a caller built by hand with numbers that do
-    /// not add up gives a wrong answer rather than a panic in a release
-    /// build. `add` and `merge` can never produce one: each of them counts a
-    /// turn once and raises at most one of the two counters with it.
+    /// Saturating, so numbers that do not add up give a wrong answer, no panic.
     pub fn pricedTurns(self: Spend) u64 {
         return self.turns -| self.free_turns -| self.unpriced_turns;
     }
 
-    /// Fold another `Spend` into this one: the totals of two sessions, added.
-    ///
-    /// **The currency rule is the one `add` keeps, and it is written once.**
-    /// Two sessions billed in different currencies add up to a number in no
-    /// currency at all, so the result stops being enforceable rather than
-    /// quietly becoming wrong, which is the same answer one session with two
-    /// currencies in it already gets.
-    ///
-    /// `currency` is borrowed from `other`, exactly as `add` borrows it from
-    /// the usage event. A caller that keeps the result past the lifetime of
-    /// `other` owns making that string live long enough, which for
-    /// `chock usage` is one arena holding both.
+    /// `currency` is borrowed from `other`: a caller that keeps the result must
+    /// keep that string alive too.
     pub fn merge(self: *Spend, other: Spend) void {
         self.turns += other.turns;
         self.input_tokens += other.input_tokens;
@@ -201,24 +108,10 @@ pub const Spend = struct {
     }
 };
 
-/// The agent's own task list, folded from every `plan.update` event.
-///
-/// **Nothing is ever removed from this list.** A step is merged in by its
-/// identifier: an identifier seen before changes that step, and one seen for
-/// the first time is added at the end. An agent that simply stops naming a
-/// step therefore does not make it disappear, and the reader still sees it
-/// sitting at whatever status it last had.
-///
-/// That rule is the design and not an implementation detail. A list where a
-/// step vanishes in silence reads as finished when it is not, so the only way
-/// to take a step off the list is `PlanStatus.abandoned`, which is a thing the
-/// agent says out loud. See `chock_proto.event.PlanUpdate`.
-///
-/// **Order is first seen order**, so a replay of the log rebuilds the same
-/// list in the same order, whatever order a later update named the steps in.
+/// Nothing is ever removed from this list. A step is merged in by identifier,
+/// so an agent that stops naming a step does not make it disappear: the only
+/// way off the list is `PlanStatus.abandoned`.
 pub const Plan = struct {
-    /// One step, with every string owned by the arena of the `Session` that
-    /// holds it.
     pub const Step = struct {
         id: []const u8,
         subject: []const u8,
@@ -226,16 +119,11 @@ pub const Plan = struct {
         blocked_by: []const u8 = "",
     };
 
-    /// How many steps are at each status. What a one line report is built
-    /// from, by `chock run` and by `chock plan`.
     pub const Counts = struct {
         pending: usize = 0,
         in_progress: usize = 0,
         done: usize = 0,
         abandoned: usize = 0,
-        /// Steps whose status this reader has no member for, from a newer
-        /// writer. **Counted apart and never folded into `done`**: an
-        /// unrecognized status is not finished work.
         unrecognized: usize = 0,
 
         pub fn total(self: Counts) usize {
@@ -243,7 +131,6 @@ pub const Plan = struct {
                 self.abandoned + self.unrecognized;
         }
 
-        /// Steps that are neither finished nor given up. What is left to do.
         pub fn left(self: Counts) usize {
             return self.pending + self.in_progress + self.unrecognized;
         }
@@ -251,13 +138,10 @@ pub const Plan = struct {
 
     steps: std.ArrayList(Step) = .empty,
 
-    /// True for a session whose agent never wrote a plan. Every such session
-    /// holds no `plan.update` event at all: see `event.PlanUpdate`.
     pub fn isEmpty(self: Plan) bool {
         return self.steps.items.len == 0;
     }
 
-    /// The step with this identifier, or null when the plan has none.
     pub fn find(self: Plan, id: []const u8) ?*Step {
         for (self.steps.items) |*step| {
             if (std.mem.eql(u8, step.id, id)) return step;
@@ -279,18 +163,12 @@ pub const Plan = struct {
         return out;
     }
 
-    /// Merge one `plan.update` in. `allocator` owns every string this keeps,
-    /// which for a `Session` is its own arena.
     pub fn apply(
         self: *Plan,
         allocator: std.mem.Allocator,
         update: event.PlanUpdate,
     ) std.mem.Allocator.Error!void {
         for (update.steps) |given| {
-            // A step with no identifier cannot be merged and cannot be found
-            // again, so it is dropped rather than added as a step nothing can
-            // ever change. `Loop` refuses such a call before it reaches the
-            // log. This is the answer for a log written by something else.
             if (given.id.len == 0) continue;
 
             const status = try dupePlanStatus(allocator, given.status);
@@ -298,9 +176,6 @@ pub const Plan = struct {
             if (self.find(given.id)) |step| {
                 step.status = status;
                 step.blocked_by = blocked_by;
-                // An update may reword a step. An empty subject leaves the
-                // wording alone, so a caller that only changes a status does
-                // not have to repeat the words to keep them.
                 if (given.subject.len != 0) step.subject = try allocator.dupe(u8, given.subject);
                 continue;
             }
@@ -314,45 +189,15 @@ pub const Plan = struct {
     }
 };
 
-/// What the agent has promised about itself, folded from every `policy.self`
-/// event. See `chock_policy.ratchet`, which holds the rule, and
-/// `chock_proto.event.PolicySelf`, which is what writes one.
-///
-/// **Nothing is ever removed from this list, and there is no event that could
-/// remove one.** The ceiling for one act is the narrowest promise that covers
-/// it, so a list that only grows is a session's own word that only ever gets
-/// narrower. That is the ratchet, and it is a property of this fold rather
-/// than of a check anybody remembers to write: a promise cannot be lifted
-/// because there is nothing to lift it with.
-///
-/// **Order is the order the promises were made in**, so a replay of the log
-/// rebuilds the same list. Nothing reads the order, because the answer is a
-/// minimum, and a reader is a person who wants to see what was promised when.
+/// Nothing is ever removed from this list, and no event can remove one. The
+/// ceiling for an act is the narrowest promise that covers it, so a list that
+/// only grows can only narrow.
 pub const SelfPolicy = struct {
-    /// Every promise, in the order they were made. Empty for a session whose
-    /// agent promised nothing, which is every session that had no use for a
-    /// promise: such a session holds no `policy.self` event at all.
-    ///
-    /// **There is no `isEmpty` beside this, and no other reader either.** The
-    /// list is what `chock_policy.ratchet.ceilingFor` folds, and a session
-    /// that promised nothing folds to `allow`, which is already the answer a
-    /// caller wants. `Plan` has an `isEmpty` because `chock plan` asks that
-    /// question of a session it is about to print. Nothing asks it here.
     restrictions: std.ArrayList(event.SelfRestriction) = .empty,
 
-    /// Merge one `policy.self` in. `allocator` owns every string this keeps,
-    /// which for a `Session` is its own arena.
-    ///
-    /// **An authorised update replaces by exact name, and every other one only
-    /// appends.** See `event.PolicySelf.authorised`: an agent cannot write that
-    /// flag, because `chock_core.Loop` only sets it after a broker outside the
-    /// agent's reach permitted the widening, and the broker holds the policy
-    /// table the agent cannot read.
-    ///
-    /// The strings of a dropped promise are not freed. A `Session` folds into
-    /// one arena that is released whole, the same way every other list here is
-    /// kept, and a fold that freed piece by piece would have to know which
-    /// allocator each string came from.
+    /// An authorised update replaces by exact name, every other one appends. An
+    /// agent cannot write that flag: `chock_core.Loop` sets it only after a
+    /// broker outside the agent's reach permitted the widening.
     pub fn apply(
         self: *SelfPolicy,
         allocator: std.mem.Allocator,
@@ -364,9 +209,6 @@ pub const SelfPolicy = struct {
                 var index: usize = 0;
                 while (index < self.restrictions.items.len) {
                     if (std.mem.eql(u8, self.restrictions.items[index].action, given.action)) {
-                        // Ordered, so the promises that are left read in the
-                        // order they were made, which is what a person reading
-                        // the record the next morning expects.
                         _ = self.restrictions.orderedRemove(index);
                         continue;
                     }
@@ -375,11 +217,6 @@ pub const SelfPolicy = struct {
             }
         }
         for (update.restrictions) |given| {
-            // A restriction that names no action covers no act, so it binds
-            // nothing and a reader could never say what was promised.
-            // `chock_core.Loop` refuses one before it reaches the log. This is
-            // the answer for a log written by something else. Dropping it is
-            // the same treatment `Plan.apply` gives a step with no identifier.
             if (given.action.len == 0) continue;
             try self.restrictions.append(allocator, .{
                 .action = try allocator.dupe(u8, given.action),
@@ -390,69 +227,16 @@ pub const SelfPolicy = struct {
     }
 };
 
-/// A memory of every answer of `approved_by_user_for_session`, folded from the
-/// log so that a resumed process holds the same memory a crashed one did. See
-/// `event.ApprovalDecision.approved_by_user_for_session` for what the decision
-/// itself means.
-///
-/// **Not `chock_broker.askpass.Grants`.** That one holds a host's password.
-/// This one holds a person's answer to an approval. The two share a name and
-/// nothing else.
-///
-/// **A memory of an answer, and never a permission of its own.** Nothing here
-/// decides whether an act runs. A caller reads `get` only after the policy
-/// table has already answered `ask` about the very same action. A `deny` or
-/// an `allow` the table gives on its own is never looked up here, because
-/// there is nothing this struct could add to either of those. It cannot turn
-/// a `deny` into anything else: the table is asked first, every time, and
-/// this is consulted only on the branch where the table's own answer was
-/// already `ask`.
-///
-/// **Session only, and exact.** The key is the exact `action` string a
-/// request named, the same string `chock_policy.table` matches a rule
-/// against. Nothing here is ever written to `chock.zon`. This struct lives
-/// inside `Session`, which lives inside one process for as long as that
-/// process runs, and a process that takes the session over rebuilds it from
-/// nothing but the log, the same way it rebuilds every other field of
-/// `Session`.
-///
-/// **The type cannot enforce that a grant never outlives a narrowing, and it
-/// cannot even detect one.** A `policy.self` event that raises the ceiling
-/// above `ask` for an action already granted here is nothing this struct can
-/// see: `apply` below folds `approval.response` events only, and a
-/// `policy.self` event never passes through it. Session.apply is the caller
-/// that folds both, and `invalidate` is the half of this file that closes
-/// that gap. It exists because the struct itself has no way to close it.
+/// A memory of an answer, never a permission of its own. The type cannot
+/// enforce that a grant never outlives a narrowing, and it cannot detect one:
+/// `apply` folds `approval.response` events only.
 pub const SessionGrants = struct {
     granted: std.StringHashMapUnmanaged(void) = .empty,
 
-    /// Merge one `approval.response` in. `allocator` owns the copy of the
-    /// action string this keeps, which for a `Session` is its own arena.
-    ///
-    /// **Only `approved_by_user_for_session` ever adds an entry, and the
-    /// match is exact equality, never an `else`.** A decision this fold does
-    /// not otherwise recognise cannot fall through into a grant by accident,
-    /// which is the one bug that would turn this memory into a hole.
-    ///
-    /// **`request_id` zero is refused too, even for that one decision.** A
-    /// response the policy table answers on its own, `allowed_by_policy` and
-    /// `denied_by_policy` both, always carries `request_id` zero, because no
-    /// question was ever written for a person to answer: see
-    /// `event.ApprovalResponse.request_id`.
-    ///
-    /// **This build does now write `approved_by_user_for_session` with a
-    /// zero `request_id`, and this is exactly the line that keeps that safe.**
-    /// `Broker.request`'s own `ask` branch, the `.ask` case, writes one to
-    /// record that a remembered grant served an act, with no question asked
-    /// and so no `approval.request` in front of it. That record must never
-    /// become a second source of the grant it is reporting on, or a log an
-    /// attacker could shape would let one recorded use conjure the grant it
-    /// depends on. A person can only give this answer to a question that was
-    /// actually asked, so a fold reads whatever the log holds and must not
-    /// take a line's word for what it claims when the line contradicts
-    /// itself. This is what keeps the read that follows scoped to the ask
-    /// branch: nothing reaches `granted` that did not first pass through a
-    /// real question.
+    /// The match is exact equality, never an `else`: a decision this fold does
+    /// not recognise must not fall through into a grant. `request_id` zero is
+    /// refused too, because a response the table answered on its own carries
+    /// zero, and so does the record of a grant that served an act.
     pub fn apply(
         self: *SessionGrants,
         allocator: std.mem.Allocator,
@@ -465,52 +249,18 @@ pub const SessionGrants = struct {
         try self.granted.put(allocator, owned, {});
     }
 
-    /// Whether this exact action was granted for the rest of the session.
-    /// Null for every action never granted this way, which includes one never
-    /// asked about and one answered with a plain yes, a no, or anything else.
-    ///
-    /// **`fresh_decision_is_ask` must be true only when the caller has just
-    /// asked the policy table about this same action and the table's answer
-    /// was exactly `ask`, never `agent_then_human` and nothing softer than
-    /// that either.** The caller proves it by passing this flag rather than
-    /// this function checking it, because `chock_proto` cannot import
-    /// `chock_policy` and so has no name here for
-    /// `chock_policy.table.Decision` to compare against. A plain boolean is
-    /// the only proof this file can ask for. When the flag is false this
-    /// returns null unconditionally, so an action the table now answers
-    /// `agent_then_human` about can never be waved through on the strength of
-    /// a grant a person gave before that requirement existed.
+    /// `fresh_decision_is_ask` must be true only when the table's answer for
+    /// this same action was exactly `ask`. The caller proves it with a flag
+    /// because `chock_proto` cannot import `chock_policy`.
     pub fn get(self: SessionGrants, action: []const u8, fresh_decision_is_ask: bool) ?bool {
         if (!fresh_decision_is_ask) return null;
         if (self.granted.contains(action)) return true;
         return null;
     }
 
-    /// Drop every remembered grant that `restriction` narrows below `ask`.
-    /// `Session.apply` calls this for every restriction inside a `policy.self`
-    /// event, before or after folding it into `SelfPolicy`. The order between
-    /// the two does not matter, because they are separate structures.
-    ///
-    /// **Only a ceiling stricter than `ask` invalidates.** `chock_policy.table.Decision`
-    /// ranks `deny` and `agent_then_human` below `ask`, and `agent_review` and
-    /// `allow` above it. A grant given while the table said `ask` answers the
-    /// same question a fresh `ask` would, so a restriction that only widens
-    /// past `ask` leaves it alone. `get` would not even look at it, since a
-    /// caller reads `get` only on the branch where the fresh evaluation is
-    /// exactly `ask`. A restriction that narrows to `deny` or to
-    /// `agent_then_human` changes what saying yes once was worth, so the
-    /// remembered answer can no longer stand for the question that is asked
-    /// now. An `unknown` ceiling this build cannot name is read the narrowest
-    /// way there is, the same way `chock_policy.ratchet.ceilingFromLog` reads
-    /// one, so it invalidates too.
-    ///
-    /// **The match is `restriction.action` as a pattern, `git.*` included.**
-    /// `chock_proto` cannot import `chock_policy` to reuse
-    /// `chock_policy.table.patternMatches`, so `matchesPattern` below is a
-    /// second, narrower copy of the same rule: every grant this holds is
-    /// already an exact action, never a pattern, so this only ever has to ask
-    /// whether one pattern covers one exact key, and never whether one
-    /// pattern covers another.
+    /// Only a ceiling stricter than `ask` invalidates: a grant given while the
+    /// table said `ask` still answers a fresh `ask`. An `unknown` ceiling is
+    /// read the narrowest way there is, so it invalidates.
     pub fn invalidate(
         self: *SessionGrants,
         allocator: std.mem.Allocator,
@@ -532,10 +282,7 @@ pub const SessionGrants = struct {
     }
 };
 
-/// Whether `pattern` names `key`, in the pattern language
-/// `chock_policy.table.patternMatches` reads: a bare name that must equal
-/// `key` exactly, or a name followed by `.*` that also names anything below
-/// it. `git.*` matches `git.push` and does not match `git` itself.
+/// `git.*` matches `git.push` and does not match `git` itself.
 fn matchesPattern(pattern: []const u8, key: []const u8) bool {
     if (std.mem.endsWith(u8, pattern, ".*")) {
         const prefix = pattern[0 .. pattern.len - 2];
@@ -547,9 +294,6 @@ fn matchesPattern(pattern: []const u8, key: []const u8) bool {
 }
 
 pub const Session = struct {
-    /// Owns every slice this struct or its entries hold. One arena for the
-    /// whole session's lifetime keeps `apply` simple: nothing here is freed
-    /// piece by piece, only all at once in `deinit`.
     arena: std.heap.ArenaAllocator,
 
     agent_kind: []const u8 = "",
@@ -560,56 +304,24 @@ pub const Session = struct {
     end_reason: event.SessionEndReason = .{ .unknown = "" },
     end_detail: []const u8 = "",
 
-    /// The model's view. Shrinks only when a compaction folds a run of entries
-    /// into one summary entry. Every other event that touches this list only
-    /// grows it.
     context: std.ArrayList(ContextEntry) = .empty,
 
-    /// Every child this session spawned, in `session.spawn` order.
     children: std.ArrayList(Child) = .empty,
 
-    /// The workspace the last attempt at this session opened, or null for a
-    /// session that never opened one.
-    ///
-    /// **A process that takes over a session reads the log, and reads nothing
-    /// else.** The path carries an attempt identifier that `chock run` mints
-    /// for each invocation, so no other process can compute it. A workspace
-    /// the new owner cannot name is a workspace it has to build again out of
-    /// committed state, and that throws away everything the last owner did not
-    /// commit. The base commit is here for the same reason: it is what the
-    /// work of the session is measured against, and a new owner that read
-    /// `HEAD` again would measure against a commit the session made itself.
+    /// A process that takes a session over reads the log and nothing else. A
+    /// new owner that read `HEAD` again would compare the work against a
+    /// commit the session made itself.
     workspace: ?Workspace = null,
 
-    /// The agent's own task list. Empty for a session whose agent never wrote
-    /// one, which is every session that had no use for one. See `Plan`.
     plan: Plan = .{},
 
-    /// What the agent promised about itself. Empty for a session whose agent
-    /// promised nothing. See `SelfPolicy`, and `chock_policy.ratchet` for what
-    /// a promise means once it is here.
     self_policy: SelfPolicy = .{},
 
-    /// Every exact action a person has already said "yes, for the rest of
-    /// this session" to. Empty for a session where nobody has answered that
-    /// way yet. See `SessionGrants`.
     grants: SessionGrants = .{},
 
-    /// What the session has spent so far, folded from every `usage` event.
-    /// See `Spend`: the log is the truth, so a replay of the same log reaches
-    /// the same total, which is the guarantee the context fold already gives.
     spend: Spend = .{},
 
-    /// How many input tokens the last request of this session actually
-    /// carried, from the newest `usage` event. **Zero means nobody knows
-    /// yet**, which is true of a session before its first reply and of one
-    /// right after a compaction, and it is never a claim that the context is
-    /// empty.
-    ///
-    /// Folded here rather than counted in the loop so that a resumed session,
-    /// or one a `/daemonize` handed over, knows how full its context is
-    /// before it sends anything. The state is a fold over the log, and this
-    /// number is in the log already.
+    /// Zero means nobody knows yet, never that the context is empty.
     last_input_tokens: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Session {
@@ -620,7 +332,6 @@ pub const Session = struct {
         self.arena.deinit();
     }
 
-    /// Fold one more event into the state.
     pub fn apply(self: *Session, envelope: event.Envelope) std.mem.Allocator.Error!void {
         const allocator = self.arena.allocator();
         switch (envelope.event) {
@@ -635,22 +346,11 @@ pub const Session = struct {
                 self.end_detail = try allocator.dupe(u8, end.detail);
             },
             .session_spawn => |spawn| {
-                // Record that the child exists. Do not touch the child's log:
-                // the parent context gets the child's result later, through a
-                // different event, never the child's own transcript.
-                //
-                // Built by `childFrom`, the same function `PolicyFold.apply`
-                // calls for the same event: see that struct's own top comment
-                // for why the two folds share this instead of each keeping a
-                // copy that could drift.
                 try self.children.append(allocator, try childFrom(allocator, spawn));
             },
             .workspace_open => |opened| {
-                // **The last one wins.** Each attempt at a session opens one
-                // workspace, so the newest `workspace.open` in the log names
-                // the one that is on disk now. A fold that kept the first
-                // would send the next owner to a path an earlier attempt
-                // already removed.
+                // The last one wins. Keeping the first would send the next
+                // owner to a path an earlier attempt removed.
                 self.workspace = .{
                     .kind = try dupeWorkspaceKind(allocator, opened.kind),
                     .attempt = try allocator.dupe(u8, opened.attempt),
@@ -669,21 +369,12 @@ pub const Session = struct {
                 });
             },
             .usage => |usage| {
-                // The currency is borrowed from the envelope, which the
-                // caller of `apply` owns and may release, so the arena keeps
-                // a copy the way every other field here does. `ownedUsage` is
-                // the same function `PolicyFold.apply` calls for the same
-                // event: see that struct's own top comment.
                 self.spend.add(try ownedUsage(allocator, usage));
                 self.last_input_tokens = usage.input_tokens +
                     usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
             },
             .plan_update => |update| try self.plan.apply(allocator, update),
             .policy_self => |update| {
-                // `grants` and `self_policy` are independent structures, so
-                // the order between clearing one and folding the other does
-                // not matter. See `SessionGrants.invalidate` for why a
-                // narrowing here must clear a grant it covers.
                 for (update.restrictions) |restriction| {
                     try self.grants.invalidate(allocator, restriction);
                 }
@@ -692,37 +383,15 @@ pub const Session = struct {
             .approval_response => |response| try self.grants.apply(allocator, response),
             .compaction => |compaction| {
                 try self.applyCompaction(allocator, compaction);
-                // The context this number measured no longer exists, and the
-                // size of the shorter one is not known until the next reply
-                // says so. A reader that kept the old number would compact
-                // again on the next turn, and then again, on a context that
-                // already has room.
+                // A reader that kept this number would compact again at once.
                 self.last_input_tokens = 0;
             },
-            // Every other kind changes state this fold does not track yet:
-            // tool calls, approval requests, prompts, and diffs. Folding those
-            // belongs with the agent loop, and adding fields nothing reads yet
-            // would be untested code, not state. An `approval.response` is the
-            // one exception, above, and only for the one decision
-            // `SessionGrants` remembers. Every other decision it can carry
-            // changes nothing here.
             else => {},
         }
     }
 
-    /// Replace every context entry inside `[from_id, through_id]` with one
-    /// summary entry, except an entry inside one of `kept_ranges`, which stays
-    /// as it was. This is the only operation that shortens `context`. The log
-    /// itself is never touched, so a fresh replay of it still returns every
-    /// event this session ever applied.
-    ///
-    /// A summary entry is always added, even when no context entry falls
-    /// inside `[from_id, through_id]`, for example a range that covers only
-    /// `tool.call` events, which this fold does not put in the context. A
-    /// compaction is an event in the log, and a reader must be able to see
-    /// that it ran, not just its effect when it had one. The summary lands at
-    /// the point in `context` where a folded entry would have sat, so the
-    /// order of `context` still matches the order of the log.
+    /// A summary entry is always added, even when the range holds no context
+    /// entry, so a reader can see that the compaction ran.
     fn applyCompaction(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -741,9 +410,6 @@ pub const Session = struct {
                 if (isKept(compaction.kept_ranges, entry.id)) try folded.append(allocator, entry);
                 continue;
             }
-            // An entry past the compacted range, with no entry ever falling
-            // inside it: the summary belongs here, in the range's own place
-            // in the id order, not tacked onto the end of the list.
             if (!summary_written and entry.id > compaction.through_id) {
                 try folded.append(allocator, try summaryEntry(allocator, compaction));
                 summary_written = true;
@@ -752,32 +418,21 @@ pub const Session = struct {
         }
         if (!summary_written) try folded.append(allocator, try summaryEntry(allocator, compaction));
 
-        // The old backing array is arena memory: nothing needs an explicit free
-        // here, the whole arena goes away together in Session.deinit.
         self.context = folded;
     }
 };
 
-/// Build one `Child` out of a `session.spawn` event, copied into `allocator`.
-/// Shared by `Session.apply` and `PolicyFold.apply`, so there is one place
-/// that decides what a spawn means and not two that could disagree.
 fn childFrom(allocator: std.mem.Allocator, spawn: event.SessionSpawn) std.mem.Allocator.Error!Child {
     return .{
         .session = try allocator.dupe(u8, spawn.child_session),
         .agent_kind = try allocator.dupe(u8, spawn.child_agent_kind),
         .reason = try allocator.dupe(u8, spawn.reason),
-        // What this child was allowed to spend. Folded here, and not counted
-        // in the loop, so a parent that resumed knows what it has already
-        // handed out. See `chock_core.subagent.budgetSlice`: a slice a
-        // resumed parent forgot would be a slice it could hand out twice.
+        // A budget slice a resumed parent forgot is one it hands out twice.
         .budget_max_cost = spawn.budget_max_cost,
         .budget_currency = try allocator.dupe(u8, spawn.budget_currency),
     };
 }
 
-/// `usage`, with a `known` cost's currency copied into `allocator` so it
-/// outlives the envelope `apply` was given. Shared by `Session.apply` and
-/// `PolicyFold.apply`, for the same reason `childFrom` is.
 fn ownedUsage(allocator: std.mem.Allocator, usage: event.Usage) std.mem.Allocator.Error!event.Usage {
     var owned = usage;
     if (usage.cost == .known) {
@@ -789,73 +444,14 @@ fn ownedUsage(allocator: std.mem.Allocator, usage: event.Usage) std.mem.Allocato
     return owned;
 }
 
-/// What a session's own budget and its promises depend on, kept alive across
-/// many questions the way `src/run.zig`'s `SessionArbiter.decideFn` and
-/// `ToolNetwork.refreshToolPromises` need to, and grown by nothing else.
-///
-/// ## Why this exists, and not a `Session` kept the same way
-///
-/// `Session.context` mirrors the whole conversation, and it only grows: a
-/// `Session` kept alive for the life of a run and caught up on every tool
-/// call, as `decideFn` and `refreshToolPromises` both do, would carry that
-/// growth with it even though neither ever reads `context`. Measured
-/// 2026-09-07 (see `src/run.zig`'s own measurement in `SessionArbiter`'s
-/// top comment): `context` is the largest part of what such a kept
-/// `Session` holds, and it climbs with every turn of the session, without
-/// bound, for a cost nothing pays it for.
-///
-/// **A struct with no `context` field, rather than a `Session` whose
-/// `context` is dropped after each fold.** Dropping a field after the fact
-/// is a promise a caller has to keep by discipline: the moment another
-/// caller reads `session.context` off a value this file handed out, it
-/// reads whatever was last dropped and gets a wrong answer with no error,
-/// exactly the shape of bug this project has already shipped twice
-/// (`Network.io`, `ToolNetwork.session`, see `src/run.zig`'s own account of
-/// both). A `PolicyFold` cannot be misread this way, because there is
-/// nothing here to misread: a caller that writes `.context` gets a compile
-/// error, not a stale value.
-///
-/// ## What it folds, and why that is safe to say once
-///
-/// Exactly the event kinds `decideFn` and `refreshToolPromises` need:
-/// `session.spawn` for `children`, `usage` for `spend`, `policy.self` and
-/// `approval.response` for `self_policy` and `grants`. Every one of those is
-/// folded through the exact function `Session.apply` itself calls for the
-/// same event: `childFrom`, `ownedUsage`, `SelfPolicy.apply`,
-/// `SessionGrants.apply`, `SessionGrants.invalidate`. `apply` below is a
-/// second dispatcher and never a second decision: **if a future event kind
-/// changes what a promise, a grant, a child, or a spend means, the change
-/// belongs in one of those five functions, and both folds pick it up.**
-/// Only the dispatch itself, which kinds to look at, is written twice, the
-/// same way `Session.apply`'s own `switch` and `logscan.zig`'s are two
-/// separate readings of `event.Kind` today: see this project's own note on
-/// that enum's blast radius.
-///
-/// ## What it does not fold, on purpose
-///
-/// `context`, `plan`, `workspace`, `agent_kind`, `model_alias`,
-/// `parent_session`, `ended`, `end_reason`, `end_detail`, and
-/// `last_input_tokens`: every one of these is a real field of `Session`
-/// that a `PolicyFold` simply has none of. Nothing here is a stand-in for
-/// them and nothing here should ever grow one back without giving this
-/// struct a new name, because the day it holds `context` again it is a
-/// `Session` with extra ceremony, not a bound.
+/// This holds no `context` field and must never grow one: a caller that writes
+/// `.context` then gets a compile error rather than a stale value.
 pub const PolicyFold = struct {
-    /// Owns every slice this struct or its entries hold, the same way
-    /// `Session.arena` does for `Session`. One arena for the whole struct's
-    /// lifetime, so `deinit` releases it all at once and a caller never has
-    /// to say which allocator built which string.
     arena: std.heap.ArenaAllocator,
 
-    /// Every child this session spawned. See `Session.children`, the same
-    /// field, on a smaller struct.
     children: std.ArrayList(Child) = .empty,
-    /// What the agent has promised about itself. See `Session.self_policy`.
     self_policy: SelfPolicy = .{},
-    /// Every `approved_by_user_for_session` answer this session has already
-    /// seen. See `Session.grants`.
     grants: SessionGrants = .{},
-    /// What the session has spent so far. See `Session.spend`.
     spend: Spend = .{},
 
     pub fn init(allocator: std.mem.Allocator) PolicyFold {
@@ -866,47 +462,26 @@ pub const PolicyFold = struct {
         self.arena.deinit();
     }
 
-    /// Fold one more event into the state. See this struct's own top
-    /// comment for why this reads only four event kinds and why that is
-    /// safe: every kind it reads is folded through the same function
-    /// `Session.apply` calls for it.
     pub fn apply(self: *PolicyFold, envelope: event.Envelope) std.mem.Allocator.Error!void {
         const allocator = self.arena.allocator();
         switch (envelope.event) {
             .session_spawn => |spawn| try self.children.append(allocator, try childFrom(allocator, spawn)),
             .usage => |usage| self.spend.add(try ownedUsage(allocator, usage)),
             .policy_self => |update| {
-                // Same order note as `Session.apply`'s own `.policy_self`
-                // arm: `grants` and `self_policy` are independent, so the
-                // order between clearing one and folding the other does not
-                // matter.
                 for (update.restrictions) |restriction| {
                     try self.grants.invalidate(allocator, restriction);
                 }
                 try self.self_policy.apply(allocator, update);
             },
             .approval_response => |response| try self.grants.apply(allocator, response),
-            // Everything else changes a field this struct does not carry.
-            // See this struct's own top comment for the list and why each
-            // one is left out on purpose.
             else => {},
         }
     }
 };
 
-/// Build the one context entry a compaction ever adds: its summary text, with
-/// `id` set to `from_id`, and `model_alias` carried over from the compaction
-/// event instead of discarded.
-///
-/// **`from_id`, because the summary sits where the span started and the ids of
-/// `context` must stay in ascending order.** This used to be `through_id`, and
-/// a real session on 2026-08-21 showed what that costs as soon as a compaction
-/// keeps a tail: the summary landed ahead of the entries `kept_ranges` had
-/// kept, while carrying an id larger than all of them. The list was then out of
-/// id order, so the next compaction's own range test, which reads an id, did
-/// not match the entries it meant to fold. **It folded nothing and the context
-/// went on growing.** With `from_id` the summary is never larger than what
-/// follows it, because everything the fold keeps came later in the log.
+/// `from_id`, because the ids of `context` must stay in ascending order. With
+/// `through_id` the summary carried an id larger than the entries a tail kept,
+/// so the next compaction folded nothing and the context went on growing.
 fn summaryEntry(allocator: std.mem.Allocator, compaction: event.Compaction) std.mem.Allocator.Error!ContextEntry {
     return .{
         .id = compaction.from_id,
@@ -969,12 +544,7 @@ fn dupeSessionEndReason(
     };
 }
 
-/// Deep copy a message's content parts into `allocator`. Every plain string
-/// field is duplicated. `.unknown`'s raw JSON tree is not: `context` is a view
-/// built for the model, not the record of truth, and the log, not this struct,
-/// is what must keep every byte of an unrecognized part. A caller that later
-/// needs the raw value of an unknown part in the context can add that copy here
-/// once something actually reads it.
+/// `.unknown`'s raw JSON tree is not copied: the log keeps those bytes.
 fn dupeContentParts(
     allocator: std.mem.Allocator,
     parts: []const event.ContentPart,
@@ -1034,11 +604,6 @@ test "a session that replays a start and two messages holds both messages in ord
 }
 
 test "a compaction event replaces the events before it in the context, and the log keeps them" {
-    // This is the property everything else rests on. The context is a view.
-    // The history stays complete. A real log.Log proves the second half: a
-    // fresh replay after the fold still returns every event that was ever
-    // appended, compaction event included, even though the fold shortened the
-    // session's own context.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1075,17 +640,11 @@ test "a compaction event replaces the events before it in the context, and the l
         }
     }
 
-    // The context is shorter: "one" and "two" collapse into one summary entry,
-    // leaving the summary and "three", not three separate entries.
     try std.testing.expectEqual(@as(usize, 2), session.context.items.len);
     try std.testing.expectEqualStrings("one and two, summarized", session.context.items[0].data.summary);
-    // The compaction named "compact" as the alias that wrote the summary.
-    // The fold must not discard that fact.
     try std.testing.expectEqualStrings("compact", session.context.items[0].model_alias);
     try std.testing.expectEqualStrings("three", session.context.items[1].data.message.content[0].text);
 
-    // The log itself is untouched by the fold: a fresh replay still returns
-    // every event that was ever appended.
     var full_replay = try chock_log.replayFrom(allocator, io, 0);
     defer full_replay.deinit();
     var count: usize = 0;
@@ -1097,9 +656,6 @@ test "a compaction event replaces the events before it in the context, and the l
 }
 
 test "a compaction's kept_ranges survive verbatim inside the folded range" {
-    // Suspicious case: a compaction can keep part of what it folds, so a reader
-    // can see exactly what was dropped. This pins that the kept entry survives
-    // in its original place, between the summary and whatever comes after.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1133,13 +689,6 @@ test "a compaction's kept_ranges survive verbatim inside the folded range" {
 }
 
 test "a second compaction over a context that already holds a summary still shortens it" {
-    // **Measured on a real session, 2026-08-21.** The summary entry used to
-    // carry `through_id`, so after one compaction that kept a tail the
-    // context read [head][summary id 7490][kept ids 2999..7490]: out of id
-    // order. The next compaction's range test reads an id, so it matched
-    // almost nothing, folded almost nothing, and the context went on growing
-    // while the log said a compaction had happened. Every other test in this
-    // file passed throughout, because none of them compacts twice.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1149,8 +698,6 @@ test "a second compaction over a context that already holds a summary still shor
             .message = .{ .role = .user, .content = &.{.{ .text = "turn" }} },
         } });
     }
-    // Fold ids 20 through 60, keeping 50 and 60. Six entries become three:
-    // the head, the summary, and the two kept.
     try session.apply(.{ .id = 70, .session = "01S", .time_ms = 2, .event = .{
         .compaction = .{
             .summary = "the first summary",
@@ -1162,12 +709,10 @@ test "a second compaction over a context that already holds a summary still shor
     } });
     try std.testing.expectEqual(@as(usize, 4), session.context.items.len);
 
-    // The ids are still ascending, which is what the next fold depends on.
     for (session.context.items[1..], session.context.items[0 .. session.context.items.len - 1]) |after, before| {
         try std.testing.expect(before.id <= after.id);
     }
 
-    // Now fold everything after the head again, keeping only the last entry.
     try session.apply(.{ .id = 80, .session = "01S", .time_ms = 3, .event = .{
         .compaction = .{
             .summary = "the second summary",
@@ -1178,17 +723,12 @@ test "a second compaction over a context that already holds a summary still shor
         },
     } });
 
-    // The head, the second summary, and the one kept entry. Three, not four:
-    // the fold really did shorten the context a second time.
     try std.testing.expectEqual(@as(usize, 3), session.context.items.len);
     try std.testing.expectEqualStrings("the second summary", session.context.items[1].data.summary);
     try std.testing.expectEqual(@as(u64, 60), session.context.items[2].id);
 }
 
 test "the fold says which model alias produced which turn, when two aliases wrote in one session" {
-    // A session can mix models freely, a cheap alias for the routine work and
-    // an expensive one for the hard part. This proves the state can answer
-    // "which was which" after the fact, not just while the turn is fresh.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1212,18 +752,12 @@ test "the fold says which model alias produced which turn, when two aliases wrot
     } });
 
     try std.testing.expectEqual(@as(usize, 3), session.context.items.len);
-    // A user turn names no model.
     try std.testing.expectEqualStrings("", session.context.items[0].model_alias);
     try std.testing.expectEqualStrings("cheap", session.context.items[1].model_alias);
     try std.testing.expectEqualStrings("expensive", session.context.items[2].model_alias);
 }
 
 test "a compaction whose range covers no context entry still leaves a summary behind" {
-    // A reviewer found this real case: a compaction range that covers only
-    // tool.call events, which this fold never puts in the context, folded
-    // nothing and left no trace. The log is the complete history, so a
-    // compaction that changed nothing in the context must still be visible as
-    // an event that ran.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1231,8 +765,6 @@ test "a compaction whose range covers no context entry still leaves a summary be
     try session.apply(.{ .id = 10, .session = "01S", .time_ms = 1, .event = .{
         .message = .{ .role = .user, .content = &.{.{ .text = "before" }} },
     } });
-    // ids 20 through 30 stand in for tool.call and tool.result events: never
-    // folded into context, so nothing in context falls inside this range.
     try session.apply(.{ .id = 40, .session = "01S", .time_ms = 4, .event = .{
         .compaction = .{
             .summary = "nothing to fold here",
@@ -1267,16 +799,10 @@ test "a session.spawn event records the child session and not its transcript" {
     try std.testing.expectEqualStrings("reviewer", session.children.items[0].agent_kind);
     try std.testing.expectEqualStrings("review the diff", session.children.items[0].reason);
 
-    // A parent gets the result of a child, never its transcript: a spawn adds
-    // nothing to the context at all.
     try std.testing.expectEqual(@as(usize, 0), session.context.items.len);
 }
 
 test "a session with no plan.update event has no plan at all" {
-    // **Not mandatory is a property of the fold as well as of the tool.** A
-    // one step task with a task list is noise, so a session that never wrote
-    // one holds nothing here, and every reader can tell that from an empty
-    // list rather than from a list of nothing.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1293,10 +819,6 @@ test "a session with no plan.update event has no plan at all" {
 }
 
 test "a step the agent stopped naming is still in the fold, at the status it last had" {
-    // **The fault this design exists to stop.** A task quietly dropped from a
-    // list reads as a task that was finished, and a reader in the morning
-    // cannot see the difference. The fold merges by identifier and removes
-    // nothing, so the only way off the list is to say `abandoned`.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1306,25 +828,20 @@ test "a step the agent stopped naming is still in the fold, at the status it las
         .{ .id = "s2", .subject = "measure it on Darwin", .status = .pending },
         .{ .id = "s3", .subject = "write the command", .status = .pending },
     } } } });
-    // The second update names s1 and s3 and says nothing about s2.
     try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .plan_update = .{ .steps = &.{
         .{ .id = "s1", .subject = "read the fold", .status = .done },
         .{ .id = "s3", .subject = "write the command", .status = .abandoned },
     } } } });
 
-    // Three steps, still, and in the order they were first named.
     try std.testing.expectEqual(@as(usize, 3), session.plan.steps.items.len);
     try std.testing.expectEqualStrings("s1", session.plan.steps.items[0].id);
     try std.testing.expectEqualStrings("s2", session.plan.steps.items[1].id);
     try std.testing.expectEqualStrings("s3", session.plan.steps.items[2].id);
 
-    // The step nobody mentioned again kept the status it had. It did not
-    // vanish, and it did not become done.
     const forgotten = session.plan.find("s2").?;
     try std.testing.expectEqual(event.PlanStatus.pending, std.meta.activeTag(forgotten.status));
     try std.testing.expectEqualStrings("measure it on Darwin", forgotten.subject);
 
-    // And the step that was given up is visible as given up, not as gone.
     const dropped = session.plan.find("s3").?;
     try std.testing.expectEqual(event.PlanStatus.abandoned, std.meta.activeTag(dropped.status));
     try std.testing.expect(dropped.status != .done);
@@ -1334,8 +851,6 @@ test "a step the agent stopped naming is still in the fold, at the status it las
     try std.testing.expectEqual(@as(usize, 1), counts.abandoned);
     try std.testing.expectEqual(@as(usize, 1), counts.pending);
     try std.testing.expectEqual(@as(usize, 3), counts.total());
-    // One step left to do: the abandoned one is not work and the done one is
-    // not work either.
     try std.testing.expectEqual(@as(usize, 1), counts.left());
 }
 
@@ -1354,7 +869,6 @@ test "an update that only changes a status keeps the words, and one that rewords
     const step = session.plan.find("s1").?;
     try std.testing.expectEqualStrings("port the driver", step.subject);
     try std.testing.expectEqual(event.PlanStatus.in_progress, std.meta.activeTag(step.status));
-    // What held it up is gone, because the update said nothing holds it up.
     try std.testing.expectEqualStrings("", step.blocked_by);
 
     try session.apply(.{ .id = 3, .session = "01S", .time_ms = 3, .event = .{ .plan_update = .{ .steps = &.{
@@ -1365,8 +879,6 @@ test "an update that only changes a status keeps the words, and one that rewords
 }
 
 test "a status this reader does not know is counted apart, and never as done" {
-    // A plan written by a newer Chock. Reading an unrecognized status as
-    // finished would report work nobody did.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1378,17 +890,11 @@ test "a status this reader does not know is counted apart, and never as done" {
     const counts = session.plan.counts();
     try std.testing.expectEqual(@as(usize, 0), counts.done);
     try std.testing.expectEqual(@as(usize, 1), counts.unrecognized);
-    // It counts as work that is left, which is the answer that understates
-    // nothing.
     try std.testing.expectEqual(@as(usize, 1), counts.left());
     try std.testing.expectEqualStrings("deferred", session.plan.find("s1").?.status.wireName());
 }
 
 test "the plan folds from the log, and a fresh replay of the same log gives the same list" {
-    // **The property the whole design rests on.** The list is in the log, so a
-    // session that was compacted, handed to the daemon, or attached to from a
-    // phone rebuilds exactly the list the terminal had. A plan kept anywhere
-    // but the log would pass every other test in this file and fail this one.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1403,8 +909,6 @@ test "the plan folds from the log, and a fresh replay of the same log gives the 
     defer chock_log.close(io);
     var locked = try chock_log.lock(io);
 
-    // The live session: it folds each event as it appends it, which is what
-    // `Loop.appendAndApply` does.
     var live = Session.init(allocator);
     defer live.deinit();
 
@@ -1427,7 +931,6 @@ test "the plan folds from the log, and a fresh replay of the same log gives the 
         try live.apply(.{ .id = id, .session = "01PLAN", .time_ms = @intCast(time), .event = one });
     }
 
-    // The replay: a reader that has only the file.
     var replayed = Session.init(allocator);
     defer replayed.deinit();
     var replay = try chock_log.replayFrom(allocator, io, 0);
@@ -1446,8 +949,6 @@ test "the plan folds from the log, and a fresh replay of the same log gives the 
         try std.testing.expectEqualStrings(from_live.blocked_by, from_file.blocked_by);
     }
 
-    // And the list really says what happened: one finished, one given up, one
-    // still waiting on the one that was given up.
     const counts = replayed.plan.counts();
     try std.testing.expectEqual(@as(usize, 1), counts.done);
     try std.testing.expectEqual(@as(usize, 1), counts.abandoned);
@@ -1456,12 +957,6 @@ test "the plan folds from the log, and a fresh replay of the same log gives the 
 }
 
 test "a promise the agent made survives a resume, because it is folded from the log" {
-    // **The property the ratchet rests on.** A promise held in the model's
-    // attention is lost to a compaction, to a resume, and to a handover to the
-    // daemon. This one is written down, so a reader that has only the file
-    // rebuilds exactly what the live session held, which is what makes
-    // `src/run.zig` able to enforce it after `Loop.run` has ended and the
-    // live state is gone.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1484,8 +979,6 @@ test "a promise the agent made survives a resume, because it is folded from the 
         .{ .policy_self = .{ .restrictions = &.{
             .{ .action = "net.fetch", .ceiling = .deny, .reason = "this task reads local files only" },
         } } },
-        // A compaction between the two, which is the event that would take a
-        // promise away from a model that only remembered it.
         .{ .compaction = .{
             .from_id = 0,
             .through_id = 0,
@@ -1512,8 +1005,6 @@ test "a promise the agent made survives a resume, because it is folded from the 
         try replayed.apply(envelope.value);
     }
 
-    // The reader with only the file holds what the live session held, in the
-    // order the promises were made in.
     try std.testing.expectEqual(
         live.self_policy.restrictions.items.len,
         replayed.self_policy.restrictions.items.len,
@@ -1529,18 +1020,10 @@ test "a promise the agent made survives a resume, because it is folded from the 
     try std.testing.expectEqualStrings("git.*", replayed.self_policy.restrictions.items[1].action);
     try std.testing.expectEqualStrings("ask", replayed.self_policy.restrictions.items[1].ceiling.wireName());
 
-    // The compaction shortened the model's own view, and it took nothing off
-    // this list. That is the difference between a promise and a message.
     try std.testing.expect(replayed.context.items.len < written.len);
 }
 
 test "a promise from a newer writer keeps its own spelling, and one that binds nothing is dropped" {
-    // Two rules of this fold, and they fail in opposite directions on purpose.
-    // A ceiling this build has no member for is kept exactly as written, so
-    // `chock_policy.ratchet.ceilingFromLog` can read it as the narrowest thing
-    // there is rather than as one of the five it knows. An action that names
-    // nothing covers no act at all, so nothing could ever be measured against
-    // it and a reader could never say what was promised.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1559,10 +1042,6 @@ test "a promise from a newer writer keeps its own spelling, and one that binds n
 }
 
 test "a grant for the rest of the session survives a resume, because it is folded from the log" {
-    // The same property `SelfPolicy` rests on, kept here for the memory
-    // `SessionGrants` holds instead of a promise: a process that only has the
-    // file rebuilds exactly what the live session held, because nothing here
-    // lives anywhere the log does not.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1580,7 +1059,6 @@ test "a grant for the rest of the session survives a resume, because it is folde
     var live = Session.init(allocator);
     defer live.deinit();
 
-    // The action a person answers "yes, for the rest of the session" to.
     const granted_request: event.Event = .{ .approval_request = .{
         .action = "git.push",
         .summary = "push to origin",
@@ -1604,8 +1082,6 @@ test "a grant for the rest of the session survives a resume, because it is folde
     const granted_response_id = try locked.append(allocator, io, granted_response, 2);
     try live.apply(.{ .id = granted_response_id, .session = "01GRANTS", .time_ms = 2, .event = granted_response });
 
-    // A second action, asked about and answered with a plain yes. It must
-    // never be remembered the way the first one is.
     const plain_request: event.Event = .{ .approval_request = .{
         .action = "git.commit",
         .summary = "commit the fix",
@@ -1648,16 +1124,8 @@ test "a grant for the rest of the session survives a resume, because it is folde
 }
 
 test "the overlay is read only where a question was actually asked" {
-    // `event.ApprovalResponse.request_id` is zero exactly when the policy
-    // table decided on its own, `allowed_by_policy` and `denied_by_policy`
-    // both: no question was ever written, so nobody could have answered one.
-    // Nothing in this build ever writes `approved_by_user_for_session` with a
-    // zero `request_id`, because a person can only give that answer to a
-    // question that was actually shown, but this fold reads whatever a line
-    // claims and must not take its word over the one fact the rest of the log
-    // already keeps honest. This is the same fact that says the policy table
-    // answered `ask`: a request was written, and it only ever is on that
-    // branch.
+    // `request_id` is zero when the table decided on its own, so no question
+    // was written and nobody could have answered one.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1670,9 +1138,6 @@ test "the overlay is read only where a question was actually asked" {
     } } });
     try std.testing.expectEqual(@as(?bool, null), session.grants.get("git.push", true));
 
-    // The same decision, this time naming the request that was actually
-    // asked. Only now is it remembered, which is what proves the check above
-    // refuses a real thing and not merely everything.
     try session.apply(.{ .id = 2, .session = "01S", .time_ms = 2, .event = .{ .approval_response = .{
         .request_id = 1,
         .decision = .approved_by_user_for_session,
@@ -1683,12 +1148,6 @@ test "the overlay is read only where a question was actually asked" {
 }
 
 test "every decision but the one exact yes leaves the overlay untouched, a deny included" {
-    // The property that stops this being a hole. A `denied_by_policy` for the
-    // very same action a real grant would use, carrying the same nonzero
-    // `request_id` a real grant would carry, still changes nothing: the match
-    // below is an exact equality against one member, never an `else`, so a
-    // decision this fold does not otherwise recognise cannot fall through
-    // into a grant by accident.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1721,11 +1180,6 @@ test "every decision but the one exact yes leaves the overlay untouched, a deny 
 }
 
 test "a policy.self narrowing the exact action clears the grant it names" {
-    // The high finding this fold closes: a grant given while the table said
-    // `ask` must not survive the agent narrowing that very action to
-    // `agent_then_human`, because from that point on a reviewer has to weigh
-    // the act before a person is asked, and the old grant knows nothing of a
-    // reviewer.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1747,11 +1201,6 @@ test "a policy.self narrowing the exact action clears the grant it names" {
 }
 
 test "a policy.self narrowing through a class pattern clears every grant it covers" {
-    // The same clearing, reached through `git.*` rather than through
-    // `git.push` by name. A grant is keyed by the exact action a person was
-    // asked about, but the restriction that takes it away speaks the same
-    // pattern language a policy rule does, and a class covers every name
-    // below it.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1773,9 +1222,6 @@ test "a policy.self narrowing through a class pattern clears every grant it cove
 }
 
 test "a policy.self narrowing an unrelated action leaves another grant alone" {
-    // The negative for both tests above. A restriction is scoped to the
-    // action or class it names, and a grant for a different action is not
-    // collateral damage.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1796,10 +1242,6 @@ test "a policy.self narrowing an unrelated action leaves another grant alone" {
 }
 
 test "a ceiling of ask or wider never clears a grant" {
-    // The other half of `invalidate`'s own condition, pinned rather than
-    // left to the reader's trust: a restriction that names the same action
-    // but only ever repeats or widens past `ask` is not the narrowing this
-    // fold exists to catch, and it must leave the grant standing.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1828,14 +1270,8 @@ test "a ceiling of ask or wider never clears a grant" {
 }
 
 test "get returns the grant only where the fresh decision is exactly ask" {
-    // The boundary the high finding turns on, pinned directly rather than
-    // only described: `Broker.request` routes both `.ask` and
-    // `.agent_then_human` through `askTheHuman`, so a caller must prove which
-    // one the fresh evaluation actually was. `get` takes that proof as a
-    // plain boolean, because `chock_proto` cannot name
-    // `chock_policy.table.Decision` to check it itself. The same grant reads
-    // as present when the caller says `ask` and as absent when the caller
-    // says anything else, including `agent_then_human`.
+    // `Broker.request` routes both `.ask` and `.agent_then_human` through
+    // `askTheHuman`, so a caller must prove which one it had.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1852,9 +1288,6 @@ test "get returns the grant only where the fresh decision is exactly ask" {
 }
 
 test "a plan step with no identifier is dropped, because nothing could ever change it" {
-    // A line written by something that is not this loop. A step nothing can
-    // name again is a step that can never be crossed off, so it is refused at
-    // the fold rather than sitting on the list forever.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -1869,10 +1302,6 @@ test "a plan step with no identifier is dropped, because nothing could ever chan
 }
 
 test "a free turn and an unknown turn are counted apart, and neither adds money" {
-    // The fault the three state `Cost` exists to stop. Both of these leave
-    // `amount` at zero, so a reader with only a total cannot tell them apart,
-    // and they mean opposite things: the free one is a measured fact and the
-    // unknown one is an absence.
     var spend = Spend{};
     spend.add(.{ .input_tokens = 10, .cost = .free });
     spend.add(.{ .input_tokens = 20, .cost = .unknown });
@@ -1883,10 +1312,7 @@ test "a free turn and an unknown turn are counted apart, and neither adds money"
     try std.testing.expectEqual(@as(u64, 1), spend.unpriced_turns);
     try std.testing.expectEqual(@as(u64, 1), spend.pricedTurns());
     try std.testing.expectEqual(@as(u64, 60), spend.input_tokens);
-    // Only the priced turn put money in. The free one is not a discount and
-    // the unknown one is not a zero.
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), spend.amount, 1e-12);
-    // And the unknown one alone is what stops a cap being enforced.
     try std.testing.expect(!spend.enforceable());
 
     var free_only = Spend{};
@@ -1895,15 +1321,10 @@ test "a free turn and an unknown turn are counted apart, and neither adds money"
     try std.testing.expectEqual(@as(u64, 2), free_only.free_turns);
     try std.testing.expectEqual(@as(u64, 0), free_only.unpriced_turns);
     try std.testing.expectEqual(@as(u64, 0), free_only.pricedTurns());
-    // A session against a local model runs under a cap without trouble.
     try std.testing.expect(free_only.enforceable());
 }
 
 test "a state a newer writer used counts as unknown and never as free" {
-    // An `unrecognized` cost came from a Chock this reader is older than. It
-    // is not a number and it is not a measured zero, so it takes the answer
-    // that refuses to enforce a cap rather than the one that enforces a wrong
-    // one.
     var spend = Spend{};
     spend.add(.{ .cost = .{ .unrecognized = .{ .name = "metered", .raw = .null } } });
     try std.testing.expectEqual(@as(u64, 1), spend.unpriced_turns);
@@ -1912,9 +1333,6 @@ test "a state a newer writer used counts as unknown and never as free" {
 }
 
 test "two sessions add up, and two currencies stop the total being one" {
-    // What `chock usage` does across a project. Adding a euro to a dollar
-    // gives a number in no currency at all, so the sum says it is not a sum
-    // rather than printing a figure nobody can check.
     var first = Spend{};
     first.add(.{ .input_tokens = 100, .cost = .{ .known = .{ .value = 1.50, .currency = "USD" } } });
     first.add(.{ .input_tokens = 100, .cost = .free });
@@ -1940,9 +1358,6 @@ test "two sessions add up, and two currencies stop the total being one" {
     try std.testing.expect(total.mixed_currency);
     try std.testing.expect(!total.enforceable());
 
-    // And a session that was already mixed carries that across the merge,
-    // rather than the flag being lost because this session's own currency
-    // matched.
     var already_mixed = Spend{ .mixed_currency = true };
     var fresh = Spend{};
     fresh.merge(already_mixed);
@@ -1951,16 +1366,10 @@ test "two sessions add up, and two currencies stop the total being one" {
 }
 
 test "the newest workspace.open is the workspace, because each attempt opens one" {
-    // The fact this pins: the fold overwrites, and it does not append or keep
-    // the first. Each attempt at a session mints its own identifier and opens
-    // its own workspace, so only the newest one is on disk. A next owner sent
-    // to an earlier path would find a directory an earlier attempt removed.
-    // Change `apply` to keep the first value and this test stops holding.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
 
-    // A session that opened nothing names no path, so nothing can invent one.
     try std.testing.expectEqual(@as(?Workspace, null), session.workspace);
 
     try session.apply(.{ .id = 1, .session = "01S", .time_ms = 1, .event = .{ .workspace_open = .{
@@ -1980,17 +1389,10 @@ test "the newest workspace.open is the workspace, because each attempt opens one
     try std.testing.expectEqualStrings("01SECOND", workspace.attempt);
     try std.testing.expectEqualStrings("/work/01SECOND/upper", workspace.path);
     try std.testing.expectEqualStrings("overlay", workspace.kind.wireName());
-    // An overlay has no commit of its own, and the fold does not carry the
-    // commit of the attempt before it.
     try std.testing.expectEqualStrings("", workspace.base_commit);
 }
 
 test "the fold copies the workspace strings, so a released envelope leaves them whole" {
-    // The fact this pins: `apply` keeps no reference into the envelope it was
-    // given. The next owner of a session reads these strings long after the
-    // replay that produced them freed its line. Change the `.workspace_open`
-    // arm to assign the slices instead of duplicating them and this test stops
-    // holding, under the testing allocator or under a sanitizer.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -2016,17 +1418,10 @@ test "the fold copies the workspace strings, so a released envelope leaves them 
     try std.testing.expectEqualStrings("01ATTEMPT", workspace.attempt);
     try std.testing.expectEqualStrings("/work/01ATTEMPT", workspace.path);
     try std.testing.expectEqualStrings("9f2c1ab4d5e6f708", workspace.base_commit);
-    // A backing a newer writer used keeps its spelling here too, so a person
-    // reading the state sees what the log said.
     try std.testing.expectEqualStrings("btrfs_subvolume", workspace.kind.wireName());
 }
 
 test "a handed over session ends, and the workspace it names is still the one on disk" {
-    // The fact this pins: the two halves of a live handover reach the state
-    // together. The end reason says the session stopped for a new owner, and
-    // the fold still names the workspace and the commit that owner has to
-    // adopt. Change `session.end` to clear `workspace` and this test stops
-    // holding.
     const allocator = std.testing.allocator;
     var session = Session.init(allocator);
     defer session.deinit();
@@ -2046,8 +1441,6 @@ test "a handed over session ends, and the workspace it names is still the one on
         event.SessionEndReason.handed_over,
         std.meta.activeTag(session.end_reason),
     );
-    // Not a cancel: a cancel takes the workspace away, and a handover hands it
-    // on. See `event.SessionEndReason.handed_over`.
     try std.testing.expect(std.meta.activeTag(session.end_reason) != .canceled_by_user);
     try std.testing.expectEqualStrings("/work/01ATTEMPT", session.workspace.?.path);
     try std.testing.expectEqualStrings("aaaa1111", session.workspace.?.base_commit);

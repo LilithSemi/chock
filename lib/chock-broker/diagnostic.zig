@@ -1,167 +1,63 @@
-//! Why the broker refused an act, or could not carry one out.
-//!
-//! **A library must not decide what a person sees.** Every fault below used
-//! to print a line to the terminal and then return a coarse error, or in
-//! several cases return nothing at all and leave the print as the only
-//! record. That put a library in charge of what a person reads, and it left
-//! a caller that is not a terminal, such as `chockd`, with an error name or
-//! with silence.
-//!
-//! **This is one type for the whole module.** A caller of `actions.run` does
-//! not know in advance whether it will hear from the approval flow, from the
-//! act itself, or from the socket the answer arrives on, so it holds one
-//! slot and reads one answer.
-//!
-//! **Several variants own memory, and `deinit` releases all of them.** What
-//! `git` wrote on its error stream, and a field read out of the session log,
-//! both live in buffers their reader frees on the way out, so the diagnostic
-//! keeps a copy. A variant that names a path or an action inside an `Ask`
-//! borrows it: the caller of `actions.run` holds that `Ask` for the whole
-//! call, and `deinit` frees nothing there.
-//!
-//! **`deinit` names every variant and has no `else`.** A variant added later
-//! must say which of the two groups it is in before this file compiles again.
-//! The `else` this had is how `answer_claims_a_review` came to share an arm
-//! with `answer_names_an_unknown_decision`: the first held `@tagName` of a
-//! decision, which is a pointer into `.rodata`, and the second holds a copy.
-//! `gpa.free` on the literal ended the process. That field is now a
-//! `ReviewDecision`, which removes the lifetime rather than answering it.
-//!
-//! **One variant is a notice and not a fault.** See
-//! `scratch_store_holds_a_non_object`.
+//! Why the broker refused an act, or could not carry one out. A library must
+//! not decide what a person sees, so nothing here prints. Some variants own
+//! memory and the rest borrow from the `Ask` the caller holds for the call.
 
 const std = @import("std");
 
 const chock_policy = @import("chock-policy");
 
 pub const Diagnostic = union(enum) {
-    /// What is at a path could not be read, so the request cannot show it.
-    /// The path is borrowed from the `Ask`.
     path_read_failed: PathFailed,
-    /// A `git` call refused while a description was being read. Its error
-    /// stream is copied.
     git_refused_a_description: []const u8,
-    /// The scratch object store could not be opened. The path is borrowed.
     scratch_store_unreadable: PathFailed,
-    /// The scratch object store could not be walked.
     scratch_store_walk_failed: anyerror,
-    /// **A notice, not a fault.** The scratch object store holds a file that
-    /// is not an object, so that file does not move. The call still
-    /// succeeds. A caller that reads its slot after a call that returned
-    /// normally finds this, and nothing else ever lands there on that path.
-    /// The name is copied.
+    /// A notice, not a fault. The call still succeeds.
     scratch_store_holds_a_non_object: []const u8,
 
-    /// A `git` call refused while the act was being done. Its error stream
-    /// is copied.
     git_refused_the_act: []const u8,
-    /// The branch is not where the approved act said it was, so it is not
-    /// deleted. Every name is copied.
     branch_moved: BranchMoved,
-    /// The URL names a scheme this broker does not fetch. Borrowed from the
-    /// `Ask`'s own URL.
     scheme_not_fetchable: []const u8,
-    /// The URL names a host other than the one the approval covers. The
-    /// approved host is borrowed from the `Ask`; the one the URL named is
-    /// copied.
     host_not_approved: HostNotApproved,
-    /// The Nix daemon socket cannot be reached, so nothing is built. The
-    /// path is borrowed.
     nix_daemon_unreachable: PathFailed,
-    /// A file the act writes could not be opened. The path is borrowed.
     file_not_openable: PathFailed,
-    /// A file the act writes could not be written. The path is borrowed.
     file_not_writable: PathFailed,
-    /// An object the request listed is in neither store, so the ref does not
-    /// move. The id is borrowed from the `Ask`.
     object_missing: []const u8,
-    /// An object could not be put in the project. The id is borrowed.
     object_not_moved: PathFailed,
-    /// The roster of this session does not name the model. Borrowed.
     model_not_on_roster: []const u8,
-    /// A command could not be started. The name is borrowed from its own
-    /// argument vector, which the caller built.
     command_not_started: PathFailed,
-    /// What a command printed could not be read.
     command_output_unreadable: []const u8,
-    /// Waiting for a command failed.
     command_wait_failed: PathFailed,
 
-    /// The policy asks for a person and this request cannot wait for one, so
-    /// no review was paid for. The action name is borrowed from the `Ask`.
     cannot_wait_for_a_person: DecisionAbout,
-    /// A review came back for a decision that asks for no review.
     review_for_a_decision_that_asks_for_none: DecisionAbout,
-    /// The policy asks for a review and this session can start no reviewer.
     no_reviewer: DecisionAbout,
-    /// The reviewer's own kind is already in the chain that asked, so the
-    /// review would be the requester reviewing itself. Both are borrowed.
     reviewer_reviews_itself: ReviewerReviewsItself,
-    /// The answer in the log is about a different request. Every field read
-    /// out of the log is copied; the two from the `Ask` are borrowed.
     answer_is_about_another_request: MismatchedAnswer,
-    /// The answer claims a decision only the broker's own review writes.
-    /// **The decision is an enumeration and not a string**, so this variant
-    /// owns nothing and has no lifetime to get wrong: see `ReviewDecision`.
     answer_claims_a_review: ReviewClaimed,
-    /// The answer names a decision this build does not know. The name is
-    /// copied.
     answer_names_an_unknown_decision: AnswerNames,
 
-    /// The path is longer than a unix socket path may be on this platform, so
-    /// nothing was bound. Borrowed. See `chock-broker/socket.zig`'s own
-    /// `max_socket_path` for why the bound is not the same on both platforms.
     socket_path_too_long: SocketPathTooLong,
-    /// The approval socket directory could not be made. Borrowed.
     socket_dir_not_made: PathFailed,
-    /// The approval socket directory could not be opened. Borrowed.
     socket_dir_not_opened: PathFailed,
-    /// The approval socket directory could not be made private. Borrowed.
     socket_dir_not_private: PathFailed,
-    /// The approval socket itself could not be opened. Borrowed.
     socket_not_opened: PathFailed,
-    /// A socket file was already at the path and could not be removed.
-    /// Borrowed.
     socket_not_removed: PathFailed,
-    /// A client of another user tried to attach. **Not a fault of Chock's**,
-    /// and the connection is closed either way: this is what a person needs
-    /// to see when their own client will not attach.
     client_uid_refused: ClientUidRefused,
-    /// A step of the waiter failed. `what` is a literal of this module.
     waiter_step_failed: PathFailed,
 
-    /// The bytes a sandboxed process asked to reach are not a host name.
     net_host_not_a_name: NetHost,
-    /// The policy does not permit that host and port for this spawn chain.
-    /// `decision` is what the table really answered, so a person reads which
-    /// rule turned it away and not only that something did.
     net_host_not_permitted: NetRefused,
-    /// The policy permits the host and the name did not resolve.
     net_host_not_resolved: NetHost,
-    /// The name resolved onto this machine rather than onto the network: the
-    /// loopback interface, a link local address such as the cloud metadata
-    /// service, the unspecified address, or a multicast one. See
-    /// `network.addressIsReachable`.
     net_address_not_permitted: NetHost,
-    /// The address was permitted and the connection did not open.
     net_not_connected: NetHost,
 
-    /// The policy does not permit that host for this spawn chain. `decision`
-    /// is what the table really answered, so a person reads which rule turned
-    /// it away and not only that something did.
     fetch_host_not_permitted: FetchRefused,
-    /// The host's own `robots.txt` disallows that path. **Convention parity
-    /// and not a boundary**: see `lib/chock-broker/fetch.zig`.
+    /// Convention parity and not a boundary. See `lib/chock-broker/fetch.zig`.
     fetch_robots_disallow: FetchPath,
 
-    /// A secret handle has no closing brace.
     secret_handle_unterminated,
-    /// No credential is named by a handle. Borrowed from the text, which the
-    /// caller holds.
     secret_not_named: []const u8,
 
-    /// A path, or another name, and the fault it gave. `path` is borrowed
-    /// unless the variant's own comment says otherwise.
     pub const PathFailed = struct {
         path: []const u8,
         err: anyerror,
@@ -198,19 +94,10 @@ pub const Diagnostic = union(enum) {
 
     pub const AnswerNames = struct {
         request_id: u64,
-        /// **Owned**, and released by `deinit`. The name is read out of a log
-        /// event the reader moves past at once.
         name: []const u8,
     };
 
-    /// Which of the three decisions a review writes an answer claimed.
-    ///
-    /// **An enumeration and not a string**, so this field has no lifetime and
-    /// cannot dangle. It used to hold `@tagName` of the decision, which is a
-    /// pointer into `.rodata`, and `deinit` freed it beside a name that really
-    /// was a copy. The names are the wire names of
-    /// `chock_proto.event` decisions, because a person reading the message
-    /// wants the word the log holds.
+    /// An enumeration and not a string, so this field has no lifetime.
     pub const ReviewDecision = enum {
         approved_by_review,
         refused_by_review,
@@ -230,9 +117,6 @@ pub const Diagnostic = union(enum) {
         decision: ReviewDecision,
     };
 
-    /// A socket path and the bound it passed. **The bound is carried and not
-    /// read at the reader**, so a person sees the number the build that
-    /// refused really used.
     pub const SocketPathTooLong = struct {
         path: []const u8,
         bound: usize,
@@ -243,50 +127,33 @@ pub const Diagnostic = union(enum) {
         owner_uid: std.posix.uid_t,
     };
 
-    /// A host and a port a sandboxed process asked to reach. `host` is owned:
-    /// see the network broker's own group above.
     pub const NetHost = struct {
         host: []const u8,
         port: u16,
     };
 
-    /// The same, and what the table answered. `host` is owned.
     pub const NetRefused = struct {
         host: []const u8,
         port: u16,
         decision: chock_policy.table.Decision,
     };
 
-    /// A host the fetch tool was asked to read, and what the table answered.
-    /// `host` is owned, and so is `action` when it is there.
     pub const FetchRefused = struct {
         host: []const u8,
         decision: chock_policy.table.Decision,
-        /// The policy key the host builds, for example
-        /// `net.fetch.org.ziglang`, or null for a host that builds none.
-        ///
-        /// **Carried so the sentence can name the rule to add.** A person who
-        /// reads "the policy refused it" has learned nothing they can act on,
-        /// and the one thing they can do is write a row of `chock.zon`. The
-        /// key is built where the decision is made, because that is the one
-        /// place that knows how a host becomes an action.
+        /// The policy key the host builds, or null for a host that builds none.
         action: ?[]const u8 = null,
     };
 
-    /// A host and the path on it that `robots.txt` disallowed. Both are owned.
     pub const FetchPath = struct {
         host: []const u8,
         path: []const u8,
     };
 
-    /// Release what the diagnostic owns, with the allocator that filled it.
-    /// Safe on every variant, so a caller can call it without asking which
-    /// one it holds.
-    ///
-    /// **Every variant is named here, and there is no `else`.** A variant
-    /// added later must say whether it owns memory before this file compiles
-    /// again. The `else` this had is what let `answer_claims_a_review` fold
-    /// into the arm beside it and free a string literal.
+    /// Every variant is named here and there is no `else`, so a variant added
+    /// later must say whether it owns memory. An `else` once folded a
+    /// `@tagName` pointer into `.rodata` in with a copied name, and `gpa.free`
+    /// on the literal ended the process.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .git_refused_a_description,
@@ -319,10 +186,7 @@ pub const Diagnostic = union(enum) {
                 gpa.free(about.path);
             },
 
-            // Every one below owns nothing. A field of one of these is
-            // borrowed from the `Ask`, which the caller of `actions.run`
-            // holds for the whole call, or it is a number, or an
-            // enumeration, or a literal of this build.
+            // Every one below owns nothing.
             .path_read_failed,
             .scratch_store_unreadable,
             .scratch_store_walk_failed,
@@ -532,22 +396,16 @@ pub const Diagnostic = union(enum) {
                 "the connection to {s} on port {d} did not open",
                 .{ about.host, about.port },
             ),
-            // **Written to the person and not about them.** This is the one
-            // sentence a reader can act on, so it names the rule to write, the
-            // block it goes in, and the file. The agent is told a different
-            // sentence for the same refusal: see
-            // `chock_broker.fetch.Session.refusalForHost`, and
-            // `chock_proto.event.ToolResult.note` for why the two are separate
-            // and must stay so.
+            // The agent is told a different sentence for the same refusal: see
+            // `chock_broker.fetch.Session.refusalForHost`.
             .fetch_host_not_permitted => |about| {
                 try writer.print("nothing was read from {s}. ", .{about.host});
                 const action = about.action orelse {
                     return writer.writeAll("That is not a host name a policy key is built " ++
                         "from, so no rule of chock.zon can name it. Give a plain host name.");
                 };
-                // A host a rule already denies is a decision somebody made.
-                // Telling them to add an `allow` row would be wrong: the row
-                // that is there wins, and they have to find it first.
+                // A rule that is there wins, so do not tell a person to add an
+                // `allow` row for a host a rule already denies.
                 if (about.decision == .deny) {
                     return writer.print(
                         "A rule of this project's policy denies that host. Change the rule " ++
@@ -572,15 +430,9 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one, and say whether it took `value`.
-///
-/// **The first fault is kept, not the last.** An act can only be carried out
-/// after the approval flow permitted it, so a later fault overwriting an
-/// earlier one would replace the fault that explains the run with the fault
-/// it caused.
-///
-/// The answer matters because several variants own memory: a site that hands
-/// one over must release it itself when the answer is false.
+/// The first fault is kept, not the last. The answer matters because several
+/// variants own memory: a site that hands one over must release it itself when
+/// the answer is false.
 pub fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -588,9 +440,8 @@ pub fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Whether a diagnostic is wanted and still empty, which is the one case in
-/// which a site should copy a string for it. A caller that passes null must
-/// pay no allocation at all.
+/// Wanted and still empty, which is the one case in which a site should copy
+/// a string for it.
 pub fn wants(out: ?*?Diagnostic) bool {
     const slot = out orelse return false;
     return slot.* == null;
@@ -599,33 +450,19 @@ pub fn wants(out: ?*?Diagnostic) bool {
 const testing = std.testing;
 
 test "the first fault is kept, and a caller that wants none pays nothing" {
-    // **The first, not the last.** An act is only carried out after the
-    // approval flow permitted it, so a later fault overwriting an earlier one
-    // would replace the fault that explains the run with the fault it caused.
     var diag: ?Diagnostic = null;
     try testing.expect(note(&diag, .{ .no_reviewer = .{ .decision = .agent_review, .action = "git.push" } }));
     try testing.expect(!note(&diag, .{ .model_not_on_roster = "sonnet" }));
     try testing.expectEqualStrings("git.push", diag.?.no_reviewer.action);
 
-    // A caller that asked for no diagnostic must reach no store at all. The
-    // false answer is what tells an owning site to release its own copy
-    // rather than leak it into a slot that does not exist.
     try testing.expect(!note(null, .{ .model_not_on_roster = "sonnet" }));
     try testing.expect(!wants(null));
     try testing.expect(!wants(&diag));
 }
 
 test "a message is released by the allocator that filled it, and by nothing else" {
-    // The fault this test exists for: `answer_claims_a_review` held
-    // `@tagName` of a decision, `deinit` folded it into the arm that frees a
-    // copied name, and `gpa.free` reached a pointer into `.rodata`. The
-    // process died on a `memset` of read only memory.
-    //
-    // Every variant goes through `deinit` here, filled the way its own site
-    // fills it. A variant added later that borrows where its neighbours own
-    // fails here rather than in a user's run. A dangling read alone often
-    // does not fail, because a freed page still holds the text: **it is the
-    // invalid free that never passes.**
+    // A dangling read alone often does not fail, because a freed page still
+    // holds the text. It is the invalid free that never passes.
     var debug: std.heap.DebugAllocator(.{ .safety = true }) = .init;
     defer testing.expect(debug.deinit() == .ok) catch @panic("a leak");
     const gpa = debug.allocator();
@@ -636,8 +473,7 @@ test "a message is released by the allocator that filled it, and by nothing else
     }
 }
 
-/// One of every variant, each filled the way its own site fills it. Owned
-/// strings are copies of `gpa`, and borrowed ones are literals.
+/// Owned strings are copies of `gpa`, and borrowed ones are literals.
 fn everyVariant(gpa: std.mem.Allocator) [12]Diagnostic {
     return .{
         .{ .git_refused_a_description = gpa.dupe(u8, "no") catch @panic("no memory") },
@@ -659,8 +495,6 @@ fn everyVariant(gpa: std.mem.Allocator) [12]Diagnostic {
             .ask_action = "c",
             .ask_tool_call_id = "d",
         } },
-        // The two that used to share one arm of `deinit`. The first owns
-        // nothing at all now.
         .{ .answer_claims_a_review = .{ .request_id = 1, .decision = .approved_by_review } },
         .{ .answer_names_an_unknown_decision = .{
             .request_id = 1,
@@ -675,7 +509,6 @@ fn everyVariant(gpa: std.mem.Allocator) [12]Diagnostic {
             .fetch_host_not_permitted = .{
                 .host = gpa.dupe(u8, "h") catch @panic("no memory"),
                 .decision = .ask,
-                // Owned as well, and released by the same arm.
                 .action = gpa.dupe(u8, "net.fetch.h") catch @panic("no memory"),
             },
         },
@@ -683,15 +516,11 @@ fn everyVariant(gpa: std.mem.Allocator) [12]Diagnostic {
             .host = gpa.dupe(u8, "h") catch @panic("no memory"),
             .path = gpa.dupe(u8, "/p") catch @panic("no memory"),
         } },
-        // One that owns nothing, so the arm with no work is walked too.
         .{ .path_read_failed = .{ .path = "/p", .err = error.AccessDenied } },
     };
 }
 
 test "every decision a review writes reads as itself" {
-    // The enumeration replaced a `@tagName`. A member added later with no
-    // text, or with the text of another, would make two different claims read
-    // the same.
     var seen: [std.meta.fields(Diagnostic.ReviewDecision).len][]const u8 = undefined;
     inline for (std.meta.fields(Diagnostic.ReviewDecision), 0..) |field, i| {
         const text = (@field(Diagnostic.ReviewDecision, field.name)).text();
@@ -702,10 +531,6 @@ test "every decision a review writes reads as itself" {
 }
 
 test "no two faults of this module read the same" {
-    // A reader has to be able to tell which one happened, and this module
-    // has several pairs that would collapse into one phrase: the two git
-    // refusals, the four socket directory faults, and the two answers that
-    // name a decision.
     const cases: []const Diagnostic = &.{
         .{ .path_read_failed = .{ .path = "/p", .err = error.AccessDenied } },
         .{ .git_refused_a_description = "no" },
@@ -753,9 +578,6 @@ test "no two faults of this module read the same" {
         .{ .net_host_not_resolved = .{ .host = "h", .port = 443 } },
         .{ .net_address_not_permitted = .{ .host = "h", .port = 443 } },
         .{ .net_not_connected = .{ .host = "h", .port = 443 } },
-        // The two the fetch tool fills. They must not read as the two above
-        // them: one is a raw connection a sandboxed process asked for, and
-        // this is a page the agent asked for.
         .{ .fetch_host_not_permitted = .{ .host = "h", .decision = .ask, .action = "net.fetch.h" } },
         .{ .fetch_robots_disallow = .{ .host = "h", .path = "/p" } },
     };
@@ -771,19 +593,6 @@ test "no two faults of this module read the same" {
 }
 
 test "a refused host tells the person the rule to write, and never tells them to write the wrong one" {
-    // **The fault the project owner reported on 2026-08-25.** He asked for a
-    // page, the policy refused it correctly, and the only sentence he could
-    // act on was the one written to the model: "which you cannot write and the
-    // user can. Ask the user, or work without that page." He read a message
-    // about himself in the third person, and reported a working refusal as a
-    // broken feature.
-    //
-    // So this sentence, which is the one he reads, names the rule, the block
-    // it goes in, and the file. The agent still reads its own, unchanged: see
-    // `chock_broker.fetch.Session.refusalForHost`.
-    //
-    // Mutation check: drop `action` and the key is gone from the sentence;
-    // fold the `.deny` arm into the one below it and the second half fails.
     var buffer: [512]u8 = undefined;
 
     const asked = Diagnostic{ .fetch_host_not_permitted = .{
@@ -792,20 +601,14 @@ test "a refused host tells the person the rule to write, and never tells them to
         .action = "net.fetch.org.ziglang",
     } };
     const said = try std.fmt.bufPrint(&buffer, "{f}", .{&asked});
-    // The whole rule, in the syntax `chock.zon` really takes.
     try testing.expect(std.mem.indexOf(
         u8,
         said,
         ".{ .action = \"net.fetch.org.ziglang\", .decision = .allow }",
     ) != null);
-    // The block, because a rule written beside `.agents` is a file that does
-    // not parse and a session that does not start. See docs/configuration.md.
     try testing.expect(std.mem.indexOf(u8, said, ".policy.rules") != null);
     try testing.expect(std.mem.indexOf(u8, said, "chock.zon") != null);
 
-    // **A host a rule already denies is a different instruction.** The row
-    // that is there wins, so telling somebody to add an `allow` row would send
-    // them to write a rule that changes nothing.
     var deny_buffer: [512]u8 = undefined;
     const denied = Diagnostic{ .fetch_host_not_permitted = .{
         .host = "ziglang.org",
@@ -816,8 +619,6 @@ test "a refused host tells the person the rule to write, and never tells them to
     try testing.expect(std.mem.indexOf(u8, refused, "denies that host") != null);
     try testing.expect(std.mem.indexOf(u8, refused, ".decision = .allow }") == null);
 
-    // A host that builds no key promises no rule at all, rather than naming
-    // one nobody can write.
     var none_buffer: [512]u8 = undefined;
     const unnamed = Diagnostic{ .fetch_host_not_permitted = .{
         .host = "..",

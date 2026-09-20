@@ -1,76 +1,7 @@
-//! **Carrying the session's work onto the branch the user has checked out**,
-//! for the three modes of `chock_policy.apply` that ask for it.
-//!
-//! `lib/chock-broker/actions.zig` owns `workspace.apply`: the objects move into
-//! the project and `refs/chock/<session>` moves to the session's commit. That
-//! much happens on every apply, whatever the mode, and it moves no branch of
-//! the user's. This file is the part after it. **It is why no mode means "park
-//! it": the ref is written either way, so a mode that stopped there would only
-//! be saying "do not integrate", which the policy row and the person answering
-//! the approval already say.**
-//!
-//! ## The one rule: the project is never left in the middle of anything
-//!
-//! A merge or a rebase that stops on a conflict leaves a repository with an
-//! unfinished operation in it, index entries a person has to resolve, and a
-//! working tree that is neither where it was nor where it was going. **Chock
-//! must never hand that back.** So no merge and no rebase is ever run in the
-//! user's repository. Instead:
-//!
-//! 1. `planning` builds the whole result **in the session's own scratch object
-//!    store**, with `git merge-tree` and `git commit-tree`, which touch no
-//!    index and no working tree at all. A conflict is an exit code here, not a
-//!    state on disk, and the user's repository has not been written to.
-//! 2. The commit that comes out has the branch tip as an ancestor, by
-//!    construction, in all three modes.
-//! 3. `moving` therefore has exactly one thing to do to the user's repository:
-//!    **a fast forward.** A fast forward onto a clean working tree cannot
-//!    conflict, and git refuses one it cannot do before it changes anything.
-//!
-//! That is the whole design, and it is what makes "the repository is left
-//! exactly as it was" a property of the shape rather than a promise about
-//! cleanup code.
-//!
-//! ## The result is described before it is approved
-//!
-//! `planning` runs while the approval request is being built, so a conflict, a
-//! dirty working tree, a detached head and an unfinished rebase are all known
-//! **before a person is asked**. `Plan.park` carries the reason,
-//! `actions.Action.detail` prints it, and the prompt then says the work will
-//! wait at the ref. A person is never asked to approve a merge that was
-//! already known to be impossible.
-//!
-//! ## And checked again before it is done
-//!
-//! A person can dirty their working tree, switch branch or start a rebase
-//! between reading the question and answering it. `moving` reads the same facts
-//! again and parks the work when any of them has changed. **Parking is narrower
-//! than what was approved and never wider**: the work still lands at the ref,
-//! which every apply does before this file is reached at all, and no branch
-//! moves. The log records which of the two happened, so the narrowing is never
-//! silent.
-//!
-//! ## Who the commit says it is
-//!
-//! `lib/chock-workspace/git.zig` forces `GIT_CONFIG_GLOBAL` and
-//! `GIT_CONFIG_SYSTEM` to `/dev/null` on every call, so a person's own
-//! `~/.gitconfig` is not readable from here and cannot be the identity of a
-//! commit this file writes. Reaching around that would undo the reason it is
-//! there.
-//!
-//! So the identity comes from **the session's own commit**, the commit being
-//! carried. That is honest in both directions: a merge or a squash was made by
-//! the same actor that made the work, and a rebase keeps each replayed commit's
-//! own author exactly as `git rebase` does. It also needs no configuration to
-//! be present, so a project whose repository names no `user.name` still
-//! integrates.
-//!
-//! What that identity actually says is set one layer down, by
-//! `Workspace.identity_env`, which gives every commit made inside the sandbox
-//! the same name and the same address. **The two are separate acts and stay
-//! separate.** That one answers "who is making this commit", and this file
-//! answers "whose commit is being carried", which is why this file reads a
-//! date from the work and that one sets none.
+//! Carry the session's work onto the branch the user has checked out. No merge
+//! and no rebase ever runs in the user's repository: the result is built in the
+//! session's scratch object store, and the only write to the project is one
+//! fast forward.
 
 const std = @import("std");
 const chock_policy = @import("chock-policy");
@@ -80,18 +11,10 @@ const diagnostic = @import("diagnostic.zig");
 const Diagnostic = diagnostic.Diagnostic;
 const git = chock_workspace.git;
 
-/// The three shapes one apply can take, named by `chock_policy.apply`. Every
-/// one of them moves a branch: "no branch moves" is a `Wanted.none` and a
-/// `Reason` beside it, and never a landing.
 pub const Landing = chock_policy.apply.Landing;
 
-/// The names git gives the files it leaves in the git directory while an
-/// operation is unfinished. A repository holding any one of them is mid merge,
-/// mid rebase, mid cherry pick or mid revert, and Chock adds nothing to that.
-///
-/// **Found by asking git where they are**, never by joining them onto `.git`:
-/// a worktree, a bare repository and a repository with a separate git
-/// directory each put the git directory somewhere else.
+/// Ask git where these are. Do not join them onto `.git`: a worktree and a
+/// bare repository each put the git directory somewhere else.
 const unfinished_markers = [_][]const u8{
     "MERGE_HEAD",
     "CHERRY_PICK_HEAD",
@@ -100,50 +23,20 @@ const unfinished_markers = [_][]const u8{
     "rebase-apply",
 };
 
-/// Why no branch moved.
-///
-/// **An enum and not a sentence**, so a caller acts on the member and the
-/// member is what the log records. `sentence` is what a person reads, and the
-/// two cannot drift apart because each has one switch over the whole enum.
 pub const Reason = enum {
-    /// The `workspace.integrate` row of the policy table answers `deny`, so no
-    /// approval of this session may move a branch. `chock_policy.apply.boundBy`
-    /// is where that is read, and null is what it leaves.
     policy_refused,
-    /// The project asks at the moment of the apply, and nobody named a landing:
-    /// there was no terminal, nobody answered in time, or what was typed is not
-    /// a landing. **The narrow answer**, and the one a session with nobody
-    /// watching always gets.
     nobody_answered,
-    /// The apply itself was not approved, so nothing happened at all and no
-    /// branch could move.
     apply_refused,
-    /// The branch already reaches the session's commit, so there is nothing to
-    /// carry onto it.
     already_there,
-    /// The working tree holds changes that are not committed, or files that are
-    /// not tracked. Integrating into it could lose them.
     dirty_tree,
-    /// No branch is checked out. `HEAD` names a commit and not a ref.
     detached_head,
-    /// A merge, a rebase, a cherry pick or a revert is unfinished here.
     unfinished_operation,
-    /// The checked out branch names no commit yet.
     branch_has_no_commit,
-    /// The work and the branch change the same lines, so an integration would
-    /// stop and ask a person to resolve it.
     would_conflict,
-    /// A rebase was asked for and the work holds a commit with more than one
-    /// parent, or with none, which a replay one commit at a time cannot carry.
     history_not_linear,
-    /// The branch is not where it was when the question was put, so the act a
-    /// person approved is not the act this would perform.
     branch_moved,
-    /// git refused a step of the integration. What it said is in the
-    /// diagnostic.
     git_refused,
 
-    /// The word the log records.
     pub fn wireName(self: Reason) []const u8 {
         return switch (self) {
             .policy_refused => "policy_refused",
@@ -161,9 +54,6 @@ pub const Reason = enum {
         };
     }
 
-    /// The line a person reads, in the approval prompt and at the end of a
-    /// run. It says what is true of their repository, and the caller says what
-    /// Chock does about it.
     pub fn sentence(self: Reason) []const u8 {
         return switch (self) {
             .policy_refused => "the policy answers deny for workspace.integrate, so no approval " ++
@@ -186,47 +76,22 @@ pub const Reason = enum {
     }
 };
 
-/// Which branch moves, from where, to where. Everything `moving` needs, and
-/// everything the approval prompt says out loud.
 pub const Move = struct {
-    /// The mode that built `to`.
     landing: Landing,
-    /// The full name of the branch, for example `refs/heads/main`.
     branch: []const u8,
-    /// Where that branch is now. `moving` parks the work when it is somewhere
-    /// else by the time it runs.
     at: []const u8,
-    /// The commit the branch moves to. Already built, and already in the
-    /// session's scratch object store, so `workspace.apply` carries it across
-    /// with the rest of the work and a person reads it in the object list.
     to: []const u8,
 };
 
-/// No branch moves. **Both halves**: what the landing was going to be, and why
-/// it is not happening. A reader who is told only the reason cannot tell a
-/// merge that the working tree refused from one nobody ever settled on.
 pub const Parked = struct {
-    /// The landing this apply was going to take. **Null when none was ever
-    /// settled on**, which is what the policy row refusing and nobody
-    /// answering both leave. `why` says which.
     wanted: ?Landing,
     why: Reason,
 };
 
-/// What an apply may do to the checked out branch, worked out on the host
-/// before anything is described.
-///
-/// **A landing, or nothing and the reason for nothing.** `Landing` holds only
-/// landings that move a branch, so "move nothing" cannot be one of its members,
-/// and a caller that carries it as a bare optional would throw away why. See
-/// `chock_policy.apply.Landing`.
 pub const Wanted = union(enum) {
-    /// Carry the work onto the checked out branch, in this shape.
     land: Landing,
-    /// Move no branch, for a reason that is not about the repository at all.
     none: Reason,
 
-    /// The landing, or null when there is none.
     pub fn landing(self: Wanted) ?Landing {
         return switch (self) {
             .land => |it| it,
@@ -235,15 +100,10 @@ pub const Wanted = union(enum) {
     }
 };
 
-/// What an apply is going to do to the branch, worked out before anybody is
-/// asked.
 pub const Plan = union(enum) {
-    /// A branch moves, and this is the whole of it.
     move: Move,
-    /// No branch moves. The work still lands at the ref.
     park: Parked,
 
-    /// Why no branch moves, or null when one does.
     pub fn parked(self: Plan) ?Parked {
         return switch (self) {
             .move => null,
@@ -251,8 +111,6 @@ pub const Plan = union(enum) {
         };
     }
 
-    /// The landing, whether or not it is happening. Null when none was ever
-    /// settled on.
     pub fn wanted(self: Plan) ?Landing {
         return switch (self) {
             .move => |m| m.landing,
@@ -261,18 +119,13 @@ pub const Plan = union(enum) {
     }
 };
 
-/// What really happened to the branch. Every string is owned by the allocator
-/// the call was given.
 pub const Outcome = union(enum) {
-    /// The branch moved. **The one member that means a person's own branch is
-    /// somewhere new.**
     moved: struct {
         landing: Landing,
         branch: []u8,
         from: []u8,
         to: []u8,
     },
-    /// No branch moved. The work is at the ref and nowhere else.
     park: Parked,
 
     pub fn deinit(self: *Outcome, gpa: std.mem.Allocator) void {
@@ -288,58 +141,31 @@ pub const Outcome = union(enum) {
     }
 };
 
-/// What planning an integration can fail with. A repository that says no is
-/// not in here: that is a `Plan.park` carrying a `Reason`, because a refusal is
-/// an answer and not a fault.
 pub const Error = git.Error || error{
-    /// A `git` call this file cannot go on without exited nonzero, and it is
-    /// not one of the refusals `Reason` names.
     GitFailed,
 };
 
-/// Work out what an apply of `new_id` can do to the checked out branch, and
-/// build the commit that branch would move to.
-///
-/// **Nothing here writes to the user's repository.** Every object this produces
-/// is written into `scratch_object_store`, which is the session's own and which
-/// `workspace.apply` moves across afterwards. The project's own store is named
-/// only as an alternate, and a read of an alternate cannot write to it: see
-/// `lib/chock-workspace/worktree.zig`'s own doc comment.
-///
-/// Every string comes out of `arena`, which the caller owns.
+/// Nothing here writes to the user's repository. Every object goes into
+/// `scratch_object_store`, and every string comes out of `arena`.
 pub fn planning(
     arena: std.mem.Allocator,
     io: std.Io,
     env: *const std.process.Environ.Map,
     params: struct {
-        /// Absolute host path of the user's own project.
         repository: []const u8,
-        /// Absolute host path of the session's own scratch object store.
         scratch_object_store: []const u8,
-        /// Absolute host path of the project's own object store.
         project_object_store: []const u8,
-        /// What the mode asked for, after the policy row bounded it and after
-        /// a person answered an `ask`. `.none` carries the reason there is no
-        /// landing, and this call hands it straight back as the park.
         wanted: Wanted,
-        /// The ref the work is parked at, which the commit message names.
         ref: []const u8,
-        /// The session's commit. It lives in the scratch store.
         new_id: []const u8,
     },
     diag: ?*?Diagnostic,
 ) Error!Plan {
-    // **No landing answers before anything is opened**, so a session the policy
-    // refused and a session nobody answered each cost one switch and no git
-    // call at all.
     const landing = switch (params.wanted) {
         .land => |it| it,
         .none => |why| return .{ .park = .{ .wanted = null, .why = why } },
     };
 
-    // Reading the session's commit from the project needs the scratch store as
-    // an alternate. Writing the result needs the scratch store as the primary,
-    // so nothing this call produces lands in the project.
     var reading = try env.clone(arena);
     defer reading.deinit();
     try reading.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", params.scratch_object_store);
@@ -355,8 +181,6 @@ pub fn planning(
         .ready => |it| it,
     };
 
-    // Nothing to carry. Read through the alternate, because the session's
-    // commit is still only in the scratch store.
     if (try isAncestor(arena, io, &reading, params.repository, params.new_id, ready.at))
         return .{ .park = .{ .wanted = landing, .why = .already_there } };
 
@@ -387,15 +211,6 @@ pub fn planning(
     };
 }
 
-/// Move the branch, after checking that the repository is still where the
-/// question said it was.
-///
-/// **The only write this makes to the user's repository is one fast forward.**
-/// See this file's own top comment. Every way the repository can say no comes
-/// back as `Outcome.park`, which leaves it exactly as it was.
-///
-/// The strings in the answer are owned by `gpa`, and `Outcome.deinit` frees
-/// them.
 pub fn moving(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -408,9 +223,7 @@ pub fn moving(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // **The same four facts, read again.** A person can dirty their tree,
-    // switch branch or start a rebase between reading the question and
-    // answering it, and the act they approved was the one described then.
+    // A person can change the repository between the question and the answer.
     const standing = standingOf(arena, io, env, repository, diag) catch |err| switch (err) {
         error.GitFailed => return .{ .park = .{ .wanted = move.landing, .why = .git_refused } },
         else => |e| return e,
@@ -423,9 +236,6 @@ pub fn moving(
         return .{ .park = .{ .wanted = move.landing, .why = .branch_moved } };
     }
 
-    // A fast forward and nothing else. `to` was built on `at`, `at` is where
-    // the branch still is, and the tree is clean, so git either does the whole
-    // of this or refuses before it changes anything.
     var output = try git.run(gpa, io, env, repository, &.{
         "merge", "--ff-only", "--quiet", move.to,
     }, null);
@@ -445,15 +255,11 @@ pub fn moving(
     } };
 }
 
-/// Where the repository stands: either it can take an integration now, or here
-/// is the reason it cannot.
 const Standing = union(enum) {
     ready: struct { branch: []const u8, at: []const u8 },
     park: Reason,
 };
 
-/// Read the four facts that decide whether a branch can move, cheapest first.
-/// Each one is about the project and none of them is about the work.
 fn standingOf(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -461,8 +267,7 @@ fn standingOf(
     repository: []const u8,
     diag: ?*?Diagnostic,
 ) Error!Standing {
-    // A branch, and not a detached head. `--quiet` makes a detached head an
-    // exit code instead of a message on standard error.
+    // `--quiet` makes a detached head an exit code, not a message on stderr.
     var head = try git.run(arena, io, env, repository, &.{
         "symbolic-ref", "--quiet", "HEAD",
     }, null);
@@ -474,10 +279,7 @@ fn standingOf(
 
     if (try midOperation(arena, io, env, repository, diag)) return .{ .park = .unfinished_operation };
 
-    // **Untracked files count.** They are work a person has not saved, and a
-    // fast forward that had to write over one would be refused by git anyway.
-    // Files a project ignores are not reported, so this is not every stray
-    // byte in the directory.
+    // Untracked files count as dirty, but ignored files are not reported.
     const status = try ok(arena, io, env, repository, &.{ "status", "--porcelain" }, diag);
     if (status.len != 0) return .{ .park = .dirty_tree };
 
@@ -494,9 +296,6 @@ fn standingOf(
     } };
 }
 
-/// Whether an operation is unfinished in this repository. One `git` call for
-/// every marker at once, because `--git-path` takes as many as it is given and
-/// prints one line each.
 fn midOperation(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -516,14 +315,13 @@ fn midOperation(
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         // `access` and not a stat of a kind: `rebase-merge` is a directory and
-        // `MERGE_HEAD` is a file, and either one being there is the answer.
+        // `MERGE_HEAD` is a file.
         std.Io.Dir.accessAbsolute(io, line, .{}) catch continue;
         return true;
     }
     return false;
 }
 
-/// Whether `ancestor` is reachable from `descendant`.
 fn isAncestor(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -537,23 +335,15 @@ fn isAncestor(
     }, null);
     defer output.deinit(arena);
     // Exit 0 is yes, exit 1 is no, and anything else is git saying it could
-    // not tell. The safe reading of "could not tell" is no: the integration
-    // then goes ahead and its own conflict check answers for it.
+    // not tell. Read "could not tell" as no.
     return output.term == .exited and output.term.exited == 0;
 }
 
-/// What building the result came to.
 const Built = union(enum) {
     commit: []const u8,
     refused: Reason,
 };
 
-/// The merge commit or the squash commit, both out of one merged tree.
-///
-/// The two differ in one thing: how many parents the commit gets. A merge names
-/// the branch and the work, so git can see afterwards where the work came from;
-/// a squash names only the branch, which is what makes it one commit on a
-/// straight line.
 fn mergeOrSquash(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -596,12 +386,6 @@ fn mergeOrSquash(
     return .{ .commit = try ok(arena, io, &identity, params.repository, argv, diag) };
 }
 
-/// The message a squash commit carries: one subject line, and then the subject
-/// of every commit it replaces.
-///
-/// **A squash loses the individual commits from the history**, so the one
-/// commit that is left says what they were. A person reading `git log` a month
-/// later has the same list they would have had.
 fn squashMessage(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -624,8 +408,6 @@ fn squashMessage(
     );
 }
 
-/// Replay every commit of `at..new_id` onto `at`, one at a time, and give back
-/// the last commit built. This is a rebase with no index and no working tree.
 fn replay(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -639,8 +421,7 @@ fn replay(
     diag: ?*?Diagnostic,
 ) Error!Built {
     const range = try std.fmt.allocPrint(arena, "{s}..{s}", .{ params.at, params.new_id });
-    // `--parents` prints the commit and then every parent of it on one line,
-    // so one call answers both "which commits" and "is any of them a merge".
+    // `--parents` prints the commit and then every parent of it on one line.
     const listed = try ok(arena, io, reading, params.repository, &.{
         "rev-list", "--reverse", "--parents", range,
     }, diag);
@@ -652,8 +433,6 @@ fn replay(
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         const commit = fields.next() orelse continue;
         const parent = fields.next() orelse return .{ .refused = .history_not_linear };
-        // A second parent means a merge commit, which a replay of one commit
-        // at a time cannot carry across.
         if (fields.next() != null) return .{ .refused = .history_not_linear };
 
         const tree = switch (try mergedTree(arena, io, writing, params.repository, .{
@@ -675,20 +454,12 @@ fn replay(
         replayed += 1;
     }
 
-    // The caller already answered "the branch reaches this commit", so an
-    // empty range here means git and that check disagree. Say so rather than
-    // hand back the branch tip as if work had been carried.
     if (replayed == 0) return .{ .refused = .already_there };
     return .{ .commit = current };
 }
 
-/// The tree of merging `theirs` into `ours`, written into whichever store
-/// `writing` names as the primary.
-///
-/// **This is where a conflict is found**, and it is found as an exit code with
-/// no index, no working tree and nothing to clean up. `--merge-base` names the
-/// base explicitly, which is what turns a merge into a cherry pick and is how
-/// `replay` gets rebase semantics out of the same call.
+/// `--merge-base` names the base explicitly, which is what turns a merge into
+/// a cherry pick.
 fn mergedTree(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -713,10 +484,8 @@ fn mergedTree(
     defer output.deinit(arena);
     if (output.term != .exited) return error.GitFailed;
     switch (output.term.exited) {
-        // Clean. The first line is the tree.
         0 => {},
-        // Conflicts. git printed the tree and then the conflicted paths, and
-        // the tree it printed holds conflict markers, so it is never used.
+        // On exit 1 the tree git printed holds conflict markers.
         1 => return .{ .refused = .would_conflict },
         else => {
             if (diagnostic.wants(diag)) {
@@ -734,11 +503,9 @@ fn mergedTree(
     return .{ .commit = try arena.dupe(u8, first) };
 }
 
-/// The environment a `commit-tree` runs with, so the commit it writes carries
-/// the identity of `commit` rather than of nobody.
-///
-/// See this file's own top comment for why the identity is taken from a commit
-/// and not from a person's git configuration.
+/// `lib/chock-workspace/git.zig` forces the global and system git config to
+/// `/dev/null`, so a person's own `~/.gitconfig` cannot be the identity of a
+/// commit this file writes. Do not reach around that.
 fn identityOf(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -765,14 +532,10 @@ fn identityOf(
     try out.put("GIT_AUTHOR_DATE", author_date);
     try out.put("GIT_COMMITTER_NAME", committer_name);
     try out.put("GIT_COMMITTER_EMAIL", committer_email);
-    // **The committer date is now and the author date is the work's own.** That
-    // is what git itself does for a rebase, and it keeps "when was this
-    // written" apart from "when did it reach my branch".
+    // Committer date now, author date the work's own, as git does for a rebase.
     return out;
 }
 
-/// One `git` call that must exit zero, and what it printed on standard output,
-/// trimmed. What git said on a failure travels in `diag`.
 fn ok(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -797,20 +560,10 @@ fn ok(
 const testing = std.testing;
 
 test "every reason says something a person can read, and none of them is silence" {
-    // **Every park now says why.** The member that used to mean "this project
-    // asked for nothing" is gone with `apply.Mode.ref`, so a park is a fault in
-    // the repository, a refusal by the policy, a refusal by the person, or
-    // nobody answering, and each of the four has a sentence of its own.
-    //
-    // Mutation check: give any member an empty sentence and this fails.
     for (std.enums.values(Reason)) |reason| {
         try testing.expect(reason.wireName().len > 0);
         try testing.expect(reason.sentence().len > 0);
-        // The wire name is a name and never a sentence: it goes in a log field
-        // that a reader matches on.
         try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, reason.wireName(), ' '));
-        // And no member says the work was never asked about, because there is
-        // no longer a way to ask for nothing.
         try testing.expect(!std.mem.eql(u8, "not_asked_for", reason.wireName()));
     }
     try testing.expectEqualStrings("policy_refused", Reason.policy_refused.wireName());
@@ -819,12 +572,8 @@ test "every reason says something a person can read, and none of them is silence
 test "a plan that moves nothing names why, and one that moves says nothing about why" {
     const parked: Plan = .{ .park = .{ .wanted = .merge, .why = .dirty_tree } };
     try testing.expectEqual(Reason.dirty_tree, parked.parked().?.why);
-    // **What the landing was going to be survives the refusal.** A reader told
-    // only "dirty tree" cannot tell this from a park nobody chose a landing for.
     try testing.expectEqual(@as(?Landing, .merge), parked.wanted());
 
-    // And a park with no landing at all says so, rather than naming one that
-    // was never settled on.
     const never: Plan = .{ .park = .{ .wanted = null, .why = .policy_refused } };
     try testing.expectEqual(@as(?Landing, null), never.wanted());
     try testing.expectEqual(Reason.policy_refused, never.parked().?.why);
@@ -840,12 +589,6 @@ test "a plan that moves nothing names why, and one that moves says nothing about
 }
 
 test "no landing plans no move, and hands back the reason it was given" {
-    // Read through the real entry point, with no repository behind it at all:
-    // `.none` answers before anything is opened, which is what makes a refused
-    // session cost nothing and is why the paths below are never looked at.
-    //
-    // Mutation check: make the `.none` arm fall through to `standingOf` and
-    // this fails trying to run git in /nowhere/at/all.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var env = try std.testing.environ.createMap(testing.allocator);
@@ -861,7 +604,6 @@ test "no landing plans no move, and hands back the reason it was given" {
             .new_id = "c" ** 40,
         }, null);
         try testing.expectEqual(why, plan.parked().?.why);
-        // **And no landing is named**, because none was ever settled on.
         try testing.expectEqual(@as(?Landing, null), plan.wanted());
     }
 }
