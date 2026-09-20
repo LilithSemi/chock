@@ -5,14 +5,15 @@ real project is never written by a tool call. This page says what the boundary
 is made of.
 
 The layers below are the Linux ones. macOS builds the boundary out of Seatbelt,
-and it gives less. [The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do)
-says what it holds and what it cannot.
+and it gives less.
+[The sandbox on macOS](#the-sandbox-on-macos-and-what-it-does-not-do) says what
+it holds and what it cannot.
 
 The layers are separate on purpose. Each one is tested, each one can be absent
-on a given machine, and `chock doctor` says which are on. A red team run on
-2026-08-22 set up an io_uring ring inside a tool call, which is the classic way
-past a system call filter, and the paths were still refused by Landlock and the
-network was still unreachable. That is what layers are for.
+on a given machine, and `chock doctor` says which are on. A red team run set up
+an io_uring ring inside a tool call, which is the classic way past a system
+call filter, and the paths were still refused by Landlock and the network was
+still unreachable. That is what layers are for.
 
 ## Namespaces
 
@@ -53,7 +54,7 @@ There are three modes, and a tool call gets the first:
 
 `fetch_url` does not work by opening the sandbox. The broker reads the page in
 a process the agent cannot reach, and the host is a row on the
-[policy table](policy.md).
+[action table](../configure/actions.md).
 
 So a program that opens a socket in a tool call fails. `ping` answers
 `socktype: SOCK_RAW` and exits 2, and `curl` cannot resolve a name. That is the
@@ -101,15 +102,15 @@ are:
   `process_vm_writev`, `bpf`, `userfaultfd`
 - the machine: `reboot`, `syslog`, `sethostname`
 - `open_by_handle_at`. This one is belt and braces rather than a hole closed on
-  faith. It reaches the kernel today and is already refused with `EPERM` by the
-  kernel's own capability check, because it needs `CAP_DAC_READ_SEARCH` in the
-  user namespace that owns the target filesystem's superblock, and a process
-  born from `CLONE_NEWUSER`, which every sandboxed process here is, never holds
-  a capability in an ancestor namespace over an object that namespace owns. A
-  small program run outside Chock entirely, and again as a probe inside a real
-  sandbox, gets `EPERM` both times, whether the caller is an ordinary user or
-  `root` inside a fresh `unshare -U -r`. `name_to_handle_at`, the call that
-  only encodes a handle and grants nothing on its own, is left reachable.
+  faith. The kernel's own capability check already refuses it with `EPERM`,
+  because it needs `CAP_DAC_READ_SEARCH` in the user namespace that owns the
+  target filesystem's superblock, and a process born from `CLONE_NEWUSER`,
+  which every sandboxed process here is, never holds a capability in an
+  ancestor namespace over an object that namespace owns. A probe outside Chock
+  and a probe inside a real sandbox both get `EPERM`, whether the caller is an
+  ordinary user or `root` inside a fresh `unshare -U -r`. `name_to_handle_at`,
+  the call that only encodes a handle and grants nothing on its own, is left
+  reachable.
 
 Two more rules inspect an argument and kill rather than answer `EPERM`, because
 each closes a boundary and not a cost:
@@ -146,7 +147,7 @@ starts, before it runs one line, and `UV_USE_IO_URING=0` does not stop it. The
 probe is meant to fail on a kernel older than 5.1, and libuv then falls back to
 its thread pool. So Node does not need a ring: it needs the probe to fail
 survivably. A kill ended every Node, Deno and Bun program at startup and bought
-nothing, because a hostile program can simply not call io_uring.
+nothing, because a hostile program can leave io_uring alone.
 
 Four rules inspect an argument and answer `EPERM` instead of killing, so a
 program can recover: `personality` asking for `READ_IMPLIES_EXEC`, `shmat` with
@@ -206,7 +207,8 @@ By default the agent sees the committed state. `chock run --allow-dirty` copies
 your uncommitted work in as well.
 
 Work reaches your project only when the agent commits it in the workspace and
-the policy permits the apply, which [approvals.md](approvals.md) describes.
+the policy permits the apply, which
+[approvals.md](../using/approvals.md) describes.
 
 ## What is in the tree, and what is not
 
@@ -233,9 +235,9 @@ writes go into a layer the sandbox made, and nothing reaches the host. This is
 the one place a tool call needs rootless overlayfs on such a machine, and
 `chock doctor` says so on the `resolver files` row.
 
-The full list is in [toolchains.md](toolchains.md). Paths a project denies by
-name are covered before the workspace is built, and their bytes are not in the
-tree at all.
+The full list is in [toolchains.md](../operate/toolchains.md). Paths a project
+denies by name are covered before the workspace is built, and their bytes are
+not in the tree at all.
 
 ## Limits
 
@@ -331,8 +333,9 @@ gets no device and no crash, and no row for it in `chock doctor` either.
 When a device is named in a project's `devices` block and let through by a
 `policy` rule, Chock binds its node into the sandbox by the same mechanism a
 workspace path gets: `mknodat` makes a placeholder and a bind mount lands the
-real node on top of it, read and write. [policy.md](policy.md) has the
-two-block shape that has to agree before any of this runs.
+real node on top of it, read and write.
+[actions.md](../configure/actions.md) has the two-block shape that has to agree
+before any of this runs.
 
 The grant is the whole device, and never a part of it. A device node is a
 direct channel to a kernel driver, and most of what the sandbox reasons about
@@ -379,7 +382,7 @@ identical lookup outside any profile succeeds. See
 
 A layer this driver reports as on, and does not enforce, is worse than a
 refusal. Chock compares a policy against a driver and refuses a driver that
-claims too little, but it trusts a driver that claims too much. So every claim
+claims too little, and it trusts a driver that claims too much. So every claim
 above comes from a run on Apple Silicon, macOS 15.7.9, arm64. Two layers were
 tried and then dropped:
 

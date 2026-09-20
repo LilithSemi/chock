@@ -5,8 +5,8 @@ there is a moment at which a person can be asked. The broker knows eight
 actions: `git.commit`, `git.push`, `git.branch.delete`, `net.fetch`,
 `nix.build`, `file.write`, `workspace.apply` and `model.select`. It answers one
 more, `policy.widen`, which is a session asking to be let out of a promise it
-made to itself. The [policy table](policy.md) in `chock.zon` says which of them
-is allowed, denied or asked.
+made to itself. The [policy table](../configure/policy.md) in `chock.zon` says
+which of them is allowed, denied or asked.
 
 Three of those are read before the work they govern, at a moment when nobody is
 waiting to answer, so `ask` is a refusal for `net.fetch`, `nix.build` and
@@ -19,9 +19,9 @@ about every one, so a project rule of `ask` on `call.write_file`, `exec.*`, or
 any other action `Tool.actionInto` names reaches a person mid session. A
 filtered tool call's own `net.connect.*` question reaches the same person: a
 host no rule names answers `ask`, and that `ask` is a live question, not the
-refusal `net.fetch` is. [threat-model.md](threat-model.md) describes the
-network descriptor every foreground tool call holds, whether or not any host
-has been named.
+refusal `net.fetch` is. [threat-model.md](../security/threat-model.md)
+describes the network descriptor every foreground tool call holds, whether or
+not any host has been named.
 
 ## The one every project meets
 
@@ -99,9 +99,9 @@ working tree. An apply that moves no branch says so in the same place, and says
 why. The questions do not read alike, because the same `y` does not mean the
 same thing.
 
-Every mode parks the work at the ref first, so the ref is there whatever else
-happened. That is why `merge` is safe as the default: nothing is ever lost, and
-the fallback is one `git reset --hard` away.
+Every mode parks the work at the ref first. That is why `merge` is safe as the
+default: nothing is ever lost, and the fallback is one `git reset --hard`
+away.
 
 Chock never leaves your repository in the middle of a merge. The merge, the
 rebase and the squash are all built inside the session's own object store, with
@@ -146,7 +146,7 @@ mode, the policy answer that permitted it, the branch, where it moved from and
 to, and, when no branch moved, why.
 
 An organisation can close this road for every project at once with one
-[policy rule](policy.md#the-actions).
+[policy rule](../configure/actions.md#the-actions).
 
 ### The agent can ask for the same thing
 

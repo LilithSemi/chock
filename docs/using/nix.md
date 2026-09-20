@@ -1,66 +1,12 @@
-# A program the agent has not got
+# Nix, from inside a session
 
-An agent in a sandbox that wants a program it has not got runs `apt install`
-or `npm install -g`. Neither can work here. Chock is built on Nix, so the agent
-names a package, Chock realises it, and the program is on the `PATH` of every
-tool call after that one.
-
-```
-$ run_command {"argv":["rg","token","notes.txt"]}
-! rg was not found on the host PATH ... To get it, call provide_tool with the
-  package name, which is often not the program name.
-$ provide_tool {"program":"ripgrep"}
-  ripgrep is now in this session's toolchain, from nixpkgs#ripgrep.
-$ run_command {"argv":["rg","token","notes.txt"]}
-  hello token here
-```
-
-## It is off until you turn it on
-
-Realising a package runs `nix build` on your machine, outside the sandbox, so
-it is checked against the `nix.build` policy key. The answer decides whether
-the tool exists at all, so it is read before the tool list the model sees is
-built, which is before the session starts. A project with no `chock.zon`
-answers `ask` for every key, and an `ask` at that moment reaches nobody, so the
-tool is not offered. Turn it on with a rule:
-
-```zon
-.{
-    .policy = .{
-        .rules = .{
-            .{ .action = "nix.build", .decision = .allow },
-        },
-    },
-}
-```
-
-This is not asked about later. The answer is read once, at the start, and a
-session that started without the tool does not gain it.
-
-## What a name may be
-
-The agent names a package and never anything else. A name holds letters,
-digits, `-`, `_`, `+` and `.` and nothing more, so it cannot be a path, a URL,
-or a flake reference, and where names are looked up is your own Nix flake
-registry.
-
-A program provisioned this way lasts for that session only. What a project
-needs every time belongs in `flake.nix`. See [toolchains.md](toolchains.md).
-
-## What it costs
-
-A request holds the turn and has no deadline. `nix build` on a cache miss is
-minutes, and the turn waits for it, because the answer has to reach the mount
-set the very next tool call is built from and not the model. A line is printed
-before the wait so the terminal is not silent, and Ctrl-C reaches the `nix`
-child the same way it reaches a subagent. A build that never ends holds the
-session, which [status.md](status.md) lists as an open item.
+`nix_eval` answers what an expression says, and `nix_build` makes one attribute
+of a flake. Getting a program the session has not got is `provide_tool`, which
+is in [tools.md](tools.md).
 
 # Asking Nix what something is
 
-`provide_tool` above puts a program in the session. `nix_eval` answers a
-different question: what does an expression say? The agent sends one Nix
-expression and reads the value back.
+The agent sends one Nix expression and reads the value back.
 
 ```
 $ nix_eval {"expression":"(import <nixpkgs> {}).hello.version"}
@@ -116,11 +62,11 @@ A `nix` block in `chock.zon` bounds what an evaluation may put in a store.
 }
 ```
 
-`max_object_bytes` bounds one object. The operator's own `config.zon` names
-the same block and the project wins over it, and an organisation's policy
-bundle is the last word over both. `max_session_bytes` is read and folded the
-same way, and it bounds what every build of one session puts in your store
-between them.
+`max_object_bytes` bounds one object, and `max_session_bytes` bounds what every
+build of one session puts in your store between them. The operator's own
+`config.zon` names the same block, the project wins over it, and an
+organisation's policy bundle is the last word over both.
+[org.md](../configure/org.md) has the whole fold.
 
 # Building one attribute
 
@@ -217,10 +163,11 @@ derivation in it, and asks about each host under `nix.net`:
 .{ .action = "nix.net.org.nixos.cache.*", .decision = .allow },
 ```
 
-The labels are reversed for the reason [policy.md](policy.md) gives. A build
-gets its own namespace because it is not your agent opening a socket.
-`net.connect` stays the sandbox's own connections and `net.fetch` stays the
-fetch tool, so a host you allow for a build is not a host your agent may reach.
+The labels are reversed for the reason
+[actions.md](../configure/actions.md) gives. A build gets its own namespace
+because it is not your agent opening a socket. `net.connect` stays the
+sandbox's own connections and `net.fetch` stays the fetch tool, so a host you
+allow for a build is not a host your agent may reach.
 
 A build fetches in two phases. An input fetched so an expression can evaluate
 is `nix.net.eval`, and a derivation fetching while it builds is
@@ -256,9 +203,9 @@ closure reaches a hundred of them. Chock reads your rules for every host first:
 a host a rule allows is decided there and never appears in the question, and a
 host a rule denies refuses the build with nobody asked. Only the hosts no rule
 covers are left, and those go into one question, under `nix.net.hosts`, that
-says how many there are and names the first few. The detail key shows every one of them
-beside the exact rule you would write to stop being asked. A yes covers the
-hosts of that question for that build and nothing after it.
+says how many there are and names the first few. The detail key shows every one
+of them beside the exact rule you would write to stop being asked. A yes covers
+the hosts of that question for that build and nothing after it.
 
 A URL whose scheme Chock does not read, and one with no host in it, are both
 refusals: Chock guesses no port, and a fetch nobody can name is a fetch nobody
@@ -269,18 +216,23 @@ them, is taken off and the URL behind it is read. So a rule for any of them
 looks like any other: `nix.net.org.gmplib.ftp.21`,
 `nix.net.org.sourceware.9418`.
 
+### Mirrors
+
 A `mirror://` URL names a site and not a host, and nixpkgs writes plenty of
 them. The derivation also names its own mirrors file, a store path that holds
 the mirrors of every site, so Chock reads that file and turns the site into the
-hosts it really names. That file is itself a derivation output, so it is often
-not in your store yet. Chock realises it first, with local and remote builds
-both turned off, so Nix either takes it from a substituter or refuses: no
-builder runs for it, and a derivation that named a path of its own cannot be
-built before a rule has answered. A mirrors file no substituter has is a
-refusal that says so. One site is one question: the mirrors are taken in the
-file's own order, one your rules already allow is taken with nothing asked, and
-otherwise you are asked about the first of them. A site the file does not name,
-and a derivation with no mirrors file, stay refusals.
+hosts it really names.
+
+That file is itself a derivation output, so it is often not in your store yet.
+Chock realises it first, with local and remote builds both turned off, so Nix
+either takes it from a substituter or refuses: no builder runs for it, and a
+derivation that named a path of its own cannot be built before a rule has
+answered. A mirrors file no substituter has is a refusal that says so.
+
+One site is one question. The mirrors are taken in the file's own order, one
+your rules already allow is taken with nothing asked, and otherwise you are
+asked about the first of them. A site the file does not name, and a derivation
+with no mirrors file, stay refusals.
 
 A site is named with the hash of its own mirror list, so a rule says which
 mirrors you agreed to and not merely which site:
@@ -301,11 +253,13 @@ nixpkgs fetcher tries a hashed mirror for every fetch and would otherwise reach
 a host that appears in no URL of the derivation. Only a rule can turn that one
 on, and it is off for every other build.
 
+### A build that names no URL
+
 A fixed output derivation that says nowhere it fetches from is a different
-question, `nix.net.build.opaque`. Some fetchers read their URLs out of a lock file
-at build time, `zig.fetchDeps`, npm deps and `fetchCargoVendor` among them, and
-those hold no URL anywhere in the derivation. There is no host, so there is
-nothing a rule could name.
+question, `nix.net.build.opaque`. Some fetchers read their URLs out of a lock
+file at build time, `zig.fetchDeps`, npm deps and `fetchCargoVendor` among
+them, and those hold no URL anywhere in the derivation. There is no host, so
+there is nothing a rule could name.
 
 Chock ships that one as `allow`, because that is how every vendored
 dependency fetch works: refusing them refuses nearly every Rust, Node and Zig
@@ -387,6 +341,6 @@ running does not get it, and nothing survives the session.
 A program out of a build asks under `exec.nix.store.*` when the agent runs it,
 and not under `exec.devshell.*`. The dev shell is the toolchain your project
 declared. A build is something the agent asked for, and the two are not the
-same class. [policy.md](policy.md) has both rows.
+same class. [actions.md](../configure/actions.md) has both rows.
 
 The turn waits for the build, with no deadline, exactly as `provide_tool` does.

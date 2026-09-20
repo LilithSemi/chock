@@ -74,7 +74,7 @@ credential. It refuses before it builds anything, so no workspace and no log
 are left behind.
 
 Where a lookup goes, and what `chock login` writes, is in
-[credentials.md](credentials.md).
+[credentials.md](../operate/credentials.md).
 
 ## The machine's own resource limits
 
@@ -94,7 +94,7 @@ This is the machine's own default: every project run from this machine which
 names no `limits` field of its own gets the number here instead of Chock's
 own machine sized default. A project's own `chock.zon` still wins over it, the
 same way a project's own choices win over everything this file sets. See
-[Sandbox resource limits](policy.md#sandbox-resource-limits) for the field
+[Sandbox resource limits](org.md#sandbox-resource-limits) for the field
 syntax and the full order the layers fold in.
 
 ## The machine's own Nix store caps
@@ -115,7 +115,7 @@ This is the machine's own default for how much a Nix evaluation may add to
 the store: every project run from this machine which names no `nix` field of
 its own gets the number here instead of Chock's own built in default. A
 project's own `chock.zon` still wins over it. See
-[Nix store byte caps](policy.md#nix-store-byte-caps) for the field syntax and
+[Nix store byte caps](org.md#nix-store-byte-caps) for the field syntax and
 the full order the layers fold in.
 
 ## The project's own file
@@ -151,14 +151,14 @@ is a complete `chock.zon` with every block a first project needs:
 ```
 
 `.subagents` also takes `.max_depth`. Both default to 6. See
-[subagents.md](subagents.md).
+[subagents.md](../using/subagents.md).
 
 `.apply.mode` says how an approved apply lands. It defaults to `merge`, which
 parks the work at `refs/chock/<session>` and then merges it into the branch you
 have checked out. The approval prompt names the branch and the landing before
 you answer, so the `y` you give is a `y` to that act. There is no mode that
 means "move nothing": say `n` to the apply, or write the policy row below.
-[approvals.md](approvals.md) shows both prompts.
+[approvals.md](../using/approvals.md) shows both prompts.
 
 A rule goes under `.policy.rules`, and never directly under `.policy`.
 `.policy` is a struct with named fields, so a rule written beside `.agents` is
@@ -166,24 +166,15 @@ a syntax error and the session does not start. Every block is optional: leave
 out the ones you do not want.
 
 Every block of this file narrows what an agent may do, and two rows of the
-policy table widen. `.{ .action = "sandbox.jit", .decision = .allow }` turns
-off the sandbox rule that refuses a page which is writable and executable,
-which a run time with a just in time compiler needs. It is a policy row and not
-a block of its own because it widens: the table is where an organisation can
-forbid it and a project cannot take that back.
+policy table widen: `sandbox.jit` and `workspace.integrate`. Each is a row and
+not a block of its own, because the table is where an organisation can forbid
+what a project cannot take back. [actions.md](actions.md) has both.
 
-`workspace.integrate` is the other. `.apply.mode` above is the project's own
-taste, and this row says whether an approved apply may move a branch at all. An
-organisation that wants no branch touched automatically writes
-`.{ .action = "workspace.integrate", .decision = .deny }` once, in its bundle,
-and no project under it can move a branch whatever `.apply.mode` says. A row
-nobody wrote permits the mode, so a project on an installation with no bundle
-gets the mode it configured, and the default `merge` where it configured
-none.
-
-- [policy.md](policy.md) for the policy table and the denied paths.
-- [subagents.md](subagents.md) for the subagent limits.
-- [plugins.md](plugins.md) for the plugin list.
+- [policy.md](policy.md) for how a rule is read, and for the denied paths.
+- [actions.md](actions.md) for every action name a rule can carry.
+- [org.md](org.md) for the bundle an organisation puts above the project.
+- [subagents.md](../using/subagents.md) for the subagent limits.
+- [plugins.md](../extend/plugins.md) for the plugin list.
 
 ### When Chock refuses the file
 

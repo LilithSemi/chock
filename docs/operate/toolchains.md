@@ -4,12 +4,12 @@ Every tool call runs with the environment of this project's Nix dev shell, and
 the mount set of a call is that shell's closure, read only, each store path at
 its own path. So the agent gets the project's own compiler, and it gets nothing
 else from the store. What a project needs every time belongs in `flake.nix`.
-For one program in one session, see [tools.md](tools.md).
+For one program in one session, see [tools.md](../using/tools.md).
 
 The closure is also a policy class. A program inside it names
 `exec.devshell.*`, which Chock ships as `allow`, so the project's own toolchain
 runs with no prompt. Any other store path names `exec.nix.store.*`, which ships
-as `ask`. [policy.md](policy.md) has both rows.
+as `ask`. [actions.md](../configure/actions.md) has both rows.
 
 The answer does not depend on the caller. Chock reads the dev shell the way
 nix-direnv does, and it takes the difference between two shells rather than one
@@ -93,7 +93,7 @@ has no cache in it at all.
 | `/run/chock/scratch` | this session's scratchpad | read and write |
 | `/run/chock/tmp` | a capped tmpfs, and `TMPDIR` | read and write |
 | `/run/chock/tasks` | the session's task records | read only |
-| `/run/chock/memory` | the knowledgebase, on two tool calls only | see [memory.md](memory.md) |
+| `/run/chock/memory` | the knowledgebase, on two calls only | see [memory.md](../using/memory.md) |
 | `/run/chock/tool-bin/<name>` | the one program this call runs | read only |
 | each store path of the dev shell | the toolchain | read only |
 | `chock.zon` | the project's own rules | read only |
@@ -116,4 +116,4 @@ names the scratchpad there, so a temporary file survives the call that wrote
 it. `chock doctor` reports the second as `disk cap tmpfs: NONE`.
 
 Free space is checked before a session starts, against a floor of 1 GiB, which
-`chock doctor` reports. See [sandbox.md](sandbox.md).
+`chock doctor` reports. See [sandbox.md](../security/sandbox.md).

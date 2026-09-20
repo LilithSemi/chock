@@ -37,7 +37,7 @@ rather than that the work finished.
 
 A child also holds no more policy than its parent, whatever the file says about
 that child alone, and no more than any promise an ancestor made with
-`restrict_self`, which [policy.md](policy.md) describes.
+`restrict_self`, which [policy.md](../configure/policy.md) describes.
 
 ## A spawn waits, or it carries on, and the agent says which
 
@@ -61,7 +61,7 @@ session, and it also names every agent kind above it, root first. A child holds
 no more policy than its parent, so the answer the policy table gives depends on
 all of those kinds. A person who reads one exported log can see which rules
 applied to it, and does not need the parent log as well. `chock sessions export`
-is in [running.md](running.md).
+is in [running.md](../running.md).
 
 ## A subagent has nobody at the keyboard
 

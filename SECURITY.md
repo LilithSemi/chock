@@ -5,7 +5,7 @@
 Chock is pre-alpha and it has not had an external security review. Do not give
 it access you would not give to a program you are still testing.
 
-See [docs/threat-model.md](docs/threat-model.md) for the adversary Chock is
+See [docs/security/threat-model.md](docs/security/threat-model.md) for the adversary Chock is
 built against, one real attack walked end to end, and what the sandbox does
 not cover.
 

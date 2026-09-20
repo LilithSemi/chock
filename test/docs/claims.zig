@@ -72,12 +72,12 @@ const refused_examples = [_][]const u8{ "fix", "rnu" };
 
 /// Options the documentation names that belong to another program.
 ///
-/// `docs/sandbox.md` says that Node is started with `--jitless`, which is
-/// Node's option and not Chock's. `docs/tools.md` says that Nix's `--offline`
-/// turns a substituter off without stopping a fixed output build from
-/// fetching, which is why Chock does not pass it. Both ends are checked here
-/// too: an entry that Chock starts to accept fails its test, and so does one
-/// that no documentation names any more.
+/// `docs/security/sandbox.md` says that Node is started with `--jitless`,
+/// which is Node's option and not Chock's. `docs/using/nix.md` says that Nix's
+/// `--offline` turns a substituter off without stopping a fixed output build
+/// from fetching, which is why Chock does not pass it. Both ends are checked
+/// here too: an entry that Chock starts to accept fails its test, and so does
+/// one that no documentation names any more.
 const foreign_options = [_][]const u8{ "--jitless", "--offline" };
 
 /// One documentation file, with its path relative to the root of the
@@ -88,11 +88,12 @@ const Doc = struct {
 };
 
 /// Every `*.md` file a reader of this project reads: the ones in the root, and
-/// the ones under `docs/`.
+/// the ones anywhere under `docs/`.
 ///
 /// Read off the disk and never listed here, so a page added tomorrow is
-/// checked tomorrow. The fetched packages under `zig-pkg/` carry markdown of
-/// their own and are not ours, so the walk does not recurse.
+/// checked tomorrow. The root is read one level deep, because the fetched
+/// packages under `zig-pkg/` carry markdown of their own and are not ours.
+/// `docs/` is walked, because the pages are grouped into subdirectories.
 ///
 /// Sorted by path, so a failure reads the same way twice.
 fn loadDocs(arena: std.mem.Allocator, io: std.Io) ![]Doc {
@@ -114,13 +115,14 @@ fn loadDocs(arena: std.mem.Allocator, io: std.Io) ![]Doc {
     var pages = try root.openDir(io, "docs", .{ .iterate = true });
     defer pages.close(io);
 
-    var page_entries = pages.iterate();
+    var page_entries = try pages.walk(arena);
+    defer page_entries.deinit();
     while (try page_entries.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".md")) continue;
         try docs.append(arena, .{
-            .path = try std.fmt.allocPrint(arena, "docs/{s}", .{entry.name}),
-            .text = try pages.readFileAlloc(io, entry.name, arena, .limited(max_doc_bytes)),
+            .path = try std.fmt.allocPrint(arena, "docs/{s}", .{entry.path}),
+            .text = try pages.readFileAlloc(io, entry.path, arena, .limited(max_doc_bytes)),
         });
     }
 
@@ -440,7 +442,8 @@ test "every path the documentation names is in the repository" {
     const spans = try allSpans(arena, docs);
     for (spans) |span| {
         // **Prose only, and never a fenced block.** A fence holds an example
-        // of what a reader writes in their own project: `docs/plugins.md`
+        // of what a reader writes in their own project:
+        // `docs/extend/plugins.md`
         // names `plugins/chock-plugin-hello.wasm` in a sample `chock.zon`,
         // and that path is theirs and not ours. A path in a sentence is a
         // reference to this repository.
@@ -736,13 +739,13 @@ test "the tool list names every tool, and counts them right" {
     const arena = arena_state.allocator();
     const docs = try loadDocs(arena, testing.io);
 
-    const running = try docText(docs, "docs/running.md");
+    const page = try docText(docs, "docs/using/tools.md");
     const fields = @typeInfo(chock_core.tools.Tool).@"enum".fields;
 
     var wrong: std.ArrayList(u8) = .empty;
     inline for (fields) |field| {
-        if (!try namesInTicks(running, field.name, arena)) {
-            try wrong.print(arena, "docs/running.md names no tool `{s}`\n", .{field.name});
+        if (!try namesInTicks(page, field.name, arena)) {
+            try wrong.print(arena, "docs/using/tools.md names no tool `{s}`\n", .{field.name});
         }
     }
     try checkCount(arena, docs, null, "tools", fields.len, &wrong);
@@ -761,25 +764,25 @@ test "the policy page names every decision and every field of a rule, and counts
     const arena = arena_state.allocator();
     const docs = try loadDocs(arena, testing.io);
 
-    const policy = try docText(docs, "docs/policy.md");
+    const policy = try docText(docs, "docs/configure/policy.md");
     const decisions = @typeInfo(chock_policy.table.Decision).@"enum".fields;
     const rule_fields = @typeInfo(chock_policy.table.Rule).@"struct".fields;
 
     var wrong: std.ArrayList(u8) = .empty;
     inline for (decisions) |field| {
         if (!try namesInTicks(policy, field.name, arena)) {
-            try wrong.print(arena, "docs/policy.md names no decision `{s}`\n", .{field.name});
+            try wrong.print(arena, "docs/configure/policy.md names no decision `{s}`\n", .{field.name});
         }
     }
     inline for (rule_fields) |field| {
         if (!try namesInTicks(policy, field.name, arena)) {
-            try wrong.print(arena, "docs/policy.md names no rule field `{s}`\n", .{field.name});
+            try wrong.print(arena, "docs/configure/policy.md names no rule field `{s}`\n", .{field.name});
         }
     }
     // Only this page, because `fields` and `decisions` are ordinary words and
     // another page may count something else with them.
-    try checkCount(arena, docs, "docs/policy.md", "decisions", decisions.len, &wrong);
-    try checkCount(arena, docs, "docs/policy.md", "fields", rule_fields.len, &wrong);
+    try checkCount(arena, docs, "docs/configure/policy.md", "decisions", decisions.len, &wrong);
+    try checkCount(arena, docs, "docs/configure/policy.md", "fields", rule_fields.len, &wrong);
 
     try testing.expectEqualStrings("", wrong.items);
 }
@@ -815,9 +818,9 @@ test "every name the documentation spells with an underscore is a name the code 
 }
 
 test "every action a table row names is an action the code has" {
-    // The actions table of `docs/policy.md` is what a person copies into a
-    // rule, and a rule that names an action the broker never asks about is a
-    // rule that never fires. Mutation check: rename a row.
+    // The actions table of `docs/configure/actions.md` is what a person copies
+    // into a rule, and a rule that names an action the broker never asks about
+    // is a rule that never fires. Mutation check: rename a row.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -949,7 +952,7 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
     try checkCount(
         arena,
         docs,
-        "docs/sandbox.md",
+        "docs/security/sandbox.md",
         "entries",
         chock_sandbox.namespace.masked_proc_entries.len,
         &wrong,
@@ -957,7 +960,7 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
     try checkCount(
         arena,
         docs,
-        "docs/sandbox.md",
+        "docs/security/sandbox.md",
         "calls",
         chock_sandbox.seccomp.blocked_calls.len,
         &wrong,

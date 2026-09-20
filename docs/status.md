@@ -45,8 +45,8 @@ never in the middle of one, so a board plugged in while a long call is already
 running is seen by the next call and not by that one. `chock doctor` carries a
 row saying how many devices this machine could pass. The block is in
 [running.md](running.md), the action names and the rule are in
-[policy.md](policy.md), and what the grant does not bound is in
-[sandbox.md](sandbox.md).
+[actions.md](configure/actions.md), and what the grant does not bound is in
+[sandbox.md](security/sandbox.md).
 
 ## The red team harness
 
@@ -127,8 +127,8 @@ before this harness existed found nine faults, and this run found a tenth.
   classes. See `lib/chock-policy/defaults.zig`'s own top comment, "What is
   deliberately absent". The second is `exec.nix.store.*`, a store path this
   session did not start with, which ships as `ask` while the dev shell closure
-  it split off, `exec.devshell.*`, ships as `allow`. [policy.md](policy.md) has
-  both.
+  it split off, `exec.devshell.*`, ships as `allow`.
+  [actions.md](configure/actions.md) has both.
 
   Seven tool names are skipped by this gate and decided elsewhere, at the key
   that actually works. `spawn_agent` is bounded by `chock.zon`'s own
@@ -248,7 +248,7 @@ before this harness existed found nine faults, and this run found a tenth.
   session ends. There is also no capped temporary area, so `TMPDIR` and
   `CHOCK_SCRATCHPAD` name one directory and a file written through either
   survives the call. `chock doctor` reports both. See
-  [sandbox.md](sandbox.md).
+  [sandbox.md](security/sandbox.md).
 
 - Two CI runs touch macOS, and only one of them proves the sandbox. Nix on
   macOS puts every builder under `sandbox-exec`, and macOS refuses to put one

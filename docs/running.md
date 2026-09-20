@@ -29,53 +29,17 @@ it is about, and it is used only on a terminal that can show it: a pipe, a file,
 
 Every tool call runs inside the sandbox, in a throwaway copy of the project: a
 linked git worktree for a git project and an overlay otherwise. Your real
-project is never written by a tool call, and [sandbox.md](sandbox.md) says what
-the boundary is made of.
+project is never written by a tool call, and
+[sandbox.md](security/sandbox.md) says what the boundary is made of.
 
 By default the agent sees the committed state of the project. `--allow-dirty`
 copies your uncommitted work into the workspace as well.
 
 ## The tools
 
-The agent has 21 tools, and every one that touches the machine goes through that
-sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
-`edit_file`, `run_command`, `read_memory` and `write_memory`. Only
-`run_command` takes a command. The rest name a path, a pattern, or the text to
-write, because a person can review a change and cannot review a shell line.
-
-`read_image` reads a picture out of the workspace, a screenshot, a diagram, a
-rendered chart, and gives it to the model as an image. It is the one tool that
-is not always offered. A model that cannot read a picture never hears the name,
-so it cannot spend a turn calling it: the wire format must have a shape for an
-image, and the provider instance must say it takes one, which is the
-`.capabilities = .{ .images = true }` block of that instance in your
-configuration. The kind of file is read from the content and never from the
-name, so a text file called `plot.png` is refused. At most 3145728 bytes.
-
-`read_guidance` reads a document compiled into Chock, so it reaches nothing on
-the machine at all. `ask_user` puts one question to the person who started the
-session, and it grants nothing: a yes there permits no act. `set_title` names
-the session, so `chock sessions` reads as more than a list of identifiers. The
-last eight are described on pages of their own:
-
-| Tool | What it asks for | Page |
-|---|---|---|
-| `provide_tool` | a program the session has not got | [tools.md](tools.md) |
-| `nix_eval` | what one Nix expression says | [tools.md](tools.md) |
-| `nix_build` | one attribute of a flake, built | [tools.md](tools.md) |
-| `spawn_agent` | a subagent | [subagents.md](subagents.md) |
-| `restrict_self` | a promise the agent cannot take back | [policy.md](policy.md) |
-| `fetch_url` | one page over http or https | [policy.md](policy.md) |
-| `request_action` | your work carried back into your repository | [approvals.md](approvals.md) |
-| `update_plan` | a task list you can watch | below |
-
-`request_action` is the one act an agent can ask for by name, and it takes
-`workspace.apply` and nothing else. An agent that believes it is finished calls
-it, and your policy, or you, answer. It never moves a branch of yours: the work
-lands on a ref of the session's own, which you read with `git log` and take with
-`git merge`. An agent that has made no commit is told so and nobody is asked,
-because only a commit is carried back. [status.md](status.md) lists what an
-agent still cannot ask for.
+Every tool the agent has, what each one asks for, and how a call is gated are
+in [tools.md](using/tools.md). `provide_tool` is there too, and the two Nix
+tools are in [nix.md](using/nix.md).
 
 ## Devices
 
@@ -93,8 +57,9 @@ A project can name a USB or serial device it wants a session to reach, in a
 
 Naming a device here is not enough on its own. `chock.zon` still needs a
 `policy` rule for the same action, because Chock ships no default for
-`device.*`. The action names and the rule are in [policy.md](policy.md), and
-what the grant does and does not bound is in [sandbox.md](sandbox.md).
+`device.*`. The action names and the rule are in
+[actions.md](configure/actions.md), and what the grant does and does not bound
+is in [sandbox.md](security/sandbox.md).
 
 A device is picked up at the start of each tool call, and never in the middle of
 one. A sandbox is built fresh for every tool call and the call blocks until the
@@ -144,9 +109,9 @@ chock sessions prune --older-than 30
 Every run writes a `sandbox.open` event before its first turn, naming the run
 and whether the sandbox's write and execute rule was on for it. It is written on
 every run and not only on the run that gave the rule up, so an absent line means
-an older Chock and never a session nobody recorded. [sandbox.md](sandbox.md)
-has the row a project writes to give it up, and `chock doctor` reports the same
-fact before a session starts.
+an older Chock and never a session nobody recorded.
+[sandbox.md](security/sandbox.md) has the row a project writes to give it up,
+and `chock doctor` reports the same fact before a session starts.
 
 The listing needs no index, because a session identifier starts with the
 millisecond it was made and sorts in that order, so the directory is already the
@@ -189,7 +154,7 @@ prompt names that branch and that merge before you answer. A project can say
 asked each time. Chock refuses the integration rather than leave your repository
 in the middle of one, and the work is at the ref either way. An organisation
 that wants no branch touched writes one policy row, which
-[approvals.md](approvals.md) shows.
+[approvals.md](using/approvals.md) shows.
 
 A session that does not end cleanly keeps its workspace, and prints where it is.
 Errored, refused, budget reached, no progress, interrupted: whatever the agent
@@ -312,7 +277,7 @@ written, one file per session, byte for byte, so `chock sessions verify` reads
 it there too. `--export-syslog <path>` sends each line to a unix datagram socket
 as an RFC 5424 message. A syslog message is not a copy of the log: use
 `--export-dir` for one that verifies. An org policy bundle can require a sink of
-either kind, which [policy.md](policy.md) describes.
+either kind, which [org.md](configure/org.md) describes.
 
 ## Whether this machine can run a session
 
@@ -322,8 +287,8 @@ chock doctor
 
 `chock doctor` tries each sandbox layer for real, in a forked child, and says
 which are on. It exits `0` when a first run can work here, even with a layer
-missing, and `2` when it cannot. [sandbox.md](sandbox.md) says what the rows
-mean.
+missing, and `2` when it cannot. [sandbox.md](security/sandbox.md) says what
+the rows mean.
 
 On an installation an organisation manages, it also reports what that
 organisation's policy bundle imposes: the audit sinks it requires, and every

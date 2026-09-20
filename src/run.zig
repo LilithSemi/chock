@@ -781,7 +781,7 @@ fn start(
         tty.print(
             .err,
             "  Or give that provider .token_file in {s}/{s}, which is how sops-nix and agenix " ++
-                "work. See docs/credentials.md.\n",
+                "work. See docs/operate/credentials.md.\n",
             .{ config_dir, chock_auth.config.file_name },
         );
         return error.Reported;
@@ -888,8 +888,8 @@ fn start(
             ),
             error.ChockZonNotValid, error.DenyBlockNotValid, error.ChockZonTooLarge => tty.print(
                 .err,
-                "chock run: that file is {s}/chock.zon. docs/configuration.md holds a complete " ++
-                    "one, and docs/policy.md holds the policy block.\n",
+                "chock run: that file is {s}/chock.zon. docs/configure/configuration.md holds a complete " ++
+                    "one, and docs/configure/policy.md holds the policy block.\n",
                 .{project_root},
             ),
             else => {},

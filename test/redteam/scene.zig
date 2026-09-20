@@ -501,7 +501,7 @@ fn policyFor(
         .maximum =>
         \\            .{ .action = "net.*", .decision = .deny },
         ,
-        // What ships. `docs/configuration.md` uses exactly this rule as the
+        // What ships. `docs/configure/configuration.md` uses exactly this rule as the
         // example of a project that permits one host.
         .realistic =>
         \\            .{ .action = "net.fetch.org.ziglang", .decision = .allow },

@@ -29,23 +29,26 @@ nobody answers is a refusal.
 ## Features
 
 - Every tool call inside the operating system's own sandbox, with a throwaway
-  workspace. See [docs/sandbox.md](docs/sandbox.md).
+  workspace. See [docs/security/sandbox.md](docs/security/sandbox.md).
 - A declarative policy table, per project, that the agent cannot edit, plus an
-  organisation's bundle above it. See [docs/policy.md](docs/policy.md).
+  organisation's bundle above it. See
+  [docs/configure/policy.md](docs/configure/policy.md) and
+  [docs/configure/org.md](docs/configure/org.md).
 - An agent that can narrow its own policy and cannot widen it again. See
-  [docs/policy.md](docs/policy.md).
+  [docs/configure/policy.md](docs/configure/policy.md).
 - Nix aware tool calls: a project with a `flake.nix` dev shell gets that
   shell's closure and nothing else from the store, and the agent can ask for
   one more program. See
-  [docs/toolchains.md](docs/toolchains.md) and [docs/tools.md](docs/tools.md).
+  [docs/operate/toolchains.md](docs/operate/toolchains.md) and
+  [docs/using/nix.md](docs/using/nix.md).
 - Subagents, bounded in depth and width by the project. See
-  [docs/subagents.md](docs/subagents.md).
+  [docs/using/subagents.md](docs/using/subagents.md).
 - Notes an agent keeps between sessions, outside your project. See
-  [docs/memory.md](docs/memory.md).
+  [docs/using/memory.md](docs/using/memory.md).
 - Tools you supply yourself, as WebAssembly. See
-  [docs/plugins.md](docs/plugins.md).
+  [docs/extend/plugins.md](docs/extend/plugins.md).
 - A daemon that owns sessions, and a browser in front of it. See
-  [docs/daemon.md](docs/daemon.md).
+  [docs/operate/daemon.md](docs/operate/daemon.md).
 
 ## Providers
 
@@ -75,7 +78,8 @@ quietly became a task would spend money on a typo. `chock -- fix the parser`
 runs, and so does `echo "fix the parser" | chock`.
 
 Name your providers in `~/.config/chock/config.zon`, which Chock reads and
-never writes. See [docs/configuration.md](docs/configuration.md).
+never writes. See
+[docs/configure/configuration.md](docs/configure/configuration.md).
 
 Chock is an early prototype. See [docs/status.md](docs/status.md) for what
 works and what does not.

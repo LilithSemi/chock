@@ -1473,7 +1473,7 @@ pub fn build(b: *std.Build) void {
     // Linux only, by `linux_only` above. Every canary here reads `/proc`,
     // which macOS has not got, and the sandbox a run measures is the Linux
     // driver. This is NOT because macOS runs no tool calls. It runs real
-    // sessions with four layers on: see `docs/sandbox.md`. Measuring the
+    // sessions with four layers on: see `docs/security/sandbox.md`. Measuring the
     // Darwin boundary needs canaries of its own.
     if (linux_only) {
         // The harness starts `chock`, so it needs the path of the very binary
