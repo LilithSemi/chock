@@ -1,65 +1,23 @@
 //! Chock's own sandbox, over a root filesystem that came out of a container
-//! image.
-//!
-//! **This is the acceptance test for the central design decision.**
-//! `lib/chock-container.zig` decides that a tool call does not run inside a
-//! container: the image is a source of files, exactly as a Nix closure is, and
-//! Chock's own sandbox is still the whole boundary. Every test here starts a
-//! real program out of a real image inside a real `Sandbox.spawn`, with no
-//! container runtime running at any point.
-//!
-//! ## What each test proves
-//!
-//! * A program from the image runs at all, and its exit status comes back.
-//! * The sandbox root really is the image, because a file only the image has
-//!   is readable inside it.
-//! * The host tree is not reachable, because a directory only the host has is
-//!   not there.
-//! * An absolute symbolic link inside the image resolves, which it cannot do
-//!   on the host. This is the reason the mount set exists in the shape it has.
-//! * The network namespace still applies. A container arrangement changes
-//!   nothing about the boundary, and this is the test that says so.
-//!
-//! ## Why there is a second program
-//!
-//! `Sandbox.spawn` calls `fork`, and `fork` carries only the calling thread
-//! into the child, so its caller must be single threaded. The Zig test runner
-//! is not. `test/container/rootfs_probe.zig` is, and this file starts it and
-//! reads its exit status, which is the pattern `test/sandbox/escape.zig` and
-//! `test/workspace/escape.zig` both already use.
-//!
-//! ## What makes a test here skip
-//!
-//! No container runtime, or the test image not on the disk. See
-//! `test/container/real_runtime.zig`'s own top comment: these tests never
-//! fetch, for the same reason a session never does.
-//!
-//! Measured on 2026-08-25, on Linux 6.18.42, aarch64, against Docker 29.7.2
-//! with `alpine:3.20` on the disk.
+//! image. No container runtime runs at any point, and a test skips when no
+//! runtime is installed. `Sandbox.spawn` calls `fork`, whose caller must be
+//! single threaded, so each test starts `rootfs_probe.zig` and reads its status.
 
 const std = @import("std");
 const chock_container = @import("chock-container");
-// `chock-sandbox` for one question only: the exit status the probe answers
-// with when this machine will not give it a sandbox at all.
 const sandbox = @import("chock-sandbox");
 
 const Image = chock_container.Image;
 const Runtime = chock_container.Runtime;
 
-// Zig 0.16 removed `std.process.argsWithAllocator`, and the default test
-// runner panics on any argv it does not recognize, so the probe's path cannot
-// come in as a CLI argument. build.zig embeds it as a build time constant, the
-// same way it does for every other probe in this project.
+// The test runner panics on unknown argv, so build.zig embeds the probe path.
 const probe_path = @import("rootfs_probe_path").rootfs_probe_path;
 
 const test_image = "alpine:3.20";
 
-/// The four statuses `rootfs_probe` uses for its own faults. Kept in step with
-/// that file by name.
+/// Kept in step with `rootfs_probe.zig`'s own status by name.
 const spawn_refused = 253;
 
-/// Everything one test needs: a real image, an empty sandbox root, and the
-/// blobs the probe reads.
 const Arranged = struct {
     arena: std.heap.ArenaAllocator,
     env: std.process.Environ.Map,
@@ -96,8 +54,6 @@ fn arrangeOrSkip(allocator: std.mem.Allocator) !Arranged {
     const length = try tmp.dir.realPath(std.testing.io, &buffer);
     const scratch = buffer[0..length];
 
-    // The cache and the sandbox root are siblings. The root has to be an empty
-    // directory of its own: the mount tree is built inside it.
     try tmp.dir.createDir(std.testing.io, "cache", .default_dir);
     try tmp.dir.createDir(std.testing.io, "root", .default_dir);
 
@@ -123,12 +79,8 @@ fn arrangeOrSkip(allocator: std.mem.Allocator) !Arranged {
         owned.deinit(std.testing.io);
     }
 
-    // **Built before the struct literal, never inside it.** `arena` is copied
-    // by value into the field below, and a struct literal fills its fields in
-    // order, so a call that allocated from `arena` inside the literal would
-    // put its blocks on the local arena's list and not on the copy's. The
-    // copy's `deinit` would then free neither. Measured as a leak on
-    // 2026-08-25, before this line moved.
+    // Built before the struct literal, never inside it. `arena` is copied by
+    // value below, so a block allocated inside the literal is never freed.
     const mounts_text = try mountsBlob(arena.allocator(), image);
     const env_text = try envBlob(arena.allocator(), image);
 
@@ -143,9 +95,6 @@ fn arrangeOrSkip(allocator: std.mem.Allocator) !Arranged {
     };
 }
 
-/// The mount set the module produced, in the probe's own wire shape. **Nothing
-/// is added or left out here**, so what the sandbox binds is exactly what
-/// `Image.mounts` said.
 fn mountsBlob(arena: std.mem.Allocator, image: Image) ![]const u8 {
     var text: std.ArrayList(u8) = .empty;
     for (image.mounts) |mount| {
@@ -161,20 +110,15 @@ fn mountsBlob(arena: std.mem.Allocator, image: Image) ![]const u8 {
     return text.toOwnedSlice(arena);
 }
 
-/// The environment the image states, in the probe's own wire shape.
 fn envBlob(arena: std.mem.Allocator, image: Image) ![]const u8 {
     var text: std.ArrayList(u8) = .empty;
     for (image.variables) |record| {
-        // A variable holding a newline cannot travel in this shape. No image
-        // config states one, and a test that quietly dropped it would be worse
-        // than one that says so.
         try std.testing.expect(std.mem.indexOfScalar(u8, record, '\n') == null);
         try text.print(arena, "{s}\n", .{record});
     }
     return text.toOwnedSlice(arena);
 }
 
-/// Run `argv` inside the sandbox and answer its exit status.
 fn runInside(arranged: *const Arranged, allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
     var command: std.ArrayList([]const u8) = .empty;
     defer command.deinit(allocator);
@@ -190,10 +134,7 @@ fn runInside(arranged: *const Arranged, allocator: std.mem.Allocator, argv: []co
     const result = try std.process.run(allocator, std.testing.io, .{
         .argv = command.items,
         .environ_map = &arranged.env,
-        // **Captured, never let through.** A run step that writes to standard
-        // error is read by `zig build` as a failed command whatever its exit
-        // status, and a sandboxed program that says something must not turn a
-        // passing suite into a doubtful build log.
+        // `zig build` reads a run step that wrote to standard error as failed.
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     });
@@ -204,19 +145,11 @@ fn runInside(arranged: *const Arranged, allocator: std.mem.Allocator, argv: []co
         .exited => |c| c,
         else => 255,
     };
-    // **A boundary that was never reached is not a boundary that held.** Every
-    // test below asks what a sandbox does with an image as its root, and a
-    // machine that will not give a sandbox measures nothing here. See
-    // `chock-sandbox`'s own `namespace.nothing_measured_exit_status`, and the
-    // CI job named "Sandbox", which runs this suite on a machine that can host
-    // one and fails rather than skips.
     if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
     return code;
 }
 
 test "a program out of the image runs in Chock's own sandbox, and its status comes back" {
-    // **The central claim, measured.** No container is running. The sandbox is
-    // the one `chock doctor` speaks for, and the files came from an image.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
@@ -226,8 +159,6 @@ test "a program out of the image runs in Chock's own sandbox, and its status com
         try runInside(&arranged, allocator, &.{ "/bin/busybox", "true" }),
     );
 
-    // A chosen status, so this proves a program really ran rather than that
-    // something answered zero.
     try std.testing.expectEqual(
         @as(u8, 7),
         try runInside(&arranged, allocator, &.{ "/bin/busybox", "sh", "-c", "exit 7" }),
@@ -239,7 +170,6 @@ test "the sandbox root really is the image, and the host tree is not reachable" 
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
 
-    // A file only Alpine has. The machine this runs on is NixOS and has none.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
@@ -247,8 +177,6 @@ test "the sandbox root really is the image, and the host tree is not reachable" 
         }),
     );
 
-    // And a directory only the host has. This is the half that says the image
-    // replaced the root rather than being added beside it.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
@@ -258,11 +186,7 @@ test "the sandbox root really is the image, and the host tree is not reachable" 
 }
 
 test "an absolute link inside the image resolves once the image is the root" {
-    // `/bin/sh` in Alpine is a symbolic link to the absolute path
-    // `/bin/busybox`. On the host that names the host's own `/bin/busybox`,
-    // which a NixOS machine does not have, so this link is broken outside the
-    // sandbox and correct inside it. Every test above that used `sh` already
-    // relies on this. This one states it.
+    // Alpine's `/bin/sh` links to `/bin/busybox`, which a NixOS host lacks.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
@@ -274,18 +198,8 @@ test "an absolute link inside the image resolves once the image is the root" {
 }
 
 test "the network namespace still applies over an image" {
-    // **The point of the whole design.** Where the files came from changes
-    // nothing about the boundary. A tool call over an image gets the same
-    // network isolation a tool call over a Nix closure gets, because it is the
-    // same sandbox.
-    //
-    // **The namespace itself is what is compared, and never a connection that
-    // failed.** An earlier form of this test ran BusyBox `wget` and expected
-    // it to fail. It did fail, and for the wrong reason: `wget` could not
-    // resolve a name, so the test passed just as happily with the host's own
-    // network namespace on. A mutation on 2026-08-25 caught that. A test whose
-    // failure has a second explanation is a test that proves nothing, and a
-    // connection that fails on a machine with no route is exactly that.
+    // The namespace is compared, never a connection. `wget` also fails with no
+    // name to resolve, which would pass over the host's own namespace.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
@@ -307,9 +221,6 @@ test "the network namespace still applies over an image" {
         try runInside(&arranged, allocator, &.{ "/bin/busybox", "sh", "-c", script }),
     );
 
-    // And the namespace it did get is empty except for loopback, which is what
-    // "no route out" means in the end. BusyBox prints one `Link encap` line per
-    // interface. Measured on 2026-08-25: one inside, seven on the host.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
@@ -320,18 +231,6 @@ test "the network namespace still applies over an image" {
 }
 
 test "the pid namespace still applies over an image" {
-    // The other half of the same statement. A program from an image is in a pid
-    // namespace of its own, and sees no process of the machine.
-    //
-    // **The namespace itself is compared, and never a pid number.** This test
-    // read `[ "$$" = "1" ]` until 2026-09-14. That was true only because the
-    // sandboxed program happened to be the first process in the namespace. A
-    // keeper now holds process 1 and reaps orphans, so the program is process 2
-    // and the old assertion broke while the boundary it stood for was untouched.
-    // The sentence above it claimed two things at once, a pid number and an
-    // isolation property, and only the number stopped being true. This is the
-    // same fault the network test above records: an assertion whose failure has
-    // a second explanation proves nothing.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();
@@ -353,19 +252,8 @@ test "the pid namespace still applies over an image" {
         try runInside(&arranged, allocator, &.{ "/bin/busybox", "sh", "-c", script }),
     );
 
-    // And the namespace it did get holds this sandbox and nothing of the
-    // machine's. A host runs hundreds of processes. This namespace holds the
-    // keeper, the program, and whatever the shell of this very check forks, so
-    // the upper bound is loose on purpose and still two orders of magnitude
-    // under a host. Counting is what catches a `/proc` that shows the machine's
-    // own table, which a namespace identifier alone reports as different and
-    // therefore as a pass.
-    //
-    // **The lower bound is what stops this passing on nothing.** A `/proc` that
-    // is not mounted at all makes `ls` fail and `grep -c` answer 0, and
-    // `[ 0 -le 16 ]` is true, so the upper bound alone would report isolation
-    // while measuring nothing. The keeper and the program are both always
-    // there, so a count under two is a broken check and not a clean sandbox.
+    // A `/proc` that is not mounted makes `grep -c` answer 0, so the upper
+    // bound alone would report isolation over nothing.
     try std.testing.expectEqual(
         @as(u8, 0),
         try runInside(&arranged, allocator, &.{
@@ -374,16 +262,10 @@ test "the pid namespace still applies over an image" {
         }),
     );
 
-    // A `spawn` that never came up would answer with this, and would make
-    // every check above pass for the wrong reason.
     try std.testing.expect(spawn_refused != 0);
 }
 
 test "the mount set the sandbox was given is the one the module produced" {
-    // The blob is the seam between the module and the probe, so a test that
-    // did not check it could pass with a probe that quietly added a mount of
-    // its own. Every line of the blob names a mount of `Image.mounts`, in
-    // order, and there are no others.
     const allocator = std.testing.allocator;
     var arranged = try arrangeOrSkip(allocator);
     defer arranged.deinit();

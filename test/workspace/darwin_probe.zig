@@ -1,17 +1,10 @@
 //! The program `test/workspace/darwin_escape.zig` drives. It rebuilds a real
 //! `Sandbox.Config` from the blobs on its command line, calls
-//! `chock_sandbox.spawn` with it, and reports what the kernel answered.
+//! `chock_sandbox.spawn`, and reports what the kernel answered.
 //!
-//! **A separate program, because `spawn` forks.** `fork` carries only the
-//! calling thread into the child, so its caller must be single threaded, and
-//! the zig test runner is not. This is the same shape
-//! `test/sandbox/darwin_probe.zig` and `test/workspace/escape_probe.zig` both
-//! use, and for the same reason.
-//!
-//! **Nothing here inspects a Seatbelt profile.** Every answer this program
-//! gives comes from a real `open` or a real `execve` inside a profile the
-//! kernel applied. A test that read the profile text would pass against a
-//! profile that denies nothing at all.
+//! A separate program, because `spawn` forks and its caller must be single
+//! threaded. Nothing here reads a Seatbelt profile: a test that read the profile
+//! text would pass against a profile that denies nothing.
 //!
 //! Command line, for the outer invocation:
 //!   darwin-probe <op> <cwd> <mounts-blob> <rules-blob> <env-blob> <args-blob>
@@ -19,10 +12,8 @@
 //! `<op>` is one of:
 //!   write    spawn this same program again, inside the sandbox, with
 //!            "spawned-write" and the one path `<args-blob>` holds. The inner
-//!            invocation builds no sandbox of its own, so whatever it meets is
-//!            the doing of the profile alone.
-//!   run      spawn the argv `<args-blob>` holds, inside the sandbox, in
-//!            `<cwd>`. Used for the real git commands.
+//!            invocation builds no sandbox of its own.
+//!   run      spawn the argv `<args-blob>` holds, inside the sandbox, in `<cwd>`.
 //!   spawned-write   create `<args-blob>` for write. The inner half of "write",
 //!            and never invoked from the outside.
 //!
@@ -35,25 +26,18 @@
 //! `<args-blob>` is one line per argv element. Lines are separated by "\n" and
 //! an empty blob is the empty string.
 //!
-//! Exit codes:
+//! Exit codes, which match `test/sandbox/darwin_probe.zig`:
 //!   0 - the operation succeeded.
 //!   1 - the operation was refused by the kernel.
 //!   2 - the command line is wrong, or the operation is not one this program
 //!       knows.
 //!   3 - this program could not build the config it was given, before any
-//!       sandbox was asked for. Never reused by 0 or 1: a setup failure that
-//!       answers the code a passing test asserts has shipped twice in this
-//!       project.
+//!       sandbox was asked for.
 //!   5 - the operation failed for a reason the design does not predict.
 //!  21 - `spawn` failed for a reason not named below.
 //!  24 - `sandbox_init` refused the profile, so no boundary was ever built.
 //!  25 - the config named a path this platform cannot put where it was asked.
 //!  26 - the profile could not be built at all.
-//!
-//! **21 and up did not use to exist, and every one of them answered 3.** So a
-//! build log could not tell a machine that refused to nest a Seatbelt profile
-//! from a blob this program failed to parse. The numbers match
-//! `test/sandbox/darwin_probe.zig`, so one vocabulary reads across both logs.
 
 const std = @import("std");
 const sandbox = @import("chock-sandbox");
@@ -68,12 +52,8 @@ const profile_refused: u8 = 24;
 const not_expressible: u8 = 25;
 const profile_unbuildable: u8 = 26;
 
-/// What one `spawn` failure exits with. **One code per cause**, because
-/// `setup_failed` used to cover both a refused profile and a blob this program
-/// could not read, and those two ask opposite things of whoever reads the log.
-/// Measured on a real Mac on 2026-08-26: inside a `nix build`, where the
-/// builder already holds a Seatbelt profile, `spawn` answers
-/// `LandlockRestrictFailed`, which is `profile_refused`.
+/// One exit code per cause. Inside a `nix build` the builder already holds a
+/// Seatbelt profile, and `spawn` then answers `LandlockRestrictFailed`.
 fn exitFor(err: anyerror) u8 {
     return switch (err) {
         error.LandlockRestrictFailed => profile_refused,
@@ -137,8 +117,6 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 }
 
-/// Create `path` for write, and report what the kernel said. **The inner half
-/// of "write", and the only place this program touches the probed path.**
 fn createForWrite(path: []const u8) u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= buffer.len) return bad_arguments;

@@ -1,11 +1,6 @@
-//! The one `Loop.run` test that needs a real HTTP round trip:
-//! `test/core/fake_provider.zig`, a real socket server. Lives here, not in
-//! `lib/chock-core/Loop.zig` itself, for the same reason `test/core/client.zig`
-//! is its own test target: Zig 0.16 refuses a relative `@import` that
-//! reaches outside a module's own root directory, so `Loop.zig` cannot
-//! import `fake_provider.zig` directly. Every other fact about `Loop.run`
-//! is proven inside `Loop.zig` itself, against `FakeClient` and
-//! `FakeToolRunner`, two in memory test doubles that need no socket.
+//! The one `Loop.run` test that needs a real HTTP round trip. It lives here
+//! and not in `Loop.zig` because Zig 0.16 refuses a relative `@import` that
+//! reaches outside a module's own root directory.
 
 const std = @import("std");
 const chock_provider = @import("chock-provider");
@@ -15,9 +10,6 @@ const fake_provider = @import("fake_provider.zig");
 
 const Loop = chock_core.Loop;
 
-/// A `Loop.ToolRunner` that answers every call the same way, without a
-/// sandbox: this test only cares about the key, not about what a tool call
-/// actually does.
 const NoopToolRunner = struct {
     fn dispatch(
         ptr: *anyopaque,
@@ -43,11 +35,6 @@ const NoopToolRunner = struct {
 };
 
 test "the API key is in no event in the log, driven through a real HttpClient" {
-    // Extends test/core/client.zig's own "the key travels in a header and
-    // appears in no log line" from the HTTP request body to the session
-    // log Loop.run builds from the reply. The model context never holds a
-    // credential, because chockd re-serves the session log to other
-    // clients, and a key in the log is a key given away.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const key = "sk-loop-test-only-secret-4b2e";
@@ -87,11 +74,8 @@ test "the API key is in no event in the log, driven through a real HttpClient" {
     fp.join();
     defer fp.deinit();
 
-    // The fake server actually saw the key, in the header, over the wire.
     try std.testing.expect(std.mem.indexOf(u8, fp.captured.head, "authorization: Bearer " ++ key) != null);
 
-    // Every event now on the log, byte for byte, holds no trace of it: the
-    // whole point of this test.
     var replay = try store.replay(allocator, io, 0);
     defer replay.deinit();
     var events_seen: usize = 0;

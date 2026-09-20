@@ -1,66 +1,21 @@
-//! Fixtures for the tests in this directory: a certificate chain, a private key
-//! that matches the leaf of it, and the pieces of a PIV exchange.
-//!
-//! ## Where these came from, exactly
-//!
-//! **These certificates were not captured from a card.** No card, no reader and
-//! no daemon was available where this was written, and saying otherwise would be
-//! the one thing this project's own notes name as the way a test goes vacuous.
-//!
-//! They were made with `openssl` on a workstation, once, and the bytes were
-//! written into this file. `openssl` is not in the build: nothing here runs it,
-//! and `zig build` stays the only tool a build needs. What that buys is real
-//! X.509: the chain below is signed with real ECDSA over P-256, and
-//! `std.crypto.Certificate`, which is the real parser and the real verifier, is
-//! what reads it. A chain this project's own code both made and checked would
-//! prove nothing; a chain the standard library verifies is a real chain.
-//!
-//! **What it does not buy**: the extensions under Yubico's own object
-//! identifier arc are the right shape and hold made up values, and the leaf
-//! subject is written to look like a real one. Nothing here proves Chock can
-//! read a certificate a Yubikey actually emits. That needs a Yubikey, and it is
-//! named as an open item rather than glossed over.
-//!
-//! ## The chain
-//!
-//! `leaf_der` is signed by `intermediate_der`, which is signed by `root_der`.
-//! `leaf_der` holds the public key of `leaf_secret`, so a seal signed with that
-//! key is bound to this chain and a seal signed with any other key is not.
-//!
-//! The rest are the cases a reader has to keep apart:
-//!
-//! * `other_key_leaf_der`: a real leaf, correctly signed by the same
-//!   intermediate, for a different key. This is an attestation borrowed from
-//!   another card.
-//! * `expired_leaf_der`: the same key and the same issuer, with a validity
-//!   window that closed in 2020.
-//! * `rogue_root_der` and `rogue_leaf_der`: a whole second chain, made by
-//!   somebody else, with the same subject name as the real root.
-//!
-//! ## Times
-//!
-//! Every test in this directory passes a fixed moment rather than reading a
-//! clock, so no assertion here depends on the day it runs.
+//! A certificate chain, a private key for its leaf, and the pieces of a PIV
+//! exchange. Made once with `openssl`, not captured from a card, and the Yubico
+//! extensions hold made up values, so none of it shows Chock can read a Yubikey.
 
 const std = @import("std");
 
-/// A moment inside every validity window below except the expired one.
-/// 2030-01-01T00:00:00Z.
+/// 2030-01-01T00:00:00Z, inside every window below except the expired one.
 pub const inside_window: i64 = 1893456000;
 
-/// A moment before the chain was made. 2020-01-01T00:00:00Z, which is also
-/// inside `expired_leaf_der`'s own window.
+/// 2020-01-01T00:00:00Z, inside `expired_leaf_der`'s window and no other.
 pub const before_window: i64 = 1577836800;
 
-/// The private key the leaf certificate is about, as the raw 32 byte scalar.
 pub const leaf_secret = hex("52bfb777ed365c094caa8d4b02bf839b55964aa447b368f480b85a5f0d621a86");
 
-/// Turn a hexadecimal literal into bytes at compile time. The certificates
-/// below are written this way because a hexadecimal string is what every other
-/// tool prints them as, so a reader can check one against `openssl` output.
+/// Hexadecimal, because that is what `openssl` prints, so a reader can compare.
 fn hex(comptime text: []const u8) [text.len / 2]u8 {
-    // A certificate is around 500 bytes, and the standard library's own decoder
-    // takes one branch a byte, which is past the compiler's default budget.
+    // The standard library decoder takes one branch a byte, which is past the
+    // compiler's default budget for a certificate.
     @setEvalBranchQuota(text.len * 8);
     var out: [text.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, text) catch unreachable;
@@ -157,6 +112,7 @@ pub const expired_leaf_der = hex("308201f330820199a003020102021475bf54d69f8a1410
     "36876e75d689121de0ee4cbdd7963003a77e723403022015793c8d16" ++
     "135842a2b39f81000e879b266446805fda5c4956bd77bce7b1ee5f");
 
+/// The same subject name as the real root, and a whole second chain under it.
 pub const rogue_root_der = hex("308201973082013da003020102021451a08ae1cd7d26ab2ce52e8dc5" ++
     "49b268fa0eb678300a06082a8648ce3d0403023021311f301d060355" ++
     "04030c1643686f636b20546573742050495620526f6f74204341301e" ++
@@ -192,34 +148,17 @@ pub const rogue_leaf_der = hex("308201e93082018fa003020102021421bee52f5091611d8d
     "8d869e43b3c3b95680430221008c1be356b14db69e616dc49747d12a" ++
     "51084bf8c35e1be77acc04d6fbc5efece6");
 
-/// The digest the recorded `GENERAL AUTHENTICATE` asks the card to sign:
 /// SHA-256 of "chock pcsc transcript".
 pub const transcript_digest = hex("a14f4bfd6bdd8c2fd8d1fea079911c68d252a639847324bdf4fdd10e261e88d9");
 
-/// The signature a card answers that request with, DER encoded, made by the
-/// same private key `leaf_der` holds the public part of.
-///
-/// **Made by `openssl` and not by this project's own code.** A signature Chock
-/// produced and then checked with Chock would prove only that two halves of one
-/// program agree. This one was produced by a different implementation entirely,
-/// so decoding it and checking it against `leaf_der` proves the decoding is
-/// right.
+/// Made by `openssl`, so checking it shows the decoding is right rather than
+/// that Chock agrees with itself.
 pub const transcript_signature_der = hex("304402200facb9e0c03ad59db784de07e1958adc456d174105c1d317" ++
     "ed114755d8e153ff022012ec5c10e2ef0fde57e166ec9b8b37177d41" ++
     "c4c127a93e7676d4c909c955973c");
 
-/// A real RSA2048 key, made once with `ssh-keygen -t rsa -b 2048 -m PEM` on
-/// the machine this was written for, and read out of the PKCS#1 DER it wrote.
-///
-/// **The private half is here on purpose and it guards nothing.** A card never
-/// gives its private key up, so a test that wanted to record what a card would
-/// answer had to hold a key it could sign with. This one signs the seals in
-/// this directory and nothing else.
-///
-/// **What it buys**: the RSA half of `seal.read` is checked against a signature
-/// made by raw modular exponentiation with this exponent, so the padding, the
-/// key encoding and the verification all have to agree with a key this project
-/// did not make.
+/// Made once with `ssh-keygen -t rsa -b 2048 -m PEM`. The private half is here
+/// because a card never gives its key up, and a recording must sign with it.
 pub const rsa_modulus = hex("9509dfd16e1418d7f321af6642275d2ad7544e7ceeb561a9c612c058" ++
     "fcffa394780f67dd2df0c54c5696bd1e3cc58484ad45da750035b14c" ++
     "e36abcdd6f99a5fea31bce1a45ab2fa76f0179241714f891493d1fc2" ++
@@ -231,10 +170,9 @@ pub const rsa_modulus = hex("9509dfd16e1418d7f321af6642275d2ad7544e7ceeb561a9c61
     "124b01cd7b69bd875e143ec44ab403fd028ac58029215cffec1d59e1" ++
     "2583668f");
 
-/// The public exponent, 65537. The one every RSA key a PIV card generates has.
+/// 65537, which every RSA key a PIV card makes has.
 pub const rsa_exponent = hex("010001");
 
-/// The private exponent of `rsa_modulus`. See the comment on it.
 pub const rsa_private_exponent = hex("06d1efdb0e957ed98af7b4a6124ae8d98807049c74f3f9e721f843b3" ++
     "0ec8c7fc884df42bcbe963aded9c72450af4e2ee8b5b51f6deae9651" ++
     "756ab1ffd4168ce10d27bd93b8327038d23c98058dc4d8e71519e5f5" ++

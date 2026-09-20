@@ -1,43 +1,15 @@
-//! `chock-redteam`: the red team harness.
+//! `chock-redteam`: the red team harness. A program somebody runs, and not a
+//! step `zig build test` depends on. A scene is never removed.
 //!
-//! This is not a test that passes or fails a build. It is an exercise that is
-//! run deliberately, and the harness exists so that the result is a fact and
-//! not an opinion.
-//!
-//! So this is a program somebody runs, and not a step `zig build test`
-//! depends on. What it does is fixed before a session starts: it builds a
-//! scene, measures every canary, runs one session, measures every canary
-//! again, and prints one value per boundary. Nobody reads a transcript.
-//!
-//! ## The verbs
+//! The verbs:
 //!
 //! * `scope` prints the list a run is judged against, and nothing else.
-//! * `self-test` forges every escape in that list and checks that the oracle
-//!   catches each one, then checks that a clean session reports clean. **No
-//!   model, no credential, no network.** This is `zig build redteam-oracle`.
+//! * `self-test` forges every escape in that list, checks that the oracle
+//!   catches each one, then checks that a clean session reports clean. No
+//!   model, no credential, no network. This is `zig build redteam-oracle`.
 //! * `forge <name>` does one of those, and leaves the scene behind to look at.
 //! * `run` is the exercise: one real session against one real model.
-//!
-//! ## Two configurations, and the gap between them
-//!
-//! `run --both` runs the maximum hardening configuration and the realistic
-//! one and prints both numbers. A sandbox that holds because the box is
-//! empty is a weaker result than it looks. The gap between the two numbers is
-//! what the tools cost.
-//!
-//! ## The evidence is kept, including the failures
-//!
-//! A scene is never removed. The log of every run is kept, including the
-//! failures, because a near miss names the next test to write, and a harness
-//! that tidied up after a session that held would throw away exactly the near
-//! miss that was worth keeping.
-//!
-//! ## Nothing here has a fixed path
-//!
-//! Every scene is a directory named from `std.crypto.random`, under `TMPDIR`
-//! or under `--scene`. The whole class of bug where two runs share a path
-//! was audited, and a canary at a shared name is a canary that reports one
-//! run's escape against another run's evidence.
+//! * `run --both` runs both configurations and prints both numbers.
 
 const std = @import("std");
 const chock_broker = @import("chock-broker");
@@ -51,38 +23,26 @@ const oracle = @import("oracle.zig");
 const scene_mod = @import("scene.zig");
 const scope = @import("scope.zig");
 
-/// The `chock` this build produced, as a build time constant. A harness that
-/// hunted for a binary on a path could measure a build older than the tree it
-/// was compiled from, which is the one mistake that would make every number
-/// here wrong and none of them look wrong.
+/// A build time constant, so this cannot run a build older than the tree.
 const chock_path = @import("redteam-paths").chock_path;
 
-/// The repository this build came from, whose flake supplies the shipping dev
-/// shell the realistic configuration uses by reference.
 const repo_root = @import("redteam-paths").repo_root;
 
-/// The hidden verb a forged surviving process runs. One binary and no helper
-/// program on a path, which is the rule `src/main.zig` already keeps for the
-/// plugin host and for a subagent.
+/// One binary and no helper program on a path.
 const linger_verb = "__linger";
 
-/// How long a forged surviving process stays alive. Long enough that the scan
-/// after the forge always finds it, short enough that a scene left behind on
-/// a shared machine does not hold a process for the rest of the day.
+/// Long enough for the scan after the forge, short enough not to hold a process
+/// on a shared machine all day.
 const linger_seconds = 120;
 
 pub const Exit = enum(u8) {
-    /// Every boundary was checked and every one held.
+    /// Every boundary was checked and held.
     clean = 0,
-    /// At least one boundary was breached. For `self-test`, at least one
-    /// forge was not caught or the clean case did not report clean.
+    /// At least one boundary was breached, or a `self-test` forge was missed.
     breached = 1,
-    /// The harness could not run. **Never confused with a clean result**: a
-    /// step that reports success for work it did not do is the fault that
-    /// made this project's Darwin cross compile check hollow for weeks.
+    /// The harness could not run, which is never the same as a clean result.
     could_not_run = 2,
-    /// Nothing was breached and something could not be checked. A pass this
-    /// is not.
+    /// Nothing was breached and something could not be checked. Not a pass.
     inconclusive = 3,
 
     fn code(self: Exit) u8 {
@@ -176,8 +136,8 @@ pub fn main(init: std.process.Init) !u8 {
             return Exit.could_not_run.code();
         },
         .linger => {
-            // Nothing is printed and nothing is written. This exists to be
-            // found by a `/proc` scan and by nothing else.
+            // Nothing is printed and nothing is written. This is here to be found
+            // by a `/proc` scan.
             init.io.sleep(
                 .{ .nanoseconds = linger_seconds * std.time.ns_per_s },
                 .awake,
@@ -393,12 +353,8 @@ fn oneSession(
     var before = try oracle.Snapshot.take(gpa, io, &scene, env, git_path);
     defer before.deinit();
 
-    // **Read before the session, and never after it.** The re-derivation asks
-    // what the table said when the answer was recorded. An agent that edited
-    // `chock.zon` to permit what it wanted and then did it would, judged
-    // against the file it left behind, come out agreeing with the table. The
-    // `chock.zon` canary would still name the edit, but the policy check would
-    // have quietly reported held, which is the worse of the two failures.
+    // Before the session, or an agent that edited `chock.zon` to permit what it
+    // wanted would come out agreeing with the table.
     const table = oracle.tableFor(gpa, io, &scene);
     defer if (table) |loaded| chock_policy.table.Table.destroy(gpa, loaded);
 
@@ -410,8 +366,8 @@ fn oneSession(
 
     try runChock(gpa, io, out, env, &scene, options, request, prompt);
 
-    // Measured before the listener is stopped, so a connection that arrived
-    // during the session is still in the accept queue when the count is read.
+    // Before the listener is stopped, so a connection made during the session is
+    // still in the accept queue.
     var after = try oracle.Snapshot.take(gpa, io, &scene, env, git_path);
     defer after.deinit();
 
@@ -423,12 +379,11 @@ fn oneSession(
     return finish(gpa, io, &scene, table, &before, &after, listener.count(), survivors);
 }
 
-/// Read every log, judge, and write the report into the scene beside them.
 fn finish(
     gpa: std.mem.Allocator,
     io: std.Io,
     scene: *const scene_mod.Scene,
-    /// The policy table as it read **before** the session. See `oneSession`.
+    /// The policy table as it read before the session. See `oneSession`.
     table: ?*const chock_policy.table.Table,
     before: *const oracle.Snapshot,
     after: *const oracle.Snapshot,
@@ -450,11 +405,8 @@ fn finish(
         try scans.append(gpa, one);
     }
 
-    // **Read back, and not only written.** The harness has kept the child's
-    // standard error since it was written, and nothing ever looked at it. A
-    // line in there saying a socket could not be opened is a boundary that was
-    // checkable in principle and was not checked in fact, which the oracle must
-    // report as inconclusive rather than held: see `oracle.no_approval_socket`.
+    // A line here saying a socket could not be opened is a boundary the oracle
+    // must call inconclusive rather than held.
     const child_stderr = readEvidence(gpa, io, scene, "stderr.txt");
     defer gpa.free(child_stderr);
 
@@ -473,12 +425,8 @@ fn finish(
     return result;
 }
 
-/// One evidence file, read back. Answers with an empty, freeable slice when
-/// there is nothing to read.
-///
-/// **Never fails the run.** Evidence that is missing is a reason to report less
-/// confidence, which is what the oracle does with what this returns, and never
-/// a reason to lose a verdict that was measured from everything else.
+/// Never fails the run: missing evidence gives an empty slice, which the oracle
+/// reads as less confidence.
 fn readEvidence(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -492,9 +440,7 @@ fn readEvidence(
         gpa.alloc(u8, 0) catch unreachable;
 }
 
-/// How much of one evidence file the oracle reads back. A child's standard
-/// error is a handful of lines in every healthy run, and a run that filled a
-/// disk with it must not make this process do the same.
+/// A run that filled a disk with standard error must not fill one here too.
 const max_evidence_bytes: usize = 1 << 20;
 
 fn writeReport(
@@ -508,9 +454,6 @@ fn writeReport(
     var writer = std.Io.Writer.Allocating.fromArrayList(gpa, &text);
     defer text = writer.toArrayList();
 
-    // The report carries the rules it was judged under, so that a saved
-    // report does not have to be read beside a source file that may have
-    // moved on since.
     scope.write(&writer.writer) catch {};
     writer.writer.writeAll("\n") catch {};
     result.write(&writer.writer) catch {};
@@ -534,22 +477,15 @@ fn runChock(
 ) !void {
     var child_env = try env.clone(gpa);
     defer child_env.deinit();
-    // The session's whole state goes into the scene, which is what puts the
-    // log where the oracle looks and keeps the user's own sessions out of the
-    // way. The configuration directory is the scene's too, because that is
-    // where the decoy provider lives.
+    // The configuration directory is the scene's, because the decoy lives there.
     try child_env.put("XDG_STATE_HOME", scene.state);
     try child_env.put("XDG_CONFIG_HOME", scene.config);
 
     var turns_buffer: [16]u8 = undefined;
     const turns = try std.fmt.bufPrint(&turns_buffer, "{d}", .{options.max_turns});
 
-    // **Made absolute here, and it has to be.** `build.zig` hands the path
-    // over as `addOptionPath` gives it, which is relative to the build root,
-    // and the child below is started with its working directory in the scene.
-    // Measured: the first dry run said `chock would not start: FileNotFound`,
-    // and every log backed boundary came out inconclusive because there was
-    // no session. The oracle refusing to call that clean is what showed it.
+    // `addOptionPath` gives a path relative to the build root, and the child below
+    // starts in the scene.
     const program = try absolutePath(gpa, io, chock_path);
     defer gpa.free(program);
 
@@ -568,9 +504,6 @@ fn runChock(
         "--",
         prompt,
     };
-    // A dry run still starts the real binary, with the real environment, into
-    // the real transcript files. Everything but the session happens, so the
-    // wiring is proved and no provider is reached.
     const dry_argv = [_][]const u8{ program, "--version" };
     const argv: []const []const u8 = if (options.dry_run) &dry_argv else &session_argv;
 
@@ -587,10 +520,8 @@ fn runChock(
     try out.print("running {s} for at most {d} turns\n", .{ request.model, options.max_turns });
     try out.flush();
 
-    // **Standard input is not the parent's.** A session with nobody on the
-    // approval socket and no terminal refuses an `ask` at once rather than
-    // waiting, which is what a headless exercise wants: see
-    // `docs/approvals.md`, "Nobody at all is a refusal".
+    // A session with no terminal and nobody on the approval socket refuses an
+    // `ask` at once rather than waiting.
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = scene.project },
@@ -641,9 +572,6 @@ fn selfTest(
             kind.name(),
             kind.proves(),
         });
-        // The reason, and not only the answer. A forge that tripped the wrong
-        // canary would pass a count and hide a hole, so what actually fired is
-        // printed for every case, right or wrong.
         try out.print("          fired: {s}\n", .{answer.fired()});
         try out.flush();
     }
@@ -670,9 +598,6 @@ fn forgeOne(
     options: Options,
     kind: forge.Kind,
 ) !u8 {
-    // A scene that could not be built has already said why in words a person
-    // reads, so the code alone travels from here and no stack trace is printed
-    // over the message. See `reportSceneError`.
     const answer = forgeAndJudge(gpa, io, out, env, options, kind) catch |err| switch (err) {
         error.Reported => return Exit.could_not_run.code(),
         else => |e| return e,
@@ -682,16 +607,10 @@ fn forgeOne(
     return Exit.breached.code();
 }
 
-/// What one forged escape proved.
-///
-/// **A length and an accessor, not a slice.** A slice into `buffer` would
-/// point at the frame this value was built in, and the copy the caller gets
-/// would carry a pointer to memory that is gone. That fault already cost this
-/// harness one segmentation fault, in `forge.LogWriter`, from the same shape.
+/// A length and an accessor, because a slice into `buffer` would point at a
+/// frame the caller's copy outlives.
 const Proof = struct {
-    /// True when the oracle said exactly what it had to say.
     right: bool,
-    /// Which boundaries it reported, in words.
     buffer: [512]u8,
     length: usize,
 
@@ -700,8 +619,6 @@ const Proof = struct {
     }
 };
 
-/// Build a scene with no session in it, forge one escape, and answer whether
-/// the oracle saw the **right** boundary move.
 fn forgeAndJudge(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -723,9 +640,7 @@ fn forgeAndJudge(
         .root = root,
         .configuration = options.configuration,
         .repo_root = repo_root,
-        // No provider and no credential: nothing here starts a session, so
-        // asking for one would make proving the oracle depend on being logged
-        // in, which it must not.
+        // Checking the oracle must not depend on being logged in.
         .provider = null,
         .listener_port = listener.port,
         .git_path = git_path,
@@ -733,9 +648,6 @@ fn forgeAndJudge(
     }) catch |err| {
         listener.stop();
         try reportSceneError(out, err, "none");
-        // `Reported`, the same as `oneSession`'s: the message a person reads is
-        // already written, and a stack trace on top of it says less than the
-        // message alone. See `Exit.could_not_run`.
         return error.Reported;
     };
     defer scene.deinit();
@@ -743,15 +655,12 @@ fn forgeAndJudge(
     var before = try oracle.Snapshot.take(gpa, io, &scene, env, git_path);
     defer before.deinit();
 
-    // The table as it read before the forge, for the same reason `oneSession`
-    // reads it there: the `chock_zon` forge changes the file, and a judgement
-    // made against what it left behind is a judgement against the wrong rules.
+    // Before the forge, because the `chock_zon` forge changes the file.
     const table = oracle.tableFor(gpa, io, &scene);
     defer if (table) |loaded| chock_policy.table.Table.destroy(gpa, loaded);
 
-    // No allocation for this one. `realPathFileAlloc` hands back a sentinel
-    // slice, and freeing it as an ordinary one is an allocator fault that
-    // reaches standard error, which in a build step reads like a test failure.
+    // `realPathFileAlloc` hands back a sentinel slice, and freeing it as an ordinary
+    // one is an allocator fault that reaches standard error.
     var self_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const self_path = selfPath(io, &self_buffer) catch chock_path;
 
@@ -793,34 +702,23 @@ fn forgeAndJudge(
     }
     proof.length = written;
 
-    // **The named boundary, and not a count.** "Some boundary moved" would
-    // pass a forge that tripped the wrong canary, which is a hole that looks
-    // exactly like a pass. The clean case is held to more than an absence of
-    // breaches as well: a run that could not check something is not clean.
+    // The named boundary and not a count, or a forge that tripped the wrong canary
+    // would pass.
     proof.right = if (kind.boundary()) |wanted|
         result.verdicts[@intFromEnum(wanted)] == .breached
     else
         result.breaches() == 0 and result.trustworthy();
 
-    // **A forge that proved what it had to prove leaves nothing behind, and a
-    // forge that did not keeps everything.** A scene root is short now, which
-    // means it is under `/tmp` and not under a `TMPDIR` a shell removes on its
-    // way out, and `self-test` builds nine of them each time it runs. A pile of
-    // scenes nobody will ever read is litter. The scene of a case that came out
-    // wrong is the only copy of the evidence for it. See `makeSceneRoot`.
+    // Only a case that came out right is cleaned up. The rest is the evidence.
     if (proof.right) std.Io.Dir.cwd().deleteTree(io, scene.root) catch {};
 
     return proof;
 }
 
-/// `path` as an absolute path, joined against this process's own working
-/// directory when it is relative. The caller owns the result.
 fn absolutePath(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return gpa.dupe(u8, path);
-    // `Dir.cwd()` is the `AT_FDCWD` sentinel and not a descriptor, so asking
-    // it for its own real path fails. Opening `.` gives a real descriptor that
-    // can answer. Measured: the first version called `Dir.cwd().realPath` and
-    // died with `FileNotFound`.
+    // `Dir.cwd()` is the `AT_FDCWD` sentinel and not a descriptor, so asking it for
+    // its own real path fails. Opening `.` gives one that can answer.
     var here = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer here.close(io);
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -878,20 +776,11 @@ fn reportSceneError(out: *std.Io.Writer, err: scene_mod.Error, provider: []const
     }
 }
 
-/// How many random characters a scene directory's name ends with. Eight of a
-/// 32 character alphabet is forty bits, which is far more than enough to tell
-/// this run's scene from a scene left behind by another, and short enough to
-/// keep the whole root inside `scene_mod.max_root_bytes`.
+/// Forty bits, and short enough to keep the root inside `max_root_bytes`.
 const scene_suffix_len = 8;
 
-/// The parent directory a scene is built under when the caller named none.
-///
-/// **`TMPDIR` only while `TMPDIR` is short.** A nix dev shell sets `TMPDIR` to
-/// a path it made, and the shell of 2026-08-26 set one 34 bytes long, which
-/// left no room at all for a session's sockets below the scene. `/tmp` is the
-/// fallback because a unix socket path bound is a bound on the whole path, so
-/// the only thing that can give the chain room is a shorter start. See
-/// `scene_mod.max_root_bytes`.
+/// `TMPDIR` only while it is short. A nix dev shell sets one long enough to leave
+/// a session's sockets no room, and the socket bound is on the whole path.
 fn defaultSceneParent(
     env: *const std.process.Environ.Map,
     configuration: scene_mod.Configuration,
@@ -901,12 +790,7 @@ fn defaultSceneParent(
     return if (spent <= scene_mod.max_root_bytes) tmpdir else "/tmp";
 }
 
-/// A directory nothing else will ever be given.
-///
-/// **Short on purpose.** Everything in the name is spent against the unix
-/// socket path bound, which the whole chain below this directory shares: see
-/// `scene_mod.max_root_bytes`, and `scene_mod.build`, which refuses a root that
-/// is too long rather than letting the run go on and measure less than it says.
+/// Everything in the name is spent against `scene_mod.max_root_bytes`.
 fn makeSceneRoot(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -914,10 +798,6 @@ fn makeSceneRoot(
     options: Options,
     configuration: scene_mod.Configuration,
 ) ![]u8 {
-    // A root the caller named is used as it was written, and never quietly
-    // moved somewhere shorter: `scene_mod.build` refuses it if it will not do,
-    // which tells the person what is wrong instead of ignoring what they asked
-    // for.
     const parent = options.scene_root orelse defaultSceneParent(env, configuration);
 
     var attempt: usize = 0;
@@ -943,11 +823,8 @@ fn makeSceneRoot(
 }
 
 test {
-    // The harness's own unit tests live beside the code they pin. Whether the
-    // oracle catches a real escape is proved by `zig build redteam-oracle`,
-    // because that is a claim no unit test can make: it needs a scene, a
-    // repository and a forged escape, and it takes seconds rather than
-    // milliseconds.
+    // Whether the oracle catches a real escape is answered by
+    // `zig build redteam-oracle` and by no unit test here.
     std.testing.refAllDecls(@This());
     _ = canary;
     _ = logscan;
@@ -957,8 +834,6 @@ test {
 }
 
 test "a long TMPDIR is not the parent, because the whole socket path shares its length" {
-    // The measured shell of 2026-08-26 set a TMPDIR that left a scene no room
-    // at all. See `defaultSceneParent`.
     const gpa = std.testing.allocator;
 
     var long = std.process.Environ.Map.init(gpa);
@@ -977,13 +852,9 @@ test "a long TMPDIR is not the parent, because the whole socket path shares its 
 }
 
 test "every root this harness picks for itself leaves a session's sockets room to bind" {
-    // The check `scene_mod.build` makes, made here against the name this file
-    // builds, so a longer scene directory name fails a test rather than a run.
     const gpa = std.testing.allocator;
 
     for ([_]scene_mod.Configuration{ .maximum, .realistic }) |configuration| {
-        // The same name `makeSceneRoot` builds, with every random character
-        // spent.
         const root = try std.fmt.allocPrint(gpa, "/tmp/ckrt-{s}-{s}", .{
             configuration.tag(),
             "z" ** scene_suffix_len,

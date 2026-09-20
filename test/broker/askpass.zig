@@ -1,29 +1,6 @@
-//! The password helper, driven by a real `git`.
-//!
-//! **A test that calls the answering function proves the function, and this
-//! project has already shipped a client that had never spoken to a real
-//! server.** `lib/chock-broker/askpass.zig` has its own unit tests over a real
-//! unix socket; what none of them can say is whether a real `git`, with a real
-//! `GIT_ASKPASS`, ever reaches that socket at all, and whether what comes back
-//! is a password as far as `git` is concerned. So every test here starts the
-//! `git` on this machine.
-//!
-//! `git credential fill` is the subcommand that asks. It reads a description
-//! of one credential on standard input, prompts for what the description does
-//! not hold, and prints the whole credential back. **It reaches no network**,
-//! which is what makes it the right way to ask a real `git` for a password on
-//! a machine with no remote to push to.
-//!
-//! Two things are proved here that a unit test cannot:
-//!
-//! * The value really is a password to `git`. It comes back on `git`'s own
-//!   standard output as `password=...`, which is `git` saying it accepted it.
-//! * The refusal really is a refusal to `git`. A helper that prints nothing
-//!   makes `git` fail, and it fails **without** the credential.
-//!
-//! And one thing is proved by reading `/proc` while the helper runs: the value
-//! is in no environment variable and on no command line, so `ps` shows nothing
-//! and a shell history holds nothing. See `snapshot_script`.
+//! The password helper, driven by the real `git` on this machine. `git
+//! credential fill` reaches no network, so it is the way to ask a real `git`
+//! for a password with no remote to push to.
 
 const std = @import("std");
 const chock_broker = @import("chock-broker");
@@ -34,24 +11,15 @@ const askpass = chock_broker.askpass;
 const table = chock_policy.table;
 const testing = std.testing;
 
-/// Zig 0.16 removed the argv access that would let a test take a path at run
-/// time, so `build.zig` embeds both as build time constants. `git_path` is an
-/// empty string on a machine with no git, which this reads as a reason to
-/// skip.
+/// `build.zig` embeds both as build time constants, because the Zig 0.16 test
+/// runner takes no argument. An empty `git_path` is a reason to skip.
 const chock_path = @import("chock_path").chock_path;
 const git_path = @import("chock_path").git_path;
 
-/// The credential every test here hands out. Long enough that finding it in a
-/// file proves something, and shaped like a real forge token so a reader knows
-/// what it stands in for.
 const the_password = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
 
-/// The host the policy below permits.
 const the_host = "git.example.com";
 
-/// A table that permits exactly one host. Written with the labels reversed,
-/// which is what `askpass.actionInto` builds and what
-/// `lib/chock-broker/network.zig` argues for at length.
 const permit_one_host: [:0]const u8 =
     \\.{
     \\    .policy = .{
@@ -62,14 +30,9 @@ const permit_one_host: [:0]const u8 =
     \\}
 ;
 
-/// A shell wrapper that records what `ps` would show for the helper, and then
-/// becomes the helper.
-///
-/// `$$` is the shell's own process id, so `/proc/$$/cmdline` and
-/// `/proc/$$/environ` are the argument vector and the environment `git` really
-/// started this with. `exec` then replaces the shell with `chock askpass`,
-/// which inherits both unchanged, so the two files are exactly what another
-/// user of this machine could have read while the helper ran.
+/// A shell wrapper that records what `ps` would show for the helper, then
+/// becomes the helper. `$$` is the shell's own process id, and `exec` keeps
+/// the argument vector and the environment `git` really started it with.
 const snapshot_script =
     \\#!/bin/sh
     \\cat /proc/$$/cmdline > "{s}/cmdline"
@@ -78,20 +41,13 @@ const snapshot_script =
     \\
 ;
 
-/// One drive of a real `git credential fill` against a real endpoint.
 const Run = struct {
     gpa: std.mem.Allocator,
-    /// Everything `git` printed on standard output. `git credential fill`
-    /// prints the credential here.
     stdout: []u8,
-    /// Everything `git` and the helper printed on standard error.
     stderr: []u8,
     term: std.process.Child.Term,
-    /// Every byte of the session log, as `chockd` would serve it.
     log: []u8,
-    /// The environment `git` was started with, one `KEY=VALUE` per entry.
     env: [][]u8,
-    /// The argument vector `git` was started with.
     argv: []const []const u8,
     answered: usize,
     refused: usize,
@@ -112,28 +68,14 @@ const Run = struct {
     }
 };
 
-/// What one test asks of `git`.
 const Ask = struct {
-    /// The host in the credential description `git` reads on standard input.
     host: []const u8,
-    /// The user in that description. An empty one makes `git` prompt for a
-    /// user name first, which this helper never answers.
     user: []const u8 = "ross",
-    /// The program `GIT_ASKPASS` names. The session's own `askpass` link by
-    /// default, which is what a real caller sets.
     helper: ?[]const u8 = null,
-    /// Whether the session's socket is named in the environment at all. False
-    /// is a helper with nobody to ask, which is every tool call inside the
-    /// sandbox.
     tell_the_helper_where: bool = true,
-    /// The policy table this session runs under. The one that permits the test
-    /// host by default.
     policy: [:0]const u8 = permit_one_host,
 };
 
-/// A table that denies the test host. **`deny` is the one decision that stops
-/// a prompt on its own**, now that `ask` means a person is prompted: see
-/// `lib/chock-broker/askpass.zig`'s own top comment.
 const deny_the_host: [:0]const u8 =
     \\.{
     \\    .policy = .{
@@ -144,14 +86,8 @@ const deny_the_host: [:0]const u8 =
     \\}
 ;
 
-/// Build a scratch session, start a real `git credential fill`, and answer it
-/// off a real socket while it runs.
-///
-/// **The endpoint is polled while `git` runs, and that is the shape a caller
-/// has to keep.** `git` is waiting on the helper and the helper is waiting on
-/// this socket, so a caller that started `git` and blocked on it at once would
-/// deadlock. `lib/chock-broker/askpass.zig`'s own top comment says so and
-/// gives the three lines; this is those three lines against a real `git`.
+/// The endpoint is polled while `git` runs. `git` waits on the helper and the
+/// helper waits on this socket, so a caller that blocked on `git` would deadlock.
 fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -165,16 +101,12 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var endpoint = try askpass.Endpoint.open(io, socket_path, null);
     defer endpoint.close(io);
 
-    // **The link is what `GIT_ASKPASS` can name.** Git runs one executable
-    // path with one argument and puts no shell in the way, so
-    // `GIT_ASKPASS="<chock> askpass"` fails with `cannot exec`, measured
-    // against git 2.55. This is the line a real caller writes.
+    // Git runs one executable path with one argument and puts no shell in the
+    // way, so `GIT_ASKPASS="<chock> askpass"` fails with `cannot exec` on git
+    // 2.55. `build.zig` gives a path relative to the build root, and a link
+    // resolves against the directory it sits in, so it needs the absolute one.
     const link_path = try std.fmt.allocPrint(gpa, "{s}/ctl/{s}", .{ dir, askpass.link_name });
     defer gpa.free(link_path);
-    // `build.zig` gives the path the way the build system holds it, which is
-    // relative to the build root. A link resolves against the directory it
-    // sits in, so it needs the absolute one, which is what `link` refuses
-    // without.
     const chock_absolute = try std.Io.Dir.realPathFileAlloc(.cwd(), io, chock_path, gpa);
     defer gpa.free(chock_absolute);
     try askpass.link(io, link_path, chock_absolute);
@@ -196,8 +128,6 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
         .model = "main",
     };
 
-    // The credential description `git credential fill` reads. A blank line
-    // ends it.
     const description = if (ask.user.len == 0)
         try std.fmt.allocPrint(gpa, "protocol=https\nhost={s}\n\n", .{ask.host})
     else
@@ -223,15 +153,11 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
     var env = try std.testing.environ.createMap(gpa);
     defer env.deinit();
     // git must answer in the C locale, because `askpass.readPrompt` reads the
-    // two English prompts and refuses everything else.
+    // two English prompts. It must read no user configuration and fall back to
+    // no terminal, so the helper is the only route to a password.
     try env.put("LC_ALL", "C");
-    // A user's own configuration must not decide what this test measures, and
-    // a credential helper on this machine would answer before the prompt was
-    // ever written.
     try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
     try env.put("GIT_CONFIG_SYSTEM", "/dev/null");
-    // Nothing may fall back to a terminal, so the helper is the only route to
-    // a password.
     try env.put("GIT_TERMINAL_PROMPT", "0");
     try env.put("GIT_ASKPASS", ask.helper orelse link_path);
     if (ask.tell_the_helper_where) try env.put(askpass.env_socket, socket_path);
@@ -247,9 +173,7 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
         .stderr = .{ .file = stderr },
     });
 
-    // **The loop a real caller writes.** Bounded, so a git that never asks
-    // ends this test rather than hanging it: ten seconds of fifty millisecond
-    // looks. `git credential fill` answers in milliseconds.
+    // Bounded, so a git that never asks ends this test rather than hanging it.
     for (0..200) |_| {
         _ = try endpoint.step(gpa, io, &locked, asker, 50);
         if (endpoint.answered + endpoint.refused > 0) break;
@@ -274,13 +198,6 @@ fn drive(gpa: std.mem.Allocator, io: std.Io, ask: Ask) !Run {
 }
 
 test "a real git asks over the socket and gets the password, and the value is nowhere else" {
-    // The proof the whole task turns on. A real `git`, a real `GIT_ASKPASS`
-    // pointed at the built binary, a real unix socket, and `git` printing the
-    // value back as a password it accepted.
-    //
-    // Mutation check: change `Asker.answer` to return
-    // `.{ .refused = .host_not_permitted }` unconditionally, and the first
-    // expectation below fails because git exits non zero with no password.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -288,26 +205,16 @@ test "a real git asks over the socket and gets the password, and the value is no
     var run = try drive(gpa, io, .{ .host = the_host });
     defer run.deinit();
 
-    // git took it. `git credential fill` prints the credential it assembled,
-    // and the password line is git saying the helper answered.
     try testing.expectEqual(@as(?u8, 0), run.exited());
     try testing.expect(std.mem.indexOf(u8, run.stdout, "password=" ++ the_password) != null);
     try testing.expect(std.mem.indexOf(u8, run.stdout, "host=" ++ the_host) != null);
     try testing.expectEqual(@as(usize, 1), run.answered);
     try testing.expectEqual(@as(usize, 0), run.refused);
 
-    // **Nowhere else.** Each of these is one of the four places the value must
-    // never reach, checked against what really happened rather than against
-    // what the code was meant to do.
-    //
-    // The session log, which `chockd` serves to every attached client. The
-    // fact that a prompt happened is in it, and the answer is not.
     try testing.expect(std.mem.indexOf(u8, run.log, "prompt.password") != null);
     try testing.expect(std.mem.indexOf(u8, run.log, the_host) != null);
     try testing.expect(std.mem.indexOf(u8, run.log, the_password) == null);
 
-    // The environment git was started with, which is the environment the
-    // helper inherited. `CHOCK_ASKPASS_SOCKET` is in it and holds a path.
     var told_where = false;
     for (run.env) |entry| {
         try testing.expect(std.mem.indexOf(u8, entry, the_password) == null);
@@ -318,25 +225,12 @@ test "a real git asks over the socket and gets the password, and the value is no
     }
     try testing.expect(told_where);
 
-    // The command line, which `ps` shows to every other user of the machine.
     for (run.argv) |arg| try testing.expect(std.mem.indexOf(u8, arg, the_password) == null);
 
-    // And standard error, where a helper that explained itself too eagerly
-    // would have put it.
     try testing.expect(std.mem.indexOf(u8, run.stderr, the_password) == null);
 }
 
 test "a host nobody typed a password for gets none, and git fails rather than carrying on" {
-    // The safe direction, measured at the far end.
-    //
-    // **A person is prompted once, for the host the remote names.** The prompt
-    // `git` writes is untrusted text, so a prompt naming a different host
-    // finds nothing, and the refusal reaches git as a failure and never as an
-    // empty password.
-    //
-    // Mutation check: make `Grants.find` answer its first entry whatever host
-    // it was asked about, and this test finds `password=` in git's own output
-    // for a host nobody typed one for.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -350,27 +244,15 @@ test "a host nobody typed a password for gets none, and git fails rather than ca
     try testing.expectEqual(@as(usize, 0), run.answered);
     try testing.expectEqual(@as(usize, 1), run.refused);
 
-    // The person reading git's output is told which refusal it was and what to
-    // do about it, rather than only that something failed.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "chock askpass") != null);
     try testing.expect(std.mem.indexOf(u8, run.stderr, "nobody typed a password") != null);
-    // git's own message about the same failure is beside it.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "askpass") != null);
 
-    // The prompt is still recorded, so a person can see that Chock was asked
-    // and said no.
     try testing.expect(std.mem.indexOf(u8, run.log, "prompt.password") != null);
     try testing.expect(std.mem.indexOf(u8, run.log, the_password) == null);
 }
 
 test "a host the policy denies gets no password even when somebody typed one" {
-    // **`deny` is the one decision that refuses on its own**, now that `ask`
-    // means a person is prompted. This drives the same host, with the same
-    // credential held, under a table that denies it, and a real git still
-    // fails without the value.
-    //
-    // Mutation check: delete the `.deny` arm of `Asker.mayPrompt` and this
-    // test finds the password in git's own output.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -384,16 +266,13 @@ test "a host the policy denies gets no password even when somebody typed one" {
     try testing.expectEqual(@as(usize, 0), run.answered);
     try testing.expectEqual(@as(usize, 1), run.refused);
 
-    // The rule is named, so whoever wrote it can find it.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "secret.password") != null);
     try testing.expect(std.mem.indexOf(u8, run.log, the_password) == null);
 }
 
 test "a user name prompt is never answered, so a password can never be read as a user" {
-    // Measured, and this is why the refusal exists. A helper that answered the
-    // user name prompt with the password made git write `username=<the
-    // password>` into the credential, which puts it in the URL of every
-    // request afterwards.
+    // A helper that answered the user name prompt with the password made git
+    // write `username=<the password>`, which puts it in every later URL.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -409,14 +288,6 @@ test "a user name prompt is never answered, so a password can never be read as a
 }
 
 test "a helper with no session to ask answers nothing at all" {
-    // What every tool call inside the sandbox gets, because the sandbox has no
-    // path to a session's control directory. Here it is spelled as an
-    // environment with no socket named in it, which is the same state that
-    // reaches this program.
-    //
-    // Mutation check: make `main` fall back to reading a credential store when
-    // the variable is absent, and this test hands out the password to a git
-    // that no session was watching.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -427,23 +298,13 @@ test "a helper with no session to ask answers nothing at all" {
     try testing.expect(run.exited() != @as(?u8, 0));
     try testing.expect(std.mem.indexOf(u8, run.stdout, "password=") == null);
     try testing.expect(std.mem.indexOf(u8, run.stdout, the_password) == null);
-    // Nothing was asked of the session at all.
     try testing.expectEqual(@as(usize, 0), run.answered);
     try testing.expectEqual(@as(usize, 0), run.refused);
     try testing.expect(std.mem.indexOf(u8, run.log, "prompt.password") == null);
-    // And the helper said why, in a sentence that names the sandbox.
     try testing.expect(std.mem.indexOf(u8, run.stderr, "reached no session") != null);
 }
 
 test "ps and proc show the helper holding no credential while it runs" {
-    // The live check, and it is live rather than argued. A wrapper records
-    // `/proc/$$/cmdline` and `/proc/$$/environ` and then becomes the helper by
-    // `exec`, so what is written is exactly the argument vector and the
-    // environment another user of this machine could have read at that moment.
-    //
-    // Mutation check: put the value in the environment by adding
-    // `try env.put("CHOCK_PASSWORD", the_password)` in `drive`, and the
-    // environ half of this test fails.
     if (git_path.len == 0) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -465,8 +326,6 @@ test "ps and proc show the helper holding no credential while it runs" {
     var run = try drive(gpa, io, .{ .host = the_host, .helper = script_path });
     defer run.deinit();
 
-    // The wrapper really did become the helper, so the snapshot is of the
-    // process that answered.
     try testing.expectEqual(@as(?u8, 0), run.exited());
     try testing.expect(std.mem.indexOf(u8, run.stdout, "password=" ++ the_password) != null);
 
@@ -480,15 +339,11 @@ test "ps and proc show the helper holding no credential while it runs" {
     const environ = try readWholeFile(gpa, io, environ_path);
     defer gpa.free(environ);
 
-    // Both were really read, so an empty file cannot pass this by accident.
     try testing.expect(cmdline.len != 0);
     try testing.expect(environ.len != 0);
-    // The prompt is on the command line, which is what git put there.
     try testing.expect(std.mem.indexOf(u8, cmdline, "Password for") != null);
-    // And the socket is in the environment, which is a path.
     try testing.expect(std.mem.indexOf(u8, environ, askpass.env_socket) != null);
 
-    // Neither holds the value.
     try testing.expect(std.mem.indexOf(u8, cmdline, the_password) == null);
     try testing.expect(std.mem.indexOf(u8, environ, the_password) == null);
 }
@@ -511,11 +366,8 @@ fn setExecutable(io: std.Io, path: []const u8) !void {
     try file.setPermissions(io, .fromMode(0o700));
 }
 
-/// Every byte of `path`, bounded. Owned by the caller.
 fn readWholeFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
-        // A wrapper that never ran wrote no file, and an empty result is what
-        // the test then reads, which is a failure and not a crash.
         error.FileNotFound => return gpa.dupe(u8, ""),
         else => |e| return e,
     };
@@ -535,8 +387,6 @@ fn readWholeFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// A flat copy of an environment map, one `KEY=VALUE` per entry, so a test can
-/// read it after the map has gone.
 fn copyEnv(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) ![][]u8 {
     var entries: std.ArrayList([]u8) = .empty;
     errdefer {

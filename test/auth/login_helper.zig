@@ -1,37 +1,14 @@
-//! One `chock login` worth of store writing, as its own process.
+//! One `chock login` worth of store writing, as its own process. Two of these
+//! run at once to make two commands contend through the filesystem.
 //!
-//! **Two `chock login` runs at once is the ordinary case**: a person who runs
-//! the command twice, or once while a script does. Both write the same index
-//! file, so the contention is through the filesystem and two `Store.put` calls
-//! inside one test binary would say nothing about two commands. This program is
-//! one of those commands, with everything a login does around the store taken
-//! away: no prompt, no provider check, no configuration.
-//!
-//! **The start time is a command line argument**, because the section under
-//! measurement is microseconds long. Processes started one after the other
-//! would not overlap at all, and a race nobody entered measures nothing. Every
-//! helper waits for the same wall clock instant and then goes.
-//!
-//! **Nothing here writes to standard error.** `test/proto/lock.zig` holds the
-//! rule for the whole build. Every answer travels as an exit status.
-//!
-//! **The two shapes a login has, and they are not the same race.** A login that
-//! was given `--name` replaces what that name held, and says so. A login that
-//! was given none must refuse when the name is already there, so that a
-//! second unnamed instance never silently replaces the first. This helper can
-//! run either shape, and `<if-present>` chooses.
-//!
-//! **The refusing shape asks twice, exactly as `src/login.zig` does.** The early
-//! `get` is the one that keeps a person from being asked for a credential that
-//! cannot be kept, and it is outside every lock. The `replace_existing` field is
-//! the one the store checks again with the lock held. A helper that made only
-//! the second check would measure a command nobody runs.
+//! Write nothing to standard error: `test/proto/lock.zig` holds that rule for
+//! the whole build. The start instant is an argument so that helpers started
+//! one after the other still overlap.
 //!
 //! Command line:
 //!   login-helper <data-dir> <name> <token> <stored-ms> <start-unix-ms> <if-present>
 //!
-//! `<if-present>` is `replace` for a login that was given `--name`, or `refuse`
-//! for one that was not.
+//! `<if-present>` is `replace` for a login given `--name`, `refuse` otherwise.
 //!
 //! Exit status:
 //!   0   the credential was stored
@@ -73,8 +50,8 @@ pub fn main(init: std.process.Init) u8 {
     const driver = chock_auth.store.Driver{ .data_dir = data_dir };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
 
-    // The early look, which `src/login.zig` makes before it asks a person for
-    // anything. It holds no lock, so two logins can both pass it.
+    // `src/login.zig` looks here before it asks a person for anything, and it
+    // holds no lock, so two logins can both pass.
     if (!replace) {
         const existing = store.get(init.gpa, init.io, name, null) catch return store_failed;
         if (existing) |found| {
@@ -105,9 +82,8 @@ pub fn main(init: std.process.Init) u8 {
     return stored;
 }
 
-/// Spin until the wall clock reaches `start_ms`. Short sleeps rather than a
-/// tight loop: eight helpers burning a core each would change what is being
-/// measured.
+/// Short sleeps, not a tight loop: eight helpers each burning a core would
+/// change the thing under test.
 fn waitUntil(io: std.Io, start_ms: i64) void {
     while (std.Io.Timestamp.now(io, .real).toMilliseconds() < start_ms) {
         std.Io.sleep(io, .fromNanoseconds(200 * std.time.ns_per_us), .awake) catch return;

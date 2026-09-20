@@ -1,24 +1,14 @@
 //! Tests that try to escape the sandbox around a real workspace: a throwaway
 //! git worktree, mounted the way `Workspace.sandboxConfig` builds it. Each one
-//! must fail to escape, except the two that prove the sandbox is not a deny
-//! all. These three refusals could not be proved until the workspace
-//! existed, because a sandbox on its own has no `.git` to protect.
+//! must fail to escape, except the two that prove the sandbox is not a deny all.
 //!
-//! Every test here builds its own project inside a fresh `std.testing.tmpDir`
-//! and sets its own `GIT_CEILING_DIRECTORIES`, the same pattern
-//! `worktree.zig`'s own tests use and explain in full: this project's own
-//! checkout is itself a git repository, and `tmpDir` makes every scratch
-//! directory somewhere underneath it, so git's own upward search for a
-//! `.git` directory would otherwise walk past a fresh scratch repository and
-//! find this project's real one instead.
+//! Every test builds its own project inside a fresh `std.testing.tmpDir` and
+//! sets `GIT_CEILING_DIRECTORIES`, because `tmpDir` makes every scratch
+//! directory under this project's own checkout and git's upward search for a
+//! `.git` would otherwise find this project's real repository.
 //!
-//! A real `Sandbox.spawn` call needs a single threaded caller, the same
-//! requirement `chock-sandbox`'s own escape tests and `chock-workspace`'s own
-//! overlay tests already carry: see `test/workspace/escape_probe.zig`'s own
-//! top comment. This test binary never calls `Sandbox.spawn` itself. It
-//! starts `escape_probe` as a fresh process for that and reads its exit
-//! status, the same pattern `test/sandbox/escape.zig` uses to run
-//! `test/sandbox/probe.zig`.
+//! `Sandbox.spawn` needs a single threaded caller, so this binary never calls it.
+//! It starts `escape_probe` as a fresh process and reads its exit status.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -27,10 +17,8 @@ const sandbox = @import("chock-sandbox");
 const Workspace = chock_workspace.Workspace;
 const git = chock_workspace.git;
 
-// Zig 0.16 removed std.process.argsWithAllocator, and the default test
-// runner panics on any argv it does not recognize, so the probe's path
-// cannot come in as a CLI argument. build.zig embeds it as a build time
-// constant instead, the same way it does for test/sandbox/probe.zig.
+// The default test runner panics on any argv it does not recognize, so the
+// probe's path cannot come in as an argument. build.zig embeds it instead.
 const escape_probe_path = @import("escape_probe_path").escape_probe_path;
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
@@ -64,14 +52,6 @@ fn writeFile(io: std.Io, path: [:0]const u8, contents: []const u8) !void {
     try file.writeStreamingAll(io, contents);
 }
 
-/// A fresh repository at `root_path`, one commit deep, with `tracked.txt` and
-/// `chock.zon` both committed. The same shape as `worktree.zig`'s own
-/// `TestProject`, with `chock.zon` added: the "cannot delete chock.zon" test
-/// needs one committed, or a worktree checked out at HEAD would never have
-/// it at all.
-/// The `chock.zon` every project in this file is built with. It names a
-/// budget, so "the agent cannot raise its own budget" is a fact about a cap
-/// that is really written down: see `lib/chock-cost/budget.zig`.
 const chock_zon_content =
     \\.{
     \\    .budget = .{ .max_cost = 5.0, .currency = "USD" },
@@ -79,16 +59,11 @@ const chock_zon_content =
     \\
 ;
 
-/// What `secret.env` holds in a project built with `TestProject.initWith`.
-/// **Never the empty string, and never a repeat of another file's content**:
-/// the deny tests read this path from inside a real sandbox and compare what
-/// came back, so a value that happened to match the notice, or that read the
-/// same as an empty file, would make a passing test say nothing.
+/// Never empty, and never the same as another file here. A value that matched
+/// the deny notice or an empty file would make a passing test say nothing.
 const secret_content = "AWS_SECRET_ACCESS_KEY=this-must-never-reach-a-tool-call\n";
 
-/// A `chock.zon` that denies `secret.env` and `.env`, beside the budget block
-/// every project in this file already has. Two entries on purpose: one file
-/// the project really holds, and one it does not hold at all.
+/// Two entries on purpose: one file the project holds, and one it does not.
 const chock_zon_with_deny =
     \\.{
     \\    .budget = .{ .max_cost = 5.0, .currency = "USD" },
@@ -107,10 +82,6 @@ const TestProject = struct {
         return initWith(allocator, tmp, chock_zon_content);
     }
 
-    /// `init`, with the `chock.zon` named rather than assumed, and with a
-    /// `secret.env` committed beside `tracked.txt`. The deny tests need a real
-    /// file with real content in the project: a `deny_read` block pointed at
-    /// nothing would pass every check below for the wrong reason.
     fn initWith(
         allocator: std.mem.Allocator,
         tmp: std.testing.TmpDir,
@@ -149,11 +120,6 @@ const TestProject = struct {
 
         var chock_zon_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const chock_zon_path = try std.fmt.bufPrintZ(&chock_zon_buffer, "{s}/chock.zon", .{root_path});
-        // A real budget block, not an empty file: the session's spending cap
-        // lives in this file precisely because the deny_read block already
-        // keeps the agent out of it, and the tests below prove that property
-        // with the cap actually written down rather than taking it on trust
-        // from an unrelated empty file.
         try writeFile(std.testing.io, chock_zon_path, chock_zon);
 
         var add_output = try git.run(allocator, std.testing.io, &env, root_path, &.{ "add", "tracked.txt", "secret.env", "chock.zon" }, null);
@@ -179,12 +145,7 @@ const TestProject = struct {
     }
 };
 
-/// A fresh project and scratch directory pair, both directly under the same
-/// `tmpDir`, kept apart the same way `TestProject` keeps them apart. Unlike
-/// `TestProject`, `root_path` is never turned into a git repository, so
-/// `Workspace.open` picks the overlay kind for it. Used by the test that
-/// drives both workspace kinds through `runProbe`, to prove neither the
-/// caller nor `runProbe` itself has to know which kind it got.
+/// `root_path` is never a git repository, so `Workspace.open` picks the overlay.
 const PlainProject = struct {
     allocator: std.mem.Allocator,
     root_path: [:0]const u8,
@@ -220,11 +181,8 @@ const PlainProject = struct {
     }
 };
 
-/// Serialize `mounts` the way `escape_probe.zig`'s own top comment documents:
-/// one line per mount, fields separated by 0x01, the first field always the
-/// kind ("bind", "overlay", "proc" or "deny") so `escape_probe.zig` can parse
-/// any of them back into a real `sandbox.namespace.Mount`. The caller owns the
-/// returned slice.
+/// One line per mount, fields separated by 0x01, the first field always the kind.
+/// `escape_probe.zig` parses these back. The caller owns the answer.
 fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespace.Mount) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -257,7 +215,6 @@ fn serializeMounts(allocator: std.mem.Allocator, mounts: []const sandbox.namespa
     return out.toOwnedSlice(allocator);
 }
 
-/// Same shape as `serializeMounts`, for a rules list.
 fn serializeRules(allocator: std.mem.Allocator, rules: []const sandbox.Config.Rule) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -269,12 +226,6 @@ fn serializeRules(allocator: std.mem.Allocator, rules: []const sandbox.Config.Ru
     return out.toOwnedSlice(allocator);
 }
 
-/// Serialize `env`, the environment `Workspace.sandboxConfig` built (the
-/// `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` for the
-/// worktree kind, empty for the overlay kind), one "KEY=VALUE" line per
-/// entry. Each entry is already a complete "KEY=VALUE" string, so this needs
-/// no field separator the way `serializeMounts` and `serializeRules` do. The
-/// caller owns the returned slice.
 fn serializeEnv(allocator: std.mem.Allocator, env: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -285,13 +236,8 @@ fn serializeEnv(allocator: std.mem.Allocator, env: []const []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Run `escape_probe` with `op` and `target`, against a sandbox built from
-/// `workspace`'s own `Sandbox.Config`, inside a fresh scratch root.
-/// `root_tmp` is a caller-owned `std.testing.tmpDir`, the sandbox's own root:
-/// kept separate from the project and scratch directories `TestProject` and
-/// `Workspace.open` already used, the same way `test/sandbox/escape.zig`'s
-/// own `scratchRoot` keeps a probe's sandbox root apart from everything the
-/// test building it already made.
+/// `root_tmp` is the sandbox root, kept apart from the project and the scratch
+/// directories `TestProject` and `Workspace.open` already used.
 fn runProbe(
     allocator: std.mem.Allocator,
     workspace: *const Workspace,
@@ -314,9 +260,8 @@ fn runProbe(
     const env_blob = try serializeEnv(allocator, config.env);
     defer allocator.free(env_blob);
 
-    // The probe reports through its exit status, which is the only thing a
-    // caller here reads. Its standard error goes nowhere on purpose: see the
-    // same spawn in `test/broker/support.zig` for the whole reason.
+    // The probe reports through its exit status, and its standard error goes
+    // nowhere, because the build fails on a byte a test binary writes there.
     var child = try std.process.spawn(std.testing.io, .{
         .argv = &.{ escape_probe_path, op, root_path, config.cwd, mounts_blob, rules_blob, env_blob, target },
         .stdin = .ignore,
@@ -328,15 +273,8 @@ fn runProbe(
     return term;
 }
 
-/// Skip when the probe answered "this machine would not give me a sandbox".
-///
-/// **A boundary that was never reached is not a boundary that held.** Every
-/// test here asks whether a workspace mount stops something, and every one
-/// needs a real sandbox to ask inside, so a machine that refuses one measures
-/// nothing and must not report a row of passes. A skip is what says so. See
-/// `namespace.nothing_measured_exit_status`, and the CI job named "Sandbox",
-/// which runs this suite on a machine that can host one and fails rather than
-/// skips.
+/// Skip when the probe answered "this machine would not give me a sandbox". A
+/// boundary that was never reached must not report a row of passes.
 fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
     const code = switch (term) {
         .exited => |c| c,
@@ -345,11 +283,6 @@ fn skipIfNothingMeasured(term: std.process.Child.Term) !void {
     if (code == sandbox.namespace.nothing_measured_exit_status) return error.SkipZigTest;
 }
 
-/// Find `git` on this process's own PATH, the same binary `nix develop`
-/// already put there for every other git call in this project. Returns null
-/// when it cannot be found, so the one test that needs a real git binary can
-/// skip cleanly instead of failing for an environment reason unrelated to
-/// the sandbox itself.
 fn findGitOnPath(allocator: std.mem.Allocator, io: std.Io) !?[]u8 {
     const path_env = std.process.Environ.getPosix(std.testing.environ, "PATH") orelse return null;
     var it = std.mem.tokenizeScalar(u8, path_env, ':');
@@ -416,10 +349,6 @@ test "a tool call cannot delete chock.zon" {
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // chock.zon was committed, so Workspace.open must have found it in the
-    // worktree's own checkout and set up its protection: without that, this
-    // test would pass for the wrong reason, a target path that simply is
-    // not mounted at all rather than one that is mounted read only.
     try std.testing.expect(workspace.chock_zon_source != null);
 
     const wt = workspace.kind.worktree;
@@ -434,13 +363,9 @@ test "a tool call cannot delete chock.zon" {
 }
 
 test "a tool call cannot write to chock.zon" {
-    // Finding 3: the test above only proves chock.zon cannot be unlinked,
-    // and that stays true whether the mount is read only or not, because
-    // unlinking a mount point is EBUSY either way, from the kernel, not
-    // from Landlock or a read only bind. A reviewer who flipped the mount
-    // to read write left the delete test green. This test pins the other
-    // half: an open for write must fail too, with the EROFS a read only
-    // bind mount gives, which a writable mount would not.
+    // Unlinking a mount point answers EBUSY from the kernel whether the mount is
+    // read only or not, so the delete test above stays green on a writable
+    // mount. An open for write must fail too, with EROFS.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -464,12 +389,6 @@ test "a tool call cannot write to chock.zon" {
 }
 
 test "the agent cannot raise its own budget, because the budget lives in chock.zon" {
-    // The cap is a control the user holds and the model cannot touch, and
-    // that property comes for free from the read only bind of the project's
-    // own `chock.zon`. "For free" is worth
-    // proving rather than asserting: this writes a real budget block, has a
-    // sandboxed tool call try to write over it, and then reads the file back
-    // to show the number the session is capped at did not move.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -491,9 +410,6 @@ test "the agent cannot raise its own budget, because the budget lives in chock.z
     const term = try runProbe(allocator, &workspace, root_tmp, "write", target);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 
-    // The bytes the cap is read from, unchanged. A write that had gone
-    // through would have replaced this content, and a session started
-    // afterwards would have run under whatever the model wrote.
     const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, target, allocator, .limited(4096));
     defer allocator.free(after);
     try std.testing.expectEqualStrings(chock_zon_content, after);
@@ -522,35 +438,14 @@ test "a tool call can write in the worktree, so the sandbox is not a deny all" {
 }
 
 test "a tool call can run git status inside the worktree, and the index is genuinely written to" {
-    // The index has to be writable for this. It is the test that catches a
-    // mount list which is too strict, and the tests above catch one that is
-    // too loose: a linked worktree writes its own .git/worktrees/<id>/index
-    // on an ordinary status, and if that mount were read only, git would
-    // fail on the lock file and every tool call that touches git would
-    // break with it.
-    //
-    // Finding 2: a worktree fresh out of `create` has an index that already
-    // matches what git checked out, so a plain `git status` right after
-    // needs no refresh write at all, and this test used to pass even with
-    // the whole metadata directory mounted read only, appended last in the
-    // list so the kernel took it: nothing here ever exercised index
-    // writability, the one thing this test exists to pin. Confirmed by hand
-    // that a plain `git status` never fails on exit code either way, read
-    // only index or not, because git treats the refresh write as a silent,
-    // best effort optimization: mounting the whole metadata directory read
-    // only in the same way, by hand, left this test green even then. So
-    // this test does not trust the exit code alone. It touches a tracked
-    // file's mtime, without changing its content, which is exactly the
-    // shape a plain `git status` will safely refresh the cached stat entry
-    // for, then reads the index bytes on the host before and after the
-    // probe runs and requires them to differ: a read only mount leaves the
-    // index untouched, and only a genuinely writable one lets git rewrite
-    // it.
+    // git treats the index refresh write as a silent, best effort optimization,
+    // so `git status` exits zero whether the index is writable or not. This test
+    // therefore reads the index bytes before and after and requires them to
+    // differ. A fresh worktree also needs its mtime touched first, or git has
+    // nothing to refresh.
     const allocator = std.testing.allocator;
 
     const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse {
-        // A skip needs no message: a test that writes to standard error and
-        // passes still puts a `failed command:` line in the build log.
         return error.SkipZigTest;
     };
     defer allocator.free(git_path);
@@ -565,10 +460,7 @@ test "a tool call can run git status inside the worktree, and the index is genui
 
     const wt = workspace.kind.worktree;
 
-    // **The index git writes is the session's own copy's**, never the
-    // project's: `Worktree.mounts`'s own entry 3 binds the copy, so this
-    // reads there. The project's own index is read too, and required to be
-    // untouched afterwards, which is finding 4's own property.
+    // The index git writes is the session's own copy's, never the project's.
     var copy_index_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const copy_index_path = try std.fmt.bufPrint(&copy_index_buffer, "{s}/index", .{wt.worktree_meta_bind_source});
 
@@ -578,19 +470,12 @@ test "a tool call can run git status inside the worktree, and the index is genui
     const project_index_before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wt.worktree_index_source, allocator, .limited(1 << 20));
     defer allocator.free(project_index_before);
 
-    // A gap short enough to make tracked.txt's new mtime land in the same
-    // second as the index's own cached entry for it makes git treat the
-    // file as "racily clean" and refuse to trust a stat only refresh for
-    // it, confirmed by hand: this test would then see the index rewritten
-    // for the wrong reason (a full re-hash every time, mount read only or
-    // not) rather than the one Finding 2 exists to pin. 1.1 seconds is
-    // comfortably past git's one second timestamp granularity.
+    // A new mtime in the same second as the index's cached entry makes git call
+    // the file racily clean and re-hash it, which would rewrite the index for the
+    // wrong reason. 1.1 seconds is past git's one second granularity.
     _ = linux.nanosleep(&.{ .sec = 1, .nsec = 100_000_000 }, null);
 
-    // Same content as TestProject.init already wrote and committed: only
-    // the mtime changes, so git's own safe refresh path applies, not a real
-    // "modified" report that a plain git status would never write back on
-    // its own.
+    // Same content, so only the mtime changes.
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tracked_path = try std.fmt.bufPrintZ(&tracked_buffer, "{s}/tracked.txt", .{wt.path});
     try writeFile(std.testing.io, tracked_path, "hello\n");
@@ -605,30 +490,17 @@ test "a tool call can run git status inside the worktree, and the index is genui
     defer allocator.free(index_after);
     try std.testing.expect(!std.mem.eql(u8, index_before, index_after));
 
-    // And the project's own index did not move one byte while that happened,
-    // which is what makes the line above a write to the copy rather than a
-    // write to the user's repository.
     const project_index_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wt.worktree_index_source, allocator, .limited(1 << 20));
     defer allocator.free(project_index_after);
     try std.testing.expectEqualSlices(u8, project_index_before, project_index_after);
 }
 
 test "finding 4: a tool call writes the worktree metadata directory and the user's own repository never sees it" {
-    // **Finding 4, reproduced and then refused.** The first complete red team
-    // run drove a tool call to write
-    // `.git/worktrees/<id>/logs/probe-from-session` into the user's own
-    // repository, and the 6 bytes were still on disk when the session ended.
-    // `.git/worktrees/<id>` is read write on purpose: `git add` and
-    // `git commit` create `index.lock` and `HEAD.lock` in it and rename each
-    // over the file it locks, and a read only mount there answers `EROFS` on
-    // the first `git add`. So the fix is not a read only mount but a
-    // different directory: `Worktree.mounts` binds the session's own copy.
-    //
-    // This test drives the same three writes the red team session made, at
-    // the same three paths, and requires each one to succeed inside the
-    // sandbox, because a refusal is a broken workspace and not a fix. Then it
-    // reads the project's own `.git/worktrees/<id>` on the host and requires
-    // every one of the three to be absent there, and the copy to hold them.
+    // `.git/worktrees/<id>` is read write on purpose: `git add` and `git commit`
+    // create `index.lock` and `HEAD.lock` there and rename each over the file it
+    // locks, so a read only mount answers EROFS on the first `git add`. The fix
+    // is a different directory, so each write must succeed and must land in the
+    // session's own copy and never in the project.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -643,10 +515,6 @@ test "finding 4: a tool call writes the worktree metadata directory and the user
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // The red team session's own three paths: the reflog directory, which is
-    // the one the oracle caught, the per worktree refs directory, which it
-    // did not catch because it accepts every name under `refs/`, and the root
-    // of the directory itself, which no read only mount can ever cover.
     const probes = [_][]const u8{
         "logs/probe-from-session",
         "refs/probe-from-session",
@@ -657,18 +525,11 @@ test "finding 4: a tool call writes the worktree metadata directory and the user
         var in_sandbox_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const in_sandbox = try std.fmt.bufPrint(&in_sandbox_buffer, "{s}/{s}", .{ wt.worktree_meta_target, relative });
 
-        // Exit 0 is the write succeeding. A refusal here would mean the
-        // metadata directory had stopped being writable, which is the state
-        // that breaks every git command a tool call makes.
         try std.testing.expectEqual(
             std.process.Child.Term{ .exited = 0 },
             try runProbe(allocator, &workspace, root_tmp, "write", in_sandbox),
         );
 
-        // The user's own repository never saw it, which is the whole
-        // finding. Read first, so a build that put the file back in the
-        // project fails on this line and names the fault, rather than
-        // failing on the copy being empty and naming a symptom.
         var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const in_project = try std.fmt.bufPrint(&project_buffer, "{s}/{s}", .{ wt.worktree_meta_source, relative });
         try std.testing.expectError(
@@ -676,9 +537,6 @@ test "finding 4: a tool call writes the worktree metadata directory and the user
             std.Io.Dir.cwd().statFile(std.testing.io, in_project, .{}),
         );
 
-        // And it really was written, in the session's own copy: without this
-        // the line above would hold just as well for a sandbox that refused
-        // the write, which is a broken workspace and not a fix.
         var copy_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const in_copy = try std.fmt.bufPrint(&copy_buffer, "{s}/{s}", .{ wt.worktree_meta_bind_source, relative });
         _ = try std.Io.Dir.cwd().statFile(std.testing.io, in_copy, .{});
@@ -686,11 +544,6 @@ test "finding 4: a tool call writes the worktree metadata directory and the user
 }
 
 test "finding 4: git status, git add, and git commit still work inside the sandbox" {
-    // The other half of finding 4. A workspace that refuses the three writes
-    // above and also refuses `git commit` has closed nothing worth having,
-    // so this drives a real add and a real commit through a real sandbox,
-    // against the copy, and then reads the commit back the way
-    // `Worktree.headAfterSession` does.
     const allocator = std.testing.allocator;
 
     const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse return error.SkipZigTest;
@@ -706,13 +559,9 @@ test "finding 4: git status, git add, and git commit still work inside the sandb
 
     const wt = workspace.kind.worktree;
 
-    // What the metadata directory the project owns held before the session,
-    // to compare against after it.
     const project_head_before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wt.worktree_head_source, allocator, .limited(1 << 16));
     defer allocator.free(project_head_before);
 
-    // The file the git-commit flow adds and commits, written on the host
-    // into the checkout, with content nothing has committed before.
     var agent_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const agent_path = try std.fmt.bufPrintZ(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
     try writeFile(std.testing.io, agent_path, "the agent wrote this inside the sandbox\n");
@@ -720,34 +569,24 @@ test "finding 4: git status, git add, and git commit still work inside the sandb
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // The probe's own git-commit flow: git status, then git add, then git
-    // commit, each one a separate sandbox of its own.
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 0 },
         try runProbe(allocator, &workspace, root_tmp, "git-commit", git_path),
     );
 
-    // The session's own commit is readable, and it is not the base.
     const moved = (try wt.headMoved(allocator, std.testing.io, &project.env, null)) orelse
         return error.TheSessionsOwnCommitWasNotVisible;
     defer allocator.free(moved);
     try std.testing.expect(!std.mem.eql(u8, moved, wt.base_commit));
 
-    // And the project's own HEAD for this worktree never moved, because the
-    // commit was written to the copy.
     const project_head_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wt.worktree_head_source, allocator, .limited(1 << 16));
     defer allocator.free(project_head_after);
     try std.testing.expectEqualSlices(u8, project_head_before, project_head_after);
 }
 
-/// Take the project's own `user.name` and `user.email` away again, and
-/// confirm git now answers "there is no identity here".
-///
-/// `TestProject.init` has to state one to make its first commit, and a real
-/// project does not: a person's identity lives in their own `~/.gitconfig`,
-/// which the sandbox has no `HOME` to find and no mount to reach. This
-/// returns the project to that shape, which is the shape the fault was
-/// measured in.
+/// A person's identity lives in their own `~/.gitconfig`, which the sandbox has
+/// no `HOME` to find and no mount to reach. `TestProject.init` has to state one
+/// to make its first commit, and this puts the project back to the real shape.
 fn removeProjectIdentity(
     allocator: std.mem.Allocator,
     env: *const std.process.Environ.Map,
@@ -759,11 +598,6 @@ fn removeProjectIdentity(
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
     }
 
-    // Confirmed, never assumed. Without this the test below could pass on a
-    // project that still states an identity, which measures nothing at all.
-    // `git.run` already forces `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to
-    // `/dev/null`, so this read sees the repository's own configuration and
-    // nothing else.
     var read_back = try git.run(allocator, std.testing.io, env, root_path, &.{ "config", "user.name" }, null);
     defer read_back.deinit(allocator);
     const still_set = switch (read_back.term) {
@@ -774,21 +608,9 @@ fn removeProjectIdentity(
 }
 
 test "a bare git commit inside the sandbox succeeds on a project that states no identity, and the commit is Chock's own" {
-    // **This is the fault, reproduced and then fixed.** Measured in a real
-    // session: the agent ran `git commit -m ...`, git answered "Author
-    // identity unknown", and the agent worked around it by inventing an
-    // identity on the command line. A second session invented a different
-    // one. `git config` cannot make one either, because the whole of `.git`
-    // is mounted read only. And a commit in the workspace is the only way a
-    // session's work reaches the user at all, through `workspace.apply`.
-    //
-    // So: a project with no identity of its own, a real sandbox, `git add`
-    // and `git commit` with no `-c` flag anywhere, and then the commit read
-    // back on the host to see whose name is on it.
-    //
-    // Mutation check: take the four identity entries out of
-    // `Workspace.sandboxConfig` and the probe exits 5, because git refuses
-    // the commit. Change either value and the last comparison fails.
+    // Without an identity git answers "Author identity unknown" and refuses the
+    // commit, and `git config` cannot make one because the whole of `.git` is
+    // mounted read only. No `-c` flag anywhere here.
     const allocator = std.testing.allocator;
 
     const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse return error.SkipZigTest;
@@ -805,7 +627,6 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
 
     const wt = workspace.kind.worktree;
 
-    // The file the git-commit flow adds and commits.
     var agent_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const agent_path = try std.fmt.bufPrintZ(&agent_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
     try writeFile(std.testing.io, agent_path, "the agent wrote this inside the sandbox\n");
@@ -813,8 +634,6 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // Exit 5 is what the probe answers when a git step did not exit zero,
-    // which is what "Author identity unknown" looks like from out here.
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 0 },
         try runProbe(allocator, &workspace, root_tmp, "git-commit", git_path),
@@ -824,8 +643,8 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
         return error.TheSessionsOwnCommitWasNotVisible;
     defer allocator.free(moved);
 
-    // Whose name is on it. The commit object is in the session's own scratch
-    // store, so that store comes in as an alternate for this one read.
+    // The commit object is in the session's own scratch store, so that store
+    // comes in as an alternate for this one read.
     var reading = try project.env.clone(allocator);
     defer reading.deinit();
     try reading.put("GIT_ALTERNATE_OBJECT_DIRECTORIES", wt.object_store_source);
@@ -835,9 +654,8 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
     defer shown.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, shown.term);
 
-    // Author and committer both, because git takes the two from separate
-    // variables and falls back to the configuration for either one it is not
-    // given.
+    // Both, because git takes author and committer from separate variables and
+    // falls back to the configuration for either one it is not given.
     try std.testing.expectEqualStrings(
         "Chock\nchock@lilithsemi.com\nChock\nchock@lilithsemi.com",
         std.mem.trimEnd(u8, shown.stdout, "\n"),
@@ -845,14 +663,8 @@ test "a bare git commit inside the sandbox succeeds on a project that states no 
 }
 
 test "the sandbox identity reaches no commit the user makes on the host" {
-    // The other side of the same wiring. The identity is four entries in one
-    // `Sandbox.Config`, handed to one sandboxed process, and it must be
-    // nothing else: not this process's own environment, and not something
-    // `chock-workspace/git.zig` forces on every call it makes. Either of
-    // those would put Chock's name on work a person did.
-    //
-    // Mutation check: add the four names to `git.zig`'s own `forced_env`, or
-    // set them with `setenv` anywhere in this library, and this fails.
+    // In this process's environment, or in `git.zig`'s forced set, the identity
+    // would put Chock's name on work a person did.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -860,8 +672,6 @@ test "the sandbox identity reaches no commit the user makes on the host" {
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
 
-    // A workspace is opened and its config built, so this test measures the
-    // state a session is actually in, not the state before one starts.
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
     const config = try workspace.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
@@ -869,7 +679,6 @@ test "the sandbox identity reaches no commit the user makes on the host" {
     defer allocator.free(config.rules);
     defer allocator.free(config.env);
 
-    // An ordinary commit by the person, in their own project, on the host.
     var host_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const host_path = try std.fmt.bufPrintZ(&host_buffer, "{s}/the-user-wrote-this.txt", .{project.root_path});
     try writeFile(std.testing.io, host_path, "mine\n");
@@ -894,26 +703,18 @@ test "the sandbox identity reaches no commit the user makes on the host" {
 }
 
 test "the config.worktree redirect stays closed even when a project has extensions.worktreeConfig on but no config.worktree of its own yet" {
-    // The reviewer's own reproduction of Finding 1: a project with
-    // extensions.worktreeConfig already on, but with no config.worktree of
-    // its own, is exactly the shape where `git worktree add` leaves a
-    // linked worktree with no config.worktree either. From inside a real
-    // sandbox, the reviewer wrote core.fsmonitor and core.hooksPath into
-    // that path, then ran an ordinary git status on the host, against that
-    // worktree, and watched the marker file the fsmonitor line named
-    // appear: host code execution, chosen entirely by the agent. This test
-    // drives the same shape end to end and confirms the fix closes it: the
-    // write from inside the sandbox is refused, and a host side git status
-    // afterward runs nothing the agent chose.
+    // A project with extensions.worktreeConfig on but no config.worktree of its
+    // own is the shape where `git worktree add` leaves a linked worktree with no
+    // config.worktree either. core.fsmonitor or core.hooksPath written there is
+    // host code execution on the next git status.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
 
-    // Turn the extension on, but never set a value with --worktree: the
-    // main checkout's own .git/config.worktree is then never written, the
-    // premise the reviewer's reproduction depends on.
+    // Never set a value with --worktree, or the main checkout's own
+    // .git/config.worktree is written and the premise is gone.
     var config_output = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{
         "config", "extensions.worktreeConfig", "true",
     }, null);
@@ -924,9 +725,6 @@ test "the config.worktree redirect stays closed even when a project has extensio
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
     const wt = workspace.kind.worktree;
-    // Confirm the premise before trusting the rest of this test: this
-    // worktree really has no config.worktree of its own, only create's own
-    // scratch stand-in for one.
     try std.testing.expect(wt.worktree_config_worktree_is_scratch);
 
     var root_tmp = std.testing.tmpDir(.{});
@@ -935,25 +733,15 @@ test "the config.worktree redirect stays closed even when a project has extensio
     const term = try runProbe(allocator, &workspace, root_tmp, "write", wt.worktree_config_worktree_target);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 
-    // Belt and suspenders, the way the reviewer proved the hole in the
-    // first place: an ordinary git status on the host, against the
-    // worktree itself, must run cleanly and touch nothing the agent chose.
     var status_output = try git.run(allocator, std.testing.io, &project.env, wt.path, &.{"status"}, null);
     defer status_output.deinit(allocator);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, status_output.term);
 
-    // The file behind the mount is still create's own empty scratch file,
-    // not a core.hooksPath or a core.fsmonitor the agent would have had git
-    // run on this very status call.
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, wt.worktree_config_worktree_source, allocator, .limited(4096));
     defer allocator.free(contents);
     try std.testing.expectEqual(@as(usize, 0), contents.len);
 }
 
-/// Sum the "count:" and "in-pack:" lines of `git count-objects -v` at
-/// `root_path`: the total number of objects the repository holds on disk,
-/// loose or packed. Used to prove a sandboxed git call never added anything
-/// to the real object store, whatever it wrote into its own scratch one.
 fn countRealObjects(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, root_path: []const u8) !usize {
     var output = try git.run(allocator, std.testing.io, env, root_path, &.{ "count-objects", "-v" }, null);
     defer output.deinit(allocator);
@@ -971,10 +759,6 @@ fn countRealObjects(allocator: std.mem.Allocator, env: *const std.process.Enviro
     return total;
 }
 
-/// The exact bytes `git show-ref` prints at `root_path`: every ref the
-/// repository has and what it points at. Used to prove a sandboxed git call
-/// never moved a ref of the real repository. The caller owns the returned
-/// slice.
 fn captureRefs(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, root_path: []const u8) ![]u8 {
     var output = try git.run(allocator, std.testing.io, env, root_path, &.{"show-ref"}, null);
     defer output.deinit(allocator);
@@ -982,10 +766,6 @@ fn captureRefs(allocator: std.mem.Allocator, env: *const std.process.Environ.Map
     return allocator.dupe(u8, output.stdout);
 }
 
-/// The number of regular files anywhere under `root_path`, walked
-/// recursively. Used to prove the scratch object store actually gained a
-/// file: a passing "git-commit" probe run that wrote nothing there would be
-/// proving nothing about the scratch store at all.
 fn countRegularFiles(allocator: std.mem.Allocator, root_path: []const u8) !usize {
     var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, root_path, .{ .iterate = true });
     defer dir.close(std.testing.io);
@@ -1003,8 +783,6 @@ test "git add and git commit succeed inside the sandbox, and the object lands on
     const allocator = std.testing.allocator;
 
     const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse {
-        // A skip needs no message: a test that writes to standard error and
-        // passes still puts a `failed command:` line in the build log.
         return error.SkipZigTest;
     };
     defer allocator.free(git_path);
@@ -1023,9 +801,7 @@ test "git add and git commit succeed inside the sandbox, and the object lands on
 
     const wt = workspace.kind.worktree;
 
-    // Fresh content: never committed before, so git cannot skip writing the
-    // object because it already has one with this hash. See
-    // escape_probe.zig's own doc comment on commit_test_file.
+    // Never committed before, so git cannot skip writing the object.
     var new_file_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const new_file_path = try std.fmt.bufPrintZ(&new_file_buffer, "{s}/chock-object-store-test.txt", .{wt.path});
     try writeFile(std.testing.io, new_file_path, "chock overlay tamper\n");
@@ -1038,16 +814,11 @@ test "git add and git commit succeed inside the sandbox, and the object lands on
     const term = try runProbe(allocator, &workspace, root_tmp, "git-commit", git_path);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // The scratch store, on the host, actually gained files: the new blob,
-    // the new tree, and the new commit object all had to land somewhere,
-    // and GIT_OBJECT_DIRECTORY said it was here.
     const scratch_files_after = try countRegularFiles(allocator, wt.object_store_source);
     try std.testing.expect(scratch_files_after > scratch_files_before);
 
-    // The real repository, on the host, gained nothing: neither a new
-    // object nor a moved ref. The worktree was created detached, so the
-    // commit only ever updated the worktree's own HEAD file, never a ref
-    // under the real repository's own refs/heads.
+    // The worktree was created detached, so the commit only updated the
+    // worktree's own HEAD file and never a ref under refs/heads.
     const objects_after = try countRealObjects(allocator, &project.env, project.root_path);
     try std.testing.expectEqual(objects_before, objects_after);
     const refs_after = try captureRefs(allocator, &project.env, project.root_path);
@@ -1056,27 +827,10 @@ test "git add and git commit succeed inside the sandbox, and the object lands on
 }
 
 test "an agent that renames its own GIT_ALTERNATE_OBJECT_DIRECTORIES gains nothing: it can still commit, but can no longer read history it did not just write" {
-    // The security question a renamed alternate asks: the alternates
-    // mechanism is a variable that names a path git reads
-    // objects from, the same category as commondir and config.worktree,
-    // both of which gave an attacker host code execution in earlier
-    // reviews. Can the agent change where the alternate points, and if so,
-    // what does that get it?
-    //
-    // The answer this test proves, not just argues: yes, the agent can
-    // change it, because it is an ordinary environment variable and the
-    // agent can set one on any subprocess of its own. But changing it gets
-    // the agent nothing useful. git never writes to an alternate, only
-    // reads from one, so no value of this variable ever grants a write the
-    // mount layer would otherwise refuse: GIT_OBJECT_DIRECTORY, fixed by
-    // the sandbox's own mount list to the scratch store, is what decides
-    // where a write lands, never the alternate. The only thing tampering
-    // with it changes is what that one command can read: this probe run
-    // still commits successfully, exactly like the test above, but the
-    // read of the pre-existing parent commit, the one from before this
-    // session started, now fails, because the tampered alternate no longer
-    // names a real path. See escape_probe.zig's own runGitCommitFlow for
-    // the exact sequence.
+    // The agent can change the alternate, because it is an ordinary environment
+    // variable. git never writes to an alternate, only reads from one, and
+    // GIT_OBJECT_DIRECTORY decides where a write lands. So tampering only costs
+    // the agent the history it did not write itself.
     const allocator = std.testing.allocator;
 
     const git_path = (try findGitOnPath(allocator, std.testing.io)) orelse {
@@ -1107,19 +861,11 @@ test "an agent that renames its own GIT_ALTERNATE_OBJECT_DIRECTORIES gains nothi
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // escape_probe.zig's own git-alternate-tamper op runs add and commit
-    // (which must still succeed) and then drops the real
-    // GIT_ALTERNATE_OBJECT_DIRECTORIES this test's own workspace.sandboxConfig
-    // built, replacing it with a bogus path, before reading the
-    // pre-existing parent commit (which must now fail). Exit 0 means both
-    // halves happened exactly as predicted; see escape_probe.zig's own top
-    // comment for what any other exit code would mean.
+    // The op commits, then replaces the alternate with a bogus path and reads
+    // the parent commit, which must now fail.
     const term = try runProbe(allocator, &workspace, root_tmp, "git-alternate-tamper", git_path);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // Belt and suspenders, the same as every other escape test here: the
-    // real repository still gained nothing, whether or not the tampering
-    // itself succeeded.
     const objects_after = try countRealObjects(allocator, &project.env, project.root_path);
     try std.testing.expectEqual(objects_before, objects_after);
     const refs_after = try captureRefs(allocator, &project.env, project.root_path);
@@ -1127,13 +873,9 @@ test "an agent that renames its own GIT_ALTERNATE_OBJECT_DIRECTORIES gains nothi
     try std.testing.expectEqualStrings(refs_before, refs_after);
 }
 
-/// The nested "work" directory overlayfs itself creates inside `ov.work` for
-/// its own bookkeeping is left behind with mode 0000. `std.testing.tmpDir`'s
-/// own cleanup cannot delete a directory it cannot even read. Put the
-/// permission back before `tmpDir.cleanup` ever tries. Best effort: the
-/// directory may not exist at all if the mount itself never happened. The
-/// same fix `overlay.zig`'s and `Workspace.zig`'s own tests already carry,
-/// under the same name, for the same reason.
+/// overlayfs leaves the nested "work" directory it makes inside `ov.work` with
+/// mode 0000, and `tmpDir.cleanup` cannot delete a directory it cannot read. Put
+/// the permission back first. Best effort: the mount may never have happened.
 fn allowScratchCleanup(allocator: std.mem.Allocator, ov: chock_workspace.overlay.Overlay) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ ov.work, "work" }) catch return;
     defer allocator.free(kernel_work_dir);
@@ -1162,13 +904,10 @@ test "a tool call in the worktree kind writes into the workspace, not the user's
     const term = try runProbe(allocator, &workspace, root_tmp, "write", target);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // The write landed in the worktree, on the host.
     const in_worktree = try std.fs.path.join(allocator, &.{ wt.path, "chock-abstraction-proof.txt" });
     defer allocator.free(in_worktree);
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, in_worktree, .{});
 
-    // The user's real project never gained the file: the agent was never in
-    // that tree at all.
     const in_project = try std.fs.path.join(allocator, &.{ project.root_path, "chock-abstraction-proof.txt" });
     defer allocator.free(in_project);
     try std.testing.expectError(
@@ -1184,9 +923,6 @@ test "a tool call in the overlay kind writes into the workspace, not the user's 
     var project = try PlainProject.init(allocator, tmp);
     defer project.deinit();
 
-    // Same three calls as the worktree test above: open, sandboxConfig
-    // (inside runProbe), spawn. Nothing here asks which kind Workspace.open
-    // picked.
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
     try std.testing.expect(workspace.kind == .overlay);
@@ -1199,26 +935,14 @@ test "a tool call in the overlay kind writes into the workspace, not the user's 
     defer root_tmp.cleanup();
 
     const term = try runProbe(allocator, &workspace, root_tmp, "write", target);
-    // A real overlay mount, made by chock-sandbox's own buildRoot, leaves
-    // its own scratch "work" directory mode 0000 on the host: the same fix
-    // overlay.zig's and Workspace.zig's own tests already carry, under the
-    // same name, for the same reason. Put the permission back before
-    // tmp.cleanup runs, whether or not the probe itself succeeded, or this
-    // leaves an undeletable directory under .zig-cache/tmp.
+    // Before `tmp.cleanup`, and whether or not the probe succeeded.
     allowScratchCleanup(allocator, ov);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // The write landed in the overlay's own upper layer, on the host: this
-    // is the real mount `chock-sandbox`'s own buildRoot performed, inside
-    // the sandbox this probe spawned, proving the overlay-kind Mount entry
-    // sandboxConfig described was not just a description but a mount a real
-    // sandbox actually made.
     const in_upper = try std.fs.path.join(allocator, &.{ ov.upper, "chock-abstraction-proof.txt" });
     defer allocator.free(in_upper);
     _ = try std.Io.Dir.cwd().statFile(std.testing.io, in_upper, .{});
 
-    // The user's real project, the overlay's own read only lower layer,
-    // never gained the file.
     const in_project = try std.fs.path.join(allocator, &.{ project.root_path, "chock-abstraction-proof.txt" });
     defer allocator.free(in_project);
     try std.testing.expectError(
@@ -1228,14 +952,9 @@ test "a tool call in the overlay kind writes into the workspace, not the user's 
 }
 
 test "a denied file cannot be read by a real tool call, and reads as the notice" {
-    // **The whole claim, end to end.** `secret.env` is committed, so the
-    // worktree checkout really holds it and the mount is the only thing
-    // between a tool call and its bytes. Exit code 1 means the read landed on
-    // `namespace.deny_notice` and not on `secret_content`.
-    //
-    // Mutation check: drop the `.deny` append in `Workspace.sandboxConfig`,
-    // or the deny pass in `buildRoot`, and this probe reads the real secret
-    // and exits 0.
+    // `secret.env` is committed, so the checkout really holds it and the mount is
+    // all that stands between a tool call and its bytes. Exit 1 means the read
+    // landed on `namespace.deny_notice`.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1245,8 +964,6 @@ test "a denied file cannot be read by a real tool call, and reads as the notice"
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // The premise, before anything is trusted: the checkout really did get
-    // the secret, so the refusal below is about a file that is there.
     const in_checkout = try std.fs.path.join(allocator, &.{ workspace.workPath(), "secret.env" });
     defer allocator.free(in_checkout);
     const on_disk = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, in_checkout, allocator, .limited(4096));
@@ -1264,11 +981,8 @@ test "a denied file cannot be read by a real tool call, and reads as the notice"
 }
 
 test "the same sandbox reads an ordinary file normally, so the denial is not a deny all" {
-    // **The other half of the test above, and it is not decoration.** A probe
-    // that answered "not the notice" for every path, or a mount tree that
-    // covered the whole project, would let the test above pass while breaking
-    // every session. This reads `tracked.txt` through the very same config and
-    // requires exit 0: bytes that are neither empty nor the notice.
+    // A probe that answered "not the notice" for every path, or a mount tree
+    // over the whole project, would pass the test above and break every session.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1289,17 +1003,10 @@ test "the same sandbox reads an ordinary file normally, so the denial is not a d
 }
 
 test "a denied path the project does not hold yet is covered, and cannot be created" {
-    // **The lapse this design refuses to have.** `.env` is in no commit, so
-    // the checkout has no such file, and a denial that only covered files that
-    // already exist would protect nothing the moment the agent, or the user,
-    // made one. `chock-sandbox`'s own `applyDenyMounts` makes an empty file to
-    // bind over instead, so the name is covered before anything runs.
-    //
-    // Two probes, because one would not settle it. The read must give the
-    // notice, and the write must be refused with EROFS: a mount that existed
-    // but was writable would let an agent put its own content there and read
-    // it back, which is harmless in itself but would mean the mount is not
-    // read only, and a later denial of a real file would inherit that.
+    // `.env` is in no commit, so a denial that only covered files that exist
+    // would protect nothing the moment somebody made one. `applyDenyMounts` makes
+    // an empty file to bind over instead. Two probes, because a mount that
+    // existed but was writable would still pass the read alone.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1309,7 +1016,6 @@ test "a denied path the project does not hold yet is covered, and cannot be crea
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
 
-    // The premise: the checkout really has no `.env` of its own.
     const in_checkout = try std.fs.path.join(allocator, &.{ workspace.workPath(), ".env" });
     defer allocator.free(in_checkout);
     try std.testing.expectError(
@@ -1334,20 +1040,14 @@ test "a denied path the project does not hold yet is covered, and cannot be crea
         try runProbe(allocator, &workspace, write_root, "write", target),
     );
 
-    // And what that costs, written down rather than left to be discovered: the
-    // empty file `applyDenyMounts` made to bind over is still in the checkout
-    // after the sandbox is gone. It is one empty file, with a name the project
-    // itself asked to deny, and it reaches the user's repository through
-    // nothing but a commit. See `applyDenyMounts`'s own doc comment.
+    // What that costs: the empty file `applyDenyMounts` made is still in the
+    // checkout after the sandbox is gone, and a commit would carry it out.
     const left_behind = try std.Io.Dir.cwd().statFile(std.testing.io, in_checkout, .{});
     try std.testing.expectEqual(@as(u64, 0), left_behind.size);
 }
 
 test "a denied file cannot be deleted, so an agent cannot uncover it" {
-    // A whiteout or an unlink would take the mount away and leave the real
-    // file, or the empty placeholder, in its place. It cannot: the path is
-    // itself a mount point, and unlinking one answers EBUSY. The same fact
-    // `chock.zon` already relies on, now relied on by every denied path.
+    // The path is itself a mount point, and unlinking one answers EBUSY.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1368,22 +1068,10 @@ test "a denied file cannot be deleted, so an agent cannot uncover it" {
 }
 
 test "the denial survives the agent replacing chock.zon inside its own workspace" {
-    // **The list is fixed when the workspace opens, and no later read of any
-    // `chock.zon` can move it.** This writes a `chock.zon` with no `deny_read`
-    // at all straight into the checkout, on the host, which is a stronger move
-    // than the agent itself can make from inside the sandbox, where that path
-    // is a read only mount point, and then runs `sandboxConfig` again, which
-    // is what every tool call of a real session does.
-    //
-    // **What this pins, said exactly.** Nothing re-reads the block today, so
-    // this holds for a `Workspace.open` that read the checkout as readily as
-    // for one that read the project. It is here to fail the day somebody adds
-    // that re-read to `sandboxConfig`, which is the one change that would turn
-    // an edit made mid session into a way out of the block. The test that
-    // catches a reader pointed at the wrong copy **today** is the `adopt` one
-    // at the end of this file, where the checkout really does carry the edited
-    // file by the time the list is read: point `adopt` at `wt.path` and it
-    // fails while this one still passes.
+    // The list is fixed when the workspace opens. Nothing re-reads the block
+    // today, so this passes for a reader pointed at either copy: it is here to
+    // fail the day a re-read is added to `sandboxConfig`. The `adopt` test at the
+    // end of this file is what catches a reader pointed at the wrong copy today.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1396,8 +1084,6 @@ test "the denial survives the agent replacing chock.zon inside its own workspace
     var edited_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const edited = try std.fmt.bufPrintZ(&edited_buffer, "{s}/chock.zon", .{workspace.workPath()});
     try writeFile(std.testing.io, edited, chock_zon_content);
-    // The edit really happened, so the refusal below is not a fact about a
-    // write that quietly failed.
     const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, edited, allocator, .limited(4096));
     defer allocator.free(after);
     try std.testing.expectEqualStrings(chock_zon_content, after);
@@ -1408,17 +1094,12 @@ test "the denial survives the agent replacing chock.zon inside its own workspace
     var root_tmp = std.testing.tmpDir(.{});
     defer root_tmp.cleanup();
 
-    // `sandboxConfig` runs again inside `runProbe`, after the edit, which is
-    // exactly what happens on every tool call of a real session.
     const term = try runProbe(allocator, &workspace, root_tmp, "read", target);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
 test "a project that denies nothing gets no deny mount and reads its files as before" {
-    // **The case that must cost nothing**, because it is every project that
-    // exists today. The mount list carries no `.deny` entry at all, so
-    // `applyDenyMounts` returns before it makes any file, and a read of the
-    // very file another project denies comes back whole.
+    // With no `.deny` entry `applyDenyMounts` returns before it makes any file.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1450,9 +1131,8 @@ test "a project that denies nothing gets no deny mount and reads its files as be
 
 test "the overlay kind denies a file the same way the worktree kind does" {
     // A project with no git of its own gets one overlay mount over the whole
-    // tree, so its secret is reachable through a different mount from the
-    // worktree kind's. The denial is the same pass either way, which is the
-    // point of applying it after every other mount rather than beside them.
+    // tree, so the secret is reachable through a different mount. The denial is
+    // the same pass either way, because it runs after every other mount.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1482,12 +1162,9 @@ test "the overlay kind denies a file the same way the worktree kind does" {
     allowScratchCleanup(allocator, ov);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 
-    // **And the secret was not copied up.** A mount target opened with
-    // `O_CREAT` would make overlayfs copy the lower file into the upper layer,
-    // which puts the very bytes this exists to hide into the session's own
-    // scratch directory on the host. `applyDenyMounts` reads the kind with
-    // `statx` and never opens an existing target, and this is that rule
-    // measured rather than argued.
+    // A mount target opened with `O_CREAT` would make overlayfs copy the lower
+    // file up into the session's own scratch directory, so `applyDenyMounts`
+    // reads the kind with `statx` and never opens an existing target.
     const in_upper = try std.fs.path.join(allocator, &.{ ov.upper, "secret.env" });
     defer allocator.free(in_upper);
     try std.testing.expectError(
@@ -1497,11 +1174,8 @@ test "the overlay kind denies a file the same way the worktree kind does" {
 }
 
 test "a deny_read entry that names a directory refuses the whole session, by name" {
-    // `~/.aws` is a directory and `.env` is a file, and this design supports
-    // only the second. A refusal by name, before any workspace is built, is
-    // the honest answer: a covered directory would read as "this project keeps
-    // no credentials here", which is the confusion the notice file exists to
-    // avoid and which an empty directory has no room for.
+    // This design covers files and not directories. An empty covered directory
+    // would read as "this project keeps no credentials here".
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1526,11 +1200,8 @@ test "a deny_read entry that names a directory refuses the whole session, by nam
 }
 
 test "adopt takes the deny list from the project, not from the checkout it inherits" {
-    // The handover case. `adopt` runs against a checkout a whole session has
-    // already worked in, so the `chock.zon` in it is whatever that session
-    // left. Reading the deny list from there would make handing over a way out
-    // of the block, which is the same fault `findChockZonForAdopt` answers for
-    // the policy file itself.
+    // The `chock.zon` in an adopted checkout is whatever the last session left,
+    // so reading the deny list from there would make a handover a way out.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 

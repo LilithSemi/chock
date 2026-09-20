@@ -1,29 +1,9 @@
-//! The plugin the project ships, read back out of a real
-//! `wasm32-freestanding` module by the host side reader.
+//! The plugin the project ships, read back out of the real
+//! `wasm32-freestanding` module that `build.zig` builds. Tests of a refusal
+//! reach it by changing one thing in that module.
 //!
-//! `test/plugin/guest.zig` drives the guest half inside a native binary, where
-//! it instantiates the SDK's exports by hand. That leaves two things untested,
-//! and both are easy to get wrong.
-//!
-//! - The SDK's automatic path, where `lib/chock-plugin-sdk/exports.zig` reads
-//!   `@import("root").chock_plugin_metadata` and emits the symbols with nobody
-//!   asking it to. A plugin built the wrong way compiles and exports nothing
-//!   at all, so only a look at the built module can tell.
-//! - `chock_core.plugin_module`, which walks a module's sections and resolves
-//!   the metadata out of its data segments. **That reader must work on what a
-//!   real linker emits and not on what a test would emit.** Vulcan's own
-//!   eighty three wasm tests were all hand built byte blobs, which is exactly
-//!   why it could not run a single module from a real toolchain for years.
-//!
-//! So every test here starts from the module `build.zig` really builds, and
-//! the ones that check a refusal reach it by changing one thing in that
-//! module. Each of them says what it changed and what that stands for.
-//!
-//! **Nothing here runs the plugin**, and that is the design and not a gap:
-//! reading a plugin executes no guest code, so a host learns a plugin's tools
-//! and prices them before anything of it runs. See `lib/chock-core/plugin.zig`.
-//! The engine lives in the plugin host process, which `test/plugin/engine.zig`
-//! drives.
+//! Nothing here runs the plugin. The engine lives in the plugin host process,
+//! which `test/plugin/engine.zig` drives.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -35,9 +15,7 @@ const wasm_path = @import("plugin_wasm_path").plugin_wasm_path;
 const plugin = chock_core.plugin;
 const plugin_module = chock_core.plugin_module;
 
-/// The most this test will read off disk, which is the bound the host side
-/// reader keeps as well. One number, so a module the reader would accept can
-/// never be one this test refuses to read.
+/// The reader's own bound, so this test never refuses a module the reader takes.
 const max_module_bytes = plugin_module.max_module_bytes;
 
 const testing = std.testing;
@@ -51,17 +29,9 @@ fn readModule(gpa: std.mem.Allocator) ![]u8 {
     );
 }
 
-/// Where the metadata blob starts inside the module's own bytes.
-///
-/// Every blob starts with the magic word, so a search for it finds the
-/// candidates. The magic can appear by chance in half a megabyte of debug
-/// information, so each candidate is offered to the blob reader and the first
-/// one that reads is the answer.
-///
-/// **This is a test looking for a needle in a file, and not how the host finds
-/// the blob.** The host resolves the address the `chock_plugin_metadata`
-/// global holds: see `chock_core.plugin_module`. The two roads meeting at the
-/// same bytes is what one of the tests below states.
+/// The magic word can appear by chance in half a megabyte of debug information,
+/// so the first candidate the blob reader accepts wins. The host does not search
+/// like this: it resolves the address the `chock_plugin_metadata` global holds.
 fn findBlob(module: []const u8) !usize {
     var magic_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &magic_bytes, core.Magic.word, .little);
@@ -76,7 +46,6 @@ fn findBlob(module: []const u8) !usize {
     return error.NoMetadataInModule;
 }
 
-/// A policy that allows everything, and one that denies one action.
 const Decider = struct {
     denied: []const u8 = "",
     asked: std.ArrayList([]const u8) = .empty,
@@ -117,9 +86,6 @@ fn sentence(refusal: plugin_module.Refusal) ![]u8 {
 }
 
 test "the host side reader reads the real module as the author wrote it" {
-    // The acceptance test. An author's declaration, the SDK's automatic path,
-    // a wasm32-freestanding build, a linker, and a reader that starts no
-    // engine, end to end.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -132,8 +98,6 @@ test "the host side reader reads the real module as the author wrote it" {
     try testing.expectEqualStrings("A simple hello world plugin", read.record().description[0].value);
     try testing.expectEqual(@as(usize, 2), read.record().tools.len);
     try testing.expectEqualStrings("hello", read.record().tools[0].name);
-    // And what the second one takes, read out of a real module with no engine.
-    // A schema that did not survive the linker would leave this empty.
     try testing.expectEqualStrings("greet", read.record().tools[1].name);
     try testing.expectEqual(@as(usize, 2), read.record().tools[1].parameters.len);
     try testing.expectEqualStrings("who", read.record().tools[1].parameters[0].name);
@@ -142,11 +106,6 @@ test "the host side reader reads the real module as the author wrote it" {
 }
 
 test "the two roads to the blob meet at the same bytes" {
-    // The reader resolves the address the `chock_plugin_metadata` global
-    // holds. This test finds the blob by searching the file for the magic
-    // word, which is a different road entirely, and the record read by each
-    // must be the same. A reader that resolved the wrong address would still
-    // pass the test above if the wrong address happened to hold a blob.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -160,15 +119,9 @@ test "the two roads to the blob meet at the same bytes" {
 }
 
 test "the real linker exports the metadata as a global holding an address" {
-    // The whole reader rests on this. `@export(&blob, ...)` is a data export,
-    // and on wasm32 the linker turns one into an **exported global whose value
-    // is the address**, not into the bytes. A reader written for a linker that
-    // did something else would resolve nothing.
-    //
-    // The export section comes before every custom section in this module, so
-    // the first time the name appears is in the export section. The kind byte
-    // that follows it is checked rather than assumed, which is what makes the
-    // change below mean what it says.
+    // On wasm32 the linker turns a data export into an exported global whose
+    // value is the address, not into the bytes. The export section comes before
+    // every custom section, so the first time the name appears is that section.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -195,26 +148,19 @@ test "the real linker exports the metadata as a global holding an address" {
 }
 
 test "the module really is wasm" {
-    // The blob would read the same out of a native binary, so this pins that
-    // the file under it was built for the target a plugin actually runs on.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     try testing.expectEqualSlices(u8, &plugin_module.wasm_preamble, module[0..4]);
 }
 
 test "a real module built for another plugin ABI is refused with both numbers" {
-    // The failure that happens constantly: a plugin built for another Chock.
-    // The module states its ABI twice, in the `chock_plugin_magic` global and
-    // in the blob's own prefix, and both are moved here so the refusal is
-    // about the ABI and not about the two disagreeing.
+    // The module states its ABI twice, so both move together here.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
 
-    // The `chock_plugin_magic` global holds the four bytes in front of the
-    // blob. Measured on this module, and asserted rather than assumed: if the
-    // linker ever lays the two out differently, this fails here and says so
-    // instead of quietly testing half of what it says it tests.
+    // The `chock_plugin_magic` global holds the four bytes in front of the blob.
+    // Asserted, so a linker that lays the two out differently fails here.
     try testing.expectEqual(
         @as(u32, @intFromEnum(core.AbiVersion.current)),
         std.mem.readInt(u32, module[blob_at - 4 ..][0..4], .little),
@@ -230,9 +176,6 @@ test "a real module built for another plugin ABI is refused with both numbers" {
     );
     const text = try sentence(refusal.?);
     defer testing.allocator.free(text);
-    // The number this Chock speaks comes from the enum and not from a literal,
-    // so a later ABI keeps this test measuring the sentence rather than the
-    // version it was written in.
     const want = try std.fmt.allocPrint(
         testing.allocator,
         "built for plugin ABI 7, this Chock speaks plugin ABI {d}: rebuild the plugin",
@@ -243,9 +186,6 @@ test "a real module built for another plugin ABI is refused with both numbers" {
 }
 
 test "a real module whose two ABI numbers disagree is refused" {
-    // Only the blob's own prefix is moved. A reader that read one of the two
-    // numbers and trusted it would take this module for a plugin of whichever
-    // number it happened to read.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
@@ -268,10 +208,6 @@ test "a real module whose two ABI numbers disagree is refused" {
 }
 
 test "a real module with the magic word struck out of its blob is not a plugin" {
-    // The magic is checked before any length prefixed read. A blob that is not
-    // ours must never hand this reader a length to trust, and the module is
-    // otherwise a perfectly good plugin, which is what makes this the case a
-    // reader could get away with skipping.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
@@ -292,9 +228,6 @@ test "a real module with the magic word struck out of its blob is not a plugin" 
 }
 
 test "a real module whose blob states four gigabytes is refused before it is allocated" {
-    // The length is the first number in a blob a reader could act on, and it
-    // comes from a file somebody else wrote. A reader that allocated first
-    // would ask for four gigabytes on the word of a half megabyte file.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
@@ -315,9 +248,6 @@ test "a real module whose blob states four gigabytes is refused before it is all
 }
 
 test "a real module cut short is refused" {
-    // Half a file is not a plugin. Nothing in the head of the module says the
-    // tail is missing, so a reader that trusted a section length would walk
-    // off the end of the buffer here.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -328,8 +258,6 @@ test "a real module cut short is refused" {
     );
     try testing.expect(refusal.? == .malformed_module);
 
-    // And one byte short, which is the cut a reader is most likely to survive
-    // by accident.
     var short: ?plugin_module.Refusal = null;
     try testing.expectError(
         error.MalformedModule,
@@ -338,8 +266,6 @@ test "a real module cut short is refused" {
 }
 
 test "a file of the right length full of zeros is not a plugin" {
-    // A zeroed page, or a file that failed to be written. It must be refused
-    // at the first field, before any length in it is trusted.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     @memset(module, 0);
@@ -348,10 +274,8 @@ test "a file of the right length full of zeros is not a plugin" {
 }
 
 test "a real module that exports no chock_plugin_magic is not a Chock plugin" {
-    // The symbol name is the magic, so striking the name out of the export
-    // section is the whole of what makes a module not a plugin. The name is
-    // replaced everywhere it appears, so the debug information cannot leave a
-    // copy behind for a reader to find by searching.
+    // The name is replaced everywhere it appears, so the debug information
+    // cannot leave a copy behind for a search to find.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -373,8 +297,6 @@ test "a real module that exports no chock_plugin_magic is not a Chock plugin" {
 }
 
 test "the real plugin loads, and its tool is offered under a dotted action" {
-    // The whole road: a module on disk, a reader, the collision rule, the
-    // capability fold, and a definition the model would read.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -408,10 +330,6 @@ test "the real plugin loads, and its tool is offered under a dotted action" {
     try testing.expectEqual(@as(usize, 2), offered.items.len);
     try testing.expectEqualStrings("hello", offered.items[0].name);
 
-    // **The schema the model reads, out of a real module.** `hello` takes
-    // nothing and says so, and `greet` names its one required field. A host
-    // that still advertised an empty object would pass every unit test and
-    // tell the model nothing here.
     const nothing = try std.json.Stringify.valueAlloc(
         testing.allocator,
         offered.items[0].parameters,
@@ -431,9 +349,6 @@ test "the real plugin loads, and its tool is offered under a dotted action" {
 }
 
 test "the real plugin's tool is refused by policy like any other action" {
-    // A plugin tool is on the policy table with everything else that has
-    // consequence. A project that denies its action gets no tool, and gets it
-    // before the model is ever offered the name.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
 
@@ -452,20 +367,13 @@ test "the real plugin's tool is refused by policy like any other action" {
     var offered: std.ArrayList(chock_core.tools.Definition) = .empty;
     defer offered.deinit(testing.allocator);
     try session.appendDefinitions(testing.allocator, &offered);
-    // **One denied action takes one tool and no more.** The plugin's other
-    // tool has its own action and its own row, so a refusal that reached it
-    // would be a refusal about a rule nobody wrote.
     try testing.expectEqual(@as(usize, 1), offered.items.len);
     try testing.expectEqualStrings("greet", offered.items[0].name);
 }
 
 test "a real module whose tool is named after a built-in fails to load entirely" {
-    // The project owner's own rule, driven from a real module rather than from
-    // a record built in a test. The plugin's own tool is renamed to `glob`,
-    // which `chock_core.tools.Tool` already holds, by writing a fresh blob
-    // over the one the module carries. The new blob is shorter, and the reader
-    // reads exactly the length the blob states, so the leftover bytes behind
-    // it change nothing.
+    // A fresh blob goes over the one the module carries. The reader reads only
+    // the length the blob states, so leftover bytes behind it change nothing.
     const module = try readModule(testing.allocator);
     defer testing.allocator.free(module);
     const blob_at = try findBlob(module);
@@ -486,10 +394,8 @@ test "a real module whose tool is named after a built-in fails to load entirely"
     };
     defer testing.allocator.free(blob);
 
-    // `glob` is shorter than `hello`, so the new blob fits where the old one
-    // was. A test that had to grow the module would have to rewrite the data
-    // segment's length and the data section's length as well, which is a
-    // different thing to get wrong.
+    // `glob` is shorter than `hello`, so the new blob fits in place. A module
+    // that had to grow would need its segment and section lengths rewritten.
     const was = std.mem.readInt(u32, module[blob_at + core.Prefix.total_len_offset ..][0..4], .little);
     try testing.expect(blob.len < was);
     @memcpy(module[blob_at..][0..blob.len], blob);
@@ -510,9 +416,6 @@ test "a real module whose tool is named after a built-in fails to load entirely"
     );
     defer loaded.deinit();
 
-    // The module read perfectly well. The refusal is the host's, taken against
-    // its own built-in list and never against what the plugin says about
-    // itself.
     try testing.expectEqualStrings("glob", loaded.record().tools[0].name);
     try testing.expectEqual(plugin.Failure.shadows_built_in, failure.?);
     try testing.expect(session.isEmpty());

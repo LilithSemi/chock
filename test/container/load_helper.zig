@@ -1,35 +1,6 @@
 //! One `Image.load` against one image cache directory, as its own process.
-//!
-//! **Two sessions on one image is the ordinary case**, and a shared image cache
-//! is what makes the second one cheap. This program is one of those sessions.
-//! `test/container/concurrent.zig` starts several at once on one directory and
-//! reads what each said, which is the only way to measure the race: the cache
-//! is shared through the filesystem, so two `Image.load` calls inside one test
-//! binary would contend on the same lock correctly and still prove nothing
-//! about two `chock run` commands in two terminals.
-//!
-//! **Nothing here writes to standard error.** `test/proto/lock.zig` holds the
-//! rule for the whole build. Every answer travels as an exit status.
-//!
-//! **A session lasts, and that is the second thing this measures.** With
-//! `<hold-ms>` this program keeps the image it was given and reads its mount
-//! set again and again, which is what every tool call of a real session does.
-//! A second session that resolves the same directory to another digest used to
-//! remove the tree under this one. See
-//! `test/container/concurrent.zig` for the numbers.
-//!
-//! Command line:
-//!   load-helper <cache-dir> <reference> [hold-ms]
-//!
-//! Exit status:
-//!   0   the image came out of the cache, and no tree was written
-//!   1   this process extracted the image
-//!   2   the load refused
-//!   3   the load failed
-//!   4   the tree it was given is not whole
-//!   5   this machine has no container runtime
-//!   6   the command line was wrong
-//!   7   this program itself ran out of memory
+//! `test/container/concurrent.zig` starts several of these at once, because two
+//! loads in one test binary share a lock and show nothing about the race.
 
 const std = @import("std");
 const chock_container = @import("chock-container");
@@ -37,6 +8,8 @@ const chock_container = @import("chock-container");
 const Image = chock_container.Image;
 const Runtime = chock_container.Runtime;
 
+// Every answer is an exit status. Nothing here writes to standard error, which
+// is the rule `test/proto/lock.zig` holds for the whole build.
 pub const from_cache = 0;
 pub const extracted = 1;
 pub const refused = 2;
@@ -87,13 +60,7 @@ pub fn main(init: std.process.Init) u8 {
     }
 }
 
-/// Read the mount set again every `check_every_ms` for `hold_ms`, and answer
-/// false the first time it is not whole.
-///
-/// **This is a session, in the one respect that matters here.** A session lives
-/// for minutes or hours and every tool call of it binds the same mount set, so
-/// the tree has to stay on the disk for all of that time. A helper that loaded
-/// and exited at once could never see a second session remove it.
+/// False the first time the mount set is not whole, during `hold_ms`.
 fn heldFor(io: std.Io, image: *const Image, hold_ms: u64) bool {
     if (hold_ms == 0) return true;
 
@@ -108,14 +75,9 @@ fn heldFor(io: std.Io, image: *const Image, hold_ms: u64) bool {
 const check_every_ms: u64 = 25;
 
 /// True when the mount set names a tree that is really on the disk.
-///
-/// **This is what a torn cache looks like from a session's side.** A second
-/// session that removes and rebuilds the tree under this one leaves a mount set
-/// naming paths that are gone, and the failure then arrives one tool call into
-/// the session with nothing to explain it.
 fn whole(io: std.Io, image: *const Image) bool {
-    // A base image has `/etc`, `/usr` and more. A set this short means the tree
-    // was read while another process was rebuilding it.
+    // A base image has `/etc`, `/usr` and more. A shorter set means the tree was
+    // read while another process rebuilt it.
     if (image.mounts.len < 4) return false;
 
     for (image.mounts) |mount| {

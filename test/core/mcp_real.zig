@@ -1,52 +1,10 @@
-//! A **real MCP server**, driven by the production protocol, into the offers a
-//! model would be given.
+//! A real third party MCP server, `mcp-server-time`, driven by the production
+//! protocol into the offers a model would be given.
 //!
-//! `lib/chock-core/mcp_driver.zig` has tests of its own, and it says out loud
-//! what they leave out: a server written by the same hand as the driver agrees
-//! with every assumption the driver makes, including the wrong ones. That is
-//! the trap of a fake that is too kind, and this project has already shipped a
-//! whole LSP feature that had never worked against a real server for exactly
-//! that reason.
+//! Not real here: the sandbox. The server is an ordinary child process, so the
+//! mount tree and the seccomp filter go untested.
 //!
-//! So this file runs `mcp-server-time`, which is a real third party MCP server
-//! built on the reference Python `mcp` package. **It reaches no network and
-//! keeps no state**: it answers the current time and converts one time zone to
-//! another, which is why it is safe in a test suite.
-//!
-//! ## What is real here, and what is not
-//!
-//! Real: the process, the framing, the JSON, the handshake, the tool list, a
-//! tool call that works, a tool call that fails, and the whole of
-//! `chock_core.mcp.Session` on top of them.
-//!
-//! **Not real: the sandbox.** The server runs as an ordinary child process of
-//! this test and not through `Sandbox.spawn`. `chock_core.helper.Channel` is
-//! two ordinary pipes and nothing else, so the production protocol reaches a
-//! real server over the production channel either way, and this test then runs
-//! on Darwin as well, where `Sandbox.spawn` refuses outright. What the missing
-//! half would add is the mount tree and the seccomp filter, and
-//! `test/core/lsp.zig` already proves a real long lived helper comes up inside
-//! a real sandbox. This file proves the other thing, which is that Chock and a
-//! server nobody here wrote agree about the protocol.
-//!
-//! ## What this found that no written server did
-//!
-//! **An MCP server frames a message with a newline and not with a
-//! `Content-Length` header.** The obvious way to build this driver is to copy
-//! `lib/chock-core/lsp_driver.zig`, which frames with headers, and a test
-//! server written from the same file would have read them happily. Measured
-//! against `mcp-server-time` 2026.7.10 on 2026-08-23 before a line of the
-//! driver was written.
-//!
-//! Two more facts came from the same run, and both are in the driver now:
-//!
-//! * A call that goes wrong comes back as a **result** with `isError` true and
-//!   a text part, and not as a JSON-RPC error. An `Invalid timezone` is
-//!   something the model reads and acts on.
-//! * A **method the server does not know** does come back as a JSON-RPC error,
-//!   with `code` -32602, while the server writes a wall of validation text on
-//!   its own standard error. That standard error is `/dev/null` for a real
-//!   helper, which is `chock_core.helper.Helper`'s own decision.
+//! An MCP server frames a message with a newline, not a `Content-Length` header.
 
 const std = @import("std");
 const chock_core = @import("chock-core");
@@ -57,21 +15,12 @@ const mcp_driver = chock_core.mcp_driver;
 
 const chock_proto = @import("chock-proto");
 
-/// The server this suite runs, found on the dev shell's own `PATH` when the
-/// project was built. **Null is an ordinary answer**: a machine whose shell has
-/// no MCP server skips these tests rather than failing them, and a test that
-/// fetched one would be a build. `pkgs/chock/default.nix` names it.
+/// Found on the dev shell's `PATH` at build time. Null is a skip, not a failure.
 const server_path: ?[]const u8 = @import("mcp_real_path").mcp_server_time_path;
 
 const testing = std.testing;
 
-/// An `Arbiter` that permits every call, so this file measures the protocol and
-/// not the policy.
-///
-/// **A session with no arbiter runs no MCP tool at all**, which is the rule
-/// `chock_core.mcp.Session.dispatch` keeps: a third party tool is decided one
-/// call at a time by whoever the caller named, and a caller that named nobody
-/// refuses. This file names this.
+/// A session with no arbiter runs no MCP tool at all, so this file names one.
 const PermitAll = struct {
     var anchor: u8 = 0;
 
@@ -97,8 +46,6 @@ const PermitAll = struct {
     }
 };
 
-/// A real session log, locked the way `Loop.run` locks one, so the handle an
-/// arbiter is given here is the shape a real one is given.
 const LockedLog = struct {
     backing: chock_proto.storage.Memory,
     store: chock_proto.storage.Storage = undefined,
@@ -121,7 +68,6 @@ const LockedLog = struct {
     }
 };
 
-/// A real server on two real pipes, and the production channel over them.
 const RealServer = struct {
     child: std.process.Child,
     channel: helper.Channel,
@@ -132,11 +78,8 @@ const RealServer = struct {
             .argv = &.{program},
             .stdin = .pipe,
             .stdout = .pipe,
-            // **Ignored, and not a pipe.** The server writes validation
-            // warnings there, and a pipe nobody drains fills up and wedges it
-            // mid sentence. That is the same decision
-            // `chock_core.helper.Helper.start` makes for a real helper, and
-            // this test would be a poor place to find out it was wrong.
+            // The server writes validation warnings there, and a pipe nobody
+            // drains fills up and wedges it mid sentence.
             .stderr = .ignore,
         });
         errdefer child.kill(io);
@@ -151,8 +94,7 @@ const RealServer = struct {
         };
     }
 
-    /// `kill` closes every pipe and reaps the process, so nothing here closes
-    /// a descriptor of its own.
+    /// `kill` closes every pipe and reaps the process.
     fn deinit(self: *RealServer, io: std.Io) void {
         self.protocol.deinit();
         self.child.kill(io);
@@ -164,13 +106,6 @@ const RealServer = struct {
 };
 
 test "a real MCP server lists its real tools through the production protocol" {
-    // The floor, and the whole point of this file: the framing, the handshake
-    // and the list are the production ones, and the far end is a program
-    // nobody here wrote.
-    //
-    // Mutation check: frame a message with a `Content-Length` header in
-    // `mcp_driver.Protocol.send` and this test hangs until its budget ends,
-    // while every written server in that file still passes.
     const program = server_path orelse return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -188,25 +123,19 @@ test "a real MCP server lists its real tools through the production protocol" {
         RealServer.deadline(io),
     );
 
-    // The two tools this server really has, measured on 2026-08-23.
+    // The count this server really declares.
     try testing.expectEqual(@as(usize, 2), declared.len);
     var found_time = false;
     for (declared) |one| {
         if (std.mem.eql(u8, one.name, "get_current_time")) found_time = true;
-        // Every real name passes the shape rule, so the rule is not one that
-        // refuses every real server.
         try testing.expect(mcp.nameIsUsable(one.name));
         try testing.expect(one.description.len != 0);
-        // A real schema is an object, which is what the provider requires.
         try testing.expect(one.schema == .object);
     }
     try testing.expect(found_time);
 }
 
 test "a real tool runs, and its answer reaches the context through the flattening" {
-    // A call that works, end to end, through `mcp.Session`: the policy, the
-    // name rules, the dispatch and the text cleaning are all the production
-    // ones, and the answer is one a real program computed.
     const program = server_path orelse return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -236,7 +165,6 @@ test "a real tool runs, and its answer reaches the context through the flattenin
     try log.arm(io);
     session.asker = .{ .arbiter = PermitAll.arbiter(), .locked = &log.locked };
 
-    // Not one real tool name shadows a built-in, so the server loads.
     try testing.expect(one.failure == null);
     try testing.expect(!session.isEmpty());
 
@@ -250,17 +178,11 @@ test "a real tool runs, and its answer reaches the context through the flattenin
     defer gpa.free(outcome.text);
 
     try testing.expect(!outcome.is_error);
-    // The server answers a JSON object as text. The exact time is a clock, so
-    // nothing here asserts one: what is pinned is that the answer is the
-    // server's own and came back whole.
+    // The exact time is a clock, so nothing here asserts one.
     try testing.expect(std.mem.indexOf(u8, outcome.text, "\"timezone\": \"UTC\"") != null);
     try testing.expect(std.mem.indexOf(u8, outcome.text, "datetime") != null);
-    // **The newline survived**, which is the one thing that separates this
-    // cleaning from `chock_core.lsp.flattenMessage`. A real server answers
-    // pretty printed JSON, and a result folded onto one line is a result
-    // nothing can read.
+    // A real server answers pretty printed JSON, so the newline must survive.
     try testing.expect(std.mem.indexOfScalar(u8, outcome.text, '\n') != null);
-    // And nothing that could move a terminal cursor came back.
     for (outcome.text) |byte| {
         if (byte == '\n' or byte == '\t') continue;
         try testing.expect(byte >= 0x20 and byte != 0x7F);
@@ -268,11 +190,8 @@ test "a real tool runs, and its answer reaches the context through the flattenin
 }
 
 test "a real tool that fails is a result, and the server still answers the next call" {
-    // Measured: this server answers a bad time zone with a text result and
-    // `isError` true, and not with a JSON-RPC error. A driver that read that
-    // as a fault would end a server that is working perfectly.
-    //
-    // The second call is what pins that nothing wedged.
+    // This server answers a bad time zone with a text result and `isError` true,
+    // and not with a JSON-RPC error.
     const program = server_path orelse return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -290,8 +209,7 @@ test "a real tool that fails is a result, and the server still answers the next 
     try testing.expect(failed.is_error);
     try testing.expect(std.mem.indexOf(u8, failed.text, "Invalid timezone") != null);
 
-    // A method the server does not know comes back as a JSON-RPC error, and
-    // that is a result too.
+    // A method the server does not know comes back as a JSON-RPC error.
     const unknown = try server.protocol.call(
         arena,
         io,
@@ -302,7 +220,6 @@ test "a real tool that fails is a result, and the server still answers the next 
     );
     try testing.expect(unknown.is_error);
 
-    // And the server is still there, so neither of the two wedged anything.
     const good = try server.protocol.call(arena, io, &server.channel, RealServer.deadline(io), "get_current_time",
         \\{"timezone":"UTC"}
     );
@@ -311,9 +228,7 @@ test "a real tool that fails is a result, and the server still answers the next 
 }
 
 test "a real server is asked to initialize one time, however many calls follow" {
-    // A second `initialize` is a protocol error, and a real server is what
-    // proves this client does not send one. Three exchanges on one server, and
-    // the third answers as well as the first.
+    // A second `initialize` is a protocol error.
     const program = server_path orelse return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = testing.io;
@@ -334,14 +249,9 @@ test "a real server is asked to initialize one time, however many calls follow" 
         \\{"timezone":"UTC"}
     );
     try testing.expect(!answer.is_error);
-    // Two more requests went out and no more, so no second handshake was
-    // among them.
     try testing.expectEqual(before + 2, server.protocol.last_id);
 }
 
-/// An `mcp.Host` over a `RealServer`, so `mcp.Session` can drive one with no
-/// `helper.Helper` and therefore no sandbox. `chock_core.mcp_driver.Driver` is
-/// the production shape and it only adds the process.
 const ProtocolHost = struct {
     server: *RealServer,
 
@@ -376,9 +286,6 @@ const ProtocolHost = struct {
     }
 };
 
-/// A policy that says yes to everything, so this file measures the protocol
-/// and not the table. `lib/chock-core/mcp.zig` is where the policy itself is
-/// tested, against every decision.
 const AllowAll = struct {
     fn decider(self: *AllowAll) mcp.Decider {
         return .{ .ptr = self, .vtable = &vtable };

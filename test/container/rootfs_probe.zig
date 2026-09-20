@@ -1,24 +1,10 @@
-//! Runs one program inside a real `Sandbox.spawn` sandbox, whose whole root
-//! filesystem is a container image that `chock-container` extracted.
+//! Runs one program inside a real `Sandbox.spawn` sandbox whose whole root
+//! filesystem is a container image that `chock-container` extracted. No
+//! container runtime takes part.
 //!
-//! **This is the acceptance test for the central design decision.**
-//! `lib/chock-container.zig` says a tool call does not run inside a container:
-//! the image is a source of files and Chock's own sandbox is still the whole
-//! boundary. That claim is only worth what a measurement makes it worth, and
-//! this program is the measurement. It builds a `Sandbox.Config` out of the
-//! mount set the module really produced and starts a program out of the image.
-//! No container runtime is involved at any point in this file.
-//!
-//! It is a separate program for the reason every sandbox probe in this project
-//! is one: `Sandbox.spawn` calls `fork`, `fork` carries only the calling thread
-//! into the child, so its caller must be single threaded. The Zig test runner
-//! that runs `test/container/sandbox.zig` is not that caller. This is.
-//!
-//! **Nothing here writes to standard error.** `test/proto/lock.zig` holds this
-//! project's rule, and the exemption list it carries lives in a file this
-//! program does not own. Every answer travels as an exit status instead, which is
-//! enough: the whole question is whether a program from the image ran and what
-//! it exited with.
+//! A separate program because `Sandbox.spawn` calls `fork`, so its caller must
+//! be single threaded and the Zig test runner is not. Nothing here writes to
+//! standard error, so every answer travels as an exit status.
 //!
 //! Command line:
 //!   rootfs-probe <root> <cwd> <mounts-blob> <env-blob> <program> [args...]
@@ -34,10 +20,8 @@
 //!   252                             this program ran out of memory or could
 //!                                   not parse a blob
 //!   253                             `Sandbox.spawn` refused
-//!    63                             this machine would not give the sandbox
-//!                                   its namespaces, so nothing here was
-//!                                   measured. **Not a pass and not a
-//!                                   failure**: the caller skips. See
+//!    63                             this machine would not give the sandbox its
+//!                                   namespaces, so the caller skips. See
 //!                                   `namespace.nothing_measured_exit_status`.
 //!   254                             the sandboxed program was signalled
 
@@ -49,8 +33,6 @@ const probe_fault = 252;
 const spawn_refused = 253;
 const program_signalled = 254;
 
-/// The field separator inside one blob line. The same 0x01 every other probe
-/// in this project uses.
 const field = '\x01';
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -72,20 +54,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     parseMounts(arena, mounts_blob, &mounts, &rules) catch return probe_fault;
 
-    // A procfs of the sandbox's own. Every real toolchain reads something
-    // under `/proc`, and an image never carries one. This is why `/proc` is in
-    // `Image.sandbox_owns`.
+    // An image carries no `/proc`, and every real toolchain reads one.
     mounts.append(arena, .{ .proc = .{} }) catch return probe_fault;
     rules.append(arena, .{ .path = "/proc", .access = sandbox.landlock.AccessFs.read_only }) catch
         return probe_fault;
 
-    // `/dev/null` from the host, which is a device node and not something the
-    // image can supply: `std.tar` writes no device nodes, and an exported image
-    // holds empty ordinary files where its own were. This is why `/dev` is in
-    // `Image.sandbox_owns`.
-    //
-    // Not read only. `namespace.zig`'s own `markReadOnly` also sets `NODEV` on
-    // a read only mount, which then refuses to open the device node at all.
+    // `std.tar` writes no device nodes, so an exported image holds an empty
+    // ordinary file where `/dev/null` was. Not read only: `markReadOnly` also
+    // sets `NODEV`, which then refuses to open the device node at all.
     mounts.append(arena, .{ .bind = .{
         .source = "/dev/null",
         .target = "/dev/null",
@@ -104,15 +80,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .rules = rules.items,
         .cwd = cwd,
         .env = env,
-        // **The default, stated anyway.** A tool call over an image gets the
-        // same network isolation every other tool call gets, because the
-        // sandbox is unchanged by where the files came from.
         .network = .none,
     }, argv, null, null) catch |err| {
-        // **The machine, and not the image.** A sandbox that cannot be built
-        // at all means nothing about the rootfs was measured, which is a
-        // different fact from a sandbox that refused this configuration. See
-        // `namespace.nothing_measured_exit_status`.
+        // A sandbox that cannot be built says nothing about the image.
         if (err == error.NamespaceFailed) return sandbox.namespace.nothing_measured_exit_status;
         return spawn_refused;
     };
@@ -145,10 +115,8 @@ fn parseMounts(
             .read_only = true,
         } });
 
-        // **A directory right over a regular file is refused by the kernel**,
-        // `EINVAL`, which `lib/chock-sandbox/linux/landlock.zig` measured on
-        // kernel 6.18.42. The mount's own kind is what picks the rule, and it
-        // comes from `Image.Mount.kind`.
+        // The kernel returns `EINVAL` for a directory rule over a regular file,
+        // so the mount's own kind picks the rule.
         try rules.append(arena, .{
             .path = target,
             .access = switch (kind[0]) {

@@ -1,41 +1,10 @@
-//! **The documentation must describe the software that is here.**
+//! Every test here reads a claim out of a file a person reads and compares it
+//! with the code. The truth always comes from the code or from the disk, never
+//! from a second list in this file.
 //!
-//! Every test below reads a claim out of a file a person reads, and compares
-//! it with the code. A claim that no longer agrees with the code fails the
-//! build.
-//!
-//! ## Why this file exists
-//!
-//! `CONTRIBUTING.md` names "prose that expired" as a fault nothing catches: a
-//! sentence that was true when it was written and is false now. The
-//! documentation is the part of Chock that a reader cannot compile. So the
-//! mechanical half of it is compiled here.
-//!
-//! ## The truth comes from the code, never from a second list
-//!
-//! No test below holds a copy of what Chock can do. The command names come
-//! from `main.commands`, the exit codes from `main.Exit`, the tool names from
-//! `tools.Tool`, the policy words from `table.Decision` and `table.Rule`, the
-//! counted sandbox lists from the arrays themselves, and every path from the
-//! repository on disk. A test that held its own list would be a third place
-//! for the same judgement to drift, which is the fault this file is written
-//! against.
-//!
-//! ## The two exception lists, and why they clean themselves
-//!
-//! `refused_examples` and `foreign_options` are the only hand written words
-//! here, and neither one says what Chock can do. Each says the opposite: a
-//! word the documentation shows on purpose that Chock answers to. Both lists
-//! are checked from both ends. An entry that stops being an example, and an
-//! entry that becomes real, each fail a test of their own. So a dead entry
-//! cannot sit here and hide a real fault.
-//!
-//! ## A failure names every offender at once
-//!
-//! Each test collects what it found into one string and compares it against
-//! the empty string. So one run reports every wrong sentence, and a person
-//! reads the whole list rather than fixing one and running again. Nothing is
-//! written to standard error, which `zig build test` refuses.
+//! Each test collects what it found into one string and compares that against
+//! the empty string, so one run reports every wrong sentence and nothing goes
+//! to standard error, which `zig build test` refuses.
 
 const std = @import("std");
 const chock_main = @import("chock_main");
@@ -43,59 +12,34 @@ const chock_core = @import("chock-core");
 const chock_policy = @import("chock-policy");
 const chock_sandbox = @import("chock-sandbox");
 
-/// Where this repository is, from `build.zig`, which is the one thing that
-/// knows. Not the working directory: a test binary cannot say what directory
-/// `zig build` was started from.
+/// From `build.zig`. Not the working directory: a test binary cannot say what
+/// directory `zig build` was started from.
 const repo_root = @import("repo_root").repo_root;
 
 const testing = std.testing;
 
-/// The longest documentation file this test reads. The longest today is about
-/// 15 kB.
 const max_doc_bytes = 512 * 1024;
 
-/// The longest source file this test reads. The longest today is `src/run.zig`
-/// at about 830 kB.
 const max_source_bytes = 4 * 1024 * 1024;
 
-/// Words the documentation shows after `chock` that name no command, on
-/// purpose.
-///
-/// **This is not a list of what Chock can do.** `README.md` and
-/// `docs/running.md` both teach that a first word is read as a command name,
-/// and they teach it with a line that is refused. A test that did not know
-/// that would report the lesson as a fault.
-///
-/// Both ends are checked, so an entry cannot rot. See the test named for
-/// these words.
+/// Words the documentation shows after `chock` on purpose that name no command:
+/// the pages teach the first word with a line that is refused. Both ends are
+/// checked, so an entry cannot rot.
 const refused_examples = [_][]const u8{ "fix", "rnu" };
 
-/// Options the documentation names that belong to another program.
-///
-/// `docs/security/sandbox.md` says that Node is started with `--jitless`,
-/// which is Node's option and not Chock's. `docs/using/nix.md` says that Nix's
-/// `--offline` turns a substituter off without stopping a fixed output build
-/// from fetching, which is why Chock does not pass it. Both ends are checked
-/// here too: an entry that Chock starts to accept fails its test, and so does
-/// one that no documentation names any more.
+/// Options the documentation names that belong to another program. `--jitless`
+/// is Node's, and `--offline` is Nix's, where it turns a substituter off without
+/// stopping a fixed output build from fetching. Both ends are checked.
 const foreign_options = [_][]const u8{ "--jitless", "--offline" };
 
-/// One documentation file, with its path relative to the root of the
-/// repository.
 const Doc = struct {
     path: []const u8,
     text: []const u8,
 };
 
-/// Every `*.md` file a reader of this project reads: the ones in the root, and
-/// the ones anywhere under `docs/`.
-///
-/// Read off the disk and never listed here, so a page added tomorrow is
-/// checked tomorrow. The root is read one level deep, because the fetched
-/// packages under `zig-pkg/` carry markdown of their own and are not ours.
-/// `docs/` is walked, because the pages are grouped into subdirectories.
-///
-/// Sorted by path, so a failure reads the same way twice.
+/// The root is read one level deep, because the fetched packages under
+/// `zig-pkg/` carry markdown of their own and are not ours. Sorted by path, so
+/// a failure reads the same way twice.
 fn loadDocs(arena: std.mem.Allocator, io: std.Io) ![]Doc {
     var docs: std.ArrayList(Doc) = .empty;
 
@@ -134,7 +78,6 @@ fn lessByPath(_: void, a: Doc, b: Doc) bool {
     return std.mem.order(u8, a.path, b.path) == .lt;
 }
 
-/// The text of one documentation file.
 fn docText(docs: []const Doc, path: []const u8) ![]const u8 {
     for (docs) |doc| {
         if (std.mem.eql(u8, doc.path, path)) return doc.text;
@@ -142,12 +85,6 @@ fn docText(docs: []const Doc, path: []const u8) ![]const u8 {
     return error.NoSuchDoc;
 }
 
-/// Every Zig file under the named top level directories, joined into one
-/// buffer.
-///
-/// **What a name, an action and a message are checked against.** The code is
-/// the only record of which of those Chock really has, and a search of the
-/// source is a search that nobody can forget to update when a file is added.
 fn loadSources(arena: std.mem.Allocator, io: std.Io, tops: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
 
@@ -173,20 +110,13 @@ fn loadSources(arena: std.mem.Allocator, io: std.Io, tops: []const []const u8) !
     return out.items;
 }
 
-/// Everything a reader of the documentation can name.
 const all_code = [_][]const u8{ "src", "lib" };
 
-/// The command line, and nothing below it.
-///
-/// **An option is read in `src/` alone.** `CONTRIBUTING.md` states the rule
-/// that makes this exact: `lib/` never prints and never parses a command line,
-/// so every option Chock takes is a literal in a file under `src/`. Searching
-/// the libraries as well would accept `--quiet`, which is an argument
-/// `chock-broker` gives to git and not an option of ours.
+/// `lib/` never parses a command line, so every option is a literal under
+/// `src/`. A search of the libraries too would accept `--quiet`, which
+/// `chock-broker` gives to git.
 const command_line_code = [_][]const u8{"src"};
 
-/// One piece of a documentation file that holds code: the text between two
-/// backticks on one line, or one line inside a fenced block.
 const Span = struct {
     doc: []const u8,
     line: usize,
@@ -194,11 +124,7 @@ const Span = struct {
     fenced: bool,
 };
 
-/// Every code span in one file, in the order a reader meets them.
-///
 /// A fenced block gives one span per line, because a command line is a line.
-/// Outside a fence, each pair of backticks on one line gives one span. A
-/// backtick that opens nothing is not a span and is skipped.
 fn collectSpans(arena: std.mem.Allocator, doc: Doc, out: *std.ArrayList(Span)) !void {
     var lines = std.mem.splitScalar(u8, doc.text, '\n');
     var number: usize = 0;
@@ -230,25 +156,19 @@ fn collectSpans(arena: std.mem.Allocator, doc: Doc, out: *std.ArrayList(Span)) !
     }
 }
 
-/// Every code span in every file.
 fn allSpans(arena: std.mem.Allocator, docs: []const Doc) ![]const Span {
     var spans: std.ArrayList(Span) = .empty;
     for (docs) |doc| try collectSpans(arena, doc, &spans);
     return spans.items;
 }
 
-/// Whether this span is a `chock` command line rather than prose.
 fn isChockLine(span: Span) bool {
     var words = std.mem.tokenizeAny(u8, span.text, " \t");
     const first = words.next() orelse return false;
     return std.mem.eql(u8, first, "chock");
 }
 
-/// The word an option token names, with any `=value` and any punctuation
-/// removed. Null when the token is not an option.
-///
-/// `--` alone is the end of the options and never one of them: it is how a
-/// task reaches bare `chock`.
+/// `--` alone ends the options and is never one of them.
 fn optionName(token: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, token, "--")) return null;
     var end: usize = 2;
@@ -261,11 +181,8 @@ fn optionName(token: []const u8) ?[]const u8 {
     return token[0..end];
 }
 
-/// Whether the source declares this option.
-///
 /// Both spellings, because `src/tty.zig` reads `--color=<when>` with one
-/// literal that carries the `=`, and a parser that took a separate value would
-/// hold the plain word.
+/// literal that carries the `=`.
 fn sourceHasOption(source: []const u8, option: []const u8, arena: std.mem.Allocator) !bool {
     const plain = try std.fmt.allocPrint(arena, "\"{s}\"", .{option});
     if (std.mem.indexOf(u8, source, plain) != null) return true;
@@ -273,7 +190,6 @@ fn sourceHasOption(source: []const u8, option: []const u8, arena: std.mem.Alloca
     return std.mem.indexOf(u8, source, valued) != null;
 }
 
-/// Whether `commands` holds this name.
 fn isCommand(name: []const u8) bool {
     for (chock_main.commands) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return true;
@@ -281,8 +197,6 @@ fn isCommand(name: []const u8) bool {
     return false;
 }
 
-/// Whether every character is a lower case letter, a digit, or one of
-/// `extra`.
 fn isMadeOf(word: []const u8, comptime extra: []const u8) bool {
     if (word.len == 0) return false;
     for (word) |c| {
@@ -294,17 +208,11 @@ fn isMadeOf(word: []const u8, comptime extra: []const u8) bool {
     return true;
 }
 
-/// The value a documented count carries, spelled as a word or as digits.
-/// Null for a word that is neither.
-///
-/// **The words, and never the counts.** Every number this maps to is read
-/// from the code at the place it is compared.
 fn countWord(word: []const u8) ?usize {
     if (std.fmt.parseInt(usize, word, 10)) |digits| return digits else |_| {}
     return numberWord(word);
 }
 
-/// The value of an English number word. Null for a word that is not one.
 fn numberWord(word: []const u8) ?usize {
     const words = [_][]const u8{
         "zero",    "one",     "two",       "three",    "four",
@@ -319,8 +227,6 @@ fn numberWord(word: []const u8) ?usize {
     return null;
 }
 
-/// Report every place a documentation file claims `<number word> <noun>` and
-/// the number is not `truth`.
 fn checkCount(
     arena: std.mem.Allocator,
     docs: []const Doc,
@@ -354,13 +260,11 @@ fn checkCount(
     }
 }
 
-/// Whether the text names this word between backticks.
 fn namesInTicks(text: []const u8, word: []const u8, arena: std.mem.Allocator) !bool {
     const ticked = try std.fmt.allocPrint(arena, "`{s}`", .{word});
     return std.mem.indexOf(u8, text, ticked) != null;
 }
 
-/// Whether a path is in the repository. A directory answers yes.
 fn repoHas(io: std.Io, arena: std.mem.Allocator, path: []const u8) !bool {
     const full = try std.fs.path.join(arena, &.{ repo_root, path });
     _ = std.Io.Dir.cwd().statFile(io, full, .{}) catch return false;
@@ -368,9 +272,6 @@ fn repoHas(io: std.Io, arena: std.mem.Allocator, path: []const u8) !bool {
 }
 
 test "the documentation index names every page under docs/" {
-    // The index is the first thing a reader opens, so a page it does not name
-    // is a page nobody finds. Mutation check: add a page under `docs/` and do
-    // not name it in `docs/README.md`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -392,17 +293,12 @@ test "the documentation index names every page under docs/" {
 }
 
 test "every path the documentation names is in the repository" {
-    // Two shapes: the target of a markdown link, and a path between backticks.
-    // A link is read relative to the page it is on, the way a reader's own
-    // browser reads it. Mutation check: name a file that does not exist.
+    // A link is read relative to the page it is on, the way a browser reads it.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const docs = try loadDocs(arena, testing.io);
 
-    // The top level directories of this repository, read off the disk. A token
-    // is a repository path when it starts with one of these, so nothing here
-    // is a list a person maintains.
     var tops: std.ArrayList([]const u8) = .empty;
     {
         var root = try std.Io.Dir.openDirAbsolute(testing.io, repo_root, .{ .iterate = true });
@@ -441,12 +337,8 @@ test "every path the documentation names is in the repository" {
 
     const spans = try allSpans(arena, docs);
     for (spans) |span| {
-        // **Prose only, and never a fenced block.** A fence holds an example
-        // of what a reader writes in their own project:
-        // `docs/extend/plugins.md`
-        // names `plugins/chock-plugin-hello.wasm` in a sample `chock.zon`,
-        // and that path is theirs and not ours. A path in a sentence is a
-        // reference to this repository.
+        // A fence holds an example of what a reader writes in their own
+        // project, so a path in one is theirs and not ours.
         if (span.fenced) continue;
         var words = std.mem.tokenizeAny(u8, span.text, " \t,()");
         while (words.next()) |word| {
@@ -464,15 +356,11 @@ test "every path the documentation names is in the repository" {
         }
     }
 
-    // A scan that found nothing proves nothing: see the test for commands.
     try testing.expect(checked >= 40);
     try testing.expectEqualStrings("", missing.items);
 }
 
 test "every command the documentation shows is a command Chock answers to" {
-    // The word after `chock` on a documented command line, and the word in the
-    // prefix of a documented message. Truth is `main.commands` and nothing
-    // else. Mutation check: write `chock rnu --verbose` into a page.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -487,16 +375,11 @@ test "every command the documentation shows is a command Chock answers to" {
         var words = std.mem.tokenizeAny(u8, span.text, " \t");
         _ = words.next();
         const second = words.next() orelse continue;
-        // A comment, a quoted task, or a placeholder is not a command name.
         if (std.mem.startsWith(u8, second, "#")) continue;
         if (std.mem.startsWith(u8, second, "\"")) continue;
         if (std.mem.startsWith(u8, second, "<")) continue;
         if (std.mem.startsWith(u8, second, "[")) continue;
-        // An option is checked by the test for options, and `--` is the end of
-        // them, after which every word is the task.
         if (std.mem.startsWith(u8, second, "-")) continue;
-        // `chock run: ...` is a message Chock writes, and the word in front of
-        // the colon is still a command.
         const name = std.mem.trimEnd(u8, second, ":");
         if (!isMadeOf(name, "-")) continue;
         checked += 1;
@@ -511,17 +394,13 @@ test "every command the documentation shows is a command Chock answers to" {
         });
     }
 
-    // **A scan that found nothing proves nothing.** The floor is well under
-    // what the pages hold today, so an ordinary edit never reaches it, and a
-    // scanner that stopped working does.
+    // A floor well under what the pages hold today, so an ordinary edit never
+    // reaches it and a scanner that stopped working does.
     try testing.expect(checked >= 20);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "the words the documentation shows as refused are still refused, and still shown" {
-    // Both ends of `refused_examples`. An entry that becomes a real command,
-    // and an entry no page shows any more, each fail here, so a dead entry
-    // cannot sit in this file and hide a real fault.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -546,9 +425,6 @@ test "the words the documentation shows as refused are still refused, and still 
 }
 
 test "every subcommand word the documentation shows is read by that command" {
-    // `chock sessions verify` and the eleven like it. The command's own file
-    // is what reads the word, so that file is where the word must be.
-    // Mutation check: write `chock sessions confirm` into a page.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -568,8 +444,6 @@ test "every subcommand word the documentation shows is read by that command" {
         const command = words.next() orelse continue;
         if (!isCommand(command)) continue;
         const word = words.next() orelse continue;
-        // An option is not a subcommand word. `isMadeOf` lets a dash through,
-        // because `older-than` and `require-card` hold one in the middle.
         if (std.mem.startsWith(u8, word, "-")) continue;
         if (!isMadeOf(word, "-")) continue;
 
@@ -588,15 +462,11 @@ test "every subcommand word the documentation shows is read by that command" {
         });
     }
 
-    // A scan that found nothing proves nothing: see the test for commands.
     try testing.expect(checked >= 10);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "every option the documentation names is an option the code reads" {
-    // An option on a documented command line, and an option a page names on
-    // its own. Truth is the source of `src/`, which is where every command
-    // line is read. Mutation check: write `chock run --quietly` into a page.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -612,10 +482,8 @@ test "every option the documentation names is an option the code reads" {
         if (!isChockLine(span) and !bare_option) continue;
 
         var words = std.mem.tokenizeAny(u8, span.text, " \t");
-        // **A message Chock writes is not a command line.** `chock run: put it
-        // back with `git reset --hard ...`` names git's option inside Chock's
-        // own sentence, and that option is git's business. The test for a
-        // message reads those lines.
+        // A message Chock writes is not a command line. One can name another
+        // program's option inside Chock's own sentence.
         if (isChockLine(span)) {
             var head = std.mem.tokenizeAny(u8, span.text, " \t");
             _ = head.next();
@@ -624,8 +492,6 @@ test "every option the documentation names is an option the code reads" {
             }
         }
         while (words.next()) |word| {
-            // Everything after a comment is prose, and everything after `--`
-            // alone is the task.
             if (std.mem.startsWith(u8, word, "#")) break;
             if (std.mem.eql(u8, word, "--")) break;
             const option = optionName(std.mem.trim(u8, word, "`\"")) orelse continue;
@@ -642,14 +508,11 @@ test "every option the documentation names is an option the code reads" {
         }
     }
 
-    // A scan that found nothing proves nothing: see the test for commands.
     try testing.expect(checked >= 25);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "the options the documentation credits to another program are still not ours" {
-    // Both ends of `foreign_options`, for the reason the refused words have
-    // both ends checked.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -675,8 +538,6 @@ test "the options the documentation credits to another program are still not our
 }
 
 test "every command Chock answers to is named in the documentation" {
-    // The other direction. A command that ships with no page is a command
-    // nobody can find. Mutation check: add an entry to `main.commands`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -697,9 +558,6 @@ test "every command Chock answers to is named in the documentation" {
 }
 
 test "the exit code table has one row for each code, with the number the code has" {
-    // A script reads these, so a row that names the wrong number is worse than
-    // no table. Truth is `main.Exit`. Mutation check: add a member to `Exit`,
-    // or change a number in the table.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -731,9 +589,6 @@ test "the exit code table has one row for each code, with the number the code ha
 }
 
 test "the tool list names every tool, and counts them right" {
-    // `docs/README.md` said "the seventeen tools" while the enum held
-    // eighteen. Truth is `tools.Tool`. Mutation check: add a member to the
-    // enum, or write a different number into a page.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -754,11 +609,6 @@ test "the tool list names every tool, and counts them right" {
 }
 
 test "the policy page names every decision and every field of a rule, and counts them right" {
-    // The vocabulary a person writes into their own `chock.zon`. A decision
-    // the page does not name is a decision nobody uses, and one it names that
-    // the code has not got is a file that will not load. Truth is
-    // `table.Decision` and `table.Rule`. Mutation check: add a member to
-    // either.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -779,8 +629,7 @@ test "the policy page names every decision and every field of a rule, and counts
             try wrong.print(arena, "docs/configure/policy.md names no rule field `{s}`\n", .{field.name});
         }
     }
-    // Only this page, because `fields` and `decisions` are ordinary words and
-    // another page may count something else with them.
+    // Only this page: `fields` and `decisions` are ordinary words elsewhere.
     try checkCount(arena, docs, "docs/configure/policy.md", "decisions", decisions.len, &wrong);
     try checkCount(arena, docs, "docs/configure/policy.md", "fields", rule_fields.len, &wrong);
 
@@ -788,9 +637,6 @@ test "the policy page names every decision and every field of a rule, and counts
 }
 
 test "every name the documentation spells with an underscore is a name the code has" {
-    // A tool, a policy key, a doctor row, a system call: every one of them is
-    // written in the code, so a page that names one the code has not got is a
-    // page that has expired. Mutation check: rename any of them in a page.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -812,15 +658,11 @@ test "every name the documentation spells with an underscore is a name the code 
         });
     }
 
-    // A scan that found nothing proves nothing: see the test for commands.
     try testing.expect(checked >= 50);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "every action a table row names is an action the code has" {
-    // The actions table of `docs/configure/actions.md` is what a person copies
-    // into a rule, and a rule that names an action the broker never asks about
-    // is a rule that never fires. Mutation check: rename a row.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -851,17 +693,14 @@ test "every action a table row names is an action the code has" {
         }
     }
 
-    // A scan that found nothing proves nothing: see the test for commands.
     try testing.expect(checked >= 8);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "a message the documentation shows is a message the code writes" {
-    // The sample output in a fenced block. Byte for byte is not possible: the
-    // blocks carry a session identifier, a hash and a path from somebody
-    // else's machine. So the words in front of the first of those are
-    // compared, which is the part the code holds as a literal. Mutation
-    // check: reword the front of one of those lines.
+    // Byte for byte is not possible: a sample block carries a session
+    // identifier, a hash and a path from another machine. Only the words in
+    // front of the first of those are compared.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -870,8 +709,6 @@ test "a message the documentation shows is a message the code writes" {
     const source = try loadSources(arena, testing.io, &all_code);
     const spans = try allSpans(arena, docs);
 
-    // Enough to tell one message from another, and short enough to stop
-    // before the first value a run fills in.
     const words_compared = 3;
 
     var wrong: std.ArrayList(u8) = .empty;
@@ -891,8 +728,6 @@ test "a message the documentation shows is a message the code writes" {
         var taken: usize = 0;
         while (taken < words_compared) {
             const word = words.next() orelse break;
-            // A path, a number and a quoted name are what the run fills in,
-            // so the comparison stops in front of them.
             if (std.mem.indexOfScalar(u8, word, '/') != null) break;
             if (std.mem.indexOfAny(u8, word, "0123456789`") != null) break;
             try message.print(arena, " {s}", .{word});
@@ -905,15 +740,11 @@ test "a message the documentation shows is a message the code writes" {
         });
     }
 
-    // The check is worth nothing if the pages stop holding sample output, so
-    // say how many were read.
     try testing.expect(checked >= 4);
     try testing.expectEqualStrings("", wrong.items);
 }
 
 test "the repository layout names every library and every test area" {
-    // `CONTRIBUTING.md` is where somebody new reads what is here. Truth is the
-    // disk. Mutation check: add a directory under `test/`.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -940,9 +771,6 @@ test "the repository layout names every library and every test area" {
 }
 
 test "the sandbox page counts the calls it blocks and the proc entries it masks" {
-    // Two numbers a reader has no way to check, and both are an array in the
-    // code. The page said 22 masked entries while the array held 20. Mutation
-    // check: remove a member of either array.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

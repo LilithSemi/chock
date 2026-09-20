@@ -1,33 +1,11 @@
-//! Enters a user and mount namespace, mounts a real overlay, and performs one
-//! or more file operations against the merged view. `lib/chock-workspace/overlay.zig`'s
-//! own tests start this program and read its exit status, the same pattern
-//! `test/sandbox/escape.zig` uses to run `test/sandbox/probe.zig`: a real
-//! overlay mount needs `CAP_SYS_ADMIN` over its own mount namespace, and
-//! entering a user namespace needs a single threaded caller, so this cannot
-//! run inside the zig test binary itself. See build.zig for how this binary's
-//! path reaches that test.
+//! Enters a user and mount namespace, mounts a real overlay, and performs
+//! file operations against the merged view. A rootless overlay mount needs its
+//! own mount namespace, and entering a user namespace needs a single threaded
+//! caller, so this cannot run inside the zig test binary. build.zig gives this
+//! binary's path to the test that starts it.
 //!
-//! This program calls the very same `Overlay.mounts` the library ships, by
-//! importing the `chock-workspace` module, to get the overlay descriptor it
-//! carries, `lower`, `upper`, and `work`, rather than a second copy that
-//! could drift from it. `Overlay.mounts` only describes the overlay now; it
-//! performs no mount of its own, so this program calls `chock-sandbox`'s own
-//! `namespace.mountOverlay` directly to get a real mount, the same call
-//! `chock-sandbox`'s own `buildRoot` makes for the overlay kind. It mounts at
-//! `ov.merged`, a scratch directory kept apart from the project on purpose,
-//! never at the descriptor's own `target` (the project's real path): every
-//! test below reads the project, on the host, untouched, and compares it
-//! against what actually landed under the overlay, so the two must stay
-//! apart. The `Overlay` value this program builds borrows its four paths
-//! straight from argv rather than owning fresh copies: this process never
-//! calls `Overlay.deinit`, because it is about to exit and the kernel
-//! reclaims everything anyway.
-//!
-//! Every file operation past the mount itself uses a raw syscall, never
-//! `std.Io`: Zig 0.16 moved directory creation and file writes behind
-//! `std.Io.Dir`, which needs a threaded `Io` implementation this program
-//! cannot carry, because `sandbox.namespace.enter` needs a single threaded
-//! caller. `test/sandbox/probe.zig` follows the same rule for the same reason.
+//! Every file operation past the mount uses a raw syscall, because `std.Io.Dir`
+//! needs a threaded `Io` this program cannot carry.
 //!
 //! Command line: <project> <upper> <work> <merged> [op ...]
 //!
@@ -40,21 +18,18 @@
 //!   R:<relpath>              remove the (already empty) directory merged/<relpath>
 //!
 //! `<content>` and `<target>` run to the end of the op string, so they may
-//! hold a further ':' of their own; only `<relpath>` may not.
+//! hold a further ':' of their own. Only `<relpath>` may not.
 //!
 //! Exit codes:
 //!   0 - every step succeeded.
 //!   1 - too few arguments.
-//!   3 - the overlay mount was refused because this kernel does not support a
-//!       rootless overlay mount. See namespace.zig's own error.OverlayNotSupported.
+//!   3 - this kernel does not support a rootless overlay mount.
 //!   4 - the overlay mount failed for another reason.
-//!   5 - a component of the overlay's own paths (project, upper, or work)
-//!       could not be read.
+//!   5 - a component of the overlay's own paths could not be read.
 //!   6 - an op failed, or named an operation this program does not know.
-//!  63 - this machine would not give a user namespace, so nothing here was
-//!       measured. **Not a pass and not a failure**: the caller skips and says
-//!       why. See `namespace.nothing_measured_exit_status`, which every helper
-//!       program in this suite answers with for the same reason.
+//!  63 - this machine would not give a user namespace, so nothing ran. Not a
+//!       pass and not a failure: the caller skips and says why. See
+//!       `namespace.nothing_measured_exit_status`.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -73,8 +48,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         return 1;
     }
 
-    // Borrowed, not owned: see this file's own top comment. Overlay.mounts
-    // only ever reads these fields.
+    // Borrowed from argv and never freed. `Overlay.mounts` only reads them.
     const ov = Overlay{
         .project = @constCast(args[1]),
         .upper = @constCast(args[2]),
@@ -82,10 +56,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .merged = @constCast(args[4]),
     };
 
-    // **Nothing is printed here.** This program's standard error is the test
-    // binary's own, and `build.zig`'s `failOnTestStderr` fails the build on
-    // any byte a test binary writes there. The exit status carries the fact,
-    // and the caller turns it into a skip.
+    // Nothing is printed here. `build.zig`'s `failOnTestStderr` fails the
+    // build on any byte a test binary writes to standard error.
     sandbox.namespace.enter(.{}, null) catch {
         return sandbox.namespace.nothing_measured_exit_status;
     };
@@ -96,12 +68,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             std.debug.print("building the overlay descriptor failed\n", .{});
             return 4;
         },
-        // Overlay.mounts only ever builds one Mount.overlay entry from the
-        // four paths already on `ov`; it never touches a driver, so this
-        // program, which only ever runs on Linux, can never actually see any
-        // of the errors only the Darwin driver's own create returns. The last
-        // two belong to `adopt` and `carryOut`, which this program never calls
-        // either. See chock-workspace/overlay.zig's own top comment.
+        // These belong to the Darwin driver, to `adopt`, and to `carryOut`.
         error.NoOverlayFilesystem,
         error.ScratchOnAnotherVolume,
         error.ScratchAlreadyExists,
@@ -111,9 +78,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
     const overlay_mount = switch (described[0]) {
         .overlay => |o| o,
-        // Overlay.mounts always returns exactly one .overlay entry, never a
-        // bind and never a procfs: this program would be testing a different
-        // function's bug, not this one's, if that were ever not true.
+        // `Overlay.mounts` always returns exactly one overlay entry.
         .bind, .proc, .deny => unreachable,
     };
 
@@ -150,8 +115,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
 const OpError = error{ UnknownOp, MissingField, OutOfMemory, OpFailed };
 
-/// Apply one op string, documented at this file's own top comment, against
-/// `merged`.
+/// Apply one op string, documented at the top of this file, against `merged`.
 fn applyOp(allocator: std.mem.Allocator, merged: []const u8, op: []const u8) OpError!void {
     var parts = std.mem.splitScalar(u8, op, ':');
     const kind = parts.next() orelse return error.UnknownOp;
