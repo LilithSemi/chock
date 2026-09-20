@@ -1,42 +1,14 @@
-//! Joins the two backings `worktree.zig` and `overlay.zig` build into one type a
-//! caller can use without knowing which one a project got. `open` picks git or
-//! overlay by asking `git.isRepository`. The caller never chooses. `sandboxConfig`
-//! turns that choice into the `Sandbox.Config` a caller hands to `Sandbox.spawn`:
-//! the mount list the backing already builds, the Landlock rules that go with
-//! it, the `chock.zon` protection, when the project has one, and one covering
-//! mount per file that project's own `deny_read` block names, all in one place.
-//!
-//! Three refusals this file exists to make provable: no write to
-//! `.git/objects`, no write to `.git/hooks`, no delete of `chock.zon`. An
-//! earlier sandbox could not prove them, because it had no `.git` to
-//! protect. `test/workspace/escape.zig` is where that proof
-//! lives now.
-//!
-//! **Every path in that config has two possible shapes, and one call decides
-//! which.** `Layout.remapped` puts the checkout at the project's own path and
-//! Chock's own paths under `Sandbox.runtime_prefix`, which needs a mount
-//! namespace. `Layout.in_place` leaves every path where it really is, which is
-//! the only shape macOS can express: see `chock-workspace/layout.zig` for what
-//! that costs a person. `open` and `adopt` read the layout from the host's own
-//! sandbox driver, and `openWithLayout` and `adoptWithLayout` take one, so a
-//! test on either platform can build the mount list the other gets.
-//!
-//! This file imports `chock-sandbox` for `Sandbox.Config` and its own `Mount` and
-//! `landlock` types, the same reason `worktree.zig` and `overlay.zig` each give in
-//! their own top comments. `lib/chock-workspace.zig`, the root of this module,
-//! must never import `chock-sandbox` itself. This file is the third of the three
-//! that does.
+//! Joins the two backings `worktree.zig` and `overlay.zig` build into one type
+//! a caller can use without knowing which one a project got. `open` picks by
+//! asking `git.isRepository`, and the caller never chooses.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const diagnostic = @import("diagnostic.zig");
-/// Why a call here failed, past what `Error` can say. One type for the whole
-/// module: see `chock-workspace/diagnostic.zig`.
 pub const Diagnostic = diagnostic.Diagnostic;
 const git = @import("git.zig");
 const layout_mod = @import("layout.zig");
-/// Where the sandbox sees the workspace. See `chock-workspace/layout.zig`.
 pub const Layout = layout_mod.Layout;
 const worktree_mod = @import("worktree.zig");
 const overlay_mod = @import("overlay.zig");
@@ -44,90 +16,45 @@ const deny_mod = @import("deny.zig");
 const sandbox = @import("chock-sandbox");
 
 pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || error{
-    /// `adopt` was asked for a project with no git of its own, which gets the
-    /// overlay backing, and no second process can take one of those over
-    /// today. **A refusal, not a fault, and not a claim that the work is
-    /// lost**: `Workspace.adopt`'s own doc comment records what was read and
-    /// what is missing. `overlay.adopt` now exists, so the work of a session
-    /// that has ended is reachable with `chock workspace adopt`. What is
-    /// refused here is one *running* session moving to a second process.
     OverlayCannotBeAdopted,
     /// `chock.zon` names a symbolic link instead of an ordinary file, in the
-    /// checkout `findChockZon` was asked to read. Chock's own policy file
-    /// must be real: an agent that can write its own checkout can otherwise
-    /// replace `chock.zon` with a link to an arbitrary host path, and the
-    /// bind mount that is meant to protect it would then bind that path in
-    /// instead. Refused rather than followed. See `findChockZon`'s own doc
-    /// comment.
+    /// copy the sandbox would bind.
     ChockZonIsSymlink,
 };
 
-/// The name and the address every commit made inside the sandbox carries,
-/// as author and as committer both.
+/// The name and the address every commit made inside the sandbox carries.
 ///
-/// **A commit is the only way a session's work reaches the user.**
-/// `chock-broker`'s own `workspace.apply` takes what the agent committed in
-/// the worktree and puts it on a branch, so a `git commit` that refuses is a
-/// session whose work is lost. Without this, git refuses with "Author
-/// identity unknown": the sandbox has no `HOME`, so no global configuration
-/// is readable, and the whole of `.git` is mounted read only, so
-/// `git config user.name` cannot create one either. Measured in a real
-/// session, where the agent worked around it by inventing an identity of its
-/// own on the command line, and a second session invented a different one.
+/// A commit is the only way a session's work reaches the user, and without this
+/// git refuses with "Author identity unknown": the sandbox has no `HOME`, so no
+/// global configuration is readable, and the whole of `.git` is read only, so
+/// `git config user.name` cannot create one either. An agent once worked around
+/// it by inventing an identity of its own, and a second session invented a
+/// different one.
 ///
-/// **Environment variables, never a configuration file**, for two reasons
-/// that each stand alone. They outrank every configuration file in git's own
-/// precedence, so they decide the identity whatever a repository's own
-/// `.git/config` says. And they need nothing writable, which is the actual
-/// fault above: a file would need a writable directory inside the sandbox to
-/// live in.
-///
-/// **No `GIT_AUTHOR_DATE` and no `GIT_COMMITTER_DATE`.** git reads the real
-/// clock when neither is set, which is what a commit's timestamp must be. The
-/// host side integration in `lib/chock-broker/integrate.zig` does set a date,
-/// and it answers a different question: it carries the identity of a commit
-/// that already exists onto a new one. Nothing here is that.
-///
-/// **The identity is fixed and no project can rename it.** See
-/// `identity_env`'s own doc comment.
+/// Environment variables and never a configuration file, for two reasons that
+/// each stand alone: they outrank every configuration file in git's own
+/// precedence, and they need nothing writable.
 pub const identity_name = "Chock";
-/// The address half of `identity_name`.
 pub const identity_email = "chock@lilithsemi.com";
 
-/// The four entries `sandboxConfig` puts in front of every other
-/// environment variable, in `KEY=VALUE` form.
+/// The four entries `sandboxConfig` puts in front of every other environment
+/// variable, in `KEY=VALUE` form.
 ///
-/// **Author and committer both.** git takes the two from separate variables
-/// and falls back to the configuration for either one it is not given, so
-/// naming only the author would leave the committer as the fault this exists
-/// to fix.
+/// Author and committer both, because git takes the two from separate variables
+/// and falls back to the configuration for either one it is not given.
 ///
-/// **No project may override this, on purpose, and `chock.zon` has no block
-/// for it.** An agent's commit has to be recognisable as an agent's commit by
-/// anybody reading the history later, and an identity a project could rename
-/// is an identity that says nothing. A person who wants different authorship
-/// on the work still has it: the commit reaches them through
-/// `workspace.apply`, on a branch of their own, where `git commit --amend
-/// --author` costs one command. That is the opposite trade from a
-/// configuration surface, which would make every repository's own history
-/// the place to look before trusting a name.
+/// No project may override this. An identity a project could rename is an
+/// identity that says nothing, and a person who wants different authorship has
+/// `git commit --amend --author` on their own branch.
 ///
-/// **`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are deliberately not here.**
-/// `lib/chock-workspace/git.zig` forces both to `/dev/null` on every call it
-/// makes, and the reason is a host side reason: Chock reads what git prints,
-/// so an alias, a colour setting, or a pager in a person's own `~/.gitconfig`
-/// would change the text Chock parses. Inside the sandbox nothing of Chock's
-/// parses git's output. The agent reads it. And no global or system
-/// configuration is reachable there in the first place: the sandbox has no
-/// `HOME`, and neither `/etc/gitconfig` nor a person's home directory is
-/// mounted. So the two variables would neutralize nothing that is not already
-/// absent, while taking away a gitconfig a dev shell or a container image may
-/// have put in the tree on purpose. The one thing a configuration file could
-/// still have decided, the identity, is decided above these lines instead,
-/// which is the whole point of using variables: they outrank a repository's
-/// own `.git/config` as well. The project's own `.git/config` is read only in
-/// the sandbox, but a repository the agent makes or clones for itself is not,
-/// and the identity has to hold in that one too.
+/// `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are deliberately absent. `git.zig`
+/// forces both to `/dev/null` for a host side reason, which is that Chock parses
+/// what git prints. Inside the sandbox the agent reads it, and no global or
+/// system configuration is reachable anyway, so the two would neutralize nothing
+/// while taking away a gitconfig a dev shell may have put in the tree on purpose.
+///
+/// No `GIT_AUTHOR_DATE` and no `GIT_COMMITTER_DATE`: git reads the real clock
+/// when neither is set, which is what a commit's timestamp must be.
 pub const identity_env = [_][]const u8{
     "GIT_AUTHOR_NAME=" ++ identity_name,
     "GIT_AUTHOR_EMAIL=" ++ identity_email,
@@ -135,78 +62,32 @@ pub const identity_env = [_][]const u8{
     "GIT_COMMITTER_EMAIL=" ++ identity_email,
 };
 
-/// Which backing a session got. `Workspace.open` decides. A caller never
-/// chooses by hand.
-///
-/// The two kinds are equally free to build from an ordinary, unprivileged
-/// caller, all the way through `sandboxConfig`. `Worktree.mounts` and
-/// `Overlay.mounts` both only describe mounts: neither opens anything or
-/// mounts anything, so neither needs a namespace to call. `chock-sandbox`'s
-/// own `Mount` type carries a kind for exactly this, a bind mount or an
-/// overlay mount, and `chock-sandbox`'s own `buildRoot` is the only place
-/// that ever performs either one, inside the sandbox's own namespace, once
-/// `Sandbox.spawn` runs. An earlier version of `Overlay.mounts` performed the
-/// real overlay mount itself, here, before `Mount` could describe one, which
-/// needed `CAP_SYS_ADMIN` over the caller's own mount namespace and so needed
-/// a caller of the overlay kind to already be inside one, an extra step the
-/// worktree kind never carried. That asymmetry is gone: a caller of either
-/// kind calls `open`, then `sandboxConfig`, then hands the result to
-/// `Sandbox.spawn`, and only `Sandbox.spawn` ever needs a namespace.
+/// Which backing a session got. Both kinds are equally free to build from an
+/// ordinary, unprivileged caller, all the way through `sandboxConfig`. Neither
+/// `mounts` call opens or mounts anything, and `chock-sandbox`'s own `buildRoot`
+/// is the only place either mount is performed. An earlier `Overlay.mounts`
+/// performed the real overlay mount here, which needed `CAP_SYS_ADMIN` over the
+/// caller's own namespace and so needed a caller already inside one.
 pub const Kind = union(enum) {
-    /// The project is a git repository: a throwaway linked worktree.
     worktree: worktree_mod.Worktree,
-    /// The project has no git of its own: an overlayfs mount.
     overlay: overlay_mod.Overlay,
 };
 
 pub const Workspace = struct {
     kind: Kind,
-    /// Absolute host path of `chock.zon` inside the backing's own copy of the
-    /// project (a worktree checkout, or an overlay's lower layer), if the
-    /// project has one. `null` when it does not: not every session backs a
-    /// chock project, and a caller with no policy file to protect should not
-    /// be forced to invent one. Owned by this value.
     chock_zon_source: ?[]u8,
-    /// Where `chock_zon_source` lands inside the sandbox: the real project
-    /// path plus `chock.zon`. `null` exactly when `chock_zon_source` is
-    /// `null`. Owned by this value.
     chock_zon_target: ?[]u8,
-    /// Every file the project said the agent may not read, as an absolute
-    /// path: `sandboxRoot` plus the entry, which is where the file sits inside
-    /// the sandbox. Empty for a project that denied nothing, which is every
-    /// project with no `deny_read` block. Owned by this value.
-    ///
-    /// **Read from the host project's own `chock.zon`, and never from the
-    /// workspace.** See `deny.zig`'s own top comment: a rule that decides what
-    /// the sandbox may hold must not be read out of the sandbox. This is the
-    /// one field of this type that does not follow `chock_zon_source`, which
-    /// deliberately prefers the checkout's own copy, so that the file bound
-    /// over the agent's `chock.zon` is the one its own checkout carries.
     deny_paths: []const []u8,
 
-    /// Pick a backing for `project_root` and build it. A git repository gets
-    /// a throwaway linked worktree, detached at HEAD. Anything else gets the
-    /// overlay backing, which on Linux is an overlayfs mount with the project
-    /// as the read only lower layer, and on Darwin a copy on write clone of
-    /// the project. The caller never chooses: `git.isRepository` decides.
+    /// Pick a backing for `project_root` and build it. `git.isRepository`
+    /// decides, and the caller never chooses.
     ///
-    /// `scratch_dir` must already exist, and holds every scratch file the
-    /// chosen backing needs: a real caller gives it a session scratch
-    /// directory, and a test gives it its own `std.testing.tmpDir`.
-    /// `session_id` is only used for the worktree path. An overlay backing
-    /// ignores it, the same way `overlay.create` itself takes no session id.
+    /// `scratch_dir` must already exist and holds every scratch file the chosen
+    /// backing needs. `session_id` is only used for the worktree path.
     ///
-    /// `open` needs no namespace for either kind: see `Kind`'s own doc
-    /// comment for the one call later, `sandboxConfig`, where the two kinds
-    /// stop being alike.
-    ///
-    /// Both kinds work on Darwin. `worktree.create` only runs `git`, which
-    /// exists there too, and `overlay.create` clones the project with
-    /// `clonefile(2)`: see `darwin/overlay.zig`'s own top comment. The one
-    /// requirement Darwin adds is that `scratch_dir` sits on the project's
-    /// own volume, since a clone cannot cross one; `open` reports
-    /// `error.ScratchOnAnotherVolume` when it does not, rather than working
-    /// in the user's real files.
+    /// Darwin adds one requirement: `scratch_dir` must sit on the project's own
+    /// volume, since a clone cannot cross one. `error.ScratchOnAnotherVolume`
+    /// rather than working in the user's real files.
     pub fn open(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -219,10 +100,6 @@ pub const Workspace = struct {
         return openWithLayout(allocator, io, env, project_root, scratch_dir, session_id, Layout.forHost(), diag);
     }
 
-    /// `open`, plus paths denied by something other than the project's own
-    /// file. The layout is this host's, exactly as `open` picks it. See
-    /// `openWithLayoutAndDenied` for what the extra list is and why it is a
-    /// union.
     pub fn openAndDenied(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -246,8 +123,6 @@ pub const Workspace = struct {
         );
     }
 
-    /// `open`, with the layout named rather than read from the target. See
-    /// `worktree.createWithLayout` for why the two calls exist.
     pub fn openWithLayout(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -271,24 +146,6 @@ pub const Workspace = struct {
         );
     }
 
-    /// `openWithLayout`, plus paths denied by something other than the
-    /// project's own file.
-    ///
-    /// **This is where an org policy bundle's `deny_read` arrives.** A project
-    /// may add to the list and can take nothing off it, so the fold is a union
-    /// and not a minimum: a bundle that hid a file would be answered by a
-    /// `chock.zon` that simply did not name it, if the project's list were the
-    /// only one read.
-    ///
-    /// **They are checked here, by the same `deny.check` the project's own
-    /// entries go through.** The rules live in one place and this call does not
-    /// carry a second copy of them: see `deny.check`, which is public for that
-    /// reason. An entry an organisation wrote that breaks a rule refuses the
-    /// session with the same error a project's own would.
-    ///
-    /// A separate entry point rather than one more argument on `open`, because
-    /// `open` has one caller that knows about bundles and a hundred that do
-    /// not.
     pub fn openWithLayoutAndDenied(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -300,15 +157,13 @@ pub const Workspace = struct {
         also_denied: []const []const u8,
         diag: ?*?Diagnostic,
     ) Error!Workspace {
-        // **Before either backing is built**, so a `deny_read` block this
-        // cannot honour refuses the session rather than half building one. It
-        // reads the host project's own `chock.zon`, which for the worktree
-        // backing is not the file the checkout carries: see `deny_paths`.
+        // Before either backing is built, so a `deny_read` block this cannot
+        // honour refuses the session rather than half building one. It reads
+        // the host project's own `chock.zon`, which for the worktree backing is
+        // not the file the checkout carries.
         //
-        // **Checked here and joined later**, because where the sandbox sees
-        // the project is not known until the backing exists: under
-        // `Layout.in_place` it is the agent's own copy, at its own real path.
-        // See `deny.loadEntries`.
+        // Checked here and joined later, because where the sandbox sees the
+        // project is not known until the backing exists.
         const own = try deny_mod.loadEntries(allocator, io, project_root, diag);
         defer deny_mod.free(allocator, own);
 
@@ -317,8 +172,6 @@ pub const Workspace = struct {
 
         if (try git.isRepository(allocator, io, env, project_root, diag)) {
             var wt = try worktree_mod.createWithLayout(allocator, io, env, project_root, scratch_dir, session_id, layout, diag);
-            // No diagnostic on the cleanup: the slot already holds the first
-            // fault, which is the one that explains this removal.
             errdefer wt.remove(allocator, io, env, null) catch {};
 
             const denied = try deny_mod.joinOnto(allocator, entries, wt.sandboxRoot());
@@ -339,16 +192,13 @@ pub const Workspace = struct {
         const denied = try deny_mod.joinOnto(allocator, entries, ov.sandboxRoot());
         errdefer deny_mod.free(allocator, denied);
 
-        // The overlay's own lower layer is already read only end to end, but
-        // an agent that deletes chock.zon only makes a whiteout in the
-        // writable upper layer, and the merged view would then show it gone.
-        // Binding the project's own chock.zon back over that path, read
-        // only, the same trick worktree.zig uses, closes that the same way.
+        // The overlay's lower layer is read only end to end, but an agent that
+        // deletes chock.zon only makes a whiteout in the writable upper layer,
+        // and the merged view would then show it gone. Binding the project's
+        // own file back over that path closes it.
         //
-        // **Under `.in_place` the source is the clone's own copy**, because
-        // nothing can be bound over anything there. The entry becomes a read
-        // only rule on the clone's own `chock.zon`, which is what stops the
-        // agent rewriting or deleting it.
+        // Under `.in_place` the source is the clone's own copy, because nothing
+        // can be bound over anything there.
         const zon_source_root = switch (layout) {
             .remapped => ov.project,
             .in_place => ov.upper,
@@ -362,23 +212,11 @@ pub const Workspace = struct {
         };
     }
 
-    /// The project's own denied paths and the ones a layer above it added, in
-    /// one owned list. The caller frees it with `deny.free`.
-    ///
-    /// **Every added entry goes through `deny.check` first**, so a rule an
-    /// organisation broke is refused with the error a project's own entry
-    /// would have raised, and there is no second copy of those rules here.
-    ///
-    /// **The bound is on the whole list and not on each half.** `deny.max_paths`
-    /// is what a sandbox can carry, so a project at the bound and a bundle that
-    /// added one more is over it, however the two were counted.
     fn withAlsoDenied(
         allocator: std.mem.Allocator,
         own: []const []u8,
         also: []const []const u8,
     ) Error![]const []u8 {
-        // An empty `also` still copies, so one `deny.free` in the caller
-        // releases the list whichever path built it.
         for (also) |entry| try deny_mod.check(entry);
         if (own.len + also.len > deny_mod.max_paths) return error.TooManyDenyPaths;
         return copiedInto(allocator, own, also);
@@ -406,58 +244,21 @@ pub const Workspace = struct {
         return list;
     }
 
-    /// Take over the workspace of a session that is handing over, instead of
-    /// building a new one. The checkout is already on disk at
-    /// `<scratch_dir>/<session_id>`, another process made it, and this call
-    /// runs no git command at all: see `worktree.adopt`, which does the work
-    /// for the git backing and explains what a worktree registration does and
-    /// does not hold about the process that made it.
+    /// Take over the workspace of a session that is handing over. The checkout
+    /// is already on disk, another process made it, and this runs no git
+    /// command at all.
     ///
-    /// The argument list is `open`'s, plus `base_commit`. That one field
-    /// cannot be recovered from the disk: a session that committed before it
-    /// handed over has a HEAD that is not its base, and reading HEAD back
-    /// would make `Worktree.headMoved` answer "nothing changed" for a session
-    /// that changed plenty. The caller carries the base commit across, out of
-    /// the session log.
+    /// The argument list is `open`'s plus `base_commit`, which the disk cannot
+    /// give back: a session that committed before handing over has a HEAD that
+    /// is not its base, so reading HEAD would make `headMoved` answer "nothing
+    /// changed" for a session that changed plenty.
     ///
-    /// **The overlay backing is refused, by name, with
-    /// `error.OverlayCannotBeAdopted`.** That refusal is about moving a
-    /// *running* session to a second process, and not about reaching the work:
-    /// see `chock workspace adopt` in `src/workspace.zig`, which takes the work
-    /// out of an overlay a session that has ended left behind. What was read,
-    /// and what it says:
-    ///
-    /// - The backing itself does outlive the process that made it. `upper`,
-    ///   `work`, and `merged` are three plain directories under the session
-    ///   scratch directory, and `Overlay.changedFiles` reads the upper layer
-    ///   on the host, with no namespace and no mount. So an overlay session
-    ///   whose process ends keeps every byte the agent wrote, exactly the way
-    ///   a kept worktree does.
-    /// - The merged view does not outlive it, and does not need to.
-    ///   `Overlay.mounts` only describes the mount, and `chock-sandbox`'s own
-    ///   `buildRoot` performs it again inside every `Sandbox.spawn` child's
-    ///   own mount namespace, once per tool call. Nothing about it is bound
-    ///   to one long lived process.
-    /// - The rebuild now exists. `overlay.adopt` stands beside `overlay.create`,
-    ///   one per driver, and rebuilds the four paths over a layout that is
-    ///   already on disk. `overlay.create` still cannot be called a second time
-    ///   on the same scratch directory, which is why `adopt` is a separate call
-    ///   rather than a flag on `create`.
-    /// - And `base_commit`, the one argument this call adds to `open`, has no
-    ///   meaning for a project with no git: there is no commit, and
-    ///   `headMoved` is not the test that decides what an overlay session
-    ///   carries back. `Overlay.changedFiles` is.
-    ///
-    /// **So this refusal is about a live handover, and no longer about the work
-    /// being unreachable.** A session that has ended gives its work up through
-    /// `chock workspace adopt`, which calls `overlay.adopt` and then
-    /// `Overlay.carryOut`. What is left before this call can take the overlay
-    /// kind is the rest of a handover: `base_commit` has to stop being an
-    /// argument a caller must supply, and `src/run.zig`'s own `takenOver` has to
-    /// accept an overlay `workspace.open`.
-    ///
-    /// **`chock.zon` gets a fallback here that `open` does not need.** See
-    /// `findChockZonForAdopt`.
+    /// The overlay backing is refused with `error.OverlayCannotBeAdopted`. That
+    /// is about moving a running session to a second process and not about
+    /// reaching the work: an ended overlay session gives its work up through
+    /// `chock workspace adopt`. What is left before this call can take the
+    /// overlay kind is `base_commit` no longer being an argument a caller must
+    /// supply, and `src/run.zig`'s `takenOver` accepting an overlay open.
     pub fn adopt(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -471,8 +272,6 @@ pub const Workspace = struct {
         return adoptWithLayout(allocator, io, env, project_root, scratch_dir, session_id, base_commit, Layout.forHost(), diag);
     }
 
-    /// `adopt`, with the layout named rather than read from the target. See
-    /// `worktree.createWithLayout` for why the two calls exist.
     pub fn adoptWithLayout(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -488,11 +287,9 @@ pub const Workspace = struct {
             return error.OverlayCannotBeAdopted;
         }
 
-        // **The host project's own `chock.zon`, and this is where that matters
-        // most.** `adopt` takes over a checkout a whole session has already
-        // worked in. Reading the deny list out of that checkout would let a
-        // session hand over its way out of the list, which is the same fault
-        // `findChockZonForAdopt` answers for the policy file itself.
+        // The host project's own `chock.zon`, and this is where that matters
+        // most. Reading the deny list out of the checkout would let a session
+        // hand over its way out of the list.
         const entries = try deny_mod.loadEntries(allocator, io, project_root, diag);
         defer deny_mod.free(allocator, entries);
 
@@ -508,9 +305,8 @@ pub const Workspace = struct {
             diag,
         );
         // `keep`, never `remove`, unlike `open`'s own cleanup: the checkout
-        // belongs to the session that is handing over, so a failure here
-        // frees this value and leaves every file where it was. A `remove`
-        // here would answer a failed handover by deleting the work.
+        // belongs to the session that is handing over, and a `remove` here
+        // would answer a failed handover by deleting the work.
         errdefer wt.keep(allocator);
 
         const denied = try deny_mod.joinOnto(allocator, entries, wt.sandboxRoot());
@@ -525,11 +321,6 @@ pub const Workspace = struct {
         };
     }
 
-    /// Free everything this value owns. For a git backing this also runs
-    /// `git worktree remove`. For an overlay backing this only frees memory,
-    /// since the real overlay mount lives in a mount namespace this process
-    /// does not own, and goes away when that namespace does. `self` is not
-    /// valid after this call returns, successfully or not.
     pub fn close(
         self: *Workspace,
         allocator: std.mem.Allocator,
@@ -548,21 +339,6 @@ pub const Workspace = struct {
         self.* = undefined;
     }
 
-    /// Free everything this value owns and **leave the workspace on disk**.
-    /// For a git backing this skips `git worktree remove`, so the checkout,
-    /// its registration in the project, and the scratch object store all stay.
-    /// For an overlay backing this is exactly what `close` already did, since
-    /// that backing never removed anything itself. `self` is not valid after
-    /// this call returns.
-    ///
-    /// **A clean ending removes the workspace and an abnormal one keeps it.**
-    /// The rule that only a commit reaches the user's repository is right and
-    /// is unchanged: the loss was never the policy, it was the cleanup. A
-    /// session that errored, was refused, reached its budget, or was
-    /// interrupted used to have its work deleted with the worktree, and one
-    /// measured on 2026-08-22 lost 105 changed files that way. See
-    /// `worktree.Worktree.keep`, and `workPath`, which is what a caller prints
-    /// so the kept workspace is one a person can find.
     pub fn keep(self: *Workspace, allocator: std.mem.Allocator) void {
         if (self.chock_zon_source) |s| allocator.free(s);
         if (self.chock_zon_target) |t| allocator.free(t);
@@ -575,17 +351,6 @@ pub const Workspace = struct {
         self.* = undefined;
     }
 
-    /// Where this workspace's own work is on the host filesystem: the checkout
-    /// for a git backing, the upper layer for an overlay one.
-    ///
-    /// **Not the same path for the two kinds, on purpose.** A worktree is an
-    /// ordinary checkout a person can open. An overlay's merged view only
-    /// exists inside the sandbox's own mount namespace and is gone once the
-    /// session is, so the only place its writes survive is the upper layer.
-    /// A caller that names the merged path to a user would name a directory
-    /// that holds nothing.
-    ///
-    /// Borrowed from `self`, so it is valid only until `close` or `keep`.
     pub fn workPath(self: *const Workspace) []const u8 {
         return switch (self.kind) {
             .worktree => |wt| wt.path,
@@ -593,30 +358,20 @@ pub const Workspace = struct {
         };
     }
 
-    /// Build the `Sandbox.Config` a caller hands to `Sandbox.spawn` to run one
-    /// tool call in this workspace: the mount list the backing already
-    /// builds, the Landlock rules that go with it, and the `chock.zon`
-    /// protection when the project has one.
+    /// Build the `Sandbox.Config` a caller hands to `Sandbox.spawn` for one
+    /// tool call: the backing's mount list, the Landlock rules that go with it,
+    /// and the `chock.zon` protection.
     ///
-    /// `root` is the directory that becomes the root of the sandbox. The
-    /// caller makes and owns it, the same as every `Sandbox.spawn` caller
-    /// already does. The returned `Config`'s `cwd` is the project's own real
-    /// path, so a tool call starts where the agent's files are.
+    /// `env` carries only what this library alone knows how to build. Both
+    /// backings get `identity_env`, and the worktree backing gets
+    /// `Worktree.gitEnv` as well. A caller that needs a dev shell's environment
+    /// merges it in on top.
     ///
-    /// `env` carries only what this library alone knows how to build, and
-    /// that is two groups. Both backings get `identity_env`, the name and the
-    /// address a commit made inside the sandbox is signed with, because a
-    /// project with no git repository of its own can still have the agent
-    /// make one. The worktree backing gets `Worktree.gitEnv` as well, the two
-    /// variables every git call needs to work at all against a read only
-    /// object store. A caller that also needs a Nix dev shell's own
-    /// environment, or a secret handle, still has to merge those in on top.
+    /// The caller owns the returned slices. Every string inside them is a slice
+    /// into `self` and stays valid only as long as `self` does.
+    /// Three refusals this makes provable: no write to `.git/objects`, no write
+    /// to `.git/hooks`, no delete of `chock.zon`.
     ///
-    /// The caller owns the returned `Config`'s `mounts`, `rules`, and `env`
-    /// slices and frees each with `allocator.free`. Every string inside them
-    /// is a slice into `self`, and stays valid only as long as `self` does,
-    /// the same convention `Worktree.mounts`, `Overlay.mounts`, and
-    /// `Worktree.gitEnv` already use.
     pub fn sandboxConfig(
         self: *const Workspace,
         allocator: std.mem.Allocator,
@@ -626,10 +381,8 @@ pub const Workspace = struct {
         errdefer mounts.deinit(allocator);
         var rules: std.ArrayList(sandbox.Config.Rule) = .empty;
         errdefer rules.deinit(allocator);
-        // **The identity comes first and it comes for both backings.** A
-        // commit in the workspace is the only way a session's work reaches
-        // the user, and without these four git refuses to make one at all.
-        // See `identity_env`.
+        // The identity comes first and for both backings, because without it
+        // git refuses to make a commit at all.
         var env: std.ArrayList([]const u8) = .empty;
         errdefer env.deinit(allocator);
         try env.appendSlice(allocator, &identity_env);
@@ -642,48 +395,27 @@ pub const Workspace = struct {
                 defer allocator.free(backing_mounts);
                 try mounts.appendSlice(allocator, backing_mounts);
 
-                // The worktree itself: ordinary read write work.
                 try rules.append(allocator, .{
                     .path = wt.sandboxRoot(),
                     .access = sandbox.landlock.AccessFs.read_write,
                 });
-                // The whole real .git, read only: objects, refs, hooks, and
-                // every worktree's own commondir, gitdir, and
-                // config.worktree. The mount layer is the boundary for
-                // these; this rule only needs to let git read them at all.
                 try rules.append(allocator, .{
                     .path = wt.sandbox_git_root,
                     .access = sandbox.landlock.AccessFs.read_only,
                 });
-                // The scratch object store, read write. **It is not nested
-                // under sandbox_git_root**, and it cannot be: see
-                // worktree.zig's own object_store_prefix, which gives it a
-                // top level path of its own because a mount point under an
-                // already read only mount cannot be created. So no rule
-                // above covers it, and without this rule the mount for it
-                // would be present and unreachable. The mount layer is
-                // still what refuses a write to the real object store: this
-                // rule only lets git open the scratch one for write at all.
+                // The scratch object store, read write. It is not nested
+                // under sandbox_git_root and cannot be, so no rule above
+                // covers it and the mount would otherwise be unreachable. The
+                // mount layer still refuses a write to the real object store.
                 try rules.append(allocator, .{
                     .path = wt.object_store_target,
                     .access = sandbox.landlock.AccessFs.read_write,
                 });
-                // This worktree's own metadata directory, read write: a
-                // linked worktree writes its own index, HEAD, and logs
-                // there. commondir, gitdir, and config.worktree sit in the
-                // same directory but stay read only regardless, because the
-                // mount for them, not this rule, is what actually refuses a
-                // write: see Worktree.mounts.
                 try rules.append(allocator, .{
                     .path = wt.worktree_meta_target,
                     .access = sandbox.landlock.AccessFs.read_write,
                 });
 
-                // GIT_OBJECT_DIRECTORY and GIT_ALTERNATE_OBJECT_DIRECTORIES,
-                // so every git call the caller makes with this Config
-                // writes into the scratch store and can still read every
-                // object that already exists. See Worktree.gitEnv's own doc
-                // comment for why this is a variable, never a file.
                 const backing_env = try wt.gitEnv(allocator);
                 defer allocator.free(backing_env);
                 try env.appendSlice(allocator, backing_env);
@@ -708,28 +440,19 @@ pub const Workspace = struct {
             } });
         }
 
-        // The other half of the `chock.zon` protection: the files the project
-        // said the agent may not read. Last in the list, which reads correctly, although
-        // `chock-sandbox`'s own `buildRoot` applies every denial in a pass of
-        // its own after the rest whatever order they arrive in, so the
-        // property does not depend on this line staying last.
-        //
-        // **No Landlock rule goes with these, and none could.** Landlock
-        // rights accumulate on a nested path and are never narrowed by a wider
-        // rule, which the comment on the scratch object store rule above says
-        // as well. The project directory is read write, so a denied file under
-        // it cannot be subtracted. The mount is the whole boundary here.
+        // The files the project said the agent may not read. No Landlock rule
+        // goes with these and none could: rights accumulate on a nested path
+        // and are never narrowed by a wider rule, and the project directory is
+        // read write, so a denied file under it cannot be subtracted. The mount
+        // is the whole boundary here.
         for (self.deny_paths) |path| {
             try mounts.append(allocator, .{ .deny = .{ .target = path } });
         }
 
         return .{
-            // **`.in_place` has no root of its own, so the caller's is not
-            // used.** A root is the directory `Sandbox.spawn` pivots into, and
-            // macOS cannot pivot: `darwin/driver.zig`'s own `expressibleOn`
-            // refuses a root that is not `/` rather than promise a tree it
-            // never built. The layer that keeps the tool call to the workspace
-            // on that platform is the path rule set, not a root.
+            // `.in_place` has no root of its own. A root is what
+            // `Sandbox.spawn` pivots into, and macOS cannot pivot. The layer
+            // that keeps a tool call to the workspace there is the path rules.
             .root = switch (self.sandboxLayout()) {
                 .remapped => root,
                 .in_place => "/",
@@ -741,8 +464,6 @@ pub const Workspace = struct {
         };
     }
 
-    /// Which of the two shapes this workspace's mount list has. See
-    /// `chock-workspace/layout.zig`.
     pub fn sandboxLayout(self: *const Workspace) Layout {
         return switch (self.kind) {
             .worktree => |wt| wt.layout,
@@ -750,9 +471,6 @@ pub const Workspace = struct {
         };
     }
 
-    /// The absolute path at which the sandbox sees the agent's own copy of the
-    /// project. **This is the working directory of every tool call**, and the
-    /// root that `chock-core` reads every relative path against.
     pub fn sandboxRoot(self: *const Workspace) []const u8 {
         return switch (self.kind) {
             .worktree => |wt| wt.sandboxRoot(),
@@ -766,23 +484,6 @@ const FoundChockZon = struct {
     target: ?[]u8,
 };
 
-/// Look for `chock.zon` directly under `source_root`, the backing's own copy
-/// of the project (a worktree checkout or an overlay's lower layer), and
-/// report both where it lives there and where it belongs inside the sandbox,
-/// under `target_root`. Neither field is set when the project has no
-/// `chock.zon`: see `Workspace.chock_zon_source`'s own doc comment.
-///
-/// **A `chock.zon` that is a symbolic link is refused, not followed.** A
-/// worktree checkout is the agent's own to write between tool calls, and
-/// nothing stops it running `ln -s <host path> chock.zon` there when the
-/// project has no policy file of its own to protect: the next `adopt` would
-/// then read this link as if it were the project's own `chock.zon`, and
-/// `chock-sandbox`'s own bind mount would land on whatever host path the
-/// link names instead. `chockZonExists` answers with
-/// `error.ChockZonIsSymlink` for exactly that shape, rather than the `bool`
-/// `existsAsFile` gives every other caller in this file, because this is the
-/// one caller for which a symbolic link is not an ordinary fact about the
-/// disk but a fault this file must stop rather than hand onward.
 fn findChockZon(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -809,16 +510,6 @@ fn findChockZon(
     return .{ .source = source_path, .target = target_path };
 }
 
-/// True if `absolute_path` names `chock.zon` as an ordinary file, false if
-/// nothing is there, `error.ChockZonIsSymlink` if a symbolic link is. See
-/// `findChockZon`'s own doc comment for why this file's policy file gets its
-/// own check instead of `existsAsFile`'s.
-///
-/// **`follow_symlinks = false`, unlike `existsAsFile`.** `existsAsFile`
-/// answers what a path resolves to, which is the right question for a file
-/// this module only ever reads back through the sandbox's own mounts. This
-/// answers what is at the name itself, which is the right question for a
-/// name this module is about to trust as the project's own policy.
 fn chockZonExists(io: std.Io, absolute_path: []const u8) (std.Io.Dir.StatFileError || error{ChockZonIsSymlink})!bool {
     const st = std.Io.Dir.cwd().statFile(io, absolute_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,
@@ -829,30 +520,16 @@ fn chockZonExists(io: std.Io, absolute_path: []const u8) (std.Io.Dir.StatFileErr
 }
 
 /// The `chock.zon` an adopted session gets bound over it: the checkout's own
-/// first, exactly as `Workspace.open` reads it, and the project's own when
-/// the checkout has none.
+/// first, and the project's own when the checkout has none.
 ///
-/// **A session must not be able to hand over its way out of its own policy
-/// file.** `findChockZon` answers for the disk it is given, and it answers
-/// correctly for a checkout that has already been worked in, because a
-/// checkout is an ordinary directory and nothing about having been used
-/// changes what a `statFile` reads there. The difference is what the disk can
-/// look like. `open` reads a checkout `git worktree add` just made, so
-/// `chock.zon` is there whenever HEAD has it. `adopt` reads a checkout a
-/// whole session has already used, and a `chock.zon` that is missing there
-/// would give `null`, `Workspace.sandboxConfig` would add no bind, and the
-/// new owner would run with no policy file over it at all: a policy nobody
-/// binds is a policy nobody keeps.
+/// A session must not be able to hand over its way out of its own policy file.
+/// `open` reads a checkout `git worktree add` just made, so the file is there
+/// whenever HEAD has it. `adopt` reads a checkout a whole session has used, and
+/// a missing file there would mean no bind and no policy file at all.
 ///
-/// The project's own file is safe to bind: `sandboxConfig` binds it read
-/// only, at the same target, and nothing in this module ever opens it for
-/// write. It is also the right file, because it is the user's, and the user
-/// is who a policy belongs to.
-///
-/// The bind is what makes the delete fail in the first place: `chock.zon` is
-/// a mount point inside the sandbox, and unlinking a mount point answers
-/// `EBUSY`. This fallback is for the checkout that lost the file some other
-/// way, before the sandbox ever covered it.
+/// The bind is what makes the delete fail: `chock.zon` is a mount point inside
+/// the sandbox, and unlinking a mount point answers `EBUSY`. This fallback is
+/// for the checkout that lost the file some other way.
 fn findChockZonForAdopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -864,23 +541,16 @@ fn findChockZonForAdopt(
 ) Error!FoundChockZon {
     const in_checkout = try findChockZon(allocator, io, checkout_root, target_root, diag);
     if (in_checkout.source != null) return in_checkout;
-    // **No fallback under `.in_place`, because there is nowhere to put it.**
-    // The fallback binds the project's own file over the checkout's path, and
-    // a bind that moves a path is the one thing macOS has not got. What the
-    // fallback protects is still protected: the policy a session runs under is
-    // read from the host project, never from the sandbox, so a checkout with
-    // no `chock.zon` changes no rule. What is lost is the covering entry, so
-    // an agent on that layout can create a `chock.zon` in its own checkout.
-    // That file reaches nobody until a hand back carries it, where it reads as
-    // any other new file the session wrote.
+    // No fallback under `.in_place`, because a bind that moves a path is the
+    // one thing macOS has not got. The policy a session runs under is still
+    // read from the host project, so a checkout with no `chock.zon` changes no
+    // rule. What is lost is the covering entry, so an agent on that layout can
+    // create a `chock.zon` in its own checkout, which reaches nobody until a
+    // hand back carries it.
     if (layout == .in_place) return in_checkout;
     return findChockZon(allocator, io, project_root, target_root, diag);
 }
 
-/// True if `absolute_path` names a file that exists on disk, false if it does
-/// not exist at all or some component of it is not a directory. Any other
-/// failure, such as a permission error, is passed up rather than folded into
-/// `false`. The same shape `worktree.zig`'s own `existsOnDisk` uses.
 fn existsAsFile(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileError!bool {
     _ = std.Io.Dir.cwd().statFile(io, absolute_path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return false,
@@ -889,30 +559,9 @@ fn existsAsFile(io: std.Io, absolute_path: []const u8) std.Io.Dir.StatFileError!
     return true;
 }
 
-// This file's own tests build both kinds of `Workspace` and drive
-// `sandboxConfig` for each directly, with no namespace and no second
-// process: `Worktree.mounts` and `Overlay.mounts` both only describe mounts
-// now, so both kinds are equally safe to call from this ordinary,
-// unprivileged test process. Every test below builds its own project inside
-// a fresh `std.testing.tmpDir`, the same convention `worktree.zig`'s and
-// `overlay.zig`'s own tests use. A git project sets its own
-// `GIT_CEILING_DIRECTORIES`, for the reason `worktree.zig`'s own tests
-// explain in full: this project's own checkout is itself a git repository,
-// and `tmpDir` makes every scratch directory somewhere underneath it.
-//
-// Proving that a real `Sandbox.spawn` actually performs the overlay mount
-// `sandboxConfig` describes, and that a write through it lands in the
-// workspace and not the project, needs a real user and mount namespace:
-// that proof lives in `test/workspace/escape.zig`, which already carries the
-// single threaded probe process a real `Sandbox.spawn` call needs, for the
-// worktree kind, and now drives the overlay kind through the very same
-// probe.
+// This file's own tests build both kinds of `Workspace`.
 
-/// Read the absolute path of an already open directory, through
-/// `std.Io.Dir.realPath`. `std.testing.tmpDir` hands back a directory reached
-/// only through a relative path, but a test needs an absolute one to build a
-/// project or scratch path that does not depend on the test binary's own
-/// working directory.
+/// `std.testing.tmpDir` hands back a directory only a relative path reaches.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![:0]u8 {
     const len = dir.realPath(std.testing.io, buffer) catch return error.RealPathFailed;
     buffer[len] = 0;
@@ -927,10 +576,8 @@ fn testEnviron(allocator: std.mem.Allocator, scratch_path: []const u8) !std.proc
     return env;
 }
 
-/// Whether a sandboxed program finished its work. **A program the system
-/// killed answers nothing**, and must never be read as a refusal the sandbox
-/// made, so a signal reads the same way a nonzero exit does here and the tests
-/// that want a refusal say why in their own words.
+/// A program the system could not start answers differently from one that ran
+/// and failed.
 fn ranWell(term: std.process.Child.Term) bool {
     return switch (term) {
         .exited => |code| code == 0,
@@ -942,11 +589,6 @@ fn makeDir(path: [:0]const u8) !void {
     std.Io.Dir.createDirAbsolute(std.testing.io, path, .default_dir) catch return error.MkdirFailed;
 }
 
-/// A fresh project and scratch directory pair, both directly under the same
-/// `tmpDir`, kept apart the same way `worktree.zig`'s and `overlay.zig`'s own
-/// `TestProject` types do: listing one must never pick up the other's files.
-/// `root_path` starts empty. A test that needs a real git repository there
-/// builds one itself, with `env`, before calling `Workspace.open`.
 const TestProject = struct {
     allocator: std.mem.Allocator,
     root_path: [:0]const u8,
@@ -981,10 +623,6 @@ const TestProject = struct {
         self.env.deinit();
     }
 
-    /// Turn `root_path` into a real git repository, one commit deep. A test
-    /// that wants the worktree kind calls this before `Workspace.open`. A
-    /// test that wants the overlay kind leaves `root_path` exactly as
-    /// `init` left it, a plain empty directory with no `.git` at all.
     fn makeGitRepository(self: TestProject) !void {
         var init_output = try git.run(self.allocator, std.testing.io, &self.env, self.root_path, &.{"init"}, null);
         defer init_output.deinit(self.allocator);
@@ -1008,17 +646,10 @@ const TestProject = struct {
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, commit_output.term);
     }
 
-    /// Add a `chock.zon` to the project and commit it, so a worktree checked
-    /// out at HEAD carries one too. The `adopt` tests need a project that
-    /// really has a policy file: a `chock.zon` left uncommitted would never
-    /// reach the checkout, and the fallback those tests pin would then hold
-    /// for the wrong reason.
     fn commitChockZon(self: TestProject) !void {
         return self.commitChockZonSaying(".{}\n");
     }
 
-    /// `commitChockZon`, with the file's own bytes named. A test that needs a
-    /// real `deny_read` block writes one here.
     fn commitChockZonSaying(self: TestProject, source: []const u8) !void {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{self.root_path});
@@ -1034,12 +665,6 @@ const TestProject = struct {
     }
 };
 
-/// The commit `project` has at HEAD, which is what a caller of
-/// `Workspace.adopt` carries across as `base_commit`. The caller owns the
-/// returned string. A test reads this before it opens a workspace, the same
-/// way a real caller reads it out of the session log rather than off the
-/// checkout it is about to take: see `Workspace.adopt`'s own doc comment for
-/// why the checkout is the one place that answer must not come from.
 fn headOf(allocator: std.mem.Allocator, project: *const TestProject) ![]u8 {
     var output = try git.run(allocator, std.testing.io, &project.env, project.root_path, &.{ "rev-parse", "HEAD" }, null);
     defer output.deinit(allocator);
@@ -1062,16 +687,7 @@ test "open picks the worktree kind for a project that is a git repository" {
 }
 
 test "the in place layout builds a config the darwin driver can express, for both kinds" {
-    // **The gate this whole layout exists for.** Before it, every caller built
-    // a bind whose target was not its source, `darwin/driver.zig`'s own
-    // `expressibleOn` refused exactly that, and so macOS ran no tool call at
-    // all. The check is the driver's own function, on both backings, so a
-    // change to either mount list that reintroduces a moved path fails here on
-    // Linux rather than on a Mac nobody has to hand.
-    //
-    // Mutation check: give `Worktree.mounts` back its old entry 0, with
-    // `self.project_root` as the target, and this fails with
-    // `bind_moves_a_path`.
+    // Before this layout existed, every caller built the remapped shape.
     const darwin = sandbox.darwin_driver_for_testing;
     const allocator = std.testing.allocator;
 
@@ -1099,50 +715,25 @@ test "the in place layout builds a config the darwin driver can express, for bot
         defer allocator.free(config.rules);
         defer if (config.env.len > 0) allocator.free(config.env);
 
-        // One entry at a time first, so a failure names the mount that moved
-        // rather than only the fact that one did.
         for (config.mounts) |mount| switch (mount) {
             .bind => |bind| try std.testing.expectEqualStrings(bind.source, bind.target),
             .deny => {},
             .overlay, .proc => return error.ExpectedABindEntry,
         };
         try std.testing.expectEqual(@as(?darwin.Inexpressible, null), darwin.expressibleOn(config));
-        // The root is the real root, because macOS cannot pivot into one of
-        // its own, and the working directory is the agent's own copy.
+        // The root is the real root, because macOS cannot pivot into one of ours.
         try std.testing.expectEqualStrings("/", config.root);
         try std.testing.expectEqualStrings(workspace.sandboxRoot(), config.cwd);
-        // And the working directory is not the project, which is the whole
-        // difference this layout makes.
         try std.testing.expect(!std.mem.eql(u8, project.root_path, config.cwd));
     }
 }
 
 test "a real tool call runs in the workspace on macos, and the boundaries hold" {
-    // **The whole point of the in place layout, and it is measured and not
-    // reasoned about.** Before this, `Sandbox.spawn` refused every workspace
-    // config on macOS and no tool call had ever run there. This starts real
-    // programs, in a real sandbox, in a real worktree, and checks the four
-    // things this file promises: the agent may write
-    // in its own checkout, it may not reach the user's own project, it may not
-    // write to the real object store, and it may not rewrite the one file that
-    // redirects git at a path of its own choosing.
-    //
-    // Guarded on the target, because `sandbox.spawn` on Linux would want a
-    // user namespace and a mount tree this config deliberately has not got.
-    //
-    // Mutation check: drop the `deny` half of a read only bind in
-    // `darwin/driver.zig`'s own `optionsFor`, so a read only bind emits only an
-    // allowance of read, and the `commondir` case below passes where it must
-    // fail. Measured on 2026-08-25: that was the real behaviour before the
-    // `deny` line was added.
+    // The whole point of the in place layout: the tool call works in the
+    // checkout under its own real name.
     if (builtin.os.tag != .macos) return;
-    // **Nix on macOS runs every builder under `sandbox-exec`, and macOS refuses
-    // to nest one profile inside another.** So inside a Nix build this test asks
-    // a question the environment will not answer, and a failure there would say
-    // the workspace boundary broke when no boundary was ever built. Measured on
-    // a real Mac on 2026-08-25: from a login shell `sandbox_init` answers 0 and
-    // this test runs, and inside a Nix build the same call answers -1 with
-    // `EPERM`. See `chock-sandbox/darwin/seatbelt.zig`'s own `confinedAlready`.
+    // Nix on macOS runs every builder under `sandbox-exec`, and macOS refuses
+    // a nested sandbox, so the check has to run outside one.
     if (sandbox.darwin_driver_for_testing.confinedAlready()) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -1176,53 +767,36 @@ test "a real tool call runs in the workspace on macos, and the boundaries hold" 
         std.process.Child.Term{ .exited = 0 },
         try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", written }, null, null),
     );
-    // It landed in the agent's own checkout, and the user's project is
-    // untouched. A tool call that wrote nowhere would pass an exit code check.
     try std.testing.expect(try existsAsFile(io, written));
     var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_project = try std.fmt.bufPrint(&project_buffer, "{s}/agent-wrote-this.txt", .{project.root_path});
     try std.testing.expect(!try existsAsFile(io, in_project));
 
-    // The user's own working tree is not reachable at all.
     var tracked_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tracked = try std.fmt.bufPrint(&tracked_buffer, "{s}/tracked.txt", .{project.root_path});
     try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/bin/cat", tracked }, null, null)));
 
     const wt = workspace.kind.worktree;
 
-    // No write to the real object store, and the same file is
-    // still readable, so this is a boundary and not a broken mount list.
     var objects_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_objects = try std.fmt.bufPrint(&objects_buffer, "{s}/objects/agent-wrote-this", .{wt.sandbox_git_root});
     try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_objects }, null, null)));
 
-    // `commondir` redirects git at a git directory of the
-    // agent's own choosing, and it sits inside the one directory under `.git`
-    // the agent may write. **This is the case a read only rule alone does not
-    // hold**, because a profile grants one access at a time and a later
-    // allowance of read says nothing about an earlier allowance of write.
+    // `commondir` redirects git at a git directory of the agent's
+    // own choosing.
     try std.testing.expect(!ranWell(try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", wt.worktree_commondir_target }, null, null)));
-    // And the directory it is in really is writable, which is what makes the
-    // refusal above a narrowing rather than a wider denial nobody noticed.
     var index_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_meta = try std.fmt.bufPrint(&index_buffer, "{s}/agent-wrote-this", .{wt.worktree_meta_target});
     try std.testing.expectEqual(
         std.process.Child.Term{ .exited = 0 },
         try sandbox.spawn(allocator, run, &.{ "/usr/bin/touch", in_meta }, null, null),
     );
-    // Finding 4: and the directory that write reached is the session's own
-    // copy, so the project's own `.git/worktrees/<id>` did not gain a file.
-    // Read on the host, where the sandbox's mount namespace is gone: this is
-    // the state a person finds after the session ends.
     var real_meta_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const in_real_meta = try std.fmt.bufPrint(&real_meta_buffer, "{s}/agent-wrote-this", .{wt.worktree_meta_source});
     try std.testing.expect(!try existsAsFile(io, in_real_meta));
 }
 
 test "the remapped layout still moves the workspace to the project's own path" {
-    // The other edge. A test that only ever checked the in place shape would
-    // pass just as well for a build that had lost the remapping altogether,
-    // and the remapping is what every Linux session runs on.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1247,13 +821,8 @@ test "the remapped layout still moves the workspace to the project's own path" {
     defer allocator.free(config.rules);
     defer if (config.env.len > 0) allocator.free(config.env);
 
-    // The caller's own root is passed through, and the working directory is
-    // the project's own path.
     try std.testing.expectEqualStrings("/session/root", config.root);
     try std.testing.expectEqualStrings(project.root_path, config.cwd);
-    // And the workspace mount really moves a path, which is the one thing
-    // macOS has not got. Read off the mount rather than through
-    // `expressibleOn`, which would answer for the root above first.
     try std.testing.expect(!std.mem.eql(
         u8,
         config.mounts[0].bind.source,
@@ -1268,7 +837,6 @@ test "open picks the overlay kind for a project with no git of its own" {
     defer tmp.cleanup();
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
-    // No makeGitRepository call: root_path stays a plain, empty directory.
 
     var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
@@ -1277,11 +845,6 @@ test "open picks the overlay kind for a project with no git of its own" {
 }
 
 test "keeping a workspace leaves the agent's file on disk, and closing one takes it away" {
-    // **The pair, in one test, because the two can break each other.** A
-    // `keep` that quietly still removed would lose the work it was added to
-    // save, and a `close` that quietly stopped removing would fill the user's
-    // disk with every session they ever ran. Neither is visible from the
-    // return value of either call, so both are checked against the filesystem.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1292,7 +855,7 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
     try project.makeGitRepository();
 
     // The work an agent did and never committed. This is the 105 files of the
-    // session measured on 2026-08-22, in miniature.
+    // session a rate limit ended.
     var kept_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const kept_file = kept: {
         var workspace = try Workspace.open(
@@ -1317,8 +880,6 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
         break :kept written;
     };
 
-    // Still there, and still holding what the agent wrote. A path alone would
-    // not be enough: an empty directory left behind is not salvaged work.
     var kept_handle = try std.Io.Dir.openFileAbsolute(io, kept_file, .{});
     defer kept_handle.close(io);
     var read_buffer: [64]u8 = undefined;
@@ -1327,7 +888,6 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("work nobody committed\n", contents);
 
-    // The clean ending, unchanged: the workspace goes, and so does its file.
     var removed_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const removed_file = removed: {
         var workspace = try Workspace.open(
@@ -1359,14 +919,6 @@ test "keeping a workspace leaves the agent's file on disk, and closing one takes
 }
 
 test "sandboxConfig for the worktree kind needs no namespace, so an ordinary caller can call it directly" {
-    // The worktree kind's own half of the proof that the two kinds are now
-    // symmetric: Worktree.mounts only describes bind mounts, so sandboxConfig
-    // for this kind is exactly as safe to call from a plain, unprivileged
-    // process as this test itself is. test/workspace/escape.zig already
-    // relies on this in practice, calling sandboxConfig straight from its own
-    // un-namespaced test process; this test pins it here too, next to the
-    // overlay kind's own test below, so a reader can see both kinds behave
-    // the same way in one file.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1386,11 +938,6 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
     try std.testing.expect(config.rules.len > 0);
     try std.testing.expectEqualStrings(workspace.kind.worktree.project_root, config.cwd);
 
-    // The worktree kind's env carries the two variables that
-    // let git work against a read only object store. This pins that
-    // sandboxConfig actually wires Worktree.gitEnv in, not just that
-    // Worktree.gitEnv exists on its own. The four identity entries come
-    // with them: see the next test for what each one has to say.
     try std.testing.expectEqual(identity_env.len + 2, config.env.len);
     var found_object_directory = false;
     var found_alternate = false;
@@ -1403,15 +950,8 @@ test "sandboxConfig for the worktree kind needs no namespace, so an ordinary cal
 }
 
 test "both backings carry the git identity, author and committer, and neither carries a date" {
-    // **The one variable set is the difference between work delivered and
-    // work lost.** git refuses to commit with no identity, and a commit is
-    // the only way a session's work reaches the user. So this pins all four
-    // names and both values, for the worktree backing and for the overlay
-    // backing, and pins the two names that must stay absent.
-    //
-    // Mutation check: drop any one of the four appends in `identity_env`,
-    // or change either value, and this fails. Add a `GIT_AUTHOR_DATE` and
-    // the last loop fails.
+    // The one variable set is the difference between work delivered and work
+    // lost.
     const allocator = std.testing.allocator;
 
     const wanted = [_][]const u8{
@@ -1438,8 +978,6 @@ test "both backings carry the git identity, author and committer, and neither ca
 
         for (wanted) |entry| {
             const key = entry[0 .. std.mem.indexOfScalar(u8, entry, '=').? + 1];
-            // The entry with this name, so a wrong value is reported as the
-            // two strings side by side rather than as a bare false.
             var found: ?[]const u8 = null;
             for (config.env) |candidate| {
                 if (std.mem.startsWith(u8, candidate, key)) found = candidate;
@@ -1450,9 +988,7 @@ test "both backings carry the git identity, author and committer, and neither ca
             );
         }
 
-        // **No date, ever.** git reads the real clock when neither of these
-        // is set, and a commit whose timestamp is not the time it was made
-        // is a commit nobody can order against the rest of the history.
+        // No date, ever. git reads the real clock when neither is set.
         for (config.env) |candidate| {
             try std.testing.expect(!std.mem.startsWith(u8, candidate, "GIT_AUTHOR_DATE="));
             try std.testing.expect(!std.mem.startsWith(u8, candidate, "GIT_COMMITTER_DATE="));
@@ -1461,26 +997,11 @@ test "both backings carry the git identity, author and committer, and neither ca
 }
 
 test "sandboxConfig for the overlay kind needs no namespace either, so an ordinary caller can call it directly" {
-    // The overlay kind's own half of the proof, and the whole point of
-    // giving Mount a second kind: an earlier version of Overlay.mounts
-    // performed a real mount(2) call and needed CAP_SYS_ADMIN over the
-    // caller's own mount namespace to do it, so this same call used to fail
-    // here with error.OverlayNotSupported, because this test process has
-    // never entered one. Overlay.mounts now only describes the overlay, the
-    // same way Worktree.mounts only describes its bind mounts, so this
-    // succeeds with no namespace at all, exactly like the worktree test
-    // above, and the one call that used to need a namespace,
-    // chock-sandbox's own buildRoot, is not reached until a real
-    // Sandbox.spawn runs: see test/workspace/escape.zig's own proof that a
-    // real sandbox spawned from this Config actually performs the overlay
-    // mount and a write lands in the workspace, not the project.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
-    // No makeGitRepository call: root_path stays a plain, empty directory,
-    // so Workspace.open picks the overlay kind.
 
     var workspace = try Workspace.openWithLayout(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
     defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
@@ -1493,16 +1014,8 @@ test "sandboxConfig for the overlay kind needs no namespace either, so an ordina
     try std.testing.expect(config.mounts.len > 0);
     try std.testing.expect(config.rules.len > 0);
     try std.testing.expectEqualStrings(workspace.kind.overlay.project, config.cwd);
-    // The overlay kind has no .git of its own to protect, so it gets none
-    // of the worktree kind's git environment: a project with no git has no
-    // object store to work around. It still gets the identity, because an
-    // agent can make a repository of its own in a project that has none.
     try std.testing.expectEqual(identity_env.len, config.env.len);
 
-    // The first entry is the overlay descriptor itself, mounted at the
-    // project's own real path, the way Worktree.mounts's own entry 0 is
-    // always the worktree bound at project_root: see Worktree.mounts's own
-    // doc comment for why order matters here too.
     const overlay_entry = switch (config.mounts[0]) {
         .overlay => |o| o,
         .bind, .proc, .deny => return error.ExpectedAnOverlayEntry,
@@ -1511,21 +1024,10 @@ test "sandboxConfig for the overlay kind needs no namespace either, so an ordina
 }
 
 test "every landlock rule sandboxConfig writes names a path its own mount list holds" {
-    // **The two lists are one judgement written twice.** This function appends
-    // a mount, then appends a rule, by hand, a few lines apart. Nothing
-    // computes either list from the other, so a path added to one and not the
-    // other compiles and runs. `sandbox.firstGap` reads both real lists, and
-    // never a copy of them written into this test: a copy would be a third
-    // place to drift.
-    //
-    // Both kinds are driven, and both layouts, because the layout is what
-    // decides whether a target is moved or is its own source.
+    // The two lists are one judgement written twice, so they must not drift.
     const allocator = std.testing.allocator;
 
     for ([_]Layout{ .remapped, .in_place }) |layout| {
-        // The worktree kind, with a `chock.zon` that also denies a file, so
-        // the run covers the bind for the policy file and the denial beside
-        // it.
         var git_tmp = std.testing.tmpDir(.{});
         defer git_tmp.cleanup();
         var git_project = try TestProject.init(allocator, git_tmp);
@@ -1543,7 +1045,6 @@ test "every landlock rule sandboxConfig writes names a path its own mount list h
 
         try expectLayersAgree(worktree_config);
 
-        // The overlay kind, which is a project with no git of its own.
         var plain_tmp = std.testing.tmpDir(.{});
         defer plain_tmp.cleanup();
         var plain_project = try TestProject.init(allocator, plain_tmp);
@@ -1561,13 +1062,6 @@ test "every landlock rule sandboxConfig writes names a path its own mount list h
     }
 }
 
-/// Fail when `config`'s mount list and its Landlock rule list disagree, and
-/// name the path they disagree about. See `sandbox.LayerGap`.
-///
-/// **Compared against an empty string, and never printed.** `expectEqualStrings`
-/// puts both sides in the failure, so a reader sees which path moved, and this
-/// file keeps the rule that no line outside `main` names standard error: see
-/// `test/proto/lock.zig`.
 fn expectLayersAgree(config: sandbox.Config) !void {
     var buffer: [256]u8 = undefined;
     const said = if (sandbox.firstGap(config)) |gap|
@@ -1578,14 +1072,6 @@ fn expectLayersAgree(config: sandbox.Config) !void {
 }
 
 test "adopt takes the worktree a first process left, with the work still in it" {
-    // The whole handover, through the type a caller actually holds: one
-    // process opens a workspace, writes, and keeps it, and a second one
-    // adopts the same session and reaches the same checkout with the same
-    // bytes. `workPath` is compared because that is the path a caller prints
-    // and a person opens: an adopt that named a different directory would
-    // read as a success and hand back an empty tree. Make `adopt` build a new
-    // worktree instead of taking the one on disk and both checks stop
-    // holding.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1634,19 +1120,7 @@ test "adopt takes the worktree a first process left, with the work still in it" 
 }
 
 test "adopt binds a chock.zon the checkout lost, from the project itself" {
-    // **Stated as `.remapped`, because the fallback is a bind that moves a
-    // path.** Under `Layout.in_place` there is nowhere to put the project's own
-    // file, and `findChockZonForAdopt` says what is kept and what is lost
-    // there instead.
-    //
-    // **A session must not be able to hand over its way out of its own policy
-    // file.** The checkout the first process leaves has no `chock.zon`, and
-    // `findChockZon` alone would answer null for it, so `sandboxConfig` would
-    // add no bind and the new owner would run with no policy file over it.
-    // The fallback in `findChockZonForAdopt` binds the project's own file
-    // instead. Drop that fallback and `chock_zon_source` is null here, and
-    // the mount list below loses the read only entry that keeps the policy in
-    // place.
+    // Stated as `.remapped`, because the fallback is a bind that moves a path.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1665,8 +1139,6 @@ test "adopt binds a chock.zon the checkout lost, from the project itself" {
         var first = try Workspace.openWithLayout(allocator, io, &project.env, project.root_path, project.scratch_path, "sess1", .remapped, null);
         defer first.keep(allocator);
 
-        // The checkout really did start with one, so the deletion below is
-        // the thing being tested and not an empty gesture.
         try std.testing.expect(first.chock_zon_source != null);
 
         const path = try std.fmt.bufPrintZ(&deleted_buffer, "{s}/chock.zon", .{first.workPath()});
@@ -1689,13 +1161,8 @@ test "adopt binds a chock.zon the checkout lost, from the project itself" {
     const project_chock_zon = try std.fs.path.join(allocator, &.{ project.root_path, "chock.zon" });
     defer allocator.free(project_chock_zon);
     try std.testing.expectEqualStrings(project_chock_zon, second.chock_zon_source.?);
-    // The target is unchanged: the policy file still lands at the project's
-    // own path inside the sandbox, which is the only path anything reads it
-    // from.
     try std.testing.expectEqualStrings(project_chock_zon, second.chock_zon_target.?);
 
-    // And the bind really reaches the mount list, not only the value: the
-    // last entry is the read only `chock.zon`.
     const config = try second.sandboxConfig(allocator, "/does-not-need-to-exist-for-this-check");
     defer allocator.free(config.mounts);
     defer allocator.free(config.rules);
@@ -1709,11 +1176,6 @@ test "adopt binds a chock.zon the checkout lost, from the project itself" {
 }
 
 test "adopt keeps the checkout's own chock.zon when the checkout still has one" {
-    // The ordinary case, beside the fallback above: an adopted session that
-    // never lost its policy file gets exactly what `open` gives, the copy
-    // inside its own checkout. Without this the fallback could quietly become
-    // the only path, and every adopted session would read the project's file
-    // rather than the one it is working on.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1750,11 +1212,7 @@ test "adopt keeps the checkout's own chock.zon when the checkout still has one" 
 }
 
 test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
-    // **The live path needs no committed chock.zon at all.** A project with
-    // none gets no bind, and nothing stops an agent creating one of its own
-    // kind in its own checkout between tool calls: `ln -s <host path>
-    // chock.zon` there is exactly this shape. `findChockZonForAdopt` must not
-    // read that link as though it were the project's own policy file.
+    // The live path needs no committed chock.zon at all.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1763,8 +1221,6 @@ test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
     try project.makeGitRepository();
-    // No commitChockZon: the project itself has no policy file, so the
-    // checkout starts with none either.
 
     const base_commit = try headOf(allocator, &project);
     defer allocator.free(base_commit);
@@ -1778,9 +1234,6 @@ test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
         try std.testing.expect(first.chock_zon_source == null);
 
         const link_path = try std.fmt.bufPrintZ(&link_buffer, "{s}/chock.zon", .{first.workPath()});
-        // The target does not need to exist, or even resolve, for what this
-        // test is about: `chockZonExists` must refuse the link itself,
-        // never follow it to find out where it leads.
         const target_path = try std.fmt.bufPrintZ(&target_buffer, "{s}/outside-the-project", .{project.scratch_path});
         try std.Io.Dir.symLinkAbsolute(io, target_path, link_path, .{});
     }
@@ -1799,17 +1252,6 @@ test "adopt refuses a chock.zon that is a symlink instead of an ordinary file" {
 }
 
 test "adopt refuses the overlay kind by name, because there is no overlay.adopt to call" {
-    // What was found, in one check: an overlay backing survives its process
-    // on disk, and no second process can rebuild the value for it, because
-    // `overlay.create` refuses a scratch directory that already holds a
-    // layout and nothing else builds one. See `Workspace.adopt`'s own doc
-    // comment for the whole reading.
-    //
-    // **The refusal has to be by name.** An `error.Unexpected`, which is what
-    // calling `overlay.create` a second time gives on Linux, reads as a bug
-    // in Chock, and a caller would report a crash for a case that is simply
-    // not built yet. Change `adopt` to fall through to `overlay.create` and
-    // this test sees `error.Unexpected` instead.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1817,8 +1259,6 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
     defer tmp.cleanup();
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
-    // No makeGitRepository call: root_path stays a plain directory, so this
-    // project gets the overlay backing.
 
     var first = try Workspace.open(allocator, io, &project.env, project.root_path, project.scratch_path, "sess1", null);
     try std.testing.expect(first.kind == .overlay);
@@ -1837,13 +1277,8 @@ test "adopt refuses the overlay kind by name, because there is no overlay.adopt 
 }
 
 test "a layer above the project adds denied paths, and the project cannot take one off" {
-    // **The gap this closes.** An org policy bundle could narrow a rule and
-    // could not hide a file, so a `chock.zon` that simply did not name a path
-    // answered the organisation completely. The fold is therefore a union: see
-    // `openWithLayoutAndDenied`.
-    //
-    // Mutation check: make `withAlsoDenied` ignore `also` and the first two
-    // expectations fail.
+    // An org policy bundle could narrow a rule and be answered by a project
+    // that simply did not name the file.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1851,8 +1286,6 @@ test "a layer above the project adds denied paths, and the project cannot take o
     var project = try TestProject.init(allocator, tmp);
     defer project.deinit();
 
-    // The project names one file. The layer above it names another, and a
-    // project that named nothing would still be held to the second.
     try writeChockZon(project, ".{ .deny_read = .{ \"own.txt\" } }\n");
 
     var workspace = try Workspace.openAndDenied(
@@ -1873,11 +1306,7 @@ test "a layer above the project adds denied paths, and the project cannot take o
 }
 
 test "a path the layer above names is refused by the same rules a project's own is" {
-    // **One copy of the rules, and it is `deny.check`.** A bundle that named an
-    // absolute path, or one that climbed out of the project, used to have
-    // nowhere to be caught: this module cannot reach the policy module, and a
-    // second copy of a rule that decides what the sandbox may hold is worse
-    // than a check one moment later.
+    // One copy of the rules, and it is `deny.check`.
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1905,9 +1334,6 @@ test "a path the layer above names is refused by the same rules a project's own 
     }
 }
 
-/// Write a `chock.zon` into the project without committing it. The union tests
-/// use the overlay backing, which reads the project in place, so nothing here
-/// needs a git repository.
 fn writeChockZon(project: TestProject, source: []const u8) !void {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/chock.zon", .{project.root_path});
@@ -1916,8 +1342,7 @@ fn writeChockZon(project: TestProject, source: []const u8) !void {
     file.close(std.testing.io);
 }
 
-/// Whether any denied path ends with `leaf`. The paths are absolute and joined
-/// onto a sandbox root a test cannot predict, so the leaf is what it checks.
+/// The paths are absolute and joined onto a root a test does not spell.
 fn endsWithAny(paths: []const []u8, leaf: []const u8) bool {
     for (paths) |one| {
         if (std.mem.endsWith(u8, one, leaf)) return true;

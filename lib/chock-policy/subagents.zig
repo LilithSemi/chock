@@ -1,87 +1,35 @@
 //! How many subagents a project allows, from the `subagents` block of
-//! `chock.zon`.
-//!
-//! ```zon
-//! .{
-//!     .subagents = .{
-//!         .max_depth = 6,
-//!         .max_width = 6,
-//!     },
-//! }
-//! ```
-//!
-//! **The two limits are configuration, not constants in the loop.** Section
-//! 3.3 asks for a tree 6 deep and 6 wide, which is 36 agents, and those two
-//! numbers are the defaults here. A project writes its own pair, and section
-//! 6.2 already puts `chock.zon` beyond the agent's reach: the workspace binds
-//! the project's own copy back over that path read only, so **the model
-//! cannot raise its own limit**. `test/workspace/escape.zig` proves that on a
-//! running system.
-//!
-//! ## Zero is a real setting, and it is the one that is tested first
-//!
-//! `max_width = 0` refuses every spawn, so it disables subagents. That is a
-//! setting an author can want, and it is also the cheapest way to prove the
-//! limit works at all: a limit that is never exercised at its boundary is a
-//! limit nobody has tested. `check` gives the zero case no branch of its own,
-//! so the test at zero and the test at six read the same code.
-//!
-//! ## This reader is strict inside its own block and lenient outside it
-//!
-//! The same split `lib/chock-policy/table.zig` and `lib/chock-cost/budget.zig`
-//! make, and for the same reason: other milestones own the other blocks of
-//! this one file, and a misspelled field name inside this one must never
-//! become a limit the author did not write. `.max_dpeth = 3` is refused, not
-//! read as the default of 6.
+//! `chock.zon`. The workspace binds the project's own copy back over that path
+//! read only, so the model cannot raise its own limit.
 
 const std = @import("std");
 
-/// The name of the configuration file, in the project root.
-/// `lib/chock-policy/table.zig` looks in the same place.
 pub const file_name = "chock.zon";
 
-/// The largest `chock.zon` this reader accepts, matching the policy reader's
-/// own bound: the file comes from the project directory, so a hostile project
-/// supplies it.
 pub const max_file_bytes = 1 << 20;
 
-/// A tree 6 deep and 6 wide, which is 36 agents.
 pub const default_max_depth: u16 = 6;
 pub const default_max_width: u16 = 6;
 
-/// The largest value either limit may hold. `chock.zon` comes from the
-/// project directory, so a hostile project writes it, and a limit of sixty
-/// thousand is a request for a tree no machine runs. Sixty four is far above
-/// the 6 by 6 tree the defaults give and still bounds what one file can ask a
-/// later milestone to start.
+/// `chock.zon` comes from the project directory, so a hostile project writes
+/// it, and a limit of sixty thousand is a request for a tree no machine runs.
 pub const max_settable: u16 = 64;
 
-/// What one project allows. Both members count agents, and both accept zero.
 pub const Limits = struct {
-    /// The longest spawn chain, counting the agent a person started as 1.
     max_depth: u16 = default_max_depth,
-    /// The most subagents any one agent may start.
     max_width: u16 = default_max_width,
-    /// True when `max_depth` is the org policy bundle's number and not this
-    /// project's own. **Only `explain` reads it**, and it exists because that
-    /// sentence names the source of the limit: a refusal that blamed
-    /// `chock.zon` for a number an organisation set would send the author to
-    /// edit a file that does not hold it. See `underCeiling`.
+    /// Only `explain` reads this. A refusal that blamed `chock.zon` for a
+    /// number an organisation set would send the author to edit a file that
+    /// does not hold it.
     depth_from_org: bool = false,
-    /// True when `max_width` is the org policy bundle's number. Separate from
-    /// `depth_from_org` because a bundle may cap one and say nothing about the
-    /// other, and then one sentence names the file and the other names the
-    /// bundle.
+    /// Separate from `depth_from_org`, because a bundle may cap one and say
+    /// nothing about the other.
     width_from_org: bool = false,
 
-    /// How many agents the largest tree these limits allow holds, the agent
-    /// a person started included. Saturating, because a file names both
-    /// numbers and the count grows with the power of the depth.
-    ///
-    /// Nothing enforces this number. It exists so a person reading a pair of
-    /// limits can see what they add up to, which the pair itself does not
-    /// say. The defaults of 6 and 6 are called "36 agents", which is 6 times
-    /// 6; the tree those two limits actually describe holds 9331.
+    /// Saturating, because a file names both numbers and the count grows with
+    /// the power of the depth. Nothing enforces this number: it exists so a
+    /// person can see what a pair of limits adds up to. The defaults of 6 and 6
+    /// are called "36 agents", and the tree they describe holds 9331.
     pub fn largestTree(self: Limits) u64 {
         var total: u64 = 0;
         var level: u64 = 1;
@@ -94,52 +42,28 @@ pub const Limits = struct {
     }
 };
 
-/// Where the agent that wants to spawn stands now. Both numbers come from
-/// facts the agent's own session already holds, and neither is anything the
-/// model says.
 pub const Standing = struct {
-    /// How many agents there are from the root of the spawn tree down to
-    /// this one, this one included. The agent a person started is at 1.
     depth: usize = 1,
-    /// How many subagents this agent has already started, which is the
-    /// number of `session.spawn` events in its own log.
     width: usize = 0,
 };
 
-/// The most an organisation lets any project of this installation spawn.
-///
-/// **A field and not a rule, and a minimum and not a decision**, the same shape
-/// `org.BudgetCeiling` has. Each member is optional on its own, so a bundle may
-/// cap the width of a tree and say nothing about its depth.
-///
-/// **This lives here and not in `org.zig`** so that `org.zig` imports this file
-/// and this file imports nothing but `std`. The fold is `underCeiling` below,
-/// beside the limits it folds, rather than in the module that carries the
-/// bundle.
+/// A field and not a rule, and a minimum and not a decision. This lives here
+/// and not in `org.zig` so that `org.zig` imports this file and this file
+/// imports nothing but `std`.
 pub const Ceiling = struct {
-    /// The deepest spawn chain any project may ask for, or null for a bundle
-    /// that does not cap depth.
     max_depth: ?u16 = null,
-    /// The most subagents any one agent may start, or null for a bundle that
-    /// does not cap width. **Zero is a real answer here**: it turns subagents
-    /// off across the installation.
+    /// Zero is a real answer here: it turns subagents off across the
+    /// installation.
     max_width: ?u16 = null,
 };
 
-/// `limits` held to `ceiling`, member by member.
+/// A minimum, and never a refusal. A budget above its org ceiling refuses the
+/// session, because a budget quietly lowered ends a session in the middle of
+/// the work. A spawn refused by one of these limits says so where it happens,
+/// so the narrowing is silent here and loud where it lands.
 ///
-/// **A minimum, and never a refusal.** A budget above its org ceiling refuses
-/// the session, because a budget that is quietly lowered ends a session in the
-/// middle of the work with nothing said about why. This is the other case: a
-/// spawn refused by one of these limits says so at the moment it happens, and
-/// `explain` names the limit, the number, and now the source as well. So the
-/// narrowing is silent here and loud where it lands, which is the same shape
-/// the rule ratchet already has: narrowing is free.
-///
-/// **The source travels with the number.** Whichever side wins sets the
-/// matching flag, so the sentence a refused agent reads names the file or the
-/// bundle correctly. A fold that kept only the number would make every org
-/// narrowing read as the project's own.
+/// Whichever side wins sets the matching flag, so the sentence a refused agent
+/// reads names the file or the bundle correctly.
 pub fn underCeiling(limits: Limits, ceiling: ?Ceiling) Limits {
     const bound = ceiling orelse return limits;
     var held = limits;
@@ -158,15 +82,10 @@ pub fn underCeiling(limits: Limits, ceiling: ?Ceiling) Limits {
     return held;
 }
 
-/// Which limit refused a spawn. An enum and not a sentence, so a caller acts
-/// on the member and never on the words, the same reason
-/// `event.SessionEndReason` has a member for the budget.
 pub const Refusal = enum {
     depth,
     width,
 
-    /// The name of the field in `chock.zon` that gave this answer, so a
-    /// message can tell the author what to change.
     pub fn limitName(self: Refusal) []const u8 {
         return switch (self) {
             .depth => "max_depth",
@@ -176,16 +95,11 @@ pub const Refusal = enum {
 };
 
 /// Whether `limits` allow the agent at `standing` to start one more subagent.
-/// Null permits it. A member of `Refusal` names the limit that refused it.
+/// Null permits it.
 ///
-/// **Depth is answered before width.** Depth is a property of the whole
-/// chain, and width is a property of this one agent, so an agent that is
-/// already as deep as the tree goes hears about the tree first. Both are
-/// reported by `explain` with the numbers that produced them, so neither
-/// answer hides the other.
-///
-/// A depth of zero names no agent at all, and no caller can reach this with
-/// one: the agent that asks is itself in the chain it is asking about.
+/// Depth is answered before width, because depth is a property of the whole
+/// chain and width of this one agent. A depth of zero names no agent, and no
+/// caller can reach this with one.
 pub fn check(limits: Limits, standing: Standing) ?Refusal {
     std.debug.assert(standing.depth >= 1);
     if (standing.depth >= limits.max_depth) return .depth;
@@ -193,10 +107,6 @@ pub fn check(limits: Limits, standing: Standing) ?Refusal {
     return null;
 }
 
-/// The sentence a refused agent reads. It names the field of `chock.zon`
-/// that refused, the value that field holds, and the number the agent
-/// reached, so the answer is actionable by whoever reads the log and does
-/// not depend on the reader already knowing the limits. The caller frees it.
 pub fn explain(
     gpa: std.mem.Allocator,
     refusal: Refusal,
@@ -219,8 +129,6 @@ pub fn explain(
     };
 }
 
-/// What names the limit that refused: this project's own file, or the org
-/// policy bundle that lowered it. See `Limits.depth_from_org`.
 pub const org_source_name = "this installation's org policy bundle";
 
 fn sourceOf(limits: Limits, refusal: Refusal) []const u8 {
@@ -235,9 +143,6 @@ fn plural(count: usize, one: []const u8, many: []const u8) []const u8 {
     return if (count == 1) one else many;
 }
 
-/// The shape the file itself is parsed into. Every member is optional here
-/// and defaulted afterwards, so a file that names one limit and not the
-/// other keeps the default of the one it left out.
 const WireLimits = struct {
     max_depth: ?u16 = null,
     max_width: ?u16 = null,
@@ -245,52 +150,30 @@ const WireLimits = struct {
 
 pub const ParseError = error{
     OutOfMemory,
-    /// The file is not valid ZON, or the `subagents` block does not match the
-    /// schema. A value below zero and a value above `max_settable` for a
-    /// `u16` both arrive here. Pass a `Diagnostic` to learn which line, and
-    /// why.
     InvalidSubagents,
-    /// A limit is above `max_settable`.
     LimitTooLarge,
 };
 
 pub const LoadError = ParseError || error{
-    /// The file is larger than `max_file_bytes`.
     SubagentFileTooLarge,
-    /// The file exists and could not be read. Pass a `Diagnostic` to learn
-    /// which fault the filesystem gave.
     ReadFailed,
 };
 
-/// What went wrong while the subagents block was read, and the facts the
-/// error alone throws away.
-///
-/// **The two ZON variants own memory**, because they hold the syntax tree
-/// their message points into, which is how they can name a line and a column.
-/// A caller that receives one must call `deinit`.
+/// The two ZON variants own memory, because they hold the syntax tree their
+/// message points into. A caller that receives one must call `deinit`.
 pub const Diagnostic = union(enum) {
-    /// The file is not valid ZON at all. The parser names the place.
     file_not_zon: std.zon.parse.Diagnostics,
-    /// The file is valid ZON, and its `subagents` block does not match the
-    /// schema. A misspelled field name, and a value a `u16` cannot hold, both
-    /// land here.
     block_not_valid: std.zon.parse.Diagnostics,
-    /// The top level of the file is not a struct literal.
     not_a_struct_literal,
-    /// A limit is above `max_settable`.
     limit_too_large: LimitTooLarge,
-    /// The file is larger than `max_file_bytes`, so it was not read.
     file_too_large: usize,
-    /// The file exists and the read failed. The fault is the filesystem's.
     read_failed: anyerror,
 
     pub const LimitTooLarge = struct {
-        /// `max_depth` or `max_width`, always a literal of this file.
         field: []const u8,
         value: u16,
     };
 
-    /// Release what the diagnostic owns. Safe on every variant.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
@@ -329,14 +212,9 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one, and say whether it took `value`.
-///
-/// **The first fault is kept, not the last.** A later step can only fail
-/// because an earlier one did, so the first is the one that explains the rest.
-///
-/// The answer matters because two variants own memory: a site that hands over
-/// a `std.zon.parse.Diagnostics` must release it itself when the answer is
-/// false, or the trees leak.
+/// The first fault is kept and not the last. The answer matters because two
+/// variants own memory: a site that hands over a `std.zon.parse.Diagnostics`
+/// must release it itself when the answer is false.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -344,14 +222,8 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Read the limits out of `source`, the whole content of a `chock.zon`. A
-/// file that names no `subagents` block gets the defaults above, which is a
-/// real answer and not a missing one: every project has limits,
-/// and a project that wrote none has these.
-///
-/// `diag` is optional. A caller that passes null pays nothing and learns only
-/// the error. A caller that passes a slot must call `Diagnostic.deinit` on
-/// whatever lands in it.
+/// A file that names no `subagents` block gets the defaults above, which is a
+/// real answer and not a missing one.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Limits {
     var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -364,9 +236,6 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     defer if (zoir_owned) zoir.deinit(gpa);
 
     if (zoir.hasCompileErrors()) {
-        // The two trees carry the message, the line and the column, so they
-        // go to the caller whole rather than being flattened to a printed
-        // line here.
         if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
             ast_owned = false;
             zoir_owned = false;
@@ -377,8 +246,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     const node = try findSubagentsNode(zoir, diag) orelse return .{};
 
     var zon_diag: std.zon.parse.Diagnostics = .{};
-    // From here the diagnostics own the two trees, the same handover
-    // `lib/chock-policy/table.zig` makes.
+    // From here the diagnostics own the two trees.
     ast_owned = false;
     zoir_owned = false;
     var zon_diag_owned = true;
@@ -405,8 +273,6 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
         .max_depth = wire.max_depth orelse default_max_depth,
         .max_width = wire.max_width orelse default_max_width,
     };
-    // A mistake in the file is reported when Chock reads the file, not on the
-    // turn the agent happens to ask for a subagent.
     inline for (.{ "max_depth", "max_width" }) |field| {
         if (@field(limits, field) > max_settable) {
             _ = note(diag, .{ .limit_too_large = .{
@@ -419,13 +285,6 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     return limits;
 }
 
-/// Read `chock.zon` from `project_root` and take its limits. A project with
-/// no such file gets the defaults, the same answer a file with no `subagents`
-/// block gets.
-///
-/// `diag` carries the same detail `parse` carries, and the same rule applies:
-/// null costs nothing, and a filled slot must be released with
-/// `Diagnostic.deinit`.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -459,9 +318,6 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// The node of the `subagents` field at the top of the file. Null when the
-/// file has no such field. Every other top level field is skipped, because
-/// other milestones own the other blocks of this one file.
 fn findSubagentsNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
     switch (root.get(zoir)) {
@@ -481,17 +337,8 @@ fn findSubagentsNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zi
     }
 }
 
-// Every test below builds its own source in the test binary. The one test
-// that needs a real file writes it into a fresh `std.testing.tmpDir`, so no
-// test reads the checkout that Chock itself lives in.
-
 const testing = std.testing;
 
-/// The absolute path of an already open directory. `std.testing.tmpDir` hands
-/// back a directory that only a relative path reaches, and `load` needs a
-/// project root that does not depend on the working directory of the test
-/// binary. Mirrors the helper of the same name in
-/// `lib/chock-policy/table.zig`.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![]u8 {
     const len = dir.realPath(testing.io, buffer) catch return error.RealPathFailed;
     return buffer[0..len];
@@ -518,8 +365,6 @@ test "a limit of zero refuses the first spawn, and the refusal names the limit" 
     defer gpa.free(depth_text);
     try testing.expect(std.mem.indexOf(u8, depth_text, "max_depth to 0") != null);
 
-    // A limit of zero is the same code as any other limit: it refuses every
-    // attempt, however deep or wide the agent already is.
     for (0..4) |width| {
         for (1..4) |depth| {
             try testing.expectEqual(
@@ -531,9 +376,6 @@ test "a limit of zero refuses the first spawn, and the refusal names the limit" 
 }
 
 test "a limit of one permits exactly one, and refuses the second" {
-    // The step above zero. Width one lets the first child through and stops
-    // the second; depth one is an agent that may start nothing at all,
-    // because it is itself the whole of the chain the limit allows.
     const one_wide = Limits{ .max_depth = 6, .max_width = 1 };
     try testing.expectEqual(@as(?Refusal, null), check(one_wide, .{ .depth = 1, .width = 0 }));
     try testing.expectEqual(Refusal.width, check(one_wide, .{ .depth = 1, .width = 1 }).?);
@@ -548,10 +390,6 @@ test "a limit of one permits exactly one, and refuses the second" {
 }
 
 test "the boundary of each limit: the seventh level and the seventh child are refused" {
-    // The default numbers. Every value on each side of the boundary,
-    // not one point of it: an off by one is only visible where the answer
-    // changes, and the answer must keep changing in the same place for every
-    // value that follows.
     const limits = Limits{};
     try testing.expectEqual(default_max_depth, limits.max_depth);
     try testing.expectEqual(default_max_width, limits.max_width);
@@ -610,10 +448,6 @@ test "a file with no subagents block gets the tree the default asks for" {
 }
 
 test "a limit of zero is read, where the budget's own cap of zero is refused" {
-    // The two blocks answer differently on purpose, and this test says so.
-    // A cap of zero money refuses the first turn of every session, which no
-    // author means to write. A width of zero refuses every subagent, which is
-    // exactly how an author turns subagents off.
     const limits = try parse(testing.allocator, ".{ .subagents = .{ .max_depth = 0, .max_width = 0 } }", null);
     try testing.expectEqual(@as(u16, 0), limits.max_depth);
     try testing.expectEqual(@as(u16, 0), limits.max_width);
@@ -630,8 +464,6 @@ test "a misspelled field inside the subagents block is refused rather than read 
         parse(testing.allocator, ".{ .subagents = .{ .max_wdith = 0 } }", null),
     );
 
-    // A field name this reader does not know, outside the block, belongs to
-    // another milestone. That one is read past.
     const limits = try parse(testing.allocator, ".{ .telepathy = .{ .range_m = 3 } }", null);
     try testing.expectEqual(default_max_width, limits.max_width);
 }
@@ -664,7 +496,6 @@ test "the limits come off the disk, and a project with no file gets the defaults
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absoluteDirPath(&path_buffer, tmp.dir);
 
-    // No file at all.
     const missing = try load(gpa, testing.io, root, null);
     try testing.expectEqual(default_max_width, missing.max_width);
 
@@ -682,11 +513,8 @@ test "the limits come off the disk, and a project with no file gets the defaults
 test "the largest tree a pair of limits allows is a number a person can read" {
     try testing.expectEqual(@as(u64, 1), (Limits{ .max_depth = 1, .max_width = 6 }).largestTree());
     try testing.expectEqual(@as(u64, 0), (Limits{ .max_depth = 0, .max_width = 6 }).largestTree());
-    // One agent, and one child of it.
     try testing.expectEqual(@as(u64, 2), (Limits{ .max_depth = 2, .max_width = 1 }).largestTree());
-    // 1 + 6 + 36 + 216 + 1296 + 7776, the default pair.
     try testing.expectEqual(@as(u64, 9331), (Limits{}).largestTree());
-    // A width of zero is one agent and nothing under it, at any depth.
     try testing.expectEqual(@as(u64, 1), (Limits{ .max_depth = 6, .max_width = 0 }).largestTree());
 }
 
@@ -708,8 +536,6 @@ test "the field and the value of a limit that is too large reach the caller" {
 }
 
 test "a misspelled field names its line and column, and the trees behind it are released" {
-    // The ZON variants own the syntax tree the message points into. The
-    // testing allocator fails this test if `deinit` misses it.
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(testing.allocator);
     try testing.expectError(
@@ -752,13 +578,6 @@ test "no two faults of this module read the same" {
 }
 
 test "an org ceiling narrows a project's limits and never widens them" {
-    // **The gap this closes.** A bundle could cap what a project spends and
-    // not how wide its spawn tree grows, so an organisation had no answer at
-    // all to a runaway tree, which is the more expensive of the two.
-    //
-    // Mutation check: make `underCeiling` take the ceiling rather than the
-    // minimum and the first expectation below fails, because a project that
-    // asked for less than its org allows would be raised to the org's number.
     const generous = Limits{ .max_depth = 8, .max_width = 8 };
     const capped = Ceiling{ .max_depth = 3, .max_width = 2 };
 
@@ -766,9 +585,6 @@ test "an org ceiling narrows a project's limits and never widens them" {
     try testing.expectEqual(@as(u16, 3), held.max_depth);
     try testing.expectEqual(@as(u16, 2), held.max_width);
 
-    // A project already below the ceiling keeps its own numbers, and neither
-    // is read as coming from the bundle. Narrowing is free, and widening is
-    // not a thing this function can do.
     const modest = Limits{ .max_depth = 2, .max_width = 1 };
     const untouched = underCeiling(modest, capped);
     try testing.expectEqual(@as(u16, 2), untouched.max_depth);
@@ -776,16 +592,12 @@ test "an org ceiling narrows a project's limits and never widens them" {
     try testing.expect(!untouched.depth_from_org);
     try testing.expect(!untouched.width_from_org);
 
-    // A bundle that predates the field changes nothing at all.
     const none = underCeiling(generous, null);
     try testing.expectEqual(@as(u16, 8), none.max_depth);
     try testing.expectEqual(@as(u16, 8), none.max_width);
 }
 
 test "a bundle may cap one limit and say nothing about the other" {
-    // Each member is optional on its own, so the two are folded apart. A
-    // ceiling that named only a width used to have to name a depth as well,
-    // and the number it invented would have bound every project.
     const project = Limits{ .max_depth = 8, .max_width = 8 };
     const width_only = underCeiling(project, .{ .max_width = 2 });
 
@@ -794,21 +606,12 @@ test "a bundle may cap one limit and say nothing about the other" {
     try testing.expect(!width_only.depth_from_org);
     try testing.expect(width_only.width_from_org);
 
-    // **Zero is a real ceiling**: it turns subagents off across the
-    // installation, and `check` refuses the first spawn.
     const off = underCeiling(project, .{ .max_width = 0 });
     try testing.expectEqual(@as(u16, 0), off.max_width);
     try testing.expectEqual(Refusal.width, check(off, .{ .depth = 1, .width = 0 }).?);
 }
 
 test "a refusal names the org bundle when the org is what lowered the limit" {
-    // **The sentence has to name the file that holds the number.** A refusal
-    // that blamed `chock.zon` for a limit an organisation set would send the
-    // author to edit a file that does not hold it, and the number they found
-    // there would be the larger one they already wrote.
-    //
-    // Mutation check: make `sourceOf` answer `file_name` always, and the first
-    // expectation fails.
     const gpa = testing.allocator;
     const lowered = underCeiling(.{ .max_depth = 8, .max_width = 8 }, .{ .max_width = 2 });
 
@@ -817,8 +620,6 @@ test "a refusal names the org bundle when the org is what lowered the limit" {
     try testing.expect(std.mem.indexOf(u8, width_text, org_source_name) != null);
     try testing.expect(std.mem.indexOf(u8, width_text, file_name) == null);
 
-    // And the limit the bundle said nothing about still names the project's
-    // own file, in the same session and out of the same `Limits`.
     const depth_text = try explain(gpa, .depth, lowered, .{ .depth = 8, .width = 0 });
     defer gpa.free(depth_text);
     try testing.expect(std.mem.indexOf(u8, depth_text, file_name) != null);

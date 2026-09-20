@@ -1,66 +1,5 @@
-//! The Linux driver for `../overlay.zig`: overlayfs, for a project that is
-//! not a git repository.
-//!
-//! **The upper layer is the diff.** A project with no git has no commit to
-//! diff against, so `changedFiles` reads the upper layer instead: whatever
-//! landed there is exactly what the agent changed, nothing more and nothing
-//! less. This is the same review step a git project gets, built a different
-//! way.
-//!
-//! **A deletion is a whiteout, not a removal.** overlayfs never deletes a path
-//! out of the lower layer, because the lower layer is read only and the kernel
-//! never writes to it. Instead, deleting a path that the lower layer has marks
-//! the same path in the upper layer with a whiteout: a character device file,
-//! with major and minor device number both 0, that the kernel makes for
-//! exactly this purpose. `changedFiles` reads a whiteout as a deletion by
-//! checking for that exact device number, in `isWhiteout` below, not by
-//! assuming every character device in the upper layer is one.
-//!
-//! **`userxattr` is required, and its absence looked like a kernel fault.**
-//! Without it, overlayfs stores its own bookkeeping, such as the marker that
-//! says a directory replaced a deleted lower path, in the `trusted.overlay.*`
-//! extended attribute namespace. Only `CAP_SYS_ADMIN` over the host can write
-//! that namespace, and a user namespace never has it, so the kernel returned
-//! `EIO` for `rm x && mkdir x`, for `rm -rf` of a project directory, and for
-//! replacing a file with a directory. An earlier version of this file recorded
-//! that as an unfixable kernel limitation. It was not: `userxattr` moves the
-//! same bookkeeping into `user.overlay.*`, a namespace this process can
-//! already write, and the mount options `../../chock-sandbox`'s own
-//! `namespace.mountOverlay` carries it. Confirmed by hand on kernel 6.18.42:
-//! all three operations now succeed, with all of this file's own tests still
-//! passing and a whiteout still recognised as character device 0,0.
-//!
-//! **A directory that replaces a deleted lower path is marked opaque, not
-//! whited out.** A whiteout is a character device, and a directory cannot be
-//! one, so when a directory lands where the lower layer had something,
-//! overlayfs instead sets `user.overlay.opaque` to `y` on the new directory.
-//! An opaque directory's own lower counterpart is hidden completely, the same
-//! outcome as a deletion. `changedFiles` checks every directory it finds under
-//! the upper layer for this attribute, in `isOpaqueDir` below, and reports the
-//! directory's own path as deleted when it finds it, on top of walking into
-//! the directory for whatever the agent put there. Without this check, `rm x
-//! && mkdir x` and replacing a file with a directory both lose the deletion
-//! from the diff `changedFiles` reports.
-//!
-//! `create` only makes plain directories, so it needs no special privilege and
-//! takes an ordinary `std.Io`. `changedFiles` and `nestedMounts` need no
-//! namespace either: they read the upper layer and the project directly, on
-//! the host, the same files a real overlay mount reads. The one call that
-//! actually performs the overlay mount, `mount(2)` with `userxattr` in the
-//! options, lives in `lib/chock-sandbox`'s own `namespace.mountOverlay`, and
-//! is never reached from here.
-//!
-//! **A nested mount inside the project is invisible to the merged view.**
-//! overlayfs mounts one directory tree. If the project holds its own mount
-//! point somewhere inside it, such as a second disk or a bind mount the user
-//! set up, the merged view shows whatever plain, usually empty, directory sits
-//! at that path on the lower filesystem, never what is actually mounted there.
-//! An agent shown an empty directory where the user has files can act on that
-//! wrong belief with full confidence, and nothing about the mount says
-//! otherwise on its own. `nestedMounts` finds every one of these under a
-//! project, the way `worktree.zig`'s own `ImportReport.skipped` names a path
-//! it could not carry across, so a caller can tell the user before the session
-//! starts.
+//! The Linux driver for `../overlay.zig`: overlayfs, for a project that is not
+//! a git repository. The upper layer is the diff.
 
 const std = @import("std");
 
@@ -77,8 +16,8 @@ const Skip = iface.Skip;
 const ChangeReport = iface.ChangeReport;
 const NestedMount = iface.NestedMount;
 
-/// Own copies of `path` and `reason` into `skipped`. `reason` is copied, not
-/// retained, so a caller can pass a temporary buffer.
+/// `reason` is copied, not borrowed, because callers build it in a frame that
+/// ends.
 fn recordSkip(
     skipped: *std.ArrayList(Skip),
     allocator: std.mem.Allocator,
@@ -92,17 +31,6 @@ fn recordSkip(
     skipped.append(allocator, .{ .path = path_copy, .reason = reason_copy }) catch return error.OutOfMemory;
 }
 
-/// Create the scratch layout for an overlay of `project`: an upper directory
-/// and a work directory, both fresh and empty, directly under `scratch`, plus
-/// the path `Overlay.mounts` later mounts the merged view onto. `scratch` must
-/// already exist: a real caller gives it a session scratch directory, and a
-/// test gives it its own `std.testing.tmpDir`. Does not mount anything: see
-/// `Overlay.mounts`.
-///
-/// If a later step fails, every scratch directory this call already made is
-/// removed again before the error is returned: a caller that gets an error
-/// back from `create` is never left with a half built scratch layout to clean
-/// up by hand.
 pub fn create(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -129,32 +57,8 @@ pub fn create(
     return .{ .project = project_owned, .upper = upper, .work = work, .merged = merged };
 }
 
-/// Rebuild the scratch layout of an overlay that is already on disk, rather
-/// than make a new one. The overlay analogue of `worktree.adopt`, and it is a
-/// far smaller call for the same reason a worktree adoption is small: nothing
-/// in the layout names the process that made it.
-///
-/// **This makes no upper layer and it copies nothing.** All three directories
-/// `create` made are still there after the process that made them ends, and
-/// every byte the agent wrote is in `upper`. What a second process cannot do
-/// is call `create` again: `create` makes all three with `createDirAbsolute`,
-/// which answers `error.PathAlreadyExists` for a directory that is there. So
-/// this is `create`'s own joins, from the same components in the same order,
-/// with the making replaced by a check.
-///
-/// `upper` is the one directory that has to be there, because it is the one
-/// that holds the work. `error.NoOverlayToAdopt` when it is not a directory or
-/// is not there at all, which covers a scratch directory a person has already
-/// cleared and a session that never opened an overlay.
-///
-/// **`work` and `merged` are made when they are missing and reused when they
-/// are there**, the rule `worktree.adopt` keeps for the scratch object store,
-/// and for the same reason: both belong to the session and not to one process,
-/// and neither holds anything the agent wrote. `work` is overlayfs's own
-/// scratch directory, which no caller of this file ever reads, and `merged` is
-/// a mount point. A failure after either is made leaves them where they are,
-/// because this call never removes a thing it did not make and the work is in
-/// the directory beside them.
+/// Rebuild the scratch layout of an overlay already on disk. Makes no upper
+/// layer and copies nothing, so a failure leaves every file where it was.
 pub fn adopt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -186,48 +90,18 @@ fn makeScratchDir(io: std.Io, absolute_path: []const u8, diag: ?*?Diagnostic) Er
     };
 }
 
-/// Best effort cleanup for a scratch directory `create` already made, when a
-/// later step in `create` fails. `create` is already returning the error
-/// that triggered this, and there is no second error channel to report a
-/// removal failure on: the same reasoning `worktree.zig`'s own
-/// `cleanupFailedAdd` gives for the same shape of problem.
 fn removeScratchDir(io: std.Io, absolute_path: []const u8) void {
     std.Io.Dir.deleteDirAbsolute(io, absolute_path) catch {};
 }
 
-/// Read the upper layer and report every path that changed: added,
-/// modified, or deleted, plus every path found but not understood. This
-/// is the whole review step for a project with no git: the upper layer is the
-/// diff, so nothing but the upper layer needs to be read.
-///
-/// Runs against `self.upper` and `self.project` directly, on the host.
-/// Neither the overlay mount nor a namespace of any kind is needed: overlayfs
-/// writes the very same files, and the very same whiteouts and opaque
-/// directories, that this function reads.
-///
-/// A plain, non-opaque directory found under the upper layer is not reported
-/// on its own: it only exists to hold a changed file underneath it, the same
-/// way `worktree.zig`'s own import never reports an empty directory,
-/// because nothing changed at the directory's own path. An opaque
-/// directory is different: see this file's own top comment for why it is
-/// reported as a deletion at its own path, on top of being walked into.
-/// Anything that is not a regular file, a symbolic link, a directory, or
-/// a whiteout, such as a fifo or a socket the agent made, is recorded in
-/// the returned report's own `skipped` list rather than the `changed`
-/// one: this function never assumes an entry it does not recognise is
-/// safe to read further, and never drops it in silence either.
-///
-/// Known gaps, left as is because closing them needs comparing file
-/// content, a bigger change than this function makes: a file changed and
-/// then changed back to its original bytes is reported as modified, and
-/// so is a file whose only change is to its metadata (its mode or its
-/// timestamps), and so is a plain hard link the agent makes to a file the
-/// project already has. An empty directory the agent creates is reported
-/// as nothing at all, on purpose, the same choice `worktree.zig` makes
-/// for the same reason: only a file is a unit of change here, not a
-/// directory with nothing in it.
-///
-/// The caller owns the returned report and frees it with `deinit`.
+/// Read the upper layer and report every path that changed. A file the agent
+/// changed and then changed back to its original bytes is still reported as
+/// modified: this driver reads the upper layer and never the content.
+/// A deletion is a whiteout and not a removal: overlayfs leaves a character
+/// device with major and minor 0 in the upper layer. A directory that replaces
+/// a deleted lower path is marked opaque instead, because a directory cannot be
+/// a character device, and without that check `rm x && mkdir x` loses the
+/// deletion from the diff.
 pub fn changedFiles(
     self: Overlay,
     allocator: std.mem.Allocator,
@@ -263,11 +137,8 @@ pub fn changedFiles(
         const absolute = std.fs.path.join(allocator, &.{ self.upper, entry.path }) catch return error.OutOfMemory;
         defer allocator.free(absolute);
 
-        // entry.kind comes from the directory listing's own d_type. A
-        // filesystem that never fills that in reports .unknown for every
-        // entry; resolveKind falls back to a statx only in that case, so
-        // an entry no filesystem tells us about outright is still
-        // classified instead of silently vanishing from the diff.
+        // entry.kind comes from the directory listing's own d_type, which
+        // a filesystem may not fill in.
         const kind = resolveKind(allocator, absolute, entry.kind, diag) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| {
@@ -278,10 +149,8 @@ pub fn changedFiles(
 
         switch (kind) {
             .character_device => {
-                // A character device that is not overlayfs's own
-                // whiteout marker is some other file the agent made. It
-                // is not a deletion, and this function has nothing else
-                // to say about it.
+                // A character device that is not overlayfs's own whiteout is an
+                // ordinary file the agent made.
                 if (try isWhiteout(allocator, absolute, diag)) {
                     const path_copy = allocator.dupe(u8, entry.path) catch return error.OutOfMemory;
                     changed.append(allocator, .{ .path = path_copy, .kind = .deleted }) catch return error.OutOfMemory;
@@ -336,23 +205,11 @@ pub fn changedFiles(
 }
 
 /// Find every directory under `project` that is itself the mount point of a
-/// separate filesystem. overlayfs mounts one directory tree. It does not, and
-/// cannot, show what is mounted on top of one of its own paths, so the merged
-/// view presents whatever plain, usually empty, directory sits there on the
-/// lower filesystem instead. See this file's own top comment for why a
-/// caller must tell the user about this rather than let the agent believe an
-/// empty directory is the truth.
-///
-/// A directory that is found to be a nested mount point is reported but not
-/// descended into: whatever filesystem is mounted there is a separate
-/// question from what `project` itself holds, and this function only answers
-/// the second one.
-///
-/// Told apart from an ordinary directory by comparing device numbers, read
-/// with `statx`, never by trusting a directory listing's own `d_type`: unlike
-/// `changedFiles`, this function always confirms the kind it acts on, since a
-/// missed mount point here is a wrong answer shown to the user, not merely an
-/// entry skipped from a diff.
+/// separate filesystem, which the merged view cannot show.
+/// A nested mount inside the project is invisible to the merged view, which
+/// shows whatever plain directory sits at that path on the lower filesystem. An
+/// agent shown an empty directory where the user has files can act on that
+/// wrong belief, so a caller tells the user before the session starts.
 pub fn nestedMounts(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -400,8 +257,7 @@ pub fn nestedMounts(
             continue;
         }
 
-        // A different device: a nested mount. Reported, not entered: see
-        // this function's own doc comment.
+        // A different device: a nested mount. Reported, not entered.
         const path_copy = allocator.dupe(u8, entry.path) catch return error.OutOfMemory;
         list.append(allocator, .{ .path = path_copy }) catch return error.OutOfMemory;
     }
@@ -413,7 +269,6 @@ fn deviceNumber(stx: linux.Statx) u64 {
     return (@as(u64, stx.dev_major) << 32) | stx.dev_minor;
 }
 
-/// `statx`, on `absolute_path` itself, never a symbolic link it names.
 fn statNoFollow(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!linux.Statx {
     const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
@@ -430,25 +285,6 @@ fn statNoFollow(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?
     return stx;
 }
 
-/// True if `project` has a file at `rel_path`, false if nothing is there.
-/// Used by `changedFiles` to tell an added path from a modified one: added if
-/// the project never had this path, modified if it did.
-///
-/// Resolves `rel_path` one component at a time, from `project` down, rather
-/// than joining the whole path and asking the kernel to resolve it in one
-/// call. `follow_symlinks = false` only ever controls the final path
-/// component. The kernel always resolves every component before the last one
-/// through a symbolic link, no matter that flag. A single call on the whole
-/// joined path could therefore walk straight through a symbolic link the
-/// project already has partway down `rel_path`, land on a completely
-/// different file, and report a path the agent just added as modified
-/// instead, because something unrelated happens to exist at the link's own
-/// target. Checking one component at a time, and refusing to continue past
-/// one that is not an ordinary directory, closes that off. Only the last
-/// component may be anything, including a link: this function only asks
-/// whether something is there, and never opens anything for reading, so
-/// nothing about what a link points at can reach the agent through this
-/// check either way.
 fn existsInProject(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -474,11 +310,8 @@ fn existsInProject(
     return true;
 }
 
-/// True if `absolute_path`, already known to be a character device from a
-/// directory listing's own entry kind, is overlayfs's own whiteout marker:
-/// major and minor device number both 0. Any other character device, such as
-/// one the agent itself made with `mknod`, reports false: this function
-/// never assumes every character device in the upper layer is a deletion.
+/// True if `absolute_path`, already known to be a character device, is
+/// overlayfs's own whiteout: major and minor both zero.
 fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
     const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
@@ -496,18 +329,12 @@ fn isWhiteout(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?
     return stx.rdev_major == 0 and stx.rdev_minor == 0;
 }
 
-/// True if `absolute_path`, already known to be a directory from a directory
-/// listing's own entry kind, is marked opaque: overlayfs's own way of saying
-/// this directory replaced whatever the lower layer had at the same path, so
-/// the lower layer's own entry of that name, if any, must never be merged
-/// into this directory's listing. See this file's own top comment for why a
-/// directory carries this instead of a whiteout.
-///
-/// Read as `user.overlay.opaque`, not `trusted.overlay.opaque`: `userxattr`
-/// in the mount options, in `../../chock-sandbox`'s own `namespace.mountOverlay`,
-/// moves it into the namespace a user namespace can actually write. The value
-/// overlayfs itself ever writes here is the single byte `y`. Anything else,
-/// or the attribute being absent entirely, means an ordinary directory.
+/// `userxattr` is required, and its absence looked like a kernel fault. Without
+/// it, overlayfs keeps this bookkeeping in `trusted.overlay.*`, which only
+/// `CAP_SYS_ADMIN` over the host can write, so the kernel returned `EIO` for
+/// `rm x && mkdir x`, for `rm -rf` of a project directory, and for replacing a
+/// file with a directory. An earlier version recorded that as an unfixable
+/// kernel limitation. `userxattr` moves it into `user.overlay.*`.
 fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*?Diagnostic) Error!bool {
     const path_z = allocator.dupeZ(u8, absolute_path) catch return error.OutOfMemory;
     defer allocator.free(path_z);
@@ -518,15 +345,9 @@ fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*
         .SUCCESS => {},
         // No such attribute at all: an ordinary directory.
         .NODATA => return false,
-        // The attribute holds more than one byte, so it cannot be exactly
-        // "y", the only value overlayfs itself ever writes here.
         .RANGE => return false,
         // The filesystem underneath the upper layer does not support
-        // extended attributes at all, confirmed against a nested build
-        // sandbox where the outer directory rejects every getxattr call this
-        // way. A directory cannot be marked opaque on a filesystem that
-        // cannot hold the attribute in the first place, so this is the same
-        // answer as NODATA, not a fault.
+        // extended attributes, so it can hold no opaque marker either.
         .OPNOTSUPP => return false,
         else => |err| {
             diagnostic.noteErrno(diag, .opaque_directory_getxattr, err);
@@ -537,15 +358,6 @@ fn isOpaqueDir(allocator: std.mem.Allocator, absolute_path: []const u8, diag: ?*
     return len == 1 and value[0] == 'y';
 }
 
-/// `reported`, the kind a directory listing's own `d_type` gave for an
-/// entry, unless the filesystem never filled that field in, in which case
-/// every entry reports `.unknown` and this falls back to one `statx` call to
-/// find the real kind. Without this fallback, an entry a filesystem never
-/// identifies would silently fail to match any of `changedFiles`'s own
-/// cases and disappear from the diff, rather than being classified or
-/// recorded as a skip. The ordinary path, where `d_type` is filled in, costs
-/// nothing extra: `resolveKind` returns immediately without touching the
-/// filesystem at all.
 fn resolveKind(
     allocator: std.mem.Allocator,
     absolute_path: []const u8,
@@ -567,22 +379,10 @@ fn resolveKind(
     };
 }
 
-// Every test below builds its own project directory inside a fresh
-// std.testing.tmpDir, the same convention worktree.zig's own tests use. A real
-// overlay mount needs a user namespace, so every test that writes through the
-// overlay starts test/workspace/overlay_helper.zig as a second process and
-// reads its exit status, the same pattern test/sandbox/escape.zig uses to run
-// test/sandbox/probe.zig. See build.zig for how this binary's path reaches
-// this test binary. This whole file only ever compiles on Linux, selected by
-// `../overlay.zig`'s own comptime driver dispatch, so its tests reach for
-// `linux.*` directly wherever it is convenient, the same as
-// `lib/chock-sandbox/linux/driver.zig`'s own tests do.
+// Every test below builds its own project directory inside a fresh tmpDir.
 
 const overlay_helper_path = @import("overlay_helper_path").overlay_helper_path;
 
-// `chock-sandbox` for one question only: what the helper answers when this
-// machine will not give it a user namespace. `../overlay.zig`, the interface
-// file above this one, already imports the same module for `Mount`.
 const sandbox = @import("chock-sandbox");
 
 fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
@@ -595,10 +395,6 @@ fn absoluteDirPath(buffer: []u8, dir_fd: linux.fd_t) ![:0]u8 {
     return buffer[0..len :0];
 }
 
-/// A fresh project directory and a fresh scratch directory, both directly
-/// under the same tmpDir, kept apart the same way worktree.zig's own
-/// TestProject keeps a project and a scratch directory apart: listing one
-/// must never pick up the other's files.
 const TestProject = struct {
     allocator: std.mem.Allocator,
     root_path: []u8,
@@ -645,16 +441,6 @@ fn readUpperFile(allocator: std.mem.Allocator, ov: Overlay, name: []const u8) ![
     return std.Io.Dir.cwd().readFileAlloc(std.testing.io, file_path, allocator, .limited(4096));
 }
 
-/// The nested "work" directory overlayfs itself creates inside `ov.work` for
-/// its own bookkeeping is left behind with mode 0000. `std.testing.tmpDir`'s
-/// own cleanup cannot delete a directory it cannot even read, and swallows
-/// that failure rather than reporting it, which is how a pile of
-/// undeletable, permission-0000 directories built up under `.zig-cache/tmp`
-/// across test runs before this existed. Put the permission back before
-/// `tmpDir.cleanup` ever tries. Best effort: the directory may not exist at
-/// all if the mount itself never happened, and there is no meaningful
-/// recovery from a `chmod` failure here beyond leaving `tmpDir.cleanup` to
-/// report whatever is left.
 fn allowScratchCleanup(allocator: std.mem.Allocator, ov: Overlay) void {
     const kernel_work_dir = std.fs.path.join(allocator, &.{ ov.work, "work" }) catch return;
     defer allocator.free(kernel_work_dir);
@@ -663,16 +449,8 @@ fn allowScratchCleanup(allocator: std.mem.Allocator, ov: Overlay) void {
     _ = linux.chmod(path_z.ptr, 0o700);
 }
 
-/// True if this process can use extended attributes on an ordinary file
-/// under `tmp` at all, confirmed with a real `setxattr`, not assumed. Some
-/// sandboxed build environments disable extended attributes entirely for
-/// build reproducibility: `nix flake check` builds this package inside one,
-/// where even a plain `setfattr` on an ordinary file returns `EOPNOTSUPP`,
-/// confirmed by hand outside this codebase entirely, nothing to do with
-/// overlayfs, userxattr, or a bug in `isOpaqueDir`. A test that needs to
-/// observe an opaque directory's own marker calls this first, so it can
-/// print an honest, visible skip of the one assertion that needs the
-/// attribute rather than fail somewhere no fix in this file could reach.
+/// True if this process can use extended attributes on an ordinary file here.
+/// A filesystem without them can hold no opaque marker.
 fn xattrsSupported(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = absoluteDirPath(&buffer, tmp.dir.handle) catch return false;
@@ -688,9 +466,6 @@ fn xattrsSupported(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) bool {
     return linux.errno(rc) == .SUCCESS;
 }
 
-/// Start test/workspace/overlay_helper.zig against `ov`'s own paths, apply
-/// every op in `ops` inside a real overlay mount, and return its exit status.
-/// Each op string is documented at the top of overlay_helper.zig.
 fn runOverlayHelper(allocator: std.mem.Allocator, ov: Overlay, ops: []const []const u8) !std.process.Child.Term {
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
@@ -709,13 +484,7 @@ fn runOverlayHelper(allocator: std.mem.Allocator, ov: Overlay, ops: []const []co
     });
     const term = try child.wait(std.testing.io);
     allowScratchCleanup(allocator, ov);
-    // **A boundary that was never reached is not a boundary that held.**
-    // Every test below asks what a real overlay mount does, and the helper
-    // needs a user namespace to make one, so a machine that refuses one
-    // measures nothing here and must not report a row of passes. See
-    // `chock-sandbox`'s own `namespace.nothing_measured_exit_status`, and the
-    // CI job named "Sandbox", which runs this suite on a machine that can
-    // host one and fails rather than skips.
+    // A boundary that was never reached is not a boundary that held.
     if (term == .exited and term.exited == sandbox.namespace.nothing_measured_exit_status) {
         return error.SkipZigTest;
     }
@@ -736,8 +505,6 @@ test "a write inside the overlay does not change the file in the project" {
     const term = try runOverlayHelper(allocator, ov, &.{"W:tracked.txt:changed by the agent\n"});
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // Read the project's own file directly, not the mount options: this is
-    // the whole point of the overlay, proved by the fact and not by trust.
     const project_contents = try readProjectFile(allocator, project, "tracked.txt");
     defer allocator.free(project_contents);
     try std.testing.expectEqualStrings("original\n", project_contents);
@@ -844,10 +611,6 @@ test "changedFiles lists a new file, a changed file, and a deleted one" {
 }
 
 test "a symbolic link made inside the overlay does not touch the project, and changedFiles reports it as added" {
-    // Suspicious case: the worktree import treats a link as a name, never the
-    // file it names, and an early review found the opposite bug there.
-    // changedFiles must not try to read through a link either: it only asks
-    // whether the path existed, never what a link points at.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -860,7 +623,6 @@ test "a symbolic link made inside the overlay does not touch the project, and ch
     const term = try runOverlayHelper(allocator, ov, &.{"L:link.txt:/somewhere/outside"});
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // The project must not gain a link it never had.
     var project_dir = try std.Io.Dir.cwd().openDir(std.testing.io, project.root_path, .{ .iterate = true });
     defer project_dir.close(std.testing.io);
     var project_it = project_dir.iterate();
@@ -874,9 +636,6 @@ test "a symbolic link made inside the overlay does not touch the project, and ch
 }
 
 test "a new directory the agent made is not reported on its own, only the file inside it" {
-    // Suspicious case: changedFiles must descend into a directory the agent
-    // adds and report the file inside it, never the directory's own path,
-    // and it must not crash walking into it.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -889,7 +648,6 @@ test "a new directory the agent made is not reported on its own, only the file i
     const term = try runOverlayHelper(allocator, ov, &.{ "M:sub", "W:sub/inside.txt:nested\n" });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
 
-    // The project must not gain a directory it never had.
     var project_dir = try std.Io.Dir.cwd().openDir(std.testing.io, project.root_path, .{ .iterate = true });
     defer project_dir.close(std.testing.io);
     var project_it = project_dir.iterate();
@@ -903,15 +661,8 @@ test "a new directory the agent made is not reported on its own, only the file i
 }
 
 test "mounts describes an overlay onto the project's own path, with project as the lower layer" {
-    // Finding 3 of the original review: a reviewer swapped the mount target to
-    // `merged` and set read_only to true, the opposite of what it must be, and
-    // every test still passed, because nothing asserted on the returned list
-    // itself. Pin the facts that matter, now that `mounts` only describes the
-    // overlay instead of performing it: the target is the project's real
-    // path, and `project` itself is the lower, read only layer, never the
-    // upper one. `mounts` needs no namespace and no real mount to check this:
-    // it is a pure description now, so this test calls it directly, with no
-    // subprocess.
+    // A reviewer swapped the mount target to prove the test was really
+    // reading the merged view.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -936,12 +687,7 @@ test "mounts describes an overlay onto the project's own path, with project as t
 }
 
 test "regression: a directory that replaces a deleted file is reported as a deletion, not lost" {
-    // Finding 1 of the review that added userxattr to the mount options.
-    // Before userxattr, mkdir over a whiteout failed outright with EIO. With
-    // it, the mkdir succeeds and the kernel marks the new directory opaque
-    // instead of leaving a whiteout: without isOpaqueDir, changedFiles had
-    // nothing that told it "x" had been deleted at all. rm x && mkdir x is
-    // exactly this shape.
+    // The case that made `userxattr` necessary.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -959,15 +705,7 @@ test "regression: a directory that replaces a deleted file is reported as a dele
     defer report.deinit(allocator);
 
     // Whether "x" itself is reported deleted depends on reading the opaque
-    // marker back with getxattr, which needs an environment that supports
-    // extended attributes at all: see xattrsSupported's own doc comment.
-    // Every other environment this runs in supports it, confirmed by hand.
-    // **The skipped assertion is named here and nowhere else.** A test that
-    // writes to standard error puts a `failed command:` line in the build log
-    // even when it passes, and this test runs in exactly the environment
-    // where that matters: a Nix build sandbox supports no extended attribute
-    // at all, so the marker cannot be read there. Every other assertion below
-    // still runs, and the fact this test exists to pin is one of them.
+    // marker, which needs extended attribute support underneath.
     const check_opaque_marker = xattrsSupported(allocator, tmp);
 
     var found_deleted_x = false;
@@ -986,13 +724,8 @@ test "regression: a directory that replaces a deleted file is reported as a dele
 }
 
 test "regression: a project symlink does not let existsInProject see through a replaced directory" {
-    // Finding 6 of the review: existsInProject used to resolve rel_path in
-    // one statFile call, and follow_symlinks only ever governs the last
-    // component. The project's own read-only symlink at "x", still on disk
-    // after the agent replaces "x" with a real directory in the overlay,
-    // used to make a brand new file underneath that directory land on
-    // whatever the old link pointed at, and get reported as modified
-    // instead of added.
+    // `existsInProject` used to resolve rel_path in a way that followed a
+    // symbolic link out of the project.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1021,10 +754,6 @@ test "regression: a project symlink does not let existsInProject see through a r
     var report = try ov.changedFiles(allocator, std.testing.io, null);
     defer report.deinit(allocator);
 
-    // The fact this test exists to pin, existsInProject not following the
-    // project's own symlink, shows up in "x/existing.txt" and needs no
-    // extended attribute support. Whether "x" itself is reported deleted
-    // needs the opaque marker: see xattrsSupported's own doc comment.
     const check_opaque_marker = xattrsSupported(allocator, tmp);
 
     var found_x_deleted = false;
@@ -1043,10 +772,6 @@ test "regression: a project symlink does not let existsInProject see through a r
 }
 
 test "an entire project directory removed in the overlay is reported as one deletion" {
-    // Reviewer's second Finding 1 case: rm -rf of a project directory.
-    // Nothing replaces "olddir", so this is an ordinary whiteout of the
-    // directory itself, not the opaque-directory case the regression test
-    // above pins.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1096,10 +821,8 @@ test "a fifo made inside the overlay is recorded as a skip, not silently dropped
 }
 
 test "resolveKind falls back to statx when the caller reports unknown" {
-    // Suspicious case: a filesystem with no d_type reports every entry as
-    // unknown. Pin that resolveKind still recovers the real kind instead of
-    // leaving the caller to silently drop the entry, the bug this function
-    // exists to fix.
+    // A filesystem with no d_type reports every entry as unknown, so the walk
+    // must stat rather than trust the listing.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1114,11 +837,6 @@ test "resolveKind falls back to statx when the caller reports unknown" {
     try std.testing.expectEqual(std.Io.File.Kind.file, kind);
 }
 
-/// Write `contents` to `<upper>/<relative>`, making the directories it needs.
-/// A test that wants an added or a changed file in the upper layer writes it
-/// straight there: that is exactly what overlayfs itself leaves behind, and
-/// the tests below then need no mount and no namespace, so they measure the
-/// same thing on every machine.
 fn writeUpper(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8, contents: []const u8) !void {
     const file_path = try std.fs.path.join(allocator, &.{ ov.upper, relative });
     defer allocator.free(file_path);
@@ -1131,12 +849,7 @@ fn writeUpper(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8, c
 }
 
 /// Make the whiteout overlayfs makes for a deleted path: a character device
-/// with major and minor both 0, at the same path in the upper layer.
-///
-/// **A real `mknod`, and not a stand-in.** An ordinary user may make a
-/// character device 0,0, measured on this box, so this builds the same inode
-/// `isWhiteout` reads in a real mount. A test that faked a whiteout some other
-/// way would pass while `changedFiles` read nothing.
+/// with major and minor both zero.
 fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8) !void {
     const file_path = try std.fs.path.join(allocator, &.{ ov.upper, relative });
     defer allocator.free(file_path);
@@ -1146,9 +859,8 @@ fn makeWhiteout(allocator: std.mem.Allocator, ov: Overlay, relative: []const u8)
     const path_z = try allocator.dupeZ(u8, file_path);
     defer allocator.free(path_z);
     const rc = linux.mknod(path_z.ptr, linux.S.IFCHR | 0o600, 0);
-    // **A failure fails the test, and never skips it.** A machine that cannot
-    // make this node measures nothing about deletion, and a row of passes is
-    // what a person would read instead.
+    // A failure fails the test and never skips it. A machine that cannot make
+    // a whiteout would otherwise pass this silently.
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
     try std.testing.expect(try isWhiteout(allocator, file_path, null));
 }
@@ -1160,15 +872,6 @@ fn readCarried(allocator: std.mem.Allocator, destination: []const u8, relative: 
 }
 
 test "adopt rebuilds every path create built, over the work that is already there" {
-    // The whole point of the call: the process that made the overlay has gone,
-    // and a second one needs the same four paths without making anything. The
-    // upper layer holds the session's work, so this also holds that the work is
-    // still there afterwards, byte for byte.
-    //
-    // Mutation check: make `adopt` call `makeScratchDir` on `upper` the way
-    // `create` does, and it returns `error.Unexpected` for every real workspace,
-    // because the directory is there. Make it join `scratch` with anything but
-    // "upper" and the content check below reads nothing.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1180,8 +883,6 @@ test "adopt rebuilds every path create built, over the work that is already ther
     defer made.deinit(allocator);
     try writeUpper(allocator, made, "tracked.txt", "the agent changed this\n");
 
-    // The second owner. It is given the project and the scratch directory, and
-    // nothing else: no value the first one held.
     var taken = try adopt(allocator, std.testing.io, project.root_path, project.scratch_path, null);
     defer taken.deinit(allocator);
 
@@ -1196,15 +897,6 @@ test "adopt rebuilds every path create built, over the work that is already ther
 }
 
 test "adopt refuses a scratch directory with no upper layer, and a symbolic link where one should be" {
-    // The two ways there is nothing to take. The first is what a person has
-    // after `chock workspace clear`. The second is why the check reads the kind
-    // and does not follow the link: a link at `upper` is not a layout this
-    // process made, and adopting it would make every later join follow it
-    // somewhere else.
-    //
-    // Mutation check: drop the `NoOverlayToAdopt` return and `adopt` answers an
-    // `Overlay` whose `upper` is not there, so `carryOut` reports zero files
-    // changed for a session that changed plenty.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1232,14 +924,6 @@ test "adopt refuses a scratch directory with no upper layer, and a symbolic link
 }
 
 test "carryOut brings a changed file and a new one out, and changes nothing in the project" {
-    // The headline promise. A file the session changed and a file it made both
-    // arrive at the destination, under the paths they have in the project, and
-    // the project itself is byte for byte what it was.
-    //
-    // Mutation check: make `carryOut` copy into `destination` rather than into
-    // `<destination>/files` and the reads below fail. Make it write into
-    // `self.project` instead and the last two reads fail, which is the one
-    // failure that would mean real loss.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1268,7 +952,7 @@ test "carryOut brings a changed file and a new one out, and changes nothing in t
     defer allocator.free(added);
     try std.testing.expectEqualStrings("the agent made this\n", added);
 
-    // **The half that matters.** Nothing of the person's moved.
+    // Nothing of the person's moved.
     const still_there = try readProjectFile(allocator, project, "tracked.txt");
     defer allocator.free(still_there);
     try std.testing.expectEqualStrings("original\n", still_there);
@@ -1278,15 +962,7 @@ test "carryOut brings a changed file and a new one out, and changes nothing in t
 }
 
 test "a path the session deleted is named in the deleted file and is still in the project" {
-    // **A deletion is work, and it is carried as a name.** The file the session
-    // removed is named, once, in `deleted`, and the person's own copy of it is
-    // still where it was: this command never removes anybody's file.
-    //
-    // Mutation check: drop the `.deleted` arm of `carryOut` and the count is
-    // zero and the file is empty, so a session that deleted three files reports
-    // an adoption that says nothing about them. Make the arm delete the path in
-    // the project instead and the last read fails, which is the loss this whole
-    // shape exists to refuse.
+    // A deletion is work, and it is carried as a name.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1310,8 +986,6 @@ test "a path the session deleted is named in the deleted file and is still in th
     defer allocator.free(named);
     try std.testing.expectEqualStrings("gone.txt\n", named);
 
-    // Nothing was removed, which is the promise the count and the file are
-    // there to keep honest.
     const survivor = try readProjectFile(allocator, project, "gone.txt");
     defer allocator.free(survivor);
     try std.testing.expectEqualStrings("the agent deleted me\n", survivor);
@@ -1321,12 +995,6 @@ test "a path the session deleted is named in the deleted file and is still in th
 }
 
 test "the deleted and skipped files are written even when nothing was deleted or skipped" {
-    // A file that is there and empty says nothing was deleted. A file that is
-    // missing says only that some build did not write one, and a person cannot
-    // tell those apart. So both are always written.
-    //
-    // Mutation check: write `deleted` only when the list is not empty and this
-    // test reads a file that is not there.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1351,15 +1019,8 @@ test "the deleted and skipped files are written even when nothing was deleted or
 }
 
 test "carryOut refuses a destination that already holds something, and reads nothing out of the upper layer" {
-    // **Not silent, and not a merge.** A destination that is already there may
-    // hold a carry out somebody has since edited, and nothing can tell those
-    // files from the ones this call would write. So it refuses by name, and it
-    // refuses before it opens the upper layer at all, which is what lets the
-    // caller name another destination and still get everything.
-    //
-    // Mutation check: replace the refusal with a `createDirPath` that tolerates
-    // a directory that exists, and the file already at the destination is
-    // written over with no word to anybody.
+    // Not silent, and not a merge. A destination that is already there may
+    // hold files a person edited, and there is no telling those apart.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1385,12 +1046,10 @@ test "carryOut refuses a destination that already holds something, and reads not
         ov.carryOut(allocator, std.testing.io, destination, null),
     );
 
-    // Untouched, which is the whole claim.
     const still_there = try readCarried(allocator, destination, "files");
     defer allocator.free(still_there);
     try std.testing.expectEqualStrings("a person put this here\n", still_there);
 
-    // And the work is still in the upper layer, so a second destination gets it.
     const second = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted-again" });
     defer allocator.free(second);
     const carried = try ov.carryOut(allocator, std.testing.io, second, null);
@@ -1398,14 +1057,7 @@ test "carryOut refuses a destination that already holds something, and reads not
 }
 
 test "a symbolic link the session made is carried as a link, and an executable file keeps its mode" {
-    // Two facts a plain read and write would lose. Following the link would
-    // copy whatever it points at, which can be a file outside the project the
-    // session never wrote. Dropping the mode would hand back a script that no
-    // longer runs.
-    //
-    // Mutation check: make `carryOne` stat with `follow_symlinks = true` and
-    // the link arrives as a copy of the file, so the first check fails. Pass
-    // `.permissions` to `copyFile` and the mode check fails.
+    // Following the link would copy a file the session never wrote.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1424,8 +1076,7 @@ test "a symbolic link the session made is carried as a link, and an executable f
 
     const link_path = try std.fs.path.join(allocator, &.{ ov.upper, "latest" });
     defer allocator.free(link_path);
-    // A relative target, which is what an agent makes, and the case that
-    // panics through `symLinkAbsolute`.
+    // A relative target, which is what an agent makes.
     try std.Io.Dir.cwd().symLink(std.testing.io, "build.sh", link_path, .{});
 
     const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });
@@ -1457,13 +1108,6 @@ test "a symbolic link the session made is carried as a link, and an executable f
 }
 
 test "a fifo the session made is named in the skipped file rather than dropped" {
-    // `changedFiles` already records a path it cannot classify. `carryOut`
-    // carries that record through to the destination, so the person reads which
-    // paths did not come and why, rather than counting files and wondering.
-    //
-    // Mutation check: drop the loop that turns `report.skipped` into lines and
-    // the count is zero and the file is empty for a workspace that really did
-    // hold something nothing could carry.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1477,8 +1121,7 @@ test "a fifo the session made is named in the skipped file rather than dropped" 
     defer allocator.free(fifo_path);
     const fifo_z = try allocator.dupeZ(u8, fifo_path);
     defer allocator.free(fifo_z);
-    // A fifo needs no privilege at all. A failure here fails the test, because
-    // a machine that cannot make one measures nothing about a skip.
+    // A fifo needs no privilege at all, so a failure here fails the test.
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mknod(fifo_z.ptr, linux.S.IFIFO | 0o600, 0)));
 
     const destination = try std.fs.path.join(allocator, &.{ project.scratch_path, "adopted" });

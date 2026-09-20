@@ -1,248 +1,33 @@
-//! The policy table. The policy is a static table in `chock.zon`. The key has
-//! four parts: the agent kind, the model, the tool, and the action. The value
-//! is `allow`, `ask`, `deny`, `agent_review`, or `agent_then_human`. The
-//! broker evaluates the table, and the broker is the one process the agent
-//! cannot reach.
-//!
-//! The table is declarative on purpose. A policy that a reader must execute
-//! to understand is a bad property for a security control.
-//!
-//! ## The file
-//!
-//! This reader looks for the field `policy` at the top of `chock.zon`, and
-//! `load` looks for `chock.zon` in the project root, the same place
-//! `lib/chock-workspace/Workspace.zig` binds it back over the workspace read
-//! only. Every other top level field is ignored, because a later milestone
-//! adds more sections to the same file. Inside the `policy` block the reader
-//! is strict: an unknown field name is an error. A field name with a typo
-//! must never become a rule that matches more than the author wanted.
-//!
-//! ```zon
-//! .{
-//!     .policy = .{
-//!         .agents = .{
-//!             .{ .kind = "main" },
-//!             .{ .kind = "reviewer", .parent = "main" },
-//!         },
-//!         .rules = .{
-//!             .{ .action = "git.*", .decision = .ask },
-//!             .{ .action = "git.push", .decision = .deny },
-//!             .{ .agent_kind = "main", .action = "git.commit", .decision = .allow },
-//!         },
-//!     },
-//! }
-//! ```
-//!
-//! The file comes from the project directory, so a hostile project writes it.
-//! This reader bounds what it accepts: `max_file_bytes` of text, `max_rules`
-//! rules, `max_agents` agent kinds, and `max_check_work` for the read time
-//! check. A file above any of those is refused with a named error, and the
-//! message says which bound it passed.
-//!
-//! A rule has five fields. `agent_kind`, `model`, `tool` and `action` name the
-//! key, and each of the four is optional. A field that is absent matches every
-//! value. `decision` is the answer the rule gives, and it is required.
-//!
-//! A name that ends in `.*` matches every name below that prefix. `git.*`
-//! matches `git.push` and `git.branch.delete`. It does not match `git` itself.
-//! Any other name matches only itself. A bare `"*"` is an error: leave the
-//! field out instead, so one meaning keeps one spelling.
-//!
-//! ## Which rule wins
-//!
-//! More than one rule can match one key. The most specific rule wins.
-//! Specificity is compared one field at a time, in this order: the action,
-//! then the tool, then the model, then the agent kind. The action comes first
-//! because the action is what happens to the machine. The tool is only how the
-//! agent asked for it, and the model and the agent kind are only who asked.
-//!
-//! Inside one field, a name that matches exactly beats a name that ends in
-//! `.*`, and a longer prefix beats a shorter one. Both beat an absent field.
-//!
-//! Two rules can reach the same score in all four fields and still both match
-//! one key. The more restrictive decision then wins, in the order `Decision`
-//! declares its members: `deny`, then `agent_then_human`, then `ask`, then
-//! `agent_review`, then `allow`. The order is therefore total, and the answer
-//! never depends on the order the rules have in the file.
-//!
-//! ## An action no rule names
-//!
-//! `ask` is the answer when no rule matches. A policy that forgot a case must
-//! not become permission.
-//!
-//! ## A child is never stronger than its parent
-//!
-//! Chock applies this in two places, and it needs both.
-//!
-//! `agents` declares which kind spawns which kind. `parse` refuses the file
-//! when a declared child holds more than its declared parent for any key. That
-//! is a mistake in the configuration, so the user reads about it when Chock
-//! reads the file. The user does not read about it on the turn that happens to
-//! hit the rule.
-//!
-//! `evaluateChain` is the second place, and it is the verb a caller wants. A
-//! spawn chain at run time can hold a kind that the file declared no parent
-//! for, so the intersection is taken again over the real chain. A child cannot
-//! hold a permission its parent lacks, whatever the file says about that child
-//! alone. `evaluateKindAlone` answers for one kind with no intersection at
-//! all. Its name says what it leaves out, because a caller that reaches for it
-//! by mistake loses the intersection for every kind the file declares no
-//! parent for.
-//!
-//! ## An org bundle above the file, and a project that may only narrow it
-//!
-//! `chock.zon` is in the project directory, so the developer who owns that
-//! directory writes it. An organisation that wants to bound every project at
-//! once cannot use a file inside the thing it is bounding, so
-//! `lib/chock-policy/org.zig` gives one layer above: a bundle of the same
-//! rules, in the same language, given to the installation rather than to the
-//! repository. `Table.org` holds it and `parseUnder` is how a table gets one.
-//!
-//! **It is the same intersection as before, with one more term in it.**
-//! `evaluateChain` folds the bundle at every link of the chain exactly as it
-//! folds the file, and the answer is the minimum of all of them.
-//! A rule in `chock.zon` can therefore lower an answer and can never raise
-//! one, so a project cannot widen what an org narrowed. That is a property of
-//! a minimum, not a check a later author has to remember.
-//!
-//! ## The table cannot change while a session runs
-//!
-//! Chock parses `chock.zon` one time and holds the result in memory.
-//!
-//! ## An action nobody named, and the rules Chock ships for it
-//!
-//! "`ask` is the answer when no rule matches" is the rule for what
-//! `chock.zon` did not name. `lib/chock-policy/defaults.zig` narrows that for
-//! one case only: the ordinary tool calls `lib/chock-core/tools.zig` builds a
-//! name for, so a project with no `chock.zon` at all still runs them without
-//! a prompt. See that file's own top comment for the rules themselves and for
-//! why every one of them names an action, never a tool alone.
-//!
-//! **A shipped default is its own, lower class, read only when a project
-//! names nothing that matches `key`.** `evaluateRules` asks `chock.zon`'s
-//! own rules first, over the same "which rule wins" search this file's own
-//! section above already describes, and reads `lib/chock-policy/defaults.zig`
-//! at all only when that search finds no match. A project rule that matches
-//! `key` therefore wins outright, whatever it names and however specific it
-//! is next to a default, because the whole point of a shipped default is to
-//! answer for a key the project wrote nothing about. **This is not the same
-//! search `ruleBeats` runs inside one list.** Folding the two lists into one
-//! search, and asking `ruleBeats` to pick the winner across both, is what
-//! this file did before, and it is wrong: `ruleBeats` scores an absent field
-//! as `0`, and every shipped default names an `.action`, so a project rule
-//! that named no `.action` at all always lost to a shipped default on the
-//! first field compared, whatever decision the project rule carried. See
-//! `lib/chock-policy/defaults.zig`'s own top comment for the rest of this
-//! reasoning. **This could not be built as one more term of the ceiling
-//! intersection `Table.org` uses.** A ceiling can only ever narrow an answer
-//! that already exists, and an unnamed action's existing answer is `ask`:
-//! intersecting `ask` with anything can never produce `allow`, which is the
-//! one thing a shipped default has to do for the tool calls it names.
+//! The policy table. A key has four parts, the agent kind, the model, the tool
+//! and the action, and the answer is the most specific rule that matches.
 
 const std = @import("std");
 const defaults = @import("defaults.zig");
 
-/// The name of the configuration file, in the project root.
-/// `lib/chock-workspace/Workspace.zig` looks in the same place.
 pub const file_name = "chock.zon";
 
-/// The largest `chock.zon` this reader accepts. A policy table is a small
-/// file. A larger one is a mistake or an attack, and either way the user must
-/// hear about it instead of Chock reading a gigabyte into memory.
+/// `chock.zon` sits in the project directory, so a hostile project writes it.
+/// Every bound below is there for that reason and not for tidiness.
 pub const max_file_bytes = 1 << 20;
 
-/// The largest number of rules this reader accepts. A human writes a policy of
-/// a few dozen lines. `chock.zon` comes from the project directory, so a
-/// hostile project supplies it, and `max_file_bytes` alone admits about
-/// fourteen thousand rules.
+/// `max_file_bytes` alone admits about fourteen thousand rules.
 pub const max_rules = 512;
 
-/// The largest number of agent kinds this reader accepts. A spawn tree that a
-/// human designs holds a few kinds.
 pub const max_agents = 64;
 
-/// The largest amount of work the read time check may do. See
-/// `checkChildrenAreWeaker`, which walks the product of three representative
-/// lists for each declared parent link, and reads every rule of the file,
-/// plus every rule `lib/chock-policy/defaults.zig` ships, two times for each
-/// key. The defaults are read in the worst case, not in every case: they are
-/// read only for a key the file's own rules name nothing that matches, but
-/// the count of the work must assume that, because it runs before the walk
-/// and cannot yet know which keys those will be. The action list itself also
-/// holds one representative for every pattern `defaults.zig` ships, for the
-/// same reason: `evaluateRules` can answer a key through either list, so the
-/// classes `representatives` samples must match the classes `evaluateRules`
-/// can actually tell apart, or the walk answers a question nobody asked it.
-///
-/// One read compares the key against up to four patterns of one rule, so a
-/// read costs what those names are long. The unit of this budget is therefore
-/// one read of one byte, and `checkWorkFitsBudget` multiplies the number of
-/// reads by the longest name the file spells out, or one of `defaults.zig`'s
-/// own patterns, whichever is longer.
-///
-/// `max_rules`, `max_agents` and `max_file_bytes` bound neither half of that
-/// on their own:
-///
-/// - The number of keys grows with the cube of the number of names the rules
-///   spell out. 512 rules that each name a different model, a different tool,
-///   and a different action reach 1.45 * 10^11 reads.
-/// - The length of a name is what the file says it is. 69 rules whose three
-///   names are 4600 bytes each make 6.7 * 10^7 reads.
-///
-/// This budget is 4.3 * 10^9. The most expensive file it admits measures
-/// about a second with `--release=safe`, which is the mode
-/// `pkgs/chock/default.nix` builds in: 69 rules of three names of 64 bytes,
-/// under one parent link, for 4.27 * 10^9 of the budget, with about six
-/// tenths of one percent to spare. One rule more, 70, reaches 4.50 * 10^9 and
-/// is refused. The same 69 rules with names of 4600 bytes cost about 72
-/// times as much and are refused outright.
-///
-/// **These are measured against the current reader, which counts the
-/// defaults both in the rule count and in the action space they add.**
-/// Before it counted either, the same shapes measured smaller: 75 rules of
-/// 64 byte names read at 4.21 * 10^9, six more than this reader now admits.
-/// A reader in between, which counted the defaults in the rule count alone
-/// and did not yet sample the action classes they add, admitted 72: folding
-/// the defaults into the action list as well moves the line down three
-/// rules further, from 72 to 69. A file of 70, 71 or 72 rules of this shape
-/// is refused today, at a cost neither of the earlier readers used to see.
-///
-/// The headroom above a plausible policy is real, and it is not large. 512
-/// rules that name an action each, under 64 agent kinds, cost 2.2 * 10^9 and
-/// are read. Give those same rules one shared model name and the cost is
-/// 4.45 * 10^9, a little over the budget, and the file is refused: before
-/// this reader counted the rules `defaults.zig` ships, the same file
-/// measured 4.2 * 10^9 and was wrongly read. Give them a shared tool name as
-/// well and it is 8.91 * 10^9, and the file is refused either way. An author
-/// who reaches that point must spell out fewer names.
+/// The largest amount of work `checkChildrenAreWeaker` may do. The number of
+/// keys it walks grows with the cube of the number of names the rules spell
+/// out, and one read costs what those names are long, so `max_rules`,
+/// `max_agents` and `max_file_bytes` bound neither half on their own: 512
+/// rules that each name a different model, tool and action reach 1.45 * 10^11
+/// reads. The count assumes every key also reads `defaults.zig`, because it
+/// runs before the walk and cannot yet know which keys the file answers.
 pub const max_check_work: u64 = 1 << 32;
 
-/// What the table answers for one key. The members are in order of how much
-/// they permit, from least to most, so `@intFromEnum` gives the rank that
-/// `intersect` compares. A new member must go in its correct place.
-///
-/// ## The five, and why they are in this order
-///
-/// There are two more than `allow`, `ask` and `deny`: a reviewer subagent
-/// decides, or a reviewer decides and then a person decides with the review in
-/// front of them. The order below is what makes the intersection mean
-/// anything, so it is worth stating why each step is a step:
-///
-/// * `deny` permits nothing at all.
-/// * `agent_then_human` needs two yeses, a reviewer's and a person's. Anything
-///   it lets through, `ask` would have let through as well, so it is the
-///   stricter of the two.
-/// * `ask` needs one yes, from a person.
-/// * `agent_review` needs one yes, from a reviewer agent. It is above `ask`
-///   because **it is the one decision that lets work through while nobody is
-///   awake**, which is the whole reason it exists. A rule that says `ask`
-///   therefore never becomes a rule a machine can answer.
-/// * `allow` needs nothing.
-///
-/// **The order is what a reviewer cannot climb.** `intersect` is a minimum, so
-/// a subagent whose own kind says `agent_review` under a parent that says
-/// `deny` gets `deny`, and no reviewer is ever consulted. See
-/// `lib/chock-broker/review.zig`, which is where that becomes an act.
+/// The members are in rank order, from least permitting to most, which is what
+/// `intersect` compares, so a new member must go in its correct place.
+/// `agent_review` is above `ask` because it is the one decision that lets work
+/// through while nobody is awake.
 pub const Decision = enum {
     deny,
     agent_then_human,
@@ -250,16 +35,10 @@ pub const Decision = enum {
     agent_review,
     allow,
 
-    /// How much this decision permits. `deny` permits the least.
     pub fn rank(self: Decision) u8 {
         return @intFromEnum(self);
     }
 
-    /// Whether this decision is answered by a reviewer agent before anybody
-    /// else is asked.
-    ///
-    /// A verb rather than a comparison a caller writes for itself, so a sixth
-    /// member cannot be added without this switch naming it.
     pub fn needsReview(self: Decision) bool {
         return switch (self) {
             .agent_review, .agent_then_human => true,
@@ -267,7 +46,6 @@ pub const Decision = enum {
         };
     }
 
-    /// Whether a person is asked once every other step has said yes.
     pub fn needsHuman(self: Decision) bool {
         return switch (self) {
             .ask, .agent_then_human => true,
@@ -275,27 +53,18 @@ pub const Decision = enum {
         };
     }
 
-    /// The policy of a subagent is the intersection of the policy of its
-    /// parent and the policy of its agent kind. For one key that is the
-    /// decision which permits less.
     pub fn intersect(a: Decision, b: Decision) Decision {
         return if (a.rank() <= b.rank()) a else b;
     }
 };
 
-/// What `Table.decideChain` answers.
 pub const ChainAnswer = struct {
     decision: Decision,
     /// False when no rule of the file, of `defaults.zig` or of the org bundle
-    /// matched the key at any link, so `decision` is the `ask` this table
-    /// gives a key nobody wrote about.
+    /// matched, so `decision` is the `ask` a key nobody wrote about gets.
     named: bool,
 };
 
-/// The four parts of one policy question. Every part is a name that Chock
-/// itself knows: the kind of the agent that asked, the alias of the model
-/// behind it, the tool it called, and the action that tool wants to perform.
-/// The action names of version 1 are a fixed list.
 pub const Key = struct {
     agent_kind: []const u8,
     model: []const u8,
@@ -304,8 +73,16 @@ pub const Key = struct {
 };
 
 /// One line of the table. Each of the four key fields is a pattern, and an
-/// absent pattern matches every value. See this file's top comment for the
-/// pattern language and for which rule wins.
+/// absent pattern matches every value.
+///
+/// A name ending in `.*` names every action below that prefix. `git.*` names
+/// `git.push` and does not name `git` itself. A bare `"*"` is an error.
+///
+/// The most specific rule wins, compared one field at a time in the order
+/// action, tool, model, agent kind. Inside one field an exact name beats a
+/// class, a longer prefix beats a shorter one, and both beat an absent field.
+/// On a tie the more restrictive decision wins, so the answer never depends on
+/// the order the rules have in the file.
 pub const Rule = struct {
     agent_kind: ?[]const u8 = null,
     model: ?[]const u8 = null,
@@ -314,139 +91,72 @@ pub const Rule = struct {
     decision: Decision,
 };
 
-/// One agent kind, and the kind that spawns it. A kind with no `parent` is a
-/// root, or a kind whose parent changes at run time. `evaluateChain` covers
-/// the second case.
 pub const Agent = struct {
     kind: []const u8,
     parent: ?[]const u8 = null,
 };
 
-/// The `policy` block of `chock.zon`.
 pub const Policy = struct {
     agents: []const Agent = &.{},
     rules: []const Rule = &.{},
     net: Net = .{},
 };
 
-/// What this project wants of the network, beyond which hosts it permits.
-///
-/// **Which hosts is still `net.connect.*` and nothing here.** This says only
-/// whether a tool call is given a router at all, which is a mechanism and
-/// never a permission: a router with no permitted host reaches nothing. That
-/// is why an organisation's bundle needs no ceiling over this. It caps the
-/// `net.connect` rules, and a project that turns a router on without them has
-/// turned on a road to nowhere.
+/// Which hosts is still `net.connect.*` and nothing here. This is a mechanism
+/// and never a permission, so an organisation needs no ceiling over it: a
+/// router with no permitted host reaches nothing.
 pub const Net = struct {
     router: Router = .auto,
-    /// What a call started in the background gets, which may be less than the
-    /// session has. `.auto` is whatever `router` decided.
-    ///
-    /// **A background call never asks a person.** It runs on a thread of its
-    /// own, after the dispatch that started it returned, and the handle a
-    /// question travels through belongs to the call the loop is inside of at
-    /// that moment. So a background call is given a router with no asker: it
-    /// reaches what this policy ALLOWS outright, and anything that would need
-    /// a person is refused rather than queued behind one. Set `.none` for a
-    /// project that wants a background command to reach nothing at all.
+    /// A background call never asks a person. It runs on a thread of its own,
+    /// after the dispatch that started it returned, and the handle a question
+    /// travels through belongs to the call the loop is inside of at that
+    /// moment. Anything that would need a person is refused, not queued.
     background: Router = .auto,
 };
 
-/// Whether a tool call of this session is given a network router.
 pub const Router = enum {
-    /// Decided by the rules: a router when the policy permits something under
-    /// `net.connect`, and none when it does not. **The default**, because a
-    /// project that names no host has no use for a network namespace, a
-    /// ruleset and a resolver, and a project that names one always wants them.
     auto,
-    /// Never, whatever the rules say. An off switch for a project that keeps
-    /// `net.connect` rules for its own reading and wants no network today.
     none,
-    /// Always, even with no rule permitting a host yet. For a session where a
-    /// person is expected to answer for each host as it comes up.
     filtered,
 };
 
-/// What can go wrong while reading a policy out of bytes that are already in
-/// memory.
 pub const ParseError = error{
     OutOfMemory,
-    /// The file is not valid ZON, or the `policy` block does not match the
-    /// schema. Pass a `Diagnostic` to learn which line, and why.
     InvalidPolicy,
-    /// A key pattern that this file's top comment does not allow.
     InvalidPattern,
-    /// Two `agents` entries name the same kind.
     DuplicateAgent,
-    /// An `agents` entry names a parent that no entry declares.
     UnknownParent,
-    /// The `parent` links make a loop.
     AgentCycle,
-    /// A declared child holds more than its declared parent for at least one
-    /// key.
     ChildStrongerThanParent,
-    /// The policy holds more than `max_rules` rules.
     TooManyRules,
-    /// The policy holds more than `max_agents` agent kinds.
     TooManyAgents,
-    /// The read time check would cost more than
-    /// `max_check_work`. The policy tells too many classes of key apart. The
-    /// message names the numbers, so the author can spell out fewer names.
     PolicyTooComplex,
 };
 
-/// What can go wrong while reading a policy from the project root.
 pub const LoadError = ParseError || error{
-    /// The project has no `chock.zon`. The caller decides what to do about
-    /// that. `parse` with the source `.{}` builds the safe table, where every
-    /// key resolves to `ask`.
     NoPolicyFile,
-    /// The file is larger than `max_file_bytes`.
     PolicyTooLarge,
-    /// The file exists and could not be read. Pass a `Diagnostic` to learn
-    /// which fault the filesystem gave.
     ReadFailed,
 };
 
-/// Why a policy was refused, in the words the author of `chock.zon` needs.
-///
-/// **Some variants own memory, and `deinit` releases all of them.** The two
-/// ZON variants hold the syntax tree their message points into, which is how
-/// they can name a line and a column. The variants that name an agent kind
-/// hold a copy of the name, because the `Policy` those names live in is
-/// released the moment the parse fails. A caller that gives `parse` or `load`
-/// a slot must call `deinit` on whatever lands in it.
+/// Some variants own memory and `deinit` releases all of them. The two ZON
+/// variants hold the syntax tree their message points into, and the variants
+/// that name an agent kind hold a copy, because the `Policy` those names live
+/// in is released the moment the parse fails.
 pub const Diagnostic = union(enum) {
-    /// The file is not valid ZON at all. The parser names the place.
     file_not_zon: std.zon.parse.Diagnostics,
-    /// The file is valid ZON, and its `policy` block does not match the
-    /// schema. A misspelled field name lands here.
     block_not_valid: std.zon.parse.Diagnostics,
-    /// The top level of the file is not a struct literal.
     not_a_struct_literal,
-    /// The file exists and the read failed. The path is `project_root` joined
-    /// with `file_name`, which the caller of `load` already holds.
     read_failed: anyerror,
-    /// More rules than `max_rules`.
     too_many_rules: usize,
-    /// More agent kinds than `max_agents`.
     too_many_agents: usize,
-    /// A key field holds `"*"`. The field name is a literal of this file.
     pattern_matches_everything: []const u8,
-    /// A key field holds a pattern the language does not allow.
     pattern_malformed: []const u8,
-    /// A name field holds a name the language does not allow.
     name_malformed: []const u8,
-    /// Two `agents` entries name the same kind. The kind is owned.
     duplicate_agent_kind: []const u8,
-    /// An `agents` entry names a parent no entry declares. Both are owned.
     unknown_parent: Parent,
-    /// The `parent` links make a loop. The kind that starts it is owned.
     agent_cycle: []const u8,
-    /// A child that holds more than its parent. Every name in it is owned.
     child_stronger_than_parent: ChildStronger,
-    /// The read time check would cost more than
-    /// `max_check_work`. Numbers only.
     policy_too_complex: TooComplex,
 
     pub const Parent = struct {
@@ -475,9 +185,6 @@ pub const Diagnostic = union(enum) {
         links: u64,
     };
 
-    /// Release what the diagnostic owns, with the allocator that filled it.
-    /// Safe on every variant, so a caller can call it without asking which
-    /// one it holds.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .file_not_zon, .block_not_valid => |*zon_diag| zon_diag.deinit(gpa),
@@ -584,21 +291,9 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Why a spawn chain could not be folded, so the answer was `ask`.
-///
-/// A separate type from `Diagnostic`, because this is not a fault in the
-/// file. The chain arrives from a session log, which holds whatever that file
-/// holds, so a chain this reader cannot use is a run time fault and not a
-/// broken caller. See `Table.evaluateChain`.
-///
-/// This owns nothing. Every name in it points into the `chain` and the `Key`
-/// the caller passed, which the caller still holds.
 pub const ChainFault = union(enum) {
-    /// The chain names no agent at all.
     empty: []const u8,
-    /// A link in the chain has no name.
     link_with_no_name: []const u8,
-    /// The last link is not the kind that asked.
     last_link_is_not_the_asker: Mismatch,
 
     pub const Mismatch = struct {
@@ -624,13 +319,8 @@ pub const ChainFault = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one, and say whether it took `value`.
-///
-/// **The first fault is kept, not the last.** A later check can only fail
-/// because an earlier one did, so the first is the one that explains the rest.
-///
-/// The answer matters because several variants own memory: a site that hands
-/// one over must release it itself when the answer is false.
+/// The first fault is kept and not the last. Several variants own memory, so a
+/// site that hands one over must release it itself when the answer is false.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -638,52 +328,27 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Whether a diagnostic is wanted and still empty, which is the one case in
-/// which a site should copy a name for it. A caller that passes null must pay
-/// no allocation at all.
 fn wantsDiagnostic(out: ?*?Diagnostic) bool {
     const slot = out orelse return false;
     return slot.* == null;
 }
 
-/// `note`, for `ChainFault`. The same first fault rule, and no answer is
-/// needed because a `ChainFault` owns nothing there is anything to release.
 fn noteChain(out: ?*?ChainFault, value: ChainFault) void {
     const slot = out orelse return;
     if (slot.* != null) return;
     slot.* = value;
 }
 
-/// A parsed policy table. `parse` and `load` are the only two constructors,
-/// and both hand back a `*const Table`, so no caller ever holds a mutable
-/// table. `destroy` ends the life of one. See this file's top comment on why,
-/// and the comptime block at the end of this file for what enforces it.
+/// `parse` and `load` both hand back a `*const Table`, so no caller ever holds
+/// a mutable one. The comptime block at the end of this file keeps that true.
 pub const Table = struct {
-    /// The rules, behind a pointer to const. Nothing can write a rule of a
-    /// loaded table.
     policy: *const Policy,
-    /// The rules of the org bundle above this project, or empty for a session
-    /// that was given none. See this file's own top comment, and
-    /// `lib/chock-policy/org.zig`.
-    ///
-    /// **Borrowed, and never owned.** The bundle is read before the table and
-    /// released after it, so `destroy` frees nothing here. A caller that hands
-    /// these in must keep them alive as long as the table.
-    ///
-    /// **Empty is exactly today's behaviour**, and it is not a special case
-    /// anywhere: `ceilingRules` answers `allow` for a rule list that names
-    /// nothing, and `allow` is the identity of `intersect`.
+    /// Borrowed and never owned, so `destroy` frees nothing here. Empty is no
+    /// special case anywhere: `ceilingRules` answers `allow` for a rule list
+    /// that names nothing, and `allow` is the identity of `intersect`.
     org: []const Rule = &.{},
-    /// The hash of the bytes this table was built from.
     hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
-    /// Read the policy out of `source`, which must be the whole content of a
-    /// `chock.zon`. The returned table owns a copy of every name in it, so the
-    /// caller is free to release `source` at once. `destroy` releases the
-    /// table, with the same allocator.
-    /// `diag` is optional. A caller that passes null pays nothing, allocates
-    /// nothing extra, and learns only the error. A caller that passes a slot
-    /// must call `Diagnostic.deinit` on whatever lands in it.
     pub fn parse(
         gpa: std.mem.Allocator,
         source: [:0]const u8,
@@ -692,18 +357,8 @@ pub const Table = struct {
         return parseUnder(gpa, source, &.{}, diag);
     }
 
-    /// `parse`, under the rules of an org bundle. See this file's own top
-    /// comment: the bundle is the outermost layer and `source` may only narrow
-    /// it.
-    ///
-    /// `org` is borrowed for the life of the table. It is
-    /// `lib/chock-policy/org.zig`'s `Bundle.rules`, and passing an empty slice
-    /// gives exactly the table `parse` gives.
-    ///
-    /// **The bundle is not validated here.** `org.parse` already refuses a
-    /// pattern this language does not allow, and it is the one reader of a
-    /// bundle. Checking it a second time would put two answers in the build to
-    /// what a bundle may hold.
+    /// `org` is borrowed for the life of the table, and it is not validated
+    /// here: `org.parse` is the one reader of a bundle.
     pub fn parseUnder(
         gpa: std.mem.Allocator,
         source: [:0]const u8,
@@ -716,7 +371,6 @@ pub const Table = struct {
 
         const policy = policy: {
             const node = try findPolicyNode(trees.zoir, diag) orelse break :policy Policy{};
-            // From here `trees.diag` owns the two trees. See `Trees`.
             trees.diag_owns_trees = true;
             break :policy std.zon.parse.fromZoirNodeAlloc(
                 Policy,
@@ -747,13 +401,6 @@ pub const Table = struct {
         return table;
     }
 
-    /// Read `chock.zon` from `project_root` and parse it. `project_root` is
-    /// the same directory `Workspace` calls the project root, and the file has
-    /// the same name there.
-    ///
-    /// `diag` carries the same detail `parse` carries, and the same rule
-    /// applies: null costs nothing, and a filled slot must be released with
-    /// `Diagnostic.deinit`.
     pub fn load(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -763,7 +410,6 @@ pub const Table = struct {
         return loadUnder(gpa, io, project_root, &.{}, diag);
     }
 
-    /// `load`, under the rules of an org bundle. See `parseUnder`.
     pub fn loadUnder(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -795,77 +441,31 @@ pub const Table = struct {
         return parseUnder(gpa, source, org, diag);
     }
 
-    /// Release everything the table owns, with the allocator that built it.
-    /// `self` is not valid after this call.
-    ///
-    /// The allocator is a parameter and not a field, so that a `Table` holds
-    /// nothing a caller could aim somewhere else, and so that this function
-    /// takes a pointer to const like every other function here. See the
-    /// comptime block at the end of this file.
-    ///
-    /// Two things follow from that, and both are on the caller:
-    ///
-    /// - **Write `Table.destroy(gpa, t)`.** The allocator is the first
-    ///   parameter, so `t.destroy(gpa)` does not compile.
-    /// - **Give it a table `parse` or `load` made, and the allocator that
-    ///   made it.** This function frees `self` itself, so it ends a table on
-    ///   the stack or in static memory as readily as one on the heap. Nothing
-    ///   in a `Table` says where it came from, which is the same reason the
-    ///   allocator is not a field.
+    /// The allocator is a parameter and not a field, so a `Table` holds nothing
+    /// a caller could aim somewhere else. Write `Table.destroy(gpa, t)`. It
+    /// frees `self` itself, so it ends a table on the stack as readily as one
+    /// on the heap, and nothing in a `Table` says where it came from.
     pub fn destroy(gpa: std.mem.Allocator, self: *const Table) void {
         std.zon.parse.free(gpa, self.policy.*);
         gpa.destroy(self.policy);
         gpa.destroy(self);
     }
 
-    /// The answer for one agent kind on its own, from the one rule that wins.
-    /// `ask` when no rule matches.
-    ///
-    /// This applies no intersection. Use
-    /// `evaluateChain`, which is the verb the broker wants. This one answers a
-    /// narrower question: what does the file say about this kind alone. The
-    /// read time check covers only the links the file declares, so a caller
-    /// that uses this for a real request loses the intersection for every kind
-    /// the file declares no parent for.
-    ///
-    /// **The org bundle is applied here as well**, because a caller that asks
-    /// about one kind is still a caller that must not be told a project holds
-    /// more than its organisation gave it.
+    /// One agent kind on its own, with no intersection at all. The read time
+    /// check covers only the links the file declares, so a caller that uses
+    /// this for a real request loses the intersection for every kind the file
+    /// declares no parent for. `evaluateChain` is the verb the broker wants.
     pub fn evaluateKindAlone(self: *const Table, key: Key) Decision {
         return evaluateRules(self.policy.rules, key).intersect(ceilingRules(self.org, key));
     }
 
-    /// `chain` names every agent kind from the root of the spawn
-    /// tree down to the agent that asked, root first. The answer is the
-    /// intersection over the whole chain, so a child never holds a permission
-    /// its parent lacks.
+    /// `chain` names every agent kind from the root of the spawn tree down to
+    /// the agent that asked, root first. The caller builds it and it is not
+    /// `ApprovalRequest.spawn_chain`, which leaves the asker out.
     ///
-    /// **The caller builds this chain, and it is not
-    /// `ApprovalRequest.spawn_chain` itself.** That field holds every parent
-    /// between the root session and the agent that asked, and it leaves the
-    /// asker out. See its own comment in `lib/chock-proto/event.zig`. The
-    /// chain this function wants is the `agent_kind` of each of those links,
-    /// in the order they are in, and then the kind of the agent that asked.
-    /// A root agent asks with a chain of one link.
-    ///
-    /// `chain` is not this program's own data. The links come from
-    /// `ApprovalRequest.spawn_chain`, which arrives as JSON in the session
-    /// log, and a replayed log holds whatever that file holds. A chain this
-    /// function cannot use is therefore a runtime fault and not a broken
-    /// caller, so it gets an answer and not an assert. That answer is `ask`,
-    /// the same as every other case the policy does not cover. There are three
-    /// such chains:
-    ///
-    /// - an empty chain, which names no agent at all;
-    /// - a chain that holds a link of length zero, which names no kind. The
-    ///   rules cannot be read for a kind that has no name.
-    /// - a chain whose last link is not the kind in `key`. The last link is
-    ///   the agent that asked, so the two must not disagree about who asked.
-    ///
-    /// `fault` is filled for each of those three chains, and only for those
-    /// three. It borrows from `chain` and `key`, so it is valid as long as
-    /// the caller's own arguments are. A caller that passes null pays
-    /// nothing: this function allocates in no case at all.
+    /// The links come from a session log, so a chain this function cannot use
+    /// is a run time fault and not a broken caller: it gets `ask` and not an
+    /// assert. `fault` borrows from `chain` and `key`.
     pub fn evaluateChain(
         self: *const Table,
         chain: []const []const u8,
@@ -875,16 +475,9 @@ pub const Table = struct {
         return self.decideChain(chain, key, fault).decision;
     }
 
-    /// `evaluateChain`, and the one fact a `Decision` cannot carry: whether
-    /// any rule named this key at all.
-    ///
     /// `ask` is both "nobody wrote a rule" and "somebody wrote `ask`", and a
     /// caller that reads a second, wider name when the first is not covered
-    /// has to tell them apart or it widens past what an author wrote. See
-    /// `src/run.zig`'s `NixTableReader`, which reads a phase scoped Nix name
-    /// and then a phase free one.
-    ///
-    /// One walk and not two: `evaluateChain` is this with the flag dropped.
+    /// has to tell them apart or it widens past what an author wrote.
     pub fn decideChain(
         self: *const Table,
         chain: []const []const u8,
@@ -911,13 +504,8 @@ pub const Table = struct {
 
         // The first link seeds the fold. There is no `allow` here to seed it
         // with, so a chain that walks no link can never leave this function
-        // with a decision the rules did not give it.
-        //
-        // **The org bundle is folded at every link, beside the file.** See this
-        // file's own top comment: it is one more term of the same minimum, so
-        // a project can lower an answer and can never raise one. A session with
-        // no bundle folds an empty rule list, which answers `allow` and changes
-        // nothing.
+        // with a decision the rules did not give it. The org bundle is folded
+        // at every link beside the file, as one more term of the same minimum.
         var answer = self.linkAnswer(keyForKind(key, chain[0]));
         for (chain[1..]) |kind| {
             const link = self.linkAnswer(keyForKind(key, kind));
@@ -929,9 +517,8 @@ pub const Table = struct {
         return answer;
     }
 
-    /// One link of the chain, over the file, the shipped defaults and the org
-    /// bundle. An org rule counts as naming the key: without that, a wider
-    /// name could be read past a ceiling the organisation set on this one.
+    /// An org rule counts as naming the key. Without that, a wider name could
+    /// be read past a ceiling the organisation set on this one.
     fn linkAnswer(self: *const Table, link: Key) ChainAnswer {
         const own = rulesAnswer(self.policy.rules, link);
         const ceiling = winnerFor(self.org, link);
@@ -941,78 +528,11 @@ pub const Table = struct {
         };
     }
 
-    /// True when this table holds a rule that could permit **some** action
-    /// under `key.action`, which is read here as a **prefix** and not as an
-    /// action.
-    ///
-    /// ## What question this answers, and what it refuses to answer
-    ///
-    /// It is an **existence** question: did the author write anything at all
-    /// that reaches below this prefix. It says nothing about what the answer
-    /// to a real action would be, and no caller may treat a `true` here as a
-    /// permission. The decision for a real action is `evaluateChain`, which
-    /// folds the whole spawn chain and picks a winner by specificity. This
-    /// walks the rules one time and stops at the first one that could matter.
-    ///
-    /// ## The one caller, and why the question exists at all
-    ///
-    /// `lib/chock-broker/network.zig`'s resolver. A program inside a sandbox
-    /// looks a host name up **before** it opens anything, so at that moment
-    /// there is no port, and a `net.connect` action ends in one. Neither
-    /// reading of a full action fits:
-    ///
-    /// * `evaluateChain` on the bare prefix answers `ask` for a project whose
-    ///   only rule is `net.connect.com.anthropic.api.443`, because no rule
-    ///   names `net.connect.com.anthropic.api`. The host would never resolve,
-    ///   and the rule the author wrote could never be reached at all.
-    /// * `ceilingChain` on the bare prefix answers `allow` for a host nobody
-    ///   named, so every name in the world would resolve and the refusal would
-    ///   happen one step later, after the program had already been told the
-    ///   name exists.
-    ///
-    /// The resolver asks both: `ceilingChain` for "is this host forbidden
-    /// outright", and this for "did anybody write a rule that reaches it". A
-    /// name needs both answers before it resolves.
-    ///
-    /// ## A `deny` rule is not a rule that reaches
-    ///
-    /// A rule whose decision is `deny` is skipped. An author who wrote only
-    /// `net.connect.com.evil.*` set to `deny` wrote nothing that could permit
-    /// anything under it, and reading a refusal as "somebody named this host"
-    /// would turn a denial into the reason a name resolves.
-    ///
-    /// ## The chain is not folded here
-    ///
-    /// The key is the asking agent's own. A subagent whose parent is denied
-    /// still resolves the name and is then refused the connection by
-    /// `evaluateChain`, which does fold the chain. **That is the safe
-    /// direction for an existence question**: folding it here could only make
-    /// a name resolve that this reading already refuses, and the connection
-    /// itself is judged either way.
-    /// Whether a tool call of this session is given a network router.
-    ///
-    /// **A mechanism and never a permission.** A router grants no host by
-    /// itself: every connection is still decided at `net.connect.*`, and a
-    /// router with nothing permitted reaches nothing. What this decides is
-    /// whether the sandbox pays for a network namespace, a kernel ruleset and
-    /// a resolver at all, and therefore what `chock doctor` and the header
-    /// can honestly say about a session.
-    ///
-    /// **`.auto` reads the rules and not the defaults.** `defaults.zig` holds
-    /// no rule under `net.connect.*` or `net.fetch.*` on purpose, so nothing
-    /// shipped can make this true, and a project that names a host is the
-    /// only thing that does. A rule that only denies is not a reason to build
-    /// a network: `rulesReachBelow` skips a `deny`.
-    ///
-    /// **The whole `net` namespace, and not `net.connect` alone.** One seam
-    /// carries the router for every tool, so a project that permits only
-    /// `net.fetch.*` would otherwise have `fetch_url` lose the seam it asks
-    /// through.
-    ///
-    /// **No tool, model or agent kind is asked about here.** This is one
-    /// answer for the whole session, given before any call exists, so a rule
-    /// that permits a host for one tool is a reason to build the network for
-    /// the session. The narrower question is asked again per connection.
+    /// `.auto` reads the rules and not the defaults. `defaults.zig` holds no
+    /// rule under `net.connect.*` or `net.fetch.*`, so nothing shipped can make
+    /// this true, and a rule that only denies is not a reason to build a
+    /// network. The whole `net` namespace, because one seam carries the router
+    /// for every tool.
     pub fn wantsRouter(self: *const Table) bool {
         return switch (self.policy.net.router) {
             .none => false,
@@ -1021,17 +541,6 @@ pub const Table = struct {
         };
     }
 
-    /// Whether a call this session starts in the background is given a router.
-    ///
-    /// **Never more than the session itself has.** `.auto` follows
-    /// `wantsRouter`, and an explicit `.filtered` here cannot give a
-    /// background call a network a foreground call does not have: a session
-    /// with no router builds none, and there would be nothing for this to
-    /// attach.
-    ///
-    /// What it does NOT decide is whether a person can be asked. That is
-    /// always no for a background call, whatever this says: see
-    /// `Net.background`.
     pub fn wantsBackgroundRouter(self: *const Table) bool {
         if (!self.wantsRouter()) return false;
         return switch (self.policy.net.background) {
@@ -1041,35 +550,27 @@ pub const Table = struct {
         };
     }
 
+    /// True when this table holds a rule that could permit some action under
+    /// `key.action`, read as a prefix and not as an action. An existence
+    /// question, and no caller may read a `true` here as a permission.
+    ///
+    /// A host name is looked up before anything is opened, so there is no port
+    /// yet and neither other reading fits: `evaluateChain` on the bare prefix
+    /// answers `ask` for a project whose only rule names one port, and
+    /// `ceilingChain` answers `allow` for a host nobody named. A `deny` rule is
+    /// skipped, because reading a refusal as "somebody named this host" would
+    /// turn a denial into the reason a name resolves.
     pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
         return rulesReachBelow(self.policy.rules, key) or
             rulesReachBelow(defaults.rules, key);
     }
 
-    /// The **ceiling** both layers put on `key`, folded over the whole spawn
-    /// chain. `allow` when nothing names the key at all.
-    ///
-    /// This is the reading for a question about a resource rather than about
-    /// an act: may this session use this provider, may it use this model. See
-    /// `lib/chock-policy/access.zig`, which is the only caller and which says
-    /// what the names are. `evaluateChain` is the reading for an act, and the
-    /// two differ in exactly one place: what an action nobody named answers.
-    ///
-    /// * An act nobody named answers `ask`. A policy that forgot a case must
-    ///   not become permission.
-    /// * A resource nobody named answers `allow`. There is no ceiling on it,
-    ///   and a project that wrote no rule about providers must behave the way
-    ///   it did before providers could be named at all.
-    ///
-    /// `ratchet.ceilingFor` makes the same distinction, for the same reason,
-    /// over an agent's own promises. Three layers now read the same rules two
-    /// ways, and this is the one function that gives the second reading over a
-    /// chain.
-    ///
-    /// `fault` is filled for the same three chains `evaluateChain` fills it
-    /// for, and the answer for those is `deny`. **Not `ask`**: a chain this
-    /// reader cannot fold is a log holding something Chock did not write, and
-    /// there is nobody to ask about a model at the moment a session picks one.
+    /// The reading for a question about a resource rather than about an act.
+    /// The two differ in one place only: an act nobody named answers `ask`, and
+    /// a resource nobody named answers `allow`, because a project that wrote no
+    /// rule about providers must behave as it did before providers could be
+    /// named at all. `fault` answers `deny` here, because there is nobody to
+    /// ask about a model at the moment a session picks one.
     pub fn ceilingChain(
         self: *const Table,
         chain: []const []const u8,
@@ -1104,20 +605,11 @@ pub const Table = struct {
         return result;
     }
 
-    /// The hash of the bytes this table was parsed from.
-    ///
-    /// Chock compares the file at the end of a session against what it read
-    /// at the start. This is one half of that comparison.
-    /// The other half is to read the file again and hash it with `hashSource`.
-    /// A `Table` keeps no path on purpose, so it cannot read the file a second
-    /// time. Nothing in this module can make that comparison, and no check
-    /// here can remind a caller to make it. The caller owns it.
     pub fn sourceHash(self: *const Table) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
         return self.hash;
     }
 };
 
-/// `key` with a different agent kind, for one link of a spawn chain.
 fn keyForKind(key: Key, agent_kind: []const u8) Key {
     return .{
         .agent_kind = agent_kind,
@@ -1127,28 +619,19 @@ fn keyForKind(key: Key, agent_kind: []const u8) Key {
     };
 }
 
-// Chock parses `chock.zon` one time and holds it in memory, so a
-// change to the file cannot change the policy of a running session. These
-// checks enforce that, instead of a comment that asks a later author to
-// remember it. They fail the build, which is the one place a rule like this
-// cannot be skipped.
+// Chock parses `chock.zon` one time and holds it in memory, so a change to the
+// file cannot change the policy of a running session. A build failure is the
+// one place a rule like this cannot be skipped.
 comptime {
     const pointer = @typeInfo(@FieldType(Table, "policy")).pointer;
     if (!pointer.is_const) @compileError(
         "Table.policy must point to const, or a caller could rewrite a rule of a live session",
     );
 
-    // Both namespaces, because a free function in this file can take a table
-    // as well as a method can. `@typeInfo` reports the public declarations, so
-    // this covers every function a caller outside this file can reach.
     refuseMutableTable(Table, "Table.");
     refuseMutableTable(@This(), "");
 }
 
-/// Fail the build when a public function of `namespace` takes a mutable
-/// `*Table` in any position. `parse` and `load` hand back a `*const Table`, so
-/// a mutable one is a table this file made, and a function that asks for one
-/// is a function that means to change a table of a live session.
 fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) void {
     for (@typeInfo(namespace).@"struct".decls) |decl| {
         const info = switch (@typeInfo(@TypeOf(@field(namespace, decl.name)))) {
@@ -1168,30 +651,15 @@ fn refuseMutableTable(comptime namespace: type, comptime prefix: []const u8) voi
     }
 }
 
-/// The answer `Table.evaluateKindAlone` gives, over a rule list on its own.
-/// `validate` needs this before there is a `Table` to ask.
-///
-/// **A project rule that matches `key` at all wins, whatever it names, and
-/// `lib/chock-policy/defaults.zig`'s rules are read only when `rules` holds
-/// no match for `key`.** The two lists are not one search for the strongest
-/// rule of either: a default names an `.action`, and before this the search
-/// scored an absent field as `0`, so a project rule that named no `.action`
-/// at all, such as `.{ .agent_kind = "reviewer", .decision = .deny }`, lost
-/// to a shipped default on the very first field compared, whatever decision
-/// the project rule carried. That is backwards. The contract of this whole
-/// table is that a project narrows what Chock permits, and a rule that
-/// matches the key at all is the project narrowing it, however it is
-/// spelled. A shipped default exists only to answer for a key a project
-/// wrote nothing about, so it must never outrank a project rule that did.
-/// See `lib/chock-policy/defaults.zig`'s own top comment for the rest of
-/// this reasoning and for why a rule there must still keep to one exact
-/// `.action` if it names one at all: this change is about which list is
-/// asked first, not about how wide one shipped default may be.
+/// A project rule that matches `key` at all wins, whatever it names, and
+/// `defaults.zig`'s rules are read only when `rules` holds no match. The two
+/// lists are not one search: a default always names an `.action`, and a search
+/// that scores an absent field as `0` made a project rule that named no
+/// `.action` lose to a shipped default on the first field compared.
 fn evaluateRules(rules: []const Rule, key: Key) Decision {
     return rulesAnswer(rules, key).decision;
 }
 
-/// `evaluateRules`, and whether a rule of either list named `key`.
 fn rulesAnswer(rules: []const Rule, key: Key) ChainAnswer {
     if (winnerFor(rules, key)) |winner| return .{ .decision = winner.decision, .named = true };
     if (winnerFor(defaults.rules, key)) |winner| {
@@ -1200,19 +668,14 @@ fn rulesAnswer(rules: []const Rule, key: Key) ChainAnswer {
     return .{ .decision = .ask, .named = false };
 }
 
-/// `evaluateRules`, for a layer that is read as a ceiling: **a key no rule
-/// names answers `allow`**, which is no ceiling at all rather than the safe
-/// answer to a question about an act.
-///
-/// The same rules and the same winner. See this file's own top comment for
-/// which layer is read which way and why the two defaults have to differ.
+/// `evaluateRules`, for a layer read as a ceiling: a key no rule names answers
+/// `allow`, which is no ceiling at all rather than the safe answer to a
+/// question about an act.
 fn ceilingRules(rules: []const Rule, key: Key) Decision {
     const answer = winnerFor(rules, key) orelse return .allow;
     return answer.decision;
 }
 
-/// The one rule of `rules` that answers for `key`, or null when none matches.
-/// The two readings above differ only in what they make of null.
 fn winnerFor(rules: []const Rule, key: Key) ?Rule {
     // Chock builds every key itself, out of names it already holds. An empty
     // part means the caller is broken, not that the file is.
@@ -1233,15 +696,6 @@ fn winnerFor(rules: []const Rule, key: Key) ?Rule {
     return winner;
 }
 
-/// True when any rule of `rules` could permit something under `key.action`.
-/// See `Table.permitsSomethingUnder`, which is the only reading of this.
-/// True when some rule that is not a `deny` names `prefix` itself or names
-/// something under it, whatever tool, model or agent kind it is written for.
-///
-/// **The action alone, unlike `rulesReachBelow`.** That one answers a
-/// question about one call, so it folds the other three patterns against that
-/// call's own key. This answers a question about a whole session, which has
-/// no key yet.
 fn rulesPermitBelow(rules: []const Rule, prefix: []const u8) bool {
     std.debug.assert(prefix.len > 0);
     for (rules) |rule| {
@@ -1265,31 +719,16 @@ fn rulesReachBelow(rules: []const Rule, key: Key) bool {
     return false;
 }
 
-/// True when `pattern` names the prefix itself or names something under it.
-///
-/// Two ways, because a rule can sit on either side of the prefix:
-///
-/// * `net.connect.com.anthropic.*` **matches** the value
-///   `net.connect.com.anthropic.api`, so a class rule above the prefix reaches
-///   everything below it.
-/// * `net.connect.com.anthropic.api.443` **is under**
-///   `net.connect.com.anthropic.api`, so an exact rule for one port of a host
-///   reaches that host.
-///
-/// A rule with no action at all names every action, so it reaches everything.
+/// A rule can sit on either side of the prefix: `net.connect.com.anthropic.*`
+/// matches the value `net.connect.com.anthropic.api`, and
+/// `net.connect.com.anthropic.api.443` is under `net.connect.com.anthropic.api`.
 fn actionReachesBelow(pattern: ?[]const u8, prefix: []const u8) bool {
     const text = pattern orelse return true;
     if (patternMatches(text, prefix)) return true;
-    // `classPrefix` takes the `.*` off a class, so `net.connect.com.*` reads
-    // here as the name `net.connect.com`, which is the shape a rule under the
-    // prefix has once its class marker is gone.
-    //
-    // **Equal counts, and it is the case `patternMatches` above cannot
-    // answer.** `net.connect.com.anthropic.*` does not match the value
+    // Equal counts, and it is the case `patternMatches` cannot answer.
+    // `net.connect.com.anthropic.*` does not match the value
     // `net.connect.com.anthropic`, because a class never matches its own
-    // prefix, and yet it does permit `net.connect.com.anthropic.443`. So the
-    // host `anthropic.com` is reached by that rule and the query for it has to
-    // say so.
+    // prefix, and yet it does permit `net.connect.com.anthropic.443`.
     const body = classPrefix(text) orelse text;
     return std.mem.startsWith(u8, body, prefix) and
         (body.len == prefix.len or body[prefix.len] == '.');
@@ -1302,10 +741,6 @@ fn ruleMatches(rule: Rule, key: Key) bool {
         patternMatches(rule.agent_kind, key.agent_kind);
 }
 
-/// True when `candidate` answers instead of `best`. The two rules are compared
-/// one field at a time, in the order this file's top comment gives, and the
-/// more restrictive decision breaks a tie. The order is therefore total, and
-/// the answer never depends on the order the rules have in the file.
 fn ruleBeats(candidate: Rule, best: Rule) bool {
     inline for (.{ "action", "tool", "model", "agent_kind" }) |field| {
         const left = patternScore(@field(candidate, field));
@@ -1315,20 +750,11 @@ fn ruleBeats(candidate: Rule, best: Rule) bool {
     return candidate.decision.rank() < best.decision.rank();
 }
 
-/// The prefix of a class pattern. `git.*` names the class of every action
-/// below `git`. Null when the pattern names one value exactly.
 fn classPrefix(pattern: []const u8) ?[]const u8 {
     if (!std.mem.endsWith(u8, pattern, ".*")) return null;
     return pattern[0 .. pattern.len - 2];
 }
 
-/// True when `pattern` names `value`. An absent pattern names every value.
-///
-/// **Public because the pattern language is this file's**, and
-/// `lib/chock-policy/ratchet.zig` reads the same key with the same rules. A
-/// second implementation of `git.*` would be a second answer to "does this rule
-/// cover this action", and the two would disagree the first time one of them
-/// changed.
 pub fn patternMatches(pattern: ?[]const u8, value: []const u8) bool {
     const text = pattern orelse return true;
     const prefix = classPrefix(text) orelse return std.mem.eql(u8, text, value);
@@ -1338,15 +764,6 @@ pub fn patternMatches(pattern: ?[]const u8, value: []const u8) bool {
         value[prefix.len] == '.';
 }
 
-/// True when every name `inner` names is also named by `outer`.
-///
-/// `patternMatches` answers about one value. This answers about one pattern,
-/// which is the question `lib/chock-policy/ratchet.zig` asks when an agent
-/// proposes a restriction over a whole class: `git.*` covers `git.push` and
-/// covers `git.branch.*`, and `git.push` covers only itself.
-///
-/// **A name is a pattern that names itself**, so this answers `patternMatches`
-/// for an `inner` that names one value exactly, and the two never disagree.
 pub fn patternCovers(outer: []const u8, inner: []const u8) bool {
     const outer_prefix = classPrefix(outer) orelse return std.mem.eql(u8, outer, inner);
     const inner_prefix = classPrefix(inner) orelse return patternMatches(outer, inner);
@@ -1357,13 +774,6 @@ pub fn patternCovers(outer: []const u8, inner: []const u8) bool {
         inner_prefix[outer_prefix.len] == '.';
 }
 
-/// True when `pattern` is a pattern this file's language allows: a name, or a
-/// name and `.*`. A bare `"*"` is not one, and neither is a name that holds a
-/// `*` or the byte `fresh_marker` invents.
-///
-/// **Public for `lib/chock-policy/ratchet.zig`**, which reads a pattern an
-/// agent wrote rather than one `chock.zon` holds. `validatePattern` is the
-/// same check with the message a file's author needs.
 pub fn patternIsWellFormed(pattern: []const u8) bool {
     if (std.mem.eql(u8, pattern, "*")) return false;
     const body = classPrefix(pattern) orelse pattern;
@@ -1372,26 +782,13 @@ pub fn patternIsWellFormed(pattern: []const u8) bool {
         std.mem.indexOfScalar(u8, body, 0) == null;
 }
 
-/// The longest single label this file lets a caller build into an action
-/// name. Sixty four, moved down from `chock_core.mcp.max_name_bytes`, which
-/// this same number used to bound alone before `labelIsUsable` existed.
 pub const max_label_bytes = 64;
 
-/// True when `bytes` can be one label of an action name: a segment between
-/// two dots, or the whole name when it holds none.
-///
-/// Letters, digits, hyphen and underscore, one byte up to `max_label_bytes`.
-/// **No dot**, which is what separates the segments of an action name: a
-/// caller that could put one in a label could name a class of actions an
-/// author never wrote. **No `*`**, for the same reason `patternIsWellFormed`
-/// above refuses one: it names a class, and a label is not a class. No NUL.
-///
-/// **Down from `chock_core.mcp.nameIsUsable`, which now calls this.** The
-/// rule used to live there alone, and `lib/chock-core/lsp_driver.zig`
-/// borrowed it a second time. `chock-policy` imports no other chock library,
-/// so a device identity needed the same rule and a naive implementation would
-/// have made a third copy. One copy, in the lowest layer both callers already
-/// sit above, is the fix: see `lib/chock-policy/devices.zig`.
+/// Letters, digits, hyphen and underscore. No dot, which separates the
+/// segments of an action name, so a caller that could put one in a label could
+/// name a class of actions an author never wrote. No `*`, and no NUL.
+/// `chock-policy` imports no other chock library, so this is the lowest layer
+/// `chock_core.mcp.nameIsUsable` and `devices.zig` both sit above already.
 pub fn labelIsUsable(bytes: []const u8) bool {
     if (bytes.len == 0 or bytes.len > max_label_bytes) return false;
     for (bytes) |byte| {
@@ -1404,13 +801,6 @@ pub fn labelIsUsable(bytes: []const u8) bool {
     return true;
 }
 
-/// The score of every exact name, which is above the score of every class. A
-/// class score is the number of names in its prefix, and no file can push that
-/// this high, because `max_file_bytes` bounds the length of a name.
-///
-/// Every exact name holds the same score. Two exact patterns that both match
-/// one key are the same string, so nothing about the name itself can ever
-/// break a tie between two rules that both match.
 const exact_score: u64 = 1 << 32;
 
 fn patternScore(pattern: ?[]const u8) u64 {
@@ -1423,20 +813,15 @@ fn segmentCount(name: []const u8) u64 {
     return std.mem.count(u8, name, ".") + 1;
 }
 
-/// The hash of one policy source, so two sources can be compared.
 pub fn hashSource(source: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var out: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source, &out, .{});
     return out;
 }
 
-/// The `Ast` and the `Zoir` of one parse, plus the diagnostics that report
-/// what was wrong with them.
-///
-/// `std.zon.parse.Diagnostics.deinit` frees the two trees that were given to
-/// the parse call, and the parse call takes them the moment it starts. Before
-/// that call the trees are ours to free. `diag_owns_trees` holds which of the
-/// two is true, so every failure path frees the trees exactly one time.
+/// `std.zon.parse.Diagnostics.deinit` frees the two trees given to the parse
+/// call, and the parse call takes them the moment it starts. `diag_owns_trees`
+/// holds which side owns them, so every failure path frees them exactly once.
 const Trees = struct {
     ast: std.zig.Ast,
     zoir: std.zig.Zoir,
@@ -1450,21 +835,16 @@ const Trees = struct {
         var ast_owned = true;
         errdefer if (ast_owned) ast.deinit(gpa);
 
-        // `parse_str_lits = false` matches what `std.zon.parse.fromSlice`
-        // does. The parse call below reads the string literals from the `Ast`,
-        // and this file only reads field names, which are always available.
+        // `parse_str_lits = false` matches `std.zon.parse.fromSlice`. This
+        // file reads only field names, which are always available.
         var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = false });
         var zoir_owned = true;
         errdefer if (zoir_owned) zoir.deinit(gpa);
 
-        // A syntax error also arrives here, because `ZonGen.generate` lowers
-        // the errors of the `Ast` into its own. When there is one, the `Zoir`
-        // holds no nodes at all, so nothing may walk it.
+        // A syntax error arrives here too, because `ZonGen.generate` lowers
+        // the errors of the `Ast` into its own. The `Zoir` then holds no nodes
+        // at all, so nothing may walk it.
         if (zoir.hasCompileErrors()) {
-            // The two trees carry the message, the line and the column, so
-            // they go to the caller whole rather than being flattened to a
-            // printed line here. `std.zon.parse.Diagnostics` owns both from
-            // this point, which is the same handover `parse` makes below.
             if (note(diag, .{ .file_not_zon = .{ .ast = ast, .zoir = zoir } })) {
                 ast_owned = false;
                 zoir_owned = false;
@@ -1486,9 +866,6 @@ const Trees = struct {
     }
 };
 
-/// The node of the `policy` field at the top of the file. Null when the file
-/// has no such field, which is a file that says nothing about policy, and
-/// therefore a table where every key resolves to `ask`.
 fn findPolicyNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Zoir.Node.Index {
     const root: std.zig.Zoir.Node.Index = .root;
     switch (root.get(zoir)) {
@@ -1508,14 +885,9 @@ fn findPolicyNode(zoir: std.zig.Zoir, diag: ?*?Diagnostic) ParseError!?std.zig.Z
     }
 }
 
-/// Everything about a policy that must be right before a session starts. A
-/// mistake here is reported when Chock reads the file. The user does not read
-/// about it on the turn that happens to hit the rule.
 fn validate(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagnostic) ParseError!void {
     // The counts come first, because every check below costs time in the
-    // number of rules and the read time check costs a great
-    // deal of it. `chock.zon` comes from the project directory, so a hostile
-    // project writes it.
+    // number of rules and the read time check costs a great deal of it.
     if (policy.rules.len > max_rules) {
         _ = note(diag, .{ .too_many_rules = policy.rules.len });
         return error.TooManyRules;
@@ -1567,8 +939,6 @@ fn findAgent(agents: []const Agent, kind: []const u8) ?Agent {
     return null;
 }
 
-/// `field` is always a literal of this file, so the diagnostic borrows it and
-/// copies nothing.
 fn validatePattern(field: []const u8, pattern: ?[]const u8, diag: ?*?Diagnostic) ParseError!void {
     const text = pattern orelse return;
     if (std.mem.eql(u8, text, "*")) {
@@ -1581,7 +951,6 @@ fn validatePattern(field: []const u8, pattern: ?[]const u8, diag: ?*?Diagnostic)
     }
 }
 
-/// `field` is always a literal of this file. See `validatePattern`.
 fn validateName(field: []const u8, name: []const u8, diag: ?*?Diagnostic) ParseError!void {
     if (name.len > 0 and
         std.mem.indexOfScalar(u8, name, '*') == null and
@@ -1597,7 +966,6 @@ fn checkNoCycle(gpa: std.mem.Allocator, agents: []const Agent, diag: ?*?Diagnost
         while (current.parent) |parent| {
             steps += 1;
             if (steps > agents.len) {
-                // Copied, for the reason `validate` gives above.
                 if (wantsDiagnostic(diag)) {
                     _ = note(diag, .{ .agent_cycle = try gpa.dupe(u8, start.kind) });
                 }
@@ -1608,14 +976,9 @@ fn checkNoCycle(gpa: std.mem.Allocator, agents: []const Agent, diag: ?*?Diagnost
     }
 }
 
-/// A declared child must hold no more than its declared parent, for every
-/// key. There is no need to walk every key that exists, because `rules`,
-/// together with the shipped defaults `evaluateRules` can also answer a key
-/// from, can only tell a finite number of classes of key apart. See
-/// `representatives`.
-///
-/// Finite is not the same as small. `checkWorkFitsBudget` counts the walk
-/// before the walk starts, and refuses a file that asks for too much of it.
+/// There is no need to walk every key that exists, because `rules` and the
+/// shipped defaults together tell only a finite number of classes apart.
+/// Finite is not small: `checkWorkFitsBudget` counts the walk before it starts.
 fn checkChildrenAreWeaker(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagnostic) ParseError!void {
     if (policy.agents.len == 0) return;
 
@@ -1638,8 +1001,6 @@ fn checkChildrenAreWeaker(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagn
         .actions = actions.len,
         .links = links,
         .rules = policy.rules.len,
-        // `defaults.zig`'s own patterns are read too, whenever the file's own
-        // rules name nothing that matches. See `checkWorkFitsBudget`.
         .longest_name = @max(longestPattern(policy.rules), longestPattern(defaults.rules)),
     }, diag);
 
@@ -1660,10 +1021,8 @@ fn checkChildrenAreWeaker(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagn
             });
             if (child_answer.rank() <= parent_answer.rank()) continue;
 
-            // Every name here is copied. The two kinds live in the `Policy`
-            // that `Table.parse` releases on this path, and a model, a tool,
-            // or an action can also be a name `representatives` invented in
-            // the arena above, which this function ends on the way out.
+            // Every name here is copied. Some live in the `Policy` this path
+            // releases, and some in the arena this function ends on the way out.
             if (wantsDiagnostic(diag)) {
                 var owned: Diagnostic = .{ .child_stronger_than_parent = .{
                     .kind = "",
@@ -1688,52 +1047,30 @@ fn checkChildrenAreWeaker(gpa: std.mem.Allocator, policy: Policy, diag: ?*?Diagn
     }
 }
 
-/// The length below which one read of a rule costs what a read of a name of
-/// this length costs. A read compares up to four names, and it also does the
-/// work around those comparisons, so the cost of a read stops falling once the
-/// names are short. Measured with `--release=safe`: a read over names of 4
-/// bytes and a read over names of 64 bytes both cost about 15 to 20
-/// nanoseconds, and a read over names of 4600 bytes costs 460.
+/// A read compares up to four names and also does the work around those
+/// comparisons, so the cost of a read stops falling once the names are short.
+/// With `--release=safe`, a read over names of 4 bytes and one over names of
+/// 64 bytes both cost about 15 to 20 nanoseconds, and one over 4600 bytes 460.
 const shortest_billed_name = 64;
 
-/// How far the read time check must walk, and what one step of
-/// it costs. `checkWorkFitsBudget` turns this into one number.
 const Walk = struct {
-    /// The three representative lists. See `representatives`.
     models: u64,
     tools: u64,
     actions: u64,
-    /// How many declared parent links the walk covers.
     links: u64,
-    /// How many rules of the file itself each key is read against.
-    /// `checkWorkFitsBudget` adds `defaults.rules.len` to this before it
-    /// counts a read, because `evaluateRules` reads that many more whenever
-    /// this file's own rules name nothing that matches. This field stays the
-    /// file's own count, and not the sum, because `Diagnostic.format` reports
-    /// it as "the rules hold {d} lines", which must describe what the author
-    /// wrote and not a number that includes rules they did not write.
+    /// The file's own count, and never the sum with `defaults.rules.len`,
+    /// because `Diagnostic.format` reports it as "the rules hold {d} lines",
+    /// which must describe what the author wrote.
     rules: u64,
-    /// The longest name any rule spells out, in bytes.
     longest_name: u64,
 };
 
-/// Refuse a policy whose read time check would cost more than
-/// `max_check_work`. The walk reads every rule two times for each key, the
-/// number of keys is the product of the three representative lists and the
-/// number of declared links, and one read costs what the names are long.
+/// Every key is read against `defaults.zig`'s rules as well as the file's own.
+/// That second read never happens for a key the file already answered, but the
+/// budget must count it, because the count comes before the work.
 ///
-/// **Every key is read against `defaults.zig`'s rules as well as the file's
-/// own.** `evaluateRules`, which `checkChildrenAreWeaker` calls to answer for
-/// a key, tries the file's own rules first and reads every one of
-/// `defaults.rules` only when none of those matched. That second read never
-/// happens for a key the file's own rules already answered, but the budget
-/// must count the case where it does, because the count of the work comes
-/// before the work runs and cannot yet know which keys those will be.
-///
-/// The count of the work comes before the work, so a hostile `chock.zon`
-/// cannot hold the start of a session. The count is in `u64` and the
-/// arithmetic saturates, because the product of six numbers a file controls
-/// overflows any register.
+/// The arithmetic saturates, because the product of six numbers a file
+/// controls overflows any register.
 fn checkWorkFitsBudget(walk: Walk, diag: ?*?Diagnostic) ParseError!void {
     const name_cost = @max(walk.longest_name, shortest_billed_name);
     const keys = walk.models *| walk.tools *| walk.actions *| walk.links;
@@ -1755,15 +1092,10 @@ fn checkWorkFitsBudget(walk: Walk, diag: ?*?Diagnostic) ParseError!void {
     return error.PolicyTooComplex;
 }
 
-/// The end of an English plural, for a count in a message to the user.
 fn plural(count: u64) []const u8 {
     return if (count == 1) "" else "s";
 }
 
-/// The longest pattern any rule spells out, in bytes. A read of one rule
-/// compares the key against up to four of these, and the value in the key is
-/// a name Chock holds, so the pattern is what bounds the length of the
-/// comparison.
 fn longestPattern(rules: []const Rule) usize {
     var longest: usize = 0;
     for (rules) |rule| {
@@ -1779,40 +1111,12 @@ fn longestPattern(rules: []const Rule) usize {
 const fresh_marker = "\x00";
 
 /// One value for each class of value the rules can tell apart, for one field.
-/// Two values in the same class match exactly the same rules, so one of them
-/// answers for all of them. The list holds every name `rules` spells out, one
-/// invented name below each class `rules` names, one invented name that no
-/// pattern in `rules` matches at all, and the same again for every pattern
-/// `lib/chock-policy/defaults.zig` ships for this field.
 ///
-/// **The defaults must be sampled too, or the walk below is answering a
-/// question `evaluateRules` was never actually asked.** `evaluateRules`
-/// answers a key from `defaults.zig`'s rules whenever `rules` itself names
-/// nothing that matches, so a class only a default tells apart is still a
-/// class `checkChildrenAreWeaker` must walk. `defaults.zig` currently names
-/// only `.action`, so this only widens the action list in practice, but the
-/// widening has to come from here and not from a special case in the caller,
-/// because the caller does not know which field a future default will name.
-///
-/// Before this, the action list held only the classes the file's own rules
-/// named, plus one invented name matching none of them. `evaluateRules`
-/// could still answer that invented name through a shipped default the walk
-/// had never sampled, because the invented name was chosen to match nothing
-/// in `rules` and it also, by construction, matched nothing in
-/// `defaults.zig`. A child that named no rule at all then read as `ask`
-/// against `ask` for every action the walk tried, and passed, while the same
-/// child read as `allow` for a real action such as `call.write_file`, which
-/// a shipped default answers and the walk never tried.
-///
-/// This is what makes the check in `checkChildrenAreWeaker` finite. That check
-/// walks the product of three of these lists for each declared parent link, so
-/// it reads at most the cube of one more than the number of names either list
-/// spells out, for each field, for each link. `checkWorkFitsBudget` refuses a
-/// policy that reaches too far up that cube.
-///
-/// A name that two rules share earns one entry, whichever of the two lists
-/// either rule comes from, because a second entry would only make the walk
-/// read the same key again.
+/// The shipped defaults must be sampled too, or the walk answers a question
+/// `evaluateRules` was never asked: it answers a key from `defaults.zig`
+/// whenever `rules` names nothing that matches. Sampling the file's own
+/// classes alone let a child that named no rule read as `ask` for every action
+/// the walk tried, and as `allow` for `call.write_file`.
 fn representatives(
     arena: std.mem.Allocator,
     rules: []const Rule,
@@ -1827,9 +1131,6 @@ fn representatives(
     return list.items;
 }
 
-/// The half of `representatives` that reads one rule list. Called once for
-/// `rules` and once for `defaults.rules`, into the same list, so a name
-/// either list spells out earns exactly one entry between them.
 fn appendRepresentatives(
     arena: std.mem.Allocator,
     list: *std.ArrayList([]const u8),
@@ -1854,14 +1155,6 @@ fn holdsName(names: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// A name from `representatives`, written the way the author would have
-/// written it, with the field it names.
-///
-/// An invented name holds `fresh_marker`. The bare marker stands for every
-/// value the rules do not name, and there is no way to write that in the file,
-/// so this prints `any action` and not a pattern the reader would refuse. An
-/// invented name below a class stands for that class, and this prints the
-/// class the way the author wrote it, as `the action git.*`.
 const NameForMessage = struct {
     field: []const u8,
     name: []const u8,
@@ -1875,12 +1168,9 @@ const NameForMessage = struct {
     }
 };
 
-// Every test below builds its own policy source in the test binary, and the one
-// test that needs a real file writes it into a fresh `std.testing.tmpDir`. No
-// test reads the checkout that Chock itself lives in.
+// Every test below builds its own policy source in the test binary. No test
+// reads the checkout that Chock itself lives in.
 
-/// A key for one agent kind and one action, with the two parts these tests do
-/// not vary held still.
 fn testKey(agent_kind: []const u8, action: []const u8) Key {
     return .{
         .agent_kind = agent_kind,
@@ -1890,19 +1180,14 @@ fn testKey(agent_kind: []const u8, action: []const u8) Key {
     };
 }
 
-/// The absolute path of an already open directory. `std.testing.tmpDir` hands
-/// back a directory that only a relative path reaches, and `Table.load` needs
-/// a project root that does not depend on the working directory of the test
-/// binary. Mirrors the helper of the same name in
-/// `lib/chock-workspace/worktree.zig`.
+/// `std.testing.tmpDir` hands back a directory that only a relative path
+/// reaches, and `Table.load` needs a project root that does not depend on the
+/// working directory of the test binary.
 fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![]u8 {
     const len = dir.realPath(std.testing.io, buffer) catch return error.RealPathFailed;
     return buffer[0..len];
 }
 
-/// A policy source with `count` copies of `item` between `head` and `tail`.
-/// Every `#` in `item` becomes the number of the copy, so each copy names a
-/// different rule or a different agent kind.
 fn repeatedSource(
     gpa: std.mem.Allocator,
     head: []const u8,
@@ -1929,12 +1214,6 @@ fn repeatedSource(
     return out.toOwnedSliceSentinel(gpa, 0);
 }
 
-/// A policy of `rules` rules under one declared parent link, where every rule
-/// names a model, a tool and an action of its own, and every name is
-/// `name_bytes` long. Two names of one field differ only in the digits at the
-/// end, which is the shape that reads the most bytes for each comparison.
-///
-/// `name_bytes` must hold the digits of the largest index and one byte more.
 fn wideSource(gpa: std.mem.Allocator, rules: usize, name_bytes: usize) ![:0]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -1957,7 +1236,6 @@ fn wideSource(gpa: std.mem.Allocator, rules: usize, name_bytes: usize) ![:0]u8 {
     return out.toOwnedSliceSentinel(gpa, 0);
 }
 
-/// The name `wideSource` gives to the field of the rule with this index.
 fn wideName(buffer: []u8, index: usize, name_bytes: usize) ![]u8 {
     var digits: [24]u8 = undefined;
     const number = try std.fmt.bufPrint(&digits, "{d}", .{index});
@@ -1966,9 +1244,6 @@ fn wideName(buffer: []u8, index: usize, name_bytes: usize) ![]u8 {
     return buffer[0..name_bytes];
 }
 
-/// The name of every public function of this file, and of `Table`, that takes
-/// a mutable `*Table` in any position. There must be none, because
-/// `parse` and `load` hand back a `*const Table` and `destroy` takes one.
 fn mutableTableFunctionNames() []const []const u8 {
     comptime {
         var names: []const []const u8 = &.{};
@@ -1996,8 +1271,6 @@ fn mutableTableFunctionNames() []const []const u8 {
 test "a policy that names an action exactly beats one that names a class" {
     const gpa = std.testing.allocator;
 
-    // The same two rules in both orders. The answer must not depend on which
-    // one the author wrote first.
     const class_first: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2028,7 +1301,6 @@ test "a policy that names an action exactly beats one that names a class" {
         try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(testKey("main", "git.branch.delete")));
     }
 
-    // A longer prefix beats a shorter one, for the same reason.
     const nested: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2046,12 +1318,6 @@ test "a policy that names an action exactly beats one that names a class" {
 }
 
 test "a name the author never wrote a rule about reaches nothing, and one they wrote a port rule about does" {
-    // **The reading a resolver needs, and neither of the other two.** A host
-    // name is looked up before any connection exists, so there is no port and
-    // no full action to ask about. `evaluateChain` on the bare prefix answers
-    // `ask` for a project whose only rule names one port, and `ceilingChain`
-    // answers `allow` for a host nobody named at all. See
-    // `Table.permitsSomethingUnder`.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2067,28 +1333,12 @@ test "a name the author never wrote a rule about reaches nothing, and one they w
     const table = try Table.parse(gpa, source, null);
     defer Table.destroy(gpa, table);
 
-    // A rule **under** the prefix reaches it. This is the case that makes the
-    // whole query necessary: the author wrote a rule about one port of this
-    // host, and the name has to resolve for that rule to be reachable at all.
-    //
-    // Mutation check: delete the second half of `actionReachesBelow`, the one
-    // that reads a rule under the prefix, and this line fails.
     try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic.api")));
 
-    // A host nobody named reaches nothing. **This is what stops every name in
-    // the world resolving**, which is what `ceilingChain` alone would do.
     try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.test.evil.secret")));
 
-    // A `deny` rule is not a rule that reaches. An author who wrote only a
-    // refusal about a host wrote nothing that could permit anything under it.
-    //
-    // Mutation check: delete the `rule.decision == .deny` skip in
-    // `rulesReachBelow` and this line fails.
     try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.com.evil.metadata")));
 
-    // The three parts of the key that are not the action still have to match.
-    // `testKey` names the tool `git`, and both rules above name it too, so a
-    // different tool reaches neither of them.
     try std.testing.expect(!table.permitsSomethingUnder(.{
         .agent_kind = "main",
         .model = "test-model",
@@ -2112,38 +1362,18 @@ test "a class rule above a host reaches every host under it, and a rule about a 
     const table = try Table.parse(gpa, source, null);
     defer Table.destroy(gpa, table);
 
-    // The class matches the prefix itself, so every host under it resolves.
-    //
-    // Mutation check: delete the `patternMatches` half of `actionReachesBelow`
-    // and this line fails while the exact port rule of the test above still
-    // passes.
     try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic.api")));
-    // **And the host the class is named after, which is the case a reader
-    // gets wrong.** `net.connect.com.anthropic.*` does not match the value
-    // `net.connect.com.anthropic`, because a class never matches its own
-    // prefix, and yet it plainly permits `net.connect.com.anthropic.443`. So
-    // `anthropic.com` itself has to resolve.
-    //
-    // Mutation check: read `actionReachesBelow`'s last comparison as
-    // `body.len > prefix.len` and this line fails while the one above it
-    // passes.
     try std.testing.expect(table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropic")));
 
-    // **A name that only looks like it is under the class is not.** The labels
-    // run the other way round for exactly this reason: a request for
-    // `evil.com.anthropic.api` becomes `net.connect.api.anthropic.com.evil`,
+    // The labels run the other way round for exactly this reason: a request
+    // for `evil.com.anthropic.api` becomes `net.connect.api.anthropic.com.evil`,
     // which this class does not reach.
     try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.api.anthropic.com.evil")));
 
-    // And a host of a different company, which shares no label with the class.
     try std.testing.expect(!table.permitsSomethingUnder(testKey("main", "net.connect.com.anthropicx")));
 }
 
 test "a subagent's policy is the intersection of its parent's and its kind's" {
-    // Never a superset. A tree 6 deep becomes weaker at the
-    // leaves, and this test proves a child cannot hold a permission its parent
-    // lacks: `a3` and `a5` each hold an `allow` of their own, and the chain
-    // takes both away.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2171,9 +1401,6 @@ test "a subagent's policy is the intersection of its parent's and its kind's" {
         try std.testing.expectEqual(want, table.evaluateKindAlone(testKey(kind, "git.push")));
     }
 
-    // What the chain says at each depth. `a3` asks although its own kind
-    // allows, because `a2` only asks. `a5` is denied although its own kind
-    // allows, because `a4` denies.
     const want_chain = [_]Decision{ .allow, .allow, .ask, .ask, .deny, .deny };
     for (1..chain.len + 1) |depth| {
         const links = chain[0..depth];
@@ -2183,7 +1410,6 @@ test "a subagent's policy is the intersection of its parent's and its kind's" {
         if (depth > 1) {
             const parent_links = chain[0 .. depth - 1];
             const parent = table.evaluateChain(parent_links, testKey(parent_links[depth - 2], "git.push"), null);
-            // Never a superset: the child holds at most what the parent holds.
             try std.testing.expect(got.rank() <= parent.rank());
         }
     }
@@ -2193,8 +1419,6 @@ test "a subagent's policy is the intersection of its parent's and its kind's" {
 }
 
 test "an action no rule names resolves to ask, never to allow" {
-    // The safe default. A policy that forgot a case must not become
-    // permission.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2211,17 +1435,13 @@ test "an action no rule names resolves to ask, never to allow" {
     const table = try Table.parse(gpa, source, null);
     defer Table.destroy(gpa, table);
 
-    // This action has a name of its own, and this policy forgot it.
     try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "net.fetch")));
-    // `git.*` names everything below `git`, and not `git` itself.
     try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git")));
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "main", "reviewer" }, testKey("reviewer", "net.fetch"), null),
     );
 
-    // A file with an empty policy block, and a file that says nothing about
-    // policy at all, both answer `ask` for every key.
     for ([_][:0]const u8{ ".{ .policy = .{} }", ".{}", ".{ .models = .{} }" }) |empty_source| {
         const empty = try Table.parse(gpa, empty_source, null);
         defer Table.destroy(gpa, empty);
@@ -2231,11 +1451,6 @@ test "an action no rule names resolves to ask, never to allow" {
 }
 
 test "a project can write the two review decisions, and a child still cannot climb to one" {
-    // The two decisions a reviewer answers are written in `chock.zon` like
-    // any other, and the intersection holds over them: the order of
-    // `Decision`'s members is what a child
-    // cannot climb, and `lib/chock-broker/review.zig` is what turns that into
-    // an act.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2262,30 +1477,21 @@ test "a project can write the two review decisions, and a child still cannot cli
         table.evaluateKindAlone(testKey("main", "git.push")),
     );
 
-    // A worker under a cautious parent gets the parent's `ask`, although its
-    // own kind holds `agent_review`. That is the ratchet: narrowing is free
-    // and climbing is not, so a reviewer is never reached for this key at all.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "cautious", "worker" }, testKey("worker", "workspace.apply"), null),
     );
-    // And the other way round the child keeps the narrower of the two.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "worker", "cautious" }, testKey("cautious", "workspace.apply"), null),
     );
 
-    // A file with a decision name this reader does not know is refused rather
-    // than read as the nearest one it does. A misspelled decision that became
-    // `allow` is the worst failure this file has.
     try std.testing.expectError(error.InvalidPolicy, Table.parse(gpa,
         \\.{ .policy = .{ .rules = .{ .{ .action = "git.push", .decision = .agent_reveiw } } } }
     , null));
 }
 
 test "a policy that gives a child more than its parent is refused when it is read" {
-    // Not at evaluation time. A configuration mistake is reported when Chock
-    // reads the file, not on the turn that happens to hit it.
     const gpa = std.testing.allocator;
 
     const child_rule_is_stronger: [:0]const u8 =
@@ -2307,9 +1513,6 @@ test "a policy that gives a child more than its parent is refused when it is rea
         Table.parse(gpa, child_rule_is_stronger, null),
     );
 
-    // The same mistake with no rule for the child at all: the child falls back
-    // to a rule that names every kind, and that fallback is stronger than what
-    // its parent holds. The check must cover a key the child never names.
     const child_falls_back_stronger: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2329,10 +1532,6 @@ test "a policy that gives a child more than its parent is refused when it is rea
         Table.parse(gpa, child_falls_back_stronger, null),
     );
 
-    // The two review decisions are ranked with the other three, so the
-    // read time check covers them with no branch of its own. A child that may
-    // have a machine answer for it, under a parent that has to wake a person,
-    // is a child stronger than its parent.
     const child_would_be_reviewed: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2352,8 +1551,6 @@ test "a policy that gives a child more than its parent is refused when it is rea
         Table.parse(gpa, child_would_be_reviewed, null),
     );
 
-    // The mirror image reads without complaint, and only then is there a table
-    // to evaluate at all.
     const child_is_weaker: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2375,20 +1572,6 @@ test "a policy that gives a child more than its parent is refused when it is rea
 }
 
 test "a child with no rule at all can still outrank a parent's blanket rule, through a shipped default the walk never sampled" {
-    // `representatives` used to sample the file's own action classes only,
-    // plus one invented name built to match none of them. `evaluateRules`
-    // still answers an unmatched key from `lib/chock-policy/defaults.zig`
-    // whenever the file's own rules name nothing that matches, and a real
-    // action such as `call.write_file` matches one of those shipped defaults
-    // even though the invented name does not. The walk below tried only the
-    // invented name, so it never tried a key that told the child and the
-    // parent apart, and `Table.parse` accepted a child that could hold
-    // `allow` where its parent holds `ask`.
-    //
-    // The parent names one rule, and it names no action at all, so it
-    // answers `ask` for every key including `call.write_file`. The child
-    // names no rule at all, so `call.write_file` falls all the way through
-    // to the shipped default, which is `allow`.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2408,10 +1591,6 @@ test "a child with no rule at all can still outrank a parent's blanket rule, thr
 }
 
 test "a child that narrows the same shipped default its parent narrows still loads" {
-    // The fix above must not turn the check into one that refuses every
-    // hierarchy that leans on a shipped default. A child whose own rule
-    // matches the parent's narrowing, action for action, is not a child
-    // stronger than its parent, and the file must still read.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2434,9 +1613,6 @@ test "a child that narrows the same shipped default its parent narrows still loa
 }
 
 test "an ordinary hierarchy with no chock.zon rules at all still loads" {
-    // Neither kind names a rule of its own, so both fall through to the same
-    // shipped defaults for every action, and the two must never disagree.
-    // A check that refused this would refuse the plainest hierarchy there is.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -2456,9 +1632,6 @@ test "an ordinary hierarchy with no chock.zon rules at all still loads" {
 }
 
 test "a field name with a typo inside the policy block is refused, not ignored" {
-    // A rule with no `action` matches every action. If this reader ignored a
-    // field name it did not know, `.actoin` would silently become a rule that
-    // permits far more than the author wrote.
     const gpa = std.testing.allocator;
 
     const typo: [:0]const u8 =
@@ -2472,16 +1645,12 @@ test "a field name with a typo inside the policy block is refused, not ignored" 
     ;
     try std.testing.expectError(error.InvalidPolicy, Table.parse(gpa, typo, null));
 
-    // A field name this reader does not know, outside the policy block, is a
-    // section of chock.zon that a later milestone adds. That one is ignored.
     const table = try Table.parse(gpa, ".{ .models = .{ .main = \"sonnet\" } }", null);
     defer Table.destroy(gpa, table);
     try std.testing.expectEqual(Decision.ask, table.evaluateKindAlone(testKey("main", "git.push")));
 }
 
 test "the table cannot be changed after a session starts" {
-    // Chock parses chock.zon once and holds it. A change to the
-    // file cannot change the policy of a running session.
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2500,26 +1669,15 @@ test "the table cannot be changed after a session starts" {
     const after_edit = ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .deny } } } }";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = after_edit });
 
-    // The session holds what it read.
     try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(testKey("main", "git.push")));
 
-    // The edit did reach the file, so the line above is a fact about the
-    // table and not about the file.
     const next_session = try Table.load(gpa, std.testing.io, project_root, null);
     defer Table.destroy(gpa, next_session);
     try std.testing.expectEqual(Decision.deny, next_session.evaluateKindAlone(testKey("main", "git.push")));
 
-    // Chock also compares the hash at the end of a session and reports a
-    // difference to the user. The table keeps what it read.
     try std.testing.expectEqualSlices(u8, &hashSource(at_start), &table.sourceHash());
     try std.testing.expect(!std.mem.eql(u8, &hashSource(after_edit), &table.sourceHash()));
 
-    // The two facts above are about these two tables. The three facts below
-    // are about the type, and they are what makes the rule hold for every
-    // table. `policy` points to const, so no rule can be written through it.
-    // `parse` and `load` hand back a `*const Table`, so no caller holds a
-    // table it could point at a different `Policy`. And no public function of
-    // this file asks for a mutable one.
     try std.testing.expect(@typeInfo(@FieldType(Table, "policy")).pointer.is_const);
     inline for (.{ Table.parse, Table.load }) |constructor| {
         const returns = @typeInfo(@typeInfo(@TypeOf(constructor)).@"fn".return_type.?)
@@ -2532,15 +1690,8 @@ test "the table cannot be changed after a session starts" {
 }
 
 test "an empty spawn chain answers ask, never allow" {
-    // `ApprovalRequest.spawn_chain` is JSON in the session log, so a replayed
-    // log can hold a chain with no links at all. That is a fault in the file
-    // and not a broken caller, so it gets the same answer as every other case
-    // the policy does not cover.
     const gpa = std.testing.allocator;
 
-    // A policy that says `allow` for every kind and every action. If an empty
-    // chain walked no link and kept the value it started with, the answer here
-    // would be `allow`, which is the one answer it must never be.
     const allows_everything: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2553,7 +1704,6 @@ test "an empty spawn chain answers ask, never allow" {
     const table = try Table.parse(gpa, allows_everything, null);
     defer Table.destroy(gpa, table);
 
-    // One link answers `allow`, so the table really does permit this key.
     try std.testing.expectEqual(
         Decision.allow,
         table.evaluateChain(&.{"main"}, testKey("main", "git.push"), null),
@@ -2562,8 +1712,6 @@ test "an empty spawn chain answers ask, never allow" {
     const empty: []const []const u8 = &.{};
     try std.testing.expectEqual(Decision.ask, table.evaluateChain(empty, testKey("main", "git.push"), null));
 
-    // A chain whose last link is not the kind that asked answers the same way.
-    // The two must not disagree about who asked.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "main", "reviewer" }, testKey("main", "git.push"), null),
@@ -2571,15 +1719,8 @@ test "an empty spawn chain answers ask, never allow" {
 }
 
 test "a spawn chain with a link of no name answers ask, never allow" {
-    // `ApprovalRequest.spawn_chain` is JSON in the session log, so a replayed
-    // log can hold a link whose `agent_kind` is the empty string. The format
-    // carries an empty string in other fields already. A name of no bytes is a
-    // kind the rules cannot be read for, so it gets the answer every other
-    // case the policy does not cover gets.
     const gpa = std.testing.allocator;
 
-    // The same policy the empty chain test uses: `allow` for every kind and
-    // every action. The answers below are therefore facts about the chain.
     const allows_everything: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2592,26 +1733,21 @@ test "a spawn chain with a link of no name answers ask, never allow" {
     const table = try Table.parse(gpa, allows_everything, null);
     defer Table.destroy(gpa, table);
 
-    // Two named links answer `allow`, so the table really does permit this key.
     try std.testing.expectEqual(
         Decision.allow,
         table.evaluateChain(&.{ "main", "reviewer" }, testKey("reviewer", "git.push"), null),
     );
 
-    // The root has no name. This chain passes the last link check, because its
-    // last link is the kind that asked, so nothing else stops it.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "", "reviewer" }, testKey("reviewer", "git.push"), null),
     );
 
-    // The agent that asked has no name.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{ "main", "" }, testKey("", "git.push"), null),
     );
 
-    // One link, and it has no name.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{""}, testKey("", "git.push"), null),
@@ -2619,14 +1755,9 @@ test "a spawn chain with a link of no name answers ask, never allow" {
 }
 
 test "a policy of few rules and long names is refused" {
-    // The length of a name is what the file says it is, and a read of a rule
-    // compares up to four of them. 72 rules of three names of 4600 bytes are
-    // inside `max_rules`, inside `max_agents` and inside `max_file_bytes`, and
-    // they make 7.8 * 10^7 reads, counting the rules `defaults.zig` ships and
-    // the action classes they add, as well as the file's own. That file
-    // measured 26 seconds of startup with `--release=safe`, before this
-    // reader counted reads at all: a bound that stopped at `max_rules`,
-    // `max_agents` and `max_file_bytes` alone would still have read it.
+    // 72 rules of three names of 4600 bytes are inside `max_rules`,
+    // `max_agents` and `max_file_bytes`, and that file took 26 seconds of
+    // startup with `--release=safe` before this reader counted reads at all.
     const gpa = std.testing.allocator;
 
     const long = try wideSource(gpa, 72, 4600);
@@ -2635,10 +1766,6 @@ test "a policy of few rules and long names is refused" {
     try std.testing.expect(long.len < max_file_bytes);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, long, null));
 
-    // The same shape at 27 rules, where the length of the name is the whole
-    // difference between the two answers. Both files hold 27 rules, 3 names
-    // each, and one declared parent link, so they walk the same number of
-    // keys and read the same number of rules.
     const long_names = try wideSource(gpa, 27, 4600);
     defer gpa.free(long_names);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, long_names, null));
@@ -2648,7 +1775,6 @@ test "a policy of few rules and long names is refused" {
     const table = try Table.parse(gpa, short_names, null);
     defer Table.destroy(gpa, table);
 
-    // The file that is read is a real table, and not an empty one.
     var buffer: [4]u8 = undefined;
     const name = try wideName(&buffer, 11, 4);
     try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(.{
@@ -2666,15 +1792,12 @@ test "a policy of few rules and long names is refused" {
 }
 
 test "a name that holds the byte the read time check invents is refused" {
-    // The read time check walks one invented name for each
-    // class of key, and it marks an invented name with a NUL byte. The file
-    // must not be able to write that byte. If it could, a rule could name the
-    // representative for "matches nothing", that class would stop being
-    // sampled, and a child could then hold `allow` where its parent only asks
-    // and still be read.
+    // The walk marks an invented name with a NUL byte. A rule that could name
+    // that byte would name the representative for "matches nothing", that
+    // class would stop being sampled, and a child could hold `allow` where its
+    // parent only asks and still be read.
     const gpa = std.testing.allocator;
 
-    // The exact collision: the rule names the representative itself.
     const holds_the_marker: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2691,7 +1814,6 @@ test "a name that holds the byte the read time check invents is refused" {
     ;
     try std.testing.expectError(error.InvalidPattern, Table.parse(gpa, holds_the_marker, null));
 
-    // The same byte inside the prefix of a class pattern.
     const class_prefix_holds_the_marker: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2703,7 +1825,6 @@ test "a name that holds the byte the read time check invents is refused" {
     ;
     try std.testing.expectError(error.InvalidPattern, Table.parse(gpa, class_prefix_holds_the_marker, null));
 
-    // An `agents` entry is read by `validateName`, which refuses the byte too.
     const kind_holds_the_marker: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2715,8 +1836,6 @@ test "a name that holds the byte the read time check invents is refused" {
     ;
     try std.testing.expectError(error.InvalidPattern, Table.parse(gpa, kind_holds_the_marker, null));
 
-    // Without the marker the same shape reads, so the refusal above is about
-    // the byte and not about the shape of the file.
     const same_shape_without_it: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2737,9 +1856,6 @@ test "a name that holds the byte the read time check invents is refused" {
 }
 
 test "a bare star is refused, so matching every value keeps one spelling" {
-    // "Match everything" is spelled by leaving the field out. Two spellings of
-    // one meaning is how a reader comes to believe a rule is narrower than it
-    // is.
     const gpa = std.testing.allocator;
 
     inline for (.{ "agent_kind", "model", "tool", "action" }) |field| {
@@ -2754,30 +1870,18 @@ test "a bare star is refused, so matching every value keeps one spelling" {
 }
 
 test "one pattern covers another only when it names everything that one names" {
-    // `patternCovers` is what `lib/chock-policy/ratchet.zig` asks when an agent
-    // proposes a restriction over a class rather than over one action. It has
-    // to agree with `patternMatches` wherever both can be asked, or a rule
-    // would cover an action the ratchet thought it did not.
     try std.testing.expect(patternCovers("git.push", "git.push"));
     try std.testing.expect(!patternCovers("git.push", "git.commit"));
-    // A class covers a name under it, and never the name it is built from.
     try std.testing.expect(patternCovers("git.*", "git.push"));
     try std.testing.expect(patternCovers("git.*", "git.branch.delete"));
     try std.testing.expect(!patternCovers("git.*", "git"));
-    // A class covers a narrower class, and a narrower class never covers it.
     try std.testing.expect(patternCovers("git.*", "git.*"));
     try std.testing.expect(patternCovers("git.*", "git.branch.*"));
     try std.testing.expect(!patternCovers("git.branch.*", "git.*"));
-    // A name never covers a class, however much of it the class names.
     try std.testing.expect(!patternCovers("git.push", "git.*"));
-    // A prefix of a name is not a prefix of a class: `git.*` is about the
-    // segment, not about the bytes.
     try std.testing.expect(!patternCovers("git.*", "gitlab.*"));
     try std.testing.expect(!patternCovers("git.*", "gitlab.push"));
 
-    // Wherever the covered pattern names one value exactly, the two functions
-    // answer the same thing. That is the property the ratchet leans on when it
-    // asks about a concrete action.
     const patterns = [_][]const u8{ "git.push", "git.*", "git.branch.*", "net.fetch" };
     const values = [_][]const u8{ "git.push", "git.branch.delete", "git", "net.fetch", "nix.build" };
     for (patterns) |pattern| {
@@ -2788,9 +1892,6 @@ test "one pattern covers another only when it names everything that one names" {
 }
 
 test "a well formed pattern is a name, or a name and a class star, and nothing else" {
-    // The same rule `validatePattern` reports to the author of `chock.zon`,
-    // read here by the ratchet for a pattern an agent wrote at run time. Two
-    // spellings of the check would be two answers to what a pattern is.
     try std.testing.expect(patternIsWellFormed("git.push"));
     try std.testing.expect(patternIsWellFormed("git.*"));
     try std.testing.expect(patternIsWellFormed("a"));
@@ -2800,8 +1901,6 @@ test "a well formed pattern is a name, or a name and a class star, and nothing e
     try std.testing.expect(!patternIsWellFormed("git.*.push"));
     try std.testing.expect(!patternIsWellFormed("git\x00push"));
 
-    // And the file reader refuses exactly what this refuses, so a pattern the
-    // ratchet accepts is one `chock.zon` could have held.
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidPattern, Table.parse(
         gpa,
@@ -2811,10 +1910,6 @@ test "a well formed pattern is a name, or a name and a class star, and nothing e
 }
 
 test "a policy with more rules or more agents than the reader accepts is refused" {
-    // `chock.zon` comes from the project directory, so a hostile project
-    // writes it. `max_file_bytes` alone admits about fourteen thousand rules,
-    // and the read time check costs the cube of the number of
-    // names the rules spell out.
     const gpa = std.testing.allocator;
 
     const too_many_rules = try repeatedSource(
@@ -2851,10 +1946,6 @@ test "a policy with more rules or more agents than the reader accepts is refused
 }
 
 test "a policy that would make the read time check walk too far is refused" {
-    // The check reads every rule for every class of key, for
-    // every declared link. The number of classes grows with the cube of the
-    // number of names the rules spell out, so a file of 30 KB inside every
-    // other cap can still hold the start of a session for minutes.
     const gpa = std.testing.allocator;
 
     const wide = try repeatedSource(
@@ -2868,9 +1959,6 @@ test "a policy that would make the read time check walk too far is refused" {
     try std.testing.expect(wide.len < 64 * 1024);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, wide, null));
 
-    // The same number of rules, and the same number of links, over names that
-    // vary in one field only. That policy is read, so the refusal above is
-    // about how far the check must walk and not about the size of the file.
     const narrow = try repeatedSource(
         gpa,
         ".{ .policy = .{ .agents = .{ .{ .kind = \"p\" }, .{ .kind = \"c\", .parent = \"p\" } }, .rules = .{",
@@ -2885,8 +1973,6 @@ test "a policy that would make the read time check walk too far is refused" {
 }
 
 test "two agents that name the same kind are refused" {
-    // Which of the two would answer for that kind is not a question a security
-    // control may leave open.
     const gpa = std.testing.allocator;
 
     const twice: [:0]const u8 =
@@ -2903,8 +1989,6 @@ test "two agents that name the same kind are refused" {
 }
 
 test "an agent whose parent no entry declares is refused" {
-    // The read time check compares a child against its parent.
-    // A parent that is not in the file is a link this reader cannot check.
     const gpa = std.testing.allocator;
 
     const missing_parent: [:0]const u8 =
@@ -2920,8 +2004,6 @@ test "an agent whose parent no entry declares is refused" {
 }
 
 test "a loop in the parent links is refused" {
-    // A loop has no root, so no walk up the tree ends, and no child in the
-    // loop can be compared against a parent that is weaker than it.
     const gpa = std.testing.allocator;
 
     const loop: [:0]const u8 =
@@ -2937,7 +2019,6 @@ test "a loop in the parent links is refused" {
     ;
     try std.testing.expectError(error.AgentCycle, Table.parse(gpa, loop, null));
 
-    // An agent that names itself is the shortest loop there is.
     const names_itself: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -2951,9 +2032,6 @@ test "a loop in the parent links is refused" {
 }
 
 test "a file larger than the byte cap, and a project with no file, are both reported" {
-    // Neither is a table. The caller decides what to do about a project that
-    // holds no policy, and `parse` with `.{}` builds the table where every key
-    // resolves to `ask`.
     const gpa = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2967,8 +2045,6 @@ test "a file larger than the byte cap, and a project with no file, are both repo
         Table.load(gpa, std.testing.io, project_root, null),
     );
 
-    // One byte over the cap. The file is valid ZON, so it would read if the
-    // cap did not stop it first.
     const oversized = try gpa.alloc(u8, max_file_bytes + 1);
     defer gpa.free(oversized);
     @memset(oversized, ' ');
@@ -2979,8 +2055,6 @@ test "a file larger than the byte cap, and a project with no file, are both repo
         Table.load(gpa, std.testing.io, project_root, null),
     );
 
-    // The same bytes under the cap are read, so the refusal is about the size
-    // and not about what the file holds.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = oversized[4..] });
     const table = try Table.load(gpa, std.testing.io, project_root, null);
     defer Table.destroy(gpa, table);
@@ -3018,9 +2092,6 @@ test "the names in a refusal reach the caller, and no longer only a terminal" {
     try std.testing.expectEqual(Decision.deny, names.parent_answer);
     try std.testing.expectEqualStrings("git.push", names.action);
 
-    // **The names are copies.** `Table.parse` releases the `Policy` they
-    // point into on this path, so a diagnostic that borrowed them would
-    // dangle. The testing allocator fails this test if `deinit` misses one.
     var buffer: [512]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{f}", .{&diag.?});
     try std.testing.expectEqualStrings(
@@ -3046,9 +2117,6 @@ test "a misspelled decision names its line and column, and the trees behind it a
 }
 
 test "a caller that wants no diagnostic allocates nothing extra for one" {
-    // The outer optional is what lets a caller opt out. The testing allocator
-    // fails this test if a refused parse leaks the copy it would have made
-    // for a diagnostic that nobody asked for.
     const gpa = std.testing.allocator;
     const loop: [:0]const u8 =
         \\.{ .policy = .{ .agents = .{
@@ -3071,9 +2139,6 @@ test "the first fault is kept, and a caller that wants none pays nothing" {
 }
 
 test "no two faults of this module read the same" {
-    // A reader has to be able to tell which one happened. The two ZON
-    // variants are left out, because both render a syntax tree that no
-    // literal here can build; the tests above pin those two.
     const cases: []const Diagnostic = &.{
         .not_a_struct_literal,
         .{ .read_failed = error.AccessDenied },
@@ -3117,8 +2182,6 @@ test "no two faults of this module read the same" {
 }
 
 test "a spawn chain the reader cannot fold names why, and the answer stays ask" {
-    // `evaluateChain` allocates in no case, so its fault type owns nothing
-    // and borrows from the caller's own chain and key.
     const gpa = std.testing.allocator;
     const table = try Table.parse(gpa, ".{ .policy = .{ .rules = .{ .{ .decision = .allow } } } }", null);
     defer Table.destroy(gpa, table);
@@ -3130,7 +2193,6 @@ test "a spawn chain the reader cannot fold names why, and the answer stays ask" 
     );
     try std.testing.expectEqualStrings("git.push", fault.?.empty);
 
-    // **The first, not the last**, here too.
     _ = table.evaluateChain(&.{""}, testKey("", "git.push"), &fault);
     try std.testing.expectEqualStrings("git.push", fault.?.empty);
 
@@ -3145,7 +2207,6 @@ test "a spawn chain the reader cannot fold names why, and the answer stays ask" 
         try std.fmt.bufPrint(&buffer, "{f}", .{second.?}),
     );
 
-    // A caller that wants no fault gets the same decision and stores nothing.
     try std.testing.expectEqual(
         Decision.ask,
         table.evaluateChain(&.{}, testKey("main", "git.push"), null),
@@ -3155,7 +2216,6 @@ test "a spawn chain the reader cannot fold names why, and the answer stays ask" 
 test "a project cannot widen what an org narrowed" {
     const gpa = std.testing.allocator;
 
-    // The project is as permissive as a file can be about this act.
     const project_allows: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -3180,20 +2240,13 @@ test "a project cannot widen what an org narrowed" {
 
     try std.testing.expectEqual(Decision.ask, bound.evaluateChain(&chain, push, null));
     try std.testing.expectEqual(Decision.deny, bound.evaluateChain(&chain, model, null));
-    // And for the reading a resource question takes, which is the one
-    // `lib/chock-policy/access.zig` uses.
     try std.testing.expectEqual(Decision.deny, bound.ceilingChain(&chain, model, null));
 
-    // The same project with no bundle above it holds what it wrote, so the
-    // narrowing above is the bundle and not something the file did to itself.
     const alone = try Table.parse(gpa, project_allows, null);
     defer Table.destroy(gpa, alone);
     try std.testing.expectEqual(Decision.allow, alone.evaluateChain(&chain, push, null));
     try std.testing.expectEqual(Decision.allow, alone.evaluateChain(&chain, model, null));
 
-    // The direction that is free. A project that is narrower than its
-    // organisation keeps its own narrower answer, because the minimum does not
-    // care which layer holds it.
     const project_narrows: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -3210,9 +2263,6 @@ test "a project cannot widen what an org narrowed" {
     defer Table.destroy(gpa, narrower);
     try std.testing.expectEqual(Decision.deny, narrower.evaluateChain(&chain, push, null));
 
-    // An org rule that names an act the project never mentioned still binds,
-    // which is what makes the bundle the outer layer rather than an override
-    // of rules that happen to collide.
     const org_only = [_]Rule{
         .{ .action = "net.fetch", .decision = .deny },
     };
@@ -3223,8 +2273,6 @@ test "a project cannot widen what an org narrowed" {
         unmentioned.evaluateChain(&chain, testKey("main", "net.fetch"), null),
     );
 
-    // Every pair of decisions, so no ordering is right by accident: the answer
-    // is the narrower of the two layers, whichever of them is narrower.
     const every = [_]Decision{ .deny, .agent_then_human, .ask, .agent_review, .allow };
     for (every) |from_project| {
         for (every) |from_org| {
@@ -3247,9 +2295,6 @@ test "a project cannot widen what an org narrowed" {
 }
 
 test "a session with no org bundle answers exactly as it did before bundles existed" {
-    // The property that decides whether the outer layer may ship. An empty
-    // bundle must change no answer anywhere, and `allow` being the identity of
-    // `intersect` is why it does not.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =
@@ -3274,9 +2319,6 @@ test "a session with no org bundle answers exactly as it did before bundles exis
     const with_empty = try Table.parseUnder(gpa, source, &.{}, null);
     defer Table.destroy(gpa, with_empty);
 
-    // Every key the rules can tell apart, over every chain a two kind file can
-    // make. A sampled comparison would prove nothing about the case that
-    // differs.
     const kinds = [_][]const u8{ "main", "worker" };
     const actions = [_][]const u8{
         "git.push",
@@ -3316,8 +2358,6 @@ test "a session with no org bundle answers exactly as it did before bundles exis
         }
     }
 
-    // And the answers themselves are the ones this file has always given, so
-    // the comparison above is not two functions agreeing on a wrong number.
     try std.testing.expectEqual(
         Decision.deny,
         with_empty.evaluateChain(&.{"main"}, testKey("main", "git.push"), null),
@@ -3334,16 +2374,10 @@ test "a session with no org bundle answers exactly as it did before bundles exis
         Decision.ask,
         with_empty.evaluateChain(&.{"main"}, testKey("main", "workspace.apply"), null),
     );
-    // The hash of the bytes is the file's own and a bundle does not enter it.
-    // Chock compares that hash at the end of a session, and a bundle
-    // that changed it would make every such comparison fail.
     try std.testing.expectEqualSlices(u8, &plain.sourceHash(), &with_empty.sourceHash());
 }
 
 test "an org bundle is read as a ceiling, so a rule it never wrote narrows nothing" {
-    // The one place the two layers are read differently, and the reason an org
-    // that writes one rule does not cap every project at ask. A resource
-    // nobody named has no ceiling; an act nobody named is still `ask`.
     const gpa = std.testing.allocator;
 
     const project: [:0]const u8 =
@@ -3363,19 +2397,14 @@ test "an org bundle is read as a ceiling, so a rule it never wrote narrows nothi
     defer Table.destroy(gpa, bound);
     const chain = [_][]const u8{"main"};
 
-    // The act the bundle says nothing about keeps the project's own answer.
-    // Reading the bundle as a decision would have made this `ask`.
     try std.testing.expectEqual(
         Decision.allow,
         bound.evaluateChain(&chain, testKey("main", "git.commit"), null),
     );
-    // And an act neither layer named is `ask`, which is the file's own rule
-    // for a case nobody covered and is not something the bundle supplied.
     try std.testing.expectEqual(
         Decision.ask,
         bound.evaluateChain(&chain, testKey("main", "workspace.apply"), null),
     );
-    // The one row the bundle did write still binds.
     try std.testing.expectEqual(
         Decision.deny,
         bound.evaluateChain(&chain, testKey("main", "provider.public.gpt-5"), null),
@@ -3383,16 +2412,6 @@ test "an org bundle is read as a ceiling, so a rule it never wrote narrows nothi
 }
 
 test "the read time check counts the shipped defaults, and refuses what the file's own rules alone would not" {
-    // `evaluateRules` reads a key against `policy.rules` first and, when
-    // nothing there matches, against `defaults.zig`'s rules after. Every key
-    // `checkChildrenAreWeaker` walks costs both reads in the worst case, so
-    // the budget must count both lists. Before this fix it counted only
-    // `policy.rules.len`, so a file whose true cost crosses `max_check_work`
-    // only once the shipped defaults are counted still read.
-    //
-    // 73 rules of three distinct 64 byte names, under one declared parent
-    // link, is that file. Counting the file's rules alone its cost is under
-    // budget; counting the file's rules and the defaults together it is over.
     const gpa = std.testing.allocator;
 
     const source = try wideSource(gpa, 73, 64);
@@ -3406,18 +2425,9 @@ test "the read time check counts the shipped defaults, and refuses what the file
     try std.testing.expectEqual(@as(u64, 73), walk.rules);
     try std.testing.expectEqual(@as(u64, 64), walk.longest_name);
 
-    // 74 names in the model list and in the tool list (73 distinct plus the
-    // "matches nothing" marker), and 74 plus one entry for each rule
-    // `defaults.zig` ships in the action list, because `representatives` now
-    // folds those in too, so the action space this check walks matches the one
-    // `evaluateRules` actually reads. The product is cubed for the one
-    // declared link, and read against the file's 73 rules plus the rules
-    // `defaults.zig` ships, twice per key.
-    //
-    // **Written against `defaults.rules.len` and never against a number.**
-    // That list grew from 13 rules to 50 on 2026-09-15, when the git shim's
-    // approval half was wired and every git action name it can build for a
-    // workspace-only subcommand was shipped as a default.
+    // Written against `defaults.rules.len` and never against a number. That
+    // list grew from 13 rules to 50 when the git shim's approval half was
+    // wired.
     const keys: u64 = 74 * 74 * (74 + @as(u64, defaults.rules.len));
     const rules_per_key: u64 = walk.rules + @as(u64, defaults.rules.len);
     try std.testing.expectEqual(keys * rules_per_key * 2, walk.reads);
@@ -3425,9 +2435,6 @@ test "the read time check counts the shipped defaults, and refuses what the file
 }
 
 test "a decision the rules named is told apart from the ask a key nobody wrote gets" {
-    // `ask` is two facts in one word, and a caller that reads a second, wider
-    // name when the first is not covered has to tell them apart or it widens
-    // past what an author wrote.
     const gpa = std.testing.allocator;
 
     const t = try Table.parse(gpa,
@@ -3457,8 +2464,6 @@ test "a decision the rules named is told apart from the ask a key nobody wrote g
     try std.testing.expect(!nobody.named);
     try std.testing.expectEqual(Decision.ask, nobody.decision);
 
-    // A shipped default names a key too, so a project that wrote nothing is
-    // still decided.
     const shipped = t.decideChain(&.{"main"}, .{
         .agent_kind = "main",
         .model = "a-model",
@@ -3468,8 +2473,6 @@ test "a decision the rules named is told apart from the ask a key nobody wrote g
     try std.testing.expect(shipped.named);
     try std.testing.expectEqual(Decision.allow, shipped.decision);
 
-    // A chain this reader cannot fold names nothing, so a caller reading a
-    // second name is not sent past a fault either.
     const broken = t.decideChain(&.{}, .{
         .agent_kind = "main",
         .model = "a-model",
@@ -3478,7 +2481,6 @@ test "a decision the rules named is told apart from the ask a key nobody wrote g
     }, null);
     try std.testing.expect(!broken.named);
 
-    // The two entry points cannot disagree: one walk answers both.
     for ([_][]const u8{
         "nix.net.build.com.example.443",
         "nix.net.build.com.other.443",
@@ -3498,24 +2500,11 @@ test "a decision the rules named is told apart from the ask a key nobody wrote g
 }
 
 test "the corrected budget still reads a table under it and still refuses one clearly over it" {
-    // The point of this check is to refuse the right tables, so the fix above
-    // must not turn it into a check that refuses every table or none.
-    // Folding the shipped defaults into the action list as well as the rule
-    // count moves the ceiling down further, from 72 rules to 69: 69 rules of
-    // three distinct 64 byte names under one declared parent link was the
-    // largest file of this shape the corrected budget still read.
-    //
-    // **The ceiling moved again, to 52, and it moved for a reason worth
-    // naming.** `defaults.zig` shipped 13 rules and now ships 55: wiring the
-    // git shim's approval half made every git subcommand the shim classifies a
-    // key this table is asked about, and the shipped `.allow` rules are what
-    // keep a project with no `chock.zon` from being prompted for `git add`.
-    // The last of them is `nix.net.build.opaque`. Every one of those rules is
-    // counted twice per key by the budget above and adds one name to the
-    // action list, so a project's own file has less room than it did. **It is
-    // the pathological shape that lost the room**: 52 rules of three distinct
-    // 64 byte names each, under a declared parent link. A real `chock.zon`
-    // holds a handful of short rules and is nowhere near this.
+    // The ceiling this budget puts on a project's own file moves whenever
+    // `defaults.zig` grows, because every shipped rule is counted twice per
+    // key and adds one name to the action list. It was 72 rules of this shape,
+    // then 69, and is 52 now that `defaults.zig` ships 55 rules. A real
+    // `chock.zon` holds a handful of short rules and is nowhere near this.
     const gpa = std.testing.allocator;
 
     const admitted = try wideSource(gpa, 52, 64);
@@ -3523,7 +2512,6 @@ test "the corrected budget still reads a table under it and still refuses one cl
     const table = try Table.parse(gpa, admitted, null);
     defer Table.destroy(gpa, table);
 
-    // The file that is read is a real table, and not an empty one.
     var buffer: [64]u8 = undefined;
     const name = try wideName(&buffer, 11, 64);
     try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(.{
@@ -3533,16 +2521,10 @@ test "the corrected budget still reads a table under it and still refuses one cl
         .action = name,
     }));
 
-    // One rule more, 53, is refused. The same shape crosses the budget at
-    // exactly one rule above what is admitted.
     const one_more = try wideSource(gpa, 53, 64);
     defer gpa.free(one_more);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, one_more, null));
 
-    // A table clearly over the budget, whatever the fix counts, is still
-    // refused. `max_rules` distinct 64 byte names is `1.4 * 10^11` reads
-    // before the shipped defaults are even added in, thousands of times the
-    // budget.
     const clearly_over = try wideSource(gpa, max_rules, 64);
     defer gpa.free(clearly_over);
     try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, clearly_over, null));
@@ -3551,8 +2533,6 @@ test "the corrected budget still reads a table under it and still refuses one cl
 test "a router is wanted when the policy permits a host, and not when it only denies one" {
     const gpa = std.testing.allocator;
 
-    // **The default, and the case that matters most.** A project that names
-    // no host pays for no network at all.
     const quiet = try Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
     defer Table.destroy(gpa, quiet);
     try std.testing.expect(!quiet.wantsRouter());
@@ -3565,7 +2545,6 @@ test "a router is wanted when the policy permits a host, and not when it only de
     defer Table.destroy(gpa, permits);
     try std.testing.expect(permits.wantsRouter());
 
-    // An `ask` is a reason to build one: the person may say yes.
     const asks = try Table.parse(
         gpa,
         ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .ask } } } }",
@@ -3574,7 +2553,6 @@ test "a router is wanted when the policy permits a host, and not when it only de
     defer Table.destroy(gpa, asks);
     try std.testing.expect(asks.wantsRouter());
 
-    // **A deny is not.** A road nobody may take is not a road to build.
     const denies = try Table.parse(
         gpa,
         ".{ .policy = .{ .rules = .{ .{ .action = \"net.connect.com.github\", .decision = .deny } } } }",
@@ -3583,8 +2561,6 @@ test "a router is wanted when the policy permits a host, and not when it only de
     defer Table.destroy(gpa, denies);
     try std.testing.expect(!denies.wantsRouter());
 
-    // **`net.fetch` counts too**, because one seam carries the router for
-    // every tool and `fetch_url` asks through it.
     const fetches = try Table.parse(
         gpa,
         ".{ .policy = .{ .rules = .{ .{ .action = \"net.fetch.rs.docs\", .decision = .allow } } } }",
@@ -3593,7 +2569,6 @@ test "a router is wanted when the policy permits a host, and not when it only de
     defer Table.destroy(gpa, fetches);
     try std.testing.expect(fetches.wantsRouter());
 
-    // A rule about something else entirely is not a reason either.
     const elsewhere = try Table.parse(
         gpa,
         ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .allow } } } }",
@@ -3606,7 +2581,6 @@ test "a router is wanted when the policy permits a host, and not when it only de
 test "the router setting overrides what the rules would have decided, both ways" {
     const gpa = std.testing.allocator;
 
-    // `.none` refuses a network the rules would have built.
     const off = try Table.parse(
         gpa,
         ".{ .policy = .{ .net = .{ .router = .none }, .rules = .{ " ++
@@ -3616,14 +2590,10 @@ test "the router setting overrides what the rules would have decided, both ways"
     defer Table.destroy(gpa, off);
     try std.testing.expect(!off.wantsRouter());
 
-    // `.filtered` builds one the rules would not have, which is what a
-    // session that expects to be asked host by host wants.
     const on = try Table.parse(gpa, ".{ .policy = .{ .net = .{ .router = .filtered } } }", null);
     defer Table.destroy(gpa, on);
     try std.testing.expect(on.wantsRouter());
 
-    // And the default is `.auto`, stated here so a change to it fails a test
-    // rather than changing every session quietly.
     const plain = try Table.parse(gpa, ".{ .policy = .{ .rules = .{} } }", null);
     defer Table.destroy(gpa, plain);
     try std.testing.expectEqual(Router.auto, plain.policy.net.router);
@@ -3641,7 +2611,6 @@ test "a background call follows the session's network, and can be refused one of
     try std.testing.expect(permits.wantsRouter());
     try std.testing.expect(permits.wantsBackgroundRouter());
 
-    // Off for the background alone, with the session's own network untouched.
     const foreground_only = try Table.parse(
         gpa,
         ".{ .policy = .{ .net = .{ .background = .none }, .rules = .{ " ++
@@ -3652,8 +2621,6 @@ test "a background call follows the session's network, and can be refused one of
     try std.testing.expect(foreground_only.wantsRouter());
     try std.testing.expect(!foreground_only.wantsBackgroundRouter());
 
-    // **And never more than the session has.** A session with no router has
-    // nothing for a background call to be given, whatever this field says.
     const nothing = try Table.parse(
         gpa,
         ".{ .policy = .{ .net = .{ .router = .none, .background = .filtered } } }",

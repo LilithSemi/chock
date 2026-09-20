@@ -1,187 +1,5 @@
-//! The org bundle: **the policy an organisation gives an installation, above
-//! the policy a project writes for itself.** `chock.zon` may only narrow it.
-//!
-//! ## The rule, which is the ratchet one level up
-//!
-//! * A bundle holds `table.Rule`s. The same four key fields, the same dotted
-//!   pattern language, the same rule that wins.
-//! * `Table.evaluateChain` folds a bundle in as one more term of the minimum
-//!   it already takes over the chain. See `Table.org`.
-//! * A rule of `chock.zon` can therefore lower an answer and can never raise
-//!   one. A project cannot widen what an org narrowed, and that is a property
-//!   of a minimum rather than a check somebody has to remember to write.
-//!
-//! **A bundle is read as a ceiling and never as a decision.** An action no
-//! bundle rule names answers `allow`, which is no ceiling at all, and not
-//! `ask`, which is what `chock.zon` answers for an action nobody named. The two
-//! defaults are different because the two questions are different, and
-//! `ratchet.ceilingFor` already draws that line for the agent's own promises:
-//! "may this happen" must be safe when nobody said, and "how far does this
-//! layer let it go" must be silent when this layer said nothing. Reading a
-//! bundle as a decision would cap every action in every project at `ask` the
-//! moment an installation was given one.
-//!
-//! ## Identity is the credential, and Chock builds no identity system
-//!
-//! The organisation issues the credential, so the hub that issued it already
-//! knows who the subject is. The bundle travels with the credential and states
-//! that subject; Chock reads it and never checks it. There is no user
-//! database here, no directory, no sign in, and no token this file verifies:
-//! **a bundle is trusted exactly as far as the file it was written into**,
-//! which is a file in the data directory `lib/chock-auth/paths.zig` names,
-//! written by whatever installed Chock and beyond the reach of the project.
-//!
-//! ## An expired bundle: neither failing shut nor falling open
-//!
-//! A laptop is offline for a week. The bundle it holds says it expired on
-//! Tuesday. Two answers suggest themselves and both are wrong:
-//!
-//! * **Fail shut**, and refuse to run. The organisation's control becomes an
-//!   outage every time a network is missing, and the people it was written for
-//!   go around it.
-//! * **Fall open**, and ignore the bundle. Every narrowing the organisation
-//!   made evaporates at exactly the moment nobody can be reached to say
-//!   whether that is right, and a bundle could be retired by keeping a machine
-//!   off a network for long enough.
-//!
-//! **The answer is neither, and it falls out of what a bundle is.** A bundle
-//! only narrows. Every rule in it is one more term of the same minimum, so a
-//! bundle can refuse an act and it can never permit one. Dropping an expired
-//! bundle can therefore only widen, and keeping one can only hold a session to
-//! more than it has to be held to. So Chock decides:
-//!
-//! 1. **An expired bundle keeps binding, in full and for ever.** The laptop
-//!    keeps working, under the last policy its organisation gave it, which is
-//!    the last policy that organisation said it wanted.
-//! 2. **An expired bundle is said out loud, on every start**, with how long
-//!    ago it expired. `src/run.zig` prints it as a warning. An expiry that
-//!    changes nothing and says nothing would be decoration, and a reader who
-//!    is under a stale policy has to be able to see that they are.
-//! 3. **An expired bundle may not be installed.** `refusalForInstall` refuses
-//!    a file that is already expired, so `chock run --org-bundle` will not take
-//!    one. That is what the date is for: it is the day after which nobody may
-//!    hand this file to Chock, and it is not the day the file stops binding a
-//!    machine that already has it.
-//!
-//! ## A bundle this build cannot fully read is refused
-//!
-//! `version` is the one field that fails a whole bundle. A file that names a
-//! version above `max_version` was written by a newer Chock, and this build
-//! cannot know whether the part it does not understand narrows something. An
-//! unknown *field* at a version this build knows is ignored, which is how a hub
-//! adds a note or a display name without breaking older installations; an
-//! unknown *version* is refused, because falling open on a bundle is the one
-//! outcome this file exists to prevent. A hub that adds a field which changes
-//! what is permitted raises the version.
-//!
-//! ## A budget ceiling, which is a bound and not a rule
-//!
-//! An organisation caps what a project may spend, and a project may not raise
-//! that cap. The rule is the one above, one more time: narrowing is free and
-//! widening is not. The arithmetic is different, though, and that difference
-//! is the whole of the design.
-//!
-//! **A rule answers "may this happen" and a bound answers "how much".** The
-//! table folds its layers as an intersection of decisions; a ceiling folds as
-//! a **minimum** of two numbers. So `budget` is a field of a `Bundle` and
-//! never a `table.Rule`, for the same reason a required sink is a field: the
-//! arithmetic a rule uses is the wrong arithmetic for this question.
-//!
-//! **A project above the ceiling is refused, and never quietly lowered.**
-//! `chock_cost.budget.underCeiling` takes the minimum and argues that decision
-//! in full. The short of it: a project that got a smaller number than it wrote
-//! believes it has money it does not have, and finds out as a session that
-//! stops in the middle of the work with no stated cause.
-//!
-//! ## A required sink, which is a control and not an option
-//!
-//! Log export is `lib/chock-proto/ship.zig`, and until this field it was
-//! command line only. That made the audit trail **opt in by the person being
-//! observed**: a developer who left `--export-dir` off left no trail, and an
-//! installation had no way to say *every session here exports to this place*.
-//! That is the difference between a control and an option, and an organisation
-//! buying observability is buying the control.
-//!
-//! **A sink is not a rule, so it is a field and not a row.** A rule answers
-//! "may this act happen"; a sink is a place bytes go. `evaluateChain` takes a
-//! minimum over rules, and a minimum is the wrong arithmetic for a place: two
-//! sinks are both used, never the lesser of the two.
-//!
-//! **The ratchet reading still holds, in the shape a sink can take it.** A
-//! project narrows a rule and may not widen one. A project may **add** a sink
-//! of its own, because more of the record reaching more places narrows nothing,
-//! and it may **never drop** one the installation named. Chock takes the union
-//! of the required sinks and whatever `--export-dir` and `--export-syslog`
-//! asked for, so removal is not a thing a command line can express rather than
-//! a thing a check has to catch. There is no flag that turns export off.
-//!
-//! **A required sink inherits the expiry decision above, in full.** An expired
-//! bundle keeps requiring its sinks for ever, for the same reason it keeps
-//! binding its rules: dropping the requirement can only widen, at exactly the
-//! moment nobody can be reached to say whether that is right.
-//!
-//! ### A session that cannot reach a required sink
-//!
-//! **Decided: the session runs, and the machine tells on itself.**
-//!
-//! `ship.zig` already decided that a sink being down is not fatal, because a
-//! session that fails when an audit sink fails is an observability feature an
-//! operator turns off, and that a trail which silently stops arriving is worse
-//! than one that never started. A *required* sink is a stronger claim than an
-//! optional one, so the two candidate answers were weighed again:
-//!
-//! * **Refuse to start.** This is the answer that sounds strict and is the
-//!   weakest one in practice. The organisation's control becomes an outage
-//!   every time a daemon restarts, and a developer who cannot work reaches for
-//!   a tool that is not Chock. The organisation then gets **no** record of that
-//!   work, rather than a late one, and it gets a reputation for stopping
-//!   people. It is the same argument that made an expired bundle keep binding
-//!   instead of failing shut, and it is the same answer.
-//! * **Behave exactly like an optional sink.** Then "required" is a word in a
-//!   file and nothing else, and the failure that matters is left in place: an
-//!   organisation believing it holds a whole trail while a machine quietly
-//!   holds the only copy.
-//!
-//! Neither, and for the reason that decides between them: **the party the
-//! control serves is not the party at the keyboard.** The developer can already
-//! see the warning; the organisation cannot see anything, because the thing
-//! that would have told it is the sink that is down. So a required sink differs
-//! from an optional one in three ways that are all about being seen:
-//!
-//! 1. **It is reached for before the first turn**, not found to be down when
-//!    the first event fails to ship. `src/run.zig` pushes the header line at
-//!    start, so an unreachable required sink is said while a person can still
-//!    fix it and before a model has spent anything.
-//! 2. **What it says names the installation and not the flag.** Nobody typed
-//!    this sink, so a message about `--export-dir` would send a reader looking
-//!    for a command line that does not hold it.
-//! 3. **A gap that is still open when the session ends is in the exit status.**
-//!    `Exit.audit_gap`. This is the part an organisation can act on without a
-//!    person choosing to tell it, and it is deliberately narrow: a sink that
-//!    was down and came back leaves no gap at all, because the log on disk is
-//!    the queue and the shipper backfills every line it missed. Only a tail
-//!    that is still on this machine and nowhere else when the session is over
-//!    reaches the exit code. A transient outage therefore costs nothing, which
-//!    is what stops this being the outage answer wearing a different hat.
-//!
-//! ### A required sink names an absolute path
-//!
-//! A relative path in an installation wide file resolves against whatever
-//! directory a session was started in, which for `chock run` is the project.
-//! An organisation writing `audit` would put the trail **inside the tree the
-//! developer owns**, where the person being observed can delete it. Refused at
-//! read time, with a message that says so.
-//!
-//! **This reader is looser about a field name than `chock.zon`'s reader is**,
-//! and the two are looser in opposite directions on purpose. `table.parse` is
-//! strict, because a misspelled key field there makes a rule match more than
-//! its author wanted, and a rule that matches more permits more. Here a
-//! misspelled key field makes a rule match more as well, and a rule that
-//! matches more *narrows* more, because this layer is a ceiling. So the typo
-//! that would be an escalation in a project file is an over-restriction in a
-//! bundle, and the safe reading of an unknown name is opposite in the two.
-//! `decision` still has no default, so a rule with no decision at all is
-//! refused in both.
+//! The org bundle: the policy an organisation gives an installation, above the
+//! project's own `chock.zon`, which may only narrow it.
 
 const std = @import("std");
 const table = @import("table.zig");
@@ -189,334 +7,133 @@ const subagent = @import("subagents.zig");
 const limits_mod = @import("limits.zig");
 const nix_mod = @import("nix.zig");
 
-/// The name of the bundle file. It lives in the data directory
-/// `lib/chock-auth/paths.zig` names, beside the credential store, because the
-/// organisation issues both and neither is the project's to write.
-///
-/// **The reader is here and the directory is chock-auth's.** `lib/chock-auth`
-/// imports no other chock library, by a rule its own module comment states, so
-/// a reader that needs `table.Rule` cannot live there. `src/run.zig` joins the
-/// two.
 pub const file_name = "org-policy.zon";
 
-/// The largest bundle this reader accepts. A bundle is a small file, and it is
-/// read before anything else a session does.
 pub const max_file_bytes = 1 << 20;
 
-/// The longest subject this reader accepts. A subject is a name an
-/// organisation gave a person or a machine, not a document.
 pub const max_subject_bytes = 256;
 
-/// The longest issuer this reader accepts.
 pub const max_issuer_bytes = 256;
 
-/// The highest `version` this build reads. See this file's own top comment: a
-/// file above this is refused whole, because this build cannot know whether
-/// the part it does not understand narrows something.
+/// A file above this was written by a newer Chock, which may narrow something
+/// this build cannot see.
 pub const max_version: u32 = 1;
 
-/// How many sinks one bundle may require.
-///
-/// **Small on purpose.** Every sink is written on the session's own single
-/// threaded path, once per event, so a bundle that named a hundred of them
-/// would slow every turn of every session in the installation. An organisation
-/// needs its own collector and perhaps a second one it is migrating to.
 pub const max_sinks: usize = 4;
 
-/// The longest sink path this reader accepts.
 pub const max_sink_path_bytes = 4096;
 
 /// A place every session of this installation sends its log, whatever the
-/// person at the keyboard asked for.
-///
-/// **This is the control the command line could not be.** See this file's own
-/// top comment for what "required" means, for why a session that cannot reach
-/// one still runs, and for what it does instead.
+/// person at the keyboard asked for. This is the control the command line could
+/// not be.
 pub const RequiredSink = struct {
-    /// Which of the two transports `lib/chock-proto/ship.zig` carries.
     kind: Kind,
-    /// Where it goes. **Absolute, and the reader refuses anything else**: see
-    /// this file's own top comment, where a relative path puts the trail inside
-    /// the tree the observed person owns.
+    /// Absolute, and the reader refuses anything else: a relative path puts
+    /// the trail inside the tree the observed person owns.
     path: []const u8,
 
-    /// The two sinks that exist. The names are the two options a person types,
-    /// so a bundle and a command line say the same thing the same way.
-    ///
-    /// **No network sink.** `chock run` is single threaded on the tool path, so
-    /// a sink that could block on a network would block the session; the whole
-    /// argument is in `lib/chock-proto/ship.zig`. A bundle cannot require what
-    /// Chock cannot carry.
+    /// No network sink. `chock run` is single threaded on the tool path, so a sink
+    /// that could block on a network would block the session. A bundle cannot
+    /// require what Chock cannot carry.
     pub const Kind = enum {
-        /// A directory a collector watches. One file per session appears in it,
-        /// byte for byte the log, so `chock sessions verify` reads it at the
-        /// far end. The same thing `--export-dir` names.
         directory,
-        /// A unix datagram socket the local syslog daemon reads. The same thing
-        /// `--export-syslog` names.
         syslog,
     };
 };
 
-/// The most every session of this installation may spend, whatever `chock.zon`
-/// asks for.
-///
-/// **A bound and not a rule, so it is a field and not a `table.Rule`.** The
-/// table answers "may this happen" and folds its layers as an intersection of
-/// decisions. This answers "how much", and the fold for a number is a minimum:
-/// `chock_cost.budget.underCeiling` takes it, and that function argues in full
-/// why a project above the ceiling is refused instead of quietly lowered.
-///
-/// The same shape as `chock_cost.budget.Budget`, written out again here
-/// because **this library imports no other chock library**, which is the rule
-/// `lib/chock-policy.zig` states. `src/run.zig` joins the two, the same way it
-/// already joins `RequiredSink.Kind` to the shipper's own kinds.
+/// A bound and not a rule, so it is a field and not a `table.Rule`. The fold
+/// for a number is a minimum, and `chock_cost.budget.underCeiling` takes it.
+/// Written out again here because this library imports no other chock library.
 pub const BudgetCeiling = struct {
-    /// The ceiling, in `currency`. Above zero and finite, and `validate`
-    /// refuses a bundle whose number is neither.
     max_cost: f64,
-    /// ISO 4217. **Empty when the bundle named none**, and the one default
-    /// lives in `chock_cost.budget.default_currency` rather than being spelled
-    /// a second time here. An empty string is also what `subject` and `issuer`
-    /// hold for a field the file left out, so the free path of
-    /// `std.zon.parse` sees the same thing it already sees.
+    /// ISO 4217. Empty when the bundle named none, and the one default lives
+    /// in `chock_cost.budget.default_currency`.
     currency: []const u8 = "",
 };
 
-/// What a bundle file holds.
-///
-/// **`rules` is the whole of the policy, and there are no `agents`.** A
-/// `table.Policy` also declares which kind spawns which, and that is the
-/// project's own shape: an organisation does not know the spawn tree of a
-/// repository it has never seen. The read time check `table.parse` runs over
-/// declared parent links has nothing to run over here, and it is not needed:
-/// `Table.evaluateChain` takes the intersection over the real chain at run
-/// time, which is where a bundle binds.
 pub const Bundle = struct {
-    /// Whose credential this installation holds, in the organisation's own
-    /// spelling. **A record, never a control**: see this file's top comment.
-    /// Empty for a bundle that named nobody.
     subject: []const u8 = "",
-    /// Who issued it, in the organisation's own spelling. Empty when the file
-    /// named nobody. Read by nothing; written for the person reading a log.
     issuer: []const u8 = "",
-    /// When the organisation issued this, in milliseconds since the epoch.
-    /// Zero when the file said nothing, which is a bundle whose age cannot be
-    /// reported.
     issued_ms: i64 = 0,
-    /// When this stops being a file anybody may install, in milliseconds since
-    /// the epoch. **Zero means it never expires**, which is the ordinary
-    /// answer for an installation that is not managed by a hub.
-    ///
-    /// See this file's own top comment for what an expiry does and does not
-    /// do. It does not stop the bundle binding.
     expires_ms: i64 = 0,
-    /// The rules, in the same language `chock.zon` speaks. Read as a ceiling:
-    /// an action no rule here names is one this layer says nothing about.
     rules: []const table.Rule = &.{},
-    /// Where every session of this installation sends its log, whatever the
-    /// person at the keyboard asked for. Empty for an installation that
-    /// requires none, which is every installation that predates this field.
-    ///
-    /// **A field and not a rule**, and a union and not a minimum: see this
-    /// file's own top comment. A project adds a sink of its own and can drop
-    /// none of these.
     sinks: []const RequiredSink = &.{},
-    /// The most a session of this installation may spend. Null for a bundle
-    /// that sets no ceiling, which is every bundle that predates this field,
-    /// and then a project's own `budget` block is the only cap there is.
-    ///
-    /// **A field and not a rule, and a minimum and not an intersection**: see
-    /// `BudgetCeiling`.
     budget: ?BudgetCeiling = null,
-    /// The largest spawn tree any project of this installation may ask for.
-    /// Null for a bundle that caps neither depth nor width, which is every
-    /// bundle that predates this field, and then the project's own `subagents`
-    /// block is the only limit there is.
-    ///
-    /// **A field and not a rule, and a minimum and not a refusal**: see
-    /// `subagents.underCeiling`, which also says why this narrows quietly where
-    /// the budget ceiling refuses. **An org can now cap fan-out**, which for a
-    /// runaway spawn tree is the more expensive of the two.
     subagents: ?subagent.Ceiling = null,
-    /// The most a sandboxed program of this installation may use: how many
-    /// processes and threads, and how much resident memory. Null for a
-    /// bundle that caps neither, which is every bundle that predates this
-    /// field, and then `limits_mod.foldLayers`'s first two layers are the
-    /// only limit there is.
-    ///
-    /// **A field and not a rule, and a minimum and not a refusal**, the same
-    /// shape `subagents` has above: see `limits_mod.underCeiling`, which also
-    /// says why a session that is held to a lower number has to say so where
-    /// a person can read it, and `src/doctor.zig`'s own `measureOrgCeilings`,
-    /// which is where that happens.
     limits: ?limits_mod.Ceiling = null,
-    /// The most a session of this installation may add to the Nix store: how
-    /// large one object may be, and how much a whole session may add. Null
-    /// for a bundle that caps neither, which is every bundle that predates
-    /// this field, and then `nix_mod.foldLayers`'s first two layers are the
-    /// only limit there is.
-    ///
-    /// **A field and not a rule, and a minimum and not a refusal**, the same
-    /// shape `limits` has above: see `nix_mod.underCeiling`.
     nix: ?nix_mod.Ceiling = null,
     /// Files every project of this installation must keep out of the sandbox,
-    /// on top of whatever its own `deny_read` block names. Empty for a bundle
-    /// that hides nothing, which is every bundle that predates this field.
+    /// on top of its own `deny_read` block.
     ///
-    /// **A field and not a rule, and a union and not a minimum.** A project
-    /// adds to this list and can take nothing off it. The other direction
-    /// would be no control at all: a bundle that hid a file would be answered
-    /// by a `chock.zon` that simply did not name it.
-    ///
-    /// **The entries are checked by `chock_workspace.deny.check`**, which is
-    /// the one place those rules live, and not by anything in this file. This
-    /// module cannot reach that one, and a second copy of a rule that decides
-    /// what the sandbox may hold is worse than a check that happens a moment
-    /// later: see `Workspace.openWithLayoutAndDenied`, which refuses a session
-    /// whose bundle names a path no project could have named either.
+    /// A union and not a minimum: a project adds to this list and can take
+    /// nothing off it. The entries are checked by `chock_workspace.deny.check`,
+    /// which this module cannot reach, so the refusal happens a moment later
+    /// rather than in a second copy of that rule.
     deny_read: []const []const u8 = &.{},
-    /// The version of the bundle format. See `max_version`.
     version: u32 = 1,
 
-    /// Whether `now_ms` is past `expires_ms`. False for a bundle with no
-    /// expiry at all.
-    ///
-    /// **The time is a parameter and never a clock.** This module reads no
-    /// clock, so a test can pin every answer here without a wall clock
-    /// assertion, and `src/run.zig` reads the one clock the session already
-    /// has.
+    /// An expired bundle keeps binding, in full and for ever. A bundle only
+    /// narrows, so dropping an expired one can only widen, at exactly the
+    /// moment nobody can be reached to say whether that is right. It is said
+    /// out loud on every start, and `refusalForInstall` refuses to install one:
+    /// the date is the day after which nobody may hand this file to Chock, not
+    /// the day it stops binding a machine that already has it.
     pub fn expiredAt(self: *const Bundle, now_ms: i64) bool {
         if (self.expires_ms == 0) return false;
         return now_ms > self.expires_ms;
     }
 
-    /// How long ago this expired, in milliseconds, or null for a bundle that
-    /// has not expired or that never expires. **For the line a person reads**,
-    /// which is point 2 of this file's expiry decision.
     pub fn expiredForMs(self: *const Bundle, now_ms: i64) ?i64 {
         if (!self.expiredAt(now_ms)) return null;
-        // Both are milliseconds since the epoch and the branch above proves
-        // the difference is positive, so this cannot overflow for any pair of
-        // times a machine can hold.
         return now_ms -| self.expires_ms;
     }
 };
 
-/// What can go wrong while reading a bundle out of bytes in memory.
 pub const ParseError = error{
     OutOfMemory,
-    /// The file is not valid ZON, or it does not match the schema. Pass a
-    /// `Diagnostic` to learn which line, and why.
     InvalidBundle,
-    /// A key pattern the language of `lib/chock-policy/table.zig` does not
-    /// allow.
     InvalidPattern,
-    /// The bundle holds more than `table.max_rules` rules.
     TooManyRules,
-    /// The subject or the issuer is longer than this reader accepts.
     NameTooLong,
-    /// The bundle names a version above `max_version`. See this file's own top
-    /// comment: a bundle this build cannot fully read is refused whole.
     VersionTooNew,
-    /// The bundle requires more than `max_sinks` sinks.
     TooManySinks,
-    /// A required sink names a path this reader will not take: an empty one, a
-    /// relative one, or one longer than `max_sink_path_bytes`.
     InvalidSinkPath,
-    /// The budget ceiling's `max_cost` is zero, negative, or not a number. The
-    /// same rule `chock_cost.budget` keeps for a project's own cap: a ceiling
-    /// of zero would refuse the first turn of every session in the
-    /// installation, and a negative one has no meaning at all.
     InvalidBudgetCeiling,
-    /// The subagent ceiling names neither `max_depth` nor `max_width`. A
-    /// ceiling that caps nothing is a block somebody meant to fill in, and
-    /// reading it as "no ceiling" would hide the mistake for as long as the
-    /// bundle lives.
     InvalidSubagentCeiling,
-    /// The limits ceiling names neither `processes` nor `memory`. The same
-    /// rule `InvalidSubagentCeiling` keeps, for the same reason.
     InvalidLimitsCeilingEmpty,
-    /// The limits ceiling names a `processes` or a `memory` field whose text
-    /// is not a percentage or an absolute value `limits_mod.parseSetting`
-    /// can read. A ceiling that cannot parse is refused when the bundle is
-    /// read, and never at the moment it would have bound a session.
     InvalidLimitsCeilingSetting,
-    /// The nix ceiling names neither `max_object_bytes` nor
-    /// `max_session_bytes`. The same rule `InvalidLimitsCeilingEmpty` keeps,
-    /// for the same reason.
     InvalidNixCeilingEmpty,
-    /// The nix ceiling names a field whose text `nix_mod.parseBytes` cannot
-    /// read, including a percentage: see `nix_mod`'s own top comment for why
-    /// a store byte cap takes no percentage at all.
     InvalidNixCeilingSetting,
 };
 
-/// What can go wrong while reading a bundle from a path.
 pub const LoadError = ParseError || error{
-    /// There is no bundle at that path. **The ordinary answer for an
-    /// installation nobody gave a bundle**, and never a fault: see
-    /// `src/run.zig`, which then runs exactly as it did before bundles
-    /// existed.
+    /// The ordinary answer for an installation nobody gave a bundle, and never
+    /// a fault.
     NoBundleFile,
-    /// The file is larger than `max_file_bytes`.
     BundleTooLarge,
-    /// The file exists and could not be read.
     ReadFailed,
 };
 
-/// Why a bundle was refused, in the words the person who installed it needs.
-///
-/// The ZON variant owns the syntax tree its message points into. A caller that
-/// gives `parse` or `load` a slot must call `deinit` on whatever lands in it.
 pub const Diagnostic = union(enum) {
-    /// The file is not valid ZON, or it does not match the schema.
     not_valid: std.zon.parse.Diagnostics,
-    /// The file exists and the read failed.
     read_failed: anyerror,
-    /// More rules than `table.max_rules`.
     too_many_rules: usize,
-    /// A key field holds `"*"`. The field name is a literal of this file.
     pattern_matches_everything: []const u8,
-    /// A key field holds a pattern the language does not allow.
     pattern_malformed: []const u8,
-    /// The subject or the issuer is too long. The field name is a literal of
-    /// this file, and the numbers are the length it holds and the bound.
     name_too_long: NameTooLong,
-    /// The bundle was written by a newer Chock.
     version_too_new: u32,
-    /// More required sinks than `max_sinks`.
     too_many_sinks: usize,
-    /// A required sink names no path at all. The number is which sink, counted
-    /// from one.
-    ///
-    /// **A position and never the path itself.** A bundle that fails to
-    /// validate is freed by `parse` before this reaches a caller, so a
-    /// diagnostic that borrowed a string out of it would dangle. The position
-    /// is a number and outlives everything.
+    /// A position and never the path itself. A bundle that fails to validate is
+    /// freed by `parse` before this reaches a caller, so a diagnostic that
+    /// borrowed a string out of it would dangle.
     sink_path_empty: usize,
-    /// A required sink names a path that is not absolute. The number is which
-    /// sink, counted from one. See `sink_path_empty` for why it is a position.
     sink_path_relative: usize,
-    /// A required sink names a path longer than `max_sink_path_bytes`. The
-    /// number is which sink, counted from one.
     sink_path_too_long: usize,
-    /// The budget ceiling names a `max_cost` that is not a number above zero.
-    /// The value is what the file said.
     budget_max_cost_not_positive: f64,
-    /// The subagent ceiling names neither limit.
     subagent_ceiling_names_nothing,
-    /// The limits ceiling names neither `processes` nor `memory`.
     limits_ceiling_names_nothing,
-    /// A limits ceiling field's text does not parse. The field name is a
-    /// literal of `lib/chock-policy/limits.zig`, so this owns nothing.
     invalid_limits_ceiling: InvalidLimitsCeiling,
-    /// The nix ceiling names neither `max_object_bytes` nor
-    /// `max_session_bytes`.
     nix_ceiling_names_nothing,
-    /// A nix ceiling field's text does not parse, or names a percentage. The
-    /// field name is a literal of `lib/chock-policy/nix.zig`, so this owns
-    /// nothing.
     invalid_nix_ceiling: InvalidNixCeiling,
 
     pub const InvalidLimitsCeiling = struct {
@@ -535,8 +152,6 @@ pub const Diagnostic = union(enum) {
         bound: usize,
     };
 
-    /// Release what the diagnostic owns, with the allocator that filled it.
-    /// Safe on every variant.
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .not_valid => |*zon_diag| zon_diag.deinit(gpa),
@@ -627,9 +242,7 @@ pub const Diagnostic = union(enum) {
     }
 };
 
-/// Fill `out` when the caller asked for one. The first fault is kept, not the
-/// last, the same rule `table.zig` keeps and for the same reason: a later
-/// check can only fail because an earlier one did.
+/// The first fault is kept and not the last.
 fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     const slot = out orelse return false;
     if (slot.* != null) return false;
@@ -637,14 +250,10 @@ fn note(out: ?*?Diagnostic, value: Diagnostic) bool {
     return true;
 }
 
-/// Read a bundle out of `source`, which must be the whole content of a bundle
-/// file. The returned bundle owns a copy of every name in it, so the caller is
-/// free to release `source` at once. `destroy` releases it, with the same
-/// allocator.
-///
-/// `diag` is optional. A caller that passes null pays nothing and learns only
-/// the error. A caller that passes a slot must call `Diagnostic.deinit` on
-/// whatever lands in it.
+/// This reader is looser about a field name than `chock.zon`'s reader, and the
+/// two are loose in opposite directions on purpose. A misspelled key field in a
+/// project file makes a rule match more and so permit more. Here it makes a
+/// rule match more and so narrow more, because this layer is a ceiling.
 pub fn parse(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
@@ -655,10 +264,8 @@ pub fn parse(
     defer if (diag_owned) zon_diag.deinit(gpa);
 
     const bundle = std.zon.parse.fromSliceAlloc(Bundle, gpa, source, &zon_diag, .{
-        // A member this build has no field for is kept out rather than
-        // refused. See this file's own top comment: a hub adds a note or a
-        // display name without breaking an older installation, and a hub that
-        // changes what is permitted raises `version` instead.
+        // A member this build has no field for is kept out rather than refusing
+        // the bundle: only an unknown version refuses.
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -676,10 +283,6 @@ pub fn parse(
     return owned;
 }
 
-/// Read a bundle from `path` and parse it.
-///
-/// `error.NoBundleFile` is the ordinary answer, not a fault. See
-/// `LoadError.NoBundleFile`.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -707,21 +310,14 @@ pub fn load(
     return parse(gpa, source, diag);
 }
 
-/// Release everything the bundle owns, with the allocator that built it.
-/// `self` is not valid after this call.
-///
-/// The allocator is the first parameter, for the reason `table.Table.destroy`
-/// gives: a `Bundle` holds nothing that says where it came from, so it holds
-/// no allocator either.
 pub fn destroy(gpa: std.mem.Allocator, self: *const Bundle) void {
     std.zon.parse.free(gpa, self.*);
     gpa.destroy(self);
 }
 
-/// Everything about a bundle that must be right before a session starts.
 fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
     // The version first, because every other check is a check of a schema this
-    // build believes it understands.
+    // build may not be reading correctly at all.
     if (bundle.version > max_version) {
         _ = note(diag, .{ .version_too_new = bundle.version });
         return error.VersionTooNew;
@@ -772,10 +368,6 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         }
     }
 
-    // The same test `chock_cost.budget.parse` makes on a project's own cap,
-    // and it is made here for the same reason: a number that cannot bound
-    // anything is heard when the file is read, and not on the turn it would
-    // have stopped the work.
     if (bundle.budget) |ceiling| {
         if (!(ceiling.max_cost > 0) or !std.math.isFinite(ceiling.max_cost)) {
             _ = note(diag, .{ .budget_max_cost_not_positive = ceiling.max_cost });
@@ -783,9 +375,9 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         }
     }
 
-    // **Zero is a real ceiling here and an empty block is not.** A `max_width`
-    // of zero turns subagents off across the installation, which somebody may
-    // well mean, so the only shape refused is the one that caps nothing at all.
+    // Zero is a real ceiling here and an empty block is not. A `max_width` of
+    // zero turns subagents off for the installation, and a block that names
+    // neither limit caps nothing.
     if (bundle.subagents) |ceiling| {
         if (ceiling.max_depth == null and ceiling.max_width == null) {
             _ = note(diag, .subagent_ceiling_names_nothing);
@@ -793,12 +385,6 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         }
     }
 
-    // **The same two rules the subagent ceiling above already keeps.** A
-    // block that caps nothing is a mistake and not a ceiling, and a field
-    // whose text `limits_mod.parseSetting` cannot read is refused here,
-    // when the bundle is read, rather than the moment it would have sized a
-    // sandbox: see `limits_mod.Ceiling`'s own doc comment for why the field
-    // is text and not a `Setting` already.
     if (bundle.limits) |ceiling| {
         if (ceiling.processes == null and ceiling.memory == null) {
             _ = note(diag, .limits_ceiling_names_nothing);
@@ -818,10 +404,6 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
         }
     }
 
-    // The same two rules the limits ceiling above already keeps: a block
-    // that caps nothing is a mistake, and a field whose text
-    // `nix_mod.parseBytes` cannot read, including a percentage, is refused
-    // here rather than at the moment it would have bound a session.
     if (bundle.nix) |ceiling| {
         if (ceiling.max_object_bytes == null and ceiling.max_session_bytes == null) {
             _ = note(diag, .nix_ceiling_names_nothing);
@@ -843,9 +425,7 @@ fn validate(bundle: Bundle, diag: ?*?Diagnostic) ParseError!void {
 }
 
 /// The same check `table.validatePattern` makes, with the message the person
-/// who installed a bundle needs rather than the one the author of `chock.zon`
-/// needs. `field` is always a literal of this file, so the diagnostic borrows
-/// it and copies nothing.
+/// who installed the bundle needs.
 fn validatePattern(field: []const u8, pattern: ?[]const u8, diag: ?*?Diagnostic) ParseError!void {
     const text = pattern orelse return;
     if (std.mem.eql(u8, text, "*")) {
@@ -858,14 +438,6 @@ fn validatePattern(field: []const u8, pattern: ?[]const u8, diag: ?*?Diagnostic)
     }
 }
 
-/// Why this bundle may not be installed, or null when it may.
-///
-/// **This is the whole of what an expiry acts on**, which is point 3 of this
-/// file's own expiry decision. A bundle that is already past its date is not a
-/// file anybody may hand to Chock; a bundle already on the machine keeps
-/// binding whatever the date says.
-///
-/// The message is for the person who ran the command, so it says what to do.
 pub fn refusalForInstall(bundle: *const Bundle, now_ms: i64) ?[]const u8 {
     if (bundle.expiredAt(now_ms)) {
         return "this org policy bundle expired before it was given to Chock. Ask whoever issued " ++
@@ -875,14 +447,10 @@ pub fn refusalForInstall(bundle: *const Bundle, now_ms: i64) ?[]const u8 {
     return null;
 }
 
-// Every test below reads bytes and answers a question about them. What a
-// bundle does to a decision is `lib/chock-policy/table.zig`'s own tests, over
-// `Table.org`, because that is where the minimum is taken.
+// Every test below reads bytes built in the test binary.
 
 const testing = std.testing;
 
-/// A bundle whose rules and dates the caller chose, as bytes. Written as a
-/// helper so a test names the fact it pins and not the ZON around it.
 fn bundleSource(
     gpa: std.mem.Allocator,
     body: []const u8,
@@ -912,14 +480,10 @@ test "a bundle states a subject, and reading it verifies nothing about that subj
     try testing.expectEqual(@as(usize, 1), bundle.rules.len);
     try testing.expectEqualStrings("git.push", bundle.rules[0].action.?);
     try testing.expectEqual(table.Decision.deny, bundle.rules[0].decision);
-    // The three key fields the rule left out match every value, which is the
-    // same reading `chock.zon` gets.
     try testing.expectEqual(@as(?[]const u8, null), bundle.rules[0].agent_kind);
     try testing.expectEqual(@as(?[]const u8, null), bundle.rules[0].model);
     try testing.expectEqual(@as(?[]const u8, null), bundle.rules[0].tool);
 
-    // A bundle that names nobody is a bundle, not a fault. An installation
-    // that is not managed by a hub still writes rules.
     const anonymous = try parse(gpa, ".{ .rules = .{ .{ .action = \"git.push\", .decision = .deny } } }", null);
     defer destroy(gpa, anonymous);
     try testing.expectEqualStrings("", anonymous.subject);
@@ -928,9 +492,6 @@ test "a bundle states a subject, and reading it verifies nothing about that subj
 }
 
 test "an expired bundle keeps binding, says how long ago, and may not be installed" {
-    // The three points of this file's expiry decision, one assertion each.
-    // Neither failing shut nor falling open: the rules are still there, the
-    // staleness is reportable, and the date stops an installation.
     const gpa = testing.allocator;
 
     const source = try bundleSource(gpa,
@@ -943,28 +504,19 @@ test "an expired bundle keeps binding, says how long ago, and may not be install
     const bundle = try parse(gpa, source, null);
     defer destroy(gpa, bundle);
 
-    // Point 1. The rules survive the date. Nothing here drops a rule, and
-    // there is no expired reading of a bundle in which `rules` is empty.
     try testing.expect(bundle.expiredAt(9000));
     try testing.expectEqual(@as(usize, 1), bundle.rules.len);
     try testing.expectEqualStrings("provider.public.*", bundle.rules[0].action.?);
 
-    // Point 2. How long ago, in the unit the caller prints. A stale policy a
-    // reader cannot see is the failure this number exists to prevent.
     try testing.expectEqual(@as(?i64, 4000), bundle.expiredForMs(9000));
     try testing.expectEqual(@as(?i64, null), bundle.expiredForMs(4999));
-    // The boundary is not expired. A bundle is current on the millisecond it
-    // names, because a deadline is the last moment that counts.
     try testing.expect(!bundle.expiredAt(5000));
     try testing.expect(bundle.expiredAt(5001));
 
-    // Point 3. The one thing the date acts on.
     try testing.expect(refusalForInstall(bundle, 9000) != null);
     try testing.expectEqual(@as(?[]const u8, null), refusalForInstall(bundle, 5000));
     try testing.expectEqual(@as(?[]const u8, null), refusalForInstall(bundle, 1));
 
-    // A bundle with no expiry never expires and is always installable, which
-    // is the ordinary answer for an installation no hub manages.
     const forever = try parse(gpa, ".{ .rules = .{} }", null);
     defer destroy(gpa, forever);
     try testing.expect(!forever.expiredAt(9000));
@@ -988,9 +540,6 @@ test "a bundle from a newer Chock is refused whole, and an unknown field is not"
     defer destroy(gpa, current);
     try testing.expectEqual(@as(u32, 1), current.version);
 
-    // An unknown member at a known version is kept out and the bundle still
-    // reads. The rule beside it must survive, or "ignored" would mean "the
-    // file was skipped".
     const with_extra = try parse(
         gpa,
         ".{ .display_name = \"Example Org\", .rules = .{ .{ .action = \"git.push\", .decision = .deny } } }",
@@ -1027,8 +576,6 @@ test "a bundle with a pattern the language does not allow is refused before it b
 }
 
 test "a bundle larger than the reader accepts is refused by count and by name length" {
-    // The file is not the project's, and it is still bytes on a disk that can
-    // be wrong. Every bound is checked one value each side of itself.
     const gpa = testing.allocator;
 
     var body: std.ArrayList(u8) = .empty;
@@ -1056,8 +603,6 @@ test "a bundle larger than the reader accepts is refused by count and by name le
     try testing.expectEqualStrings("subject", name_diag.?.name_too_long.field);
     try testing.expectEqual(@as(usize, max_subject_bytes + 1), name_diag.?.name_too_long.held);
 
-    // One byte shorter is read, so the bound is the bound and not an
-    // approximation of one.
     const at_bound = "s" ** max_subject_bytes;
     const accepted = try parse(gpa, ".{ .subject = \"" ++ at_bound ++ "\", .rules = .{} }", null);
     defer destroy(gpa, accepted);
@@ -1079,8 +624,6 @@ test "a file that is not there is not a fault, and one that is broken names its 
     defer gpa.free(missing);
     try testing.expectError(error.NoBundleFile, load(gpa, io, missing, null));
 
-    // A file that is there and is not ZON names where it went wrong, and the
-    // trees behind the message are released with the diagnostic.
     try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = ".{ .rules = " });
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -1098,15 +641,6 @@ test "a file that is not there is not a fault, and one that is broken names its 
 }
 
 test "a bundle requires a sink, and an installation that requires none reads as empty" {
-    // **The whole of what this field adds at the reading layer**: an
-    // installation states where every session sends its log, and a bundle that
-    // states nothing states nothing. The second half is what keeps every
-    // installation that predates the field behaving as it did, because an empty
-    // list is what `src/run.zig` unions with the command line.
-    //
-    // Mutation check: default `sinks` to anything other than empty and the
-    // second half fails, which is every existing bundle gaining a sink nobody
-    // asked for.
     const gpa = testing.allocator;
 
     const source = try bundleSource(gpa,
@@ -1128,21 +662,12 @@ test "a bundle requires a sink, and an installation that requires none reads as 
     try testing.expectEqual(RequiredSink.Kind.syslog, bundle.sinks[1].kind);
     try testing.expectEqualStrings("/dev/log", bundle.sinks[1].path);
 
-    // A bundle that requires none, and a bundle written before the field
-    // existed, are the same bundle. Neither gains a sink.
     const none = try parse(gpa, ".{ .rules = .{ .{ .action = \"git.push\", .decision = .deny } } }", null);
     defer destroy(gpa, none);
     try testing.expectEqual(@as(usize, 0), none.sinks.len);
 }
 
 test "an expired bundle keeps requiring its sinks, the same way it keeps binding its rules" {
-    // A required sink inherits the expiry decision in full. Dropping the
-    // requirement can only widen what a session may do without being recorded,
-    // and it would widen it at exactly the moment nobody can be reached.
-    //
-    // Mutation check: clear `sinks` for an expired bundle anywhere and this
-    // fails, which is an organisation losing its trail by a laptop staying off
-    // a network for a week.
     const gpa = testing.allocator;
 
     const source = try bundleSource(gpa,
@@ -1156,23 +681,14 @@ test "an expired bundle keeps requiring its sinks, the same way it keeps binding
     defer destroy(gpa, bundle);
 
     try testing.expect(bundle.expiredAt(9000));
-    // There is no expired reading of a bundle in which the sinks are gone.
     try testing.expectEqual(@as(usize, 1), bundle.sinks.len);
     try testing.expectEqualStrings("/var/audit/chock", bundle.sinks[0].path);
-    // And the staleness is still reportable, so nobody is under a stale
-    // requirement without being able to see it.
     try testing.expectEqual(@as(?i64, 4000), bundle.expiredForMs(9000));
 }
 
 test "a required sink that is not an absolute path is refused before it binds" {
     // A relative path in an installation wide file resolves against the
-    // directory a session started in, which is the project. The trail would
-    // land inside the tree the person under audit owns, where they can delete
-    // it, and it would land in a different place for every project.
-    //
-    // Mutation check: drop the `isAbsolute` check and the first case below
-    // parses, which is an organisation writing one word and getting a trail its
-    // own subject can remove.
+    // directory a session started in, which for `chock run` is the project.
     const gpa = testing.allocator;
 
     var relative: ?Diagnostic = null;
@@ -1184,13 +700,10 @@ test "a required sink that is not an absolute path is refused before it binds" {
     ));
     try testing.expectEqual(@as(usize, 1), relative.?.sink_path_relative);
 
-    // The message says why, because "not absolute" alone reads as pedantry.
     const said = try std.fmt.allocPrint(gpa, "{f}", .{&relative.?});
     defer gpa.free(said);
     try testing.expect(std.mem.indexOf(u8, said, "the tree the person under audit owns") != null);
 
-    // The position is which sink, counted from one, so a bundle with several
-    // says which one is wrong.
     var second: ?Diagnostic = null;
     defer if (second) |*d| d.deinit(gpa);
     try testing.expectError(error.InvalidSinkPath, parse(
@@ -1201,8 +714,6 @@ test "a required sink that is not an absolute path is refused before it binds" {
     ));
     try testing.expectEqual(@as(usize, 2), second.?.sink_path_relative);
 
-    // An empty path is its own fault, not a relative one, because "name a path"
-    // and "name it from the root" are different things to do.
     var empty: ?Diagnostic = null;
     defer if (empty) |*d| d.deinit(gpa);
     try testing.expectError(error.InvalidSinkPath, parse(
@@ -1212,8 +723,6 @@ test "a required sink that is not an absolute path is refused before it binds" {
     ));
     try testing.expectEqual(@as(usize, 1), empty.?.sink_path_empty);
 
-    // And a path longer than the reader accepts, one byte each side of the
-    // bound, so the bound is the bound.
     const long = "/" ++ "p" ** max_sink_path_bytes;
     var too_long: ?Diagnostic = null;
     defer if (too_long) |*d| d.deinit(gpa);
@@ -1255,8 +764,6 @@ test "a bundle that requires more sinks than the reader accepts is refused" {
 }
 
 test "no two faults of this module read the same" {
-    // The same check every diagnostic in this project keeps. Two faults that
-    // print the same sentence are two faults a person cannot tell apart.
     const gpa = testing.allocator;
 
     const faults = [_]Diagnostic{
@@ -1292,8 +799,6 @@ test "a caller that wants no diagnostic allocates nothing extra for one" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     try testing.expectError(error.OutOfMemory, parse(failing.allocator(), ".{ .rules = .{} }", null));
 
-    // And the parse of a broken file with no slot ends with nothing leaked,
-    // which the testing allocator proves for the whole test.
     try testing.expectError(error.InvalidBundle, parse(testing.allocator, ".{ .rules = ", null));
     try testing.expectError(
         error.VersionTooNew,
@@ -1315,18 +820,12 @@ test "a bundle sets a budget ceiling, and one that names none sets no ceiling" {
     try testing.expectApproxEqAbs(@as(f64, 5.0), bundle.budget.?.max_cost, 1e-12);
     try testing.expectEqualStrings("USD", bundle.budget.?.currency);
 
-    // The ordinary bundle, which is every bundle written before this field
-    // existed. Null is no ceiling at all, and a project's own cap is then the
-    // only cap there is.
     const no_ceiling = try parse(gpa, ".{ .rules = .{} }", null);
     defer destroy(gpa, no_ceiling);
     try testing.expectEqual(@as(?BudgetCeiling, null), no_ceiling.budget);
 }
 
 test "a budget ceiling that names no currency leaves the field empty for the folder to fill" {
-    // The one default lives in `chock_cost.budget.default_currency`, and this
-    // library imports no other chock library, so an empty string travels and
-    // `src/run.zig` puts the default on it.
     const gpa = testing.allocator;
     const bundle = try parse(gpa, ".{ .budget = .{ .max_cost = 5.0 } }", null);
     defer destroy(gpa, bundle);
@@ -1334,9 +833,6 @@ test "a budget ceiling that names no currency leaves the field empty for the fol
 }
 
 test "a budget ceiling of zero or below is refused when the bundle is read" {
-    // Read time and not run time, the same rule `chock_cost.budget.parse`
-    // keeps: a ceiling of zero stops every session of the installation on its
-    // first turn, and nobody writes that on purpose.
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -1360,8 +856,6 @@ test "a budget ceiling of zero or below is refused when the bundle is read" {
 test "a bundle carries a subagent ceiling, and one that caps nothing is refused" {
     const gpa = testing.allocator;
 
-    // The shape an organisation writes. A bundle may cap one limit and leave
-    // the other to the project, so both are read back exactly as written.
     const both = try parse(gpa, ".{ .subagents = .{ .max_depth = 3, .max_width = 2 } }", null);
     defer destroy(gpa, both);
     try testing.expectEqual(@as(?u16, 3), both.subagents.?.max_depth);
@@ -1370,19 +864,12 @@ test "a bundle carries a subagent ceiling, and one that caps nothing is refused"
     const width_only = try parse(gpa, ".{ .subagents = .{ .max_width = 0 } }", null);
     defer destroy(gpa, width_only);
     try testing.expectEqual(@as(?u16, null), width_only.subagents.?.max_depth);
-    // **Zero is kept and not read as absent**: it turns subagents off for
-    // every project of this installation, which is a thing an organisation
-    // may well mean.
     try testing.expectEqual(@as(?u16, 0), width_only.subagents.?.max_width);
 
-    // Every bundle written before this field sets no ceiling at all.
     const older = try parse(gpa, ".{ .rules = .{} }", null);
     defer destroy(gpa, older);
     try testing.expectEqual(@as(?subagent.Ceiling, null), older.subagents);
 
-    // A block that names neither limit caps nothing. Reading it as "no
-    // ceiling" would hide the mistake for as long as the bundle lives, so it
-    // is refused when the file is read, with the reason.
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -1398,10 +885,6 @@ test "a bundle carries a subagent ceiling, and one that caps nothing is refused"
 test "a bundle carries a limits ceiling, and one that caps nothing is refused" {
     const gpa = testing.allocator;
 
-    // The shape an organisation writes. A bundle may cap one limit and leave
-    // the other to the project or the operator, so both are read back
-    // exactly as written, as text: see `limits_mod.Ceiling`'s own doc
-    // comment for why this field is a string and not a `Setting` already.
     const both = try parse(gpa, ".{ .limits = .{ .processes = \"256\", .memory = \"8GiB\" } }", null);
     defer destroy(gpa, both);
     try testing.expectEqualStrings("256", both.limits.?.processes.?);
@@ -1412,14 +895,10 @@ test "a bundle carries a limits ceiling, and one that caps nothing is refused" {
     try testing.expectEqual(@as(?[]const u8, null), memory_only.limits.?.processes);
     try testing.expectEqualStrings("50%", memory_only.limits.?.memory.?);
 
-    // Every bundle written before this field sets no ceiling at all.
     const older = try parse(gpa, ".{ .rules = .{} }", null);
     defer destroy(gpa, older);
     try testing.expectEqual(@as(?limits_mod.Ceiling, null), older.limits);
 
-    // A block that names neither limit caps nothing, the same rule the
-    // subagent ceiling above keeps, refused when the file is read rather
-    // than silently treated as "no ceiling".
     var empty_diag: ?Diagnostic = null;
     defer if (empty_diag) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -1433,14 +912,7 @@ test "a bundle carries a limits ceiling, and one that caps nothing is refused" {
 }
 
 test "a limits ceiling that cannot parse is refused when the bundle is read" {
-    // **Read time and not the moment it would have sized a sandbox.** The
-    // same reason `InvalidBudgetCeiling` and `InvalidSubagentCeiling` are
-    // both checked here rather than at the call site that would hit them.
-    //
-    // Mutation check: skip this validation and a bundle with
-    // `.processes = "200%"` parses cleanly, and `underCeiling`'s own
-    // defensive branch (see `limits_mod`'s own tests) silently drops the
-    // ceiling instead of a person ever hearing that their bundle is wrong.
+    // Read time and not the moment it would have sized a sandbox.
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);

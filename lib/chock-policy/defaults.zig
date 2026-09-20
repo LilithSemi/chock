@@ -1,257 +1,41 @@
-//! The rules Chock ships, so a project with no `chock.zon` at all keeps
-//! today's behaviour once the loop starts asking `table.Table` about every
-//! tool call: an ordinary call runs, and nothing that needed a human before
-//! this file existed needs one less now.
+//! The rules Chock ships, so a project with no `chock.zon` keeps today's
+//! behaviour once the loop asks `table.Table` about every tool call.
 //!
-//! `lib/chock-core/tools.zig`'s `Tool.actionInto` is what a tool call turns
-//! into before it reaches the table. `.{ .action = "call.write_file",
-//! .decision = .ask }` is a name a `chock.zon` author writes, and `rules`
-//! below is the same language, read by the same table, so it is tempting to
-//! think a rule here and a rule a project writes settle a disagreement the
-//! way two rules of one `chock.zon` would: the more specific pattern wins.
-//! **They do not.** A shipped default is a lower class of rule, read only
-//! when a project's own rules name nothing that matches the key at all. A
-//! project rule that matches wins outright, whatever it names and however
-//! wide it is next to a default, because the entire reason a default exists
-//! is to answer for a key the project did not. See `table.zig`'s own top
-//! comment, "An action nobody named, and the rules Chock ships for it", and
-//! `evaluateRules` there for how the two lists are actually read.
+//! A shipped default is a lower class of rule than a project's own. A project
+//! rule that matches wins outright, however wide it is, because a default only
+//! answers for a key the project did not name.
 //!
-//! ## Every rule here names an action, and never a tool alone
+//! Every rule names an `.action` and never a tool alone. A tool name such as
+//! `fetch_url` is asked a second, narrower question later at `net.fetch.*` and
+//! `net.connect.*`, and a rule that named only the tool would answer those too.
 //!
-//! **Measured, not assumed, and the opposite of the first guess.** A rule
-//! that names an `.action` always beats a rule that names only a `.tool`,
-//! whichever order the two are written in and whichever decision each one
-//! carries. `table.zig`'s `ruleBeats` compares the four fields in the order
-//! action, tool, model, agent kind, and scores an absent field as `0`. A
-//! rule that leaves `.action` out scores `0` on the very first comparison, so
-//! a rule that names any `.action` at all wins there before `.tool` is ever
-//! read. **A tool wide `allow` therefore does not swallow a narrower
-//! `exec.*` rule underneath it.** Pinned by the test
-//! `"a rule that names an action beats a rule that names only a tool"`
-//! below, which this file's rules still depend on for a different reason:
-//! see the next paragraph.
-//!
-//! That specificity result only helps a project that wrote a narrower rule
-//! of its own to win with. It does nothing for a key that no rule at all
-//! contests, which is the case a shipped default exists for in the first
-//! place. It is safe for `run_command` to line up rules of its own for the
-//! four classes `actionInto` can name a path into, because `exec.*` is
-//! `run_command`'s alone: nothing else in Chock ever asks the table about an
-//! `exec.*` key, so a `.tool = "run_command"` default would have cost
-//! nothing there. `exec.unparsed`, the fifth name `actionInto` can build,
-//! holds no rule at all: see "What is deliberately absent" below.
-//!
-//! It is **not** safe for a tool whose own name is also read for a second,
-//! narrower question, and this is the reason every rule below names an
-//! `.action`. `fetch_url` is the clear case: `lib/chock-broker/fetch.zig`
-//! asks the table again for `net.fetch.*`, and `lib/chock-broker/network.zig`
-//! asks it again for `net.connect.*`, both with `.tool = "fetch_url"`, once
-//! the handler is already inside the call. `request_action` is the same
-//! shape: the action it names is a request to run a distinct act such as
-//! `git.push`, evaluated with `.tool = "request_action"` and the act's own
-//! name, not with `call.request_action`. A rule of `.{ .tool = "fetch_url",
-//! .decision = .allow }` would answer `allow` for `net.connect.evil.443` as
-//! readily as for `call.fetch_url`, because nothing else would name that key.
-//! A project that wrote no `chock.zon` at all has no narrower rule to
-//! contest it with, so the broad one would be the only rule that matches,
-//! and it would answer for a key it was never meant to. Naming the
-//! exact action `actionInto` builds, and nothing wider, is what keeps a
-//! shipped default from ever answering a question it was not written for.
-//!
-//! ## The store is two classes and not one
-//!
-//! `exec.nix.store.*` shipped as `allow` for a time, and the reasoning
-//! written with it was that a store path is content addressed and immutable,
-//! so it names exactly one program forever, unlike `./thing`, which the agent
-//! can rewrite on the turn before it runs. **That reasoning held only while
-//! the agent could not put a path in the store.** It can now: it evaluates an
-//! expression, Chock registers the result, and a build makes store paths that
-//! did not exist when the session started. A blanket allow written for "the
-//! toolchain you were given" covered those too.
-//!
-//! So `lib/chock-core/tools.zig` names two classes where it named one.
-//! `exec.devshell.*` is a program inside the closure the session mounted at
-//! its start, which is known before the model says anything, and it is
-//! allowed here for the reason the store rule once was. `exec.nix.store.*` is
-//! every other store path, a provisioned program and a built one alike, and
-//! it asks.
-//!
-//! **It is the one shipped rule that is not an `allow`, and it is spelled out
-//! rather than left absent on purpose.** The absent rules below say `ask` by
-//! saying nothing, which is right for a key no class of Chock's own ever
-//! builds a sibling of. This key has three siblings that are allowed, and a
-//! reader comparing the four classes must see all four in one place. `ask`
-//! also ranks no lower than an unnamed key does, so nothing in `table.zig`'s
-//! `representatives` changes: see the `device.*` comment further down for
-//! what a rank below `ask` would have cost.
-//!
-//! `exec.path.*` needs no split of its own. A bare name is a `PATH` lookup,
-//! and `PATH` inside the sandbox is the one the session sets, so a lookup
-//! reaches only what the session mounted. A program `provide_tool` added is
-//! on that `PATH`, and the act that put it there was already decided at
-//! `nix.build`, before the tool was offered at all.
-//!
-//! ## Seven names with no `call.*` rule at all
-//!
-//! `lib/chock-core/Loop.zig`'s `gateToolCall` answers seven tool names itself,
-//! before it ever calls `Tool.actionInto` for them, so no `call.spawn_agent`,
-//! `call.update_plan`, `call.restrict_self`, `call.fetch_url`, `call.ask_user`,
-//! `call.set_title` or `call.request_action` key is ever built or evaluated by
-//! anything in Chock. A rule here under one of those names would read as a
-//! control and do nothing: this file ships none of them, on purpose, and an
-//! author who wants to bound one of these seven writes the key that is
-//! actually read instead.
-//!
-//! * `spawn_agent` is bounded by `chock.zon`'s own `subagents` block,
-//!   `max_width` and `max_depth`. There is no table key.
-//! * `restrict_self` narrowing needs nobody's permission, by design. Widening
-//!   asks about `ratchet.widen_action`.
-//! * `fetch_url` is decided per host, once the URL is known, at
-//!   `net.fetch.*` and `net.connect.*`.
-//! * `request_action` is decided at the requested act's own name, such as
-//!   `git.push`, with `.tool = "request_action"`.
-//! * `update_plan`, `ask_user` and `set_title` grant no capability and need no
-//!   key at all.
-//!
-//! ## The git shim asks too, and its names are here for one reason
-//!
-//! `lib/chock-broker/git_shim.zig` reads a `run_command` call that runs `git`
-//! and answers `run_the_real_git` or `ask`. Until 2026-09-15 the `ask` half
-//! reached nobody: `src/run.zig` threw away every verdict that was not a
-//! subcommand needing a host. It reaches the arbiter now, which means a
-//! subcommand the shim classifies is a key this table is asked about, and a
-//! key nobody named answers `ask`.
-//!
-//! **So a `git.*` rule here buys exactly one thing: a project with no
-//! `chock.zon` keeps running `git add` and `git commit` with no prompt.**
-//! That is the same promise `call.write_file` and `call.edit_file` above are
-//! here for, read for a different tool. Without these lines, wiring the shim
-//! would have made every ordinary session stop at its first `git add`, and a
-//! piped session, which can ask nobody, would have been refused outright.
-//!
-//! **The split is whether the subcommand reaches another host, and nothing
-//! else.** `git_shim.needs_network` is where that judgement already lives, and
-//! it is not copied here: the four names on it that this file could have
-//! written simply are not written, so there is one list and not two. A
-//! subcommand that only changes the session's own workspace is allowed,
-//! because the workspace is a scratch worktree the project never sees and the
-//! user is asked about `workspace.apply` at the end of the session either way.
-//! A subcommand that reaches a host is not, because that act leaves the
-//! sandbox and Chock asks about every act that leaves it.
-//!
-//! **Two names the shim builds hold no rule, and both are the safe default.**
-//! `git.unknown` is what an option this shim cannot read answers, which stops
-//! it reading the subcommand at all, and a verb on neither of the shim's own
-//! lists answers `git.<verb>`, which no line below names. Both are a git
-//! command Chock could not read, and a command nobody can read is not safe for
-//! being unreadable: that is the reading `exec.unparsed` below already gets.
-//!
-//! ## What is deliberately absent
-//!
-//! `net.connect.*` and `net.fetch.*` hold no rule here, on purpose. Chock
-//! answers `ask` for a key nobody named, and a network reach is exactly the
-//! kind of act that must keep asking until a project's own `chock.zon` says
-//! otherwise. Adding a rule that spells `.decision = .ask` here would read
-//! the same at first glance and mean something worse: it would be one more
-//! line for the next author to wonder whether narrowing it is enough, when
-//! today the true answer is that no rule exists at all.
-//!
-//! `git.push`, `git.clone`, `git.fetch` and `git.pull` join them, for the
-//! same reason and one more of their own: each one reaches another host, and
-//! a host reach is decided at `net.connect.*`, which holds no rule here
-//! either. `git.unknown` joins them as well: see the section above.
-//!
-//! `file.write` joins them, and it is worth saying why it is not read as a
-//! contradiction of `call.write_file` above. The two are different acts with
-//! similar names. `call.write_file` is a tool call, which writes inside the
-//! sandbox and reaches only the session's own workspace, so it is allowed.
-//! `file.write` is `lib/chock-broker/actions.zig`'s act, which the broker
-//! performs **on the host**, at a path outside the workspace. An unnamed key
-//! answers `ask`, which is the right answer for the second one, and writing a
-//! rule here would be writing one for the wrong one.
-//!
-//! `exec.unparsed` joins them, and it did not always. `lib/chock-core/tools.zig`
-//! answers `exec.unparsed` for a path it refuses to resolve, most often a `..`
-//! component: resolving one correctly needs the filesystem, to follow any
-//! symlink the segment before it might be, and reading only the string the
-//! call gave is the right call there. **The fault this file shipped was
-//! answering `allow` for the name that refusal produces, not the refusal
-//! itself.** `./.git/../build.sh` and `./.git/../x/bin/bash` both name
-//! `exec.unparsed`, because a `..` at a depth greater than zero does not
-//! leave the project and `.git` always exists, and a project that denied
-//! `exec.workspace.*`, `exec.path.*`, `exec.devshell.*` and
-//! `exec.nix.store.*` by name still
-//! answered `allow` for either, because none of the four named
-//! `exec.unparsed` and the shipped default did. An unnameable program is not
-//! a safe one merely for being unnameable: it is a program Chock could not
-//! tell apart from any other, and that is exactly the case `ask` exists for.
-//! Removing the rule, rather than spelling `.decision = .ask` here, keeps to
-//! the same reasoning `net.connect.*` and `net.fetch.*` already gave: one
-//! fewer line for a later author to wonder whether narrowing it is enough.
-//!
-//! ## Where this folds in
-//!
-//! `table.zig`'s own `evaluateRules` reads a project's own rules first, and
-//! reads `rules` here only when the project named nothing that matches the
-//! key. It does not read `rules` as a ceiling the way `Table.org` is read
-//! either: a ceiling can only ever narrow an existing answer, and it can
-//! never turn an unnamed key's `ask` into this file's `allow`, which is the
-//! one thing a shipped default has to do for a project that wrote no
-//! `chock.zon` at all. See `evaluateRules`'s own comment.
+//! An unnamed key answers `ask`, so absence is how this file refuses.
+//! `gateToolCall` answers `spawn_agent`, `update_plan`, `restrict_self`,
+//! `fetch_url`, `ask_user`, `set_title` and `request_action` itself, so a
+//! `call.*` rule for one of those would read as a control and do nothing.
 
 const table = @import("table.zig");
 
-/// One rule for every action `gateToolCall` actually asks the table about
-/// for an ordinary tool call, plus the git shim's own names, so an empty or
-/// absent `chock.zon` still runs them without a prompt.
+/// One rule for every action an ordinary tool call builds, plus the git shim's
+/// own subcommand names.
 ///
-/// **The `git.*` block at the end is not a `gateToolCall` key.** It is asked
-/// by `src/run.zig`'s `GitToolRunner`, out of what
-/// `lib/chock-broker/git_shim.zig` read from one `run_command` argument
-/// vector. See this file's own top comment, "The git shim asks too", for why
-/// the block stops at the subcommands that reach no other host.
-///
-/// `run_command` needs four rules, one for each class `actionInto` can
-/// build a path into, because `.tool = "run_command"` alone would be exactly
-/// the unsafe shape this file's own top comment measures against. Three of
-/// the four are `allow` and `exec.nix.store.*` is `ask`: see "The store is
-/// two classes and not one". It builds a fifth name, `exec.unparsed`, for a
-/// path it refuses to resolve, and that
-/// one holds no rule here at all: see this file's own top comment, "What is
-/// deliberately absent". Every other tool needs exactly one rule, because
-/// `actionInto` builds it exactly one name, `"call." ++ @tagName(tool)`, and
-/// nothing else in Chock ever asks the table about that name.
-///
-/// **The seven names `gateToolCall` answers itself hold no rule here.**
-/// `spawn_agent`, `update_plan`, `restrict_self`, `fetch_url`, `ask_user`,
-/// `set_title` and `request_action` never reach `Tool.actionInto` from
-/// `gateToolCall`, so a `call.*` rule for any of them would never be built
-/// or evaluated by anything. See this file's own top comment, "Seven names
-/// with no `call.*` rule at all".
-///
-/// **A tool added to `lib/chock-core/tools.zig` and forgotten here does not
-/// fail a build.** `chock-policy` imports no other chock library, so this
-/// file cannot read the `Tool` enum to check itself against it. A forgotten
-/// tool answers `ask`, the same as any other key nobody named: see
-/// `"a tool this file forgot still answers ask"` below for why that is the
-/// safe direction to fail in, and not a silent `allow`.
+/// A tool added to `lib/chock-core/tools.zig` and forgotten here does not fail
+/// a build. `chock-policy` imports no other chock library, so it cannot read
+/// the `Tool` enum, and a forgotten tool answers `ask`.
 pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_file", .decision = .allow },
-    // Reading a picture out of the workspace is a read, the same class as
-    // `call.read_file` above it. What holds it back is not this table but
-    // `Support`: a session whose provider cannot take an image is never
-    // offered the tool, so this row is never reached there.
+    // A session whose provider cannot take an image is never offered the tool,
+    // so this row is never reached there.
     .{ .action = "call.read_image", .decision = .allow },
     .{ .action = "call.list_directory", .decision = .allow },
     .{ .action = "call.glob", .decision = .allow },
     .{ .action = "call.grep", .decision = .allow },
     .{ .action = "call.write_file", .decision = .allow },
     .{ .action = "call.edit_file", .decision = .allow },
-    // **The dev shell closure runs, and the rest of the store asks.** See
-    // this file's own top comment, "The store is two classes and not one",
-    // for why the store rule below is the one shipped default that is not an
-    // `allow`.
+    // The dev shell closure was known before the model said anything. Every
+    // other store path the session could have made itself, so it asks.
+    // `exec.unparsed`, the fifth class `actionInto` builds, holds no rule: a
+    // program Chock could not name is not safe for being unnameable.
     .{ .action = "exec.devshell.*", .decision = .allow },
     .{ .action = "exec.nix.store.*", .decision = .ask },
     .{ .action = "exec.workspace.*", .decision = .allow },
@@ -260,60 +44,31 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "call.read_memory", .decision = .allow },
     .{ .action = "call.write_memory", .decision = .allow },
     .{ .action = "call.provide_tool", .decision = .allow },
-    // **An evaluation reads and never builds.** It runs in the harness, in
-    // pure mode, and the one tree it may read is the workspace the reading
-    // tools above already read, so it is the same class as `call.read_file`.
-    // A build is a separate act under `nix.build`, which is not this row.
+    // An evaluation runs in pure mode and reads only the workspace. A build is
+    // a separate act under `nix.build`.
     .{ .action = "call.nix_eval", .decision = .allow },
-    // **A fixed output derivation that names no URL at all.** `zig.fetchDeps`,
-    // npm deps and `fetchCargoVendor` read their URLs out of a lock file while
-    // they build, so the derivation holds no URL anywhere and there is no host
-    // for a `nix.net` rule to cover. There never was one.
-    //
-    // Shipped `allow` because that is how every vendored dependency fetch
-    // works. A default that refuses them refuses nearly every Rust, Node and
-    // Zig package, this repository's own package and its own dev shell among
-    // them, and a control nobody can leave on is not a control.
-    //
-    // **What it costs.** The output hash proves the bytes are what the
-    // derivation expected and proves nothing about where the request went, so
-    // a build allowed here can reach a host nobody named. The row exists so a
-    // project can take it back: `.{ .action = "nix.net.build.opaque",
-    // .decision = .ask }` in its own `chock.zon` puts the question to a
-    // person, and `.deny` refuses such a build outright. Every derivation that
-    // does name a URL is unaffected and still goes to `nix.net` per host.
+    // A fixed output derivation that names no URL, which is how every vendored
+    // dependency fetch works. The output hash proves the bytes and not the
+    // host, so a project that wants the question writes this action with `ask`.
     .{ .action = "nix.net.build.opaque", .decision = .allow },
-    // **A language server, which every project that has one already runs.**
-    // Shipped `allow` so that giving this act a name changes nothing for
-    // anybody: a project with a `language_servers` block behaves exactly as it
-    // did. What the name buys is a lever that did not exist, and the one that
-    // matters is an organisation's: `lsp.*` deny in an org bundle now stops
-    // every project of an installation starting one. See
-    // `chock_core.lsp_driver.actionInto`, which also says why a label is not an
-    // identity.
+    // A language server, which every project that has one already runs. The
+    // name buys an organisation an `lsp.*` deny across an installation.
     .{ .action = "lsp.*", .decision = .allow },
 
-    // **The git shim's own names.** See this file's own top comment, "The git
-    // shim asks too". Every one of these changes the session's own scratch
-    // workspace and nothing outside it, so a project that wrote no `chock.zon`
-    // runs them with no prompt, exactly as it did before the shim's `ask` half
-    // was wired. `git.push`, `git.clone`, `git.fetch`, `git.pull` and
-    // `git.unknown` are deliberately not here.
+    // The git shim's own names. Each changes the session's scratch workspace
+    // and nothing outside it. `git.push`, `git.clone`, `git.fetch`, `git.pull`
+    // and `git.unknown` are absent because each one reaches another host.
     .{ .action = "git.add", .decision = .allow },
     .{ .action = "git.am", .decision = .allow },
     .{ .action = "git.apply", .decision = .allow },
     .{ .action = "git.bisect", .decision = .allow },
     .{ .action = "git.branch", .decision = .allow },
-    // `git branch -d` is the one spelling that names an act of its own, so it
-    // is its own key. It still deletes a branch in the session's own object
-    // store and never in the user's repository.
+    // `git branch -d` deletes a branch in the session's own object store.
     .{ .action = "git.branch.delete", .decision = .allow },
     .{ .action = "git.checkout", .decision = .allow },
     .{ .action = "git.cherry-pick", .decision = .allow },
     .{ .action = "git.clean", .decision = .allow },
-    // **The one that must not prompt.** A commit in the workspace is how a
-    // session's work reaches the user at all, through the `workspace.apply`
-    // the user is asked about at the end of the run.
+    // A commit is how a session's work reaches the user, at `workspace.apply`.
     .{ .action = "git.commit", .decision = .allow },
     .{ .action = "git.config", .decision = .allow },
     .{ .action = "git.filter-branch", .decision = .allow },
@@ -327,10 +82,8 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "git.prune", .decision = .allow },
     .{ .action = "git.rebase", .decision = .allow },
     .{ .action = "git.reflog", .decision = .allow },
-    // `git remote` and `git submodule` reach a host in some spellings and not
-    // in others, which is why `git_shim.needs_network` leaves both off. They
-    // are allowed here for the same reason every other line is, and the reach
-    // itself is still decided at `net.connect.*`, which holds no rule at all.
+    // Both reach a host in some spellings, so `git_shim.needs_network` lists
+    // neither and the reach itself is still decided at `net.connect.*`.
     .{ .action = "git.remote", .decision = .allow },
     .{ .action = "git.repack", .decision = .allow },
     .{ .action = "git.replace", .decision = .allow },
@@ -348,38 +101,16 @@ pub const rules: []const table.Rule = &.{
     .{ .action = "git.worktree", .decision = .allow },
 };
 
-// `device.*` holds no shipped default, on purpose, and a `deny` was tried
-// here and rejected. An action nobody names already answers `ask`, which is
-// the table's own safe default, so the class needs no entry at all, and
-// `ask` is genuinely answerable for a device: it arrives mid-session, when a
-// person is there to be asked, unlike a language server's question, which
-// would arrive at startup with nobody to answer it.
-//
-// **The `deny` was rejected because it was the first shipped default ranked
-// below `ask`, and that rank alone broke policies that had nothing to do
-// with a device.** `table.zig`'s `representatives` samples every class
-// `defaults.zig` ships, including one that names nothing else, so a `deny`
-// here would give `checkChildrenAreWeaker` an action class where the answer
-// can fall below `ask` for the first time ever. Before this, an unscoped
-// child rule of `ask` could never outrank a parent, because nothing shipped
-// ever ranked lower. A `chock.zon` where a child agent kind holds a rule
-// broader than its parent, leaning on shipped defaults to fill the rest,
-// would have stopped parsing the moment this `deny` shipped, in a project
-// that never named a device at all. See the test just below, and
-// `table.zig`'s own test `"a name that holds the byte the read time check
-// invents is refused"`, which pins the exact fixture this would have broken.
-//
-// Whoever reaches for this again: the fix is not to scope the `deny` more
-// narrowly. Any class ranked below `ask` in the shipped defaults reaches
-// every policy in existence through `representatives`, not only the ones
-// that mention it.
+// `device.*` holds no shipped default. A `deny` was tried and rejected: it
+// would be the first class ranked below `ask`, and `table.zig`'s
+// `representatives` samples every class shipped here, so it would refuse
+// policies that never named a device. Scoping the `deny` narrower does not
+// help.
 
 const std = @import("std");
 
-/// A key for one action, with the parts these tests do not vary held still.
-/// Mirrors `table.zig`'s own `testKey`, but the tool named here is never read
-/// by any rule in `rules`: every rule above matches on `.action` alone, so
-/// changing this constant must never change what a test below measures.
+/// No rule in `rules` reads the tool name, so changing it must never change
+/// what a test below answers.
 fn key(action: []const u8) table.Key {
     return .{
         .agent_kind = "main",
@@ -389,10 +120,6 @@ fn key(action: []const u8) table.Key {
     };
 }
 
-/// An empty policy, the same as a project with no `chock.zon` at all. See
-/// `table.zig`'s own `LoadError.NoPolicyFile`: its own doc says `parse` with
-/// the source `.{}` builds the table that answers this file is measuring
-/// against.
 fn emptyTable(gpa: std.mem.Allocator) !*const table.Table {
     return table.Table.parse(gpa, ".{}", null);
 }
@@ -431,10 +158,6 @@ test "every action an ordinary tool call builds answers allow with no chock.zon 
 }
 
 test "a store path outside the dev shell closure asks with no chock.zon at all" {
-    // The fourth class `run_command` builds, and the one shipped rule that is
-    // not an `allow`. A store path the session did not start with is a path
-    // the session itself could have made, so it asks. Mutation check: put the
-    // row back to `allow` and this fails while every other default holds.
     const gpa = std.testing.allocator;
     const t = try emptyTable(gpa);
     defer table.Table.destroy(gpa, t);
@@ -443,8 +166,6 @@ test "a store path outside the dev shell closure asks with no chock.zon at all" 
         table.Decision.ask,
         t.evaluateKindAlone(key("exec.nix.store.abc-jq.bin.jq")),
     );
-    // The closure keeps running with no prompt, which is what the split is
-    // for: the toolchain was known before the model said anything.
     try std.testing.expectEqual(
         table.Decision.allow,
         t.evaluateKindAlone(key("exec.devshell.abc-jq.bin.jq")),
@@ -456,12 +177,8 @@ test "net.connect and net.fetch hold no default rule and still answer ask" {
     const t = try emptyTable(gpa);
     defer table.Table.destroy(gpa, t);
 
-    // `.tool` is set to "fetch_url" here, on purpose: this is the same key
-    // `lib/chock-broker/fetch.zig` and `lib/chock-broker/network.zig` build
-    // once a `fetch_url` call is already running. If a default rule ever
-    // named `.tool = "fetch_url"` alone, this test would start answering
-    // `allow` and would catch the regression this file's top comment warns
-    // against.
+    // `.tool` is "fetch_url" here on purpose: a default rule that named the
+    // tool alone would answer `allow` for both keys below.
     const fetch_key = table.Key{
         .agent_kind = "main",
         .model = "test-model",
@@ -482,10 +199,6 @@ test "net.connect and net.fetch hold no default rule and still answer ask" {
 test "a build that fetches with no url is allowed by default, and a project can take it back" {
     const gpa = std.testing.allocator;
 
-    // **The shipped answer, with no `chock.zon` at all.** Every vendored
-    // dependency fetch is a fixed output derivation that names no URL, so a
-    // default that refused them would refuse nearly every Rust, Node and Zig
-    // package.
     const empty = try emptyTable(gpa);
     defer table.Table.destroy(gpa, empty);
     try std.testing.expectEqual(
@@ -493,9 +206,6 @@ test "a build that fetches with no url is allowed by default, and a project can 
         empty.evaluateKindAlone(key("nix.net.build.opaque")),
     );
 
-    // **And the whole reason the row is here rather than absent.** A project
-    // that wants the question writes one line, and one that wants it gone
-    // writes the other.
     const asking = try table.Table.parse(
         gpa,
         \\.{
@@ -532,8 +242,6 @@ test "a build that fetches with no url is allowed by default, and a project can 
         denying.evaluateKindAlone(key("nix.net.build.opaque")),
     );
 
-    // A derivation that names a URL is unaffected: it still goes to
-    // `net.connect`, which holds no default rule and answers ask.
     try std.testing.expectEqual(
         table.Decision.ask,
         empty.evaluateKindAlone(key("net.connect.com.example.443")),
@@ -545,8 +253,6 @@ test "a tool this file forgot still answers ask" {
     const t = try emptyTable(gpa);
     defer table.Table.destroy(gpa, t);
 
-    // No rule in `rules` names this action, and none ever will: it stands in
-    // for whatever a future tool builds before this file is updated for it.
     try std.testing.expectEqual(
         table.Decision.ask,
         t.evaluateKindAlone(key("call.a_tool_this_file_has_never_heard_of")),
@@ -568,16 +274,9 @@ test "a project rule narrows a shipped default, and never raises one" {
     const t = try table.Table.parse(gpa, narrowed, null);
     defer table.Table.destroy(gpa, t);
 
-    // Narrowed: the shipped default is `allow`, and the project's own rule
-    // for the very same action wins because it is a tie in specificity and
-    // `ask` is the more restrictive of the two decisions.
     try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("call.write_file")));
-    // Every other shipped default is untouched.
     try std.testing.expectEqual(table.Decision.allow, t.evaluateKindAlone(key("call.read_file")));
 
-    // Nothing in the Decision enum ranks above `allow`, so a project cannot
-    // write a rule that raises a shipped default even if it tries: an
-    // `.allow` rule for the same action changes nothing.
     const same_source: [:0]const u8 =
         \\.{
         \\    .policy = .{
@@ -593,16 +292,6 @@ test "a project rule narrows a shipped default, and never raises one" {
 }
 
 test "a rule that names an action beats a rule that names only a tool" {
-    // The question this file's own top comment measures before it decides
-    // anything: with a shipped default of the shape
-    // `.{ .tool = "run_command", .decision = .allow }`, does a project's own
-    // `.{ .action = "exec.workspace.*", .decision = .deny }` win, or does the
-    // tool wide `allow`?
-    //
-    // Built from raw `table.Rule` values and not from `rules` above, because
-    // the question is about `table.zig`'s own specificity rule, not about
-    // what this file ships. The answer holds regardless of which rules a
-    // policy actually names.
     const gpa = std.testing.allocator;
 
     const tool_wide_first: [:0]const u8 =
@@ -636,16 +325,8 @@ test "a rule that names an action beats a rule that names only a tool" {
             .tool = "run_command",
             .action = "exec.workspace.build%2Esh",
         };
-        // The rule that names the action wins. A shipped default that named
-        // only a tool would therefore be overridden by a project rule this
-        // specific, whichever order the two rules are written in.
         try std.testing.expectEqual(table.Decision.deny, t.evaluateKindAlone(workspace_key));
 
-        // The tool wide rule still answers for every action the narrower
-        // rule does not cover, which is the entire hazard this file's top
-        // comment describes: nothing stops it from answering for
-        // `net.connect.*` or `net.fetch.*` as well, if it were ever given a
-        // tool whose name is read for those too.
         const other_key = table.Key{
             .agent_kind = "main",
             .model = "test-model",
@@ -657,17 +338,8 @@ test "a rule that names an action beats a rule that names only a tool" {
 }
 
 test "a project rule that never names an action still beats a shipped default" {
-    // Measured against a real table. A shipped default always names an
-    // `.action`, and `ruleBeats` scored an absent field as `0`, so a project
-    // rule that named no `.action` at all lost to a shipped default on the
-    // very first comparison, whatever the project rule said. A project must
-    // be able to narrow, so a project's own rule has to win here regardless
-    // of how specific it is next to a default: see this file's own top
-    // comment, "A project rule wins over a shipped default outright".
-    //
-    // Each case below is one of the five shapes measured before the fix,
-    // every one of which answered `allow` although the project rule named
-    // was `deny`.
+    // `ruleBeats` scored an absent field as `0`, so a project rule that named
+    // no `.action` lost to a shipped default, which always names one.
     const gpa = std.testing.allocator;
 
     const Case = struct {
@@ -750,12 +422,6 @@ test "a project rule that never names an action still beats a shipped default" {
 }
 
 test "exec.unparsed holds no shipped default, and answers ask like any other unnamed action" {
-    // `exec.unparsed` was shipped as `allow`, so a path holding a `..` that
-    // `lib/chock-core/tools.zig` refused to resolve ran without ever being
-    // named by a project's own rules. See this file's own top comment,
-    // "What is deliberately absent": the same reasoning that keeps
-    // `net.connect.*` and `net.fetch.*` off this list applies here too, and
-    // it is why `exec.unparsed` now joins them.
     const gpa = std.testing.allocator;
     const t = try emptyTable(gpa);
     defer table.Table.destroy(gpa, t);
@@ -764,16 +430,6 @@ test "exec.unparsed holds no shipped default, and answers ask like any other unn
 }
 
 test "device.* holds no shipped default, and answers ask like any other unnamed action" {
-    // A `deny` was tried here and rejected: see the comment above `rules`
-    // where `device.*` would have gone. `device.*` would have been the first
-    // shipped default ranked below `ask`, and `table.zig`'s
-    // `checkChildrenAreWeaker` samples every class a default ships, so that
-    // one entry would have broken a `chock.zon` that never named a device at
-    // all, wherever a child agent kind held a rule broader than its parent
-    // and leaned on shipped defaults for the rest. `ask` is genuinely
-    // answerable for a device, since it arrives mid-session when a person is
-    // there to answer, so the class needs no entry and this is the table's
-    // own safe default already.
     const gpa = std.testing.allocator;
     const t = try emptyTable(gpa);
     defer table.Table.destroy(gpa, t);
@@ -782,12 +438,8 @@ test "device.* holds no shipped default, and answers ask like any other unnamed 
 }
 
 test "a project rule denying every exec class still denies a path that could not be classified" {
-    // Measured: `./build.sh` denies, but `./.git/../build.sh` and
-    // `./.git/../x/bin/bash` both name `exec.unparsed` instead of
-    // `exec.workspace.*`, because a `..` is never resolved lexically. None
-    // of the four rules below names `exec.unparsed`, so with the old
-    // shipped default of `allow` this fell straight through the project's
-    // own denial of every exec class it knew to name.
+    // A `..` is never resolved lexically, so `./.git/../build.sh` names
+    // `exec.unparsed` and not `exec.workspace.*`.
     const gpa = std.testing.allocator;
 
     const source: [:0]const u8 =

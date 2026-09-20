@@ -1,19 +1,17 @@
-//! The Nix store's own byte caps. The reader, the `Diagnostic` and the fold
-//! all mirror `lib/chock-policy/limits.zig`.
+//! The Nix store's own byte caps, mirroring `lib/chock-policy/limits.zig`.
 
 const std = @import("std");
 const limits_mod = @import("limits.zig");
 
-/// `limits.zig`'s own, imported rather than written a second time.
 pub const Setting = limits_mod.Setting;
 pub const parseSetting = limits_mod.parseSetting;
 pub const SettingError = limits_mod.SettingError;
 
 pub const BytesError = SettingError || error{PercentNotAllowed};
 
-/// `text` as a byte count. A percentage is refused rather than resolved,
-/// because a store object has no machine quantity to be a share of the way a
-/// process count or a memory total has.
+/// A percentage is refused rather than resolved, because a store object has no
+/// machine quantity to be a share of the way a process count or a memory total
+/// has.
 pub fn parseBytes(text: []const u8) BytesError!u64 {
     return switch (try parseSetting(text)) {
         .absolute => |value| value,
@@ -21,7 +19,6 @@ pub fn parseBytes(text: []const u8) BytesError!u64 {
     };
 }
 
-/// `reason` as the clause that finishes "which ...".
 pub fn reasonText(reason: BytesError) []const u8 {
     return switch (reason) {
         error.PercentNotAllowed => "names a percentage, and a store byte cap has no machine quantity to be a share of",
@@ -31,36 +28,26 @@ pub fn reasonText(reason: BytesError) []const u8 {
     };
 }
 
-/// The most one store object may carry when nothing at any layer named a
-/// number. The same number as `chock_nix.backend.default_max_object_bytes`,
-/// written twice because this library imports no other chock library.
+/// The same number as `chock_nix.backend.default_max_object_bytes`, written
+/// twice because this library imports no other chock library.
 pub const default_max_object_bytes: u64 = 16 << 20;
 
-/// The most a whole session may add when nothing at any layer named a number.
 pub const default_max_session_bytes: u64 = 256 << 20;
 
-/// What one `nix` block asks for. Every member is optional, so "this file
-/// named nothing" is told apart from "this file named today's default".
+/// Every member is optional, so "this file named nothing" is told apart from
+/// "this file named today's default".
 pub const Nix = struct {
-    /// Feeds `chock_nix.backend.Driver.max_object_bytes`, which refuses a
-    /// longer object before it is held in memory at all.
     max_object_bytes: ?u64 = null,
-    /// Feeds `chock_nix.build.Budget`, so a build whose evaluation would pass
-    /// this number is refused while it is written, and nothing is built.
     max_session_bytes: ?u64 = null,
 };
 
 pub const Resolved = struct {
     max_object_bytes: u64,
     max_session_bytes: u64,
-    /// True when `max_object_bytes` is the org policy bundle's number and not
-    /// the project's or the operator's own.
     max_object_bytes_from_org: bool = false,
     max_session_bytes_from_org: bool = false,
 };
 
-/// The project's `nix` block wins over the operator's, the operator's over the
-/// built in default, and the org ceiling is read last over all three.
 pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
     const resolved = Resolved{
         .max_object_bytes = project.max_object_bytes orelse operator.max_object_bytes orelse default_max_object_bytes,
@@ -69,22 +56,17 @@ pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
     return underCeiling(resolved, ceiling);
 }
 
-/// The most an organisation lets any project of this installation add to the
-/// store. Text and not a number, because `org.zig` reads the whole bundle
-/// through one `std.zon.parse.fromSliceAlloc` call and a quoted string is the
-/// one shape that reader and `chock.zon`'s own bare integer can both go
-/// through. `org.zig` parses each field once when the bundle is read, so a bad
-/// ceiling is refused there and never when it would have bound a session.
+/// Text and not a number, because `org.zig` reads the whole bundle through one
+/// `std.zon.parse.fromSliceAlloc` call and a quoted string is the one shape
+/// that reader and `chock.zon`'s own bare integer can both go through.
 pub const Ceiling = struct {
     max_object_bytes: ?[]const u8 = null,
     max_session_bytes: ?[]const u8 = null,
 };
 
-/// `resolved` held to `ceiling`. A minimum and never a refusal.
-///
-/// A ceiling this build cannot parse is read as no ceiling: `org.zig` refuses
-/// a bundle whose `nix` block does not parse, so one that fails here can only
-/// have been built by hand.
+/// A minimum and never a refusal. A ceiling this build cannot parse is read as
+/// no ceiling: `org.zig` refuses a bundle whose `nix` block does not parse, so
+/// one that fails here can only have been built by hand.
 pub fn underCeiling(resolved: Resolved, ceiling: ?Ceiling) Resolved {
     const bound = ceiling orelse return resolved;
     var held = resolved;
@@ -107,7 +89,6 @@ pub fn underCeiling(resolved: Resolved, ceiling: ?Ceiling) Resolved {
     return held;
 }
 
-/// Why a `nix` block was refused. Mirrors `limits.Diagnostic` field for field.
 pub const Diagnostic = struct {
     source: []const u8,
     fault: Fault,
@@ -115,16 +96,10 @@ pub const Diagnostic = struct {
     pub const Fault = union(enum) {
         file_not_zon: std.zon.parse.Diagnostics,
         not_a_struct_literal,
-        /// A field of the `nix` block this reader does not know. Owned.
         unknown_field: []const u8,
-        /// A field held something other than a string or a number. Owned.
         value_not_string_or_number: []const u8,
-        /// A field's text was not a percentage, not an absolute value, named
-        /// a percentage over 100, or named a percentage at all. Owned.
         invalid_setting: InvalidSetting,
-        /// A bare ZON integer was negative. A byte cap cannot be. Owned.
         negative_setting: []const u8,
-        /// A bare ZON integer does not fit a `u64`. Owned.
         setting_overflow: []const u8,
         file_too_large: usize,
         read_failed: anyerror,
@@ -193,8 +168,6 @@ pub const Diagnostic = struct {
 
 pub const ParseError = error{
     OutOfMemory,
-    /// The file is not valid ZON, or the `nix` block does not match the
-    /// schema. Pass a `Diagnostic` to learn which line, and why.
     InvalidNix,
 };
 
@@ -210,14 +183,10 @@ fn note(out: ?*?Diagnostic, source: []const u8, fault: Diagnostic.Fault) bool {
     return true;
 }
 
-/// Read the nix caps out of `source`, the whole content of `chock.zon`. A file
-/// that names no `nix` block gets every field null, which `foldLayers` falls
-/// through.
 pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) ParseError!Nix {
     return parseFrom(gpa, source, limits_mod.file_name, diag);
 }
 
-/// `parse`, naming a different source file in every diagnostic.
 pub fn parseFrom(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
@@ -278,7 +247,6 @@ fn parseFields(
     return nix;
 }
 
-/// A string is read through `parseBytes`; a bare integer is decoded here.
 fn readBytes(
     gpa: std.mem.Allocator,
     zoir: std.zig.Zoir,
@@ -334,8 +302,6 @@ fn intLiteralToU64(lit: anytype) IntLiteralError!u64 {
     };
 }
 
-/// The node of the `nix` field at the top of the file. Every other top level
-/// field is skipped: other readers own the other blocks of `chock.zon`.
 fn findNixNode(
     zoir: std.zig.Zoir,
     source_name: []const u8,
@@ -359,8 +325,6 @@ fn findNixNode(
     }
 }
 
-/// Read `chock.zon` from `project_root`. A project with no such file gets
-/// every field null, the same answer a file with no `nix` block gets.
 pub fn load(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -370,8 +334,6 @@ pub fn load(
     return loadFrom(gpa, io, project_root, limits_mod.file_name, diag);
 }
 
-/// Read `config.zon` from the configuration directory. A machine with no such
-/// file gets every field null.
 pub fn loadOperator(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -415,8 +377,7 @@ fn loadFrom(
     return parseFrom(gpa, source, source_name, diag);
 }
 
-// Every test below builds its own source in the test binary, so no test reads
-// the checkout Chock itself lives in.
+// Every test below builds its own source in the test binary.
 
 const testing = std.testing;
 
@@ -470,7 +431,6 @@ test "a misspelled field inside the nix block is refused rather than silently sk
     try testing.expectEqualStrings("max_objct_bytes", diag.?.fault.unknown_field);
     try testing.expectEqualStrings(limits_mod.file_name, diag.?.source);
 
-    // A field name outside the block belongs to another reader.
     const nix = try parse(testing.allocator, ".{ .telepathy = .{ .range_m = 3 } }", null);
     try testing.expectEqual(@as(?u64, null), nix.max_object_bytes);
 }
@@ -486,8 +446,6 @@ test "a percentage is refused for a byte cap, and the reason says why" {
     try testing.expectEqual(BytesError.PercentNotAllowed, diag.?.fault.invalid_setting.reason);
 
     try testing.expectError(error.PercentNotAllowed, parseBytes("50%"));
-    // A percentage over 100 is refused for being over 100 before it is asked
-    // whether a byte cap could take a percentage at all.
     try testing.expectError(error.PercentOverHundred, parseBytes("101%"));
 }
 
@@ -539,7 +497,6 @@ test "the operator's own config.zon is read through the same loader, by a differ
     const written = try loadOperator(gpa, testing.io, root, null);
     try testing.expectEqual(@as(u64, 512 << 20), written.max_session_bytes.?);
 
-    // A `chock.zon` in the same directory is not what this loader reads.
     const project_side = try load(gpa, testing.io, root, null);
     try testing.expectEqual(@as(?u64, null), project_side.max_session_bytes);
 }
@@ -559,7 +516,6 @@ test "the fold: the project wins over the operator, and the operator wins over t
     );
     try testing.expectEqual(@as(u64, 32 << 20), both_named.max_object_bytes);
 
-    // The two fields fold apart.
     const mixed = foldLayers(
         .{ .max_session_bytes = 64 << 20 },
         .{ .max_object_bytes = 4 << 20 },
@@ -605,8 +561,6 @@ test "a ceiling this build cannot parse changes nothing, rather than crashing" {
     try testing.expectEqual(resolved.max_object_bytes, held.max_object_bytes);
     try testing.expect(!held.max_object_bytes_from_org);
 
-    // A percentage in a hand built ceiling is unreadable by this reader's own
-    // rule, so it changes nothing.
     const percent_held = underCeiling(resolved, .{ .max_object_bytes = "50%" });
     try testing.expectEqual(resolved.max_object_bytes, percent_held.max_object_bytes);
     try testing.expect(!percent_held.max_object_bytes_from_org);
