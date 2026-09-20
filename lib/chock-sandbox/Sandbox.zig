@@ -1,30 +1,5 @@
 //! The public interface of chock-sandbox: one driver per way of sandboxing,
-//! chosen at compile time from `builtin.os.tag`. There is no platform branch
-//! inside the sandbox: there is a driver interface, and one driver per way of
-//! sandboxing. `spawn` puts a driver's layers in place and runs the program; a
-//! caller reads only this file's own declarations and can never learn, from a
-//! type or a field here, which driver actually ran. See the "same public
-//! shape" test at the bottom of this file for how that claim is checked.
-//!
-//! The Linux driver is `linux/driver.zig`, moved from this file unchanged:
-//! it has survived three attack reviews that each found host code execution
-//! or a sandbox escape, so this split kept its logic untouched and only
-//! relocated the type declarations every driver shares, `Config`,
-//! `SetupError`, `SpawnError`, and `LandlockReport`, to this file. The
-//! Darwin driver is `darwin/driver.zig`, new in this milestone: it refuses
-//! before it does anything, because a driver that returned success here
-//! would hand an agent the user's whole filesystem on a platform that
-//! claims to be sandboxed.
-//!
-//! `Config` still names `landlock.AccessFs`, `namespace.Mount`, `namespace.Network`,
-//! and `seccomp.Options`, all Linux mechanisms, unchanged from before the
-//! split. Redesigning `Config` into something every future driver can
-//! interpret on its own terms is not this milestone's job; only the Linux
-//! driver reads these fields today, and the Darwin driver below refuses
-//! before it ever would. `Guarantee` and `Guarantees`, also below, are the
-//! part of this file that answers the next question: a driver names which
-//! guarantees it actually gives, so that a later milestone can compare a
-//! policy against a driver and refuse when the driver is short.
+//! chosen at compile time from `builtin.os.tag`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,123 +12,27 @@ const cgroup = @import("linux/cgroup.zig");
 const nftables = @import("linux/nftables.zig");
 const grants = @import("grants.zig");
 
-/// `landlock.zig`, `namespace.zig`, and `seccomp.zig` are Linux-only
-/// mechanisms, and every line in them that reaches the kernel says so with
-/// a raw syscall from the Linux namespace of Zig's standard library.
-/// Importing their names here, in a file with no `linux` directory
-/// component of its own, does not: this file only ever names a *type* they
-/// declare, for `Config` below, the same way a driver that cannot apply a
-/// layer is still allowed to know what the layer is called. See
-/// `tools/lint_linux_only.zig`'s own top comment for the exact rule this
-/// file is written to satisfy.
-/// The one directory inside a sandbox root that belongs to Chock, and not to
-/// the project the root stands for.
-///
-/// **The root is the project's.** Everything Chock has to place inside a
-/// sandbox for its own sake, the redirected git directory, the session's
-/// scratch object store, and the one executable a tool call runs, goes under
-/// this, so the project's own paths keep the root to themselves and the
-/// filesystem conventions for runtime state are kept.
-///
-/// One parent instead of several siblings is also one thing to control when
-/// deciding what the agent may reach. Named here, in the library that owns
-/// what a sandbox root looks like, so `chock-workspace` and `chock-core`
-/// share one spelling: neither imports the other, and a second spelling is
-/// how two paths quietly stop agreeing.
-///
-/// **Nothing mounts this path itself.** `namespace.makePath` creates it, and
-/// `/run` above it, as ordinary directories before the first mount under it,
-/// and tolerates ones that already exist. A mount *at* this path, or at
-/// `/run`, would shadow everything under it, because the kernel takes the
-/// last matching mount and not the longest prefix: see
-/// `lib/chock-workspace/worktree.zig`'s own test for that.
+/// The one directory inside a sandbox root that belongs to Chock. Nothing
+/// mounts this path: the kernel takes the last matching mount and not the
+/// longest prefix, so a mount here would hide everything below it.
 pub const runtime_prefix = "/run/chock";
 
-/// Where a routed sandbox keeps its own copy of the host's trust store,
-/// inside the sandbox.
-///
-/// **Under `runtime_prefix`, and never in `/etc`.** A routed sandbox takes
-/// `/etc` for itself when the host has one, and a bind placed there before
-/// that overlay goes on is shadowed the moment it does: overlayfs does not
-/// traverse a mount in its own lower layer. `lib/chock-core/tools.zig`
-/// stages a copy of the host's bundle here, bound in rather than the host's
-/// own file bound in by its name, so a later feature that lets a tool call
-/// add its own certificate to it writes to Chock's own copy and never to
-/// the machine's real trust store. `linux/driver.zig`'s own
-/// `resolver_substitutions` then puts a symbolic link to this path at the
-/// conventional one, `/etc/ssl/certs/ca-certificates.crt`, in the routed
-/// step that runs after that overlay: see `linux/namespace.zig`'s own
-/// `Substitution.Link`.
 pub const trust_store_inside = runtime_prefix ++ "/ca-bundle.crt";
 
-/// What this build's driver can express in a `Config`.
-///
-/// **These are the questions `darwin/driver.zig`'s own `Inexpressible` answers
-/// at run time, asked here at compile time by the callers that would otherwise
-/// build a config that driver refuses.** A caller that asks for one of these on
-/// a build that has it gets exactly what it always did; a caller that asks on a
-/// build that has none gets the whole tool call refused, which is what a
-/// session on macOS measured before these existed. Read from the target, the
-/// same way `driver` below is chosen, because the two must agree.
-///
-/// macOS is the platform that answers false, and it stays that way.
-/// `lib/chock-workspace/layout.zig` is the same decision for the workspace.
 pub const expresses = struct {
-    /// A mount whose target is not its source. Everything Chock places under
-    /// `runtime_prefix` needs one. A build that answers false leaves every path
-    /// where it really is: see `lib/chock-core/cache.zig`, `scratchpad.zig`,
-    /// `tasks.zig` and `tools.zig`, which each ask before they name a target.
     pub const moved_paths = builtin.os.tag != .macos;
 
-    /// A writable area with a hard cap on how much it holds. A cap needs a
-    /// filesystem this process can mount, and an ordinary user on macOS cannot
-    /// mount one at all. `chock doctor` reports the same fact as its
-    /// `disk cap tmpfs` row, so the limit reads `unsupported` to a person
-    /// rather than reading as one that holds.
     pub const scratch_area = builtin.os.tag == .linux;
 
-    /// A procfs of the sandbox's own. A tool call carries one so that a
-    /// compiler can read `/proc/self/exe` and find its own installation. macOS
-    /// has no procfs at all, on the host or anywhere else, so a program there
-    /// never looks for one and a build with none takes nothing away.
     pub const procfs = builtin.os.tag == .linux;
 
-    /// A cgroup the caller made, with the child put inside it as the kernel
-    /// creates it. See `Config.containment`. Linux does this with `clone3` and
-    /// `CLONE_INTO_CGROUP`. macOS has no cgroup and no substitute for one, so
-    /// a build that answers false refuses such a config rather than running it
-    /// with no containment at all: see `darwin/driver.zig`'s own `spawn`.
     pub const cgroup_placement = builtin.os.tag == .linux;
 
-    /// A device bound in from `Config.device_tree` and placed by
-    /// `Config.device_source`. See `linux/devicelink.zig` and
-    /// `linux/driver.zig`'s `placeDevice`, both of which need `mknodat` and a
-    /// bind mount, neither of which macOS has. `darwin/driver.zig` reads
-    /// `device_tree` and `device_source` and applies neither, the same as
-    /// every other field this struct's own top comment names: a caller that
-    /// asks for a device on a build that answers false gets no device and no
-    /// crash. `src/run.zig` reads this before it ever asks policy, so a
-    /// session on macOS never opens `/dev` or asks a question nobody there
-    /// can answer, and the `device_exposed` event it writes says so, which is
-    /// the whole reason that event carries `enforced` apart from `decision`.
     pub const device_passthrough = builtin.os.tag == .linux;
 };
 
-/// The path a mount source or a Landlock rule must name for `path` on this
-/// build. `buffer` holds the answer when one had to be resolved, so it must
-/// live as long as the result.
-///
-/// **A driver that moves no path turns a mount into a rule, and a rule matches
-/// the path the kernel resolved.** macOS reaches `$TMPDIR` below `/var`, which
-/// is a link to `/private/var`, so a rule written on the unresolved spelling
-/// matches nothing at all and the whole call reads as a sandbox that denies
-/// every access. `src/doctor.zig`'s own probe moved off `/tmp` for that exact
-/// reason, measured on 2026-08-25. A build that remaps needs none of this: the
-/// kernel resolves a bind source itself.
-///
-/// `path` must name a directory. A caller that wants the answer for a file
-/// resolves the directory it is in and joins the name back on, because a file
-/// that is not there yet cannot be resolved at all.
+/// macOS reaches `$TMPDIR` below `/var`, a link to `/private/var`, so a rule
+/// written on the unresolved spelling matches nothing. `buffer` holds the answer.
 pub fn resolvedPath(io: std.Io, path: []const u8, buffer: []u8) []const u8 {
     if (expresses.moved_paths) return path;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return path;
@@ -163,355 +42,40 @@ pub fn resolvedPath(io: std.Io, path: []const u8, buffer: []u8) []const u8 {
 }
 
 pub const Config = struct {
-    /// The directory that becomes the root of the sandbox.
     root: []const u8,
-    /// The mounts to make inside the root: a bind mount, an overlay mount, a
-    /// procfs of the sandbox's own, or a denied path, per entry. See
-    /// `linux/namespace.zig`'s own `Mount`.
-    ///
-    /// **A `Mount.deny` entry is applied last whatever its place here**, so a
-    /// caller cannot lose a denial by putting it before the mount that would
-    /// cover it. See `linux/namespace.zig`'s own `applyDenyMounts`.
+    /// A `Mount.deny` entry is applied last whatever its place in this list.
     mounts: []const namespace.Mount,
-    /// The paths that Landlock permits, and the access for each one. A path here
-    /// is read after the mount tree is built, so it must name a path inside the
-    /// new root, the same as a mount target above, not a path on the host.
     rules: []const Rule,
-    /// The working directory inside the sandbox.
     cwd: []const u8,
-    /// The environment for the program.
     env: []const []const u8,
     seccomp_options: seccomp.Options = .{},
-    /// How the sandboxed process reaches the network. See `linux/namespace.zig`'s
-    /// own `Network`. Defaults to `.none`, so a caller that omits this
-    /// field gets no network, not the host's.
     network: namespace.Network = .none,
-    /// The descriptor the sandboxed program's own standard output is
-    /// duplicated onto, in the Linux driver's own `execute`, right before
-    /// `execve`. Defaults to this process's own standard output, so a
-    /// caller that never sets this gets the behaviour `spawn` always had:
-    /// the sandboxed program's output lands wherever this process's own
-    /// already does, with no descriptor juggling in this process at all.
-    ///
-    /// A caller that wants the sandboxed program's output somewhere else,
-    /// such as a pipe read while the program still runs, names that
-    /// descriptor here instead: see `lib/chock-core/tools.zig`'s own
-    /// `spawnCapturing`. See `linux/driver.zig`'s own doc comment on this
-    /// same field for the full reasoning; it carries over unchanged.
     stdout_fd: std.posix.fd_t = std.posix.STDOUT_FILENO,
-    /// Same as `stdout_fd`, for the sandboxed program's own standard error.
-    /// May equal `stdout_fd`: the ordinary case of a caller that wants both
-    /// streams combined on one descriptor.
-    ///
-    /// **This one also governs a sandbox that never came up.** Every setup
-    /// step, from the first one after the fork to `execve` itself, writes the
-    /// reason it could not go on here, so a caller that asked for a quiet
-    /// failure gets one: point this at `/dev/null` and a sandbox that cannot
-    /// be built says nothing on the terminal, while `spawn` still answers with
-    /// the error that names the step, such as `error.MountTreeFailed`. It used
-    /// to be obeyed only from `execve` onwards, so a failure before that point
-    /// reached the caller's own terminal whatever this field said. See
-    /// `linux/driver.zig`'s own `writeStderr`.
+    /// Also carries every setup failure, so `/dev/null` here makes a failed sandbox quiet.
     stderr_fd: std.posix.fd_t = std.posix.STDERR_FILENO,
-    /// The descriptor the sandboxed program's own standard input is
-    /// duplicated onto, or null for `/dev/null`.
-    ///
-    /// **Null is what every tool call gets, and that is the whole point of
-    /// the default.** `lib/chock-core/tools.zig` names no descriptor here, so
-    /// a program the model asked for reads end of file from `/dev/null` on
-    /// descriptor 0: a password prompt then fails fast instead of waiting on
-    /// input nobody will write, and there is no route from descriptor 0 to
-    /// the caller's own terminal. See `linux/driver.zig`'s own
-    /// `redirectStdinToDevNull` for both reasons in full.
-    ///
-    /// A caller names a descriptor here only for a **helper the harness
-    /// itself starts**: a long lived program, chosen by Chock and never by
-    /// the model, that answers on a pipe. See `lib/chock-core/helper.zig`,
-    /// which is the only caller in this project that fills this field in.
-    ///
-    /// **What a real pipe on descriptor 0 gives the sandboxed program, and
-    /// why none of it is a way out:**
-    ///
-    /// * **Bytes the harness wrote, and nothing else.** A pipe carries only
-    ///   what the process on the other end put in it. The harness is that
-    ///   process, so the whole content of descriptor 0 is a message Chock
-    ///   composed.
-    /// * **No path, so no reach.** A pipe has no name in any filesystem.
-    ///   `openat` on it is meaningless, and it cannot be walked back to the
-    ///   host tree the way an inherited directory descriptor could. That is
-    ///   the property `closeInheritedFds` exists to enforce for every *other*
-    ///   descriptor, and it still closes every other descriptor: this one is
-    ///   an exception of exactly one number.
-    /// * **No terminal, so no `TIOCSTI`.** The injection route
-    ///   `redirectStdinToDevNull` closes needs descriptor 0 to be the
-    ///   caller's controlling terminal. A pipe is not a terminal, and the
-    ///   kernel answers `ENOTTY` to every terminal `ioctl` on one.
-    /// * **A write back is a write to the harness, which reads it as data.**
-    ///   The harness never treats what a helper says as an instruction: see
-    ///   `lib/chock-core/lsp.zig`, which puts a server's own words in front
-    ///   of the model as text and lets nothing it says reach a decision.
-    ///
-    /// The one thing it really does add is that the program can now **block**
-    /// on a read of descriptor 0, which `/dev/null` made impossible. That is
-    /// the caller's problem and not the sandbox's: a helper's owner holds a
-    /// budget on every exchange, and a helper that never answers is dropped.
-    ///
-    /// `/dev/null` still goes on descriptor 0 first, before any layer, on
-    /// every call including this one. The descriptor named here replaces it
-    /// in the last step before `execve`, so nothing in the setup path can
-    /// read a caller's pipe, and a program whose sandbox failed to come up
-    /// never sees one byte of it.
+    /// Null for `/dev/null`, which is what every tool call gets. A pipe here is not
+    /// a terminal, so the kernel answers `ENOTTY` to `TIOCSTI` on it.
     stdin_fd: ?std.posix.fd_t = null,
-    /// How much of the machine this program may consume: memory, processes,
-    /// open descriptors, the size of one file, and cpu time.
-    ///
-    /// **Every other layer of this sandbox is about reach. This one is about
-    /// appetite.** A fork bomb, an allocation that never stops, and a
-    /// descriptor leak all pass the namespaces, Landlock and seccomp without
-    /// touching any of them. See `linux/rlimits.zig`'s own top comment for
-    /// each limit and the reason for it, including the ones this project
-    /// decided not to set, and `linux/cgroup.zig` for the half of the answer
-    /// that needs a cgroup v2 tree.
-    ///
-    /// The default bounds every one of the five. A caller that really wants
-    /// an unbounded program says so with `Limits.none`, and only a test has a
-    /// reason to.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct: it refuses before it reaches a
-    /// layer at all. See `darwin/driver.zig`.
     limits: Limits = .{},
-    /// Which cgroup holds this program, and which of the two promises that is.
-    /// See `Containment`, which carries the whole rule.
-    ///
-    /// **The default is the behaviour every caller had before this field
-    /// existed**: chock makes a cgroup out of `limits`, best effort, and a
-    /// machine that cannot give one still runs the program.
-    ///
-    /// A caller that names `.supplied` gets a different contract. Chock writes
-    /// **no** limit file into that cgroup, because the caller owns the tree
-    /// and a second writer is how two numbers disagree, and the child is put
-    /// inside it as the kernel creates it. `limits` is still read on that
-    /// path, for the rlimit floor alone, which is per process state and not a
-    /// write into anybody's cgroup. `LimitsReport.cgroup` then answers
-    /// `supplied`, which says exactly that: the program is contained, and
-    /// chock wrote none of what contains it.
-    ///
-    /// **Refused rather than degraded when it cannot be done.** See
-    /// `SpawnError.CgroupPlacementUnsupported` and
-    /// `SpawnError.CgroupPlacementRefused`.
-    ///
-    /// **`Config.copy` carries this across as it is**, the same as the three
-    /// descriptor fields, because a descriptor is a number in this process and
-    /// not memory to duplicate. A config that outlives the caller that opened
-    /// the descriptor must therefore keep that descriptor open too.
     containment: Containment = .best_effort,
-    /// The writable areas the sandbox owns, each one a tmpfs of its own with a
-    /// hard cap on how much it can hold. Empty by default, so a caller that
-    /// names none gets none.
-    ///
-    /// **This is the only capacity limit an unprivileged process can put on a
-    /// filesystem**, and it is the one row of `linux/rlimits.zig`'s own table
-    /// that no rlimit and no cgroup covers: `RLIMIT_FSIZE` bounds one file, and
-    /// ten thousand files of one byte each still fill a disk. See
-    /// `linux/namespace.zig`'s own `Scratch` for the measurements and the mount
-    /// options, and `linux/rlimits.zig`'s own `default_scratch_bytes` for which
-    /// areas should be named here, which one deliberately should not, and why
-    /// the cap and the memory ceiling are one decision rather than two.
-    ///
-    /// Every area named here gets `Limits.scratch_bytes` as its cap. One number
-    /// for every area, so a caller cannot give one area a cap that makes the
-    /// memory ceiling unreachable while another looks fine.
-    ///
-    /// **A path here is a path inside the sandbox**, the same as a mount target
-    /// and the same as a Landlock rule, and it is created if it is not already
-    /// there. An area a Landlock rule does not also permit is an area the
-    /// program cannot write, so a caller names it in both places.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct: it refuses before it reaches a layer
-    /// at all.
+    /// A tmpfs with a hard cap is the only capacity limit an unprivileged process
+    /// can put on a filesystem: `RLIMIT_FSIZE` bounds one file, and ten thousand one
+    /// byte files still fill a disk.
     scratch: []const namespace.Scratch = &.{},
-    /// Who answers a filtered process's request for a connection.
-    ///
-    /// **Required when `network` is `.filtered`, and refused otherwise.**
-    /// `spawn` answers `error.NetBrokerMissing` for a filtered config with no
-    /// broker, rather than quietly giving that process a `.none` sandbox: a
-    /// caller that asked for a channel out and silently got none would spend
-    /// its turns on a failure that names nothing. It answers
-    /// `error.NetBrokerNotFiltered` for a broker on a config that is not
-    /// filtered, because that config has no socket to serve and the field
-    /// would read as a permission that is never used.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct: it refuses before it reaches a layer
-    /// at all.
-    ///
-    /// **`Config.copy` carries this across as it is**, the same as
-    /// `limits_report` and the three descriptor fields, because it points at
-    /// the caller's own storage.
-    ///
-    /// **No Chock command sets this today.** Every tool call and every shell
-    /// command goes through `net_router` below. The only callers that give
-    /// this field a value are the tests of this library and
-    /// `test/sandbox/probe.zig`. The field and the exchange behind it stay
-    /// because they answer a question the router does not: a program written
-    /// for Chock asks by name and is handed a descriptor, with no network in
-    /// its namespace at all. Read this as a capability with no producer yet,
-    /// and not as a path a session takes. See `linux/netbroker.zig`.
+    /// Required when `network` is `.filtered`, and refused otherwise.
     net_broker: ?NetBroker = null,
-    /// Who answers the network router when it has to turn a name into an
-    /// address, and an address into a connection.
-    ///
-    /// **This is the new implementation of `.filtered`, and `net_broker` above
-    /// is the old one.** A caller names exactly one of the two. With this one
-    /// the sandboxed program gets a real network in its own namespace and the
-    /// kernel refuses everything policy did not permit, so an ordinary program
-    /// that knows nothing about Chock reaches a permitted host. With
-    /// `net_broker` the program gets no network at all and one socket to ask
-    /// on, which only a program written for Chock can use.
-    ///
-    /// **Both at once is refused**, with `error.NetRouterAndBroker`. The two
-    /// cannot be on together: the broker hands a descriptor made in the host's
-    /// own network namespace across the boundary, and the seccomp rule that
-    /// stops that descriptor being aimed somewhere else is the same rule that
-    /// would stop the router's own program connecting at all. See
-    /// `seccomp.Options.block_connect`.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct: it refuses before it reaches a layer
-    /// at all.
-    ///
-    /// **`Config.copy` carries this across as it is**, for the reason
-    /// `net_broker` gives.
+    /// A caller names this or `net_broker`, never both: the seccomp rule that stops
+    /// a handed over descriptor being re-aimed also stops the router's own program connecting.
     net_router: ?NetRouter = null,
-    /// Who pushes a device inward, while the sandboxed program runs.
-    ///
-    /// **Exclusive with neither `net_broker` nor `net_router`.** A hardware
-    /// session may want a network and a JTAG adapter at once, so a caller may
-    /// name this alongside either of the two above, or alongside neither.
-    ///
-    /// **Never required and never refused for being absent.** A session with
-    /// no hardware to hand over sets this to `null`, forks no helper for it,
-    /// and polls no extra descriptor for it: see `linux/driver.zig`'s own
-    /// `spawn`, and the test that proves that session is byte for byte
-    /// unchanged from one built before this field existed.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct.
-    ///
-    /// **`Config.copy` carries this across as it is**, for the reason
-    /// `net_broker` gives.
-    ///
-    /// **Needs `Config.device_tree`.** The device helper places a device by
-    /// binding a path out of that field's own `host` directory, so a config
-    /// that names this field with no `device_tree` is refused with
-    /// `error.DeviceSourceNeedsTree` before anything forks, the same as a
-    /// filtered network with no broker. See `Config.device_tree` and
-    /// `linux/driver.zig`'s `placeDevice`.
     device_source: ?DeviceSource = null,
-    /// The one host directory a device may be placed out of, and where
-    /// `spawn` binds it inside the session's own root, before anything
-    /// pivots. See `Config.device_source`.
-    ///
-    /// **This is the boundary that replaces a descriptor's own guarantee.**
-    /// A device passthrough used to cross the sandbox boundary as an open
-    /// descriptor, which needed no path resolved on either side. A
-    /// descriptor opened on the host cannot become a mount inside the
-    /// in-sandbox helper's own mount namespace, so this field exists to draw
-    /// the boundary a path can still hold: only Chock's own host side
-    /// decides what `host` names, and the helper only ever resolves a path
-    /// relative to it, checked to never climb back out. See
-    /// `linux/devicelink.zig`'s own top comment for the whole argument, and
-    /// `linux/driver.zig`'s `buildDeviceSource` for the check itself.
-    ///
-    /// **`inside` is never granted through `Config.rules`.** Landlock is an
-    /// allowlist, so a path this list never names is a path the sandboxed
-    /// program cannot open, list, or resolve through, even though the bind
-    /// itself is really there in its own filesystem view after the pivot. A
-    /// caller that added a rule for `inside` would be handing the sandboxed
-    /// program the same reach into `host` that only the helper is meant to
-    /// have.
-    ///
-    /// Null exactly when `device_source` is: naming one without the other is
-    /// refused before anything forks. See `SpawnError.DeviceSourceNeedsTree`.
-    ///
-    /// The Darwin driver reads this field and applies nothing, the same as
-    /// every other field on this struct.
-    ///
-    /// **`Config.copy` carries this across as its own duplicate strings**,
-    /// the same as `root` and `cwd`: a caller's arena can free before the
-    /// copy is done with it.
+    /// `inside` is never granted through `Config.rules`: a rule for it would hand
+    /// the sandboxed program the reach only the device helper may have.
     device_tree: ?DeviceTree = null,
-    /// Filled in with what the limits layer actually did, when a caller wants
-    /// to know. Null is the ordinary case.
-    ///
-    /// **A limit that stopped a program has to be legible**, and a signal
-    /// number is not. `memory.max` kills with a bare `SIGKILL`, which reads
-    /// exactly like the `SIGTERM`/`SIGKILL` a cancelled call gets, so a
-    /// caller that only saw the `Term` could not tell a tool call that ran
-    /// out of memory from one a person stopped. This is how it learns which
-    /// it was, and which mechanism carried each bound. See `LimitsReport`.
-    ///
-    /// A caller that leaves this null still gets the fact: the Linux driver
-    /// writes one line naming the limit to its own standard error, the same
-    /// way it reports a layer the middle process could not put on.
-    ///
-    /// **`Config.copy` carries this pointer across as it is**, the same as
-    /// the three descriptor fields, because it points at the caller's own
-    /// storage and duplicating it would report into a copy nobody reads. So a
-    /// config that outlives the storage this names, which is what `copy`
-    /// exists for, must name storage that outlives it too, or leave this
-    /// null.
     limits_report: ?*LimitsReport = null,
-    /// Where `spawn` counts whether the supervisor process could confine
-    /// itself. Null is the ordinary case, and a caller that leaves it null
-    /// still gets the terminal line.
-    ///
-    /// **One record for a whole session, and never one per call.** The answer
-    /// is the same for every call on one machine, so the counts here are what
-    /// a session writes down once at the end. See `SupervisorAudit`, which
-    /// holds the argument for why the fact has to reach the log at all.
-    ///
-    /// **`Config.copy` carries this pointer across as it is**, for the reason
-    /// `limits_report` above gives. Unlike `limits_report`, a copy that
-    /// outlives one call is the point: the record belongs to the session and
-    /// not to the call.
     supervisor_audit: ?*SupervisorAudit = null,
-    /// Where `spawn` counts the calls the sandboxed program made. Null is the
-    /// ordinary case, and a caller that leaves it null loses only the counts:
-    /// the observation itself is asked for by `seccomp_options.traps`.
-    ///
-    /// **One record for a whole session, and never one per call.** See
-    /// `SyscallAudit`, which holds the argument, and `seccomp.TrapCall`, which
-    /// holds what can be counted and what it costs.
-    ///
-    /// **`Config.copy` carries this pointer across as it is**, for the reason
-    /// `supervisor_audit` above gives, and a copy that outlives one call is
-    /// the point for the same reason.
     syscall_audit: ?*SyscallAudit = null,
-    /// Whether the supervisor also records **which paths** the sandboxed
-    /// program named, and not only how many calls it made. False is the
-    /// default, and false changes nothing for a caller that never asked.
-    ///
-    /// **It needs `seccomp_options.traps` as well.** A path is read out of a
-    /// held call, so a call nobody holds names nothing. A config that sets
-    /// this and traps nothing records nothing, and says so with a record of
-    /// zeros rather than by failing.
-    ///
-    /// **The boundary is this config's own mount set and scratch areas**, and
-    /// no caller names it. A path the config granted is counted and never
-    /// named, because a tool call makes thousands of those and the loader
-    /// makes the first of them. A path the config granted nothing for is the
-    /// anomaly, so that name is kept. See `grantPrefixes`.
-    ///
-    /// **What comes back is telemetry and never evidence.** The kernel runs
-    /// the call after the reader has read the argument, so the program is free
-    /// to write one name, wait to be let go, and then open another. Everything
-    /// this produces is labelled for that: the field in the session log is
-    /// called `unverified_paths`, and the event carries `paths_verified:
-    /// false` as a fact a later mode can flip. See `linux/notify.zig`'s own
-    /// top comment.
+    /// Telemetry and never evidence: the kernel runs the call after the reader has
+    /// read the argument, so a program can write one name and then open another.
     path_audit: bool = false,
 
     pub const Rule = struct {
@@ -519,44 +83,13 @@ pub const Config = struct {
         access: landlock.AccessFs,
     };
 
-    /// Both halves of `device_tree`. See that field's own doc comment.
     pub const DeviceTree = struct {
-        /// A directory outside the sandbox, chosen by Chock's own host side
-        /// policy. Never a path the sandboxed program named: the far side
-        /// that owns `Config.device_source` is the only caller who ever sets
-        /// this.
         host: []const u8,
-        /// Where `host` is bound, inside the session's own root, before
-        /// anything pivots. Absolute, relative to `Config.root`, and never
-        /// named in `Config.rules`.
         inside: []const u8,
     };
 
-    /// A copy of this config in `allocator`, sharing no memory with the
-    /// original.
-    ///
-    /// **For a caller that outlives the arena the config was built in.** The
-    /// config a tool call holds borrows its mounts, its rules and its
-    /// environment from an arena that is freed the moment that call returns,
-    /// and both `chock_core.tasks.Table` and `chock_core.helper.Helper`
-    /// outlive one call by definition. A caller that read the borrowed slices
-    /// would be reading freed memory on the first turn that ended before it
-    /// did.
-    ///
-    /// **Nothing is freed one piece at a time.** Give an arena, and drop the
-    /// whole arena when the copy is finished with.
-    ///
-    /// The three descriptor fields are carried across as they are: a
-    /// descriptor is a number in this process, not memory to duplicate. So
-    /// are `limits`, which is five numbers and owns no memory, and
-    /// `limits_report`, `supervisor_audit`, and `syscall_audit`, which point
-    /// at a caller's own storage that this function has no business
-    /// duplicating.
-    ///
-    /// It lives here, in the library that owns the type, because a second
-    /// spelling of this function is how two copies quietly stop agreeing when
-    /// a field is added. A field added below is copied by this function on the
-    /// day it is added, or it is not copied by any caller at all.
+    /// A copy sharing no memory with the original. A field added below is copied
+    /// here on the day it is added, or by nobody.
     pub fn copy(self: Config, allocator: std.mem.Allocator) std.mem.Allocator.Error!Config {
         var out = self;
         out.root = try allocator.dupe(u8, self.root);
@@ -603,39 +136,13 @@ pub const Config = struct {
     }
 };
 
-/// Where one `Config`'s mount list and its Landlock rule list disagree about
-/// a path.
-///
-/// **The two lists are one judgement written twice, and nothing computes one
-/// from the other.** `chock-workspace`'s own `Workspace.sandboxConfig`,
-/// `chock-core`'s own `withStore`, and `chock-core`'s own `prepare` each
-/// append a mount and then append a rule for the same path, by hand, a few
-/// lines apart. A path added to one list and not to the other compiles, runs,
-/// and changes what the sandbox holds. `firstGap` is what finds it.
-///
-/// Both halves of the disagreement matter, for different reasons:
-///
-///   * A rule for a path that no mount holds is dead on a build that pivots
-///     into a fresh root, because nothing is there to open. It is not dead on
-///     a build that does not pivot: `expresses.moved_paths` is false on macOS,
-///     the rule then names the host's own path, and Seatbelt grants what the
-///     rule says. See `darwin/driver.zig`'s own `optionsFor`.
-///   * A mount that no rule holds is present and unreachable. Landlock refuses
-///     every open below it, and the tool call then fails with a Landlock
-///     denial rather than with the missing rule.
-///
-/// A rule whose path is above a mount target, and not at or below one, counts
-/// as outside the mount set. Landlock rights accumulate downwards: a rule on
-/// `/` over a tree that mounts only `/work` permits every path in the tree, so
-/// the mount list would be the whole boundary again.
+/// Where a `Config`'s mount list and its Landlock rule list disagree. A rule
+/// above a mount target is outside the mount set, because Landlock rights
+/// accumulate downwards.
 pub const LayerGap = union(enum) {
-    /// This rule's path is at or below no mount target and at or below no
-    /// scratch area.
     rule_outside_mounts: []const u8,
-    /// This mount target is at or below no rule's path.
     mount_without_rule: []const u8,
 
-    /// The path the two lists disagree about.
     pub fn path(self: LayerGap) []const u8 {
         return switch (self) {
             .rule_outside_mounts, .mount_without_rule => |value| value,
@@ -656,29 +163,8 @@ pub const LayerGap = union(enum) {
     }
 };
 
-/// The first place `config`'s two filesystem layers disagree, or null when
-/// every rule and every mount agree. See `LayerGap`.
-///
-/// **A denied path is in neither half.** `Mount.deny` takes bytes away and
-/// grants no reach, so it needs no rule of its own, and it makes nothing
-/// reachable that a rule would have to name.
-///
-/// **`mount_without_rule` is not an invariant of every config, and a caller
-/// asks for this check only where the pairing is the intent.** A tool call, a
-/// workspace and a toolchain each pair a mount with a rule on purpose.
-/// `chock-core`'s own `plugin_host.lockdown` does the opposite on purpose: it
-/// keeps the tool call's whole mount tree and throws every rule away, so the
-/// workspace is present in the tree and unreachable through it. Landlock is
-/// the only layer holding that boundary, which is the clearest case in this
-/// project of the two layers not being one judgement.
-///
-/// **The root itself is in neither half either, and that is a real gap this
-/// cannot see.** `namespace.buildRoot` binds `config.root` over itself, read
-/// write, before it reads the mount list, so `/` and every parent directory
-/// `makePath` creates for a mount target are writable through the mount layer
-/// alone. Landlock is the only layer that refuses them, because no rule names
-/// them. That is a property of `buildRoot` and not of this config, so it
-/// belongs in a test of `buildRoot`, not here.
+/// The root is a real gap this cannot see: `namespace.buildRoot` binds
+/// `config.root` over itself read write, so only Landlock refuses `/`.
 pub fn firstGap(config: Config) ?LayerGap {
     for (config.rules) |rule| {
         if (!mountSetHolds(config, rule.path)) return .{ .rule_outside_mounts = rule.path };
@@ -693,8 +179,6 @@ pub fn firstGap(config: Config) ?LayerGap {
     return null;
 }
 
-/// The path inside the sandbox that `mount` puts something at, or null for a
-/// mount that puts nothing there. See `firstGap` for why a denial is null.
 fn mountTarget(mount: namespace.Mount) ?[]const u8 {
     return switch (mount) {
         .bind => |bind| bind.target,
@@ -722,24 +206,8 @@ fn ruleSetHolds(config: Config, target_path: []const u8) bool {
     return false;
 }
 
-/// Every path inside the sandbox that `config` puts something at, in
-/// `allocator`.
-///
-/// **This is the boundary the path audit splits on**, and it is the same set
-/// `mountSetHolds` above compares a Landlock rule against. A path a sandboxed
-/// program names that is at or below one of these is a path the caller granted
-/// it, so the record counts it and never keeps the name. A path at or below
-/// none of them is the anomaly, so the record keeps that name. See
-/// `linux/notify.zig`'s own `classify`.
-///
-/// **Derived here and never named by a caller.** A caller that wrote the
-/// boundary out by hand beside the mount list would be one judgement written
-/// twice, which is the fault `firstGap` above exists to catch.
-///
-/// **A `Mount.deny` target is not in the set**, the same as in `firstGap`: it
-/// takes bytes away and grants no reach. What it does not do is take a path
-/// out of a wider grant that covers it, so a denial below a granted tree still
-/// reads as granted. That is a known limit of a comparison on spellings alone.
+/// A `Mount.deny` target is not in the set, so a denial below a granted tree
+/// still reads as granted.
 pub fn grantPrefixes(
     allocator: std.mem.Allocator,
     config: Config,
@@ -755,8 +223,6 @@ pub fn grantPrefixes(
     return out.toOwnedSlice(allocator);
 }
 
-/// A copy of every string in `from`, in `allocator`. Used by `Config.copy` and
-/// by callers that copy an argv beside a config.
 pub fn copyStrings(
     allocator: std.mem.Allocator,
     from: []const []const u8,
@@ -766,67 +232,22 @@ pub fn copyStrings(
     return to;
 }
 
-/// Who answers a filtered process's request for a connection, and the one seam
-/// this library has for it. See `Config.net_broker`, and
-/// `linux/netbroker.zig` for the exchange that reaches this.
-///
-/// ## Why the decision is not in here
-///
-/// **A host policy is not the sandbox's to hold.** `chock-sandbox` imports no
-/// other chock library, so it cannot read
-/// `chock.zon` and must never grow a second, private answer to "may this run
-/// reach that host". What it owns is the boundary: the request arrives as
-/// bytes from a process that is assumed hostile, this library bounds and
-/// checks the shape of those bytes, and then it asks. What comes back is a
-/// descriptor or a refusal.
-///
-/// **The connect happens on this side of the boundary**, in the process that
-/// implements this interface, so a sandboxed process cannot reach a host
-/// merely by knowing its address. See `lib/chock-broker/network.zig`, which is
-/// the real implementation, and which also decides what a name is allowed to
-/// be and when it is resolved.
-///
-/// ## What a granted descriptor is worth, and for how long
-///
-/// **It outlives the check, and that is accepted.** Once the descriptor
-/// crosses, the sandboxed process holds a connection for as long as it keeps
-/// the descriptor open, and nothing revokes it. Three facts make that bounded
-/// rather than open ended:
-///
-/// * **It names one connection and cannot be aimed at another.** A connected
-///   TCP socket really can be re-aimed with `connect`, measured on 2026-08-23,
-///   so the Linux driver refuses `connect` outright for a filtered process:
-///   see `linux/seccomp.zig`'s own `Options.block_connect`.
-/// * **The answer could not have changed anyway.** The policy table is read
-///   one time and cannot change while a session runs,
-///   so a check made again later would give the same answer it gave here.
-/// * **It ends with the call.** The descriptor lives in a process the sandbox
-///   ends: nothing in a tool call outlives that call.
+/// A granted descriptor outlives the check, and a connected TCP socket can be
+/// re-aimed with `connect`, so the Linux driver refuses `connect` for a filtered
+/// process.
 pub const NetBroker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    /// What one request is answered with.
     pub const Grant = union(enum) {
-        /// A connected descriptor, which the driver sends across and then
-        /// closes its own copy of. **The implementation gives up ownership**:
-        /// after this is returned the driver closes it whether the send
-        /// worked or not.
+        /// The implementation gives up ownership. The driver closes it either way.
         granted: std.posix.fd_t,
-        /// No connection, and no reason. **The reason never crosses the
-        /// boundary**: a process that learns why it was refused learns which
-        /// hosts exist, which rule shape refused it, and whether a name
-        /// resolves, and it learns all of that for free by asking. The
-        /// implementation keeps the reason for the person reading the session.
+        /// No reason crosses the boundary: a reason tells a process which hosts exist.
         refused,
     };
 
     pub const VTable = struct {
-        /// Answer one request. `host` is a name the sandboxed process chose:
-        /// the driver has already bounded its length and refused a byte that
-        /// cannot be in a host name, and the implementation checks it again
-        /// against its own rules. `host` borrows the driver's own buffer and
-        /// is not valid after this call returns.
+        /// `host` borrows the driver's own buffer and is not valid after this returns.
         connect: *const fn (ptr: *anyopaque, host: []const u8, port: u16) Grant,
     };
 
@@ -835,75 +256,25 @@ pub const NetBroker = struct {
     }
 };
 
-/// Who answers the network router, and the second seam this library has for a
-/// connection. See `Config.net_router`, and `linux/router.zig` for the
-/// resolver and the relay that reach it.
-///
-/// ## Two questions, because a name and an address are answered at different
-/// moments
-///
-/// `resolve` is asked while the sandboxed program is still looking a name up.
-/// Nothing has been connected and no port is known, so the answer is about the
-/// **name alone**: may this session reach this host at all. An address that
-/// comes back goes into the kernel's allow set, and an address the kernel does
-/// not hold is refused by the kernel before this library sees it.
-///
-/// `open` is asked once a connection has arrived at the relay. The router
-/// recovered the address the program really asked for, and the port with it,
-/// so this is the question the policy table was written for. **The address is
-/// the identity here and the name is not**: the router's own name table
-/// answers with the name an address was last handed out for, which two hosts
-/// on one content network share, so the implementation maps the address back
-/// to the name **it** handed out and never trusts one from inside.
-///
-/// ## Why the decision is not in here
-///
-/// The same reason `NetBroker` gives: a host policy is not the sandbox's to
-/// hold. This library bounds the shape of what crosses the boundary and then
-/// asks. See `lib/chock-broker/network.zig`, which is the real implementation
-/// of both seams.
+/// On `open` the address is the identity and the name is not: two hosts on one
+/// content network share a name, so the implementation maps the address back to
+/// the name it handed out.
 pub const NetRouter = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    /// An address, in the two widths a name can answer with. The same spelling
-    /// `linux/nftables.zig` puts in the kernel's allow set, so an address does
-    /// not change type on its way from a policy answer to a kernel set.
     pub const Address = nftables.Address;
 
-    /// Which width a query asked about.
     pub const Family = @typeInfo(Address).@"union".tag_type.?;
 
-    /// What one `resolve` came back with.
     pub const Resolution = union(enum) {
-        /// An address, which the router puts in the kernel's allow set and
-        /// then answers the query with.
         granted: Address,
-        /// The policy refuses this name. The router answers `REFUSED` and adds
-        /// nothing to the allow set. **No reason crosses the boundary**, for
-        /// the reason `NetBroker.Grant.refused` gives.
         refused,
-        /// The policy permits the name and there is no address of that width.
-        /// The router answers with no error and no answer, which is what a
-        /// resolver says when it holds nothing of that type. **Told apart from
-        /// a refusal on purpose**: a program that read one as the other would
-        /// stop asking for the other width.
         unresolved,
     };
 
     pub const VTable = struct {
-        /// May this name be resolved, and to what. `host` is a name the
-        /// sandboxed program chose: the router has already bounded its length
-        /// and refused a byte that cannot be in a host name, and the
-        /// implementation checks it again against its own rules. `host`
-        /// borrows the router's own buffer and is not valid after this call
-        /// returns.
         resolve: *const fn (ptr: *anyopaque, host: []const u8, want: Family) Resolution,
-        /// May the relay carry bytes to this address and port, and on what
-        /// descriptor. **The descriptor is made in the host's own network
-        /// namespace**, which is the one thing the router cannot do from where
-        /// it stands. The implementation gives up ownership, the same as
-        /// `NetBroker.connect`.
         open: *const fn (ptr: *anyopaque, address: Address, port: u16) NetBroker.Grant,
     };
 
@@ -916,204 +287,61 @@ pub const NetRouter = struct {
     }
 };
 
-/// Who decides when a device crosses into the sandbox. See `Config.device_source`,
-/// and `linux/devicelink.zig` for the wire that carries the decision in.
-///
-/// ## Why a wakeup descriptor, and not a callback the loop calls on a timer
-///
-/// The driver's own serve loop blocks in `poll`, the same as it does for
-/// `NetBroker` and `NetRouter`. A source that could only be **asked** would
-/// force the loop to wake on a timer and ask again and again, which is a busy
-/// loop with extra steps. A descriptor lets the kernel do the waiting, which
-/// is what every other part of this driver already does: see `wakeup` below.
-///
-/// ## Why this seam runs the other way round from `NetBroker`
-///
-/// `NetBroker` and `NetRouter` answer a question the sandboxed program asks,
-/// on its own schedule. This one runs the other way: the outside decides on
-/// its own schedule, with no question from the inside to answer. A device
-/// becomes available, so the driver is told to place it; a device goes away,
-/// so the driver is told to drop it. Nothing here waits to be asked.
 pub const DeviceSource = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// A descriptor the driver polls. Readable when a placement or a
-        /// removal is waiting. **The source owns it, and the driver never
-        /// closes it**: this seam's `ptr` outlives one `spawn` call, the same
-        /// as `NetBroker`'s and `NetRouter`'s do, and a descriptor closed by
-        /// a borrower would leave the source unable to signal a second call.
+        /// The source owns this descriptor and the driver never closes it.
         wakeup: *const fn (ptr: *anyopaque) i32,
-        /// Take the next thing to do, or null when the wakeup fired and
-        /// there was nothing after all. **Called in a loop of its own**: one
-        /// wakeup can carry more than one change, and the driver keeps
-        /// calling this until it answers null before it goes back to `poll`.
         next: *const fn (ptr: *anyopaque) ?Change,
     };
 
-    /// One thing to do inside the sandbox.
     pub const Change = union(enum) {
-        /// Put the node at `source`, relative to `Config.device_tree.host`,
-        /// at `target`, an absolute path inside the sandbox. **No descriptor
-        /// rides with this.** A device passthrough used to hand the driver an
-        /// open descriptor here; that cannot cross into the in-sandbox
-        /// helper's own mount namespace as a mount, so this carries a path
-        /// instead, checked on the far side against the one directory
-        /// `Config.device_tree` names. See that field's own doc comment for
-        /// what stands in for the descriptor's own guarantee.
+        /// No descriptor rides with this: a descriptor cannot become a mount inside the
+        /// helper's own mount namespace, so a path crosses and is checked on the far side.
         place: struct { kind: u8, source: []const u8, target: []const u8 },
-        /// Take the node at `target` back out.
         drop: struct { target: []const u8 },
     };
 };
 
-/// Which cgroup holds the sandboxed program, and **which of the two promises
-/// that is**. The two are different promises and not two ways of doing one
-/// thing, so they are two members of one union rather than one nullable
-/// field: a caller names exactly one, and a driver's switch on this cannot
-/// silently treat the second as the first.
-///
-/// | | who makes the cgroup | who writes the limits | when the process goes in | what happens when it cannot |
-/// |---|---|---|---|---|
-/// | `best_effort` | chock | chock | after the fork, first act of the child | the program runs with the rlimit floor |
-/// | `supplied` | the caller | the caller | at creation, and never after | `spawn` refuses |
-///
-/// **The right hand column is the whole reason this type exists.** Chock's
-/// own cgroup is best effort on purpose: a machine with no cgroup v2 tree
-/// still gets every rlimit, and `LimitsReport.cgroup` says plainly what it did
-/// not get, so nobody believes in a bound that is not there. A caller that
-/// hands over a cgroup is asking a different question. It made that cgroup, it
-/// holds limits in it that chock never wrote, and it asked for the child to be
-/// inside it from the first instruction. Chock cannot answer that question
-/// half way. Either the kernel puts the child in at creation, or `spawn`
-/// refuses and the caller learns that at once.
-///
-/// **A fall back to the post fork write is exactly what must not happen.** A
-/// process that runs even briefly outside its cgroup can fork faster than the
-/// write that would contain it, and a fork that got out is not called back.
+/// A fall back from `supplied` to a post fork write must not happen: a process
+/// that runs even briefly outside its cgroup can fork faster than the write that
+/// would contain it.
 pub const Containment = union(enum) {
-    /// Chock makes a cgroup for this call, writes `Config.limits` into it,
-    /// reads the counters back afterwards, and removes it. **Best effort.** A
-    /// machine with no cgroup v2 tree, or one that delegates no controller,
-    /// runs the program anyway with the rlimit floor and says so through
-    /// `LimitsReport.cgroup`.
-    ///
-    /// The default, so every caller that has never heard of this field keeps
-    /// the behaviour it always had.
     best_effort,
-    /// The caller's own cgroup, and the child is created inside it.
     supplied: Supplied,
 
-    /// A cgroup the caller made and still owns.
     pub const Supplied = struct {
-        /// An open descriptor on the cgroup v2 **directory**, not on any file
-        /// in it.
-        ///
-        /// **A descriptor and not a path, for three reasons.** The kernel
-        /// takes a descriptor for `CLONE_INTO_CGROUP` and resolves no name at
-        /// clone time, so there is nothing to race: a directory that is
-        /// renamed, removed or replaced between the caller's own check and the
-        /// clone cannot make the child land somewhere else. A descriptor also
-        /// carries the caller's own permission to that cgroup, which is the
-        /// authority this placement runs on, rather than asking chock to
-        /// resolve a path it has no business interpreting. And it is the shape
-        /// this library already uses for the same class of problem: see
-        /// `linux/cgroup.zig`'s own `Cgroup.procs_fd`.
-        ///
-        /// **The caller opens it and the caller closes it.** `spawn` never
-        /// closes this, never writes through it, and never keeps it. It is
-        /// also not exempted from the pass that closes every inherited
-        /// descriptor before a program runs, so the sandboxed program is never
-        /// handed a descriptor on the caller's own cgroup tree.
+        /// A descriptor and not a path: the kernel resolves no name for
+        /// `CLONE_INTO_CGROUP`, so a directory renamed between the caller's check and
+        /// the clone cannot make the child land elsewhere.
         fd: std.posix.fd_t,
     };
 };
 
-/// How much of the machine one sandboxed program may consume. See
-/// `linux/rlimits.zig`, which owns the type and every default in it.
 pub const Limits = rlimits.Limits;
 
-/// What the resource limits layer did for one `spawn` call, and what it
-/// could not do.
-///
-/// **This exists because a limit that kills has to be legible.** This
-/// project's most repeated lesson is that a confusing failure costs turns and
-/// a plain refusal costs one, and a resource limit is unusually good at
-/// producing the confusing kind: `memory.max` kills with a bare `SIGKILL`,
-/// which is the same thing a caller sees when a person cancels a call or when
-/// the harness enforces its deadline.
-///
-/// It is also the capability record. A machine with no cgroup v2 tree, a
-/// machine with cgroup v1, and a machine that delegates nothing are three
-/// different situations, and every one of them still gets the rlimit floor.
-/// `cgroup` names which of them happened rather than leaving a person to
-/// believe in a bound that is not there.
+/// `memory.max` kills with a bare `SIGKILL`, the same thing a caller sees when a
+/// person cancels a call, so the outcome has to be named.
 pub const LimitsReport = struct {
-    /// The numbers that were asked for.
-    ///
-    /// **Asked for, and not necessarily applied.** Which of them a cgroup
-    /// really carried is what `cgroup` below says, and it is the field to read
-    /// before believing a number here bounded anything.
     limits: Limits = .{},
-    /// Whether the cgroup half went on, and why not when it did not.
-    ///
-    /// **`supplied` is the answer for a caller supplied cgroup, and it says
-    /// chock wrote nothing.** The program is contained on that path, and every
-    /// number in `limits` above that only a cgroup can carry was written by
-    /// the caller and not by chock. See `Containment` and `cgroup.Support`.
     cgroup: cgroup.Support = .off,
-    /// Whether `RLIMIT_NPROC` went on. False on a kernel older than 5.14,
-    /// where it counts the user's own processes on the host rather than the
-    /// sandbox's own. See `rlimits.nproc_per_user_namespace_since`, which
-    /// holds the measurement this is based on.
+    /// Whether `RLIMIT_NPROC` went on. False on a kernel older than 5.14, where it
+    /// counts the user's own processes on the host and not the sandbox's.
     nproc_applied: bool = false,
-    /// What the kernel counted inside the cgroup while the program ran. All
-    /// zero when there was no cgroup, which reads the same as "no cgroup
-    /// limit was reached" and is the truth in that case.
-    ///
-    /// **Also all zero for a caller supplied cgroup, and there it is an
-    /// absence and not a measurement.** Chock reads nothing out of a cgroup it
-    /// does not own, so a program the caller's own `memory.max` killed arrives
-    /// as a bare `SIGKILL` that nothing here names. The caller holds that
-    /// cgroup and can read its own `memory.events`.
     events: cgroup.Events = .{},
-    /// True when a scratch area had no space left in it when the program
-    /// ended. Read from the filesystem itself, because nothing in the kernel
-    /// counts this the way `memory.events` counts an out of memory kill: see
-    /// `linux/namespace.zig`'s own `scratchIsFull`.
-    ///
-    /// **Reported whatever the program's outcome was.** A program that filled
-    /// an area and then exited 0 did not fail, and a caller that wants to warn
-    /// about it can, while `killed_by` below stays honest about what ended the
-    /// program.
+    /// Read from the filesystem itself: nothing in the kernel counts a full tmpfs.
     scratch_full: bool = false,
-    /// The limit that ended the program, when one did. Null when the program
-    /// ended for any other reason, including a cancel and an ordinary exit.
-    ///
-    /// **`scratch_space` is the one member here that is inferred and not
-    /// counted.** Every other one comes from a signal number or a kernel
-    /// counter. A full scratch area is neither: the kernel answers the program
-    /// with `ENOSPC` and keeps no record, so this reads "the area was full when
-    /// the program ended badly" as "the area is what ended it". That can be
-    /// wrong, and it errs in the safe direction: an area that is not full is
-    /// never named. See `scratch_full`, which is the raw fact with no inference
-    /// in it at all.
+    /// `scratch_space` is inferred and not counted: the kernel answers `ENOSPC` and
+    /// keeps no record, so a full area plus a bad end reads as the area ending it.
     killed_by: ?rlimits.Diagnostic.Which = null,
 
-    /// One sentence for a person, or null when no limit ended the program.
-    /// Written into `buffer`, so this allocates nothing and can be called
-    /// from the same places `spawn` itself can.
     pub fn killedText(self: LimitsReport, buffer: []u8) ?[]const u8 {
         const which = self.killed_by orelse return null;
 
-        // **A scratch area is not a disk, and the sentence has to say so.**
-        // A program that fills one prints "No space left on device", and a
-        // person who reads only that goes and looks at their own filesystem,
-        // finds it fine, and has lost a turn. This project's most repeated
-        // lesson is that a confusing failure costs turns and a plain refusal
-        // costs one, so the refusal names the area, names the cap, and says
-        // outright that the machine's own disk is not the thing that filled.
+        // A program that fills a scratch area prints "No space left on device", so the
+        // sentence has to say the machine's own disk is not the thing that filled.
         if (which == .scratch_space) {
             if (self.limits.scratch_bytes) |number| {
                 return std.fmt.bufPrint(
@@ -1158,22 +386,11 @@ pub const LimitsReport = struct {
     }
 };
 
-/// Which process a layer is put on.
-///
-/// **A layer is not one fact, it is one fact for each process that wears it.**
-/// The same Landlock ruleset and the same seccomp filter go on the caller's
-/// own program and on the supervisor that waits for it, and the two answers to
-/// "what happens when it will not go on" are opposite. See `failModeFor`.
 pub const LayerProcess = enum {
-    /// The caller's own program, inside the sandbox. The Linux driver calls
-    /// it B.
     sandboxed,
-    /// The process that waits for it and relays its outcome. It holds this
-    /// program's own memory, which on the `chock run` path includes the
-    /// provider credential. The Linux driver calls it A.
+    /// The process that waits, which holds this program's own memory including the credential.
     supervisor,
 
-    /// The name the session log uses for this process.
     pub fn wireName(self: LayerProcess) []const u8 {
         return switch (self) {
             .sandboxed => "sandboxed",
@@ -1182,28 +399,14 @@ pub const LayerProcess = enum {
     }
 };
 
-/// One layer a driver puts on a process, named for the mechanism that carries
-/// it.
-///
-/// **Not the same list as `Guarantee`.** A guarantee is what a caller is
-/// promised. This is what a driver installs, so it holds steps a caller never
-/// asked for by name: dropping the capability set is one, and joining a fresh
-/// session keyring is another.
 pub const LayerName = enum {
-    /// The bind mounts that make the new root.
     mount_tree,
-    /// The `pivot_root` into it.
     pivot_root,
-    /// Dropping every capability.
     capabilities,
-    /// The Landlock ruleset.
     landlock,
-    /// The fresh, anonymous session keyring.
     session_keyring,
-    /// The seccomp filter.
     seccomp,
 
-    /// The name the session log uses for this layer.
     pub fn wireName(self: LayerName) []const u8 {
         return switch (self) {
             .mount_tree => "mount_tree",
@@ -1216,170 +419,57 @@ pub const LayerName = enum {
     }
 };
 
-/// What becomes of a process that could not put one of its layers on.
-///
-/// **A value and never a shape of code.** Before this type, the answer was
-/// read out of the call graph: `applyLayers` calls `die`, `restrictMiddle`
-/// prints and returns, and a reader had to follow both to learn which. A value
-/// can be printed in a report, written to the log, and asserted against in a
-/// test, and the three readers then cannot disagree.
 pub const FailMode = enum {
-    /// The process ends. Nothing runs with the layer missing.
     closed,
-    /// The process goes on without the layer, and says so. **Never silent**:
-    /// a recovery nobody can see is not a recovery.
     open,
 };
 
 /// What happens to `process` when `layer` will not go on, or null when that
-/// process never puts that layer on at all.
-///
-/// **This table is the source and the code follows it.** `linux/driver.zig`
-/// reads it at compile time: `restrictMiddle` picks its fault handler from
-/// this answer, and `applyLayers` refuses to compile if this table ever says
-/// one of its layers may be skipped. So an edit here is an edit to the
-/// behaviour, and not to a description of it.
-///
-/// **The supervisor fails open on purpose, and that is the owner's decision.**
-/// Its program is already running by the time these three go on, and ending
-/// the supervisor ends that program. A layer that guards only the supervisor
-/// must not cost the caller the work. See `SupervisorAudit`, which is where
-/// the degradation is counted so that "open" does not mean "unrecorded".
+/// process never puts it on. `linux/driver.zig` reads this table at compile time
+/// and `applyLayers` refuses to compile if it says one of its layers may be
+/// skipped, so an edit here is an edit to the behaviour.
 pub fn failModeFor(process: LayerProcess, layer: LayerName) ?FailMode {
     return switch (process) {
-        // Every layer of the sandboxed program is fatal. There is no state in
-        // which the caller's program runs with one of them quietly missing,
-        // which is the claim the session header rests on.
         .sandboxed => .closed,
         .supervisor => switch (layer) {
             .capabilities, .landlock, .seccomp => .open,
-            // The supervisor never builds a root, never pivots, and never
-            // touches the keyring. Null, and not a fail mode, because a fail
-            // mode for a layer nobody applies is an answer to a question
-            // nobody asked.
             .mount_tree, .pivot_root, .session_keyring => null,
         },
     };
 }
 
-/// Whether the supervisor process could confine itself, counted over every
-/// `spawn` a caller attached this to.
-///
-/// **The supervisor is the process that holds the provider credential.**
-/// `spawn` first forks the supervisor. The supervisor forks a pid namespace
-/// keeper and the caller's program. It can also fork a path reader. The
-/// supervisor waits and relays the program's outcome. It holds this program's
-/// own memory while it waits, so it puts a Landlock ruleset and a seccomp
-/// filter on itself. See the Linux driver's own `restrictMiddle`.
-///
-/// **That install is best effort, and it stays best effort.** Killing the
-/// supervisor because it could not confine itself would end the caller's
-/// running program for a layer that guards nothing of the caller's. So a
-/// failure is printed and the process goes on.
-///
-/// **What was missing is the record.** The printed line reaches a terminal and
-/// dies with it, so nothing could answer "did the credential holding process
-/// run unfiltered in this session" afterwards. This is that answer. A caller
-/// points `Config.supervisor_audit` at one of these, reads the counts when the
-/// session ends, and writes them to the session log.
-///
-/// **Every field is atomic**, because `lib/chock-core/tools.zig` calls `spawn`
-/// from a thread of its own and a session can have more than one tool call
-/// running at a time.
+/// Whether the supervisor process could confine itself. That install stays best
+/// effort, and the terminal line it prints dies with the terminal.
 pub const SupervisorAudit = struct {
-    /// The name the session log uses for the process these counts are about.
-    /// Here, beside the counts, so the log and the driver cannot drift apart
-    /// on what they call it.
     pub const process_name = LayerProcess.supervisor.wireName();
 
-    /// One counter set for every layer, indexed by the layer's own name.
-    ///
-    /// **Three of the six are ever written**, and `failModeFor` names which:
-    /// a layer the supervisor never puts on has no fail mode for the
-    /// supervisor, and its counters stay zero. A caller that writes these
-    /// down walks the same table rather than keeping a list of its own.
     layers: std.EnumArray(LayerName, Counters) = .initFill(.{}),
 
-    /// What one supervisor said about one of its own layers, counted over
-    /// every `spawn`.
     pub const Counters = struct {
-        /// Supervisors that said the layer went on.
         confined: std.atomic.Value(u64) = .init(0),
-        /// Supervisors that said it did not.
         unconfined: std.atomic.Value(u64) = .init(0),
-        /// Calls where the supervisor said nothing at all.
-        ///
-        /// **Not the same fact as either count above, and not a zero.** A tool
-        /// call that a person cancelled, or that ran past its deadline, kills
-        /// the supervisor before it reaches the point where it confines
-        /// itself, so there is no answer to record and a count of zero would
-        /// be a claim.
-        ///
-        /// A call that never built a sandbox at all is counted nowhere here.
-        /// It had no supervisor, so it has no answer, and `spawn` gives that
-        /// caller a setup error instead.
+        /// A cancelled call kills the supervisor before it confines itself, so there is
+        /// no answer to record and a count of zero would be a claim.
         unreported: std.atomic.Value(u64) = .init(0),
-        /// Why the first unconfined supervisor went without the layer. Zero
-        /// while `unconfined` is zero. **The first and not the last**, because
-        /// the first is the one whose reason a reader can still match against
-        /// the terminal line that named it.
         first_fault: std.atomic.Value(u8) = .init(0),
     };
 
-    /// Which way the supervisor's own install failed.
-    ///
-    /// **One set for all three layers, because the repairs are the same
-    /// sentences.** The seccomp members came first, one for each member of
-    /// `linux/seccomp.zig`'s own `InstallError`, because the repair differs
-    /// for each: a refused `no_new_privs` flag, a missing privilege, and a
-    /// filter the kernel would not read are three different faults. Landlock
-    /// and the capability set answer with a subset of the same five.
-    ///
-    /// The numbers are the wire form on the driver's own middle pipe, so zero
-    /// is left free to mean "no fault named".
     pub const Fault = enum(u8) {
-        /// This kernel does not have the mechanism at all.
-        ///
-        /// **Recorded the same way as every other member, and that is
-        /// deliberate.** It names a machine that cannot rather than a kernel
-        /// that refused, and the repair is different, which is why it keeps a
-        /// name of its own. The outcome an audit asks about is not different:
-        /// the process holding the credential ran without the layer either
-        /// way. A softer treatment would invite a reader to discount it, and
-        /// "the machine cannot" is exactly the answer an audit must still
-        /// count.
-        ///
-        /// It is also the member least likely to be true. The sandboxed
-        /// process puts the same layer on from the same inputs, and that
-        /// install is fatal: see the Linux driver's own `applyLayers`. A
-        /// machine without the mechanism fails there first and the call never
-        /// reaches a supervisor to report anything. So this member arriving
-        /// means the kernel answered two processes differently, which is worth
-        /// recording loudly rather than quietly.
+        /// The sandboxed process puts the same layer on from the same inputs and that
+        /// install is fatal, so this arriving means the kernel answered two processes differently.
         not_supported = 1,
-        /// `prctl(PR_SET_NO_NEW_PRIVS)` was refused, so the layer was never
-        /// offered to the kernel.
         no_new_privs_refused = 2,
-        /// The kernel refused because the process held neither `no_new_privs`
-        /// nor `CAP_SYS_ADMIN`.
         not_permitted = 3,
-        /// The kernel refused the layer itself.
         rejected = 4,
-        /// Anything else the kernel answered.
         unexpected = 5,
     };
 
-    /// What one supervisor said about one layer.
     pub const Outcome = union(enum) {
-        /// The layer went on.
         on,
-        /// It did not, for this reason.
         off: Fault,
-        /// The supervisor never said. See `Counters.unreported`.
         unsaid,
     };
 
-    /// Count one call's answer about one layer. Safe to call from any thread.
     pub fn record(self: *SupervisorAudit, layer: LayerName, outcome: Outcome) void {
         const slot = self.layers.getPtr(layer);
         switch (outcome) {
@@ -1387,17 +477,11 @@ pub const SupervisorAudit = struct {
             .unsaid => _ = slot.unreported.fetchAdd(1, .monotonic),
             .off => |fault| {
                 _ = slot.unconfined.fetchAdd(1, .monotonic);
-                // Keeps the first, so a second call with a different fault
-                // cannot overwrite the one a person already read on the
-                // terminal.
                 _ = slot.first_fault.cmpxchgStrong(0, @intFromEnum(fault), .monotonic, .monotonic);
             },
         }
     }
 
-    /// One layer's counts as plain numbers, for a caller that is about to
-    /// write them down. Reads each field once, so two fields can disagree by
-    /// one while a call is in flight. Call it when the calls have stopped.
     pub fn counts(self: *const SupervisorAudit, layer: LayerName) Counts {
         const slot = self.layers.getPtrConst(layer);
         const raw = slot.first_fault.load(.monotonic);
@@ -1409,93 +493,40 @@ pub const SupervisorAudit = struct {
         };
     }
 
-    /// What `counts` gives back.
     pub const Counts = struct {
         confined: u64,
         unconfined: u64,
         unreported: u64,
-        /// Null when `unconfined` is zero, and also when a fault code arrived
-        /// that this build has no name for.
         first_fault: ?Fault,
     };
 };
 
-/// What the sandboxed program asked the kernel for, counted over the whole
-/// session.
-///
-/// **Chock's log could say which program an agent ran, and not what that
-/// program then opened.** `tool.call` carries the argument vector, and nothing
-/// after it says a word about the calls the program made. This is that answer,
-/// at the one level a program cannot talk its way around: the kernel holds the
-/// call, tells the supervisor the number, and the supervisor counts it. See
-/// `linux/notify.zig` for the mechanism and `linux/seccomp.zig`'s own
-/// `TrapCall` for what is counted and what each member costs.
-///
-/// **A count and not a line for each call.** A session makes thousands of tool
-/// calls and one tool call makes thousands of opens. `SupervisorAudit` above
-/// and `NetworkSummary` have the same shape for the same reason.
-///
-/// **`observed` and `unobserved` are what make a zero readable.** A histogram
-/// of zeros is the honest record of a session that asked for no observation at
-/// all, and it is also what a session whose supervisor could not take the
-/// notification descriptor leaves behind. Those are different facts with
-/// different repairs, so they are counted apart and neither reads as "the
-/// program opened nothing".
-///
-/// **Every field is atomic**, because `lib/chock-core/tools.zig` calls `spawn`
-/// from a thread of its own and a session can have more than one tool call
-/// running at a time.
+/// What the sandboxed program asked the kernel for, at the one level a program
+/// cannot talk its way around. `observed` and `unobserved` are what make a
+/// histogram of zeros readable.
 pub const SyscallAudit = struct {
-    /// The name the session log uses for what produced these counts. Here,
-    /// beside the counts, so the log and the driver cannot drift apart on what
-    /// they call it.
     pub const mechanism_name = "seccomp_user_notif";
 
-    /// Calls whose supervisor held the notification descriptor, so the counts
-    /// below are about them.
     observed: std.atomic.Value(u64) = .init(0),
-    /// Calls that asked for an observation and did not get one. **This is the
-    /// field an audit reads.** Anything above zero means a tool call ran with
-    /// nothing watching it, and the counts below are short by a whole call.
     unobserved: std.atomic.Value(u64) = .init(0),
-    /// One count for each member of `seccomp.TrapCall`, by its tag value.
     calls: [notify.call_count]std.atomic.Value(u64) = @splat(.init(0)),
 
-    /// The paths the sandboxed programs of this session named, added up the
-    /// same way. **A lock and not an atomic**, because a name is bytes and a
-    /// set of names is read and written together. See `recordPaths`.
-    ///
-    /// Zero for a session that asked for no path audit, and that is why the
-    /// session log says which of the two it was: see `Config.path_audit` and
-    /// `linux/notify.zig`.
     paths: PathTotals = .{},
 
-    /// What one tool call's reader left behind, added up over the session.
     pub const PathTotals = struct {
         lock: Lock = .{},
-        /// Calls whose reader did not report that it saw the program end.
-        ///
-        /// **A warning and not a finding.** The ordinary pid namespace
-        /// teardown and a program that kills its own reader are identical at
-        /// the reap, so this counts both. See
-        /// `notify.PathRecord.reader_unreported` for the three discriminators
-        /// that were measured and rejected.
+        /// The ordinary pid namespace teardown and a program that kills its own reader
+        /// are identical at the reap, so this counts both.
         readers_unreported: u64 = 0,
-        /// Calls whose reader never reached its loop at all.
         readers_absent: u64 = 0,
-        /// The record itself, with the names of every tool call merged.
         seen: notify.PathRecord = .{},
     };
 
-    /// What one call's supervisor came back with.
     pub const Outcome = union(enum) {
-        /// The supervisor watched the call, and this is what it counted.
         observed: notify.Counts,
-        /// The supervisor never held the notification descriptor.
         unobserved,
     };
 
-    /// Count one call. Safe to call from any thread.
     pub fn record(self: *SyscallAudit, outcome: Outcome) void {
         switch (outcome) {
             .unobserved => _ = self.unobserved.fetchAdd(1, .monotonic),
@@ -1508,17 +539,13 @@ pub const SyscallAudit = struct {
         }
     }
 
-    /// Plain atomics and a yield, the same shape `chock_core.subagent`'s own
-    /// lock takes and for the same reason: `std.Io.Mutex.lock` needs an `Io`,
-    /// and `spawn` has none to give. Held for a few hundred bytes of copying
-    /// and never across a system call.
+    /// Plain atomics and a yield: `std.Io.Mutex.lock` needs an `Io` and `spawn` has
+    /// none to give. Never held across a system call.
     pub const Lock = struct {
         held: std.atomic.Value(bool) = .init(false),
 
         fn lock(self: *Lock) void {
             while (self.held.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-                // A yield this platform refuses leaves the spin, which is
-                // correct and only slower.
                 std.Thread.yield() catch std.atomic.spinLoopHint();
             }
         }
@@ -1528,12 +555,7 @@ pub const SyscallAudit = struct {
         }
     };
 
-    /// Add one call's path record to the session's own. Safe to call from any
-    /// thread.
-    ///
-    /// **Everything read out of `seen` is untrusted input.** It is memory the
-    /// reader process wrote, and `notify.PathRecord.name` is what clamps a
-    /// length before anything indexes with it.
+    /// Everything read out of `seen` is untrusted input: the reader process wrote it.
     pub fn recordPaths(self: *SyscallAudit, seen: *const notify.PathRecord) void {
         self.paths.lock.lock();
         defer self.paths.lock.unlock();
@@ -1551,19 +573,12 @@ pub const SyscallAudit = struct {
             into.truncated[slot] +|= seen.truncated[slot];
         }
 
-        // **Each name carries its own call total across the merge.** A name
-        // the session's own set has no room for adds that total to
-        // `ungranted_unnamed`, so a name that stood for five hundred opens
-        // does not read as one. See `notify.PathRecord.name_hits`.
         var slot: u32 = 0;
         while (slot < @min(seen.kept, notify.kept_path_cap)) : (slot += 1) {
             notify.keepName(into, seen.name_call[slot], seen.name(slot), seen.name_hits[slot]);
         }
     }
 
-    /// The counts as plain numbers, for a caller that is about to write them
-    /// down. Reads each field once, so two fields can disagree by one while a
-    /// call is in flight. Call it when the calls have stopped.
     pub fn counts(self: *const SyscallAudit) Counts {
         var out: Counts = .{
             .observed = self.observed.load(.monotonic),
@@ -1574,24 +589,15 @@ pub const SyscallAudit = struct {
         return out;
     }
 
-    /// What `counts` gives back.
     pub const Counts = struct {
         observed: u64,
         unobserved: u64,
         calls: notify.Counts,
     };
 
-    /// How many paths one session's record names at most. Read from
-    /// `linux/notify.zig`, so a caller that lays out a row list cannot drift
-    /// away from what the reader keeps.
     pub const name_cap = notify.kept_path_cap;
 
-    /// The path record as plain numbers and borrowed names, for a caller that
-    /// is about to write it down.
-    ///
-    /// **The names point into this audit's own storage.** They are valid for
-    /// as long as the audit is, and only a caller that has stopped making
-    /// tool calls may read them: a call still in flight can add a name.
+    /// The names point into this audit's own storage, and a call in flight can add one.
     pub fn pathCounts(self: *SyscallAudit) PathCounts {
         self.paths.lock.lock();
         defer self.paths.lock.unlock();
@@ -1614,30 +620,19 @@ pub const SyscallAudit = struct {
         return out;
     }
 
-    /// What `pathCounts` gives back.
     pub const PathCounts = struct {
-        /// Calls whose reader did not report that it saw the program end.
-        /// See `PathTotals.readers_unreported`.
         readers_unreported: u64,
         readers_absent: u64,
-        /// Calls whose path the caller's own config granted. Counted and never
-        /// named. See `Config.path_audit` and `grantPrefixes`.
         granted: notify.Counts,
-        /// Calls whose path it granted nothing for. Named until the set fills.
         ungranted: notify.Counts,
-        /// Calls that were ungranted and that the set had no room for.
         ungranted_unnamed: notify.Counts,
-        /// Calls whose path was relative, so the reader could not place it.
         relative: notify.Counts,
         unread: notify.Counts,
         truncated: notify.Counts,
         kept: u32,
-        /// Which call each name belongs to, by `seccomp.TrapCall` tag value.
         name_call: [name_cap]u32,
         names: [name_cap][]const u8,
 
-        /// True when nothing was ever recorded, so a caller can leave the
-        /// field out rather than write a row of zeros for every call.
         pub fn empty(self: PathCounts) bool {
             if (self.kept != 0) return false;
             if (self.readers_unreported != 0 or self.readers_absent != 0) return false;
@@ -1651,112 +646,40 @@ pub const SyscallAudit = struct {
     };
 };
 
-/// The guarantees a driver can give. A driver declares which guarantees it
-/// gives, Chock compares the policy against the driver, and refuses when the
-/// driver is short. Nothing compares against this set yet, and only two
-/// drivers exist, but the shape has to exist before that comparison can, and
-/// before a third driver, such as a Darwin virtual machine, has something to
-/// declare against.
+/// The guarantees a driver can give. Nothing compares against this set yet.
 pub const Guarantee = enum {
-    /// No network route out of the sandbox. Linux: network namespace.
-    /// Darwin design: `(deny network*)`.
-    ///
-    /// **This is a statement about the driver and not about one call.** A
-    /// driver that gives it takes a network namespace for `Config.network` of
-    /// `.none` and of `.filtered` alike, so a filtered process still has
-    /// no route of its own. What a filtered process has in addition is one
-    /// descriptor on a socket pair, and what comes back over it is a
-    /// connection a policy permitted: see `NetBroker`. A `.host` config gives
-    /// this up altogether, which is why the Linux driver refuses `.host` for
-    /// everything except an act the user approved.
     network_isolated,
-    /// Every other process is hidden, and cannot receive a signal from
-    /// inside. Linux: a PID namespace **and a process group of the
-    /// sandbox's own**. Darwin design: `(deny signal)`.
-    ///
-    /// **The PID namespace alone does not give this.** A namespace hides a
-    /// process by number, and `kill(0, sig)` names no number: it names the
-    /// caller's own process group, which the kernel holds as an object and
-    /// not as an identifier. Measured on 2026-08-21: a process in a fresh
-    /// PID namespace reads `getpgid(0)` as 0, because its group has no
-    /// number in that namespace, and `kill(0, sig)` from there still
-    /// reached a process outside the namespace, in the group the sandbox
-    /// inherited from its caller. So the Linux driver puts the sandbox in a
-    /// process group of its own; see that driver's own `newProcessGroup`.
+    /// A PID namespace alone does not give this: `kill(0, sig)` names the caller's
+    /// own process group, which the kernel holds as an object and not as a number,
+    /// and from a fresh namespace it still reached a process outside.
     signal_isolated,
-    /// System V shared memory and message queues do not cross the boundary.
-    /// Linux: IPC namespace. Darwin design: `(deny ipc-posix-shm)`.
     ipc_isolated,
-    /// Read and write access is limited to named paths. Linux: Landlock.
-    /// Darwin design: `file-read*` and `file-write*` rules.
     path_restricted,
-    /// A denylist of dangerous system calls is enforced. Linux: seccomp-bpf.
-    /// Darwin design: `(deny syscall-unix ...)`, narrower than seccomp but real.
     syscall_restricted,
-    /// The workspace appears at the real project path, and the real project
-    /// tree is not otherwise reachable from inside the sandbox. Linux:
-    /// mount namespace and bind mounts. Darwin: none, and that gap is
-    /// permanent, not one a future Seatbelt profile closes. macOS has no bind
-    /// mount, and there are only bad answers to this.
+    /// Darwin has none of this, and the gap is permanent: macOS has no bind mount.
     workspace_mounted,
 };
 
 pub const Guarantees = std.EnumSet(Guarantee);
 
-/// What a setup step can fail with, named one member per the Linux driver's
-/// own `SetupStep`, so a caller can match on exactly which layer never came
-/// up. Declared here, not on the Linux driver, so every driver's own
-/// `SpawnError` can carry the same shape without importing another
-/// driver's file. Only the Linux driver returns one of these today; the
-/// Darwin driver refuses through `SpawnError.NoMountNamespace` below before
-/// it reaches anything resembling one of these steps.
 pub const SetupError = error{
     StdinRedirectFailed,
-    /// The sandbox could not be given a network of its own with a ruleset on
-    /// it. **A setup step and not a config fault**: the network namespace was
-    /// taken, and what the kernel refused is the device or the ruleset inside
-    /// it. See `SpawnError.NetRouterUnavailable`, which is the same member
-    /// read from the other side of the pipe.
     NetRouterUnavailable,
-    /// A device source was named, but the in-sandbox helper that places its
-    /// devices never said it was ready. **A setup step and not a config
-    /// fault**: the namespace was taken and the helper's own filter was built,
-    /// and what the kernel refused is something inside that helper's own
-    /// startup, such as `capabilities.keepOnly` or `seccomp.install`. See
-    /// `Config.device_source`.
     DeviceHelperFailed,
     ProcessGroupFailed,
-    /// The process could not be moved into the cgroup that carries its
-    /// resource limits. Reported rather than ignored: a program that ran on
-    /// outside its cgroup would have no memory bound and no process bound at
-    /// all, and nothing later in the setup would notice.
     CgroupJoinFailed,
-    /// A resource limit could not be put on the process. See
-    /// `linux/rlimits.zig`.
     ResourceLimitFailed,
     CloseFdsFailed,
     NamespaceFailed,
-    /// A capped scratch area could not be mounted. Reported rather than
-    /// ignored: a program that ran on with an ordinary directory where a capped
-    /// area was asked for has no bound on what it writes, and nothing later in
-    /// the setup would notice. See `Config.scratch`.
     ScratchMountFailed,
     MountTreeFailed,
     PivotFailed,
-    /// The bounding set could not be dropped, `PR_SET_SECUREBITS` was
-    /// refused, or `capset` could not clear this process's own effective,
-    /// permitted, and inheritable sets. See `linux/capabilities.zig`.
     CapabilitiesFailed,
     LandlockInitFailed,
     LandlockRuleFailed,
     LandlockRestrictFailed,
     SessionKeyringFailed,
     SeccompInstallFailed,
-    /// The filter went on, but its notification descriptor never reached the
-    /// supervisor, so nothing could answer the calls the filter holds. A
-    /// program that ran on from here would be told by the kernel that those
-    /// calls do not exist. Only a caller that asked for an observation can
-    /// meet this: see `seccomp.Options.traps` and `linux/notify.zig`.
     NotifyHandoverFailed,
     ForkFailed,
     PdeathsigSetupFailed,
@@ -1764,154 +687,42 @@ pub const SetupError = error{
 };
 
 pub const SpawnError = error{
-    /// The kernel has no Landlock. Report this. Do not continue without the layer.
     LandlockUnavailable,
-    /// The setup pipe carried data that cannot be trusted as a real setup
-    /// failure record: the wrong number of bytes, more than one record's
-    /// worth, a bad magic value, or a step byte that names no known step.
-    /// Only the Linux driver's own pipe protocol can produce this.
     UntrustedSetupReport,
-    /// `fork`, `waitpid`, `pidfd_open`, or a read of the setup pipe returned
-    /// an errno with no specific recovery. The `pidfd_open` case is the one
-    /// that refuses rather than degrades: a caller that asked for a `Middle`
-    /// and got no handle would have a call it cannot cancel, so `spawn` ends
-    /// the process it just forked and reports this instead.
     Unexpected,
-    /// A driver that cannot give the guarantees `spawn` promises refuses
-    /// before it runs anything, named for the layer it cannot apply. Chock
-    /// refuses to run before it runs without a sandbox. Only the Darwin driver
-    /// returns this today, and it returns it for a config that needs a mount
-    /// tree, which is the one layer that platform has not got. A config whose
-    /// every path stays where it is runs there: see `darwin/driver.zig`'s
-    /// `Inexpressible` for the whole rule.
     NoMountNamespace,
-    /// `Config.network` is `.filtered` and both `Config.net_broker` and
-    /// `Config.net_router` are null, so there is nobody to ask. **Refused
-    /// rather than downgraded to `.none`**: see `Config.net_broker`.
-    ///
-    /// **Named for the broker although either field answers it.** It is the
-    /// answer a filtered config with nothing in it has always had, and a
-    /// caller that reads this name has filled in neither.
     NetBrokerMissing,
-    /// `Config.net_broker` is set on a config whose `network` is not
-    /// `.filtered`. There is no socket to serve, so the broker would never be
-    /// asked anything, and a field that reads as a permission and grants none
-    /// is worse than a refusal.
     NetBrokerNotFiltered,
-    /// The socket pair that carries the requests could not be made.
     NetBrokerSocketFailed,
-    /// `Config.net_router` is set on a config whose `network` is not
-    /// `.filtered`. There is nothing to route, for the reason
-    /// `NetBrokerNotFiltered` gives.
     NetRouterNotFiltered,
-    /// Both `Config.net_broker` and `Config.net_router` are set. The two
-    /// cannot be on together: see `Config.net_router`.
     NetRouterAndBroker,
-    /// The socket pair that carries a device placement into the sandbox
-    /// could not be made. See `Config.device_source`.
     DeviceSourceSocketFailed,
-    /// `Config.device_source` is set and `Config.device_tree` is null.
-    /// **Refused rather than left to fail deep inside a session**: the device
-    /// helper resolves a placement's own source relative to
-    /// `device_tree.host`, and a config that named a source with no tree to
-    /// resolve it against would only fail once a real device arrived, as an
-    /// unexplained `MountFailed` this deep into a session. See
-    /// `Config.device_tree`.
     DeviceSourceNeedsTree,
-    /// `Config.containment` is `.supplied` and this build cannot put a child
-    /// into a cgroup as the kernel creates it. On Linux that means a kernel
-    /// older than `linux/cgroup.zig`'s own `clone_into_cgroup_since`. On
-    /// Darwin it means the platform, which has no cgroup at all.
-    ///
-    /// **Refused and never degraded.** The remaining way to get a process into
-    /// a cgroup is to write `cgroup.procs` after the fork, and that leaves a
+    /// Refused and never degraded: writing `cgroup.procs` after the fork leaves a
     /// window in which the child is outside the cgroup the caller asked for.
-    /// A caller that got that window and was not told would believe in a
-    /// containment it does not have.
     CgroupPlacementUnsupported,
-    /// `Config.containment` is `.supplied` and the kernel refused to create
-    /// the child inside that cgroup. The descriptor may name something that is
-    /// not a cgroup v2 directory, the cgroup may not be able to hold
-    /// processes, it may already be at its own `pids.max`, or a seccomp filter
-    /// may answer `ENOSYS` for `clone3`.
-    ///
-    /// **Nothing ran.** The refusal comes from the system call that would have
-    /// created the process, so no process was created and no program was
-    /// started. See `CgroupPlacementUnsupported` for why there is no second
-    /// attempt.
     CgroupPlacementRefused,
 } || SetupError || std.mem.Allocator.Error;
 
-/// What `spawn` learned about the Landlock layer while it built the sandbox.
-/// Chock never degrades quietly: the Linux driver's own Landlock ruleset
-/// masks a right out of the whole ruleset when the running kernel's ABI
-/// does not have it, and says nothing on its own. This is how `spawn` hands
-/// that fact back, so the caller can compare `abi` against the version the
-/// design expects and tell the user when the kernel forced a smaller
-/// ruleset than they asked for. The Darwin driver never fills this in: it
-/// refuses before it would ever probe a Landlock ABI.
+/// The Landlock ruleset masks a right out of every rule when the running
+/// kernel's ABI has not got it, with no error and no other signal.
 pub const LandlockReport = struct {
-    /// The kernel's Landlock ABI version, from the Linux driver's own
-    /// `landlock.probeAbi`.
     abi: i32,
-    /// The rights that ABI version actually has. A right this struct marks
-    /// `false` was masked out of every rule the Linux driver built, on
-    /// every path, with no error and no other signal.
     features: landlock.Features,
 };
 
-/// What `spawn` hands a caller so that the caller can end a running call.
-///
-/// ## A reaped pid names nothing, and may soon name somebody else
-///
-/// `spawn` reaps the process it forked before it returns. From that moment the
-/// number is free and the kernel gives it to whatever starts next, so a
-/// `kill` by number after that reaches a process this session never started.
-/// **Measured on 2026-08-22 on a machine that was busy building: a teardown
-/// path that signalled the number unconditionally sent `SIGKILL` to a whole
-/// process group that held an unrelated build.**
-///
-/// `fd` is what closes that. It is a `pidfd`, a descriptor that names one
-/// process for as long as it is open and answers `error.Gone` once that
-/// process has been reaped. **A caller signals through `fd` and never through
-/// `pid`.** See `signalMiddle`.
-///
-/// ## Ownership
-///
-/// **The caller of `spawn` owns `fd` and must close it exactly once, with
-/// `closeMiddle`, after the `spawn` call it came from has returned.** It is
-/// deliberately not closed by `spawn` itself: the whole value of the handle is
-/// that it outlives the reap and answers `error.Gone` instead of reaching a
-/// stranger, which it can only do while it is open.
-///
-/// The two fields are written by `spawn` in a fixed order, `fd` first and then
-/// `pid` with a release store, so a caller that watches `pid` for a non zero
-/// value with an acquire load never reads an `fd` that is not there yet.
+/// `spawn` reaps the process it forked before it returns, so a `kill` by number
+/// after that reaches whatever started next: one teardown path sent `SIGKILL` to
+/// a process group holding an unrelated build. Signal through `fd`, never `pid`.
 pub const Middle = struct {
-    /// The pid of the process `spawn` forked, which is also the identifier of
-    /// the process group every process of the call is in. Zero until `spawn`
-    /// has forked, and zero forever if it failed before that.
-    ///
-    /// **This is for reporting and never for signalling.** See the type's own
-    /// doc comment above.
+    /// For reporting and never for signalling.
     pid: std.posix.pid_t = 0,
-    /// The handle to signal through, or -1 when there is none: the caller
-    /// passed null to `spawn`, `spawn` failed before its own fork, or the
-    /// platform has no such handle at all. A caller with no handle has no way
-    /// to end the call early.
     fd: std.posix.fd_t = -1,
 };
 
-/// What `signalMiddle` can answer.
 pub const SignalError = error{
-    /// The process is already gone: it ended and was reaped, so this handle
-    /// names nothing at all. **This is the answer that replaces killing a
-    /// stranger**, and it is an ordinary outcome, not a fault: a caller that
-    /// asks a finished call to stop has got what it asked for.
     Gone,
-    /// There is no handle to signal through. See `Middle.fd`.
     NoHandle,
-    /// The kernel refused the signal for a reason with no specific recovery.
     Unexpected,
 };
 
@@ -1921,19 +732,8 @@ const driver = switch (builtin.os.tag) {
     else => @compileError("chock-sandbox: no driver for target os " ++ @tagName(builtin.os.tag)),
 };
 
-/// Which guarantees this build's driver actually gives. See `Guarantee`.
 pub const guarantees: Guarantees = driver.guarantees;
 
-/// The kernel modules this build's driver needs on the host to give a sandbox
-/// a network of its own, and the ones it needs to filter that network. Named
-/// apart, because the two are two rows of `chock doctor` and two `modprobe`
-/// lines.
-///
-/// **Empty on a driver with no router**, which is every driver but the Linux
-/// one. A row built from these is a row that build never has.
-///
-/// The switch is on a comptime known value, so only the arm this build takes
-/// is analysed. The same rule `driver` above is selected by.
 pub const network_modules: []const u8 = switch (builtin.os.tag) {
     .linux => driver.network_modules,
     else => "",
@@ -1943,22 +743,13 @@ pub const filter_modules: []const u8 = switch (builtin.os.tag) {
     else => "",
 };
 
-/// The files a routed call writes inside the sandbox for itself, and the paths
-/// it hides. **One list, and `chock doctor` reads it** to ask whether this host
-/// would let them be written at all: `namespace.substitute` refuses a `text`
-/// target that is a symbolic link rather than following it. Empty on a driver
-/// with no router.
+/// `namespace.substitute` refuses a `text` target that is a symbolic link rather
+/// than following it, which is what `chock doctor` reads this list to check.
 pub const resolver_substitutions: []const namespace.Substitution = switch (builtin.os.tag) {
     .linux => &driver.resolver_substitutions,
     else => &.{},
 };
 
-/// Start a program in the sandbox and wait for it. See whichever driver
-/// `builtin.os.tag` selects, `linux/driver.zig` or `darwin/driver.zig`, for
-/// the real contract: this function only ever forwards to it and carries no
-/// logic of its own. A caller that only ever reads this file's own
-/// declarations, never a driver file directly, cannot tell which driver ran,
-/// which is the property `chock-core` has to keep.
 pub fn spawn(
     allocator: std.mem.Allocator,
     config: Config,
@@ -1969,50 +760,19 @@ pub fn spawn(
     return driver.spawn(allocator, config, argv, landlock_report, middle);
 }
 
-/// Send `sig` to the process a `Middle.fd` names. See `Middle` for why a
-/// caller signals through the handle and never through the number.
-///
-/// **Safe to call from a signal handler.** It is one syscall over a descriptor
-/// the caller already holds: no allocation, no lock, and no path.
-///
-/// It takes the descriptor rather than the whole `Middle`, because the one
-/// caller that runs in a handler, `chock_core.tools.cancelRunningTool`, holds
-/// a table of plain atomics that a handler can read and cannot hold a struct.
+/// Safe to call from a signal handler: one syscall over a descriptor already held.
 pub fn signalMiddle(fd: std.posix.fd_t, sig: std.posix.SIG) SignalError!void {
     return driver.signalMiddle(fd, sig);
 }
 
-/// Give up a handle `spawn` opened. Does nothing when there is none, and puts
-/// `fd` back to -1 so a second call cannot close a descriptor twice.
-///
-/// **Call this only after the `spawn` that filled the handle in has
-/// returned.** See `Middle` for the ownership rule in full.
+/// Call it only after the `spawn` that filled the handle in has returned.
 pub fn closeMiddle(middle: *Middle) void {
     driver.closeMiddle(middle);
 }
 
-/// Linux only, and only ever meaningful there: joins a fresh session
-/// keyring. Exposed here so `test/sandbox/probe.zig` can call it directly,
-/// outside a full `spawn`, and prove the fresh keyring really is empty; see
-/// `linux/driver.zig`'s own doc comment on the function this forwards to.
-/// The Darwin driver defines a stub of the same name only so the "same
-/// public shape" test below stays meaningful without special casing this
-/// one Linux test hook; no real caller, on either platform, has a reason to
-/// call this directly.
 pub const joinFreshSessionKeyring = driver.joinFreshSessionKeyring;
 
 test "the audit counts each of the three answers apart, and keeps the first fault" {
-    // **Three answers and not two.** A supervisor that was confined, one that
-    // was not, and one that never got far enough to say are three different
-    // facts, and folding the third into either of the others is how a call
-    // that was never measured comes to read as a call that passed.
-    //
-    // The first fault is kept rather than the last, because the first is the
-    // one whose reason a person may still have seen on the terminal.
-    //
-    // Mutation check: drop the `cmpxchgStrong` guard in `record` and write the
-    // fault every time, and the `not_supported` expectation below fails with
-    // `rejected`.
     var audit: SupervisorAudit = .{};
     try std.testing.expectEqual(@as(?SupervisorAudit.Fault, null), audit.counts(.seccomp).first_fault);
 
@@ -2031,14 +791,6 @@ test "the audit counts each of the three answers apart, and keeps the first faul
         counts.first_fault,
     );
 
-    // **One layer's answer is that layer's alone.** Before the counters were
-    // split, every layer the supervisor put on itself shared one set, so a
-    // refused Landlock ruleset and a refused filter were the same number. A
-    // reader could then not tell which layer the credential holding process
-    // ran without, which is the only question the record is for.
-    //
-    // Mutation check: make `record` ignore its `layer` argument and count
-    // against `.seccomp` always, and every expectation below fails.
     const paths = audit.counts(.landlock);
     try std.testing.expectEqual(@as(u64, 0), paths.confined);
     try std.testing.expectEqual(@as(u64, 0), paths.unconfined);
@@ -2051,10 +803,6 @@ test "the audit counts each of the three answers apart, and keeps the first faul
 }
 
 test "a fresh audit claims nothing, so an absent answer is never a confined one" {
-    // The default state, pinned. A session that built no sandbox at all must
-    // not write an event that says a supervisor was confined.
-    //
-    // Mutation check: start `confined` at one and this fails.
     const audit: SupervisorAudit = .{};
     for (std.enums.values(LayerName)) |layer| {
         const counts = audit.counts(layer);
@@ -2066,18 +814,6 @@ test "a fresh audit claims nothing, so an absent answer is never a confined one"
 }
 
 test "the grant set is every mount target and every scratch area, and no denial" {
-    // **The boundary the path record splits on.** A caller never names it, so
-    // this is the one place a mount that stopped being counted as a grant
-    // would show. A missing entry turns every open below that mount into a
-    // path nothing granted, which fills the record's few name slots with
-    // ordinary work and pushes the anomaly into the overflow count.
-    //
-    // A `Mount.deny` target is left out for the reason `firstGap` leaves it
-    // out: it takes bytes away and grants no reach.
-    //
-    // Mutation check: drop the scratch loop in `grantPrefixes` and the length
-    // below reads 3 with `/run/chock/scratch` missing. Give `.deny` a target
-    // in `mountTarget` and the length reads 5.
     const config = Config{
         .root = "/tmp/root",
         .mounts = &.{
@@ -2101,23 +837,11 @@ test "the grant set is every mount target and every scratch area, and no denial"
     try std.testing.expectEqualStrings("/proc", set[2]);
     try std.testing.expectEqualStrings("/run/chock/scratch", set[3]);
 
-    // **The same judgement `firstGap` makes.** A path a rule may name is a
-    // path the record calls granted, and the two answers come from one
-    // function so they cannot drift.
     try std.testing.expect(grants.setHolds(set, "/nix/store/abc-glibc/lib/libc.so.6"));
     try std.testing.expect(!grants.setHolds(set, "/etc/shadow"));
 }
 
 test "a copied config shares no memory with the original, scratch areas included" {
-    // **`Config.copy` exists so a caller can outlive the arena its config was
-    // built in**, which `chock_core.tasks.Table` and `chock_core.helper.Helper`
-    // both do. A field the copy misses is a field the caller reads out of freed
-    // memory on the first turn that ends before it does, and nothing about that
-    // fault points at this function.
-    //
-    // The check is on the pointers and not on the values: two slices holding
-    // the same bytes at the same address is exactly the fault, so equal content
-    // proves nothing on its own.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2142,25 +866,14 @@ test "a copied config shares no memory with the original, scratch areas included
     }
     try std.testing.expect(original.scratch.ptr != copied.scratch.ptr);
 
-    // **A path audit names no path of its own.** Its boundary is the mount
-    // set and the scratch areas, which the two pointer checks below already
-    // cover, so what has to survive the copy is the flag and nothing else.
     try std.testing.expectEqual(true, copied.path_audit);
 
-    // The fields that were already copied before scratch areas existed, so a
-    // later reader can see this test covers the whole shape and not one field.
     try std.testing.expect(original.root.ptr != copied.root.ptr);
     try std.testing.expect(original.cwd.ptr != copied.cwd.ptr);
     try std.testing.expect(original.env.ptr != copied.env.ptr);
     try std.testing.expect(original.mounts.ptr != copied.mounts.ptr);
     try std.testing.expect(original.rules.ptr != copied.rules.ptr);
 
-    // `device_tree` is the same case as `root` and `cwd`: two owned strings,
-    // both duplicated so a copy that outlives its own arena still names a
-    // real directory and not freed memory.
-    //
-    // Mutation check: drop the `if (self.device_tree) |tree| ...` block in
-    // `copy` and `copied.device_tree` reads null, failing the `orelse` below.
     const original_tree = original.device_tree orelse return error.TestUnexpectedResult;
     const copied_tree = copied.device_tree orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(original_tree.host, copied_tree.host);
@@ -2168,15 +881,7 @@ test "a copied config shares no memory with the original, scratch areas included
     try std.testing.expectEqualStrings(original_tree.inside, copied_tree.inside);
     try std.testing.expect(original_tree.inside.ptr != copied_tree.inside.ptr);
 
-    // The five numbers and the report pointer are carried across as they are,
-    // on purpose: a number is not memory to duplicate, and the report points at
-    // storage this function has no business copying.
     try std.testing.expectEqual(original.limits, copied.limits);
-    // `containment` is the same case again, and it is a descriptor rather
-    // than a pointer: a number in this process, which duplicating would only
-    // make into a second handle nobody closes. So the copy names the caller's
-    // own cgroup, and a caller whose config outlives the descriptor it named
-    // must keep that descriptor open.
     try std.testing.expectEqual(original.containment, copied.containment);
     const supplied = try (Config{
         .root = "/tmp/root",
@@ -2186,31 +891,13 @@ test "a copied config shares no memory with the original, scratch areas included
         .env = &.{},
         .containment = .{ .supplied = .{ .fd = 11 } },
     }).copy(arena);
-    // Read through a switch and not through the payload directly, so a copy
-    // that lost the tag fails with the two numbers printed rather than
-    // panicking on a union that holds the other member.
-    //
-    // Mutation check: write `out.containment = .best_effort;` in `copy` and
-    // this reads -1.
     try std.testing.expectEqual(@as(std.posix.fd_t, 11), switch (supplied.containment) {
         .supplied => |one| one.fd,
         .best_effort => @as(std.posix.fd_t, -1),
     });
 
-    // `net_broker` is the same case: two pointers at the caller's own storage,
-    // and duplicating either one would give the copy a broker nobody answers.
-    // Carried across, so a config that outlives its arena keeps its channel
-    // out. **A copy with a null broker on a filtered config is refused by
-    // `spawn`**, so a field this function forgot would be a plain refusal and
-    // never a silent isolation: see `Config.net_broker`.
     try std.testing.expectEqual(original.net_broker, copied.net_broker);
 
-    // `net_router` is the same case again, and it is checked with a seam that
-    // is really there rather than with the null every other field on this
-    // literal holds. Two nulls compare equal whether or not `copy` carries the
-    // field at all, so the check above proves less than it reads as.
-    //
-    // Mutation check: write `out.net_router = null;` in `copy` and this fails.
     var stub: StubRouter = .{};
     const routed = try (Config{
         .root = "/",
@@ -2226,11 +913,6 @@ test "a copied config shares no memory with the original, scratch areas included
         if (routed.net_router) |one| one.ptr else null,
     );
 
-    // `device_source` is the same case again, for the same reason
-    // `net_router` above is checked with a seam that is really there.
-    //
-    // Mutation check: write `out.device_source = null;` in `copy` and this
-    // fails.
     var device_stub: StubDevice = .{};
     const with_device = try (Config{
         .root = "/",
@@ -2246,8 +928,6 @@ test "a copied config shares no memory with the original, scratch areas included
     );
 }
 
-/// A device seam that answers nothing. **For `Config.copy` alone**, which
-/// carries the pointer and never calls through it.
 const StubDevice = struct {
     fn deviceSource(self: *StubDevice) DeviceSource {
         return .{ .ptr = self, .vtable = &vtable };
@@ -2264,8 +944,6 @@ const StubDevice = struct {
     }
 };
 
-/// A router seam that answers nothing. **For `Config.copy` alone**, which
-/// carries the pointer and never calls through it.
 const StubRouter = struct {
     fn netRouter(self: *StubRouter) NetRouter {
         return .{ .ptr = self, .vtable = &vtable };
@@ -2283,24 +961,12 @@ const StubRouter = struct {
 };
 
 test "the linux driver and the darwin driver expose the same public shape" {
-    // Guarded on `builtin.os.tag`, a comptime known value, so the branch
-    // this test does not take is never even imported: unconditionally
-    // importing `linux/driver.zig` while compiling for Darwin is exactly
-    // the mistake this whole split exists to avoid, since that file's own
-    // Linux syscalls do not type check for that target. See `driver` above
-    // for the same technique used for the real dispatch, not only this
-    // test. This test therefore only ever runs its real check on Linux; a
-    // Darwin compile of this file still proves the Darwin driver alone
-    // builds, through the ordinary compile of `driver` above.
     if (builtin.os.tag != .linux) return;
 
     const linux_driver = @import("linux/driver.zig");
     const darwin_driver = @import("darwin/driver.zig");
 
-    // Every name a caller can reach through this file's own driver dispatch
-    // above. Add a name here whenever spawn's own dispatch starts reading a
-    // new driver declaration, so a driver that falls behind fails the build
-    // instead of only failing silently on the platform nobody here can run.
+    // Add a name here whenever the dispatch above reads a new driver declaration.
     const shape = .{ "spawn", "guarantees", "joinFreshSessionKeyring", "signalMiddle", "closeMiddle" };
     inline for (shape) |name| {
         if (!@hasDecl(linux_driver, name)) @compileError("linux driver is missing " ++ name);
@@ -2309,15 +975,6 @@ test "the linux driver and the darwin driver expose the same public shape" {
 }
 
 test "a path a rule will name is resolved where a mount cannot be" {
-    // **The fault this ends, and it was measured before it was written.** On
-    // macOS `$TMPDIR` is reached below `/var`, a link to `/private/var`, and
-    // Seatbelt matches the path the kernel resolved. A rule on the unresolved
-    // spelling matches nothing at all, so a session whose scratchpad was named
-    // that way would report every write to it as refused. `src/doctor.zig`'s
-    // own probe moved off `/tmp` for the same reason on 2026-08-25.
-    //
-    // Mutation check: answer `path` unconditionally and the second half fails
-    // wherever a mount cannot move a path.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2333,16 +990,11 @@ test "a path a rule will name is resolved where a mount cannot be" {
     const answered = resolvedPath(std.testing.io, through_link, &answer_buffer);
 
     if (expresses.moved_paths) {
-        // The kernel resolves a bind source itself, so this costs a build that
-        // moves paths nothing and changes nothing it names.
         try std.testing.expectEqualStrings(through_link, answered);
     } else {
         try std.testing.expectEqualStrings(real, answered);
     }
 
-    // A path that is not there answers itself rather than failing: a caller
-    // that could not resolve one is left with the name it had, which is what
-    // the session did before this existed.
     var missing_buffer: [std.fs.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings(
         "/no/such/directory/here",
@@ -2351,8 +1003,6 @@ test "a path a rule will name is resolved where a mount cannot be" {
 }
 
 test "a rule below a mount agrees, and a rule beside one does not" {
-    // The ordinary shape every caller builds: one mount, one rule that names
-    // the same path, plus a second rule for a file inside it.
     const agreeing = Config{
         .root = "/root",
         .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
@@ -2365,9 +1015,6 @@ test "a rule below a mount agrees, and a rule beside one does not" {
     };
     try std.testing.expectEqual(@as(?LayerGap, null), firstGap(agreeing));
 
-    // The drift this exists to catch: somebody added a rule and forgot the
-    // mount. On a build that pivots the rule is dead. On a build that does
-    // not, it grants the host's own `/etc`.
     const extra_rule = Config{
         .root = "/root",
         .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
@@ -2384,8 +1031,6 @@ test "a rule below a mount agrees, and a rule beside one does not" {
 }
 
 test "a rule above every mount is a gap, because landlock rights reach downwards" {
-    // `/` is not a narrower way of saying `/work`. A rule there permits every
-    // path in the tree, so the mount list would be the whole boundary again.
     const too_wide = Config{
         .root = "/root",
         .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
@@ -2396,8 +1041,6 @@ test "a rule above every mount is a gap, because landlock rights reach downwards
     const gap = firstGap(too_wide) orelse return error.TestExpectedGap;
     try std.testing.expectEqualStrings("/", gap.path());
 
-    // And a prefix that is not a path component boundary is not a parent:
-    // `/work` must not be read as holding `/workshop`.
     const neighbour = Config{
         .root = "/root",
         .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
@@ -2410,9 +1053,6 @@ test "a rule above every mount is a gap, because landlock rights reach downwards
 }
 
 test "a mount with no rule is a gap, and a denied path is not" {
-    // A mount nothing permits is present and unreachable: every open below it
-    // is refused by Landlock, and the tool call fails naming Landlock rather
-    // than the missing rule.
     const unreachable_mount = Config{
         .root = "/root",
         .mounts = &.{
@@ -2427,8 +1067,6 @@ test "a mount with no rule is a gap, and a denied path is not" {
     try std.testing.expectEqual(std.meta.Tag(LayerGap).mount_without_rule, std.meta.activeTag(gap));
     try std.testing.expectEqualStrings("/run/chock/bin", gap.path());
 
-    // A denial is in neither half. It takes bytes away and grants no reach,
-    // so no rule goes with it, and `Workspace.sandboxConfig` writes none.
     const denied = Config{
         .root = "/root",
         .mounts = &.{
@@ -2443,9 +1081,6 @@ test "a mount with no rule is a gap, and a denied path is not" {
 }
 
 test "a capped scratch area is a mount the sandbox makes, and it needs a rule of its own" {
-    // `Config.scratch` is a tmpfs `mountScratch` makes, so it is in the mount
-    // set although no `Mount` entry names it. A rule for it must count as
-    // held, and the area itself must still need a rule.
     const with_rule = Config{
         .root = "/root",
         .mounts = &.{.{ .bind = .{ .source = "/host/work", .target = "/work" } }},
@@ -2472,8 +1107,6 @@ test "a capped scratch area is a mount the sandbox makes, and it needs a rule of
 }
 
 test "a gap names the path and says which of the two lists is short" {
-    // A reader has to be able to tell the two apart: one is a rule that
-    // reaches past the tree, the other is a mount nothing can open.
     var buffer: [160]u8 = undefined;
     try std.testing.expectEqualStrings(
         "landlock rule /etc names a path the mount set does not hold",
@@ -2486,19 +1119,11 @@ test "a gap names the path and says which of the two lists is short" {
 }
 
 test "one tool call's paths are added to the session's own, and a name with no room keeps its count" {
-    // **A session is many tool calls and one record.** Each call's reader
-    // writes a record of its own, and this is where they are added up. A merge
-    // that added one for a name it had no room for would say a path opened
-    // five hundred times was opened once.
-    //
-    // Mutation check: pass `1` instead of `seen.name_hits[slot]` in
-    // `recordPaths` and the overflow expectation reads 1.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const openat = @intFromEnum(seccomp.TrapCall.openat);
 
     var audit: SyscallAudit = .{};
 
-    // The first call fills the set to the cap.
     var first: notify.PathRecord = .{ .ready = 1 };
     var made: u32 = 0;
     while (made < notify.kept_path_cap) : (made += 1) {
@@ -2509,13 +1134,8 @@ test "one tool call's paths are added to the session's own, and a name with no r
     }
     audit.recordPaths(&first);
 
-    // The second call names one more path, five hundred times over, and the
-    // session's set is already full.
     var second: notify.PathRecord = .{ .ready = 1 };
     second.ungranted[openat] = 500;
-    // A relative name is neither side, so it has to survive the merge on its
-    // own. Without this the session would read a call that named a directory
-    // the reader could not see as a call that named nothing.
     second.relative[openat] = 7;
     second.granted[openat] = 11;
     notify.keepName(&second, openat, "/home/someone/.ssh/id_ed25519", 500);
@@ -2528,8 +1148,6 @@ test "one tool call's paths are added to the session's own, and a name with no r
         counted.ungranted[openat],
     );
     try std.testing.expectEqual(@as(u64, 500), counted.ungranted_unnamed[openat]);
-    // Mutation check: drop the `relative` or the `granted` line from
-    // `recordPaths`'s merge loop and one of these two reads 0.
     try std.testing.expectEqual(@as(u64, 7), counted.relative[openat]);
     try std.testing.expectEqual(@as(u64, 11), counted.granted[openat]);
     try std.testing.expectEqual(@as(u64, 0), counted.readers_unreported);
@@ -2537,14 +1155,6 @@ test "one tool call's paths are added to the session's own, and a name with no r
 }
 
 test "a reader that never started, and one that never reported, are counted apart" {
-    // **Two different facts with two different repairs.** A reader that never
-    // started means the paths for that call are missing from the beginning. A
-    // reader that started and never reported means the record may stop part
-    // way, or may be complete and the teardown simply won a race. A session
-    // that read one number for both could not tell them apart.
-    //
-    // Mutation check: count both in `readers_unreported` and the second
-    // expectation reads 2.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     var audit: SyscallAudit = .{};
 
