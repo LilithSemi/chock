@@ -106,6 +106,10 @@ pub const Options = struct {
     /// same requirement every other directory a session needs already
     /// carries, and `src/session.zig` makes it.
     cache_dir: []const u8,
+    /// The attribute under `devShells.<system>` to read. Null takes what
+    /// `nix develop` takes, which is `default`. A name no flake carries fails
+    /// the load with Nix's own message.
+    shell_name: ?[]const u8 = null,
     /// The environment `nix` itself runs with, and where `dev_env`'s own
     /// small base comes from. This process's own.
     host_env: *const std.process.Environ.Map,
@@ -140,7 +144,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
     // is what this sink exists to state.
     const sink = diagnostic.sinkOf(gpa, options.diag);
 
-    const stamp = try stampOf(gpa, io, options.project_root);
+    const stamp = try stampOf(gpa, io, options.project_root, options.shell_name);
 
     const arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
@@ -167,6 +171,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
         io,
         nix_program,
         options.project_root,
+        options.shell_name,
         options.host_env,
         sink,
     );
@@ -289,12 +294,23 @@ fn hasFlake(io: std.Io, project_root: []const u8) Error!bool {
 
 /// A hash of the two files above, length prefixed so that moving a byte from
 /// one file to the other changes the answer.
-fn stampOf(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8) Error![stamp_hex_length]u8 {
+fn stampOf(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    shell_name: ?[]const u8,
+) Error![stamp_hex_length]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     // A version of this file's own format. A stamp written by an older
     // Chock, whose cache holds fields this one does not read, must not
     // read as current.
-    hash.update("chock dev shell 1\n");
+    hash.update("chock dev shell 2\n");
+
+    // The attribute belongs in the stamp. Two names over one flake are two
+    // different environments, and without this the second one reads the
+    // first one's cache.
+    hash.update(shell_name orelse "");
+    hash.update("\n");
 
     for ([_][]const u8{ "flake.nix", "flake.lock" }) |name| {
         const path = try std.fs.path.join(gpa, &.{ project_root, name });
@@ -553,10 +569,10 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: {}; }\n");
     }
-    const first = try stampOf(allocator, std.testing.io, dir_path);
+    const first = try stampOf(allocator, std.testing.io, dir_path, null);
 
     // The same tree hashes the same, or a cache would never hit at all.
-    const again = try stampOf(allocator, std.testing.io, dir_path);
+    const again = try stampOf(allocator, std.testing.io, dir_path, null);
     try std.testing.expectEqualStrings(&first, &again);
 
     // A lock file that appears is a different dev shell: it pins different
@@ -566,7 +582,7 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ \"nodes\": {} }\n");
     }
-    const with_lock = try stampOf(allocator, std.testing.io, dir_path);
+    const with_lock = try stampOf(allocator, std.testing.io, dir_path, null);
     try std.testing.expect(!std.mem.eql(u8, &first, &with_lock));
 
     {
@@ -574,8 +590,35 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: { changed = true; }; }\n");
     }
-    const changed = try stampOf(allocator, std.testing.io, dir_path);
+    const changed = try stampOf(allocator, std.testing.io, dir_path, null);
     try std.testing.expect(!std.mem.eql(u8, &with_lock, &changed));
+}
+
+test "the dev shell name is part of the stamp, so two names never share a cache" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, &buffer);
+    const dir_path = buffer[0..len];
+
+    {
+        var file = try tmp.dir.createFile(std.testing.io, "flake.nix", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{ outputs = _: {}; }\n");
+    }
+
+    const unnamed = try stampOf(allocator, std.testing.io, dir_path, null);
+    const named = try stampOf(allocator, std.testing.io, dir_path, "ci");
+    const other = try stampOf(allocator, std.testing.io, dir_path, "release");
+
+    try std.testing.expect(!std.mem.eql(u8, &unnamed, &named));
+    try std.testing.expect(!std.mem.eql(u8, &named, &other));
+
+    const again = try stampOf(allocator, std.testing.io, dir_path, "ci");
+    try std.testing.expectEqualStrings(&named, &again);
 }
 
 test "a cache is read back whole, and a stamp that does not match is not read at all" {

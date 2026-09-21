@@ -42,6 +42,9 @@ const usage_text =
     \\  --project <dir>     The project. Defaults to the current directory.
     \\  --allow-dirty       Copy the project's uncommitted work into the workspace.
     \\                      Without this the agent sees the committed state.
+    \\  --dev-shell <name>  The devShells attribute the tool environment comes
+    \\                      from, for this run. Defaults to .nix.dev_shell, and
+    \\                      to what `nix develop` takes when neither names one.
     \\  --continue          Continue the newest session of this project.
     \\  --session <id>      Continue this session.
     \\  --adopt             Become the owner of a session that already exists and
@@ -100,6 +103,8 @@ const Options = struct {
     /// Every file `--instructions` named, in the order given.
     instructions: []const []const u8 = &.{},
     max_turns: ?usize = null,
+    /// Overrides `.nix.dev_shell` for one run.
+    dev_shell: ?[]const u8 = null,
     continue_newest: bool = false,
     adopt: bool = false,
     allow_dirty: bool = false,
@@ -972,6 +977,11 @@ fn start(
 
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
 
+    // Before the dev shell, because the `nix` block names the attribute it
+    // reads. `--dev-shell` wins over the file for this one run.
+    const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
+    const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
+
     const flake_inputs = fetchFlakeInputs(
         arena,
         io,
@@ -989,7 +999,7 @@ fn start(
     const dev_shell = if (image != null)
         null
     else
-        loadDevShell(gpa, io, env, project_root, dev_shell_dir);
+        try loadDevShell(gpa, io, env, project_root, dev_shell_dir, dev_shell_name);
 
     const tool_env = if (image) |*one|
         try imageToolEnvironment(arena, one)
@@ -1204,8 +1214,6 @@ fn start(
         model,
         dev_shell_dir,
     );
-
-    const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
 
     const nix_build = nixBuildFor(
         arena,
@@ -2195,8 +2203,13 @@ fn loadDevShell(
     env: *const std.process.Environ.Map,
     project_root: []const u8,
     cache_dir: ?[]const u8,
-) ?chock_nix.DevShell {
+    shell_name: ?[]const u8,
+) StartError!?chock_nix.DevShell {
     const dir = cache_dir orelse return null;
+
+    if (shell_name) |name| {
+        tty.detail("chock: the dev shell is the {s} attribute of this flake\n", .{name});
+    }
 
     var diag: ?chock_nix.Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -2204,6 +2217,7 @@ fn loadDevShell(
     const loaded = chock_nix.DevShell.load(gpa, io, .{
         .project_root = project_root,
         .cache_dir = dir,
+        .shell_name = shell_name,
         .host_env = env,
         .on_evaluate = reportEvaluatingDevShell,
         .diag = &diag,
@@ -2212,6 +2226,18 @@ fn loadDevShell(
             tty.print(.err, "chock: this project's dev shell could not be read: {f}\n", .{fault});
         } else {
             tty.print(.err, "chock: this project's dev shell could not be read ({t})\n", .{err});
+        }
+        // A project with a flake this cannot read still runs, under the host's
+        // own environment. A named attribute does not: a session that asked
+        // for one environment and got another is the fault this refuses.
+        if (shell_name) |name| {
+            tty.print(
+                .err,
+                "chock: nothing named {s} could be read, so this session stops. " ++
+                    "`nix develop {s}#{s}` says the same thing.\n",
+                .{ name, project_root, name },
+            );
+            return error.Reported;
         }
         break :loaded null;
     };
@@ -10453,6 +10479,7 @@ const value_options = [_][]const u8{
     "--agent-kind",
     "--org-bundle",
     "--instructions",
+    "--dev-shell",
     "--max-turns",
     "--export-dir",
     "--export-syslog",
@@ -10525,6 +10552,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
         if (std.mem.eql(u8, argument, "--instructions")) {
             try given.append(arena, value);
+        } else if (std.mem.eql(u8, argument, "--dev-shell")) {
+            options.dev_shell = value;
         } else if (std.mem.eql(u8, argument, "--provider")) {
             options.provider = value;
         } else if (std.mem.eql(u8, argument, "--model")) {
@@ -11283,6 +11312,20 @@ test "the dirty tree warning names the count, the split, and the flag" {
     const parsed = try parseOptions(gpa, &.{"--allow-dirty"});
     try testing.expect(parsed.allow_dirty);
     try testing.expect(std.mem.indexOf(u8, text, "--allow-dirty") != null);
+}
+
+test "--dev-shell takes a value, and a run that names none leaves the file to decide" {
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const named = try parseOptions(arena, &.{ "--dev-shell", "ci", "do the thing" });
+    try testing.expectEqualStrings("ci", named.dev_shell.?);
+
+    const quiet = try parseOptions(arena, &.{"do the thing"});
+    try testing.expectEqual(@as(?[]const u8, null), quiet.dev_shell);
 }
 
 test "a clean tree gets no warning at all, so the message stays worth reading" {

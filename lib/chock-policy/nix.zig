@@ -39,6 +39,9 @@ pub const default_max_session_bytes: u64 = 256 << 20;
 pub const Nix = struct {
     max_object_bytes: ?u64 = null,
     max_session_bytes: ?u64 = null,
+    /// The attribute under `devShells.<system>` the session's tool environment
+    /// comes from. Null is `default`, which is what `nix develop` takes.
+    dev_shell: ?[]const u8 = null,
 };
 
 pub const Resolved = struct {
@@ -46,12 +49,16 @@ pub const Resolved = struct {
     max_session_bytes: u64,
     max_object_bytes_from_org: bool = false,
     max_session_bytes_from_org: bool = false,
+    /// Null means the flake reference carries no attribute, so Nix takes
+    /// `default` itself.
+    dev_shell: ?[]const u8 = null,
 };
 
 pub fn foldLayers(project: Nix, operator: Nix, ceiling: ?Ceiling) Resolved {
     const resolved = Resolved{
         .max_object_bytes = project.max_object_bytes orelse operator.max_object_bytes orelse default_max_object_bytes,
         .max_session_bytes = project.max_session_bytes orelse operator.max_session_bytes orelse default_max_session_bytes,
+        .dev_shell = project.dev_shell orelse operator.dev_shell,
     };
     return underCeiling(resolved, ceiling);
 }
@@ -99,6 +106,9 @@ pub const Diagnostic = struct {
         unknown_field: []const u8,
         value_not_string_or_number: []const u8,
         invalid_setting: InvalidSetting,
+        dev_shell_not_a_string,
+        dev_shell_empty,
+        dev_shell_has_hash: []const u8,
         negative_setting: []const u8,
         setting_overflow: []const u8,
         file_too_large: usize,
@@ -114,7 +124,12 @@ pub const Diagnostic = struct {
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
             .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
-            .unknown_field, .value_not_string_or_number, .negative_setting, .setting_overflow => |name| gpa.free(name),
+            .unknown_field,
+            .value_not_string_or_number,
+            .negative_setting,
+            .setting_overflow,
+            .dev_shell_has_hash,
+            => |name| gpa.free(name),
             .invalid_setting => |setting| {
                 gpa.free(setting.field);
                 gpa.free(setting.text);
@@ -145,6 +160,19 @@ pub const Diagnostic = struct {
             .invalid_setting => |setting| try writer.print(
                 "{s}: the nix block's {s} field holds \"{s}\", which {s}",
                 .{ self.source, setting.field, setting.text, reasonText(setting.reason) },
+            ),
+            .dev_shell_not_a_string => try writer.print(
+                "{s}: the nix block's dev_shell field must be a string",
+                .{self.source},
+            ),
+            .dev_shell_empty => try writer.print(
+                "{s}: the nix block's dev_shell field is empty, and an attribute name cannot be",
+                .{self.source},
+            ),
+            .dev_shell_has_hash => |name| try writer.print(
+                "{s}: the nix block's dev_shell field holds \"{s}\". A # separates the flake from " ++
+                    "the attribute, so the name cannot hold one",
+                .{ self.source, name },
             ),
             .negative_setting => |field| try writer.print(
                 "{s}: the nix block's {s} field is a negative number, and a byte cap cannot be",
@@ -233,6 +261,8 @@ fn parseFields(
                     nix.max_object_bytes = try readBytes(gpa, zoir, "max_object_bytes", value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "max_session_bytes")) {
                     nix.max_session_bytes = try readBytes(gpa, zoir, "max_session_bytes", value_node, source_name, diag);
+                } else if (std.mem.eql(u8, name, "dev_shell")) {
+                    nix.dev_shell = try readDevShell(gpa, zoir, value_node, source_name, diag);
                 } else {
                     _ = note(diag, source_name, .{ .unknown_field = try gpa.dupe(u8, name) });
                     return error.InvalidNix;
@@ -245,6 +275,31 @@ fn parseFields(
         },
     }
     return nix;
+}
+
+fn readDevShell(
+    gpa: std.mem.Allocator,
+    zoir: std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    source_name: []const u8,
+    diag: ?*?Diagnostic,
+) ParseError![]const u8 {
+    const text = switch (node.get(zoir)) {
+        .string_literal => |text| text,
+        else => {
+            _ = note(diag, source_name, .dev_shell_not_a_string);
+            return error.InvalidNix;
+        },
+    };
+    if (text.len == 0) {
+        _ = note(diag, source_name, .dev_shell_empty);
+        return error.InvalidNix;
+    }
+    if (std.mem.indexOfScalar(u8, text, '#') != null) {
+        _ = note(diag, source_name, .{ .dev_shell_has_hash = try gpa.dupe(u8, text) });
+        return error.InvalidNix;
+    }
+    return gpa.dupe(u8, text);
 }
 
 fn readBytes(
@@ -564,4 +619,53 @@ test "a ceiling this build cannot parse changes nothing, rather than crashing" {
     const percent_held = underCeiling(resolved, .{ .max_object_bytes = "50%" });
     try testing.expectEqual(resolved.max_object_bytes, percent_held.max_object_bytes);
     try testing.expect(!percent_held.max_object_bytes_from_org);
+}
+
+test "dev_shell names the devShells attribute, and an empty or hashed name is refused" {
+    const gpa = testing.allocator;
+
+    const named = try parse(gpa, ".{ .nix = .{ .dev_shell = \"ci\" } }", null);
+    defer gpa.free(named.dev_shell.?);
+    try testing.expectEqualStrings("ci", named.dev_shell.?);
+
+    const quiet = try parse(gpa, ".{ .nix = .{ .max_object_bytes = 8 } }", null);
+    try testing.expectEqual(@as(?[]const u8, null), quiet.dev_shell);
+
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidNix,
+        parse(gpa, ".{ .nix = .{ .dev_shell = \"\" } }", &diag),
+    );
+    try testing.expect(diag.?.fault == .dev_shell_empty);
+
+    var hashed: ?Diagnostic = null;
+    defer if (hashed) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidNix,
+        parse(gpa, ".{ .nix = .{ .dev_shell = \".#ci\" } }", &hashed),
+    );
+    try testing.expectEqualStrings(".#ci", hashed.?.fault.dev_shell_has_hash);
+
+    var typed: ?Diagnostic = null;
+    defer if (typed) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidNix,
+        parse(gpa, ".{ .nix = .{ .dev_shell = 3 } }", &typed),
+    );
+    try testing.expect(typed.?.fault == .dev_shell_not_a_string);
+}
+
+test "the project's dev_shell wins over the operator's, and an org ceiling says nothing about it" {
+    const project = Nix{ .dev_shell = "ci" };
+    const operator = Nix{ .dev_shell = "default" };
+
+    try testing.expectEqualStrings("ci", foldLayers(project, operator, null).dev_shell.?);
+    try testing.expectEqualStrings("default", foldLayers(.{}, operator, null).dev_shell.?);
+    try testing.expectEqual(@as(?[]const u8, null), foldLayers(.{}, .{}, null).dev_shell);
+
+    const bound = Ceiling{ .max_object_bytes = "1MiB" };
+    const held = foldLayers(project, operator, bound);
+    try testing.expectEqualStrings("ci", held.dev_shell.?);
+    try testing.expectEqual(@as(u64, 1 << 20), held.max_object_bytes);
 }

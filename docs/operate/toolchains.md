@@ -16,6 +16,40 @@ nix-direnv does, and it takes the difference between two shells rather than one
 shell's whole environment. So a person whose direnv has already loaded the dev
 shell gets the same mount set as a person who has not.
 
+## Which dev shell
+
+Chock reads the `default` attribute of `devShells`, which is what `nix develop`
+with no attribute reads. A project whose agent needs a different one names it in
+the `nix` block of `chock.zon`:
+
+```zon
+.{
+    .nix = .{
+        .dev_shell = "ci",
+    },
+}
+```
+
+That makes the flake reference `<project>#ci`, and the environment, the mount
+set and the `exec.devshell.*` class all come from that attribute. A project
+whose ordinary shell carries an editor, a language server and a debugger can
+keep a smaller one for the agent, which makes the closure smaller and the
+allowed programs fewer.
+
+`--dev-shell <name>` says the same thing for one run, and wins over the file:
+
+```
+chock run --dev-shell ci "run the test suite"
+```
+
+A name no flake carries stops the session with Nix's own message, which lists
+the attributes the flake does carry. It never falls back to `default`: a
+session that asked for one environment and silently got another is worse than
+one that does not start.
+
+The name is part of the toolchain cache key, so two names over one flake never
+read each other's cache.
+
 ## A container image instead of a dev shell
 
 A project that names a container image in the `container` block of `chock.zon`

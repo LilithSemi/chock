@@ -129,16 +129,28 @@ const interpreter_names = [_][]const u8{ "BASH", "CONFIG_SHELL", "SHELL", "build
 /// type to `nix develop`, so a project in a git work tree is read the same
 /// way `nix develop` reads it and a user who sees an error here can
 /// reproduce it by hand with one command.
+///
+/// `shell_name` makes that reference `<flake_dir>#<shell_name>`. Null leaves
+/// the directory alone, and Nix takes `default` itself. A name no flake
+/// carries fails here with Nix's own message, which names the attributes the
+/// flake does carry.
 pub fn printDevEnv(
     allocator: std.mem.Allocator,
     io: std.Io,
     nix_program: []const u8,
     flake_dir: []const u8,
+    shell_name: ?[]const u8,
     host_env: *const std.process.Environ.Map,
     diag: ?diagnostic.Sink,
 ) Error![]u8 {
+    const installable = if (shell_name) |name|
+        try std.fmt.allocPrint(allocator, "{s}#{s}", .{ flake_dir, name })
+    else
+        flake_dir;
+    defer if (shell_name != null) allocator.free(installable);
+
     var output = try proc.run(allocator, io, .{
-        .argv = &.{ nix_program, "print-dev-env", flake_dir },
+        .argv = &.{ nix_program, "print-dev-env", installable },
         .env = host_env,
         .cwd = flake_dir,
         .max_output_bytes = max_script_bytes,

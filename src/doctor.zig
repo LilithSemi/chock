@@ -1478,12 +1478,18 @@ fn measureDevShell(
     const dir = session_paths.devShellDir(arena, env, project_root) catch return .no_flake;
     session_paths.createDevShellDir(io, dir) catch return .no_flake;
 
+    // The same attribute `chock run` reads. A doctor that reads `default`
+    // while the session reads another one answers about a shell nobody runs.
+    const block = chock_policy.nix.load(arena, io, project_root, null) catch
+        chock_policy.nix.Nix{};
+
     var diag: ?chock_nix.Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
 
     const loaded = chock_nix.DevShell.load(gpa, io, .{
         .project_root = project_root,
         .cache_dir = dir,
+        .shell_name = block.dev_shell,
         .host_env = env,
         .diag = &diag,
     }) catch |err| {

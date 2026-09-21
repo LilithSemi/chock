@@ -176,6 +176,24 @@ what a project cannot take back. [actions.md](actions.md) has both.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.
 
+### The dev shell the agent gets
+
+The `nix` block of `chock.zon` names which `devShells` attribute the tool
+environment comes from:
+
+```zon
+.{
+    .nix = .{
+        .dev_shell = "ci",
+    },
+}
+```
+
+Leave it out and Chock reads `default`, which is what `nix develop` reads.
+`--dev-shell <name>` overrides it for one run. A name no flake carries stops
+the session with Nix's own message. See
+[toolchains.md](../operate/toolchains.md#which-dev-shell).
+
 ### Paths the worktree does not carry
 
 The agent works in a git worktree at HEAD, so a file git ignores is invisible
