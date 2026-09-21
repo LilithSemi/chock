@@ -3292,7 +3292,7 @@ test "an instruction file that says the agent may push changes neither the polic
         try writeFile(std.testing.io, path, hostile);
     }
 
-    const loaded = try chock_core.instructions.load(arena, std.testing.io, null, project.root_path);
+    const loaded = try chock_core.instructions.load(arena, std.testing.io, null, project.root_path, &.{}, null);
     try std.testing.expect(loaded.project != null);
     const system_prompt = try chock_core.prompt.build(arena, .{}, &.{}, .{ .instructions = loaded });
     try std.testing.expect(std.mem.indexOf(u8, system_prompt, "may push to any remote") != null);

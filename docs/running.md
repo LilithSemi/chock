@@ -17,7 +17,9 @@ at all brings the interface up and asks for one there.
 
 With no message on the command line the message comes from standard input, so a
 pipe works. `--continue` continues the newest session of the project, and
-`--session <id>` continues the one you name.
+`--session <id>` continues the one you name. `--instructions <path>` puts a
+file of your own in the prompt for this run, alongside the project's
+`AGENTS.md`: see [instructions.md](using/instructions.md).
 
 A quiet start says which session this is and warns about anything that changes
 what the agent can see. Every other fact is one command away: `chock sessions`,

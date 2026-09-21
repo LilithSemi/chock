@@ -49,6 +49,14 @@ const usage_text =
     \\                      Needs --session or --continue. This is what
     \\                      `chock detach` asks the daemon to do.
     \\  --agent-kind <kind> The agent kind that selects the policy. Defaults to "main".
+    \\  --instructions <path>
+    \\                      Read this file and put it in the prompt as instructions
+    \\                      for this session. Give it more than once for more than
+    \\                      one file. The agent is told a person named the file on
+    \\                      the command line, so it weighs it as your own words and
+    \\                      not as the project's. It adds to AGENTS.md rather than
+    \\                      replacing it, and a file that cannot be read stops the
+    \\                      session.
     \\  --org-bundle <path> Use this org policy bundle instead of the one this
     \\                      installation holds. The bundle is the layer above
     \\                      chock.zon, and chock.zon may only narrow it. A bundle
@@ -89,6 +97,8 @@ const Options = struct {
     session: ?[]const u8 = null,
     agent_kind: []const u8 = "main",
     org_bundle: ?[]const u8 = null,
+    /// Every file `--instructions` named, in the order given.
+    instructions: []const []const u8 = &.{},
     max_turns: ?usize = null,
     continue_newest: bool = false,
     adopt: bool = false,
@@ -1205,8 +1215,27 @@ fn start(
         .role = agentRole(options),
     };
 
-    const loaded_instructions = chock_core.instructions.load(arena, io, config_dir, project_root) catch
-        return error.OutOfMemory;
+    var given_diag: chock_core.instructions.GivenDiagnostic = .{};
+    const loaded_instructions = chock_core.instructions.load(
+        arena,
+        io,
+        config_dir,
+        project_root,
+        options.instructions,
+        &given_diag,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.GivenFileUnreadable => {
+            tty.print(
+                .err,
+                "chock run: the instructions file {s} could not be read. A file named with " ++
+                    "--instructions is one this session was asked for, so it does not start " ++
+                    "without it.\n",
+                .{given_diag.path},
+            );
+            return error.Reported;
+        },
+    };
     reportInstructions(loaded_instructions);
 
     const notes = chock_core.memory.list(arena, io, memory_dir) catch return error.OutOfMemory;
@@ -9838,6 +9867,7 @@ const value_options = [_][]const u8{
     "--session",
     "--agent-kind",
     "--org-bundle",
+    "--instructions",
     "--max-turns",
     "--export-dir",
     "--export-syslog",
@@ -9859,6 +9889,7 @@ fn takesValue(argument: []const u8) bool {
 fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!Options {
     var options = Options{};
     var words: std.ArrayList([]const u8) = .empty;
+    var given: std.ArrayList([]const u8) = .empty;
     var chain: std.ArrayList(chock_proto.event.SpawnLink) = .empty;
 
     var index: usize = 0;
@@ -9907,7 +9938,9 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             break :value args[index];
         };
 
-        if (std.mem.eql(u8, argument, "--provider")) {
+        if (std.mem.eql(u8, argument, "--instructions")) {
+            try given.append(arena, value);
+        } else if (std.mem.eql(u8, argument, "--provider")) {
             options.provider = value;
         } else if (std.mem.eql(u8, argument, "--model")) {
             options.model = value;
@@ -9993,6 +10026,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
     }
 
     options.message_words = words.items;
+    options.instructions = given.items;
     options.parent_chain = chain.items;
     return options;
 }

@@ -88,6 +88,7 @@ const skipped_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-out", "node_modul
 /// the prompt without one would be a block a model cannot weigh.
 pub const Layer = enum {
     operator,
+    given,
     project,
     subtree,
 
@@ -102,6 +103,10 @@ pub const Layer = enum {
             .operator =>
             \\## Your operator's standing instructions
             \\## (AGENTS.md in your operator's own configuration directory, written by the person running you)
+            ,
+            .given =>
+            \\## Instructions for this session
+            \\## (a file the person running you named on the command line)
             ,
             .project =>
             \\## This project's instructions
@@ -143,6 +148,8 @@ pub const ReadFile = struct {
 /// the allocator passed to `load`; an arena frees the whole thing at once.
 pub const Loaded = struct {
     operator: ?Block = null,
+    /// The files `--instructions` named, in the order they were given.
+    given: []const Block = &.{},
     project: ?Block = null,
     /// One index entry per subtree file: the path, and the file's own first
     /// meaningful line as its description. The path is relative to the
@@ -166,12 +173,24 @@ pub const Error = std.mem.Allocator.Error;
 /// `AGENTS.md` at all, and a session must not fail because one is missing,
 /// unreadable, or a directory. Only running out of memory reaches the
 /// caller.
+/// Why a file `--instructions` named could not be read. The path is the
+/// caller's and is not copied.
+pub const GivenError = error{GivenFileUnreadable};
+
+/// The file `--instructions` named that could not be read, filled in when
+/// `load` answers `error.GivenFileUnreadable`.
+pub const GivenDiagnostic = struct {
+    path: []const u8 = "",
+};
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
     config_dir: ?[]const u8,
     project_root: []const u8,
-) Error!Loaded {
+    given: []const []const u8,
+    diag: ?*GivenDiagnostic,
+) (Error || GivenError)!Loaded {
     var files: std.ArrayList(ReadFile) = .empty;
     errdefer files.deinit(allocator);
 
@@ -190,6 +209,29 @@ pub fn load(
         } else {
             allocator.free(path);
         }
+    }
+
+    if (given.len != 0) {
+        var blocks = try allocator.alloc(Block, given.len);
+        errdefer allocator.free(blocks);
+        for (given, 0..) |path, index_of| {
+            // Named by a person on the command line, so a file that cannot be
+            // read is a refusal and never silence. An absent AGENTS.md is a
+            // project that has none; an absent named file is a session the
+            // caller asked for and did not get.
+            const read = try readBounded(allocator, io, path) orelse {
+                if (diag) |slot| slot.* = .{ .path = path };
+                return error.GivenFileUnreadable;
+            };
+            blocks[index_of] = .{
+                .layer = .given,
+                .path = path,
+                .text = read.text,
+                .truncated = read.truncated,
+            };
+            try files.append(allocator, .{ .layer = .given, .path = path, .bytes = read.total_bytes });
+        }
+        loaded.given = blocks;
     }
 
     {
@@ -380,7 +422,7 @@ test "the project's own AGENTS.md is read, and the file and its size are reporte
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null);
     try testing.expect(loaded.operator == null);
     try testing.expectEqualStrings(body, loaded.project.?.text);
     try testing.expectEqual(Layer.project, loaded.project.?.layer);
@@ -408,14 +450,14 @@ test "the operator's own file is read with no project file present, and alongsid
     const project_root = try std.fs.path.join(arena, &.{ tmp_path, "project" });
 
     {
-        const loaded = try load(arena, testing.io, config_dir, project_root);
+        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null);
         try testing.expectEqualStrings("Never use emoji.\n", loaded.operator.?.text);
         try testing.expect(loaded.project == null);
     }
 
     try writeAt(testing.io, tmp.dir, "project/" ++ file_name, "Use tabs.\n");
     {
-        const loaded = try load(arena, testing.io, config_dir, project_root);
+        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null);
         try testing.expectEqualStrings("Never use emoji.\n", loaded.operator.?.text);
         try testing.expectEqualStrings("Use tabs.\n", loaded.project.?.text);
         // Two files, two layers, and the two are not one block: the whole
@@ -451,7 +493,7 @@ test "an AGENTS.md in a subdirectory is an index line and not a block, so its bo
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null);
     try testing.expect(loaded.project == null);
     try testing.expectEqual(@as(usize, 1), loaded.subtrees.len);
     try testing.expectEqualStrings("src/parser/" ++ file_name, loaded.subtrees[0].name);
@@ -473,7 +515,7 @@ test "the git directory is never walked for instruction files" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
 }
 
@@ -492,7 +534,7 @@ test "a file past the block bound is cut, says so, and still reports its real si
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null);
     try testing.expect(loaded.project.?.truncated);
     try testing.expectEqual(max_block_bytes, loaded.project.?.text.len);
     try testing.expectEqual(huge.len, loaded.files[0].bytes);
@@ -509,7 +551,7 @@ test "a project with no instruction file anywhere is an ordinary session, not a 
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, "/there/is/no/such/config/dir", root);
+    const loaded = try load(arena, testing.io, "/there/is/no/such/config/dir", root, &.{}, null);
     try testing.expect(loaded.operator == null);
     try testing.expect(loaded.project == null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
@@ -535,9 +577,56 @@ test "the subtree index is bounded, and says how many files it left out" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null);
     try testing.expectEqual(max_subtree_entries, loaded.subtrees.len);
     try testing.expectEqual(@as(usize, 5), loaded.subtrees_left_out);
+}
+
+test "a file named on the command line is its own layer, and keeps the order it was given" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeAt(testing.io, tmp.dir, "first.md", "Do the first thing.\n");
+    try writeAt(testing.io, tmp.dir, "second.md", "Then the second.\n");
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absolutePath(&buffer, testing.io, tmp.dir);
+    const first = try std.fs.path.join(arena, &.{ root, "first.md" });
+    const second = try std.fs.path.join(arena, &.{ root, "second.md" });
+
+    const loaded = try load(arena, testing.io, null, root, &.{ first, second }, null);
+    try testing.expectEqual(@as(usize, 2), loaded.given.len);
+    try testing.expectEqualStrings("Do the first thing.\n", loaded.given[0].text);
+    try testing.expectEqualStrings("Then the second.\n", loaded.given[1].text);
+    try testing.expectEqual(Layer.given, loaded.given[0].layer);
+    try testing.expectEqual(@as(usize, 2), loaded.files.len);
+    try testing.expectEqualStrings(first, loaded.files[0].path);
+}
+
+test "a named file that cannot be read refuses, where a missing AGENTS.md does not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absolutePath(&buffer, testing.io, tmp.dir);
+
+    // The same directory, with no AGENTS.md in it, loads without complaint.
+    const quiet = try load(arena, testing.io, null, root, &.{}, null);
+    try testing.expect(quiet.project == null);
+
+    const missing = try std.fs.path.join(arena, &.{ root, "nowhere.md" });
+    var diag: GivenDiagnostic = .{};
+    try testing.expectError(
+        error.GivenFileUnreadable,
+        load(arena, testing.io, null, root, &.{missing}, &diag),
+    );
+    try testing.expectEqualStrings(missing, diag.path);
 }
 
 test "an instruction file is text and reaches nothing that decides what the agent may do" {
@@ -548,7 +637,8 @@ test "an instruction file is text and reaches nothing that decides what the agen
     // true, and it would be nobody's job to notice.
     inline for (@typeInfo(Loaded).@"struct".fields) |field| {
         const T = field.type;
-        const ok = T == ?Block or T == []const index.Entry or T == usize or T == []const ReadFile;
+        const ok = T == ?Block or T == []const Block or T == []const index.Entry or
+            T == usize or T == []const ReadFile;
         if (!ok) @compileError(
             "Loaded." ++ field.name ++ " is a " ++ @typeName(T) ++ ". An instruction file carries " ++
                 "text and an index of files, and nothing that decides what the agent may do: the " ++

@@ -211,6 +211,7 @@ pub fn build(
     // everything after it, and it is the only one of the three instruction
     // layers the user certainly wrote.
     if (sources.instructions.operator) |block| try appendBlock(allocator, &out, block);
+    for (sources.instructions.given) |block| try appendBlock(allocator, &out, block);
     if (sources.instructions.project) |block| try appendBlock(allocator, &out, block);
 
     if (sources.instructions.subtrees.len != 0) {
