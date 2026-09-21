@@ -155,6 +155,7 @@ nothing at all.
 | `policy.widen` | let a session out of a promise it made to itself |
 | `sandbox.jit` | run with the sandbox's write and execute rule off |
 | `workspace.integrate` | let an approved apply move the branch you have checked out |
+| `workspace.bind.<name>` | expose a path the git worktree does not carry |
 
 ### `git.*`
 
@@ -258,6 +259,31 @@ A rule that names nothing reaches this row. A catch all
 `.{ .decision = .ask }` and a `workspace.*` rule both match
 `workspace.integrate`, while a rule that names `workspace.apply` alone does
 not.
+
+### `workspace.bind.*`
+
+A path the git worktree does not carry reaches the agent only when it is named
+twice: once in a `workspace` block of `chock.zon`, and once here. The name a
+bind is asked under is the name as the block spells it, so
+`.{ .name = "scripts/release" }` asks under
+`workspace.bind.scripts/release`.
+
+```zon
+.{ .action = "workspace.bind.*", .decision = .deny }
+```
+
+That row refuses the whole mechanism, and an organisation that writes it in its
+bundle refuses it for every project under it. A row naming one path refuses
+that path alone.
+
+For a bind that copies nothing back, `read_only` and `temp_copy`, the answer
+decides whether the bind is made at all. For `write` and `copy`, the answer is
+folded with the block's own `write` field and the narrower of the two wins. A
+`write` bind is read only until that fold answers `allow`. A `copy` bind is
+written back only when the `workspace.apply` prompt that names it is permitted.
+
+The block itself is in
+[configuration.md](configuration.md#paths-the-worktree-does-not-carry).
 
 ## `device.*`
 

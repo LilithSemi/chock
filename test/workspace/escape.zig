@@ -388,6 +388,66 @@ test "a tool call cannot write to chock.zon" {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
 }
 
+test "a read_only bind cannot be written to, and a write bind can" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try TestProject.init(allocator, tmp);
+    defer project.deinit();
+
+    // Never committed, so the worktree at HEAD does not carry either of them
+    // and only the bind puts them in front of the agent.
+    var read_only_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const read_only_source = try std.fmt.bufPrintZ(&read_only_buffer, "{s}/generated.conf", .{project.root_path});
+    try writeFile(std.testing.io, read_only_source, "a=1\n");
+
+    var writable_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const writable_source = try std.fmt.bufPrintZ(&writable_buffer, "{s}/writable.conf", .{project.root_path});
+    try writeFile(std.testing.io, writable_source, "b=1\n");
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const resolved = [_]chock_workspace.binds.Resolved{
+        .{
+            .name = "generated.conf",
+            .relative = "generated.conf",
+            .host_path = read_only_source,
+            .mode = .read_only,
+            .is_directory = false,
+        },
+        .{
+            .name = "writable.conf",
+            .relative = "writable.conf",
+            .host_path = writable_source,
+            .mode = .write,
+            .is_directory = false,
+            .read_only = false,
+        },
+    };
+
+    var report = chock_workspace.worktree.ImportReport{};
+    defer report.deinit(allocator);
+    try workspace.attachBinds(allocator, std.testing.io, &resolved, true, &report);
+
+    const refused = try std.fs.path.join(allocator, &.{ workspace.sandboxRoot(), "generated.conf" });
+    defer allocator.free(refused);
+    const permitted = try std.fs.path.join(allocator, &.{ workspace.sandboxRoot(), "writable.conf" });
+    defer allocator.free(permitted);
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 1 },
+        try runProbe(allocator, &workspace, root_tmp, "write", refused),
+    );
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .exited = 0 },
+        try runProbe(allocator, &workspace, root_tmp, "write", permitted),
+    );
+}
+
 test "the agent cannot raise its own budget, because the budget lives in chock.zon" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

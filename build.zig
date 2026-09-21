@@ -135,17 +135,31 @@ pub fn build(b: *std.Build) void {
     run_control_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_control_tests.step);
 
+    // The policy table the broker evaluates. Like chock-sandbox and chock-io,
+    // it imports no other chock library and has no build.zig of its own: it
+    // reads chock.zon and answers a question about one key, and nothing else in
+    // Chock has to be present for that.
+    const chock_policy = b.addModule("chock-policy", .{
+        .root_source_file = b.path("lib/chock-policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The directory the sandbox mounts, and the git and overlay layers that
     // build it. Only chock-sandbox is forbidden from importing a library above
     // it. Nothing forbids chock-workspace from importing chock-sandbox, so this
     // imports chock-sandbox for the one Mount type a worktree's own mount list,
     // an overlay's own mount list, and Sandbox.spawn all need to agree on,
-    // field for field.
+    // field for field. chock-policy comes in for the `workspace` block, whose
+    // binds this builds the mount list from.
     const chock_workspace = b.addModule("chock-workspace", .{
         .root_source_file = b.path("lib/chock-workspace.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+        .imports = &.{
+            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "chock-policy", .module = chock_policy },
+        },
     });
 
     // A real second process for overlay.zig's own tests: a real overlay mount needs
@@ -186,6 +200,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "chock-sandbox", .module = chock_sandbox },
+                .{ .name = "chock-policy", .module = chock_policy },
                 .{ .name = "overlay_helper_path", .module = overlay_helper_path_options.createModule() },
             },
         }),
@@ -358,16 +373,6 @@ pub fn build(b: *std.Build) void {
     const run_pcsc_daemon_tests = b.addRunArtifact(pcsc_daemon_tests);
     run_pcsc_daemon_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_pcsc_daemon_tests.step);
-
-    // The policy table the broker evaluates. Like chock-sandbox and chock-io,
-    // it imports no other chock library and has no build.zig of its own: it
-    // reads chock.zon and answers a question about one key, and nothing else in
-    // Chock has to be present for that.
-    const chock_policy = b.addModule("chock-policy", .{
-        .root_source_file = b.path("lib/chock-policy.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     const policy_tests = b.addTest(.{ .root_module = chock_policy });
     const run_policy_tests = b.addRunArtifact(policy_tests);

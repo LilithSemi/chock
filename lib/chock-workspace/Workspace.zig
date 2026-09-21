@@ -13,6 +13,7 @@ pub const Layout = layout_mod.Layout;
 const worktree_mod = @import("worktree.zig");
 const overlay_mod = @import("overlay.zig");
 const deny_mod = @import("deny.zig");
+const binds_mod = @import("binds.zig");
 const sandbox = @import("chock-sandbox");
 
 pub const Error = worktree_mod.Error || overlay_mod.Error || deny_mod.Error || error{
@@ -78,6 +79,10 @@ pub const Workspace = struct {
     chock_zon_source: ?[]u8,
     chock_zon_target: ?[]u8,
     deny_paths: []const []u8,
+    /// Empty until `attachBinds` runs. The `workspace` block is read and
+    /// resolved by the caller, which is the only layer that knows whether a
+    /// write to the user's own disk was permitted.
+    binds: []binds_mod.Attached = &.{},
 
     /// Pick a backing for `project_root` and build it. `git.isRepository`
     /// decides, and the caller never chooses.
@@ -331,6 +336,7 @@ pub const Workspace = struct {
         if (self.chock_zon_source) |s| allocator.free(s);
         if (self.chock_zon_target) |t| allocator.free(t);
         deny_mod.free(allocator, self.deny_paths);
+        binds_mod.free(allocator, self.binds);
 
         switch (self.kind) {
             .worktree => |*wt| try wt.remove(allocator, io, env, diag),
@@ -343,6 +349,7 @@ pub const Workspace = struct {
         if (self.chock_zon_source) |s| allocator.free(s);
         if (self.chock_zon_target) |t| allocator.free(t);
         deny_mod.free(allocator, self.deny_paths);
+        binds_mod.free(allocator, self.binds);
 
         switch (self.kind) {
             .worktree => |*wt| wt.keep(allocator),
@@ -356,6 +363,42 @@ pub const Workspace = struct {
             .worktree => |wt| wt.path,
             .overlay => |ov| ov.upper,
         };
+    }
+
+    /// Bring the resolved `workspace` binds in. Call it once, after `open` and
+    /// before `sandboxConfig`, because the mount list is built from what this
+    /// leaves behind. `copy_in` is false for an adopted workspace, which
+    /// already holds the copies the session that filled it made.
+    pub fn attachBinds(
+        self: *Workspace,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        resolved: []const binds_mod.Resolved,
+        copy_in: bool,
+        report: *binds_mod.Report,
+    ) Error!void {
+        binds_mod.free(allocator, self.binds);
+        self.binds = try binds_mod.attach(
+            allocator,
+            io,
+            self.workPath(),
+            self.sandboxRoot(),
+            resolved,
+            copy_in,
+            report,
+        );
+    }
+
+    /// Copy every `copy` bind the caller permitted back over the user's own
+    /// files. Nothing else in this library calls it: the moment is the
+    /// caller's, because the permission is.
+    pub fn writeBackBinds(
+        self: *const Workspace,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        report: *binds_mod.Report,
+    ) Error!binds_mod.WriteBack {
+        return binds_mod.writeBack(allocator, io, self.binds, report);
     }
 
     /// Build the `Sandbox.Config` a caller hands to `Sandbox.spawn` for one
@@ -439,6 +482,12 @@ pub const Workspace = struct {
                 .read_only = true,
             } });
         }
+
+        // The paths the project said the agent may see, which the workspace
+        // does not carry. After the backing, so a bind lands over the
+        // workspace's own path, and before the denied files, so a bind can
+        // never shadow one.
+        try binds_mod.appendMounts(allocator, &mounts, self.binds);
 
         // The files the project said the agent may not read. No Landlock rule
         // goes with these and none could: rights accumulate on a nested path

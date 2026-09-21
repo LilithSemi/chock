@@ -441,7 +441,7 @@ pub const Worktree = struct {
         try report.deleted.append(allocator, try allocator.dupe(u8, rel_path));
     }
 
-    fn copyRegularFile(
+    pub fn copyRegularFile(
         allocator: std.mem.Allocator,
         io: std.Io,
         rel_path: []const u8,
@@ -464,7 +464,7 @@ pub const Worktree = struct {
     /// `readLinkAbsolute` reads the target string stored in the directory
     /// entry, so a link pointing outside the project is copied as that string
     /// and the worktree never gets the target's content.
-    fn recreateSymlink(
+    pub fn recreateSymlink(
         allocator: std.mem.Allocator,
         io: std.Io,
         rel_path: []const u8,
@@ -516,7 +516,7 @@ pub const Worktree = struct {
         try list.append(allocator, try allocator.dupe(u8, rel_path));
     }
 
-    fn recordSkip(
+    pub fn recordSkip(
         report: *ImportReport,
         allocator: std.mem.Allocator,
         rel_path: []const u8,

@@ -2921,7 +2921,12 @@ fn boundedResult(
 
 /// Whether `path` matches `pattern`. The pattern comes from the model and
 /// backtracking over it is exponential, so `matchGlob` carries a step budget.
-fn matchGlob(pattern: []const u8, path: []const u8) bool {
+///
+/// `*` matches any run of bytes inside one component, `**` matches any run of
+/// components, and `?` matches one byte that is not `/`. Every other byte
+/// matches itself, `[` included. `lib/chock-policy/workspace.zig` documents
+/// these same rules for the `workspace` block, which matches with this.
+pub fn matchGlob(pattern: []const u8, path: []const u8) bool {
     var budget: usize = glob_step_budget;
     return matchGlobBudgeted(pattern, path, &budget);
 }

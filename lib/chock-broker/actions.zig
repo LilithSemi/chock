@@ -145,6 +145,10 @@ pub const WorkspaceApply = struct {
     diff: []const u8,
     /// No default: `chock_policy.apply.Settings` decides where work lands.
     integration: integrate.Plan,
+    /// The `workspace` block's copies which land on the user's own files when
+    /// this applies. A line of this prompt and never a second question: the
+    /// answer given here is the answer to both.
+    copies: []const []const u8 = &.{},
 
     pub fn describing(
         arena: std.mem.Allocator,
@@ -156,6 +160,7 @@ pub const WorkspaceApply = struct {
             ref: []const u8,
             new_id: []const u8,
             wanted: integrate.Wanted,
+            copies: []const []const u8 = &.{},
         },
         diag: ?*?Diagnostic,
     ) DescribeError!WorkspaceApply {
@@ -204,6 +209,7 @@ pub const WorkspaceApply = struct {
             .objects = objects,
             .diff = diff,
             .integration = integration,
+            .copies = params.copies,
         };
     }
 };
@@ -504,6 +510,8 @@ pub const Action = union(Kind) {
                 defer gpa.free(objects);
                 const branch = try branchText(gpa, a);
                 defer gpa.free(branch);
+                const copies = try copiesText(gpa, a.copies);
+                defer gpa.free(copies);
                 break :apply std.fmt.allocPrint(gpa,
                     \\repository: {s}
                     \\the objects come from: {s}
@@ -512,7 +520,7 @@ pub const Action = union(Kind) {
                     \\that ref is at: {s}
                     \\that ref moves to: {s}
                     \\{s}objects that land, {d} of them:
-                    \\{s}what the ref move changes:
+                    \\{s}{s}what the ref move changes:
                     \\{s}
                 , .{
                     a.repository,
@@ -524,6 +532,7 @@ pub const Action = union(Kind) {
                     branch,
                     a.objects.len,
                     objects,
+                    copies,
                     a.diff,
                 });
             },
@@ -568,6 +577,19 @@ fn branchText(gpa: std.mem.Allocator, a: WorkspaceApply) std.mem.Allocator.Error
             \\
         , .{ p.wanted.?.wireName(), p.why.sentence(), a.ref, a.ref }),
     };
+}
+
+/// Empty for a session with no copies, so the prompt gains nothing when the
+/// `workspace` block carries no copying bind.
+fn copiesText(gpa: std.mem.Allocator, copies: []const []const u8) std.mem.Allocator.Error![]u8 {
+    if (copies.len == 0) return gpa.dupe(u8, "");
+    const listed = try indentedList(gpa, copies);
+    defer gpa.free(listed);
+    return std.fmt.allocPrint(
+        gpa,
+        "files copied back over your own, {d} of them:\n{s}",
+        .{ copies.len, listed },
+    );
 }
 
 fn indentedList(gpa: std.mem.Allocator, items: []const []const u8) std.mem.Allocator.Error![]u8 {
@@ -1975,6 +1997,37 @@ test "an action names its effect, and the effect is a diff and not a command" {
             try testing.expectEqualStrings("a detail that names no command", detail);
             return error.DetailNamesACommand;
         }
+    }
+}
+
+test "the copies a workspace block writes back are a line of the apply prompt" {
+    const gpa = testing.allocator;
+
+    const base = WorkspaceApply{
+        .repository = "/home/ross/project",
+        .scratch_object_store = "/tmp/sess1.objects",
+        .project_object_store = "/home/ross/project/.git/objects",
+        .ref = "refs/chock/01JQAAAAAAAAAAAAAAAAAAAAAA",
+        .old_id = "",
+        .new_id = "2222222222222222222222222222222222222222",
+        .objects = &.{"2222222222222222222222222222222222222222"},
+        .diff = "",
+        .integration = .{ .park = .{ .wanted = null, .why = .nobody_answered } },
+    };
+
+    {
+        const said = try (Action{ .workspace_apply = base }).detail(gpa);
+        defer gpa.free(said);
+        try testing.expect(std.mem.indexOf(u8, said, "copied back") == null);
+    }
+
+    {
+        var apply = base;
+        apply.copies = &.{ "scripts/release", "config.local.json" };
+        const said = try (Action{ .workspace_apply = apply }).detail(gpa);
+        defer gpa.free(said);
+        try testing.expect(std.mem.indexOf(u8, said, "copied back over your own, 2 of them") != null);
+        try testing.expect(std.mem.indexOf(u8, said, "  scripts/release\n") != null);
     }
 }
 

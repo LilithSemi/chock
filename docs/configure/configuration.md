@@ -176,6 +176,86 @@ what a project cannot take back. [actions.md](actions.md) has both.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.
 
+### Paths the worktree does not carry
+
+The agent works in a git worktree at HEAD, so a file git ignores is invisible
+to it. A generated configuration and an automation directory are the two a real
+project needs anyway. The `workspace` block names them:
+
+```zon
+.{
+    .workspace = .{
+        .binds = .{
+            .{ .name = "config.local.*", .mode = .read_only },
+            .{ .name = "scripts/release", .mode = .copy, .write = .ask },
+            .{ .name = "vendor/cache", .mode = .temp_copy },
+            .{ .name = "generated/maybe", .mode = .read_only, .required = false },
+        },
+    },
+}
+```
+
+Each bind names a path under the project root. The mode says how it reaches
+the agent and what happens to a change the agent makes to it:
+
+| Mode | How it arrives | What happens to a change |
+|---|---|---|
+| `read_only` | a bind mount, read only | impossible |
+| `write` | a bind mount, read write | lands on your real file as it is written |
+| `copy` | copied into the workspace | written back when the work applies |
+| `temp_copy` | copied into the workspace | discarded with the workspace |
+
+`mode` is required and has no default. Every value of it decides how much of
+your own disk the agent reaches, and a default would make that invisible.
+
+A bind can name a directory. `read_only` and `write` bind the directory and the
+two copying modes copy it whole.
+
+#### What may be written back
+
+`write` carries the same three answers a policy rule carries: `allow`, `ask`
+and `deny`. It is meaningful for `write` and `copy` alone. On `read_only` or
+`temp_copy` it is refused when the file is read, because neither of those
+reaches your files at all. Leave it out and it is `ask`.
+
+The policy table decides beside it, under the action
+`workspace.bind.<name>`, and the narrower of the two answers wins. So an
+organisation can refuse the whole mechanism with one row, and you can deny one
+path without editing a file somebody else wrote. See
+[actions.md](actions.md#workspacebind).
+
+The moment the question is asked differs by mode, because it is asked where it
+can be:
+
+- A `write` bind is decided at session start, before the bind is made. It is
+  read only until something answers `allow`, and the session start says so.
+- A `copy` bind is decided at the end, in the `workspace.apply` prompt, which
+  names every file that is copied back. Refuse that apply and your files stay
+  as they are, with the session's copies left in the workspace.
+
+#### Names, patterns and what is refused
+
+A name holding `*` or `?` is a pattern. `*` matches inside one path component,
+`**` matches any run of components, and `?` matches one character that is not a
+separator. Every other character matches itself. The patterns run against the
+project directory, and never against git's list of ignored files, so a name
+that happens to be tracked already is simply in the workspace twice over.
+
+`required` says whether a name matching nothing stops the session. Its default
+is derived: true for a name with no pattern character, false for a pattern. A
+person who wrote `scripts/release` asked for that path, and a pattern matching
+nothing is ordinary. Write `.required` yourself to say otherwise, in either
+direction.
+
+A match may be a symbolic link. Chock resolves it and binds the real file,
+because a mount source cannot be a link. Every resolved path has to stay inside
+the project: a name holding `..`, an absolute name, and a link that reaches out
+of the project are each refused by name, and the session does not start. So are
+`chock.zon` and anything under `.git`, which Chock holds for itself.
+
+The session start names every bind it made, with what the name resolved to and
+the mode it arrived under.
+
 ### When Chock refuses the file
 
 A fault in `chock.zon` stops the session before the agent runs. The message
@@ -190,8 +270,10 @@ not valid:
 4:9: error: expected field initializer
 ```
 
-The `policy`, `budget`, `subagents` and `plugins` blocks are read after the
-workspace is there, so a fault in one of those names the block instead:
+Every other block names its own block instead. The `policy` and `workspace`
+blocks are read before the workspace is built, because a bind is decided
+against the policy table. The `budget`, `subagents` and `plugins` blocks are
+read after it is there:
 
 ```
 chock run: the budget in chock.zon could not be read: chock.zon: the budget

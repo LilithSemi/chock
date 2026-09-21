@@ -816,6 +816,20 @@ fn start(
     const resuming = options.adopt or options.continue_newest or options.session != null;
     const taken = if (resuming) takenOver(gpa, io, arena, paths.log, paths.work) else null;
 
+    // Before the workspace, because the `workspace` block's binds are decided
+    // against this table and the mount list is built from that decision.
+    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
+
+    const declared_binds = try workspaceBinds(
+        arena,
+        io,
+        policy,
+        spawnChain(options),
+        options.agent_kind,
+        model,
+        project_root,
+    );
+
     // Fresh on every invocation, and never the session identifier: a
     // continued session would otherwise ask `git worktree add` for a path
     // the previous run already used.
@@ -912,6 +926,8 @@ fn start(
         .hand_on => unreachable,
     };
 
+    try attachBinds(gpa, arena, io, &workspace, declared_binds, taken == null);
+
     var sandbox_config = workspace.sandboxConfig(arena, paths.root) catch |err| {
         tty.print(.err, "chock run: the sandbox could not be described: {s}\n", .{@errorName(err)});
         return error.Reported;
@@ -953,8 +969,6 @@ fn start(
     const approvals = approvalEndpoint(arena, io, paths.dir, id);
 
     const handovers = handoverEndpoint(arena, io, paths.dir, id);
-
-    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
 
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
 
@@ -2937,6 +2951,536 @@ fn devicesFor(
         // though the bind is really there after the pivot.
         .device_tree = .{ .host = "/dev", .inside = "/.chock-device-tree" },
     };
+}
+
+/// Read the `workspace` block, find what each name matches, and resolve every
+/// match to the real path a mount source has to name.
+///
+/// Before the workspace is built, because a block this cannot honour refuses
+/// the session rather than half building one.
+fn workspaceBinds(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    policy: *const chock_policy.table.Table,
+    chain_links: []const chock_proto.event.SpawnLink,
+    agent_kind: []const u8,
+    model: []const u8,
+    project_root: []const u8,
+) StartError![]chock_policy.workspace.Resolved {
+    const block_mod = chock_policy.workspace;
+
+    var diag: ?block_mod.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+    const block = block_mod.load(arena, io, project_root, &diag) catch |err| {
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the workspace block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the workspace block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+    if (block.binds.len == 0) return &.{};
+
+    // The real path, because every match is compared against it and a project
+    // reached through a link would make every one of them look outside.
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = std.Io.Dir.cwd().realPathFile(io, project_root, &root_buffer) catch |err| {
+        tty.print(.err, "chock run: {s} could not be resolved: {t}\n", .{ project_root, err });
+        return error.Reported;
+    };
+    const root = root_buffer[0..length];
+
+    const chain = try arena.alloc([]const u8, chain_links.len + 1);
+    for (chain_links, chain[0 .. chain.len - 1]) |link, *slot| slot.* = link.agent_kind;
+    chain[chain.len - 1] = agent_kind;
+
+    var out: std.ArrayList(chock_policy.workspace.Resolved) = .empty;
+    for (block.binds) |bind| {
+        const action = try bind.actionName(arena);
+        var fault: ?chock_policy.table.ChainFault = null;
+        const table_says = policy.evaluateChain(chain, .{
+            .agent_kind = agent_kind,
+            .model = model,
+            .tool = chock_broker.actions.self_asked_tool,
+            .action = action,
+        }, &fault);
+        if (fault) |f| tty.print(.warn, "chock run: {f}\n", .{f});
+
+        if (table_says == .deny) {
+            tty.print(
+                .warn,
+                "chock run: the bind {s} is not made, because this session's policy denies {s}.\n",
+                .{ bind.name, action },
+            );
+            continue;
+        }
+
+        const matches = try matchesFor(arena, io, root, bind.name);
+        if (matches.len == 0) {
+            if (bind.isRequired()) {
+                tty.print(
+                    .err,
+                    "chock run: the bind {s} matches nothing under {s}, and a bind that names a " ++
+                        "path is required. Write `.required = false` on it to carry on without it.\n",
+                    .{ bind.name, project_root },
+                );
+                return error.Reported;
+            }
+            tty.detail("chock: the bind {s} matched nothing, and is not required.\n", .{bind.name});
+            continue;
+        }
+
+        const permitted = narrower(table_says, decisionOf(bind.write));
+        for (matches) |relative| {
+            var resolved = block_mod.resolve(arena, io, root, bind, relative, &diag) catch |err| {
+                if (diag) |*d| {
+                    tty.print(.err, "chock run: {f}\n", .{d});
+                } else {
+                    tty.print(.err, "chock run: the bind {s} could not be resolved: {t}\n", .{ bind.name, err });
+                }
+                return error.Reported;
+            };
+            resolved.read_only = bind.mode != .write or permitted != .allow;
+            resolved.write_back = bind.mode == .copy and permitted != .deny;
+            try out.append(arena, resolved);
+
+            tty.print(.plain, "chock: bind {s}, mode {t}, from {s}\n", .{
+                resolved.relative,
+                resolved.mode,
+                resolved.host_path,
+            });
+        }
+        sayWhatTheWriteDoes(bind, permitted, action);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn decisionOf(write: chock_policy.workspace.Write) chock_policy.table.Decision {
+    return switch (write) {
+        .allow => .allow,
+        .ask => .ask,
+        .deny => .deny,
+    };
+}
+
+fn narrower(a: chock_policy.table.Decision, b: chock_policy.table.Decision) chock_policy.table.Decision {
+    return if (a.rank() <= b.rank()) a else b;
+}
+
+/// The two modes that reach the user's own disk say what they will do with a
+/// change, because a bind that silently writes nothing back and a bind that
+/// silently overwrites are the same line on the screen without this.
+fn sayWhatTheWriteDoes(
+    bind: chock_policy.workspace.Bind,
+    permitted: chock_policy.table.Decision,
+    action: []const u8,
+) void {
+    switch (bind.mode) {
+        .read_only, .temp_copy => {},
+        .write => if (permitted != .allow) tty.print(
+            .warn,
+            "chock run: the bind {s} is read only, because nothing has permitted {s} yet. " ++
+                "A policy row for that action which answers allow makes it writable.\n",
+            .{ bind.name, action },
+        ),
+        .copy => switch (permitted) {
+            .allow => tty.print(
+                .plain,
+                "chock run: the bind {s} is written back over your own files when this " ++
+                    "session's work applies.\n",
+                .{bind.name},
+            ),
+            .deny => tty.print(
+                .warn,
+                "chock run: the bind {s} is never written back, because this session's policy " ++
+                    "denies {s}. Its copies stay in the workspace.\n",
+                .{ bind.name, action },
+            ),
+            else => tty.print(
+                .plain,
+                "chock run: the bind {s} is written back only if you permit the apply that " ++
+                    "asks about it.\n",
+                .{bind.name},
+            ),
+        },
+    }
+}
+
+/// How deep a pattern may descend. A `**` in a name would otherwise walk the
+/// whole project, and a project holds a `.direnv` with thousands of entries in
+/// it.
+const bind_max_depth: usize = 16;
+
+/// What one name matches, as paths under the project root, sorted so the
+/// session start report reads the same way twice.
+///
+/// The project directory and never git's own list of ignored files: a name
+/// that happens to be tracked already is harmless, it is simply in the
+/// workspace too.
+fn matchesFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    name: []const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    var walker = std.mem.tokenizeScalar(u8, name, '/');
+    while (walker.next()) |part| {
+        if (std.mem.eql(u8, part, ".")) continue;
+        try parts.append(arena, part);
+    }
+
+    try descend(arena, io, root, "", parts.items, &out);
+    std.mem.sort([]const u8, out.items, {}, lessThanPath);
+    return out.toOwnedSlice(arena);
+}
+
+fn lessThanPath(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn descend(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    prefix: []const u8,
+    parts: []const []const u8,
+    out: *std.ArrayList([]const u8),
+) std.mem.Allocator.Error!void {
+    if (out.items.len >= chock_policy.workspace.max_binds) return;
+    if (parts.len == 0) {
+        if (prefix.len != 0) try out.append(arena, prefix);
+        return;
+    }
+    if (std.mem.count(u8, prefix, "/") + 1 > bind_max_depth) return;
+
+    const part = parts[0];
+    const rest = parts[1..];
+
+    if (!chock_policy.workspace.hasGlob(part)) {
+        const next = try joinUnder(arena, prefix, part);
+        const whole = try std.fs.path.join(arena, &.{ root, next });
+        _ = std.Io.Dir.cwd().statFile(io, whole, .{}) catch return;
+        return descend(arena, io, root, next, rest, out);
+    }
+
+    // A `**` matches no component at all as well as any run of them.
+    const any_depth = std.mem.eql(u8, part, "**");
+    if (any_depth) try descend(arena, io, root, prefix, rest, out);
+
+    const here = try std.fs.path.join(arena, &.{ root, prefix });
+    var dir = std.Io.Dir.cwd().openDir(io, here, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var entries = dir.iterate();
+    while (entries.next(io) catch null) |entry| {
+        if (out.items.len >= chock_policy.workspace.max_binds) return;
+        // git's own directory is the backing's, and `chock.zon` is bound read
+        // only already. Neither is ever a match.
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
+        const next = try joinUnder(arena, prefix, entry.name);
+        if (any_depth) {
+            if (entry.kind == .directory) try descend(arena, io, root, next, parts, out);
+            continue;
+        }
+        if (!chock_core.tools.matchGlob(part, entry.name)) continue;
+        try descend(arena, io, root, next, rest, out);
+    }
+}
+
+fn joinUnder(
+    arena: std.mem.Allocator,
+    prefix: []const u8,
+    name: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    if (prefix.len == 0) return arena.dupe(u8, name);
+    return std.fs.path.join(arena, &.{ prefix, name });
+}
+
+/// Bring the resolved binds into the workspace. A path that cannot be copied
+/// is one warning and not a failed session: the agent sees a workspace with
+/// that one path missing, and the report says which.
+///
+/// A workspace this process took over copies nothing in, the same rule
+/// `handleUncommitted` keeps: its copies are the last owner's agent's own.
+fn attachBinds(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    io: std.Io,
+    workspace: *chock_workspace.Workspace,
+    resolved: []const chock_policy.workspace.Resolved,
+    copy_in: bool,
+) StartError!void {
+    if (resolved.len == 0) return;
+
+    var report = chock_workspace.worktree.ImportReport{};
+    defer report.deinit(gpa);
+    workspace.attachBinds(arena, io, resolved, copy_in, &report) catch |err| {
+        tty.print(.err, "chock run: the workspace binds could not be brought in: {t}\n", .{err});
+        return error.Reported;
+    };
+    for (report.skipped.items) |skip| {
+        tty.print(.warn, "chock run: {s} was not brought across: {s}\n", .{ skip.path, skip.reason });
+    }
+}
+
+test "a pattern matching nothing is fine, a literal name matching nothing stops the session" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const table = try chock_policy.table.Table.parseUnder(arena, ".{}", &.{}, null);
+
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{ .{ .name = "generated_*", .mode = .read_only } } } }
+    );
+    const nothing = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
+    try testing.expectEqual(@as(usize, 0), nothing.len);
+
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{ .{ .name = "generated", .mode = .read_only } } } }
+    );
+    try testing.expectError(
+        error.Reported,
+        workspaceBinds(arena, io, table, &.{}, "main", "a-model", root),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "generated") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "required") != null);
+}
+
+test "required overrides the derived answer in both directions" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const table = try chock_policy.table.Table.parseUnder(arena, ".{}", &.{}, null);
+
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{
+        \\    .{ .name = "generated", .mode = .read_only, .required = false },
+        \\} } }
+    );
+    const carried_on = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
+    try testing.expectEqual(@as(usize, 0), carried_on.len);
+
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{
+        \\    .{ .name = "generated_*", .mode = .read_only, .required = true },
+        \\} } }
+    );
+    try testing.expectError(
+        error.Reported,
+        workspaceBinds(arena, io, table, &.{}, "main", "a-model", root),
+    );
+}
+
+test "the four modes decide what is bound read only and what is written back" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+
+    {
+        var file = try project.dir.createFile(io, "config.local.json", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "CONFIG_X=y\n");
+    }
+    try project.dir.symLink(io, "config.local.json", "config.local.json-alias", .{});
+    try project.dir.createDirPath(io, "scripts/release");
+    try project.dir.createDirPath(io, "vendor/cache");
+    try project.dir.createDirPath(io, "out");
+
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{
+        \\    .{ .name = "config.local.*", .mode = .read_only },
+        \\    .{ .name = "scripts/release", .mode = .copy, .write = .allow },
+        \\    .{ .name = "vendor/cache", .mode = .temp_copy },
+        \\    .{ .name = "out", .mode = .write, .write = .allow },
+        \\} } }
+    );
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const table = try chock_policy.table.Table.parseUnder(arena,
+        \\.{ .policy = .{ .rules = .{ .{ .action = "workspace.bind.*", .decision = .allow } } } }
+    , &.{}, null);
+
+    const resolved = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
+    try testing.expectEqual(@as(usize, 5), resolved.len);
+
+    // Both matches of the pattern resolve to the one real file, because the
+    // second is a link to the first.
+    for (resolved[0..2]) |one| {
+        try testing.expectEqual(chock_policy.workspace.Mode.read_only, one.mode);
+        try testing.expect(one.read_only);
+        try testing.expect(!one.write_back);
+        try testing.expect(std.mem.endsWith(u8, one.host_path, "/config.local.json"));
+    }
+    try testing.expectEqualStrings("config.local.json", resolved[0].relative);
+    try testing.expectEqualStrings("config.local.json-alias", resolved[1].relative);
+
+    try testing.expectEqual(chock_policy.workspace.Mode.copy, resolved[2].mode);
+    try testing.expect(resolved[2].write_back);
+    try testing.expect(resolved[2].is_directory);
+
+    try testing.expectEqual(chock_policy.workspace.Mode.temp_copy, resolved[3].mode);
+    try testing.expect(!resolved[3].write_back);
+
+    try testing.expectEqual(chock_policy.workspace.Mode.write, resolved[4].mode);
+    try testing.expect(!resolved[4].read_only);
+}
+
+test "write = .deny on a write bind makes it read only and says so" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    try project.dir.createDirPath(io, "out");
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{
+        \\    .{ .name = "out", .mode = .write, .write = .deny },
+        \\} } }
+    );
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const table = try chock_policy.table.Table.parseUnder(arena,
+        \\.{ .policy = .{ .rules = .{ .{ .action = "workspace.bind.*", .decision = .allow } } } }
+    , &.{}, null);
+
+    const resolved = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
+    try testing.expectEqual(@as(usize, 1), resolved.len);
+    try testing.expect(resolved[0].read_only);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "read only") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "workspace.bind.out") != null);
+}
+
+test "a bind the policy table denies is not made at all" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    try project.dir.createDirPath(io, "out");
+    try writeChockZon(io, project.dir,
+        \\.{ .workspace = .{ .binds = .{ .{ .name = "out", .mode = .read_only } } } }
+    );
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const org = [_]chock_policy.table.Rule{
+        .{ .action = "workspace.bind.*", .decision = .deny },
+    };
+    const table = try chock_policy.table.Table.parseUnder(arena, ".{}", &org, null);
+
+    const resolved = try workspaceBinds(arena, io, table, &.{}, "main", "a-model", root);
+    try testing.expectEqual(@as(usize, 0), resolved.len);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "workspace.bind.out") != null);
+}
+
+test "a name matches against the project directory, and never against git's own" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    try project.dir.createDirPath(io, ".git");
+    try project.dir.createDirPath(io, "scripts/release/deep");
+    for ([_][]const u8{ "config.local.toml", "config.local.json", "other" }) |name| {
+        var file = try project.dir.createFile(io, name, .{});
+        defer file.close(io);
+    }
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try project.dir.realPath(io, &buffer);
+    const root = buffer[0..length];
+
+    const sorted = try matchesFor(arena, io, root, "config.local.*");
+    try testing.expectEqual(@as(usize, 2), sorted.len);
+    try testing.expectEqualStrings("config.local.json", sorted[0]);
+    try testing.expectEqualStrings("config.local.toml", sorted[1]);
+
+    const literal = try matchesFor(arena, io, root, "scripts/release");
+    try testing.expectEqual(@as(usize, 1), literal.len);
+    try testing.expectEqualStrings("scripts/release", literal[0]);
+
+    const deep = try matchesFor(arena, io, root, "scripts/**/deep");
+    try testing.expectEqual(@as(usize, 1), deep.len);
+    try testing.expectEqualStrings("scripts/release/deep", deep[0]);
+
+    const everything = try matchesFor(arena, io, root, "*");
+    for (everything) |one| try testing.expect(!std.mem.eql(u8, one, ".git"));
+}
+
+fn writeChockZon(io: std.Io, dir: std.Io.Dir, source: []const u8) !void {
+    var file = try dir.createFile(io, chock_policy.workspace.file_name, .{ .truncate = true });
+    defer file.close(io);
+    try file.writeStreamingAll(io, source);
 }
 
 const Hardening = struct {
@@ -5174,12 +5718,14 @@ fn carryCommit(
     var describe_diag: ?chock_broker.Diagnostic = null;
     defer if (describe_diag) |*d| d.deinit(arena);
     const wanted = chosenLanding(gpa, io, started.apply_mode.mode, params.screen);
+    const copies = copiesOf(arena, &started.workspace) catch return .failed;
     const apply = chock_broker.actions.WorkspaceApply.describing(arena, io, ctx, .{
         .repository = params.tree.project_root,
         .scratch_object_store = params.tree.object_store_source,
         .ref = params.ref,
         .new_id = params.new_id,
         .wanted = wanted,
+        .copies = copies,
     }, &describe_diag) catch |err| {
         if (describe_diag) |*fault| {
             tty.print(
@@ -5285,6 +5831,7 @@ fn carryCommit(
         },
         .done => |*done| {
             const carried = done.result.workspace_apply;
+            writeBackCopies(gpa, io, &started.workspace);
             recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);
             gpa.free(carried.ref);
             gpa.free(carried.new_id);
@@ -5294,6 +5841,44 @@ fn carryCommit(
             } };
         },
     }
+}
+
+/// The `workspace` block's copies which land on the user's own files when the
+/// session's work applies. The prompt names them, so the answer to it is the
+/// answer to these too.
+fn copiesOf(
+    arena: std.mem.Allocator,
+    workspace: *const chock_workspace.Workspace,
+) std.mem.Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (workspace.binds) |one| {
+        if (one.bind.mode != .copy or !one.bind.write_back) continue;
+        try out.append(arena, one.bind.relative);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// After the apply is permitted and never before it. A refused apply leaves
+/// the user's files untouched and the session's copies in the workspace.
+fn writeBackCopies(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    workspace: *const chock_workspace.Workspace,
+) void {
+    var report = chock_workspace.worktree.ImportReport{};
+    defer report.deinit(gpa);
+    const done = workspace.writeBackBinds(gpa, io, &report) catch |err| {
+        tty.print(.warn, "chock run: the workspace copies could not be written back: {t}\n", .{err});
+        return;
+    };
+    for (report.skipped.items) |skip| {
+        tty.print(.warn, "chock run: {s} was not written back: {s}\n", .{ skip.path, skip.reason });
+    }
+    if (done.binds == 0) return;
+    tty.print(.plain, "chock run: {d} files written back over your own, from {d} binds.\n", .{
+        done.files,
+        done.binds,
+    });
 }
 
 fn recordIntegration(

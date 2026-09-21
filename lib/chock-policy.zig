@@ -13,6 +13,7 @@ pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
 pub const limits = @import("chock-policy/limits.zig");
 pub const nix = @import("chock-policy/nix.zig");
+pub const workspace = @import("chock-policy/workspace.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
