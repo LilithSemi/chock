@@ -72,6 +72,37 @@ the file.
 An action no rule names, and no shipped default names either, answers `ask`. A
 session with nobody at the keyboard is refused there.
 
+## A rule for one run
+
+`--policy-rule "<action>=<decision>"` adds one rule for this session alone:
+
+```
+chock run --policy-rule "net.fetch.*=allow" "read the changelog"
+```
+
+It is repeatable. Each one names an action and a decision, and nothing else:
+a rule that narrows by tool, model or agent kind belongs in a file somebody
+can read back.
+
+The flag sits between the two layers that already exist. It answers instead of
+the project's `chock.zon`, and the org bundle still holds it. So a rule here
+cannot reach past a ceiling an organisation set, and a project that denies an
+action does not stop you allowing it for one run on your own machine.
+
+It is a layer of its own and never a rule appended to the file's. Two rules of
+one list that name the same action are settled by the narrower decision, so a
+`git.push=allow` merged into a file that denies `git.push` would lose and do
+nothing at all.
+
+Every rule given this way is printed at session start, because it is the one
+part of a session's policy that no file records. It reaches no subagent: a
+child reads the project's file and the org bundle alone, so a rule you give
+the agent you are talking to is not one its children get.
+
+An action this build cannot read is refused before the session starts, with the
+same rule the file gets: `*` is allowed as the last part alone, so
+`net.fetch.*` is a pattern and `net.*.fetch` is a fault.
+
 ## Files the agent may not read
 
 A `deny_read` block in `chock.zon` names files that are kept out of the session

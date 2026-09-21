@@ -343,11 +343,26 @@ fn noteChain(out: ?*?ChainFault, value: ChainFault) void {
 /// a mutable one. The comptime block at the end of this file keeps that true.
 pub const Table = struct {
     policy: *const Policy,
+    /// The rules a person gave on the command line. They sit above the file
+    /// and below the org bundle: a rule here answers instead of the file's,
+    /// and the org ceiling still holds it. Borrowed, like `org`.
+    ///
+    /// A layer of its own and never appended to the file's rules, because a
+    /// tie between two rules of one list goes to the narrower decision. A
+    /// `git.push=allow` merged into a file that denies `git.push` would lose
+    /// that tie and do nothing at all.
+    given: []const Rule = &.{},
     /// Borrowed and never owned, so `destroy` frees nothing here. Empty is no
     /// special case anywhere: `ceilingRules` answers `allow` for a rule list
     /// that names nothing, and `allow` is the identity of `intersect`.
     org: []const Rule = &.{},
     hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+
+    /// The two layers around the project's own file.
+    pub const Layers = struct {
+        given: []const Rule = &.{},
+        org: []const Rule = &.{},
+    };
 
     pub fn parse(
         gpa: std.mem.Allocator,
@@ -363,6 +378,17 @@ pub const Table = struct {
         gpa: std.mem.Allocator,
         source: [:0]const u8,
         org: []const Rule,
+        diag: ?*?Diagnostic,
+    ) ParseError!*const Table {
+        return parseLayered(gpa, source, .{ .org = org }, diag);
+    }
+
+    /// `parseUnder` with the command line layer as well. Both lists are
+    /// borrowed for the life of the table.
+    pub fn parseLayered(
+        gpa: std.mem.Allocator,
+        source: [:0]const u8,
+        layers: Layers,
         diag: ?*?Diagnostic,
     ) ParseError!*const Table {
         var trees = try Trees.init(gpa, source, diag);
@@ -397,7 +423,12 @@ pub const Table = struct {
         owned.* = policy;
 
         const table = try gpa.create(Table);
-        table.* = .{ .policy = owned, .org = org, .hash = hashSource(source) };
+        table.* = .{
+            .policy = owned,
+            .given = layers.given,
+            .org = layers.org,
+            .hash = hashSource(source),
+        };
         return table;
     }
 
@@ -415,6 +446,16 @@ pub const Table = struct {
         io: std.Io,
         project_root: []const u8,
         org: []const Rule,
+        diag: ?*?Diagnostic,
+    ) LoadError!*const Table {
+        return loadLayered(gpa, io, project_root, .{ .org = org }, diag);
+    }
+
+    pub fn loadLayered(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        project_root: []const u8,
+        layers: Layers,
         diag: ?*?Diagnostic,
     ) LoadError!*const Table {
         const path = try std.fs.path.join(gpa, &.{ project_root, file_name });
@@ -438,7 +479,7 @@ pub const Table = struct {
         };
         defer gpa.free(source);
 
-        return parseUnder(gpa, source, org, diag);
+        return parseLayered(gpa, source, layers, diag);
     }
 
     /// The allocator is a parameter and not a field, so a `Table` holds nothing
@@ -456,7 +497,24 @@ pub const Table = struct {
     /// this for a real request loses the intersection for every kind the file
     /// declares no parent for. `evaluateChain` is the verb the broker wants.
     pub fn evaluateKindAlone(self: *const Table, key: Key) Decision {
-        return evaluateRules(self.policy.rules, key).intersect(ceilingRules(self.org, key));
+        return self.ownAnswer(key).decision.intersect(ceilingRules(self.org, key));
+    }
+
+    /// The file's answer, with the command line answering instead when it
+    /// names the key. A rule given on the command line is the reason this is
+    /// not `rulesAnswer` everywhere.
+    fn ownAnswer(self: *const Table, key: Key) ChainAnswer {
+        if (winnerFor(self.given, key)) |winner| {
+            return .{ .decision = winner.decision, .named = true };
+        }
+        return rulesAnswer(self.policy.rules, key);
+    }
+
+    /// `ownAnswer` for a question about a resource, where a key nobody named
+    /// answers `allow`.
+    fn ownCeiling(self: *const Table, key: Key) Decision {
+        if (winnerFor(self.given, key)) |winner| return winner.decision;
+        return ceilingRules(self.policy.rules, key);
     }
 
     /// `chain` names every agent kind from the root of the spawn tree down to
@@ -520,7 +578,7 @@ pub const Table = struct {
     /// An org rule counts as naming the key. Without that, a wider name could
     /// be read past a ceiling the organisation set on this one.
     fn linkAnswer(self: *const Table, link: Key) ChainAnswer {
-        const own = rulesAnswer(self.policy.rules, link);
+        const own = self.ownAnswer(link);
         const ceiling = winnerFor(self.org, link);
         return .{
             .decision = own.decision.intersect(if (ceiling) |one| one.decision else .allow),
@@ -537,7 +595,8 @@ pub const Table = struct {
         return switch (self.policy.net.router) {
             .none => false,
             .filtered => true,
-            .auto => rulesPermitBelow(self.policy.rules, "net"),
+            .auto => rulesPermitBelow(self.policy.rules, "net") or
+                rulesPermitBelow(self.given, "net"),
         };
     }
 
@@ -561,7 +620,8 @@ pub const Table = struct {
     /// skipped, because reading a refusal as "somebody named this host" would
     /// turn a denial into the reason a name resolves.
     pub fn permitsSomethingUnder(self: *const Table, key: Key) bool {
-        return rulesReachBelow(self.policy.rules, key) or
+        return rulesReachBelow(self.given, key) or
+            rulesReachBelow(self.policy.rules, key) or
             rulesReachBelow(defaults.rules, key);
     }
 
@@ -599,7 +659,7 @@ pub const Table = struct {
         for (chain) |kind| {
             const link = keyForKind(key, kind);
             result = result
-                .intersect(ceilingRules(self.policy.rules, link))
+                .intersect(self.ownCeiling(link))
                 .intersect(ceilingRules(self.org, link));
         }
         return result;
@@ -811,6 +871,43 @@ fn patternScore(pattern: ?[]const u8) u64 {
 
 fn segmentCount(name: []const u8) u64 {
     return std.mem.count(u8, name, ".") + 1;
+}
+
+pub const GivenRuleError = error{
+    NoEquals,
+    ActionEmpty,
+    ActionMalformed,
+    DecisionUnknown,
+};
+
+pub fn givenRuleReason(reason: GivenRuleError) []const u8 {
+    return switch (reason) {
+        error.NoEquals => "holds no =, and a rule is written <action>=<decision>",
+        error.ActionEmpty => "names no action before the =",
+        error.ActionMalformed => "names an action a rule cannot carry. A * is allowed as the last part alone, as in net.fetch.*",
+        error.DecisionUnknown => "names no decision this build knows. Write deny, ask, allow, agent_review or agent_then_human",
+    };
+}
+
+/// One `<action>=<decision>` as written on the command line. The action is
+/// borrowed from `text`, so the rule lives as long as the argument does.
+///
+/// Only the action and the decision, never the tool, model or agent kind. A
+/// rule that narrows by those belongs in a file somebody can read back.
+pub fn parseGivenRule(text: []const u8) GivenRuleError!Rule {
+    const split = std.mem.lastIndexOfScalar(u8, text, '=') orelse return error.NoEquals;
+    const action = text[0..split];
+    const decision = text[split + 1 ..];
+
+    if (action.len == 0) return error.ActionEmpty;
+    if (!patternIsWellFormed(action)) return error.ActionMalformed;
+
+    inline for (@typeInfo(Decision).@"enum".fields) |field| {
+        if (std.mem.eql(u8, decision, field.name)) {
+            return .{ .action = action, .decision = @field(Decision, field.name) };
+        }
+    }
+    return error.DecisionUnknown;
 }
 
 pub fn hashSource(source: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
@@ -2628,4 +2725,68 @@ test "a background call follows the session's network, and can be refused one of
     );
     defer Table.destroy(gpa, nothing);
     try std.testing.expect(!nothing.wantsBackgroundRouter());
+}
+
+test "a rule given on the command line answers instead of the project's own" {
+    const gpa = std.testing.allocator;
+
+    const given = [_]Rule{.{ .action = "git.push", .decision = .allow }};
+    const table = try Table.parseLayered(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .deny } } } }",
+        .{ .given = &given },
+        null,
+    );
+    defer Table.destroy(gpa, table);
+
+    const key = Key{
+        .agent_kind = "coder",
+        .model = "m",
+        .tool = "run_command",
+        .action = "git.push",
+    };
+    try std.testing.expectEqual(Decision.allow, table.evaluateKindAlone(key));
+
+    // The same file with nothing given keeps its own answer, so the layer and
+    // not the parse is what changed the decision.
+    const plain = try Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"git.push\", .decision = .deny } } } }",
+        null,
+    );
+    defer Table.destroy(gpa, plain);
+    try std.testing.expectEqual(Decision.deny, plain.evaluateKindAlone(key));
+}
+
+test "an org bundle still holds a rule given on the command line" {
+    const gpa = std.testing.allocator;
+
+    const given = [_]Rule{.{ .action = "git.push", .decision = .allow }};
+    const org = [_]Rule{.{ .action = "git.push", .decision = .deny }};
+    const table = try Table.parseLayered(gpa, ".{}", .{ .given = &given, .org = &org }, null);
+    defer Table.destroy(gpa, table);
+
+    const key = Key{
+        .agent_kind = "coder",
+        .model = "m",
+        .tool = "run_command",
+        .action = "git.push",
+    };
+    try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(key));
+}
+
+test "a given rule is read as <action>=<decision>, and every other shape is refused" {
+    const rule = try parseGivenRule("net.fetch.*=allow");
+    try std.testing.expectEqualStrings("net.fetch.*", rule.action.?);
+    try std.testing.expectEqual(Decision.allow, rule.decision);
+    try std.testing.expectEqual(@as(?[]const u8, null), rule.tool);
+
+    try std.testing.expectEqual(Decision.agent_then_human, (try parseGivenRule("git.push=agent_then_human")).decision);
+
+    try std.testing.expectError(error.NoEquals, parseGivenRule("git.push"));
+    try std.testing.expectError(error.ActionEmpty, parseGivenRule("=allow"));
+    try std.testing.expectError(error.DecisionUnknown, parseGivenRule("git.push=maybe"));
+    // The same refusal the file gets: a `*` in the middle names nothing.
+    try std.testing.expectError(error.ActionMalformed, parseGivenRule("net.*.fetch=allow"));
+    try std.testing.expectError(error.ActionMalformed, parseGivenRule("*=allow"));
 }

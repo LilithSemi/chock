@@ -45,6 +45,9 @@ const usage_text =
     \\  --dev-shell <name>  The devShells attribute the tool environment comes
     \\                      from, for this run. Defaults to .nix.dev_shell, and
     \\                      to what `nix develop` takes when neither names one.
+    \\  --policy-rule <r>   One policy rule, written <action>=<decision>. It
+    \\                      answers instead of the project's chock.zon, and the
+    \\                      org bundle still holds it. Repeatable.
     \\  --continue          Continue the newest session of this project.
     \\  --session <id>      Continue this session.
     \\  --adopt             Become the owner of a session that already exists and
@@ -105,6 +108,8 @@ const Options = struct {
     max_turns: ?usize = null,
     /// Overrides `.nix.dev_shell` for one run.
     dev_shell: ?[]const u8 = null,
+    /// Every rule `--policy-rule` named, in the order given.
+    policy_rules: []const chock_policy.table.Rule = &.{},
     continue_newest: bool = false,
     adopt: bool = false,
     allow_dirty: bool = false,
@@ -585,25 +590,40 @@ fn daysIn(span_ms: i64) i64 {
     return @divFloor(span_ms, std.time.ms_per_day);
 }
 
+/// A rule given on the command line is not in a file anybody can read back, so
+/// the session says every one of them. They reach no subagent: a child reads
+/// the project's file and the org bundle alone.
+fn reportGivenRules(rules: []const chock_policy.table.Rule) void {
+    for (rules) |rule| {
+        tty.print(
+            .warn,
+            "chock run: --policy-rule answers {s} for {s}, above this project's chock.zon.\n",
+            .{ @tagName(rule.decision), rule.action orelse "*" },
+        );
+    }
+}
+
 fn loadPolicyUnder(
     arena: std.mem.Allocator,
     io: std.Io,
     project_root: []const u8,
     org_bundle: ?*const chock_policy.org.Bundle,
+    given: []const chock_policy.table.Rule,
 ) StartError!*const chock_policy.table.Table {
     const org_rules: []const chock_policy.table.Rule =
         if (org_bundle) |bundle| bundle.rules else &.{};
+    const layers = chock_policy.table.Table.Layers{ .given = given, .org = org_rules };
 
     var policy_diag: ?chock_policy.table.Diagnostic = null;
     defer if (policy_diag) |*d| d.deinit(arena);
-    return chock_policy.table.Table.loadUnder(
+    return chock_policy.table.Table.loadLayered(
         arena,
         io,
         project_root,
-        org_rules,
+        layers,
         &policy_diag,
     ) catch |err| switch (err) {
-        error.NoPolicyFile => chock_policy.table.Table.parseUnder(arena, ".{}", org_rules, null) catch
+        error.NoPolicyFile => chock_policy.table.Table.parseLayered(arena, ".{}", layers, null) catch
             return error.OutOfMemory,
         else => {
             if (policy_diag) |*d| {
@@ -823,7 +843,8 @@ fn start(
 
     // Before the workspace, because the `workspace` block's binds are decided
     // against this table and the mount list is built from that decision.
-    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle);
+    const policy = try loadPolicyUnder(arena, io, project_root, org_bundle, options.policy_rules);
+    reportGivenRules(options.policy_rules);
 
     const declared_binds = try workspaceBinds(
         arena,
@@ -10480,6 +10501,7 @@ const value_options = [_][]const u8{
     "--org-bundle",
     "--instructions",
     "--dev-shell",
+    "--policy-rule",
     "--max-turns",
     "--export-dir",
     "--export-syslog",
@@ -10502,6 +10524,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
     var options = Options{};
     var words: std.ArrayList([]const u8) = .empty;
     var given: std.ArrayList([]const u8) = .empty;
+    var rules: std.ArrayList(chock_policy.table.Rule) = .empty;
     var chain: std.ArrayList(chock_proto.event.SpawnLink) = .empty;
 
     var index: usize = 0;
@@ -10554,6 +10577,16 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             try given.append(arena, value);
         } else if (std.mem.eql(u8, argument, "--dev-shell")) {
             options.dev_shell = value;
+        } else if (std.mem.eql(u8, argument, "--policy-rule")) {
+            const rule = chock_policy.table.parseGivenRule(value) catch |err| {
+                tty.print(
+                    .err,
+                    "chock run: --policy-rule \"{s}\" {s}.\n",
+                    .{ value, chock_policy.table.givenRuleReason(err) },
+                );
+                return error.BadArguments;
+            };
+            try rules.append(arena, rule);
         } else if (std.mem.eql(u8, argument, "--provider")) {
             options.provider = value;
         } else if (std.mem.eql(u8, argument, "--model")) {
@@ -10641,6 +10674,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
 
     options.message_words = words.items;
     options.instructions = given.items;
+    options.policy_rules = rules.items;
     options.parent_chain = chain.items;
     return options;
 }
@@ -11297,6 +11331,7 @@ fn valueFor(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "--max-turns")) return "3";
     if (std.mem.eql(u8, name, subagent.flag.max_cost)) return "1.25";
     if (std.mem.eql(u8, name, "--session")) return "01JQ" ++ "A" ** 22;
+    if (std.mem.eql(u8, name, "--policy-rule")) return "git.push=allow";
     return "a-value";
 }
 
@@ -11326,6 +11361,35 @@ test "--dev-shell takes a value, and a run that names none leaves the file to de
 
     const quiet = try parseOptions(arena, &.{"do the thing"});
     try testing.expectEqual(@as(?[]const u8, null), quiet.dev_shell);
+}
+
+test "--policy-rule is repeatable, and a shape that is not <action>=<decision> is refused" {
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = try parseOptions(arena, &.{
+        "--policy-rule", "net.fetch.*=allow",
+        "--policy-rule", "git.push=deny",
+        "do the thing",
+    });
+    try testing.expectEqual(@as(usize, 2), parsed.policy_rules.len);
+    try testing.expectEqualStrings("net.fetch.*", parsed.policy_rules[0].action.?);
+    try testing.expectEqual(chock_policy.table.Decision.allow, parsed.policy_rules[0].decision);
+    try testing.expectEqualStrings("git.push", parsed.policy_rules[1].action.?);
+    try testing.expectEqual(chock_policy.table.Decision.deny, parsed.policy_rules[1].decision);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    try testing.expectError(
+        error.BadArguments,
+        parseOptions(arena, &.{ "--policy-rule", "git.push" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "holds no =") != null);
 }
 
 test "a clean tree gets no warning at all, so the message stays worth reading" {
@@ -15988,7 +16052,7 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
         .data = project_allows,
     });
 
-    const wired = try loadPolicyUnder(arena, testing.io, project_root, org_refuses);
+    const wired = try loadPolicyUnder(arena, testing.io, project_root, org_refuses, &.{});
     const rows = try chock_policy.access.rowsFor("public", "gpt-5");
     const asking = chock_policy.access.Ask{
         .chain = &.{"main"},
@@ -15999,7 +16063,7 @@ test "a project cannot widen the models its org narrowed, and the refusal names 
         chock_policy.table.Decision.deny,
         chock_policy.access.ceiling(wired, asking, &rows, null),
     );
-    const unwired = try loadPolicyUnder(arena, testing.io, project_root, null);
+    const unwired = try loadPolicyUnder(arena, testing.io, project_root, null, &.{});
     try testing.expectEqual(
         chock_policy.table.Decision.allow,
         chock_policy.access.ceiling(unwired, asking, &rows, null),
