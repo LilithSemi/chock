@@ -490,6 +490,10 @@ fn runTurn(
                 "the model backend went quiet partway through its reply: nothing at all arrived " ++
                     "for long enough that the session stopped waiting",
                 .{},
+            ) else if (failed.reason.len != 0) try std.fmt.allocPrint(
+                allocator,
+                "the reply from the model backend did not complete: {s} ({s})",
+                .{ @errorName(failed.err), failed.reason },
             ) else try std.fmt.allocPrint(
                 allocator,
                 "the reply from the model backend did not complete: {s}",

@@ -368,6 +368,15 @@ pub const Client = struct {
             on_delta: OnDelta,
             ctx: ?*anyopaque,
         ) SendError!SendResult,
+        /// The specific fault behind the last `TransportFailed`, in the
+        /// transport's own words. Null for an implementation that keeps none,
+        /// which is every test double.
+        ///
+        /// `TransportFailed` is one name for a refused connection, a failed
+        /// name lookup and a TLS handshake that would not complete, and the
+        /// three need different answers from whoever reads the log. Without
+        /// this seam the specific name is recorded and never read.
+        transportReason: ?*const fn (ptr: *anyopaque) []const u8 = null,
     };
 
     /// Send `request` and stream the reply through `on_delta`. `request` is
@@ -386,6 +395,13 @@ pub const Client = struct {
         ctx: ?*anyopaque,
     ) SendError!SendResult {
         return self.vtable.send(self.ptr, allocator, request, on_delta, ctx);
+    }
+
+    /// Empty when the implementation keeps no reason, which reads the same as
+    /// a fault it had no better name for.
+    pub fn transportReason(self: Client) []const u8 {
+        const ask = self.vtable.transportReason orelse return "";
+        return ask(self.ptr);
     }
 };
 
@@ -429,6 +445,10 @@ pub const HttpClient = struct {
     /// earlier failed call can survive a later success: check the
     /// `SendResult` or error a call actually returned first.
     last_transport_error: []const u8 = "",
+    last_transport_stage: Stage = .open,
+    /// Holds what `transportReason` builds. An error name is static and a
+    /// stage is a literal, so the only allocation either would need is this.
+    reason_buffer: [128]u8 = undefined,
     /// How long a reply may say nothing at all before `send` gives up on it
     /// with `SendError.StreamStalled`. See `default_gap_ns`, which is what
     /// this is unless a caller says otherwise, and which explains why this
@@ -489,7 +509,18 @@ pub const HttpClient = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable = Client.VTable{ .send = sendVtable };
+    const vtable = Client.VTable{ .send = sendVtable, .transportReason = transportReasonVtable };
+
+    fn transportReasonVtable(ptr: *anyopaque) []const u8 {
+        const self: *HttpClient = @ptrCast(@alignCast(ptr));
+        if (self.last_transport_error.len == 0) return "";
+        // Both halves or neither: the stage alone names no fault and the
+        // error alone does not say which request stage reached it.
+        return std.fmt.bufPrint(&self.reason_buffer, "{s}, {s}", .{
+            self.last_transport_stage.text(),
+            self.last_transport_error,
+        }) catch self.last_transport_error;
+    }
 
     fn sendVtable(
         ptr: *anyopaque,
@@ -507,11 +538,38 @@ pub const HttpClient = struct {
     /// never folded in here: it stays itself, since `SendError` already
     /// carries `std.mem.Allocator.Error` directly and a caller genuinely
     /// out of memory needs to know that, not "some transport thing failed."
-    fn transportFailed(self: *HttpClient, err: anytype) SendError {
+    fn transportFailed(self: *HttpClient, stage: Stage, err: anytype) SendError {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         self.last_transport_error = @errorName(err);
+        self.last_transport_stage = stage;
         return error.TransportFailed;
     }
+
+    /// Which part of one request failed. A name that resolves and a socket
+    /// that opens say nothing about the two stages after them, and the three
+    /// need different answers: a provider that accepts a connection and then
+    /// closes it without a response is not a provider that cannot be reached.
+    pub const Stage = enum {
+        /// The base URL this instance is configured with does not parse.
+        url,
+        /// Opening the connection: the name, the socket, the TLS handshake.
+        open,
+        /// Writing the request body, which for a chat turn is the whole
+        /// context and every tool definition.
+        send_body,
+        /// Waiting for the response head. Reaching here means the request
+        /// went out and the provider had not answered it.
+        receive_head,
+
+        pub fn text(self: Stage) []const u8 {
+            return switch (self) {
+                .url => "parsing the base url",
+                .open => "opening the connection",
+                .send_body => "sending the request",
+                .receive_head => "waiting for the response",
+            };
+        }
+    };
 
     fn send(
         self: *HttpClient,
@@ -551,7 +609,7 @@ pub const HttpClient = struct {
             },
         });
         defer allocator.free(url);
-        const uri = std.Uri.parse(url) catch |err| return self.transportFailed(err);
+        const uri = std.Uri.parse(url) catch |err| return self.transportFailed(.url, err);
 
         // An empty key builds no header value and sends no header: see the
         // `key` field's own doc comment. The buffer is still allocated in
@@ -619,13 +677,13 @@ pub const HttpClient = struct {
                 .accept_encoding = .{ .override = identity_encoding },
             },
             .extra_headers = header_storage[0..header_count],
-        }) catch |err| return self.transportFailed(err);
+        }) catch |err| return self.transportFailed(.open, err);
         defer req.deinit();
 
-        req.sendBodyComplete(body) catch |err| return self.transportFailed(err);
+        req.sendBodyComplete(body) catch |err| return self.transportFailed(.send_body, err);
 
         var redirect_buf: [4 * 1024]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| return self.transportFailed(err);
+        var response = req.receiveHead(&redirect_buf) catch |err| return self.transportFailed(.receive_head, err);
 
         // Before the status, because it decides whether either body below can
         // be read at all: a compressed body is compressed whether the
@@ -1602,7 +1660,14 @@ pub const AssembledReply = struct {
         /// caller what was already assembled along with the error." `partial`
         /// is owned the same way `.message` is: free it with
         /// `freeAssembledMessage`.
-        failed: struct { err: SendError, partial: message.Message },
+        failed: struct {
+            err: SendError,
+            partial: message.Message,
+            /// The transport's own name for the fault behind a
+            /// `TransportFailed`, empty for every other error and for an
+            /// implementation that keeps none. Static, so it is never freed.
+            reason: []const u8 = "",
+        },
     };
 
     /// Why the provider stopped this turn, in its own word, or empty when it
@@ -1718,7 +1783,11 @@ pub fn sendAndAssembleWatching(
     defer collector.deinit();
 
     const result = c.send(allocator, request, Collector.onDelta, &collector) catch |err| {
-        return collector.reply(.{ .failed = .{ .err = err, .partial = try collector.toMessage() } });
+        return collector.reply(.{ .failed = .{
+            .err = err,
+            .partial = try collector.toMessage(),
+            .reason = c.transportReason(),
+        } });
     };
     switch (result) {
         .status_error => |status_error| return collector.reply(.{ .status_error = status_error }),
@@ -2036,3 +2105,63 @@ const Collector = struct {
 // `test/core/fake_provider.zig`, a real socket server, and Zig 0.16 refuses
 // a relative `@import` that reaches outside this file's own module. See that
 // file's top comment.
+
+test "a transport fault carries the transport's own name for it, not only TransportFailed" {
+    const Stub = struct {
+        reason: []const u8,
+
+        fn sendVtable(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: message.Request,
+            _: OnDelta,
+            _: ?*anyopaque,
+        ) SendError!SendResult {
+            return error.TransportFailed;
+        }
+
+        fn reasonVtable(ptr: *anyopaque) []const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.reason;
+        }
+
+        const table = Client.VTable{ .send = sendVtable, .transportReason = reasonVtable };
+
+        fn client(self: *@This()) Client {
+            return .{ .ptr = self, .vtable = &table };
+        }
+    };
+
+    var stub = Stub{ .reason = "ConnectionResetByPeer" };
+    const reply = try sendAndAssembleWatching(stub.client(), std.testing.allocator, .{
+        .model = "m",
+        .system = "",
+        .messages = &.{},
+        .tools = &.{},
+    }, null);
+    defer freeUsage(std.testing.allocator, reply.usage);
+    defer freeAssembledMessage(std.testing.allocator, reply.outcome.failed.partial);
+
+    try std.testing.expectEqual(SendError.TransportFailed, reply.outcome.failed.err);
+    try std.testing.expectEqualStrings("ConnectionResetByPeer", reply.outcome.failed.reason);
+}
+
+test "a client that keeps no reason answers empty rather than refusing to build" {
+    const Bare = struct {
+        fn sendVtable(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: message.Request,
+            _: OnDelta,
+            _: ?*anyopaque,
+        ) SendError!SendResult {
+            return error.TransportFailed;
+        }
+
+        const table = Client.VTable{ .send = sendVtable };
+    };
+
+    var nothing: u8 = 0;
+    const bare = Client{ .ptr = &nothing, .vtable = &Bare.table };
+    try std.testing.expectEqualStrings("", bare.transportReason());
+}

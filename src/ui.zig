@@ -2535,7 +2535,16 @@ pub const Ui = struct {
                     .{opened.decision},
                 ),
             },
-            .session_end => |ended| self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()}),
+            // The detail is the whole of what this line is worth. Every path
+            // that ends a session writes a sentence saying what happened, and
+            // printing the reason alone told a reader "errored" and no more.
+            .session_end => |ended| if (ended.detail.len == 0)
+                self.sayFmt(.chock, "session ended, {s}", .{ended.reason.wireName()})
+            else
+                self.sayFmt(.chock, "session ended, {s}: {s}", .{
+                    ended.reason.wireName(),
+                    ended.detail[0..@min(ended.detail.len, shown_detail_bytes)],
+                }),
             .usage => |spent| {
                 self.tokens_in += spent.input_tokens +
                     spent.cache_creation_input_tokens +
@@ -2721,6 +2730,11 @@ pub const Ui = struct {
 
     const shown_line_bytes = 400;
 
+    /// How much of a session end detail reaches the screen. A status error's
+    /// detail carries the provider's whole response body, which has its own
+    /// far larger bound, and the log keeps all of it either way.
+    const shown_detail_bytes = 240;
+
     const kept_lines = 512;
 
     fn say(self: *Ui, voice: Voice, text: []const u8) void {
@@ -2739,7 +2753,14 @@ pub const Ui = struct {
 
     fn sayFmt(self: *Ui, voice: Voice, comptime fmt: []const u8, args: anytype) void {
         var buffer: [shown_line_bytes + 128]u8 = undefined;
-        const said = std.fmt.bufPrint(&buffer, fmt, args) catch buffer[0..];
+        // A format that does not fit leaves the tail of `buffer` untouched, so
+        // the whole of it is not a string. `bufPrint` writes from the start and
+        // fails only once it runs out, which makes the buffer minus the room it
+        // needed for the rest the most that can be read back.
+        const said = std.fmt.bufPrint(&buffer, fmt, args) catch said: {
+            @memset(buffer[buffer.len - 3 ..], '.');
+            break :said buffer[0..];
+        };
         self.say(voice, said);
         self.endLine();
     }
