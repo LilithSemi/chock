@@ -33,6 +33,19 @@ pub const expresses = struct {
 
 /// macOS reaches `$TMPDIR` below `/var`, a link to `/private/var`, so a rule
 /// written on the unresolved spelling matches nothing. `buffer` holds the answer.
+/// Length first, so two fields cannot run together into one reading: a mount
+/// of `/ab` at `/c` and one of `/a` at `/bc` are different sandboxes.
+fn feedText(hash: *std.crypto.hash.sha2.Sha256, text: []const u8) void {
+    feedCount(hash, text.len);
+    hash.update(text);
+}
+
+fn feedCount(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hash.update(&bytes);
+}
+
 pub fn resolvedPath(io: std.Io, path: []const u8, buffer: []u8) []const u8 {
     if (expresses.moved_paths) return path;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return path;
@@ -82,6 +95,94 @@ pub const Config = struct {
         path: []const u8,
         access: landlock.AccessFs,
     };
+
+    /// SHA-256 over what this sandbox lets a tool call reach: every mount with
+    /// its kind and paths, every rule with its access bits, the scratch areas,
+    /// the limits, the network mode and the device tree.
+    ///
+    /// A resumed session runs a sandbox built again from the files and flags of
+    /// that run, so a change to any of them changes this. That is what it is
+    /// for: the log holds one of these per run, and two runs of one session
+    /// that differ here were not the same sandbox.
+    ///
+    /// The environment is left out on purpose. It decides what a program does
+    /// and not what it may reach, and it carries a path that moves between
+    /// machines, which would make every hash differ for no reason worth
+    /// reporting. `stdout_fd` and the report pointers are left out for the
+    /// same reason: they are this process's own, not the sandbox's shape.
+    pub fn shapeHash(self: Config) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        // A version of this function's own reading. A hash written by an older
+        // Chock, over fewer fields, must not compare equal to one written now.
+        feedText(&hash, "chock sandbox shape 1");
+
+        feedText(&hash, self.root);
+        feedText(&hash, self.cwd);
+
+        feedCount(&hash, self.mounts.len);
+        for (self.mounts) |mount| switch (mount) {
+            .bind => |one| {
+                feedText(&hash, "bind");
+                feedText(&hash, one.source);
+                feedText(&hash, one.target);
+                feedCount(&hash, @intFromBool(one.read_only));
+            },
+            .overlay => |one| {
+                feedText(&hash, "overlay");
+                feedText(&hash, one.lower);
+                feedText(&hash, one.upper);
+                feedText(&hash, one.work);
+                feedText(&hash, one.target);
+            },
+            .proc => |one| {
+                feedText(&hash, "proc");
+                feedText(&hash, one.target);
+            },
+            .deny => |one| {
+                feedText(&hash, "deny");
+                feedText(&hash, one.target);
+            },
+        };
+
+        feedCount(&hash, self.rules.len);
+        for (self.rules) |rule| {
+            feedText(&hash, rule.path);
+            feedCount(&hash, @as(u64, @intCast(@as(u64, @bitCast(rule.access)))));
+        }
+
+        feedCount(&hash, self.scratch.len);
+        for (self.scratch) |area| feedText(&hash, area.target);
+
+        inline for (@typeInfo(Limits).@"struct".fields) |field| {
+            const value = @field(self.limits, field.name);
+            feedText(&hash, field.name);
+            if (value) |set| feedCount(&hash, set) else feedText(&hash, "none");
+        }
+
+        feedText(&hash, @tagName(self.network));
+        feedText(&hash, @tagName(self.containment));
+        feedCount(&hash, @intFromBool(self.net_broker != null));
+        feedCount(&hash, @intFromBool(self.net_router != null));
+        feedCount(&hash, @intFromBool(self.device_source != null));
+        if (self.device_tree) |tree| {
+            feedText(&hash, tree.host);
+            feedText(&hash, tree.inside);
+        } else feedText(&hash, "no devices");
+
+        inline for (@typeInfo(seccomp.Options).@"struct".fields) |field| {
+            feedText(&hash, field.name);
+            const value = @field(self.seccomp_options, field.name);
+            switch (@typeInfo(@TypeOf(value))) {
+                .bool => feedCount(&hash, @intFromBool(value)),
+                .@"enum" => feedText(&hash, @tagName(value)),
+                else => feedText(&hash, "unread"),
+            }
+        }
+
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
 
     pub const DeviceTree = struct {
         host: []const u8,
@@ -1168,4 +1269,76 @@ test "a reader that never started, and one that never reported, are counted apar
     const counted = audit.pathCounts();
     try std.testing.expectEqual(@as(u64, 1), counted.readers_absent);
     try std.testing.expectEqual(@as(u64, 1), counted.readers_unreported);
+}
+
+test "the shape hash changes when the sandbox lets through anything different" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const mounts = [_]namespace.Mount{
+        .{ .bind = .{ .source = "/nix/store/a", .target = "/nix/store/a", .read_only = true } },
+        .{ .proc = .{} },
+    };
+    const base = Config{
+        .root = "/state/root",
+        .mounts = &mounts,
+        .rules = &.{},
+        .cwd = "/project",
+        .env = &.{},
+    };
+    const first = base.shapeHash();
+
+    // The same configuration hashes the same, or one run of one session could
+    // never be compared with the next.
+    try std.testing.expectEqualSlices(u8, &first, &base.shapeHash());
+
+    // A bind that became writable is the alteration this has to catch.
+    const widened = [_]namespace.Mount{
+        .{ .bind = .{ .source = "/nix/store/a", .target = "/nix/store/a", .read_only = false } },
+        .{ .proc = .{} },
+    };
+    var changed = base;
+    changed.mounts = &widened;
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed.shapeHash()));
+
+    // One more mount, a wider limit, and a network where there was none.
+    const added = [_]namespace.Mount{
+        .{ .bind = .{ .source = "/nix/store/a", .target = "/nix/store/a", .read_only = true } },
+        .{ .proc = .{} },
+        .{ .bind = .{ .source = "/home/me/.ssh", .target = "/home/me/.ssh", .read_only = true } },
+    };
+    var more = base;
+    more.mounts = &added;
+    try std.testing.expect(!std.mem.eql(u8, &first, &more.shapeHash()));
+
+    var looser = base;
+    looser.limits = .{ .memory_bytes = (base.limits.memory_bytes orelse 0) * 2 };
+    try std.testing.expect(!std.mem.eql(u8, &first, &looser.shapeHash()));
+
+    var networked = base;
+    networked.network = .filtered;
+    try std.testing.expect(!std.mem.eql(u8, &first, &networked.shapeHash()));
+
+    // A rule with more access, at the same path.
+    const narrow = [_]Config.Rule{.{ .path = "/project", .access = .{ .read_file = true } }};
+    const wide = [_]Config.Rule{.{ .path = "/project", .access = .{ .read_file = true, .write_file = true } }};
+    var reading = base;
+    reading.rules = &narrow;
+    var writing = base;
+    writing.rules = &wide;
+    try std.testing.expect(!std.mem.eql(u8, &reading.shapeHash(), &writing.shapeHash()));
+}
+
+test "two paths that run together are told apart by the length before each" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const left = [_]namespace.Mount{
+        .{ .bind = .{ .source = "/ab", .target = "/c" } },
+    };
+    const right = [_]namespace.Mount{
+        .{ .bind = .{ .source = "/a", .target = "/bc" } },
+    };
+    var one = Config{ .root = "/r", .mounts = &left, .rules = &.{}, .cwd = "/", .env = &.{} };
+    var two = one;
+    two.mounts = &right;
+    try std.testing.expect(!std.mem.eql(u8, &one.shapeHash(), &two.shapeHash()));
 }

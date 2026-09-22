@@ -179,6 +179,11 @@ pub const Deps = struct {
     /// parent, and not the nearest one: one link would report depth 2 at every
     /// depth and `max_depth` would bound nothing.
     spawn_chain: []const event.SpawnLink = &.{},
+    /// What a person put on the command line, and the hash of the file the
+    /// policy came from. Written once, beside `session_start`, so a session
+    /// that resumes does not write it twice. Null for a caller that records
+    /// nothing, which is every test that does not ask about it.
+    config: ?event.SessionConfig = null,
     parent_session: []const u8 = "",
     spawner: ?subagent.Spawner = null,
     /// The children this session started and did not wait for. Null is the wait
@@ -280,6 +285,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
                 .parent_session = deps.parent_session,
                 .spawn_chain = deps.spawn_chain,
             },
+        });
+    }
+
+    // On every run and not only the first, because a session that resumes can
+    // be given different flags, and those decide what it may do for the rest
+    // of it. The same reason `sandbox.open` is written every run.
+    if (deps.config) |config| {
+        _ = try appendAndApply(allocator, io, &locked, &session, deps, .{
+            .session_config = config,
         });
     }
 

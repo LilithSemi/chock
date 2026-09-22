@@ -108,6 +108,39 @@ chock sessions remove <session id>
 chock sessions prune --older-than 30
 ```
 
+Every run writes a `session.config` event, holding what a person put on the
+command line and the SHA-256 of the `chock.zon` the policy came from:
+
+```json
+{"session.config":{"config_hash":"9f2a...","sandbox_hash":"41c8...",
+ "instructions":["./task.md"],"policy_rules":["net.fetch.*=allow"],
+ "dev_shell":"ci","allow_dirty":true}}
+```
+
+It holds what the session had, and nothing about what it did not: a field you
+see is one somebody set. The hash is there because a `chock.zon` can be edited
+and never committed, so git is not enough to say which rules a session ran
+under. `config_hash` is the one field always written, and `null` means the
+project has no `chock.zon` at all. An absent file and an empty one would
+otherwise hash the same.
+
+A flag leaves no trace in any file, so two sessions on one commit that were
+given different rules write different bytes here, and the chain over them
+differs. That is the point of the event.
+
+`sandbox_hash` is over what the sandbox of that run lets a tool call reach:
+every mount with its source, target and read only flag, every Landlock rule
+with its access bits, the scratch areas, the limits, the network mode and the
+devices. The environment is left out, because it decides what a program does
+and not what it may reach, and it carries paths that move between machines.
+
+It is written on every run and not only the first. `chock run --continue` can
+be given different flags from the run before it, and a resumed session is
+where someone would try to alter the sandbox: the run that resumes builds its
+sandbox again from that run's files and flags. Two `session.config` events in
+one log whose `sandbox_hash` differs are two different sandboxes, and the log
+says so without anybody having to reconstruct either.
+
 Every run writes a `sandbox.open` event before its first turn, naming the run
 and whether the sandbox's write and execute rule was on for it. It is written on
 every run and not only on the run that gave the rule up, so an absent line means

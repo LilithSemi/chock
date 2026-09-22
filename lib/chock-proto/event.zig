@@ -99,6 +99,7 @@ fn ForwardCompatible(comptime T: type) type {
 
 pub const Kind = enum {
     session_start,
+    session_config,
     session_end,
     session_spawn,
     session_title,
@@ -142,6 +143,7 @@ pub const Kind = enum {
 
 const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .session_start = "session.start",
+    .session_config = "session.config",
     .session_end = "session.end",
     .session_spawn = "session.spawn",
     .session_title = "session.title",
@@ -224,6 +226,76 @@ pub const SessionStart = struct {
     const forward = ForwardCompatible(@This());
     pub const jsonStringify = forward.jsonStringify;
     pub const jsonParse = forward.jsonParse;
+};
+
+/// What a person put on the command line, and the content of the file the
+/// session read its policy from. Together these are the part of a session's
+/// configuration that its own log would not otherwise hold: a flag leaves no
+/// trace in `chock.zon`, and a `chock.zon` that is edited but never committed
+/// leaves none in git.
+///
+/// A field nobody set is left out, so a reader sees what the session had and
+/// never a list of what it did not. `config_hash` is the one exception: it is
+/// always written, because its absence is the fact worth recording.
+pub const SessionConfig = struct {
+    /// SHA-256 of `chock.zon`, lower case hex. Null means the project has no
+    /// `chock.zon`, so the session ran under the built in rules alone.
+    config_hash: ?[]const u8 = null,
+    /// SHA-256 over what the sandbox of this run lets a tool call reach: its
+    /// mounts, its rules, its scratch areas, its limits, its network mode and
+    /// its devices. Two runs of one session that differ here did not run the
+    /// same sandbox, which is the alteration this event exists to show.
+    sandbox_hash: []const u8 = "",
+    /// Every file `--instructions` named, in the order given.
+    instructions: []const []const u8 = &.{},
+    /// Every `--policy-rule`, as the person wrote it.
+    policy_rules: []const []const u8 = &.{},
+    /// The `devShells` attribute this session read, from `--dev-shell` or
+    /// from the `nix` block.
+    dev_shell: []const u8 = "",
+    /// True when `--allow-dirty` put uncommitted work in the workspace.
+    allow_dirty: bool = false,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonParse = forward.jsonParse;
+
+    /// Not `ForwardCompatible.jsonStringify`, which writes every field. A
+    /// reader of this event asks what the session was given, and a row of
+    /// empty strings answers a question nobody asked.
+    pub fn jsonStringify(self: SessionConfig, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+
+        try jw.objectField("config_hash");
+        try jw.write(self.config_hash);
+
+        if (self.sandbox_hash.len != 0) {
+            try jw.objectField("sandbox_hash");
+            try jw.write(self.sandbox_hash);
+        }
+        if (self.instructions.len != 0) {
+            try jw.objectField("instructions");
+            try jw.write(self.instructions);
+        }
+        if (self.policy_rules.len != 0) {
+            try jw.objectField("policy_rules");
+            try jw.write(self.policy_rules);
+        }
+        if (self.dev_shell.len != 0) {
+            try jw.objectField("dev_shell");
+            try jw.write(self.dev_shell);
+        }
+        if (self.allow_dirty) {
+            try jw.objectField("allow_dirty");
+            try jw.write(true);
+        }
+
+        for (self.extra.members) |member| {
+            try jw.objectField(member.name);
+            try jw.write(member.value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SessionEndReason = union(enum) {
@@ -994,6 +1066,7 @@ pub const UnknownEvent = struct {
 
 pub const Event = union(Kind) {
     session_start: SessionStart,
+    session_config: SessionConfig,
     session_end: SessionEnd,
     session_spawn: SessionSpawn,
     session_title: SessionTitle,
@@ -2093,4 +2166,81 @@ test "a reader can tell a session that moved a branch from one that did not" {
         read_parked.value.event.workspace_integrate.parked,
     );
     try std.testing.expectEqualStrings("merge", read_parked.value.event.workspace_integrate.mode);
+}
+
+test "a resumed run whose sandbox changed writes a different session.config" {
+    const gpa = std.testing.allocator;
+
+    const before = Event{ .session_config = .{ .config_hash = "ff00", .sandbox_hash = "aa11" } };
+    const after = Event{ .session_config = .{ .config_hash = "ff00", .sandbox_hash = "bb22" } };
+
+    const first = try std.json.Stringify.valueAlloc(gpa, before, .{});
+    defer gpa.free(first);
+    const second = try std.json.Stringify.valueAlloc(gpa, after, .{});
+    defer gpa.free(second);
+
+    // The same chock.zon, a different sandbox. A reader of the log sees the
+    // second run was not the first one's sandbox.
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.indexOf(u8, second, "bb22") != null);
+}
+
+test "session.config writes what the session had, and never a row of empty fields" {
+    const gpa = std.testing.allocator;
+
+    const bare = Event{ .session_config = .{ .config_hash = "abc123" } };
+    const text = try std.json.Stringify.valueAlloc(gpa, bare, .{});
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(
+        "{\"session.config\":{\"config_hash\":\"abc123\"}}",
+        text,
+    );
+
+    // A project with no chock.zon says so, rather than leaving the reader to
+    // guess between that and a writer too old to hold the field.
+    const none = Event{ .session_config = .{} };
+    const said = try std.json.Stringify.valueAlloc(gpa, none, .{});
+    defer gpa.free(said);
+    try std.testing.expectEqualStrings("{\"session.config\":{\"config_hash\":null}}", said);
+}
+
+test "every part of a session's configuration reaches the log, and reads back" {
+    const gpa = std.testing.allocator;
+
+    const full = Event{ .session_config = .{
+        .config_hash = "ff00",
+        .sandbox_hash = "aa11",
+        .instructions = &.{ "./task.md", "./style.md" },
+        .policy_rules = &.{"net.fetch.*=allow"},
+        .dev_shell = "ci",
+        .allow_dirty = true,
+    } };
+    const text = try std.json.Stringify.valueAlloc(gpa, full, .{});
+    defer gpa.free(text);
+
+    const parsed = try std.json.parseFromSlice(Event, gpa, text, .{});
+    defer parsed.deinit();
+
+    const back = parsed.value.session_config;
+    try std.testing.expectEqualStrings("ff00", back.config_hash.?);
+    try std.testing.expectEqualStrings("aa11", back.sandbox_hash);
+    try std.testing.expectEqual(@as(usize, 2), back.instructions.len);
+    try std.testing.expectEqualStrings("./style.md", back.instructions[1]);
+    try std.testing.expectEqualStrings("net.fetch.*=allow", back.policy_rules[0]);
+    try std.testing.expectEqualStrings("ci", back.dev_shell);
+    try std.testing.expect(back.allow_dirty);
+
+    // Two sessions given different rules write different bytes, which is what
+    // makes the chain over them worth reading.
+    const other = Event{ .session_config = .{
+        .config_hash = "ff00",
+        .sandbox_hash = "aa11",
+        .instructions = &.{ "./task.md", "./style.md" },
+        .policy_rules = &.{"net.fetch.*=deny"},
+        .dev_shell = "ci",
+        .allow_dirty = true,
+    } };
+    const differs = try std.json.Stringify.valueAlloc(gpa, other, .{});
+    defer gpa.free(differs);
+    try std.testing.expect(!std.mem.eql(u8, text, differs));
 }

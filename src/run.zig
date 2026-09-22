@@ -464,6 +464,7 @@ const Started = struct {
     prompt_project: chock_core.prompt.Project,
     prompt_sources: chock_core.prompt.Sources,
     spawn_chain: []const chock_proto.event.SpawnLink,
+    session_config: chock_proto.event.SessionConfig,
     credential: chock_auth.lookup.Resolved,
     model: []const u8,
     model_alias: []const u8,
@@ -593,6 +594,37 @@ fn daysIn(span_ms: i64) i64 {
 /// A rule given on the command line is not in a file anybody can read back, so
 /// the session says every one of them. They reach no subagent: a child reads
 /// the project's file and the org bundle alone.
+/// What a person gave this run, and the content of the file the policy came
+/// from. Only what is there: a reader of the log sees what the session had,
+/// and every field it does not carry is one nobody set.
+fn sessionConfig(
+    arena: std.mem.Allocator,
+    options: Options,
+    policy: *const chock_policy.table.Table,
+    dev_shell_name: ?[]const u8,
+    sandbox_config: sandbox.Config,
+) std.mem.Allocator.Error!chock_proto.event.SessionConfig {
+    var rules: std.ArrayList([]const u8) = .empty;
+    for (options.policy_rules) |rule| {
+        try rules.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{
+            rule.action orelse "*",
+            @tagName(rule.decision),
+        }));
+    }
+
+    return .{
+        .config_hash = if (policy.hasFile())
+            try std.fmt.allocPrint(arena, "{x}", .{policy.sourceHash()})
+        else
+            null,
+        .sandbox_hash = try std.fmt.allocPrint(arena, "{x}", .{sandbox_config.shapeHash()}),
+        .instructions = options.instructions,
+        .policy_rules = rules.items,
+        .dev_shell = dev_shell_name orelse "",
+        .allow_dirty = options.allow_dirty,
+    };
+}
+
 fn reportGivenRules(rules: []const chock_policy.table.Rule) void {
     for (rules) |rule| {
         tty.print(
@@ -1347,6 +1379,7 @@ fn start(
         .prompt_project = prompt_project,
         .prompt_sources = prompt_sources,
         .spawn_chain = chain,
+        .session_config = try sessionConfig(arena, options, policy, dev_shell_name, sandbox_config),
         .model = model,
         .model_alias = instance.name,
         .system_prompt = system_prompt,
@@ -9797,6 +9830,7 @@ fn runSession(
         .billing = started.billing,
         .subagents = started.subagents,
         .spawn_chain = started.spawn_chain,
+        .config = started.session_config,
         .parent_session = options.parent_session,
         .spawner = subagent_spawner.spawner(),
         .children = &children,

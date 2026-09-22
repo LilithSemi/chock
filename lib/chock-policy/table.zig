@@ -357,6 +357,10 @@ pub const Table = struct {
     /// that names nothing, and `allow` is the identity of `intersect`.
     org: []const Rule = &.{},
     hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    /// True when the table was read from a `chock.zon` on disk. A project with
+    /// no file gets a table parsed from an empty literal, whose hash is the
+    /// hash of that literal and not of anything a person wrote.
+    from_file: bool = false,
 
     /// The two layers around the project's own file.
     pub const Layers = struct {
@@ -389,6 +393,18 @@ pub const Table = struct {
         gpa: std.mem.Allocator,
         source: [:0]const u8,
         layers: Layers,
+        diag: ?*?Diagnostic,
+    ) ParseError!*const Table {
+        return parseFrom(gpa, source, layers, false, diag);
+    }
+
+    /// `from_file` is what the two entry points differ by, and a table is
+    /// built const, so it is a parameter and never a later write.
+    fn parseFrom(
+        gpa: std.mem.Allocator,
+        source: [:0]const u8,
+        layers: Layers,
+        from_file: bool,
         diag: ?*?Diagnostic,
     ) ParseError!*const Table {
         var trees = try Trees.init(gpa, source, diag);
@@ -428,6 +444,7 @@ pub const Table = struct {
             .given = layers.given,
             .org = layers.org,
             .hash = hashSource(source),
+            .from_file = from_file,
         };
         return table;
     }
@@ -479,7 +496,7 @@ pub const Table = struct {
         };
         defer gpa.free(source);
 
-        return parseLayered(gpa, source, layers, diag);
+        return parseFrom(gpa, source, layers, true, diag);
     }
 
     /// The allocator is a parameter and not a field, so a `Table` holds nothing
@@ -667,6 +684,12 @@ pub const Table = struct {
 
     pub fn sourceHash(self: *const Table) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
         return self.hash;
+    }
+
+    /// Whether a `chock.zon` was read. False means the project has none, so
+    /// `sourceHash` is the hash of an empty literal and says nothing.
+    pub fn hasFile(self: *const Table) bool {
+        return self.from_file;
     }
 };
 
@@ -2789,4 +2812,32 @@ test "a given rule is read as <action>=<decision>, and every other shape is refu
     // The same refusal the file gets: a `*` in the middle names nothing.
     try std.testing.expectError(error.ActionMalformed, parseGivenRule("net.*.fetch=allow"));
     try std.testing.expectError(error.ActionMalformed, parseGivenRule("*=allow"));
+}
+
+test "a table says whether a chock.zon was read, so an absent file is not an empty one" {
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const written = try tmp.dir.realPath(std.testing.io, &buffer);
+    const root = buffer[0..written];
+
+    // A project with no file at all.
+    try std.testing.expectError(
+        error.NoPolicyFile,
+        Table.load(gpa, std.testing.io, root, null),
+    );
+
+    const empty = try Table.parse(gpa, ".{}", null);
+    defer Table.destroy(gpa, empty);
+    try std.testing.expect(!empty.hasFile());
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_name, .data = ".{}" });
+    const read = try Table.load(gpa, std.testing.io, root, null);
+    defer Table.destroy(gpa, read);
+    try std.testing.expect(read.hasFile());
+
+    // The same bytes, so the hash cannot be what tells them apart.
+    try std.testing.expectEqualSlices(u8, &empty.sourceHash(), &read.sourceHash());
 }
