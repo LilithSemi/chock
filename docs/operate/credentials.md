@@ -35,12 +35,32 @@ other people can see.
 The lock is the kernel's own, so a login you kill releases it at once. There is
 nothing to clean up by hand.
 
-A second login with no `--name` is refused even when the two overlap. The
-name of an instance you did not name is its kind, so two `chock login
---provider aiand` runs at once are two runs for one name. The refusal is made
-again while the lock is held, so the second one is told the name is taken
-rather than replacing what the first one stored. Give `--name` to store a
-second instance, or give the name that is there to replace it on purpose.
+The name of an instance you did not name is its kind, so a second `chock login
+--provider aiand` is a second login for one name. At a terminal it asks before
+it replaces anything, and no is the default:
+
+```
+chock login: there is already a credential named "aiand", stored as kind aiand.
+Replace it? [y/N]
+```
+
+The question comes before the credential is read, so answering no costs you
+nothing and you never type a secret for a login that will not happen.
+
+A run with nobody to ask is refused instead, because silence is not a yes.
+That is a pipe, a `--password-method` that reads a file, and any continuous
+integration job. Those say which they meant:
+
+```
+chock login --provider aiand --replace
+chock login --provider aiand --name <a name of your own>
+```
+
+`--replace` also works at a terminal, and skips the question.
+
+The same check is made again while the index lock is held, so a login that
+started while another one sat at its prompt is told the name is taken rather
+than writing over what that one stored.
 
 On macOS the lock is also held while the Keychain is written. If your Keychain
 asks you to unlock it, a second login can reach the five second bound while you

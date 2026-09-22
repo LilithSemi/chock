@@ -12,12 +12,17 @@
 //! into by accident, and it is the exact path redaction exists to close. This
 //! command is the only way in.
 //!
-//! ## The name is the key, and a second unnamed instance is refused
+//! ## The name is the key, and a second unnamed instance is asked about
 //!
 //! **A second `--provider aiand` with no `--name` must not silently replace
-//! the first.** It is refused, and the message says a name is needed. To
-//! replace a credential on purpose, name the instance: a user who typed a
-//! name meant that one.
+//! the first.** At a terminal it asks, and the default answer is no. A user
+//! who meant to replace it says so once and the login goes on.
+//!
+//! **Silence is not consent.** A run with nobody to ask, a pipe or a
+//! continuous integration job, is refused instead, and the message names
+//! `--replace` and `--name` as the two ways to say which was meant. Asking
+//! happens before the credential is read: a person who answers no is never
+//! made to type a secret first.
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
@@ -32,6 +37,7 @@ const usage_text =
     \\
     \\Options:
     \\  --name <name>              Name this instance. Omitted, the kind is the name.
+    \\  --replace                  Replace a credential of this name without asking.
     \\                             A second instance of one kind needs a name of its own.
     \\  --password-method <method> Where the credential comes from:
     \\                               prompt      a hidden prompt (the default at a terminal)
@@ -67,6 +73,9 @@ const Options = struct {
     provider: []const u8 = "",
     name: ?[]const u8 = null,
     method: ?Method = null,
+    /// Replace a credential of the same name without being asked. For a
+    /// script, which has nobody at a terminal to answer.
+    replace: bool = false,
 };
 
 pub fn main(
@@ -124,7 +133,13 @@ pub fn main(
     // for minutes: every other login would time out on it. So two logins can
     // both pass this look, and `replace_existing` below is what refuses the
     // second one when they do.
-    if (!name_was_given) {
+    // Before the check, because whether there is anybody to ask is what the
+    // check does when the name is taken, and because a prompt for the
+    // credential must not read the line an answer would have used.
+    const method = options.method orelse defaultMethod(io);
+
+    var replacing = options.replace;
+    if (!name_was_given and !options.replace) {
         var store_diag: ?chock_auth.store.Diagnostic = null;
         defer if (store_diag) |*d| d.deinit(gpa);
         const existing = store.get(gpa, io, name, &store_diag) catch |err| {
@@ -138,12 +153,21 @@ pub fn main(
         if (existing) |found| {
             var stored = found;
             defer stored.deinit();
-            reportNameTaken(name, stored.kind, options.provider);
-            return Exit.usage.code();
+
+            // A run reading the credential from a pipe or a file has nobody at
+            // a terminal, and a question nobody answers must not be read as a
+            // yes. That run is refused, and told the two ways to mean it.
+            if (method != .prompt) {
+                reportNameTaken(name, stored.kind, options.provider);
+                return Exit.usage.code();
+            }
+            replacing = askReplace(io, name, stored.kind) catch return Exit.usage.code();
+            if (!replacing) {
+                tty.print(.plain, "chock login: nothing was changed.\n", .{});
+                return Exit.refused.code();
+            }
         }
     }
-
-    const method = options.method orelse defaultMethod(io);
     const credential = readCredential(gpa, io, method, name) catch |err| switch (err) {
         error.Reported => return Exit.usage.code(),
         else => |e| return e,
@@ -224,7 +248,7 @@ pub fn main(
         // with the index locked, so a login that started while another one was
         // at its prompt is refused here rather than replacing what that one
         // stored. See `chock_auth.store.NewEntry.replace_existing`.
-        .replace_existing = name_was_given,
+        .replace_existing = name_was_given or replacing,
     }, &put_diag) catch |err| {
         // A locked Keychain, a path in the Nix store, and a data directory
         // that could not be made all read alike without this. The store used
@@ -260,12 +284,40 @@ pub fn main(
 fn reportNameTaken(name: []const u8, stored_kind: []const u8, provider: []const u8) void {
     tty.print(
         .warn,
-        "chock login: there is already a credential named \"{s}\", stored as kind {s}. " ++
-            "A name is needed:\n\n" ++
-            "  chock login --provider {s} --name <a name of your own>\n\n" ++
-            "Give --name {s} to replace the one that is there.\n",
-        .{ name, stored_kind, provider, name },
+        "chock login: there is already a credential named \"{s}\", stored as kind {s}, " ++
+            "and this run has nobody to ask. Say which was meant:\n\n" ++
+            "  chock login --provider {s} --replace\n" ++
+            "  chock login --provider {s} --name <a name of your own>\n",
+        .{ name, stored_kind, provider, provider },
     );
+}
+
+/// Ask whether to replace the credential of this name. No is the default, so
+/// a bare newline and an input that ends keep what is stored.
+///
+/// The credential has not been read yet, so a person who answers no has typed
+/// no secret. See the look this belongs to.
+fn askReplace(io: std.Io, name: []const u8, stored_kind: []const u8) error{Reported}!bool {
+    tty.print(
+        .warn,
+        "chock login: there is already a credential named \"{s}\", stored as kind {s}.\n",
+        .{ name, stored_kind },
+    );
+    tty.print(.plain, "Replace it? [y/N] ", .{});
+    tty.flushOut();
+
+    var buffer: [64]u8 = undefined;
+    var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
+    const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        // An input that ended is not a yes.
+        error.EndOfStream => return false,
+        else => {
+            tty.print(.err, "chock login: the answer could not be read: {s}\n", .{@errorName(err)});
+            return error.Reported;
+        },
+    };
+    const answer = std.mem.trim(u8, line, " \t\r");
+    return std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes");
 }
 
 /// The configuration file, read once. `chock login` needs it twice: to learn
@@ -608,6 +660,11 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             continue;
         }
 
+        if (std.mem.eql(u8, name, "--replace")) {
+            options.replace = true;
+            continue;
+        }
+
         if (std.mem.eql(u8, name, "--name")) {
             options.name = inline_value orelse next: {
                 index += 1;
@@ -872,4 +929,31 @@ test "an instance with no name takes the kind, and --name names one of its own" 
     try testing.expectError(error.BadArguments, parseOptions(&.{}));
     try testing.expect(std.mem.indexOf(u8, said.err(), "--provider is needed") != null);
     try testing.expectEqualStrings("", said.out());
+}
+
+test "--replace is a flag, and a login with neither it nor --name asks for itself" {
+    {
+        const options = try parseOptions(&.{ "--provider", "aiand", "--replace" });
+        try testing.expect(options.replace);
+        try testing.expect(options.name == null);
+    }
+    {
+        const options = try parseOptions(&.{ "--provider", "aiand" });
+        try testing.expect(!options.replace);
+    }
+}
+
+test "a run with nobody to ask names both ways of meaning it" {
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    reportNameTaken("aiand", "aiand", "aiand");
+
+    // The old message demanded --name and then said which value to give it,
+    // which is the tool naming the answer and refusing to act on it.
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--replace") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--name") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "nobody to ask") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "A name is needed") == null);
 }
