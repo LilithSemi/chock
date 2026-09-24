@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const chock_core = @import("chock-core");
+const chock_policy = @import("chock-policy");
 
 const Exit = @import("main.zig").Exit;
 const version = @import("main.zig").version;
@@ -153,6 +154,64 @@ pub const Found = struct {
     refused: []const Refusal = &.{}, // what was not carried and why
 };
 
+/// Every action name this build defines, as `docs/configure/actions.md` lists
+/// them. A `.*` entry stands for itself and for every name under it.
+const known_actions = [_][]const u8{
+    "device.*",            "exec.devshell.*",  "exec.nix.store.*", "exec.path.*",
+    "exec.unparsed",       "exec.workspace.*", "file.write",       "git.branch.delete",
+    "git.commit",          "git.push",         "lsp.*",            "mcp.*",
+    "model.select",        "net.connect.*",    "net.fetch",        "net.fetch.*",
+    "nix.build",           "nix.build.*",      "nix.net.*",        "nix.net.build.opaque",
+    "plugin.*",            "policy.widen",     "sandbox.jit",      "workspace.apply",
+    "workspace.integrate",
+};
+
+/// Whether `action` is a name this build decides anything by.
+///
+/// **A row naming an action nothing here defines is worse than no row.** It
+/// reads as a carried stance and matches nothing, and a name carrying a `*`
+/// anywhere but the end is refused outright by the policy reader, so the whole
+/// generated file then fails to load. A reader that finds no equivalent must
+/// refuse instead: see `Refusal`.
+pub fn isKnownAction(action: []const u8) bool {
+    for (known_actions) |known| {
+        if (std.mem.eql(u8, action, known)) return true;
+        if (std.mem.endsWith(u8, known, ".*")) {
+            const prefix = known[0 .. known.len - 1];
+            if (std.mem.startsWith(u8, action, prefix) and action.len > prefix.len) return true;
+        }
+    }
+    return false;
+}
+
+/// Move every hint naming an action this build does not define into
+/// `refused`, so no reader can put an inert or unloadable row in the file.
+///
+/// A reader should refuse these itself and say something useful about the
+/// source's own spelling. This is the net under that, and it runs on every
+/// read: a reader added later cannot reintroduce the fault by forgetting.
+pub fn vet(arena: std.mem.Allocator, found: Found) std.mem.Allocator.Error!Found {
+    var kept: std.ArrayList(Hint) = .empty;
+    var refused: std.ArrayList(Refusal) = .empty;
+    try refused.appendSlice(arena, found.refused);
+
+    for (found.policy_hints) |hint| {
+        if (isKnownAction(hint.action)) {
+            try kept.append(arena, hint);
+            continue;
+        }
+        try refused.append(arena, .{
+            .what = try std.fmt.allocPrint(arena, "{s} (from {s})", .{ hint.action, hint.source_file }),
+            .reason = "no action here goes by that name, so a row for it would decide nothing",
+        });
+    }
+
+    var out = found;
+    out.policy_hints = try kept.toOwnedSlice(arena);
+    out.refused = try refused.toOwnedSlice(arena);
+    return out;
+}
+
 /// One harness this build can read a configuration from.
 pub const Reader = struct {
     name: []const u8,
@@ -164,6 +223,9 @@ pub const Reader = struct {
 pub const readers = [_]Reader{
     .{ .name = "claude-code", .read = @import("migrate/claude_code.zig").read },
     .{ .name = "codex", .read = @import("migrate/codex.zig").read },
+    .{ .name = "opencode", .read = @import("migrate/opencode.zig").read },
+    .{ .name = "zed", .read = @import("migrate/zed.zig").read },
+    .{ .name = "oh-my-pi", .read = @import("migrate/oh_my_pi.zig").read },
 };
 
 /// The variable name half of a `NAME=value` pair a harness's own file wrote.
@@ -218,7 +280,7 @@ pub fn main(
     };
 
     const project_root = try resolveProject(arena, io, options.project);
-    const found = try reader.read(arena, io, project_root);
+    const found = try vet(arena, try reader.read(arena, io, project_root));
     return finish(arena, io, project_root, found, options.print);
 }
 
@@ -725,19 +787,56 @@ test "--print never touches chock.zon, even when there is none to protect" {
 test "a harness this build reads is found, and one it does not is refused by name" {
     const gpa = testing.allocator;
 
-    try testing.expect(findReader("claude-code") != null);
-    try testing.expect(findReader("codex") != null);
+    for ([_][]const u8{ "claude-code", "codex", "opencode", "zed", "oh-my-pi" }) |name| {
+        try testing.expect(findReader(name) != null);
+    }
     try testing.expect(findReader("emacs") == null);
 
     // The refusal names every harness, so a person who spelled one wrong is
     // told what this build does read.
     const known = try knownHarnesses(gpa);
     defer gpa.free(known);
-    try testing.expect(std.mem.indexOf(u8, known, "claude-code") != null);
-    try testing.expect(std.mem.indexOf(u8, known, "codex") != null);
+    for ([_][]const u8{ "claude-code", "codex", "opencode", "zed", "oh-my-pi" }) |name| {
+        try testing.expect(std.mem.indexOf(u8, known, name) != null);
+    }
 }
 
 test {
     _ = @import("migrate/claude_code.zig");
     _ = @import("migrate/codex.zig");
+}
+
+test "a hint naming an action this build does not define never reaches a row" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const found = Found{
+        .policy_hints = &.{
+            .{ .action = "git.push", .said = .deny, .source_file = "a.json" },
+            // Claude Code spells a rule as a tool and an argument pattern. The
+            // policy reader refuses an interior `*` outright, so a row carrying
+            // one would stop the whole file loading.
+            .{ .action = "Bash(cargo test:*)", .said = .allow, .source_file = "a.json" },
+            .{ .action = "sandbox.write", .said = .deny, .source_file = "b.toml" },
+        },
+    };
+
+    const vetted = try vet(arena, found);
+    try testing.expectEqual(@as(usize, 1), vetted.policy_hints.len);
+    try testing.expectEqualStrings("git.push", vetted.policy_hints[0].action);
+    try testing.expectEqual(@as(usize, 2), vetted.refused.len);
+    try testing.expect(std.mem.indexOf(u8, vetted.refused[0].what, "Bash(cargo test:*)") != null);
+}
+
+test "every action the guard admits is one the policy reader can carry" {
+    // A name this build offers but the table refuses would be a file that
+    // cannot load, which is the fault the guard exists to stop.
+    for (known_actions) |action| {
+        try testing.expect(isKnownAction(action));
+        try testing.expect(chock_policy.table.patternIsWellFormed(action));
+    }
+    try testing.expect(isKnownAction("net.fetch.com.example"));
+    try testing.expect(!isKnownAction("Bash(cargo test:*)"));
+    try testing.expect(!isKnownAction("sandbox.write"));
 }

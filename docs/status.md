@@ -331,11 +331,11 @@ before this harness existed found nine faults, and this run found a tenth.
   prompt, so the worst an agent can do is make noise, which is visible and
   refusable.
 
-- `chock migrate` reads a Claude Code or a Codex configuration. It is a one
-  shot, offline command: no session, no model, no network, no sandbox.
-  `--from <harness>` names a harness, and a name this build does not read is
-  refused against the list in `readers` in `src/migrate.zig`. OpenCode, Zed
-  and oh-my-pi are not read yet. A foreign deny renders at `.deny`. A
+- `chock migrate` reads a Claude Code, Codex, OpenCode, Zed or oh-my-pi
+  configuration. It is a one shot, offline command: no session, no model, no
+  network, no sandbox. `--from <harness>` names a harness, and a name this
+  build does not read is refused against the list in `readers` in
+  `src/migrate.zig`. A foreign deny renders at `.deny`. A
   foreign allow renders at `.ask`, never `.allow`, because an allow read
   against one tool's threat model does not become an allow under this one. A
   hook, a plugin, a skill and a slash command carry into no field: a reader
@@ -349,6 +349,20 @@ before this harness existed found nine faults, and this run found a tenth.
   each refused and named in the report. A row for an action this build does
   not define would read as a carried stance and match nothing, which is worse
   than refusing it, because the file then looks faithful.
+
+  `migrate.vet` is the net under that. It runs on every read and moves a hint
+  naming an action this build does not define into the refusals, so a reader
+  added later cannot put an inert row in the file by forgetting. A test holds
+  every name the guard admits to what `chock_policy.table.patternIsWellFormed`
+  accepts, because a name the table refuses would stop the generated file
+  loading at all.
+
+  Most foreign permissions do not survive this. A Claude Code rule names a
+  tool and an argument pattern, as in `Bash(cargo test:*)`; Zed's are regular
+  expressions over command text; oh-my-pi's and OpenCode's are their own tool
+  names. None of those is an action name here, so each is refused and named
+  rather than guessed at. `webfetch` and `lsp` in OpenCode are the two that
+  reach a real action.
 
   The generated file opens with a header comment naming the version that
   wrote it, the date, and every file a reader read with the SHA-256 of the

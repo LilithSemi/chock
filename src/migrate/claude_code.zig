@@ -39,8 +39,8 @@ pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anye
     var refused: std.ArrayList(Refusal) = .empty;
 
     try readInstructions(arena, io, project_root, &sources, &instructions);
-    try readSettings(arena, io, project_root, ".claude/settings.json", &sources, &policy_hints, &refused);
-    try readSettings(arena, io, project_root, ".claude/settings.local.json", &sources, &policy_hints, &refused);
+    try readSettings(arena, io, project_root, ".claude/settings.json", &sources, &refused);
+    try readSettings(arena, io, project_root, ".claude/settings.local.json", &sources, &refused);
     try readMcp(arena, io, project_root, &sources, &mcp_servers, &refused);
     try refuseUncarriedDirectories(arena, io, project_root, &refused);
 
@@ -112,7 +112,6 @@ fn readSettings(
     project_root: []const u8,
     rel: []const u8,
     sources: *std.ArrayList(ReadSource),
-    policy_hints: *std.ArrayList(Hint),
     refused: *std.ArrayList(Refusal),
 ) !void {
     const bytes = try readBounded(arena, io, project_root, rel, max_settings_bytes) orelse return;
@@ -137,16 +136,17 @@ fn readSettings(
 
     const permissions = parsed.permissions orelse return;
 
-    for (permissions.deny) |action| {
-        try policy_hints.append(arena, .{ .action = action, .said = .deny, .source_file = rel });
-    }
-    for (permissions.allow) |action| {
-        try policy_hints.append(arena, .{ .action = action, .said = .allow, .source_file = rel });
-    }
-    // The same row an allow gets, and not the same fact. The report tells an
-    // act that was narrowed from one that was already this narrow upstream.
-    for (permissions.ask) |action| {
-        try policy_hints.append(arena, .{ .action = action, .said = .ask, .source_file = rel });
+    // A rule here is a tool and an argument pattern, as in `Bash(cargo
+    // test:*)`. Chock's table matches an action name, so none of these carry:
+    // the name would decide nothing, and an interior `*` is refused by the
+    // policy reader outright, which would stop the whole file loading.
+    for ([_][]const []const u8{ permissions.deny, permissions.allow, permissions.ask }) |list| {
+        for (list) |rule| {
+            try refused.append(arena, .{
+                .what = try std.fmt.allocPrint(arena, "permissions rule {s}", .{rule}),
+                .reason = "it names a tool and an argument pattern, and this table decides by action name instead",
+            });
+        }
     }
 
     if (permissions.additionalDirectories.len != 0) {
@@ -272,7 +272,7 @@ fn tmpProjectRoot(arena: std.mem.Allocator, tmp: *testing.TmpDir) ![]const u8 {
     return arena.dupe(u8, buffer[0..len]);
 }
 
-test "a deny becomes said = .deny and an allow becomes said = .allow" {
+test "a permission rule is refused by name, because it is a tool and a pattern" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -281,47 +281,23 @@ test "a deny becomes said = .deny and an allow becomes said = .allow" {
     defer tmp.cleanup();
     const project_root = try tmpProjectRoot(arena, &tmp);
 
+    // The shapes Claude Code actually writes. None is an action name here,
+    // and `Bash(cargo test:*)` would be refused by the policy reader outright
+    // for the `*` in the middle, taking the whole file with it.
     try writeProjectFile(testing.io, project_root, ".claude/settings.json",
-        \\{"permissions": {"deny": ["Bash(rm:*)"], "allow": ["git.push"]}}
+        \\{"permissions": {"deny": ["Read(//etc/**)"], "allow": ["Bash(cargo test:*)"], "ask": ["WebFetch(domain:example.com)"]}}
     );
 
     const found = try read(arena, testing.io, project_root);
 
-    var saw_deny = false;
-    var saw_allow = false;
-    for (found.policy_hints) |hint| {
-        if (std.mem.eql(u8, hint.action, "Bash(rm:*)")) {
-            try testing.expectEqual(migrate.Said.deny, hint.said);
-            saw_deny = true;
-        }
-        if (std.mem.eql(u8, hint.action, "git.push")) {
-            try testing.expectEqual(migrate.Said.allow, hint.said);
-            saw_allow = true;
-        }
+    try testing.expectEqual(@as(usize, 0), found.policy_hints.len);
+    var seen: usize = 0;
+    for (found.refused) |one| {
+        if (std.mem.indexOf(u8, one.what, "Bash(cargo test:*)") != null) seen += 1;
+        if (std.mem.indexOf(u8, one.what, "Read(//etc/**)") != null) seen += 1;
+        if (std.mem.indexOf(u8, one.what, "WebFetch(domain:example.com)") != null) seen += 1;
     }
-    try testing.expect(saw_deny);
-    try testing.expect(saw_allow);
-}
-
-test "an ask entry keeps said = .ask, so the report does not call it narrowed" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const project_root = try tmpProjectRoot(arena, &tmp);
-
-    try writeProjectFile(testing.io, project_root, ".claude/settings.json",
-        \\{"permissions": {"ask": ["net.fetch.*"]}}
-    );
-
-    const found = try read(arena, testing.io, project_root);
-
-    try testing.expectEqual(@as(usize, 1), found.policy_hints.len);
-    try testing.expectEqualStrings("net.fetch.*", found.policy_hints[0].action);
-    try testing.expectEqual(migrate.Said.ask, found.policy_hints[0].said);
-    try testing.expect(!found.policy_hints[0].wasNarrowed());
+    try testing.expectEqual(@as(usize, 3), seen);
 }
 
 test "an env value never appears anywhere in the returned Found while its name does" {
