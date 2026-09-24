@@ -18,6 +18,8 @@
 //!
 //! - a `deny` carries as `.deny`. A deny only narrows, in any threat model.
 //! - an `allow` carries as `.ask`, never `.allow`.
+//! - an `ask` carries as `.ask`, which is the same row an allow gets but not
+//!   the same fact: the report separates the two.
 //! - an MCP server becomes an `.mcp_servers` entry, and an `.ask` row beside
 //!   it: running a third party program is exactly the kind of act an allow
 //!   must not carry silently.
@@ -106,8 +108,10 @@ pub const McpServer = struct {
     source_file: []const u8 = "",
 };
 
-/// What a foreign source said about one action, and where it said it.
-pub const Said = enum { allow, deny };
+/// What a foreign source said about one action. Kept as the source said it,
+/// so the report can tell an act that was narrowed from one that was already
+/// this narrow upstream.
+pub const Said = enum { allow, ask, deny };
 
 /// The policy row a foreign permission becomes. Never `.allow`: see this
 /// file's own top comment.
@@ -122,8 +126,14 @@ pub const Hint = struct {
     pub fn decision(self: Hint) Decision {
         return switch (self.said) {
             .deny => .deny,
-            .allow => .ask,
+            .allow, .ask => .ask,
         };
+    }
+
+    /// Whether this build wrote something narrower than the source did. An
+    /// `ask` upstream lands on `ask` here, so it was carried and not narrowed.
+    pub fn wasNarrowed(self: Hint) bool {
+        return self.said == .allow;
     }
 };
 
@@ -149,10 +159,12 @@ pub const Reader = struct {
     read: *const fn (arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anyerror!Found,
 };
 
-/// Every harness this build reads. Empty until the first reader lands: both
-/// `--from` and the bare command refuse against this list, and the refusal
-/// names every entry in it.
-pub const readers = [_]Reader{};
+/// Every harness this build reads. Both `--from` and the bare command refuse
+/// against this list, and the refusal names every entry in it.
+pub const readers = [_]Reader{
+    .{ .name = "claude-code", .read = @import("migrate/claude_code.zig").read },
+    .{ .name = "codex", .read = @import("migrate/codex.zig").read },
+};
 
 /// The variable name half of a `NAME=value` pair a harness's own file wrote.
 /// The value is never returned. A pair with no `=` is already a bare name
@@ -285,8 +297,12 @@ fn report(found: Found) void {
         carried = true;
     }
     for (found.policy_hints) |hint| {
-        if (hint.said != .deny) continue;
-        tty.out(.plain, "  policy        {s} -> deny  (from {s})\n", .{ hint.action, hint.source_file });
+        if (hint.wasNarrowed()) continue;
+        tty.out(.plain, "  policy        {s} -> {t}  (from {s})\n", .{
+            hint.action,
+            hint.decision(),
+            hint.source_file,
+        });
         carried = true;
     }
     if (!carried) tty.out(.plain, "  nothing\n", .{});
@@ -294,7 +310,7 @@ fn report(found: Found) void {
     tty.out(.plain, "\nnarrowed, an allow became ask:\n", .{});
     var narrowed = false;
     for (found.policy_hints) |hint| {
-        if (hint.said != .allow) continue;
+        if (!hint.wasNarrowed()) continue;
         tty.out(.plain, "  {s}  allow -> ask  (from {s})\n", .{ hint.action, hint.source_file });
         narrowed = true;
     }
@@ -706,7 +722,22 @@ test "--print never touches chock.zon, even when there is none to protect" {
     );
 }
 
-test "no reader is built yet, so any --from is refused and names what this build knows" {
-    try testing.expect(findReader("claude-code") == null);
-    try testing.expectEqualStrings("none", try knownHarnesses(testing.allocator));
+test "a harness this build reads is found, and one it does not is refused by name" {
+    const gpa = testing.allocator;
+
+    try testing.expect(findReader("claude-code") != null);
+    try testing.expect(findReader("codex") != null);
+    try testing.expect(findReader("emacs") == null);
+
+    // The refusal names every harness, so a person who spelled one wrong is
+    // told what this build does read.
+    const known = try knownHarnesses(gpa);
+    defer gpa.free(known);
+    try testing.expect(std.mem.indexOf(u8, known, "claude-code") != null);
+    try testing.expect(std.mem.indexOf(u8, known, "codex") != null);
+}
+
+test {
+    _ = @import("migrate/claude_code.zig");
+    _ = @import("migrate/codex.zig");
 }

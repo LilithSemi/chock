@@ -331,12 +331,11 @@ before this harness existed found nine faults, and this run found a tenth.
   prompt, so the worst an agent can do is make noise, which is visible and
   refusable.
 
-- `chock migrate` exists as a command and reads no harness yet. It is a one
+- `chock migrate` reads a Claude Code or a Codex configuration. It is a one
   shot, offline command: no session, no model, no network, no sandbox.
-  `--from <harness>` names a harness, and this build refuses every name,
-  because `readers` in `src/migrate.zig` lists none. What is already built is
-  the neutral value a reader will hand back, `Found`, and the writer that
-  turns one into `chock.zon` text. A foreign deny renders at `.deny`. A
+  `--from <harness>` names a harness, and a name this build does not read is
+  refused against the list in `readers` in `src/migrate.zig`. OpenCode, Zed
+  and oh-my-pi are not read yet. A foreign deny renders at `.deny`. A
   foreign allow renders at `.ask`, never `.allow`, because an allow read
   against one tool's threat model does not become an allow under this one. A
   hook, a plugin, a skill and a slash command carry into no field: a reader
@@ -344,6 +343,12 @@ before this harness existed found nine faults, and this run found a tenth.
   variable's value is never read, only its name, through `envName`. It never
   overwrites a `chock.zon` that is already there: it prints the rows it would
   have added and writes nothing instead.
+
+  A stance that covers a whole session carries into no row. Codex's
+  `sandbox_mode` and `approval_policy`, and Claude Code's `defaultMode`, are
+  each refused and named in the report. A row for an action this build does
+  not define would read as a carried stance and match nothing, which is worse
+  than refusing it, because the file then looks faithful.
 
   The generated file opens with a header comment naming the version that
   wrote it, the date, and every file a reader read with the SHA-256 of the
