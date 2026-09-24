@@ -151,6 +151,10 @@ pub const Loaded = struct {
     /// The files `--instructions` named, in the order they were given.
     given: []const Block = &.{},
     project: ?Block = null,
+    /// Files chock.zon's `instructions` block named, already resolved to a
+    /// path on disk by `chock_policy.instructions`. Each one is its own
+    /// `.project` layer block, beside `AGENTS.md`.
+    project_named: []const Block = &.{},
     /// One index entry per subtree file: the path, and the file's own first
     /// meaningful line as its description. The path is relative to the
     /// project root, which is exactly what `read_file` takes.
@@ -183,14 +187,26 @@ pub const GivenDiagnostic = struct {
     path: []const u8 = "",
 };
 
+/// Why a file chock.zon's `instructions` block named could not be read. The
+/// path is the caller's and is not copied.
+pub const ProjectNamedError = error{ProjectNamedFileUnreadable};
+
+/// The file chock.zon named that could not be read, filled in when `load`
+/// answers `error.ProjectNamedFileUnreadable`.
+pub const ProjectNamedDiagnostic = struct {
+    path: []const u8 = "",
+};
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
     config_dir: ?[]const u8,
     project_root: []const u8,
     given: []const []const u8,
-    diag: ?*GivenDiagnostic,
-) (Error || GivenError)!Loaded {
+    given_diag: ?*GivenDiagnostic,
+    project_named: []const []const u8,
+    project_named_diag: ?*ProjectNamedDiagnostic,
+) (Error || GivenError || ProjectNamedError)!Loaded {
     var files: std.ArrayList(ReadFile) = .empty;
     errdefer files.deinit(allocator);
 
@@ -220,7 +236,7 @@ pub fn load(
             // project that has none; an absent named file is a session the
             // caller asked for and did not get.
             const read = try readBounded(allocator, io, path) orelse {
-                if (diag) |slot| slot.* = .{ .path = path };
+                if (given_diag) |slot| slot.* = .{ .path = path };
                 return error.GivenFileUnreadable;
             };
             blocks[index_of] = .{
@@ -246,6 +262,30 @@ pub fn load(
             };
             try files.append(allocator, .{ .layer = .project, .path = file_name, .bytes = read.total_bytes });
         }
+    }
+
+    if (project_named.len != 0) {
+        var blocks = try allocator.alloc(Block, project_named.len);
+        errdefer allocator.free(blocks);
+        for (project_named, 0..) |path, index_of| {
+            // Named in the project's own chock.zon, so a file that cannot be
+            // read is a refusal and never silence, for the same reason a
+            // file `--instructions` names is: the project asked for it by
+            // name, and a session that silently drops it is not the session
+            // that was asked for.
+            const read = try readBounded(allocator, io, path) orelse {
+                if (project_named_diag) |slot| slot.* = .{ .path = path };
+                return error.ProjectNamedFileUnreadable;
+            };
+            blocks[index_of] = .{
+                .layer = .project,
+                .path = path,
+                .text = read.text,
+                .truncated = read.truncated,
+            };
+            try files.append(allocator, .{ .layer = .project, .path = path, .bytes = read.total_bytes });
+        }
+        loaded.project_named = blocks;
     }
 
     const found = try scanSubtrees(allocator, io, project_root, &files);
@@ -422,7 +462,7 @@ test "the project's own AGENTS.md is read, and the file and its size are reporte
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root, &.{}, null);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expect(loaded.operator == null);
     try testing.expectEqualStrings(body, loaded.project.?.text);
     try testing.expectEqual(Layer.project, loaded.project.?.layer);
@@ -450,14 +490,14 @@ test "the operator's own file is read with no project file present, and alongsid
     const project_root = try std.fs.path.join(arena, &.{ tmp_path, "project" });
 
     {
-        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null);
+        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null, &.{}, null);
         try testing.expectEqualStrings("Never use emoji.\n", loaded.operator.?.text);
         try testing.expect(loaded.project == null);
     }
 
     try writeAt(testing.io, tmp.dir, "project/" ++ file_name, "Use tabs.\n");
     {
-        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null);
+        const loaded = try load(arena, testing.io, config_dir, project_root, &.{}, null, &.{}, null);
         try testing.expectEqualStrings("Never use emoji.\n", loaded.operator.?.text);
         try testing.expectEqualStrings("Use tabs.\n", loaded.project.?.text);
         // Two files, two layers, and the two are not one block: the whole
@@ -493,7 +533,7 @@ test "an AGENTS.md in a subdirectory is an index line and not a block, so its bo
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root, &.{}, null);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expect(loaded.project == null);
     try testing.expectEqual(@as(usize, 1), loaded.subtrees.len);
     try testing.expectEqualStrings("src/parser/" ++ file_name, loaded.subtrees[0].name);
@@ -515,7 +555,7 @@ test "the git directory is never walked for instruction files" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root, &.{}, null);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
 }
 
@@ -534,7 +574,7 @@ test "a file past the block bound is cut, says so, and still reports its real si
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root, &.{}, null);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expect(loaded.project.?.truncated);
     try testing.expectEqual(max_block_bytes, loaded.project.?.text.len);
     try testing.expectEqual(huge.len, loaded.files[0].bytes);
@@ -551,7 +591,7 @@ test "a project with no instruction file anywhere is an ordinary session, not a 
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, "/there/is/no/such/config/dir", root, &.{}, null);
+    const loaded = try load(arena, testing.io, "/there/is/no/such/config/dir", root, &.{}, null, &.{}, null);
     try testing.expect(loaded.operator == null);
     try testing.expect(loaded.project == null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
@@ -577,7 +617,7 @@ test "the subtree index is bounded, and says how many files it left out" {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
-    const loaded = try load(arena, testing.io, null, root, &.{}, null);
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expectEqual(max_subtree_entries, loaded.subtrees.len);
     try testing.expectEqual(@as(usize, 5), loaded.subtrees_left_out);
 }
@@ -597,7 +637,7 @@ test "a file named on the command line is its own layer, and keeps the order it 
     const first = try std.fs.path.join(arena, &.{ root, "first.md" });
     const second = try std.fs.path.join(arena, &.{ root, "second.md" });
 
-    const loaded = try load(arena, testing.io, null, root, &.{ first, second }, null);
+    const loaded = try load(arena, testing.io, null, root, &.{ first, second }, null, &.{}, null);
     try testing.expectEqual(@as(usize, 2), loaded.given.len);
     try testing.expectEqualStrings("Do the first thing.\n", loaded.given[0].text);
     try testing.expectEqualStrings("Then the second.\n", loaded.given[1].text);
@@ -617,14 +657,54 @@ test "a named file that cannot be read refuses, where a missing AGENTS.md does n
     const root = try absolutePath(&buffer, testing.io, tmp.dir);
 
     // The same directory, with no AGENTS.md in it, loads without complaint.
-    const quiet = try load(arena, testing.io, null, root, &.{}, null);
+    const quiet = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expect(quiet.project == null);
 
     const missing = try std.fs.path.join(arena, &.{ root, "nowhere.md" });
     var diag: GivenDiagnostic = .{};
     try testing.expectError(
         error.GivenFileUnreadable,
-        load(arena, testing.io, null, root, &.{missing}, &diag),
+        load(arena, testing.io, null, root, &.{missing}, &diag, &.{}, null),
+    );
+    try testing.expectEqualStrings(missing, diag.path);
+}
+
+test "a file named in chock.zon's instructions block is its own project layer block, beside AGENTS.md" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeAt(testing.io, tmp.dir, file_name, "Use tabs.\n");
+    try writeAt(testing.io, tmp.dir, "CLAUDE.md", "Never use emoji.\n");
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absolutePath(&buffer, testing.io, tmp.dir);
+    const named = try std.fs.path.join(arena, &.{ root, "CLAUDE.md" });
+
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{named}, null);
+    try testing.expectEqualStrings("Use tabs.\n", loaded.project.?.text);
+    try testing.expectEqual(@as(usize, 1), loaded.project_named.len);
+    try testing.expectEqualStrings("Never use emoji.\n", loaded.project_named[0].text);
+    try testing.expectEqual(Layer.project, loaded.project_named[0].layer);
+}
+
+test "a file chock.zon named that cannot be read refuses, the same as a file --instructions names" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absolutePath(&buffer, testing.io, tmp.dir);
+    const missing = try std.fs.path.join(arena, &.{ root, "CLAUDE.md" });
+
+    var diag: ProjectNamedDiagnostic = .{};
+    try testing.expectError(
+        error.ProjectNamedFileUnreadable,
+        load(arena, testing.io, null, root, &.{}, null, &.{missing}, &diag),
     );
     try testing.expectEqualStrings(missing, diag.path);
 }

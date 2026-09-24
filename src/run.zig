@@ -1290,7 +1290,10 @@ fn start(
         .role = agentRole(options),
     };
 
+    const project_named = try projectNamedInstructions(arena, io, project_root);
+
     var given_diag: chock_core.instructions.GivenDiagnostic = .{};
+    var project_named_diag: chock_core.instructions.ProjectNamedDiagnostic = .{};
     const loaded_instructions = chock_core.instructions.load(
         arena,
         io,
@@ -1298,6 +1301,8 @@ fn start(
         project_root,
         options.instructions,
         &given_diag,
+        project_named,
+        &project_named_diag,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.GivenFileUnreadable => {
@@ -1307,6 +1312,16 @@ fn start(
                     "--instructions is one this session was asked for, so it does not start " ++
                     "without it.\n",
                 .{given_diag.path},
+            );
+            return error.Reported;
+        },
+        error.ProjectNamedFileUnreadable => {
+            tty.print(
+                .err,
+                "chock run: the instruction {s} named in chock.zon could not be read. A file " ++
+                    "the project's own instructions block names is one this session was asked " ++
+                    "for, so it does not start without it.\n",
+                .{project_named_diag.path},
             );
             return error.Reported;
         },
@@ -4048,6 +4063,41 @@ fn reportNotes(io: std.Io, started: *const Started) void {
         return;
     }
     tty.print(.plain, "chock: {d} notes ({s}). Read or clear them with: chock memory\n", .{ now, dir });
+}
+
+/// Resolve chock.zon's `instructions` block to real paths on disk, ready for
+/// `chock_core.instructions.load`. A missing file or a link that leaves the
+/// project refuses the session rather than starting one that silently
+/// dropped a file the project's own configuration named.
+fn projectNamedInstructions(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError![]const []const u8 {
+    var diag: ?chock_policy.instructions.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    const block = chock_policy.instructions.load(arena, io, project_root, &diag) catch |err| {
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+
+    const resolved = try arena.alloc([]const u8, block.files.len);
+    for (block.files, 0..) |name, index_of| {
+        resolved[index_of] = chock_policy.instructions.resolve(arena, io, project_root, name, &diag) catch |err| {
+            if (diag) |*d| {
+                tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {f}\n", .{d});
+            } else {
+                tty.print(.err, "chock run: the instructions block in chock.zon could not be read: {t}\n", .{err});
+            }
+            return error.Reported;
+        };
+    }
+    return resolved;
 }
 
 fn reportInstructions(loaded: chock_core.instructions.Loaded) void {

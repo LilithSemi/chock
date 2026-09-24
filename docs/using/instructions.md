@@ -6,6 +6,7 @@ Chock reads `AGENTS.md` at three layers, and it never flattens them together:
 |---|---|---|
 | operator | `~/.config/chock/AGENTS.md` | you |
 | project | `AGENTS.md` at the project root | whoever wrote the repository |
+| project | a file named in `chock.zon`'s `instructions` block | the same |
 | subtree | `AGENTS.md` in a subdirectory | the same |
 | session | any file `--instructions` names | you, for this run |
 
@@ -38,6 +39,24 @@ refuses and a sandbox with no network.
 A file in a subdirectory arrives as one line naming its path, and the agent
 reads it with `read_file` when it works there. Concatenating every `AGENTS.md`
 in a tree into turn one is the long prompt this design refuses.
+
+## A project whose instructions already live under another name
+
+Some projects keep their instructions in `CLAUDE.md` or another file rather
+than `AGENTS.md`. Name it in `chock.zon` instead of copying it:
+
+```zon
+.{ .instructions = .{ "CLAUDE.md", "docs/agent.md" } }
+```
+
+Each name joins the prompt as its own block, beside `AGENTS.md`, under the
+same project heading: the agent weighs it as the repository's own words, not
+yours. A path must stay inside the project. A symlink that leaves it is
+refused, because a repository can ship one, and a name that reads as ordinary
+could otherwise point at a file well outside the project. A name that cannot
+be read stops the session, the same rule `--instructions` follows and for the
+same reason: a file the project asked for by name is not one a session starts
+without.
 
 ## Not the same thing as a note
 

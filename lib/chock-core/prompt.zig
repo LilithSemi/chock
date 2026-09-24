@@ -213,6 +213,7 @@ pub fn build(
     if (sources.instructions.operator) |block| try appendBlock(allocator, &out, block);
     for (sources.instructions.given) |block| try appendBlock(allocator, &out, block);
     if (sources.instructions.project) |block| try appendBlock(allocator, &out, block);
+    for (sources.instructions.project_named) |block| try appendBlock(allocator, &out, block);
 
     if (sources.instructions.subtrees.len != 0) {
         try appendHeading(allocator, &out, instructions.Layer.subtree.heading());
@@ -547,6 +548,29 @@ test "the operator's block and the project's block arrive distinguishable, never
     try std.testing.expect(operator_heading_at < operator_at);
     try std.testing.expect(operator_at < project_heading_at);
     try std.testing.expect(project_heading_at < project_at);
+}
+
+test "a file chock.zon named reaches the prompt at the project layer, beside AGENTS.md" {
+    // A project whose instructions already live under another name, such as
+    // CLAUDE.md, names that file in chock.zon instead of copying it. This
+    // pins that the named file's text really does arrive in the prompt, and
+    // under the same heading as AGENTS.md: the model has no way to tell the
+    // two apart, and none is wanted.
+    const allocator = std.testing.allocator;
+    const text = try build(allocator, .{}, &.{}, .{ .instructions = .{
+        .project = .{ .layer = .project, .path = "AGENTS.md", .text = "Use tabs.\n" },
+        .project_named = &.{
+            .{ .layer = .project, .path = "CLAUDE.md", .text = "Never use emoji.\n" },
+        },
+    } });
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Use tabs.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Never use emoji.") != null);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, text, instructions.Layer.project.heading()),
+    );
 }
 
 test "a block that was cut says so, so a model does not act on half a rule" {
