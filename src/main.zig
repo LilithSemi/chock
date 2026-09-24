@@ -54,6 +54,7 @@ const workspace_cmd = @import("workspace.zig");
 const usage_cmd = @import("usage.zig");
 const plan_cmd = @import("plan.zig");
 const sessions_cmd = @import("sessions.zig");
+const migrate_cmd = @import("migrate.zig");
 const approve_cmd = @import("approve.zig");
 const doctor_cmd = @import("doctor.zig");
 const askpass_cmd = @import("askpass.zig");
@@ -433,6 +434,11 @@ pub const commands = [_]Command{
         .name = "doctor",
         .summary = "Say whether this machine can contain a session, before one starts.",
         .run = doctor_cmd.main,
+    },
+    .{
+        .name = "migrate",
+        .summary = "Read another AI coding harness's configuration and write a chock.zon for it.",
+        .run = migrate_cmd.main,
     },
     .{
         .name = "approve",

@@ -331,6 +331,29 @@ before this harness existed found nine faults, and this run found a tenth.
   prompt, so the worst an agent can do is make noise, which is visible and
   refusable.
 
+- `chock migrate` exists as a command and reads no harness yet. It is a one
+  shot, offline command: no session, no model, no network, no sandbox.
+  `--from <harness>` names a harness, and this build refuses every name,
+  because `readers` in `src/migrate.zig` lists none. What is already built is
+  the neutral value a reader will hand back, `Found`, and the writer that
+  turns one into `chock.zon` text. A foreign deny renders at `.deny`. A
+  foreign allow renders at `.ask`, never `.allow`, because an allow read
+  against one tool's threat model does not become an allow under this one. A
+  hook, a plugin, a skill and a slash command carry into no field: a reader
+  puts each in `Found.refused` with the reason instead. An environment
+  variable's value is never read, only its name, through `envName`. It never
+  overwrites a `chock.zon` that is already there: it prints the rows it would
+  have added and writes nothing instead.
+
+  The generated file opens with a header comment naming the version that
+  wrote it, the date, and every file a reader read with the SHA-256 of the
+  bytes as read, so an auditor can run `sha256sum` on the same paths and tell
+  whether the project has moved since. `Found.sources` is where a reader
+  states that list, so carrying it is not a habit one reader can keep and
+  another forget. The same list is in the report too, under "carried", so it
+  is visible even when the header is trimmed from a copy somebody keeps. What
+  is missing is every harness reader itself.
+
 ## Known open items
 
 - A wasm plugin does not run on x86_64. The engine answers `error.Unsupported`
