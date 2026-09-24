@@ -8,9 +8,28 @@ promise. Chock is an early prototype.
 Every command works.
 
 `run`, `login`, `daemon`, `serve`, `memory`, `cache`, `workspace`, `usage`,
-`plan`, `sessions`, `doctor`, `approve`, `detach`, `askpass`. Bare `chock`
-brings up a full screen interface, and it prints the usage page when nothing
-can be drawn.
+`plan`, `sessions`, `doctor`, `approve`, `detach`, `askpass`, `migrate`. Bare
+`chock` brings up a full screen interface, and it prints the usage page when
+nothing can be drawn.
+
+Instructions reach the prompt from four sources, and the prompt says which
+layer each block came from. `AGENTS.md` at the operator, project and subtree
+layers; any file `--instructions` names, at a layer of its own; and any file
+the `instructions` block of `chock.zon` names, which arrives beside the
+project's own `AGENTS.md`. A project whose instructions already live under
+another name says so there rather than copying them. A named path must stay
+inside the project: it is refused if it is absolute or climbs out, and it is
+refused again after the links are resolved, because a repository can ship a
+link and the prompt is where the bytes would land.
+
+Every run writes a `session.config` event holding what a person put on the
+command line and two hashes: the SHA-256 of the `chock.zon` the policy came
+from, and one over what the sandbox of that run lets a tool call reach. It is
+written on every run and not only the first, because a session that resumes
+can be given different flags. `session.imported` records that a transcript
+from another harness was brought in as context. It never claims Chock
+witnessed the imported work, and the imported turns are not written as
+`message` events: that row and its hash are the whole record.
 
 `read_image` reads a picture out of the workspace and gives it to the model as
 an image. It is offered only where both halves of the gate say yes: every
