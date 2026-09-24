@@ -103,6 +103,7 @@ pub const Kind = enum {
     session_end,
     session_spawn,
     session_title,
+    session_imported,
     message,
     tool_call,
     tool_result,
@@ -147,6 +148,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .session_end = "session.end",
     .session_spawn = "session.spawn",
     .session_title = "session.title",
+    .session_imported = "session.imported",
     .message = "message",
     .tool_call = "tool.call",
     .tool_result = "tool.result",
@@ -351,6 +353,72 @@ pub const SessionTitle = struct {
     const forward = ForwardCompatible(@This());
     pub const jsonStringify = forward.jsonStringify;
     pub const jsonParse = forward.jsonParse;
+};
+
+/// A new session log records that a transcript from another harness was
+/// brought in as context. It never claims Chock witnessed the imported work,
+/// only that on this date this machine read these bytes from that source. The
+/// imported turns are not written as `message` events; this row and its hash
+/// are the whole record.
+///
+/// `from`, `source_path`, `content_hash` and `imported_ms` are always written,
+/// because an import missing any of them is not a record of anything. A field
+/// nobody set is left out.
+pub const SessionImported = struct {
+    /// The harness it came from, as this build names it.
+    from: []const u8,
+    /// Where it was read on the machine that ran the import.
+    source_path: []const u8,
+    /// SHA-256 of the imported bytes, lower case hex. The chain covers this
+    /// event, so this is what ties it to exactly what was read.
+    content_hash: []const u8,
+    /// When the import ran. Not when the work happened.
+    imported_ms: i64,
+    /// The time range the source claims for the work. The source's word, not
+    /// this machine's observation. Zero when the source stated none.
+    source_started_ms: i64 = 0,
+    source_ended_ms: i64 = 0,
+    /// How many turns the transcript held.
+    messages: usize = 0,
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonParse = forward.jsonParse;
+
+    /// Not `ForwardCompatible.jsonStringify`. `from`, `source_path`,
+    /// `content_hash` and `imported_ms` are always written; the rest appear
+    /// only when the import set them.
+    pub fn jsonStringify(self: SessionImported, jw: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jw.beginObject();
+
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("source_path");
+        try jw.write(self.source_path);
+        try jw.objectField("content_hash");
+        try jw.write(self.content_hash);
+        try jw.objectField("imported_ms");
+        try jw.write(self.imported_ms);
+
+        if (self.source_started_ms != 0) {
+            try jw.objectField("source_started_ms");
+            try jw.write(self.source_started_ms);
+        }
+        if (self.source_ended_ms != 0) {
+            try jw.objectField("source_ended_ms");
+            try jw.write(self.source_ended_ms);
+        }
+        if (self.messages != 0) {
+            try jw.objectField("messages");
+            try jw.write(self.messages);
+        }
+
+        for (self.extra.members) |member| {
+            try jw.objectField(member.name);
+            try jw.write(member.value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// `signature` must be kept exactly as given. A changed or dropped signature
@@ -1070,6 +1138,7 @@ pub const Event = union(Kind) {
     session_end: SessionEnd,
     session_spawn: SessionSpawn,
     session_title: SessionTitle,
+    session_imported: SessionImported,
     message: Message,
     tool_call: ToolCall,
     tool_result: ToolResult,
@@ -2243,4 +2312,75 @@ test "every part of a session's configuration reaches the log, and reads back" {
     const differs = try std.json.Stringify.valueAlloc(gpa, other, .{});
     defer gpa.free(differs);
     try std.testing.expect(!std.mem.eql(u8, text, differs));
+}
+
+test "session.imported survives a round trip through JSON" {
+    const gpa = std.testing.allocator;
+
+    const original = Event{ .session_imported = .{
+        .from = "other-harness",
+        .source_path = "/home/someone/.other/sessions/01H0.jsonl",
+        .content_hash = "9f2a1c...",
+        .imported_ms = 1_700_000_000_000,
+        .source_started_ms = 1_699_000_000_000,
+        .source_ended_ms = 1_699_100_000_000,
+        .messages = 42,
+    } };
+    const text = try std.json.Stringify.valueAlloc(gpa, original, .{});
+    defer gpa.free(text);
+
+    const parsed = try std.json.parseFromSlice(Event, gpa, text, .{});
+    defer parsed.deinit();
+
+    const back = parsed.value.session_imported;
+    try std.testing.expectEqualStrings("other-harness", back.from);
+    try std.testing.expectEqualStrings("/home/someone/.other/sessions/01H0.jsonl", back.source_path);
+    try std.testing.expectEqualStrings("9f2a1c...", back.content_hash);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), back.imported_ms);
+    try std.testing.expectEqual(@as(i64, 1_699_000_000_000), back.source_started_ms);
+    try std.testing.expectEqual(@as(i64, 1_699_100_000_000), back.source_ended_ms);
+    try std.testing.expectEqual(@as(usize, 42), back.messages);
+}
+
+test "session.imported always writes from, source_path, content_hash and imported_ms, and leaves out the rest" {
+    const gpa = std.testing.allocator;
+
+    const bare = Event{ .session_imported = .{
+        .from = "other-harness",
+        .source_path = "/tmp/transcript.json",
+        .content_hash = "abc123",
+        .imported_ms = 5,
+    } };
+    const text = try std.json.Stringify.valueAlloc(gpa, bare, .{});
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(
+        "{\"session.imported\":{\"from\":\"other-harness\",\"source_path\":\"/tmp/transcript.json\"," ++
+            "\"content_hash\":\"abc123\",\"imported_ms\":5}}",
+        text,
+    );
+}
+
+test "two imports of different bytes produce different JSON" {
+    const gpa = std.testing.allocator;
+
+    const first = Event{ .session_imported = .{
+        .from = "other-harness",
+        .source_path = "/tmp/transcript.json",
+        .content_hash = "aa11",
+        .imported_ms = 5,
+    } };
+    const second = Event{ .session_imported = .{
+        .from = "other-harness",
+        .source_path = "/tmp/transcript.json",
+        .content_hash = "bb22",
+        .imported_ms = 5,
+    } };
+
+    const first_text = try std.json.Stringify.valueAlloc(gpa, first, .{});
+    defer gpa.free(first_text);
+    const second_text = try std.json.Stringify.valueAlloc(gpa, second, .{});
+    defer gpa.free(second_text);
+
+    // A swapped transcript hashes differently, so the chain over it says so.
+    try std.testing.expect(!std.mem.eql(u8, first_text, second_text));
 }

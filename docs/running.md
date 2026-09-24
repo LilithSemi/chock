@@ -141,6 +141,23 @@ sandbox again from that run's files and flags. Two `session.config` events in
 one log whose `sandbox_hash` differs are two different sandboxes, and the log
 says so without anybody having to reconstruct either.
 
+A session started from another harness's transcript writes one
+`session.imported` event, and never the imported turns themselves:
+
+```json
+{"session.imported":{"from":"other-harness","source_path":"/home/you/.other/sessions/01H0.jsonl",
+ "content_hash":"9f2a...","imported_ms":1700000000000,"messages":42}}
+```
+
+Writing another tool's history into the chain as `message` events would sign
+a document asserting turns Chock never saw, so the import runs the other way:
+a new session log is opened, and this one event says that on this date a
+transcript was brought in from there. The turns themselves are loaded as
+context for the agent, not appended to the log. `content_hash` is the SHA-256
+of the bytes that were read, and it is what ties the event to exactly that
+transcript: a source file swapped after the fact hashes differently, and the
+chain over the event would not match a re-import of the swap.
+
 Every run writes a `sandbox.open` event before its first turn, naming the run
 and whether the sandbox's write and execute rule was on for it. It is written on
 every run and not only on the run that gave the rule up, so an absent line means
