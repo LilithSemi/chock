@@ -42,6 +42,7 @@ pub const store = @import("chock-auth/store.zig");
 pub const lock = @import("chock-auth/lock.zig");
 pub const lookup = @import("chock-auth/lookup.zig");
 pub const signing = @import("chock-auth/signing.zig");
+pub const search = @import("chock-auth/search.zig");
 pub const check = @import("chock-auth/check.zig");
 
 /// Imported directly, not only through `store.zig`'s own comptime driver
