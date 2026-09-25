@@ -6,6 +6,7 @@
 //! `lib/chock-auth/lookup.zig`, which applies the mode rule to every source.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const paths = @import("paths.zig");
 
 pub const file_name = "config.zon";
@@ -125,6 +126,51 @@ const FileInstance = struct {
 const FileDefaults = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
+};
+
+const FileCredentials = struct {
+    store: ?[]const u8 = null,
+};
+
+/// Where Chock keeps the credentials it is given.
+///
+/// **Chosen in the file and never guessed.** A keystore can look reachable and
+/// still be unusable, so a build that picked one by probing would put a
+/// credential somewhere the user did not ask for. Naming it means an
+/// unreachable store is an error a person can read.
+pub const CredentialStore = enum {
+    /// A file in the data directory, mode 0600. Works anywhere, including a
+    /// machine reached only over ssh.
+    file,
+    /// The freedesktop secret service, over the session bus. Linux only.
+    secret_service,
+    /// The macOS Keychain. Darwin only.
+    keychain,
+
+    /// What this platform uses when the file names nothing. A keystore, so the
+    /// safer place is the one a user gets without asking.
+    pub fn default() CredentialStore {
+        return switch (builtin.os.tag) {
+            .macos => .keychain,
+            else => .secret_service,
+        };
+    }
+
+    /// Whether this platform has this store at all.
+    pub fn availableHere(self: CredentialStore) bool {
+        return switch (builtin.os.tag) {
+            .macos => self == .keychain,
+            else => self != .keychain,
+        };
+    }
+
+    /// Every store this platform has, for a message that lists them.
+    pub fn hereText() []const u8 {
+        return switch (builtin.os.tag) {
+            .macos => "keychain",
+            else => "file or secret_service",
+        };
+    }
 };
 
 /// One provider instance, checked. Every string is owned by the `Config` it
@@ -247,6 +293,10 @@ pub const Diagnostic = union(enum) {
     duplicate_instance_name: DuplicateInstanceName,
     /// A file exists and the read failed. The path is owned.
     read_failed: ReadFailed,
+    /// The credentials block named a store this reader does not know.
+    unknown_credential_store: UnknownCredentialStore,
+    /// The credentials block named a store this platform does not have.
+    credential_store_not_here: CredentialStoreNotHere,
 
     pub const BlockNotValid = struct {
         field: []const u8,
@@ -268,6 +318,15 @@ pub const Diagnostic = union(enum) {
         /// The wire name of the kind both providers hold, or null when the
         /// two are of different kinds.
         shared_kind: ?[]const u8,
+    };
+
+    pub const UnknownCredentialStore = struct {
+        /// What the file said, copied.
+        spelled: []const u8,
+    };
+
+    pub const CredentialStoreNotHere = struct {
+        store: CredentialStore,
     };
 
     pub const ReadFailed = struct {
@@ -299,8 +358,9 @@ pub const Diagnostic = union(enum) {
             .duplicate_instance_name => |names| gpa.free(names.name),
             .read_failed => |failure| gpa.free(failure.path),
             .token_file_readable_by_others => |failure| gpa.free(failure.path),
-            // These three carry nothing, or carry a literal of this file.
-            .not_a_struct_literal, .empty_provider_name, .empty_default => {},
+            .unknown_credential_store => |named| gpa.free(named.spelled),
+            // These carry nothing, or carry a literal of this file.
+            .not_a_struct_literal, .empty_provider_name, .empty_default, .credential_store_not_here => {},
         }
         self.* = undefined;
     }
@@ -363,6 +423,16 @@ pub const Diagnostic = union(enum) {
                     );
                 }
             },
+            .unknown_credential_store => |named| try writer.print(
+                "the credentials block names the store \"{s}\", and this reader knows file, " ++
+                    "secret_service, and keychain",
+                .{named.spelled},
+            ),
+            .credential_store_not_here => |named| try writer.print(
+                "the credentials block names the {s} store, which this platform does not have. " ++
+                    "It has {s}.",
+                .{ @tagName(named.store), CredentialStore.hereText() },
+            ),
             .read_failed => |failure| try writer.print(
                 "reading {s} failed: {s}",
                 .{ failure.path, @errorName(failure.err) },
@@ -417,6 +487,9 @@ pub const Config = struct {
     /// The `providers` block exactly as the file spelled it, which owns every
     /// string the instances below point into.
     providers: []const FileInstance,
+    /// Where credentials are kept. The file's own choice, or this platform's
+    /// default when it names none.
+    credential_store: CredentialStore,
     /// The `defaults` block, which owns its own two strings.
     defaults: FileDefaults,
     instances: []Instance,
@@ -476,6 +549,11 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
     const defaults = try parseBlock(FileDefaults, gpa, source, "defaults", diag) orelse FileDefaults{};
     errdefer std.zon.parse.free(gpa, defaults);
 
+    const credentials = try parseBlock(FileCredentials, gpa, source, "credentials", diag) orelse
+        FileCredentials{};
+    defer std.zon.parse.free(gpa, credentials);
+    const credential_store = try readCredentialStore(gpa, credentials, diag);
+
     const instances = try gpa.alloc(Instance, providers.len);
     errdefer gpa.free(instances);
 
@@ -500,6 +578,7 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
         .providers = providers,
         .defaults = defaults,
         .instances = instances,
+        .credential_store = credential_store,
         .default_provider = defaults.provider,
         .default_model = defaults.model,
     };
@@ -510,6 +589,44 @@ pub fn parse(gpa: std.mem.Allocator, source: [:0]const u8, diag: ?*?Diagnostic) 
 /// configuration file is small, and two reads of it cost less than the
 /// bookkeeping of sharing one parse tree across two calls that each want to
 /// take ownership of it.
+/// Which store the operator's own file names, or this platform's default when
+/// that file cannot be read.
+///
+/// **A configuration that cannot be read is not a reason to refuse.** The
+/// configuration and the credentials are separate files with separate owners,
+/// so a caller that only needs to know where a credential lives should not fail
+/// because the other file is absent or broken. The default is what the reader
+/// would have got from a file that named nothing.
+pub fn credentialStore(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8) CredentialStore {
+    var loaded = load(gpa, io, config_dir, null) catch return CredentialStore.default();
+    defer loaded.deinit();
+    return loaded.credential_store;
+}
+
+/// Which store the file named, held to what this platform has.
+///
+/// **An unavailable store is refused here and never at the first read.** A
+/// person who wrote the wrong name learns at once, rather than after a session
+/// has started and asked for a credential.
+fn readCredentialStore(
+    gpa: std.mem.Allocator,
+    block: FileCredentials,
+    diag: ?*?Diagnostic,
+) ParseError!CredentialStore {
+    const spelled = block.store orelse return CredentialStore.default();
+
+    const named = std.meta.stringToEnum(CredentialStore, spelled) orelse {
+        const copy = try gpa.dupe(u8, spelled);
+        if (!note(diag, .{ .unknown_credential_store = .{ .spelled = copy } })) gpa.free(copy);
+        return error.InvalidConfig;
+    };
+    if (!named.availableHere()) {
+        _ = note(diag, .{ .credential_store_not_here = .{ .store = named } });
+        return error.InvalidConfig;
+    }
+    return named;
+}
+
 fn parseBlock(
     comptime T: type,
     gpa: std.mem.Allocator,
@@ -1175,4 +1292,65 @@ test "no two faults of this module read the same" {
     for (lines, 0..) |line, i| {
         for (lines[i + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, line, other));
     }
+}
+
+test "the credentials block names where a credential is kept" {
+    const gpa = testing.allocator;
+
+    var named = try parse(gpa, ".{ .credentials = .{ .store = \"file\" } }", null);
+    defer named.deinit();
+    try testing.expectEqual(CredentialStore.file, named.credential_store);
+
+    // A file that names none gets this platform's keystore, so the safer place
+    // is what a user gets without asking for it.
+    var silent = try parse(gpa, ".{}", null);
+    defer silent.deinit();
+    try testing.expectEqual(CredentialStore.default(), silent.credential_store);
+    try testing.expect(silent.credential_store != .file);
+}
+
+test "a store this reader does not know is refused, and the message lists the three" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidConfig,
+        parse(gpa, ".{ .credentials = .{ .store = \"kwallet\" } }", &diag),
+    );
+    try testing.expectEqualStrings("kwallet", diag.?.unknown_credential_store.spelled);
+
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
+    defer gpa.free(text);
+    inline for (@typeInfo(CredentialStore).@"enum".fields) |field| {
+        try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
+    }
+}
+
+test "a store this platform does not have is refused when the file is read" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    // Named for the other platform, so this asserts on whichever one this is.
+    const absent = if (builtin.os.tag == .macos) "secret_service" else "keychain";
+    const source = ".{ .credentials = .{ .store = \"" ++ absent ++ "\" } }";
+
+    try testing.expectError(error.InvalidConfig, parse(gpa, source, &diag));
+    try testing.expect(diag.? == .credential_store_not_here);
+
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, CredentialStore.hereText()) != null);
+}
+
+test "every store this platform has is one this platform accepts" {
+    // Binds `availableHere` to `hereText`, so a fourth store cannot be added to
+    // one and forgotten in the other.
+    inline for (@typeInfo(CredentialStore).@"enum".fields) |field| {
+        const one: CredentialStore = @enumFromInt(field.value);
+        const listed = std.mem.indexOf(u8, CredentialStore.hereText(), field.name) != null;
+        try testing.expectEqual(one.availableHere(), listed);
+    }
+    try testing.expect(CredentialStore.default().availableHere());
 }
