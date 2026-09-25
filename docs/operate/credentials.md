@@ -7,10 +7,38 @@ chock login --provider openai-compat=http://127.0.0.1:5000/v1 --name local
 printf '%s' "$KEY" | chock login --provider aiand --password-method stdin
 ```
 
-The credential goes to `~/.local/share/chock`, which Chock alone writes, in a
-file with mode `0600` on Linux and in the Keychain on macOS. It is checked
-against the provider before it is stored, so a mistyped key fails at login
-rather than on your first turn.
+The credential goes to your operating system's own keystore: the secret service
+on Linux, which is what gnome-keyring and kwallet answer, and the Keychain on
+macOS. It is checked against the provider before it is stored, so a mistyped key
+fails at login rather than on your first turn.
+
+## Where a credential is kept
+
+Name the store in `~/.config/chock/config.zon`:
+
+```zon
+.credentials = .{ .store = "secret_service" },
+```
+
+| Store | What it is | Where |
+|---|---|---|
+| `secret_service` | the freedesktop secret service, over the session bus | Linux, and the default there |
+| `keychain` | the macOS Keychain | macOS, and the only store there |
+| `file` | a file in `~/.local/share/chock`, mode `0600` in a directory `0700` | Linux |
+
+**Nothing is guessed, and nothing falls back.** A keystore can look reachable
+and still be unusable: on a machine with no desktop session the bus is there,
+the service starts when asked, and opening a session works, and then the
+collection is locked and the prompt that would unlock it cannot be drawn. So a
+store that cannot work is an error that says so, and never a quiet move to
+somewhere less protected. Naming a store this platform does not have is refused
+when the file is read, not at your first turn.
+
+**A machine you only reach over ssh usually wants `file`.** It has no desktop
+session to unlock a collection with. The file is mode `0600` in a directory
+`0700`, so it is readable by your account and no other, which is the same
+guarantee the secret service gives against other accounts. What the keystore
+adds is encryption at rest and being locked when your session is locked.
 
 `--password-method` says where the credential comes from: `prompt` is a hidden
 prompt and the default at a terminal, `stdin` is one line of standard input
