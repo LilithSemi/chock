@@ -387,6 +387,28 @@ before this harness existed found nine faults, and this run found a tenth.
   name. A host that cannot be read exactly is refused, because a wrongly
   reversed name would grant reach to a host nobody chose.
 
+  `--sessions` brings a transcript from another harness across. It makes a
+  new session log and writes two events into it, `session.start` then
+  `session.imported`, and nothing else. The foreign turns are never written as
+  `message` events: this log is a hash chain that `chock sessions seal` signs,
+  and writing another tool's history into it would sign a claim about work
+  Chock never saw. The transcript is copied beside the session and the event
+  names it with the SHA-256 of its bytes, so a copy swapped afterwards is
+  visible. The agent reads it with `read_file` when it needs to, the same way
+  an `AGENTS.md` in a subdirectory arrives as a path and not as pasted text.
+  A real transcript runs to megabytes, so there is no other workable shape.
+  Only Claude Code has a pinned location today; every other harness is
+  refused rather than guessed at.
+
+  `--memory` brings another harness's notes into the knowledgebase, as data
+  and never as instructions. Those files are written by an agent and often
+  read like orders, so promoting them would turn a note an agent wrote to
+  itself into something it must obey.
+
+  Both read under the user's home, which the config readers deliberately do
+  not. A transcript and a notebook live nowhere else, unlike a project's own
+  configuration.
+
   `--permission <class>` carries an allow under that class as `.allow`
   instead of `.ask`. It takes `net.fetch`, and nothing else today. It exists
   because `ask` is a refusal for a fetch: only `allow` reads a host, so a

@@ -30,6 +30,15 @@
 //! - a secret's value is never carried. Only an environment variable's own
 //!   name is: see `envName`.
 //!
+//! ## `--sessions` and `--memory`
+//!
+//! Both are off unless named, and both read the user's home directory
+//! directly, which every reader above deliberately does not: a transcript
+//! and a notebook are the user's own and live nowhere else, unlike a
+//! project's configuration. `--sessions` copies a transcript in as a new
+//! session log; `--memory` copies notes in as knowledgebase entries. See
+//! `migrate/transcript.zig` and `importMemory` below.
+//!
 //! ## Provenance
 //!
 //! A generated `chock.zon` is worth nothing to somebody checking it unless
@@ -47,10 +56,12 @@ const chock_policy = @import("chock-policy");
 const Exit = @import("main.zig").Exit;
 const version = @import("main.zig").version;
 const tty = @import("tty.zig");
+const session = @import("session.zig");
+const transcript = @import("migrate/transcript.zig");
 
 const usage_text =
     \\Usage: chock migrate [--from <harness>] [--project <dir>] [--print]
-    \\                    [--permission <class>]
+    \\                    [--permission <class>] [--sessions] [--memory]
     \\
     \\Reads another AI coding harness's configuration and writes a chock.zon
     \\for it. One shot and offline: no session, no model, no network, no
@@ -71,11 +82,21 @@ const usage_text =
     \\allow reads a host, so a fetch rule written at ask is the same as no
     \\rule at all.
     \\
+    \\--sessions brings a transcript across as a new session log, holding
+    \\only session.start and session.imported: the foreign turns never
+    \\become message events, and the transcript is copied beside the new
+    \\session rather than loaded into context.
+    \\
+    \\--memory brings another harness's own notes into the knowledgebase, as
+    \\data the agent may weigh and never as instructions it must obey.
+    \\
     \\Options:
     \\  --from <harness>   The harness to read from. Refused when this build
     \\                     reads none of that name.
     \\  --project <dir>    The project. Defaults to the current directory.
     \\  --print            Write to standard output instead of chock.zon.
+    \\  --sessions         Import transcripts as new session logs.
+    \\  --memory           Import notes into the knowledgebase, as data.
     \\
 ++ tty.options_text;
 
@@ -313,7 +334,29 @@ pub fn main(
 
     const project_root = try resolveProject(arena, io, options.project);
     const found = try vet(arena, try reader.read(arena, io, project_root));
-    return finish(arena, io, project_root, found, options.print, options.permission);
+
+    var env = try environ.createMap(arena);
+    defer env.deinit();
+
+    const sessions_result: ?transcript.Result = if (options.sessions)
+        try transcript.import(arena, io, &env, options.from, project_root)
+    else
+        null;
+    const memory_result: ?MemoryResult = if (options.memory)
+        try importMemory(arena, io, &env, options.from, project_root)
+    else
+        null;
+
+    return finish(
+        arena,
+        io,
+        project_root,
+        found,
+        options.print,
+        options.permission,
+        sessions_result,
+        memory_result,
+    );
 }
 
 /// Report, then write or print. Split from `main` so a test can drive it
@@ -325,8 +368,10 @@ fn finish(
     found: Found,
     print_only: bool,
     carry: []const []const u8,
+    sessions_result: ?transcript.Result,
+    memory_result: ?MemoryResult,
 ) !u8 {
-    report(found, carry);
+    report(found, carry, sessions_result, memory_result);
 
     var stamp_buffer: [chock_core.memory.timestamp_bytes]u8 = undefined;
     const stamp = chock_core.memory.now(io, &stamp_buffer);
@@ -375,8 +420,14 @@ fn writeChockZon(io: std.Io, path: []const u8, text: []const u8) !bool {
 }
 
 /// The report every run prints, in three parts: what was carried as is,
-/// what was carried narrowed, and what was refused.
-fn report(found: Found, carry: []const []const u8) void {
+/// what was carried narrowed, and what was refused. `--sessions` and
+/// `--memory` each add their own heading, only when the flag was given.
+fn report(
+    found: Found,
+    carry: []const []const u8,
+    sessions_result: ?transcript.Result,
+    memory_result: ?MemoryResult,
+) void {
     tty.out(.plain, "carried:\n", .{});
     var carried = false;
     for (found.sources) |one| {
@@ -426,6 +477,27 @@ fn report(found: Found, carry: []const []const u8) void {
         tty.out(.plain, "  nothing\n", .{});
     } else {
         for (found.refused) |one| tty.out(.plain, "  {s}: {s}\n", .{ one.what, one.reason });
+    }
+
+    if (sessions_result) |result| {
+        tty.out(.plain, "\nsessions:\n", .{});
+        if (result.imported.len == 0 and result.refused.len == 0) tty.out(.plain, "  nothing\n", .{});
+        for (result.imported) |one| {
+            tty.out(.plain, "  {s}  session {s}  {d} messages  sha256:{s}\n", .{
+                one.source_path,
+                &one.session_id,
+                one.messages,
+                &one.content_hash,
+            });
+            tty.out(.plain, "    copied to {s}\n", .{one.copy_path});
+        }
+        for (result.refused) |one| tty.out(.plain, "  refused: {s}: {s}\n", .{ one.what, one.reason });
+    }
+
+    if (memory_result) |result| {
+        tty.out(.plain, "\nmemory:\n", .{});
+        tty.out(.plain, "  {d} note(s) carried as data\n", .{result.carried});
+        for (result.refused) |one| tty.out(.plain, "  refused: {s}: {s}\n", .{ one.what, one.reason });
     }
 }
 
@@ -588,6 +660,8 @@ const Options = struct {
     /// Every class `--permission` named. A grant is carried only under one of
     /// these, and the list is empty unless a person wrote it out.
     permission: []const []const u8 = &.{},
+    sessions: bool = false,
+    memory: bool = false,
 };
 
 const ParseError = error{ HelpWanted, BadArguments };
@@ -616,6 +690,14 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             options.print = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--sessions")) {
+            options.sessions = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--memory")) {
+            options.memory = true;
+            continue;
+        }
         if (std.mem.eql(u8, argument, "--permission")) {
             index += 1;
             if (index >= args.len) return error.BadArguments;
@@ -635,24 +717,10 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
         // leaves a person unable to tell a typo from an option this build
         // does not have.
         tty.print(.err, "chock migrate: there is no option named {s}.\n", .{argument});
-        if (unbuilt(argument)) |note| tty.print(.err, "chock migrate: {s}\n", .{note});
         return error.BadArguments;
     }
     options.permission = carried.items;
     return options;
-}
-
-/// What to say about an option this build has not grown yet, so a person who
-/// read the design and reached for one is told that rather than left guessing.
-fn unbuilt(argument: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, argument, "--sessions")) {
-        return "a transcript from another harness is not read yet. The session log " ++
-            "already carries the event that would record one, and nothing writes it.";
-    }
-    if (std.mem.eql(u8, argument, "--memory")) {
-        return "notes from another harness are not read yet.";
-    }
-    return null;
 }
 
 fn isCarryable(class: []const u8) bool {
@@ -685,6 +753,161 @@ fn resolveProject(arena: std.mem.Allocator, io: std.Io, given: ?[]const u8) ![]c
         return arena.dupe(u8, buffer[0..len]);
     }
     return std.process.currentPathAlloc(io, arena);
+}
+
+/// What `--memory` did: how many notes were carried, and why any were not.
+pub const MemoryResult = struct {
+    harness: []const u8,
+    carried: usize = 0,
+    refused: []const Refusal = &.{},
+};
+
+/// At most this many notes are carried in one run. The knowledgebase's own
+/// cap is the natural bound: carrying more than a project can ever keep
+/// would only be refused note by note further down.
+const max_memory_import = chock_core.memory.max_entries;
+
+/// `harness`'s own notes for `project_root`, brought into Chock's
+/// knowledgebase as data. Each note becomes its own entry, named after the
+/// source file; a name `--memory` finds a second time adds a version rather
+/// than a second entry, so a later run of `--memory` updates what it
+/// already carried.
+fn importMemory(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    harness: []const u8,
+    project_root: []const u8,
+) !MemoryResult {
+    if (!std.mem.eql(u8, harness, transcript.harness_name)) {
+        return .{
+            .harness = harness,
+            .refused = &.{.{
+                .what = harness,
+                .reason = "its notes location is not pinned yet, so nothing was read",
+            }},
+        };
+    }
+
+    const project_dir = transcript.homeProjectDir(arena, env, project_root) catch |err| return .{
+        .harness = harness,
+        .refused = &.{.{
+            .what = transcript.harness_name,
+            .reason = try std.fmt.allocPrint(arena, "its notes directory is unknown: {s}", .{@errorName(err)}),
+        }},
+    };
+    const notes_dir = try std.fs.path.join(arena, &.{ project_dir, "memory" });
+
+    var names: std.ArrayList([]const u8) = .empty;
+    {
+        var dir = std.Io.Dir.openDirAbsolute(io, notes_dir, .{ .iterate = true }) catch {
+            // No such directory is not a fault: most projects have no notes
+            // from this harness at all.
+            return .{ .harness = harness };
+        };
+        defer dir.close(io);
+        var walker = dir.iterate();
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
+            try names.append(arena, try arena.dupe(u8, entry.name));
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, lessThanBytes);
+
+    const dest_dir = try session.memoryDir(arena, env, project_root);
+    try session.createMemoryDir(io, dest_dir);
+
+    var carried: usize = 0;
+    var refused: std.ArrayList(Refusal) = .empty;
+
+    for (names.items) |name| {
+        if (carried >= max_memory_import) {
+            try refused.append(arena, .{
+                .what = name,
+                .reason = try std.fmt.allocPrint(
+                    arena,
+                    "at most {d} notes are carried in one run",
+                    .{max_memory_import},
+                ),
+            });
+            continue;
+        }
+        importOneNote(arena, io, harness, notes_dir, dest_dir, name) catch |err| {
+            try refused.append(arena, .{
+                .what = name,
+                .reason = try std.fmt.allocPrint(arena, "could not be carried: {s}", .{@errorName(err)}),
+            });
+            continue;
+        };
+        carried += 1;
+    }
+
+    return .{ .harness = harness, .carried = carried, .refused = try refused.toOwnedSlice(arena) };
+}
+
+fn importOneNote(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    harness: []const u8,
+    notes_dir: []const u8,
+    dest_dir: []const u8,
+    name: []const u8,
+) !void {
+    const source_path = try std.fs.path.join(arena, &.{ notes_dir, name });
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, source_path, arena, .limited(chock_core.memory.max_body_bytes));
+
+    const entry_name = try noteName(arena, name);
+    try chock_core.memory.checkName(entry_name);
+
+    const dest_path = try std.fmt.allocPrint(arena, "{s}/{s}" ++ chock_core.memory.extension, .{ dest_dir, entry_name });
+    const existing = std.Io.Dir.cwd().readFileAlloc(io, dest_path, arena, .limited(chock_core.memory.max_entry_bytes)) catch |err| switch (err) {
+        error.FileNotFound => "",
+        else => return err,
+    };
+
+    if (existing.len == 0 and chock_core.memory.count(io, dest_dir) >= chock_core.memory.max_entries) {
+        return error.KnowledgebaseFull;
+    }
+    if (chock_core.memory.versionsIn(existing) >= chock_core.memory.max_versions) {
+        return error.NoteFull;
+    }
+
+    var written_at_buffer: [chock_core.memory.timestamp_bytes]u8 = undefined;
+    const text = try chock_core.memory.addVersion(arena, existing, .{
+        .name = entry_name,
+        .description = try std.fmt.allocPrint(arena, "imported from {s}: {s}", .{ harness, name }),
+        .kind = .insight,
+        .written_at = chock_core.memory.now(io, &written_at_buffer),
+        .body = body,
+    });
+
+    var file = try std.Io.Dir.createFileAbsolute(io, dest_path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, text);
+}
+
+/// `file_name` with its extension dropped, lower cased, and every character
+/// `chock_core.memory.checkName` would refuse turned into `-`. A leading `-`
+/// or `_` is trimmed, because a name may not begin with either.
+fn noteName(arena: std.mem.Allocator, file_name: []const u8) ![]const u8 {
+    const stem = if (std.mem.endsWith(u8, file_name, ".md")) file_name[0 .. file_name.len - 3] else file_name;
+    const bound = @min(stem.len, chock_core.memory.max_name_bytes);
+    const out = try arena.alloc(u8, bound);
+    for (stem[0..bound], 0..) |byte, i| {
+        out[i] = switch (byte) {
+            'a'...'z', '0'...'9' => byte,
+            'A'...'Z' => byte + ('a' - 'A'),
+            else => '-',
+        };
+    }
+    var start: usize = 0;
+    while (start < out.len and (out[start] == '-' or out[start] == '_')) start += 1;
+    return out[start..];
+}
+
+fn lessThanBytes(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
 }
 
 const testing = std.testing;
@@ -829,7 +1052,7 @@ test "an existing chock.zon is never overwritten" {
     const found = Found{
         .policy_hints = &.{.{ .action = "git.push", .said = .deny, .source_file = "settings.json" }},
     };
-    const code = try finish(arena, testing.io, project_root, found, false, &.{});
+    const code = try finish(arena, testing.io, project_root, found, false, &.{}, null, null);
 
     // Never `finished`: nothing was written. See `src/main.zig`'s own top
     // comment.
@@ -864,7 +1087,7 @@ test "a project with no chock.zon gets one, once" {
     };
     try testing.expectEqual(
         Exit.finished.code(),
-        try finish(arena, testing.io, project_root, found, false, &.{}),
+        try finish(arena, testing.io, project_root, found, false, &.{}, null, null),
     );
 
     const written = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
@@ -874,7 +1097,7 @@ test "a project with no chock.zon gets one, once" {
     // above, but this asserts the write step itself is one shot.
     said.clear();
     try testing.expect(
-        (try finish(arena, testing.io, project_root, found, false, &.{})) != Exit.finished.code(),
+        (try finish(arena, testing.io, project_root, found, false, &.{}, null, null)) != Exit.finished.code(),
     );
     const unchanged = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
     try testing.expectEqualStrings(written, unchanged);
@@ -901,7 +1124,7 @@ test "--print never touches chock.zon, even when there is none to protect" {
     };
     try testing.expectEqual(
         Exit.finished.code(),
-        try finish(arena, testing.io, project_root, found, true, &.{}),
+        try finish(arena, testing.io, project_root, found, true, &.{}, null, null),
     );
     try testing.expect(std.mem.indexOf(u8, said.out(), "AGENTS.md") != null);
     try testing.expectError(
@@ -930,6 +1153,7 @@ test "a harness this build reads is found, and one it does not is refused by nam
 test {
     _ = @import("migrate/claude_code.zig");
     _ = @import("migrate/codex.zig");
+    _ = @import("migrate/transcript.zig");
 }
 
 test "a hint naming an action this build does not define never reaches a row" {
@@ -1008,10 +1232,8 @@ test "--permission takes a class this build carries and refuses one it does not"
     try testing.expect(std.mem.indexOf(u8, said.err(), "net.fetch") != null);
 }
 
-test "an option this build does not have is named, and an unbuilt one says so" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+test "an option this build does not have is named" {
+    const arena = testing.allocator;
 
     var said: tty.Capture = undefined;
     said.start(testing.io, testing.allocator);
@@ -1019,11 +1241,93 @@ test "an option this build does not have is named, and an unbuilt one says so" {
 
     try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--nonsense"}));
     try testing.expect(std.mem.indexOf(u8, said.err(), "--nonsense") != null);
+}
 
-    // Reaching for a flag the design names but this build has not grown is
-    // worth telling apart from a typo.
-    said.clear();
-    try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--sessions"}));
-    try testing.expect(std.mem.indexOf(u8, said.err(), "--sessions") != null);
-    try testing.expect(std.mem.indexOf(u8, said.err(), "not read yet") != null);
+test "--sessions and --memory are off unless named" {
+    const arena = testing.allocator;
+
+    const bare = try parseOptions(arena, &.{});
+    try testing.expect(!bare.sessions);
+    try testing.expect(!bare.memory);
+
+    const named = try parseOptions(arena, &.{ "--sessions", "--memory" });
+    try testing.expect(named.sessions);
+    try testing.expect(named.memory);
+}
+
+fn writeHomeFile(io: std.Io, dir: []const u8, rel: []const u8, contents: []const u8) !void {
+    const full = try std.fs.path.join(testing.allocator, &.{ dir, rel });
+    defer testing.allocator.free(full);
+    if (std.fs.path.dirname(full)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    var file = try std.Io.Dir.cwd().createFile(io, full, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, contents);
+}
+
+test "memory files are carried as data, with a bound on how many by size" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var home = testing.tmpDir(.{});
+    defer home.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try home.dir.realPath(testing.io, &home_buffer);
+    const home_path = home_buffer[0..home_len];
+
+    var data = testing.tmpDir(.{});
+    defer data.cleanup();
+    var data_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const data_len = try data.dir.realPath(testing.io, &data_buffer);
+    const data_path = data_buffer[0..data_len];
+
+    const project_root = "/home/somebody/work/parser";
+    const slug = "-home-somebody-work-parser";
+    const notes_dir = try std.fs.path.join(arena, &.{ home_path, ".claude", "projects", slug, "memory" });
+
+    try writeHomeFile(testing.io, notes_dir, "First-Note.md", "# first\nan insight worth keeping\n");
+    try writeHomeFile(testing.io, notes_dir, "second-note.md", "# second\nanother one\n");
+
+    var oversized: std.ArrayList(u8) = .empty;
+    try oversized.appendNTimes(arena, 'x', chock_core.memory.max_body_bytes + 1);
+    try writeHomeFile(testing.io, notes_dir, "too-big.md", oversized.items);
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", home_path);
+    try env.put("XDG_DATA_HOME", data_path);
+
+    const result = try importMemory(arena, testing.io, &env, "claude-code", project_root);
+    try testing.expectEqual(@as(usize, 2), result.carried);
+    try testing.expectEqual(@as(usize, 1), result.refused.len);
+    try testing.expectEqualStrings("too-big.md", result.refused[0].what);
+
+    // Each note landed as data in the knowledgebase's own file format, under
+    // a name the source file name turned into, never as pasted instructions.
+    const dest_dir = try session.memoryDir(arena, &env, project_root);
+    const note_text = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        try std.fmt.allocPrint(arena, "{s}/first-note.md", .{dest_dir}),
+        arena,
+        .limited(4096),
+    );
+    const entry = try chock_core.memory.parse(note_text);
+    try testing.expectEqualStrings("first-note", entry.name);
+    try testing.expectEqual(chock_core.memory.Kind.insight, entry.kind);
+    try testing.expect(std.mem.indexOf(u8, entry.description, "claude-code") != null);
+    try testing.expect(std.mem.indexOf(u8, entry.body, "an insight worth keeping") != null);
+}
+
+test "a harness with no pinned notes location is refused by name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+
+    const result = try importMemory(arena, testing.io, &env, "codex", "/somewhere");
+    try testing.expectEqual(@as(usize, 0), result.carried);
+    try testing.expectEqual(@as(usize, 1), result.refused.len);
+    try testing.expect(std.mem.indexOf(u8, result.refused[0].reason, "not pinned") != null);
 }
