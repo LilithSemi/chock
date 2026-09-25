@@ -218,3 +218,37 @@ fn noteRefusal(
     else
         error.StoreUnwritable;
 }
+
+const testing = std.testing;
+
+test "a name the Keychain does not hold reads back as nothing" {
+    // **The only test that exercises the bindings.** It calls the real
+    // framework, so a wrong argument order, a wrong pointer nullability or a
+    // missing framework link fails here and not in front of a user. It writes
+    // nothing, so it leaves no item behind on the machine that runs it.
+    var driver = Driver{ .data_dir = "" };
+
+    var diag: ?store.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(testing.allocator);
+
+    const held = driver.secrets().get(
+        testing.allocator,
+        testing.io,
+        "chock-test-name-no-login-ever-stored",
+        &diag,
+    ) catch |err| {
+        // A machine with no login keychain, or a locked one, cannot answer
+        // this and has nothing to prove. Both are ordinary where nobody has
+        // logged in at the desktop.
+        const met = diag orelse return err;
+        const refused = switch (met) {
+            .keychain_refused => |one| one,
+            else => return err,
+        };
+        switch (status.meaningOf(refused.status)) {
+            .no_keychain, .needs_unlock => return error.SkipZigTest,
+            else => return err,
+        }
+    };
+    try testing.expectEqual(@as(?[]u8, null), held);
+}
