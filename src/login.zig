@@ -32,10 +32,13 @@ const tty = @import("tty.zig");
 
 const usage_text =
     \\Usage: chock login --provider <kind>[=<url>] [options]
+    \\       chock login --search <name> [options]
     \\
     \\Kinds: anthropic, aiand, openai-compat=<url>
     \\
     \\Options:
+    \\  --search <name>            Store the key of a web search engine under this name,
+    \\                             which is the name your config.zon gives as .credential.
     \\  --name <name>              Name this instance. Omitted, the kind is the name.
     \\  --replace                  Replace a credential of this name without asking.
     \\                             A second instance of one kind needs a name of its own.
@@ -71,6 +74,9 @@ const Method = union(enum) {
 
 const Options = struct {
     provider: []const u8 = "",
+    /// The web search engine whose key this login stores. Set by `--search`,
+    /// and never set at the same time as `provider`.
+    search: ?[]const u8 = null,
     name: ?[]const u8 = null,
     method: ?Method = null,
     /// Replace a credential of the same name without being asked. For a
@@ -98,10 +104,6 @@ pub fn main(
         error.BadArguments => return Exit.usage.code(),
     };
 
-    const kind_and_url = splitProvider(options.provider) catch return Exit.usage.code();
-    const name = options.name orelse kind_and_url.kind.wireName();
-    const name_was_given = options.name != null;
-
     var env = try environ.createMap(arena);
 
     // `chock login` runs before a session, so it needs no sandbox and no
@@ -122,6 +124,16 @@ pub fn main(
 
     const driver = chock_auth.store.Driver{ .data_dir = data_dir };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
+
+    // A search credential is not a provider instance, so everything below this
+    // is about a provider and none of it applies.
+    if (options.search) |search_name| {
+        return searchLogin(gpa, io, driver.secrets(), data_dir, search_name, options);
+    }
+
+    const kind_and_url = splitProvider(options.provider) catch return Exit.usage.code();
+    const name = options.name orelse kind_and_url.kind.wireName();
+    const name_was_given = options.name != null;
 
     // **The first of two looks, and this is the kind one.** The refusal comes
     // before the prompt, not after it: asking a user for a credential and then
@@ -272,6 +284,119 @@ pub fn main(
     return Exit.finished.code();
 }
 
+/// Stores the key of a web search engine, under the name the operator's own
+/// `config.zon` gives as the search block's `.credential`.
+///
+/// **There is no check against the engine, and the provider path's one is not
+/// missing here by accident.** A provider credential that does not work ends
+/// every session before it starts, so it is worth a round trip before the
+/// store. A search key that does not work costs one tool call, which comes
+/// back saying the status the engine answered with. So this stores what it was
+/// given and says it did not check it.
+fn searchLogin(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    secrets: chock_auth.store.Secrets,
+    data_dir: []const u8,
+    name: []const u8,
+    options: Options,
+) !u8 {
+    var diag: ?chock_auth.store.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    // Before the prompt, so a directory that cannot be made does not cost the
+    // user the one thing they cannot easily get again.
+    chock_auth.store.ensureDir(io, data_dir, &diag) catch |err| {
+        reportStoreFault("the credential store could not be made", &diag, err);
+        return Exit.usage.code();
+    };
+
+    const method = options.method orelse defaultMethod(io);
+
+    if (!options.replace) {
+        const existing = chock_auth.search.load(gpa, io, secrets, name, &diag) catch |err| {
+            reportStoreFault("the credential store could not be read", &diag, err);
+            return Exit.usage.code();
+        };
+        if (existing) |held| {
+            defer {
+                std.crypto.secureZero(u8, held);
+                gpa.free(held);
+            }
+            // **A name given is not a replacement meant, which is the one place
+            // this differs from a provider login.** A provider name may be left
+            // out, so typing one says the user picked that one on purpose. A
+            // search credential has no unnamed form, so every login carries a
+            // name and it cannot also carry that meaning.
+            tty.print(
+                .warn,
+                "chock login: there is already a key stored for the search credential \"{s}\".\n",
+                .{name},
+            );
+            if (method != .prompt) {
+                tty.print(
+                    .warn,
+                    "This run has nobody to ask. Say it was meant:\n\n" ++
+                        "  chock login --search {s} --replace\n",
+                    .{name},
+                );
+                return Exit.usage.code();
+            }
+            if (!(confirmReplace(io) catch return Exit.usage.code())) {
+                tty.print(.plain, "chock login: nothing was changed.\n", .{});
+                return Exit.refused.code();
+            }
+        }
+    }
+
+    const credential = readCredential(gpa, io, method, name) catch |err| switch (err) {
+        error.Reported => return Exit.usage.code(),
+        else => |e| return e,
+    };
+    defer {
+        std.crypto.secureZero(u8, credential);
+        gpa.free(credential);
+    }
+    if (credential.len == 0) {
+        tty.print(.warn, "chock login: nothing was given, so nothing was stored.\n", .{});
+        return Exit.usage.code();
+    }
+
+    chock_auth.search.save(gpa, io, secrets, name, credential, &diag) catch |err| {
+        reportStoreFault("the key could not be stored", &diag, err);
+        return Exit.usage.code();
+    };
+
+    tty.print(
+        .plain,
+        "chock login: stored the key for the search credential \"{s}\". It was not checked " ++
+            "against the engine.\n",
+        .{name},
+    );
+    tty.print(
+        .plain,
+        "\nThe search block of your config.zon reads it under that name:\n\n" ++
+            "  .search = .{{ .kind = \"api\", .provider = \"brave\", " ++
+            ".base_url = \"https://api.search.brave.com\", .credential = \"{s}\" }}\n",
+        .{name},
+    );
+    return Exit.finished.code();
+}
+
+/// One wording for every fault the credential store hands back, with the
+/// diagnostic when there is one and the error name when there is not.
+fn reportStoreFault(
+    what: []const u8,
+    diag: *?chock_auth.store.Diagnostic,
+    err: anyerror,
+) void {
+    if (diag.*) |*d| {
+        tty.print(.err, "chock login: {s}: {f}\n", .{ what, d });
+    } else {
+        tty.print(.err, "chock login: {s}: {s}\n", .{ what, @errorName(err) });
+    }
+}
+
 /// Say that the name is taken and give the two commands that get past it.
 ///
 /// **One sentence for both looks.** The check before the prompt and the check
@@ -303,6 +428,12 @@ fn askReplace(io: std.Io, name: []const u8, stored_kind: []const u8) error{Repor
         "chock login: there is already a credential named \"{s}\", stored as kind {s}.\n",
         .{ name, stored_kind },
     );
+    return confirmReplace(io);
+}
+
+/// The question alone, so a provider login and a search login ask it in the
+/// same words and an answer means the same thing in both.
+fn confirmReplace(io: std.Io) error{Reported}!bool {
     tty.print(.plain, "Replace it? [y/N] ", .{});
     tty.flushOut();
 
@@ -660,6 +791,18 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             continue;
         }
 
+        if (std.mem.eql(u8, name, "--search")) {
+            options.search = inline_value orelse next: {
+                index += 1;
+                if (index >= args.len) {
+                    tty.print(.err, "chock login: --search needs a value.\n\n{s}", .{usage_text});
+                    return error.BadArguments;
+                }
+                break :next args[index];
+            };
+            continue;
+        }
+
         if (std.mem.eql(u8, name, "--replace")) {
             options.replace = true;
             continue;
@@ -699,8 +842,40 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         return error.BadArguments;
     }
 
+    if (options.search != null and options.provider.len != 0) {
+        tty.print(
+            .err,
+            "chock login: --provider and --search store different things, so one command does " ++
+                "one of them. Run it twice.\n",
+            .{},
+        );
+        return error.BadArguments;
+    }
+    if (options.search) |search_name| {
+        // A search credential has no instance in the configuration, so there is
+        // no second name for one.
+        if (options.name != null) {
+            tty.print(
+                .err,
+                "chock login: --search already names the credential, so --name says nothing " ++
+                    "more. Drop it.\n",
+                .{},
+            );
+            return error.BadArguments;
+        }
+        if (!chock_auth.search.nameIsAcceptable(search_name)) {
+            tty.print(
+                .err,
+                "chock login: \"{s}\" cannot name a search credential. A name holds letters, " ++
+                    "digits, and any of - _ . and nothing else.\n",
+                .{search_name},
+            );
+            return error.BadArguments;
+        }
+        return options;
+    }
     if (options.provider.len == 0) {
-        tty.print(.err, "chock login: --provider is needed.\n\n", .{});
+        tty.print(.err, "chock login: --provider or --search is needed.\n\n", .{});
         tty.print(.err, "{s}", .{usage_text});
         return error.BadArguments;
     }
@@ -927,7 +1102,7 @@ test "an instance with no name takes the kind, and --name names one of its own" 
     // in to, and the usage page is what it gets.
     said.clear();
     try testing.expectError(error.BadArguments, parseOptions(&.{}));
-    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider is needed") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider or --search is needed") != null);
     try testing.expectEqualStrings("", said.out());
 }
 
@@ -956,4 +1131,64 @@ test "a run with nobody to ask names both ways of meaning it" {
     try testing.expect(std.mem.indexOf(u8, said.err(), "--name") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "nobody to ask") != null);
     try testing.expect(std.mem.indexOf(u8, said.err(), "A name is needed") == null);
+}
+
+test "--search names the credential and takes the place of --provider" {
+    {
+        const options = try parseOptions(&.{ "--search", "brave" });
+        try testing.expectEqualStrings("brave", options.search.?);
+        try testing.expectEqualStrings("", options.provider);
+    }
+    {
+        const options = try parseOptions(&.{"--search=brave"});
+        try testing.expectEqualStrings("brave", options.search.?);
+    }
+}
+
+test "--provider and --search together are refused, and so is neither" {
+    {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(
+            error.BadArguments,
+            parseOptions(&.{ "--provider", "aiand", "--search", "brave" }),
+        );
+        try testing.expect(std.mem.indexOf(u8, said.err(), "Run it twice") != null);
+    }
+    {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(error.BadArguments, parseOptions(&.{}));
+        try testing.expect(std.mem.indexOf(u8, said.err(), "--search") != null);
+    }
+}
+
+test "--name says nothing next to --search, so it is refused rather than ignored" {
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    try testing.expectError(
+        error.BadArguments,
+        parseOptions(&.{ "--search", "brave", "--name", "work" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--name") != null);
+}
+
+test "a search name the credential store cannot hold is refused at the command line" {
+    // The store refuses a colon as well, because a name is joined to a
+    // reserved prefix. Being told at the command line costs the user nothing.
+    for ([_][]const u8{ "", "with space", "has:colon", "has/slash" }) |bad| {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(error.BadArguments, parseOptions(&.{ "--search", bad }));
+    }
+
+    for ([_][]const u8{ "brave", "work-key", "my_key.2" }) |good| {
+        const options = try parseOptions(&.{ "--search", good });
+        try testing.expectEqualStrings(good, options.search.?);
+    }
 }
