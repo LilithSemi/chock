@@ -14,10 +14,18 @@ pub const Kind = enum {
     scrape,
 };
 
+/// Which keyed search vendor an `api` engine talks to. Each one has its own
+/// request shape and its own reply shape, so the kind alone does not say
+/// enough to read a reply.
+pub const Provider = enum {
+    brave,
+};
+
 /// Every member is optional, so "no search block" is told apart from a block
 /// that names its own fields.
 pub const Search = struct {
     kind: ?Kind = null,
+    provider: ?Provider = null,
     base_url: ?[]const u8 = null,
     credential: ?[]const u8 = null,
 
@@ -89,11 +97,16 @@ pub const Diagnostic = struct {
         kind_not_a_string,
         kind_unknown: []const u8,
         kind_missing,
+        provider_not_a_string,
+        provider_unknown: []const u8,
+        provider_missing,
+        provider_not_for_kind: Kind,
         base_url_not_a_string,
         base_url_invalid: InvalidBaseUrl,
         base_url_missing,
         credential_not_a_string,
         credential_empty,
+        credential_missing,
         kind_not_permitted: Kind,
         base_url_not_permitted: BaseUrlMismatch,
         file_too_large: usize,
@@ -115,7 +128,7 @@ pub const Diagnostic = struct {
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
         switch (self.fault) {
             .file_not_zon => |*zon_diag| zon_diag.deinit(gpa),
-            .unknown_field, .inline_secret, .kind_unknown => |name| gpa.free(name),
+            .unknown_field, .inline_secret, .kind_unknown, .provider_unknown => |name| gpa.free(name),
             .base_url_invalid => |invalid| gpa.free(invalid.text),
             else => {},
         }
@@ -138,7 +151,7 @@ pub const Diagnostic = struct {
             ),
             .inline_secret => |field| try writer.print(
                 "{s}: the search block names a {s} field. A credential value must never be " ++
-                    "written here. It belongs in the credential store, and chock login puts it there.",
+                    "written here. It belongs in the credential store, and chock login --search puts it there.",
                 .{ self.source, field },
             ),
             .kind_not_a_string => try writer.print(
@@ -153,6 +166,22 @@ pub const Diagnostic = struct {
             .kind_missing => try writer.print(
                 "{s}: the search block names no kind, and one of self_hosted, api, or scrape is required",
                 .{self.source},
+            ),
+            .provider_not_a_string => try writer.print(
+                "{s}: the search block's provider field must be a string",
+                .{self.source},
+            ),
+            .provider_unknown => |text| try writer.print(
+                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave",
+                .{ self.source, text },
+            ),
+            .provider_missing => try writer.print(
+                "{s}: the search block's kind is api, and a provider naming the vendor is required",
+                .{self.source},
+            ),
+            .provider_not_for_kind => |kind| try writer.print(
+                "{s}: the search block names a provider, and provider applies to the api kind only, not {s}",
+                .{ self.source, @tagName(kind) },
             ),
             .base_url_not_a_string => try writer.print(
                 "{s}: the search block's base_url field must be a string",
@@ -172,6 +201,11 @@ pub const Diagnostic = struct {
             ),
             .credential_empty => try writer.print(
                 "{s}: the search block's credential field is empty, and a credential store name cannot be",
+                .{self.source},
+            ),
+            .credential_missing => try writer.print(
+                "{s}: the search block's kind is api, and a credential is required. It names an " ++
+                    "entry in the credential store, and chock login --search <name> puts one there.",
                 .{self.source},
             ),
             .kind_not_permitted => |kind| try writer.print(
@@ -300,6 +334,8 @@ fn parseFields(
                     return error.InvalidSearch;
                 } else if (std.mem.eql(u8, name, "kind")) {
                     search.kind = try readKind(gpa, zoir, value_node, source_name, diag);
+                } else if (std.mem.eql(u8, name, "provider")) {
+                    search.provider = try readProvider(gpa, zoir, value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "base_url")) {
                     search.base_url = try readBaseUrl(gpa, zoir, value_node, source_name, diag);
                 } else if (std.mem.eql(u8, name, "credential")) {
@@ -325,6 +361,23 @@ fn parseFields(
         _ = note(diag, source_name, .base_url_missing);
         return error.InvalidSearch;
     }
+
+    const kind = search.kind.?;
+    // A keyed engine with no key cannot work, so the provider and the
+    // credential are required now, not on the agent's first search.
+    if (kind == .api) {
+        if (search.provider == null) {
+            _ = note(diag, source_name, .provider_missing);
+            return error.InvalidSearch;
+        }
+        if (search.credential == null) {
+            _ = note(diag, source_name, .credential_missing);
+            return error.InvalidSearch;
+        }
+    } else if (search.provider != null) {
+        _ = note(diag, source_name, .{ .provider_not_for_kind = kind });
+        return error.InvalidSearch;
+    }
     return search;
 }
 
@@ -344,6 +397,26 @@ fn readKind(
     };
     return std.meta.stringToEnum(Kind, text) orelse {
         _ = note(diag, source_name, .{ .kind_unknown = try gpa.dupe(u8, text) });
+        return error.InvalidSearch;
+    };
+}
+
+fn readProvider(
+    gpa: std.mem.Allocator,
+    zoir: std.zig.Zoir,
+    node: std.zig.Zoir.Node.Index,
+    source_name: []const u8,
+    diag: ?*?Diagnostic,
+) ParseError!Provider {
+    const text = switch (node.get(zoir)) {
+        .string_literal => |text| text,
+        else => {
+            _ = note(diag, source_name, .provider_not_a_string);
+            return error.InvalidSearch;
+        },
+    };
+    return std.meta.stringToEnum(Provider, text) orelse {
+        _ = note(diag, source_name, .{ .provider_unknown = try gpa.dupe(u8, text) });
         return error.InvalidSearch;
     };
 }
@@ -491,7 +564,7 @@ test "each of the three kinds parses" {
     try testing.expectEqual(Kind.self_hosted, self_hosted.kind.?);
 
     var api = try parse(gpa,
-        \\.{ .search = .{ .kind = "api", .base_url = "https://search.example.com" } }
+        \\.{ .search = .{ .kind = "api", .base_url = "https://search.example.com", .provider = "brave", .credential = "brave" } }
     , null);
     defer api.deinit(gpa);
     try testing.expectEqual(Kind.api, api.kind.?);
@@ -591,7 +664,7 @@ test "credential names an entry in the store, and an empty name is refused" {
     const gpa = testing.allocator;
 
     var named = try parse(gpa,
-        \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .credential = "brave" } }
+        \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "brave", .credential = "brave" } }
     , null);
     defer named.deinit(gpa);
     try testing.expectEqualStrings("brave", named.credential.?);
@@ -654,7 +727,7 @@ test "an org ceiling forbidding scrape beats a user config that asks for it" {
     try testing.expectEqual(Kind.scrape, diag.?.fault.kind_not_permitted);
 
     var allowed = try parse(gpa,
-        \\.{ .search = .{ .kind = "api", .base_url = "https://example.org" } }
+        \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "brave", .credential = "brave" } }
     , null);
     defer allowed.deinit(gpa);
     const held = try foldLayers(allowed, ceiling, null);
@@ -665,7 +738,7 @@ test "an org ceiling naming an exact base_url refuses any other one" {
     const gpa = testing.allocator;
 
     var mismatched = try parse(gpa,
-        \\.{ .search = .{ .kind = "api", .base_url = "https://other.example.org" } }
+        \\.{ .search = .{ .kind = "self_hosted", .base_url = "https://other.example.org" } }
     , null);
     defer mismatched.deinit(gpa);
 
@@ -679,7 +752,7 @@ test "an org ceiling naming an exact base_url refuses any other one" {
     try testing.expectEqualStrings("https://other.example.org", diag.?.fault.base_url_not_permitted.text);
 
     var matched = try parse(gpa,
-        \\.{ .search = .{ .kind = "api", .base_url = "https://search.example.org" } }
+        \\.{ .search = .{ .kind = "self_hosted", .base_url = "https://search.example.org" } }
     , null);
     defer matched.deinit(gpa);
     const held = try foldLayers(matched, ceiling, null);
@@ -696,4 +769,86 @@ test "a ceiling this build was given nothing for changes nothing" {
 
     const held = try foldLayers(search, null, null);
     try testing.expectEqual(Kind.scrape, held.kind.?);
+}
+
+test "kind api with a provider and a credential parses, and provider reads back" {
+    const gpa = testing.allocator;
+
+    var search = try parse(gpa,
+        \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "brave", .credential = "brave" } }
+    , null);
+    defer search.deinit(gpa);
+    try testing.expectEqual(Provider.brave, search.provider.?);
+}
+
+test "an unknown provider is refused, and the diagnostic carries the text the user wrote" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "yahoo", .credential = "yahoo" } }
+        , &diag),
+    );
+    try testing.expectEqualStrings("yahoo", diag.?.fault.provider_unknown);
+}
+
+test "kind api requires both a provider and a credential" {
+    const gpa = testing.allocator;
+
+    var no_provider: ?Diagnostic = null;
+    defer if (no_provider) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "api", .base_url = "https://example.org" } }
+        , &no_provider),
+    );
+    try testing.expect(no_provider.?.fault == .provider_missing);
+
+    var no_credential: ?Diagnostic = null;
+    defer if (no_credential) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "brave" } }
+        , &no_credential),
+    );
+    try testing.expect(no_credential.?.fault == .credential_missing);
+}
+
+test "self_hosted and scrape must not name a provider" {
+    const gpa = testing.allocator;
+
+    var self_hosted: ?Diagnostic = null;
+    defer if (self_hosted) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "self_hosted", .base_url = "https://searx.example.org", .provider = "brave" } }
+        , &self_hosted),
+    );
+    try testing.expectEqual(Kind.self_hosted, self_hosted.?.fault.provider_not_for_kind);
+
+    var scrape: ?Diagnostic = null;
+    defer if (scrape) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.net", .provider = "brave" } }
+        , &scrape),
+    );
+    try testing.expectEqual(Kind.scrape, scrape.?.fault.provider_not_for_kind);
+}
+
+test "a self_hosted block with no provider still parses" {
+    const gpa = testing.allocator;
+
+    var search = try parse(gpa,
+        \\.{ .search = .{ .kind = "self_hosted", .base_url = "https://searx.example.org" } }
+    , null);
+    defer search.deinit(gpa);
+    try testing.expectEqual(@as(?Provider, null), search.provider);
 }

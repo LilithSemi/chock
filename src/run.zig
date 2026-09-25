@@ -448,6 +448,10 @@ const Started = struct {
     nix_build: ?NixBuild,
     nix_caps: chock_policy.nix.Resolved,
     search: chock_policy.search.Search,
+    /// The key itself, read out of the credential store, and not the name the
+    /// `search` block gives. Null when the block names none, or when the store
+    /// holds nothing under that name yet.
+    search_credential: ?[]const u8,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
     base_url: []const u8,
@@ -855,7 +859,18 @@ fn start(
         return error.Reported;
     }
 
-    const redaction = try redactionFor(arena, instance.name, credential.token, config.instances);
+    // Before the redaction, because the search key is one of the values that
+    // must never reach the log.
+    const search = try resolveSearch(arena, io, config_dir, org_bundle);
+    const search_credential = try loadSearchCredential(arena, io, store, search);
+
+    const redaction = try redactionFor(
+        arena,
+        instance.name,
+        credential.token,
+        config.instances,
+        search_credential,
+    );
 
     // Copied into the arena: `chock_proto.log.Log` borrows the session string
     // and stamps it onto every envelope for as long as the log is open.
@@ -1035,8 +1050,6 @@ fn start(
     // reads. `--dev-shell` wins over the file for this one run.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
-
-    const search = try resolveSearch(arena, io, config_dir, org_bundle);
 
     const flake_inputs = fetchFlakeInputs(
         arena,
@@ -1382,6 +1395,7 @@ fn start(
         .nix_build = nix_build,
         .nix_caps = nix_caps,
         .search = search,
+        .search_credential = search_credential,
         .backing = backing,
         .storage = storage,
         .base_url = instance.base_url,
@@ -1429,11 +1443,18 @@ fn redactionFor(
     instance_name: []const u8,
     token: []const u8,
     instances: []const chock_auth.config.Instance,
+    search_key: ?[]const u8,
 ) std.mem.Allocator.Error!chock_core.redact.Policy {
     const Named = struct { name: []const u8, value: []const u8 };
 
     var named: std.ArrayList(Named) = .empty;
     if (token.len != 0) try named.append(arena, .{ .name = instance_name, .value = token });
+
+    // A search key reaches no provider, and it still goes in the log the moment
+    // a request that carries it is written down.
+    if (search_key) |key_value| {
+        if (key_value.len != 0) try named.append(arena, .{ .name = "the search engine", .value = key_value });
+    }
 
     for (instances) |one| {
         const inline_token = switch (one.credential) {
@@ -1911,6 +1932,44 @@ fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartErro
         tty.print(.err, "chock run: the limits block could not be read: {t}\n", .{err});
     }
     return error.Reported;
+}
+
+/// The key of the configured search engine, read out of the credential store.
+///
+/// **A named credential the store has nothing under is a warning and not a
+/// refusal.** A session that never searches must still start, and the tool
+/// itself refuses the call with the command that puts the key there. Ending the
+/// session instead would make one unconfigured engine cost every other thing the
+/// agent was going to do.
+fn loadSearchCredential(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    store: chock_auth.store.Store,
+    search: chock_policy.search.Search,
+) StartError!?[]const u8 {
+    const name = search.credential orelse return null;
+
+    var diag: ?chock_auth.store.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    const held = chock_auth.search.load(arena, io, store.secrets, name, &diag) catch |err| {
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the search key could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the search key could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+    if (held == null) {
+        tty.print(
+            .warn,
+            "chock run: the search block names the credential \"{s}\" and the credential store " ++
+                "holds nothing under it. A search will be refused until you run:\n" ++
+                "  chock login --search {s}\n",
+            .{ name, name },
+        );
+    }
+    return held;
 }
 
 /// There is no project layer for `search`: it names the operator's own
@@ -9902,6 +9961,8 @@ fn runSession(
         break :about SessionSearcher{ .session = .{
             .kind = kind,
             .base_url = base,
+            .provider = started.search.provider,
+            .credential = started.search_credential,
             .clean = chock_core.mcp.textForModel,
         } };
     } else null;
@@ -16925,7 +16986,7 @@ test "this session's own credential is what the redactor is given" {
     defer said.stop(testing.io);
 
     const token = "sk-not-a-real-key-0123456789";
-    const policy = try redactionFor(arena, "hub", token, &.{});
+    const policy = try redactionFor(arena, "hub", token, &.{}, null);
 
     try testing.expectEqual(@as(usize, 2), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
@@ -16939,6 +17000,37 @@ test "this session's own credential is what the redactor is given" {
     try testing.expectEqualStrings("", said.out());
 }
 
+test "the search key is kept out of the log beside the provider credential" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    const token = "sk-not-a-real-key-0123456789";
+    const search_key = "BSA-not-a-real-search-key-0123";
+    const policy = try redactionFor(arena, "hub", token, &.{}, search_key);
+
+    // Both credentials, plus the empty slot a git password goes in.
+    try testing.expectEqual(@as(usize, 3), policy.secrets.len);
+    try testing.expectEqualStrings(token, policy.secrets[0].value);
+    try testing.expectEqualStrings(search_key, policy.secrets[1].value);
+
+    const values = try brokerRedaction(arena, policy);
+    var carried = false;
+    for (values) |one| {
+        if (std.mem.eql(u8, one, search_key)) carried = true;
+    }
+    // The broker redacts from values alone, so a key held by the core policy and
+    // not carried across would still reach a fetch that was written down.
+    try testing.expect(carried);
+
+    try testing.expectEqualStrings("", said.err());
+}
+
 test "a credential nobody could match is skipped and said out loud, and an absent one is silent" {
     const gpa = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -16950,7 +17042,7 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     defer said.stop(testing.io);
 
     const short = "abc";
-    const policy = try redactionFor(arena, "hub", short, &.{});
+    const policy = try redactionFor(arena, "hub", short, &.{}, null);
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
     try testing.expect(policy.isEmpty());
 
@@ -16960,7 +17052,7 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     try testing.expect(std.mem.indexOf(u8, warned, short) == null);
 
     said.clear();
-    const none = try redactionFor(arena, "local", "", &.{});
+    const none = try redactionFor(arena, "local", "", &.{}, null);
     try testing.expectEqual(@as(usize, 1), none.secrets.len);
     try testing.expectEqualStrings("", none.secrets[0].value);
     try testing.expectEqual(@as(usize, 0), none.tooShort());
@@ -16988,7 +17080,7 @@ test "no line this file writes about redaction can hold a credential" {
             .context_tokens = null,
             .capabilities = .{},
         }};
-        _ = try redactionFor(arena, "hub", token, &others);
+        _ = try redactionFor(arena, "hub", token, &others, null);
         try testing.expect(std.mem.indexOf(u8, said.err(), token) == null);
         try testing.expect(std.mem.indexOf(u8, said.out(), token) == null);
     }
@@ -17042,7 +17134,7 @@ test "every credential the configuration holds is in the set, and not only the o
         },
     };
 
-    const policy = try redactionFor(arena, "hub", in_use, &instances);
+    const policy = try redactionFor(arena, "hub", in_use, &instances, null);
     try testing.expectEqual(@as(usize, 3), policy.secrets.len);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
 
@@ -17081,7 +17173,7 @@ test "a short credential on another provider is named, and the good one still wo
         .capabilities = .{},
     }};
 
-    const policy = try redactionFor(arena, "hub", good, &instances);
+    const policy = try redactionFor(arena, "hub", good, &instances, null);
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
     try testing.expect(!policy.isEmpty());
 
@@ -17114,7 +17206,7 @@ test "the broker is given the same values, without the ones nobody can match" {
         .capabilities = .{},
     }};
 
-    const policy = try redactionFor(arena, "hub", good, &instances);
+    const policy = try redactionFor(arena, "hub", good, &instances, null);
     const values = try brokerRedaction(arena, policy);
 
     try testing.expectEqual(@as(usize, 1), values.len);
