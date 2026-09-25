@@ -23,6 +23,13 @@ jobs:
       fail-fast: false
 
   test-sandbox:
+    # **Not held behind DeterminateCI, unlike the artefact build.** This is the
+    # job that proves the sandbox, so it is the one whose failure a person most
+    # wants early. It shares the cache, so it builds little that DeterminateCI
+    # has not already built.
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +39,8 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - uses: DeterminateSystems/flakehub-cache-action@v3
 
       - name: Permit the nested user namespace
         if: runner.os == 'Linux'
@@ -112,13 +121,37 @@ jobs:
           fi
           nix develop --command zig build test --summary all
 
-  release:
-    if: github.event_name != 'pull_request'
-    needs: [DeterminateCI, test-sandbox]
-    runs-on: ubuntu-latest
+  # **Every platform is built by nix on its own runner, and nothing is cross
+  # compiled.** The macOS driver links the Security framework, which needs the
+  # macOS SDK, and a Linux runner has none: a cross compile of it fails at the
+  # link. Building each system natively also means the artefact a reader
+  # downloads is the derivation CI checked, and not a second build made a
+  # different way.
+  build:
+    # **After DeterminateCI, and not beside it.** That job already builds the
+    # flake on every platform, so running this one first would build the same
+    # derivations twice and would do it again on a commit DeterminateCI was
+    # about to reject. Waiting costs wall clock and saves the work.
+    needs: [DeterminateCI]
     permissions:
-      contents: write
       id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux
+          # **Apple Silicon only, and no `x86_64-macos`.** macOS 27 shipped on
+          # 2026-09-14 and dropped every Intel Mac; Tahoe 26 was the last
+          # release that ran on one, and it holds security updates only into
+          # 2028. A new tool shipping an Intel Mac binary now is building for a
+          # platform that ended this month.
+          - runner: macos-latest
+            target: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -126,10 +159,16 @@ jobs:
 
       - uses: DeterminateSystems/determinate-nix-action@v3
 
-      - name: Build the release artefacts
+      # **So this job reads what DeterminateCI already built.** Without it every
+      # runner rebuilds the same derivations from source.
+      - uses: DeterminateSystems/flakehub-cache-action@v3
+
+      - name: Build and package this platform
         run: |
           set -euo pipefail
           version=$(nix eval .#default.version --raw)
+
+          nix build .#default --print-build-logs
 
           # **A version-less copy is made for a tagged release alone.**
           # GitHub serves `releases/latest/download/<name>` out of the latest
@@ -143,74 +182,111 @@ jobs:
           esac
 
           mkdir -p artifacts
-          # **macOS is cross compiled from here and not built on a Mac.**
-          # Measured 2026-09-16: `zig build -Dtarget=aarch64-macos` on Linux
-          # produces a real Mach-O arm64 executable. The site says Chock runs on
-          # Linux and macOS, so a release that shipped Linux alone left half the
-          # readers with no file at all.
+          # **A tarball and not a bare binary.** Apache-2.0 asks that the
+          # licence travels with the distribution, and a bare binary carries
+          # nothing. A tarball also keeps the executable bit, which a browser
+          # download drops, and unpacks to a plain `chock` so nobody has to
+          # rename the file before they can run it.
           #
-          # **Apple Silicon only, and no `x86_64-macos`.** It cross compiles
-          # cleanly, so this is not a limit of the toolchain. macOS 27 shipped
-          # on 2026-09-14 and dropped every Intel Mac; Tahoe 26 was the last
-          # release that ran on one, and it holds security updates only into
-          # 2028. A new tool shipping an Intel Mac binary now is building for a
-          # platform that ended this month.
-          for target in x86_64-linux aarch64-linux aarch64-macos; do
-            name="chock-${version}-${target}"
-            nix develop --command zig build \
-              -Doptimize=ReleaseSmall \
-              -Dtarget="${target}" \
-              -Dversion="${version}" \
-              --prefix "build/${target}"
-            # **A tarball and not a bare binary.** Apache-2.0 asks that the
-            # licence travels with the distribution, and a bare binary carries
-            # nothing. A tarball also keeps the executable bit, which a browser
-            # download drops, and unpacks to a plain `chock` so nobody has to
-            # rename the file before they can run it.
-            #
-            # **It unpacks into a directory of its own, not into the current
-            # one.** A flat tarball holding `chock`, `LICENSE` and `README.md`
-            # would overwrite a README.md the reader already had, in whatever
-            # directory they happened to be standing in. One path segment is a
-            # small price for never doing that.
-            #
-            # **Built for reproducibility**: a fixed owner, group and time, a
-            # sorted member order, and `gzip -n` so the archive carries no
-            # timestamp of its own. Two builds of the same commit then give the
-            # same digest, which is what makes SHA256SUMS worth publishing for
-            # a tool whose whole claim is about boundaries.
-            shapes=("${name}")
-            if [ "${permanent_name}" = 1 ]; then
-              shapes+=("chock-${target}")
-            fi
-            for shape in "${shapes[@]}"; do
-              rm -rf "stage/${shape}"
-              mkdir -p "stage/${shape}"
-              cp "build/${target}/bin/chock" "stage/${shape}/chock"
-              cp LICENSE README.md "stage/${shape}/"
+          # **It unpacks into a directory of its own, not into the current
+          # one.** A flat tarball holding `chock`, `LICENSE` and `README.md`
+          # would overwrite a README.md the reader already had, in whatever
+          # directory they happened to be standing in. One path segment is a
+          # small price for never doing that.
+          #
+          # **Built for reproducibility**: a fixed owner, group and time, a
+          # sorted member order, and `gzip -n` so the archive carries no
+          # timestamp of its own. Two builds of the same commit then give the
+          # same digest, which is what makes SHA256SUMS worth publishing for
+          # a tool whose whole claim is about boundaries.
+          #
+          # **GNU tar by name, and never the runner's own.** macOS ships bsdtar,
+          # which has none of those four options, so the flags are not portable
+          # and neither is the archive one writes. Taking both tools from nix
+          # makes every platform build the same shape of tarball.
+          shapes=("chock-${version}-${{ matrix.target }}")
+          if [ "${permanent_name}" = 1 ]; then
+            shapes+=("chock-${{ matrix.target }}")
+          fi
+          for shape in "${shapes[@]}"; do
+            rm -rf "stage/${shape}"
+            mkdir -p "stage/${shape}"
+            cp result/bin/chock "stage/${shape}/chock"
+            chmod u+w "stage/${shape}/chock"
+            cp LICENSE README.md "stage/${shape}/"
+            nix shell nixpkgs#gnutar nixpkgs#gzip -c sh -c "
               tar --sort=name \
                   --owner=0 --group=0 --numeric-owner \
-                  --mtime="@${SOURCE_DATE_EPOCH:-0}" \
-                  -C stage -cf - "${shape}" \
-                | gzip -n > "artifacts/${shape}.tar.gz"
-            done
+                  --mtime='@${SOURCE_DATE_EPOCH:-0}' \
+                  -C stage -cf - '${shape}' \
+                | gzip -n > 'artifacts/${shape}.tar.gz'
+            "
           done
 
-          # **A digest beside every artefact.** A tool whose whole claim is
-          # about boundaries, downloaded with nothing to check it against, is
-          # the first thing a sceptic points at. Written last so it covers the
-          # version-less copy too, on a release that has one.
-          ( cd artifacts && sha256sum chock-*.tar.gz > SHA256SUMS )
-
-          ls -l artifacts
-          cat artifacts/SHA256SUMS
-
-          reported="$(./build/x86_64-linux/bin/chock --version)"
+          # **Every platform reports its own version, and not one of them on
+          # behalf of the rest.** The old job ran the Linux binary alone, so a
+          # macOS build that reported the wrong version passed.
+          reported="$(result/bin/chock --version)"
           echo "the binary reports: ${reported}"
           case "${reported}" in
             "chock ${version}"*) ;;
             *) echo "::error::${reported} does not agree with ${version}" >&2; exit 1 ;;
           esac
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: chock-${{ matrix.target }}
+          path: artifacts/
+          if-no-files-found: error
+
+  # **Runs on every event, pull requests included.** The packaging path used to
+  # run only after a merge, so a change that broke it was invisible until it
+  # was already on master. Publishing is what is held back, not building.
+  success:
+    if: always()
+    needs: [DeterminateCI, test-sandbox, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      # **`if: always()` reports success whatever happened above**, so without
+      # this a failed test would show a green gate. Cancelled and skipped count
+      # too: a run somebody stopped, and a job that never ran because the job
+      # before it failed, have both proved nothing. None of the three jobs
+      # carries a condition of its own, so skipped can only mean that.
+      - name: Refuse if anything this gate waits on did not pass
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::a job this gate depends on did not pass" >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      - uses: DeterminateSystems/flakehub-cache-action@v3
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: chock-*
+          merge-multiple: true
+          path: artifacts/
+
+      - name: Gather the digests
+        run: |
+          set -euo pipefail
+
+          # **A digest beside every artefact.** A tool whose whole claim is
+          # about boundaries, downloaded with nothing to check it against, is
+          # the first thing a sceptic points at. Written here, after every
+          # platform has arrived, so one file covers them all.
+          ( cd artifacts && sha256sum chock-*.tar.gz > SHA256SUMS )
+
+          ls -l artifacts
+          cat artifacts/SHA256SUMS
 
       - uses: actions/upload-artifact@v5
         with:
