@@ -1,7 +1,7 @@
 //! Answers a `web_search` call for the `self_hosted` and `api` search kinds.
 //! `self_hosted` is backed by a SearXNG instance and needs no credential.
 //! `api` is backed by a keyed vendor named in `chock_policy.search.Provider`,
-//! today only `brave`, and reads a credential the caller hands it. `scrape`
+//! `brave` or `kagi`, and reads a credential the caller hands it. `scrape`
 //! is named in `chock_policy.search.Kind` too and is refused here by name:
 //! it is not built yet.
 //!
@@ -46,6 +46,17 @@
 //! document a status for a bad or missing credential; a 401 is only what
 //! third parties report in practice, so this file only ever says "check the
 //! credential" for a 401 or 403, never that the credential is wrong.
+//!
+//! ## Kagi's own API, verified against its published OpenAPI specification
+//!
+//! `POST {base_url}/search` with a JSON body `{"query": ..., "limit": ...}`
+//! is the endpoint, unlike SearXNG and Brave which are both GET. The
+//! credential goes in an `Authorization` header. The reply is a JSON object
+//! with a `data` object holding several named arrays; the plain web results
+//! are `data.search`, and every other `data.*` key is ignored. Kagi
+//! documents its error statuses, so this file's Kagi statuses are worded
+//! definitely where Brave's stay a hedge: Brave never documented what a bad
+//! credential answers with, and Kagi does.
 //!
 //! ## A result is written by a stranger
 //!
@@ -155,7 +166,7 @@ fn searchSelfHosted(
     const url = try buildSearchUrl(gpa, base_url, query);
     defer gpa.free(url);
 
-    const fetched = request(gpa, io, url, &.{}) catch |err| switch (err) {
+    const fetched = request(gpa, io, .GET, url, &.{}, .default, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResponseTooLarge => return .{
             .is_error = true,
@@ -201,10 +212,11 @@ fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []
         ),
     };
 
-    // One provider today, and the switch is what makes a second vendor a
-    // compile error until it is handled.
+    // The switch is what makes a new vendor a compile error until it is
+    // handled.
     return switch (provider) {
         .brave => searchBrave(gpa, io, self.base_url, query, credential, self.clean),
+        .kagi => searchKagi(gpa, io, self.base_url, query, credential, self.clean),
     };
 }
 
@@ -258,7 +270,7 @@ fn searchBrave(
     const headers = [_]std.http.Header{
         .{ .name = "X-Subscription-Token", .value = credential },
     };
-    const fetched = request(gpa, io, url, &headers) catch |err| switch (err) {
+    const fetched = request(gpa, io, .GET, url, &headers, .default, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResponseTooLarge => return .{
             .is_error = true,
@@ -327,6 +339,73 @@ fn appendPercentEncoded(gpa: std.mem.Allocator, out: *std.ArrayList(u8), raw: []
     }
 }
 
+/// Kagi's own scheme word for its `Authorization` header. Kagi's own docs
+/// disagree with themselves: the OpenAPI specification and quick start show
+/// `Bearer`, the Search API and portal pages show `Bot`. `Bearer` is the
+/// authoritative choice, and if that turns out wrong, this is the one line
+/// to change.
+pub const kagi_auth_scheme = "Bearer";
+
+fn searchKagi(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    query: []const u8,
+    credential: []const u8,
+    clean: Clean,
+) Error!Answer {
+    const url = try buildKagiSearchUrl(gpa, base_url);
+    defer gpa.free(url);
+
+    const body = try buildKagiRequestBody(gpa, query);
+    defer gpa.free(body);
+
+    // The header value holds the credential, so it is wiped before it is
+    // freed, the same rule `lib/chock-provider/Client.zig` keeps for its own
+    // Authorization buffer.
+    const auth_value = try std.fmt.allocPrint(gpa, "{s} {s}", .{ kagi_auth_scheme, credential });
+    defer {
+        std.crypto.secureZero(u8, auth_value);
+        gpa.free(auth_value);
+    }
+
+    const fetched = request(gpa, io, .POST, url, &.{}, .{ .override = auth_value }, body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ResponseTooLarge => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: {s} answered with a body larger than {d} bytes.",
+                .{ base_url, max_body_bytes },
+            ),
+        },
+        error.RequestFailed => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: the request to {s} failed.",
+                .{base_url},
+            ),
+        },
+    };
+    defer gpa.free(fetched.body);
+
+    return answerFromKagi(gpa, base_url, query, fetched.status, fetched.body, clean);
+}
+
+fn buildKagiSearchUrl(gpa: std.mem.Allocator, base_url: []const u8) Error![]u8 {
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(gpa);
+    try url.appendSlice(gpa, base_url);
+    if (base_url.len == 0 or base_url[base_url.len - 1] != '/') try url.append(gpa, '/');
+    try url.appendSlice(gpa, "search");
+    return url.toOwnedSlice(gpa);
+}
+
+fn buildKagiRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{ .query = query, .limit = max_results }, .{});
+}
+
 const RequestError = error{ RequestFailed, ResponseTooLarge } || Error;
 
 const Fetched = struct {
@@ -335,26 +414,44 @@ const Fetched = struct {
 };
 
 /// The one place `std.http.Client` is named. See this file's own top comment.
+/// `authorization` is its own parameter because `std.http.Client.Request`
+/// treats it as a first class header: a vendor whose credential header is
+/// literally `Authorization`, like Kagi, must set it there and not through
+/// `extra_headers`, or the request would carry the header twice.
 fn request(
     gpa: std.mem.Allocator,
     io: std.Io,
+    method: std.http.Method,
     url: []const u8,
     extra_headers: []const std.http.Header,
+    authorization: std.http.Client.Request.Headers.Value,
+    /// Mutable, because `sendBodyComplete` writes through it. Every caller
+    /// that sends a body allocated it, and the type says so rather than a
+    /// comment asserting it.
+    body: ?[]u8,
 ) RequestError!Fetched {
     const uri = std.Uri.parse(url) catch return error.RequestFailed;
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    var http_request = client.request(.GET, uri, .{
+    var http_request = client.request(method, uri, .{
         .keep_alive = false,
         .redirect_behavior = .not_allowed,
-        .headers = .{ .user_agent = .{ .override = actions.user_agent } },
+        .headers = .{
+            .user_agent = .{ .override = actions.user_agent },
+            .authorization = authorization,
+            .content_type = if (body != null) .{ .override = "application/json" } else .default,
+        },
         .extra_headers = extra_headers,
     }) catch return error.RequestFailed;
     defer http_request.deinit();
 
-    http_request.sendBodiless() catch return error.RequestFailed;
+    if (body) |bytes| {
+        http_request.sendBodyComplete(bytes) catch return error.RequestFailed;
+    } else {
+        http_request.sendBodiless() catch return error.RequestFailed;
+    }
 
     var head_buffer: [4 * 1024]u8 = undefined;
     var response = http_request.receiveHead(&head_buffer) catch return error.RequestFailed;
@@ -371,13 +468,13 @@ fn request(
     var transfer_buffer: [4 * 1024]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    const body = body_reader.allocRemaining(gpa, .limited(max_body_bytes)) catch |err| switch (err) {
+    const response_body = body_reader.allocRemaining(gpa, .limited(max_body_bytes)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return error.ResponseTooLarge,
         error.ReadFailed => return error.RequestFailed,
     };
 
-    return .{ .status = @intFromEnum(response.head.status), .body = body };
+    return .{ .status = @intFromEnum(response.head.status), .body = response_body };
 }
 
 const SearxResult = struct {
@@ -568,6 +665,120 @@ fn braveNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
             gpa,
             "nothing was searched: Brave answered HTTP {d} with a body this could not read as JSON.{s}",
             .{ status, credential_note },
+        ),
+    };
+}
+
+// Kagi's own examples carry `&#39;` and `&amp;` in titles and snippets, and
+// no documented parameter turns entity decoding off. They reach the model
+// as written, the same choice this file already makes for Brave's markup.
+const KagiResult = struct {
+    title: []const u8 = "",
+    url: []const u8 = "",
+    snippet: []const u8 = "",
+};
+
+// `data` also holds `related_search`, `image`, `video`, and more, each a
+// different thing wearing the same field names as a result. Reading only
+// `search` keeps those out of the model's results.
+const KagiData = struct {
+    search: []KagiResult = &.{},
+};
+
+const KagiResponse = struct {
+    data: ?KagiData = null,
+};
+
+const KagiErrorItem = struct {
+    message: ?[]const u8 = null,
+};
+
+const KagiErrorBody = struct {
+    @"error": []KagiErrorItem = &.{},
+};
+
+/// Turns a Kagi response body into an `Answer`, with no client and no
+/// socket: this is what the tests below drive directly.
+fn answerFromKagi(
+    gpa: std.mem.Allocator,
+    base_url: []const u8,
+    query: []const u8,
+    status: u16,
+    body: []const u8,
+    clean: Clean,
+) Error!Answer {
+    if (status != 200) return kagiErrorRefusal(gpa, status, body, clean);
+
+    const parsed = std.json.parseFromSlice(
+        KagiResponse,
+        gpa,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return kagiNotJsonRefusal(gpa, status);
+    defer parsed.deinit();
+
+    const all = if (parsed.value.data) |data| data.search else &.{};
+    const kept = all[0..@min(all.len, max_results)];
+
+    var fields: [max_results]ResultFields = undefined;
+    for (kept, 0..) |one, index| {
+        fields[index] = .{ .title = one.title, .url = one.url, .snippet = one.snippet };
+    }
+
+    return .{
+        .text = try writeResultList(gpa, base_url, query, fields[0..kept.len], clean),
+        .is_error = false,
+    };
+}
+
+fn kagiStatusText(status: u16) ?[]const u8 {
+    return switch (status) {
+        401 => "the access token is missing or invalid. Kagi's own documentation disagrees " ++
+            "between Authorization: Bearer and Authorization: Bot; this build sends " ++ kagi_auth_scheme ++ ".",
+        403 => "Forbidden, IP address not authorized. The account restricts which addresses may call it.",
+        429 => "rate limited or usage limit exhausted. The account is over its rate limit, or its search balance is spent.",
+        400 => "the request was refused as invalid.",
+        else => null,
+    };
+}
+
+fn kagiErrorRefusal(gpa: std.mem.Allocator, status: u16, body: []const u8, clean: Clean) Error!Answer {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (kagiStatusText(status)) |text| {
+        try out.print(gpa, "nothing was searched: Kagi answered HTTP {d}: {s}", .{ status, text });
+    } else {
+        try out.print(gpa, "nothing was searched: Kagi answered HTTP {d}.", .{status});
+    }
+    if (try kagiErrorMessage(gpa, body, clean)) |detail| {
+        defer gpa.free(detail);
+        try out.print(gpa, " Kagi said: {s}", .{detail});
+    }
+    return .{ .is_error = true, .text = try out.toOwnedSlice(gpa) };
+}
+
+/// The error body's `message` is a stranger's text like any other, so it is
+/// cleaned and bounded through `cleanField` before it reaches the refusal.
+fn kagiErrorMessage(gpa: std.mem.Allocator, body: []const u8, clean: Clean) Error!?[]u8 {
+    const parsed = std.json.parseFromSlice(
+        KagiErrorBody,
+        gpa,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.@"error".len == 0) return null;
+    const raw = parsed.value.@"error"[0].message orelse return null;
+    return try cleanField(gpa, clean, raw, max_snippet_bytes);
+}
+
+fn kagiNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
+    return .{
+        .is_error = true,
+        .text = try std.fmt.allocPrint(
+            gpa,
+            "nothing was searched: Kagi answered HTTP {d} with a body this could not read as JSON.",
+            .{status},
         ),
     };
 }
@@ -817,4 +1028,169 @@ test "the [chock: ...] prefix marking a stranger's text is present on a Brave an
 
     try testing.expect(!answer.is_error);
     try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
+}
+
+test "a realistic Kagi body parses into a numbered list, with unknown fields ignored" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"meta":{"id":"abc","node":"us-east"},"other_top":true,"data":{"related_search":["zig lang"],"adjacent_question":["what is zig"],"search":[{"title":"Zig Language","url":"https://ziglang.org","snippet":"a systems language","extra":"x"}]}}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "zig", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig Language") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://ziglang.org") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "a systems language") != null);
+}
+
+test "a Kagi body whose data also holds a related_search array yields only the data.search rows" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"data":{"related_search":[{"title":"unrelated related term","url":"https://kagi.com/related","snippet":"do not surface me"}],"search":[{"title":"Zig Language","url":"https://ziglang.org","snippet":"a systems language"}]}}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "zig", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig Language") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "do not surface me") == null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "unrelated related term") == null);
+}
+
+test "a Kagi result count over the bound is cut" {
+    const gpa = testing.allocator;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "{\"data\":{\"search\":[");
+    var index: usize = 0;
+    while (index < max_results + 5) : (index += 1) {
+        if (index != 0) try body.append(gpa, ',');
+        try body.print(
+            gpa,
+            "{{\"title\":\"title-{d}\",\"url\":\"https://example.org/{d}\",\"snippet\":\"s\"}}",
+            .{ index, index },
+        );
+    }
+    try body.appendSlice(gpa, "]}}");
+
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 200, body.items, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "title-" ++ std.fmt.comptimePrint("{d}", .{max_results - 1})) != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "title-" ++ std.fmt.comptimePrint("{d}", .{max_results})) == null);
+}
+
+test "an empty Kagi data.search array is zero results, not an error" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"data":{"search":[]}}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "0 results") != null);
+}
+
+test "Kagi 401, 403, and 429 each refuse with their own distinct message" {
+    const gpa = testing.allocator;
+
+    const unauthorized = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 401, "", testClean);
+    defer gpa.free(unauthorized.text);
+    try testing.expect(unauthorized.is_error);
+    try testing.expect(std.mem.indexOf(u8, unauthorized.text, "token") != null);
+
+    const forbidden = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 403, "", testClean);
+    defer gpa.free(forbidden.text);
+    try testing.expect(forbidden.is_error);
+    try testing.expect(std.mem.indexOf(u8, forbidden.text, "IP address") != null);
+    try testing.expect(std.mem.indexOf(u8, forbidden.text, "token") == null);
+
+    const rate_limited = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 429, "", testClean);
+    defer gpa.free(rate_limited.text);
+    try testing.expect(rate_limited.is_error);
+    try testing.expect(std.mem.indexOf(u8, rate_limited.text, "balance") != null);
+    try testing.expect(std.mem.indexOf(u8, rate_limited.text, "IP address") == null);
+    try testing.expect(std.mem.indexOf(u8, rate_limited.text, "token") == null);
+}
+
+test "the Kagi 401 message names both Bearer and Bot" {
+    const gpa = testing.allocator;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 401, "", testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Bearer") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Bot") != null);
+}
+
+test "a Kagi error body's message reaches the refusal text, and its code and url do not" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"meta":{},"data":null,"error":[{"code":"2","url":"https://help.kagi.com","message":"Unauthorized"}]}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 401, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Unauthorized") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "help.kagi.com") == null);
+}
+
+test "a Kagi error body whose message is null still refuses, and does not crash" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"meta":{},"data":null,"error":[{"code":"5","url":"https://help.kagi.com","message":null}]}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 400, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+}
+
+test "a Kagi session with a null credential refuses and names chock login" {
+    const gpa = testing.allocator;
+
+    const session = Session{
+        .kind = .api,
+        .base_url = "https://kagi.com/api/v1",
+        .clean = testClean,
+        .provider = .kagi,
+        .credential = null,
+    };
+    const answer = try session.search(gpa, testing.io, .{ .query = "q" });
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "chock login") != null);
+}
+
+test "the [chock: ...] prefix marking a stranger's text is present on a Kagi answer" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"data":{"search":[{"title":"t","url":"https://example.org","snippet":"d"}]}}
+    ;
+    const answer = try answerFromKagi(gpa, "https://kagi.com/api/v1", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
+}
+
+test "the Kagi request body is valid JSON, and a query holding a quote and a backslash survives" {
+    const gpa = testing.allocator;
+    const query = "a \"quoted\" term with a \\ backslash";
+
+    const body = try buildKagiRequestBody(gpa, query);
+    defer gpa.free(body);
+
+    const Parsed = struct { query: []const u8, limit: usize };
+    const parsed = try std.json.parseFromSlice(Parsed, gpa, body, .{});
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings(query, parsed.value.query);
+    try testing.expectEqual(@as(usize, max_results), parsed.value.limit);
 }

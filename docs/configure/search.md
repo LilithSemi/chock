@@ -32,7 +32,7 @@ read.
 | Kind | What it talks to | State |
 |---|---|---|
 | `self_hosted` | a SearXNG instance of your own | built |
-| `api` | a keyed vendor | built, Brave only |
+| `api` | a keyed vendor | built, Brave and Kagi |
 | `scrape` | a results page, read as HTML | not built |
 
 Leave the block out and the tool is still offered. It answers that no engine is
@@ -78,7 +78,7 @@ way.
 `provider` names the vendor. A keyed vendor answers in its own shape under its
 own field names, so the kind alone does not say enough to read a reply, and a
 reader that guessed would hand the agent zero results rather than an error.
-`brave` is the only value today.
+`brave` and `kagi` are the values today.
 
 `credential` is a **name in the credential store**, never the key itself. A
 `key`, `token`, `api_key` or `secret` field in this block is refused by name.
@@ -102,6 +102,32 @@ naming the status the engine answered with.
 Brave bounds a query to 600 characters and 75 words. Chock refuses a longer one
 before the request, and says which bound was passed, so the agent can shorten
 the query rather than read a 422.
+
+Kagi is configured the same way, with its own base URL:
+
+```zon
+.search = .{
+    .kind = "api",
+    .provider = "kagi",
+    .base_url = "https://kagi.com/api/v1",
+    .credential = "kagi",
+}
+```
+
+**Kagi's own documentation disagrees with itself about the credential header.**
+Its API specification says `Authorization: Bearer`, and two of its help pages
+say the literal word `Bot`. This build sends `Bearer`, which the specification
+and the quick-start page both show. If Kagi answers 401 on a key you know is
+good, that disagreement is the first thing to suspect, and the refusal message
+says so.
+
+Kagi bills per search, and a spent balance answers with the same 429 a rate
+limit does, so the refusal names both causes.
+
+A title or snippet from Kagi can hold HTML entities such as `&#39;`, because
+Kagi sends them and documents no way to turn them off. They reach the agent as
+written. Chock does not decode them: undoing markup that may not be there would
+corrupt a snippet that legitimately holds one.
 
 ### scrape
 

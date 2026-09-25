@@ -19,6 +19,7 @@ pub const Kind = enum {
 /// enough to read a reply.
 pub const Provider = enum {
     brave,
+    kagi,
 };
 
 /// Every member is optional, so "no search block" is told apart from a block
@@ -172,7 +173,7 @@ pub const Diagnostic = struct {
                 .{self.source},
             ),
             .provider_unknown => |text| try writer.print(
-                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave",
+                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave or kagi",
                 .{ self.source, text },
             ),
             .provider_missing => try writer.print(
@@ -841,6 +842,23 @@ test "self_hosted and scrape must not name a provider" {
         , &scrape),
     );
     try testing.expectEqual(Kind.scrape, scrape.?.fault.provider_not_for_kind);
+}
+
+test "the provider_unknown message names both vendors this reader knows" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "api", .base_url = "https://example.org", .provider = "yahoo", .credential = "yahoo" } }
+        , &diag),
+    );
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "brave") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "kagi") != null);
 }
 
 test "a self_hosted block with no provider still parses" {
