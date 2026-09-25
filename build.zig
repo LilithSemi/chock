@@ -739,6 +739,22 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .macos) {
         chock_auth.linkFramework("Security", .{});
         chock_auth.linkFramework("CoreFoundation", .{});
+
+        // **Zig is told where the frameworks are, because it will not look.**
+        // It reads `NIX_CFLAGS_COMPILE` and `NIX_LDFLAGS`, and finding either
+        // one set it stops before its own SDK search. Both are always set
+        // inside a nix shell, and neither names a framework directory, so a
+        // build there reports "searched paths: none".
+        //
+        // `SDKROOT` names the SDK and is exported by the SDK's own setup, in a
+        // nix build and in a nix dev shell alike. It is absent on a Mac with
+        // Xcode and no nix, and there the search zig makes for itself works,
+        // so this only adds a path when one was given.
+        if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+            chock_auth.addSystemFrameworkPath(.{
+                .cwd_relative = b.pathJoin(&.{ sdkroot, "System/Library/Frameworks" }),
+            });
+        }
     }
 
     // The Linux credential driver can keep a value in the freedesktop secret
