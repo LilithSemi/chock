@@ -117,11 +117,10 @@ pub const Answer = struct {
 /// count from the agent, so it holds the default.
 pub const max_results: usize = 8;
 
-/// A title or a snippet, cut at this many bytes. oh-my-pi cuts a search
-/// snippet to 240 characters; a title gets the same bound so neither can
-/// push the results list out of the context.
-pub const max_title_bytes: usize = 240;
-pub const max_snippet_bytes: usize = 240;
+/// A title or a snippet, cut at this many bytes, so neither can push the
+/// results list out of the context.
+pub const max_title_bytes: usize = 400;
+pub const max_snippet_bytes: usize = 400;
 
 /// A URL is meant to be one line of ASCII, and 2048 bytes is the common
 /// browser bound for one.
