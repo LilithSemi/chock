@@ -11,7 +11,7 @@ Start with [running.md](running.md) for a session end to end, and
 
 ## Using a session
 
-- [using/tools.md](using/tools.md) - the 21 tools, what each one asks for, how
+- [using/tools.md](using/tools.md) - the 22 tools, what each one asks for, how
   every call is gated, and `provide_tool` for a program the session has not
   got.
 - [using/nix.md](using/nix.md) - `nix_eval` and `nix_build`, what a build may

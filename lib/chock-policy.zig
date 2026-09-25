@@ -13,6 +13,7 @@ pub const hardening = @import("chock-policy/hardening.zig");
 pub const apply = @import("chock-policy/apply.zig");
 pub const limits = @import("chock-policy/limits.zig");
 pub const instructions = @import("chock-policy/instructions.zig");
+pub const search = @import("chock-policy/search.zig");
 pub const nix = @import("chock-policy/nix.zig");
 pub const workspace = @import("chock-policy/workspace.zig");
 

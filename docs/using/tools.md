@@ -1,6 +1,6 @@
 # The tools
 
-The agent has 21 tools, and every one that touches the machine goes through the
+The agent has 22 tools, and every one that touches the machine goes through the
 sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
 `edit_file`, `run_command`, `read_memory` and `write_memory`. Only
 `run_command` takes a command. The rest name a path, a pattern, or the text to
@@ -21,7 +21,7 @@ the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names
 the session, so `chock sessions` reads as more than a list of identifiers.
 
-The last eight are described here or on a page of their own:
+The last nine are described here or on a page of their own:
 
 | Tool | What it asks for | Page |
 |---|---|---|
@@ -31,6 +31,7 @@ The last eight are described here or on a page of their own:
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
 | `restrict_self` | a promise the agent cannot take back | [policy.md](../configure/policy.md) |
 | `fetch_url` | one page over http or https | [actions.md](../configure/actions.md) |
+| `web_search` | one query against a search engine | [approvals.md](approvals.md) |
 | `request_action` | your work carried back into your repository | [approvals.md](approvals.md) |
 | `update_plan` | a task list you can watch | [running.md](../running.md) |
 

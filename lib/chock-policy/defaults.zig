@@ -54,6 +54,10 @@ pub const rules: []const table.Rule = &.{
     // A language server, which every project that has one already runs. The
     // name buys an organisation an `lsp.*` deny across an installation.
     .{ .action = "lsp.*", .decision = .allow },
+    // `web_search` is answered by the loop like `fetch_url`, but its question
+    // is asked live at `gateToolCall` and not early: absence would answer the
+    // same `ask`, and this row states it so a reader does not have to check.
+    .{ .action = "web.search", .decision = .ask },
 
     // The git shim's own names. Each changes the session's scratch workspace
     // and nothing outside it. `git.push`, `git.clone`, `git.fetch`, `git.pull`
@@ -246,6 +250,14 @@ test "a build that fetches with no url is allowed by default, and a project can 
         table.Decision.ask,
         empty.evaluateKindAlone(key("net.connect.com.example.443")),
     );
+}
+
+test "web.search answers ask with no chock.zon at all" {
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("web.search")));
 }
 
 test "a tool this file forgot still answers ask" {

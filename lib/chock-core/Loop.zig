@@ -18,6 +18,7 @@ const subagent = @import("subagent.zig");
 const self_policy = @import("self_policy.zig");
 const arbiter_mod = @import("arbiter.zig");
 const fetch_mod = @import("fetch.zig");
+const search_mod = @import("search.zig");
 const ask_mod = @import("ask.zig");
 const handback_mod = @import("handback.zig");
 const redact = @import("redact.zig");
@@ -230,6 +231,11 @@ pub const Deps = struct {
     /// What reads a URL for the agent. Null refuses and says so, because a tool
     /// that answered with an empty page would have a model reason about it.
     fetcher: ?fetch_mod.Fetcher = null,
+    /// What answers a search query for the agent. Null refuses and says so, the
+    /// same rule `fetcher` follows. Unlike `fetcher`, the call this answers is
+    /// gated live at `gateToolCall` under `"web.search"` before it ever reaches
+    /// here, so this seam is only ever asked for a call already permitted.
+    searcher: ?search_mod.Searcher = null,
     /// What puts a question to the person. This is not the arbiter and must never
     /// become it: it asks for a fact and grants nothing, whatever the person types.
     asker: ?ask_mod.Asker = null,
@@ -1392,6 +1398,8 @@ fn runTool(
         try runRestrictSelf(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, fetch_tool_name))
         try runFetch(allocator, io, session, deps, call)
+    else if (std.mem.eql(u8, call.tool, search_tool_name))
+        try runSearch(allocator, io, session, deps, call)
     else if (std.mem.eql(u8, call.tool, ask_tool_name))
         try runAskUser(allocator, io, deps, call)
     else if (std.mem.eql(u8, call.tool, title_tool_name))
@@ -2097,6 +2105,55 @@ fn fetchRefusal(
         .output = output,
         .is_error = true,
         .truncated = false,
+    };
+}
+
+pub const search_tool_name = @tagName(tools.Tool.web_search);
+
+/// Answer a `web_search` call, in place of the tool runner. Answered here for
+/// the same reason `fetch_url` is: a promise binds it, and the promises of a
+/// session live in the fold of its log. The call has already passed
+/// `gateToolCall`'s live "web.search" question by the time this runs; this
+/// loop decides nothing further, and `deps.searcher` does.
+fn runSearch(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *chock_proto.state.Session,
+    deps: Deps,
+    call: event.ToolCall,
+) Error!event.ToolResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const parsed = std.json.parseFromSlice(
+        tools.WebSearchArgs,
+        arena,
+        call.arguments,
+        .{ .ignore_unknown_fields = true },
+    ) catch return fetchRefusal(allocator, call, try allocator.dupe(
+        u8,
+        search_tool_name ++ " needs a JSON object with one field, \"query\", holding the search terms.",
+    ));
+
+    const searcher = deps.searcher orelse return fetchRefusal(
+        allocator,
+        call,
+        try allocator.dupe(u8, search_mod.has_no_searcher),
+    );
+
+    const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
+    const answer = try searcher.search(allocator, io, .{
+        .query = parsed.value.query,
+        .self_policy = held,
+        .tool = call.tool,
+    });
+    return .{
+        .call_id = try allocator.dupe(u8, call.call_id),
+        .output = answer.text,
+        .is_error = answer.is_error,
+        .truncated = false,
+        .note = answer.note,
     };
 }
 
@@ -8328,6 +8385,157 @@ test "a session with no fetcher reads nothing and says so" {
     try testing.expectEqualStrings(fetch_mod.has_no_fetcher, outcome.outputs[0]);
     try testing.expect(outcome.refused[1]);
     try testing.expect(std.mem.indexOf(u8, outcome.outputs[1], "\"url\"") != null);
+}
+
+const FakeSearcher = struct {
+    allocator: std.mem.Allocator,
+    result: []const u8 = "the results",
+    calls: usize = 0,
+    query: []u8 = &.{},
+
+    fn deinit(self: *FakeSearcher) void {
+        self.allocator.free(self.query);
+    }
+
+    fn searcher(self: *FakeSearcher) search_mod.Searcher {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = search_mod.Searcher.VTable{ .search = searchFn };
+
+    fn searchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        ask: search_mod.Ask,
+    ) search_mod.Error!search_mod.Answer {
+        _ = io;
+        const self: *FakeSearcher = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        self.allocator.free(self.query);
+        self.query = try self.allocator.dupe(u8, ask.query);
+        return .{ .text = try gpa.dupe(u8, self.result), .is_error = false };
+    }
+};
+
+// Unlike `fetch_url`, whose `net.fetch` question is read early and never
+// through the arbiter in this test file, `web_search` takes the ordinary
+// gate: `ActionArbiter` here stands in for a live person, and it is asked.
+test "a web_search call is gated live under the action web.search, and then reaches the searcher" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SEARCHGATE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = search_tool_name,
+            .arguments = "{\"query\":\"zig 0.16 release notes\"}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "the sandboxed tool runner, never reached" };
+    var judge = ActionArbiter{};
+    var fake_searcher = FakeSearcher{ .allocator = allocator };
+    defer fake_searcher.deinit();
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    deps.searcher = fake_searcher.searcher();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqualStrings("web.search", judge.sawAt(0));
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+    try testing.expectEqual(@as(usize, 1), fake_searcher.calls);
+    try testing.expectEqualStrings("zig 0.16 release notes", fake_searcher.query);
+}
+
+test "a web_search call the arbiter refuses never reaches the searcher" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SEARCHREFUSE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = search_tool_name,
+            .arguments = "{\"query\":\"anything\"}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "never reached" };
+    var judge = ActionArbiter{ .refuse_prefix = "web.search" };
+    var fake_searcher = FakeSearcher{ .allocator = allocator };
+    defer fake_searcher.deinit();
+
+    var deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    deps.arbiter = judge.arbiter();
+    deps.searcher = fake_searcher.searcher();
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 1), judge.calls);
+    try testing.expectEqual(@as(usize, 0), fake_searcher.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var saw_refusal = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(parsed.value.event.tool_result.is_error);
+            saw_refusal = true;
+        }
+    }
+    try testing.expect(saw_refusal);
+}
+
+test "a session with no searcher reads nothing and names where an engine is configured" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+
+    var backing = try chock_proto.storage.Memory.init(allocator, "01SEARCHNONE");
+    const store = backing.storage();
+    defer store.close(io);
+
+    var fake_client = FakeClient{ .turns = &.{
+        .{ .deltas = &.{.{ .tool_call = .{
+            .index = 0,
+            .id = "call1",
+            .name = search_tool_name,
+            .arguments = "{\"query\":\"anything\"}",
+        } }} },
+        .{ .deltas = &.{.{ .text = "done" }} },
+    } };
+    var fake_tools = FakeToolRunner{ .output = "never reached" };
+
+    // The default arbiter here always permits, so the gate lets the call
+    // through and the refusal below is the seam's own, not the gate's.
+    const deps = testDeps(fake_client.client(), store, fake_tools.runner());
+    try run(allocator, io, deps);
+
+    try testing.expectEqual(@as(usize, 0), fake_tools.calls);
+
+    var replay = try store.replay(allocator, io, 0);
+    defer replay.deinit();
+    var found = false;
+    while (try replay.next(io)) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.event == .tool_result) {
+            try testing.expect(parsed.value.event.tool_result.is_error);
+            try testing.expectEqualStrings(search_mod.has_no_searcher, parsed.value.event.tool_result.output);
+            found = true;
+        }
+    }
+    try testing.expect(found);
 }
 
 const FakeHandback = struct {
