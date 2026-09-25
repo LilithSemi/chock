@@ -59,6 +59,13 @@ pub const rules: []const table.Rule = &.{
     // same `ask`, and this row states it so a reader does not have to check.
     .{ .action = "web.search", .decision = .ask },
 
+    // **Using a secret is a question, not a standing permission.** The project
+    // already said which tool may be given which secret, and this says whether
+    // a person hears about it each time. Asked live, the same way `web.search`
+    // is, so `ask` here means a question and never a refusal. A project that
+    // wants it silent writes `allow` for the one secret it means.
+    .{ .action = "secret.use.*", .decision = .ask },
+
     // The git shim's own names. Each changes the session's scratch workspace
     // and nothing outside it. `git.push`, `git.clone`, `git.fetch`, `git.pull`
     // and `git.unknown` are absent because each one reaches another host.
