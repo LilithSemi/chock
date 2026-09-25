@@ -732,6 +732,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The Darwin credential driver calls the Keychain through the Security
+    // framework, and CoreFoundation releases what a lookup hands back. Declared
+    // on the module, so every artifact that imports it links them and none has
+    // to remember. Nothing is linked for any other target.
+    if (target.result.os.tag == .macos) {
+        chock_auth.linkFramework("Security", .{});
+        chock_auth.linkFramework("CoreFoundation", .{});
+    }
+
     const auth_tests = b.addTest(.{ .root_module = chock_auth });
     const run_auth_tests = b.addRunArtifact(auth_tests);
     // Same reasoning as run_sandbox_tests above.

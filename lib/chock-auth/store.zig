@@ -39,6 +39,7 @@ const builtin = @import("builtin");
 const paths = @import("paths.zig");
 const config = @import("config.zig");
 const lock = @import("lock.zig");
+const darwin_status = @import("darwin/status.zig");
 
 /// The index file, in the data directory. Holds no secret.
 pub const index_file_name = "instances.zon";
@@ -159,12 +160,8 @@ pub const Diagnostic = union(enum) {
     /// says where and never what is in it**, because that file's own text is
     /// the credential.
     credential_file_not_valid: []const u8,
-    /// A `security` command could not be started, written to, or waited for.
-    keychain_command_failed: KeychainCommandFailed,
-    /// A `security` command ran and refused.
+    /// The Keychain refused, and the status is what it answered.
     keychain_refused: KeychainRefused,
-    /// A `security` command was killed by a signal, or stopped.
-    keychain_did_not_exit_normally: KeychainCommandFailed,
 
     pub const Failed = struct {
         path: []const u8,
@@ -220,20 +217,12 @@ pub const Diagnostic = union(enum) {
         };
     };
 
-    pub const KeychainCommandFailed = struct {
+    pub const KeychainRefused = struct {
         /// `reading` or `storing`, always a literal of this module.
         verb: []const u8,
         name: []const u8,
-        err: ?anyerror = null,
-    };
-
-    pub const KeychainRefused = struct {
-        verb: []const u8,
-        name: []const u8,
-        status: u8,
-        /// What `security` wrote to its error stream, trimmed. Empty when
-        /// the driver did not capture it.
-        detail: []const u8,
+        /// The `OSStatus` the Security framework answered with.
+        status: darwin_status.OSStatus,
     };
 
     /// Release what the diagnostic owns, with the allocator that filled it.
@@ -260,11 +249,7 @@ pub const Diagnostic = union(enum) {
                 if (failure.link_target) |target| gpa.free(target);
             },
             .credential_file_not_valid, .name_is_reserved => |text| gpa.free(text),
-            .keychain_command_failed, .keychain_did_not_exit_normally => |failure| gpa.free(failure.name),
-            .keychain_refused => |failure| {
-                gpa.free(failure.name);
-                gpa.free(failure.detail);
-            },
+            .keychain_refused => |failure| gpa.free(failure.name),
         }
         self.* = undefined;
     }
@@ -358,43 +343,22 @@ pub const Diagnostic = union(enum) {
                     "Run: chmod 600 {s}",
                 .{ failure.path, failure.mode, failure.path },
             ),
-            .keychain_command_failed => |failure| try writer.print(
-                "running {s} failed while {s} {s}: {s}",
-                .{ security_command, failure.verb, failure.name, errName(failure.err) },
-            ),
             .keychain_refused => |failure| {
                 const storing = std.mem.eql(u8, failure.verb, storing_verb);
                 try writer.print(
-                    "the Keychain would not {s} the credential for {s}: {s} exited {d}{s}{s}",
-                    .{
-                        if (storing) "keep" else "give",
-                        failure.name,
-                        security_command,
-                        failure.status,
-                        if (failure.detail.len == 0) "" else ": ",
-                        failure.detail,
-                    },
+                    "the Keychain would not {s} the credential for {s}, and answered {d}",
+                    .{ if (storing) "keep" else "give", failure.name, failure.status },
                 );
-                // Measured on macOS: this is the ordinary reason a store
-                // fails on a machine reached over ssh, and an exit status
-                // alone sends the reader nowhere.
-                if (storing) try writer.writeAll(
-                    ". A Keychain that is locked, for example on a machine reached over ssh with no " ++
-                        "desktop session, refuses this.",
-                );
+                // The number alone sends a reader nowhere. The two an ssh
+                // session meets have an answer each, and they are not the same
+                // answer.
+                if (darwin_status.adviceFor(failure.status)) |advice| {
+                    try writer.print(": {s}", .{advice});
+                }
             },
-            .keychain_did_not_exit_normally => |failure| try writer.print(
-                "{s} did not exit normally while {s} {s}",
-                .{ security_command, failure.verb, failure.name },
-            ),
         }
     }
 };
-
-/// The name of the macOS tool the Darwin driver runs. Spelled here, and not
-/// taken from the driver, so `Diagnostic` compiles on a target whose driver
-/// is not the Darwin one.
-const security_command = "/usr/bin/security";
 
 /// The two verbs a Keychain fault names. Spelled once, here, so a driver and
 /// a message cannot disagree about which of the two happened.
@@ -1730,12 +1694,10 @@ test "no two faults of this module read the same" {
         .{ .credential_file_not_valid = "/y" },
         .{ .name_is_reserved = reserved_prefix ++ "seal-key-v1" },
         .{ .name_already_stored = .{ .name = "aiand", .kind = "aiand" } },
-        .{ .keychain_command_failed = .{ .verb = reading_verb, .name = "work", .err = error.FileNotFound } },
-        .{ .keychain_command_failed = .{ .verb = storing_verb, .name = "work", .err = error.FileNotFound } },
-        .{ .keychain_refused = .{ .verb = reading_verb, .name = "work", .status = 1, .detail = "no" } },
-        .{ .keychain_refused = .{ .verb = storing_verb, .name = "work", .status = 1, .detail = "" } },
-        .{ .keychain_did_not_exit_normally = .{ .verb = reading_verb, .name = "work" } },
-        .{ .keychain_did_not_exit_normally = .{ .verb = storing_verb, .name = "work" } },
+        .{ .keychain_refused = .{ .verb = reading_verb, .name = "work", .status = darwin_status.auth_failed } },
+        .{ .keychain_refused = .{ .verb = storing_verb, .name = "work", .status = darwin_status.auth_failed } },
+        .{ .keychain_refused = .{ .verb = storing_verb, .name = "work", .status = darwin_status.interaction_not_allowed } },
+        .{ .keychain_refused = .{ .verb = storing_verb, .name = "work", .status = darwin_status.no_default_keychain } },
     };
     var buffers: [cases.len][512]u8 = undefined;
     var lines: [cases.len][]const u8 = undefined;

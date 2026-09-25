@@ -45,12 +45,14 @@ pub const signing = @import("chock-auth/signing.zig");
 pub const search = @import("chock-auth/search.zig");
 pub const check = @import("chock-auth/check.zig");
 
-/// Imported directly, not only through `store.zig`'s own comptime driver
-/// dispatch, so the parts of the Darwin driver that need no Keychain are
-/// checked on every host this project builds on: see
-/// `chock-auth/darwin/secrets.zig`'s own top comment, and
-/// `chock-sandbox.zig`'s own export of the same shape for the same reason.
-pub const darwin_driver_for_testing = @import("chock-auth/darwin/secrets.zig");
+/// What the Keychain answers, and what a person does about it. Exported
+/// directly, and not only through `store.zig`'s comptime driver dispatch, so it
+/// is checked on every host this project builds on.
+///
+/// **The driver beside it is not exported, and that is deliberate.** It
+/// declares `extern` functions that link only against the Security framework,
+/// so naming it here would break a build for any other target.
+pub const darwin_status = @import("chock-auth/darwin/status.zig");
 
 const std = @import("std");
 
