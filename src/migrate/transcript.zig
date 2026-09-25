@@ -50,6 +50,19 @@ pub const Result = struct {
 
 /// Import every transcript `harness` has for `project_root`, each into its
 /// own new session. Never touches an existing session.
+/// One refusal, on the arena. **Never `&.{ ... }` holding a value read at run
+/// time**: that takes the address of a temporary, and the slice dangles the
+/// moment the function returns.
+pub fn oneRefusal(
+    arena: std.mem.Allocator,
+    what: []const u8,
+    reason: []const u8,
+) std.mem.Allocator.Error![]const migrate.Refusal {
+    const out = try arena.alloc(migrate.Refusal, 1);
+    out[0] = .{ .what = what, .reason = reason };
+    return out;
+}
+
 pub fn import(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -60,23 +73,17 @@ pub fn import(
     if (!std.mem.eql(u8, harness, harness_name)) {
         return .{
             .harness = harness,
-            .refused = &.{.{
-                .what = harness,
-                .reason = "its transcript location is not pinned yet, so nothing was read",
-            }},
+            .refused = try oneRefusal(arena, harness, "its transcript location is not pinned yet, so nothing was read"),
         };
     }
 
     const project_dir = homeProjectDir(arena, env, project_root) catch |err| return .{
         .harness = harness,
-        .refused = &.{.{
-            .what = harness_name,
-            .reason = try std.fmt.allocPrint(
-                arena,
-                "its transcript directory is unknown: {s}",
-                .{@errorName(err)},
-            ),
-        }},
+        .refused = try oneRefusal(arena, harness_name, try std.fmt.allocPrint(
+            arena,
+            "its transcript directory is unknown: {s}",
+            .{@errorName(err)},
+        )),
     };
 
     var names: std.ArrayList([]const u8) = .empty;

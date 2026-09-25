@@ -782,19 +782,21 @@ fn importMemory(
     if (!std.mem.eql(u8, harness, transcript.harness_name)) {
         return .{
             .harness = harness,
-            .refused = &.{.{
-                .what = harness,
-                .reason = "its notes location is not pinned yet, so nothing was read",
-            }},
+            .refused = try transcript.oneRefusal(
+                arena,
+                harness,
+                "its notes location is not pinned yet, so nothing was read",
+            ),
         };
     }
 
     const project_dir = transcript.homeProjectDir(arena, env, project_root) catch |err| return .{
         .harness = harness,
-        .refused = &.{.{
-            .what = transcript.harness_name,
-            .reason = try std.fmt.allocPrint(arena, "its notes directory is unknown: {s}", .{@errorName(err)}),
-        }},
+        .refused = try transcript.oneRefusal(
+            arena,
+            transcript.harness_name,
+            try std.fmt.allocPrint(arena, "its notes directory is unknown: {s}", .{@errorName(err)}),
+        ),
     };
     const notes_dir = try std.fs.path.join(arena, &.{ project_dir, "memory" });
 
