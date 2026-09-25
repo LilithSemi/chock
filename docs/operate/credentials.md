@@ -48,7 +48,8 @@ Chock implements none of those backends itself.
 ```
 
 Chock runs `secretspec serve` and asks it, so `secretspec` has to be on your
-`PATH`. A read runs it with `--read-only`.
+`PATH`. Reading a credential runs it in its own read only mode, so a session
+that only needs a key cannot change one.
 
 **A secret it does not have is not an error.** Chock reads that as "nobody has
 stored this yet", the same as every other store, so `chock login` is what fills
