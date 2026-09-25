@@ -25,6 +25,7 @@ Name the store in `~/.config/chock/config.zon`:
 | `secret_service` | the freedesktop secret service, over the session bus | Linux, and the default there |
 | `keychain` | the macOS Keychain | macOS, and the only store there |
 | `file` | a file in `~/.local/share/chock`, mode `0600` in a directory `0700` | Linux |
+| `secretspec` | [SecretSpec](https://secretspec.dev), asked over its own protocol | every platform |
 
 **Nothing is guessed, and nothing falls back.** A keystore can look reachable
 and still be unusable: on a machine with no desktop session the bus is there,
@@ -33,6 +34,27 @@ collection is locked and the prompt that would unlock it cannot be drawn. So a
 store that cannot work is an error that says so, and never a quiet move to
 somewhere less protected. Naming a store this platform does not have is refused
 when the file is read, not at your first turn.
+
+### secretspec
+
+SecretSpec declares what secrets a project needs, separately from where they
+live, and fetches them from whichever of its own backends you configured:
+keyring, 1Password, Vault, AWS, SOPS and about thirty more. Naming it here means
+your Chock credential comes from wherever you already keep your secrets, and
+Chock implements none of those backends itself.
+
+```zon
+.credentials = .{ .store = "secretspec" },
+```
+
+Chock runs `secretspec serve` and asks it, so `secretspec` has to be on your
+`PATH`. A read runs it with `--read-only`.
+
+**A secret it does not have is not an error.** Chock reads that as "nobody has
+stored this yet", the same as every other store, so `chock login` is what fills
+it. What a login cannot fix is a secret your `secretspec.toml` does not declare,
+or a SecretSpec configured read only. Both refuse, and Chock repeats what
+SecretSpec said about it rather than inventing a reason of its own.
 
 **A machine you only reach over ssh usually wants `file`.** It has no desktop
 session to unlock a collection with. The file is mode `0600` in a directory
