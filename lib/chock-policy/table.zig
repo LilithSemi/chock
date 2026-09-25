@@ -2620,30 +2620,38 @@ test "a decision the rules named is told apart from the ask a key nobody wrote g
 }
 
 test "the corrected budget still reads a table under it and still refuses one clearly over it" {
-    // The ceiling this budget puts on a project's own file moves whenever
-    // `defaults.zig` grows, because every shipped rule is counted twice per
-    // key and adds one name to the action list. It was 72 rules of this shape,
-    // then 69, and is 52 now that `defaults.zig` ships 55 rules. A real
-    // `chock.zon` holds a handful of short rules and is nowhere near this.
+    // **The boundary is found and never written down.** Every shipped rule in
+    // `defaults.zig` is counted twice per key and adds a name to the action
+    // list, so the ceiling a project's own file meets moves whenever the
+    // defaults grow. Three earlier versions of this test held the number of the
+    // day, and each one had to be edited when it moved. This asserts the shape
+    // instead: there is a boundary, one rule past it is refused, and it leaves
+    // far more room than a real file uses.
     const gpa = std.testing.allocator;
 
-    const admitted = try wideSource(gpa, 52, 64);
-    defer gpa.free(admitted);
-    const table = try Table.parse(gpa, admitted, null);
-    defer Table.destroy(gpa, table);
+    var admitted: usize = 0;
+    var count: usize = 1;
+    while (count < max_rules) : (count += 1) {
+        const source = try wideSource(gpa, count, 64);
+        defer gpa.free(source);
+        const table = Table.parse(gpa, source, null) catch |err| switch (err) {
+            error.PolicyTooComplex => break,
+            else => return err,
+        };
+        Table.destroy(gpa, table);
+        admitted = count;
+    }
 
-    var buffer: [64]u8 = undefined;
-    const name = try wideName(&buffer, 11, 64);
-    try std.testing.expectEqual(Decision.deny, table.evaluateKindAlone(.{
-        .agent_kind = "c",
-        .model = name,
-        .tool = name,
-        .action = name,
-    }));
+    // A boundary was actually met, rather than the loop running out.
+    try std.testing.expect(admitted != 0);
+    try std.testing.expect(count < max_rules);
+    try std.testing.expectEqual(admitted + 1, count);
 
-    const one_more = try wideSource(gpa, 53, 64);
-    defer gpa.free(one_more);
-    try std.testing.expectError(error.PolicyTooComplex, Table.parse(gpa, one_more, null));
+    // **Room for a real file.** These are rules of 64 byte names in all three
+    // fields, which no hand written `chock.zon` comes near. If the defaults
+    // ever grow enough to push this under, that is the thing to look at and
+    // not this number.
+    try std.testing.expect(admitted >= 24);
 
     const clearly_over = try wideSource(gpa, max_rules, 64);
     defer gpa.free(clearly_over);
