@@ -1627,7 +1627,11 @@ fn measureCredential(
         .unconfigured = "the configuration names no default model",
     };
 
-    const driver = chock_auth.store.Driver{ .data_dir = data_dir };
+    const driver = chock_auth.store.Driver{
+        .data_dir = data_dir,
+        .store = config.credential_store,
+        .env = env,
+    };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
     var lookup_diag: ?chock_auth.lookup.Diagnostic = null;
     defer if (lookup_diag) |*d| d.deinit(arena);

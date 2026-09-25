@@ -122,7 +122,15 @@ pub fn main(
         return Exit.usage.code();
     };
 
-    const driver = chock_auth.store.Driver{ .data_dir = data_dir };
+    // The `credentials` block of the same file the providers come from. Read
+    // here rather than at the store, so a name this platform does not have is
+    // refused before a person is asked for a credential.
+    const credential_store = chock_auth.config.credentialStore(arena, io, config_dir);
+    const driver = chock_auth.store.Driver{
+        .data_dir = data_dir,
+        .store = credential_store,
+        .env = &env,
+    };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
 
     // A search credential is not a provider instance, so everything below this

@@ -810,7 +810,14 @@ fn start(
         return error.Reported;
     };
 
-    const driver = chock_auth.store.Driver{ .data_dir = data_dir };
+    // The `credentials` block of the same file the providers came from, read
+    // above. A store this platform does not have was refused when the file was
+    // read, so nothing here has to check it again.
+    const driver = chock_auth.store.Driver{
+        .data_dir = data_dir,
+        .store = config.credential_store,
+        .env = env,
+    };
     const store = chock_auth.store.Store{ .data_dir = data_dir, .secrets = driver.secrets() };
     var credential_diag: ?chock_auth.lookup.Diagnostic = null;
     defer if (credential_diag) |*d| d.deinit(arena);

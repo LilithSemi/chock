@@ -1200,7 +1200,17 @@ fn sealMain(
         tty.print(.err, "chock sessions seal: the data directory is unknown: {s}\n", .{@errorName(err)});
         return Exit.usage.code();
     };
-    var driver = chock_auth.store.Driver{ .data_dir = data_dir };
+    // The seal key lives wherever the credentials do, so a machine using the
+    // keystore does not leave this one key in a file beside it.
+    const config_dir = chock_auth.paths.configDir(arena, env) catch |err| {
+        tty.print(.err, "chock sessions seal: the configuration directory is unknown: {s}\n", .{@errorName(err)});
+        return Exit.usage.code();
+    };
+    var driver = chock_auth.store.Driver{
+        .data_dir = data_dir,
+        .store = chock_auth.config.credentialStore(arena, io, config_dir),
+        .env = env,
+    };
 
     // It must not move, because the attempt below points at it and the signer
     // points at the attempt.
