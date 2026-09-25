@@ -89,11 +89,19 @@ a site's own `robots.txt` is honoured. There is no way to send a header, a
 credential, or a body: `fetch_url` reads, and it never writes to a remote
 service.
 
-Only `allow` reads a host. A host that no rule names answers `ask`, and for a
-fetch `ask` is a refusal, because Chock cannot put the question to you while a
-turn holds the session log. So a page you want the agent to read needs an
-`allow` rule in `chock.zon` before the session starts. The refusal on your
-screen names the rule to add, and the block it goes in.
+Only `allow` reads a host with no question. A host that no rule names answers
+`ask`, and for the host the agent itself named that `ask` reaches you while the
+agent waits: you answer once and the fetch goes on.
+
+**A redirect hop is not asked.** A fetch follows redirects, and each hop is a
+new host. A hop a rule does not name is refused, because a page that could ask
+at every hop would let whoever wrote it chain redirects and turn the prompt
+into a way to tire you out. So you approve reading the host you were told
+about, and never wherever it forwards you.
+
+A rule in `chock.zon` still reads a host with no question at all, which is what
+you want for a host the agent visits often. The refusal on your screen names
+the rule to add, and the block it goes in.
 
 ### Whether a session has a network at all
 

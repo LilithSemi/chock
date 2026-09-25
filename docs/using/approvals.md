@@ -8,9 +8,10 @@ more, `policy.widen`, which is a session asking to be let out of a promise it
 made to itself. The [policy table](../configure/policy.md) in `chock.zon` says
 which of them is allowed, denied or asked.
 
-Three of those are read before the work they govern, at a moment when nobody is
-waiting to answer, so `ask` is a refusal for `net.fetch`, `nix.build` and
-`model.select`. `workspace.apply` is asked at the end of a session, and again
+Two of those are read before the work they govern, at a moment when nobody is
+waiting to answer, so `ask` is a refusal for `nix.build` and `model.select`.
+`net.fetch` is asked live for the host the agent named, and stays a refusal for
+every redirect hop after it: see [actions.md](../configure/actions.md). `workspace.apply` is asked at the end of a session, and again
 during one when the agent asks for it with `request_action`. `policy.widen` is
 asked during one.
 
@@ -18,8 +19,7 @@ An ordinary tool call is gated as well. `gateToolCall` asks the same arbiter
 about every one, so a project rule of `ask` on `call.write_file`, `exec.*`, or
 any other action `Tool.actionInto` names reaches a person mid session. A
 filtered tool call's own `net.connect.*` question reaches the same person: a
-host no rule names answers `ask`, and that `ask` is a live question, not the
-refusal `net.fetch` is. [threat-model.md](../security/threat-model.md)
+host no rule names answers `ask`, and that `ask` is a live question. [threat-model.md](../security/threat-model.md)
 describes the network descriptor every foreground tool call holds, whether or
 not any host has been named.
 

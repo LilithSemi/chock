@@ -1397,7 +1397,7 @@ fn runTool(
     else if (std.mem.eql(u8, call.tool, restrict_tool_name))
         try runRestrictSelf(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, fetch_tool_name))
-        try runFetch(allocator, io, session, deps, call)
+        try runFetch(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, search_tool_name))
         try runSearch(allocator, io, session, deps, call)
     else if (std.mem.eql(u8, call.tool, ask_tool_name))
@@ -2056,6 +2056,7 @@ pub const fetch_tool_name = @tagName(tools.Tool.fetch_url);
 fn runFetch(
     allocator: std.mem.Allocator,
     io: std.Io,
+    locked: anytype,
     session: *chock_proto.state.Session,
     deps: Deps,
     call: event.ToolCall,
@@ -2080,11 +2081,50 @@ fn runFetch(
         try allocator.dupe(u8, fetch_mod.has_no_fetcher),
     );
 
+    // Puts the host the agent named to a person, live. The fetch seam calls
+    // back into this because an approval is two log events and only the loop
+    // holds the lock that writes them.
+    const HostAsker = struct {
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        locked: @TypeOf(locked),
+        deps: Deps,
+        call: event.ToolCall,
+
+        fn permits(ptr: *anyopaque, host: []const u8, action: []const u8) fetch_mod.Error!bool {
+            const me: *@This() = @ptrCast(@alignCast(ptr));
+            const arbiter = me.deps.arbiter orelse return false;
+            const summary = try std.fmt.allocPrint(
+                me.allocator,
+                "read a page from \"{s}\"",
+                .{host},
+            );
+            defer me.allocator.free(summary);
+            const answer = arbiter.decide(me.allocator, me.io, me.locked, .{
+                .action = action,
+                .summary = summary,
+                .detail = action,
+                .reason = "",
+                .tool = me.call.tool,
+                .tool_call_id = me.call.call_id,
+            });
+            return answer.permitted;
+        }
+    };
+    var host_asker = HostAsker{
+        .allocator = allocator,
+        .io = io,
+        .locked = locked,
+        .deps = deps,
+        .call = call,
+    };
+
     const held = try self_policy.restrictionsFrom(arena, session.self_policy.restrictions.items);
     const answer = try fetcher.fetch(allocator, io, .{
         .url = parsed.value.url,
         .self_policy = held,
         .tool = call.tool,
+        .ask_host = .{ .ptr = &host_asker, .call = HostAsker.permits },
     });
     return .{
         .call_id = try allocator.dupe(u8, call.call_id),

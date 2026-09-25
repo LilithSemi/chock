@@ -7019,6 +7019,7 @@ const SessionFetcher = struct {
         var outcome = try self.session.fetch(io, .{
             .url = ask.url,
             .self_policy = promised.items,
+            .ask_host = if (ask.ask_host) |one| .{ .ptr = one.ptr, .call = one.call } else null,
         }, &diag);
         defer outcome.deinit(self.gpa);
 

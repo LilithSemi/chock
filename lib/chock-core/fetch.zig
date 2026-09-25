@@ -59,9 +59,31 @@ const ratchet = chock_policy.ratchet;
 pub const max_result_bytes: usize = 32 * 1024;
 
 /// What the loop wants read.
+/// Puts one host to a person, live, while the agent waits.
+///
+/// **Only the host the agent named.** A fetch follows redirects and each hop
+/// is a new host, so a page that could ask at every hop would let whoever
+/// wrote it chain twenty of them and turn the prompt into a way to tire a
+/// person out. An approval answered wearily is worth nothing, so a hop keeps
+/// the refusal a rule it does not name already gets.
+///
+/// Null where nobody can be asked, which is every caller but a session with a
+/// person attached to it. Then `ask` stays the refusal it is today.
+pub const HostAsk = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, host: []const u8, action: []const u8) Error!bool,
+
+    pub fn permits(self: HostAsk, host: []const u8, action: []const u8) Error!bool {
+        return self.call(self.ptr, host, action);
+    }
+};
+
 pub const Ask = struct {
     /// The URL the model named. Borrowed for the call.
     url: []const u8,
+    /// Who to put a host to, when the table answers `ask` for the host the
+    /// agent named. See `HostAsk`.
+    ask_host: ?HostAsk = null,
     /// What this session promised about itself, folded from its own
     /// `policy.self` events. **Carried and never applied here**: see this
     /// file's own top comment.

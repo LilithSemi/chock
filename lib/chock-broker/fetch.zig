@@ -335,7 +335,20 @@ pub const Session = struct {
             );
             const host = try host_component.toRawMaybeAlloc(arena);
 
-            const decision = self.decide(host, request.self_policy);
+            var decision = self.decide(host, request.self_policy);
+
+            // Only the host the agent named, which is the first hop. A
+            // redirect keeps the refusal, so a page cannot chain hops to make
+            // a person answer one question after another.
+            if (mayAsk(decision, hop)) {
+                if (request.ask_host) |asker| {
+                    var key_buffer: [max_action_bytes]u8 = undefined;
+                    if (actionInto(&key_buffer, host)) |action| {
+                        if (try asker.permits(host, action)) decision = .allow;
+                    }
+                }
+            }
+
             if (decision != .allow) {
                 if (diagnostic.wants(diag)) {
                     var key_buffer: [max_action_bytes]u8 = undefined;
@@ -556,10 +569,35 @@ pub const Session = struct {
     }
 };
 
+/// Puts one host to a person while the agent waits. `chock-broker` cannot
+/// import `chock-core`, so this carries the same shape as
+/// `chock_core.fetch.HostAsk` and `src/run.zig` hands one across.
+pub const HostAsk = struct {
+    ptr: *anyopaque,
+    call: *const fn (ptr: *anyopaque, host: []const u8, action: []const u8) Error!bool,
+
+    pub fn permits(self: HostAsk, host: []const u8, action: []const u8) Error!bool {
+        return self.call(self.ptr, host, action);
+    }
+};
+
 pub const Request = struct {
     url: []const u8,
     self_policy: []const ratchet.Restriction = &.{},
+    /// Null where nobody can be asked, and then `ask` stays a refusal.
+    ask_host: ?HostAsk = null,
 };
+
+/// Whether this host may be put to a person while the agent waits.
+///
+/// **Only the host the agent named, which is hop zero.** A redirect hop keeps
+/// the refusal a host no rule names already gets. A page that could ask at
+/// every hop would let whoever wrote it chain redirects and turn the prompt
+/// into a way to tire a person out, and an approval answered wearily is worth
+/// nothing.
+fn mayAsk(decision: table.Decision, hop: usize) bool {
+    return decision == .ask and hop == 0;
+}
 
 fn refuse(kind: Refusal.Kind, text: []u8) Outcome {
     return .{ .refused = .{ .kind = kind, .text = text } };
@@ -819,4 +857,19 @@ test "a promise on the bare class binds a host the project allowed" {
     }};
     try testing.expectEqual(table.Decision.deny, session.decide("www.example.com", &one_host));
     try testing.expectEqual(table.Decision.allow, session.decide("docs.example.com", &one_host));
+}
+
+test "only the host the agent named may be put to a person" {
+    // The host the agent asked for, and the table wants a person.
+    try std.testing.expect(mayAsk(.ask, 0));
+
+    // Every redirect hop keeps the refusal. This is the whole of the bound on
+    // a page that would otherwise chain hops to make a person answer again
+    // and again.
+    try std.testing.expect(!mayAsk(.ask, 1));
+    try std.testing.expect(!mayAsk(.ask, 2));
+
+    // Nothing else is a question. A deny is a deny and an allow needs nobody.
+    try std.testing.expect(!mayAsk(.deny, 0));
+    try std.testing.expect(!mayAsk(.allow, 0));
 }
