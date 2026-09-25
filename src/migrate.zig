@@ -50,6 +50,7 @@ const tty = @import("tty.zig");
 
 const usage_text =
     \\Usage: chock migrate [--from <harness>] [--project <dir>] [--print]
+    \\                    [--permission <class>]
     \\
     \\Reads another AI coding harness's configuration and writes a chock.zon
     \\for it. One shot and offline: no session, no model, no network, no
@@ -62,6 +63,13 @@ const usage_text =
     \\A foreign deny is carried as .deny. A foreign allow is carried as .ask,
     \\because an allow under another tool's threat model does not become an
     \\allow under this one.
+    \\
+    \\--permission <class> carries an allow under that class as .allow. It
+    \\takes net.fetch, and it is repeatable. Only a host the source named
+    \\itself is carried, never a wider one. Use it when you have read those
+    \\grants and accept them, because ask is a refusal for a fetch: only
+    \\allow reads a host, so a fetch rule written at ask is the same as no
+    \\rule at all.
     \\
     \\Options:
     \\  --from <harness>   The harness to read from. Refused when this build
@@ -114,9 +122,29 @@ pub const McpServer = struct {
 /// this narrow upstream.
 pub const Said = enum { allow, ask, deny };
 
-/// The policy row a foreign permission becomes. Never `.allow`: see this
-/// file's own top comment.
-pub const Decision = enum { deny, ask };
+/// The policy row a foreign permission becomes. `.allow` is reachable only
+/// through `--permission`, which is a person saying in as many words that they
+/// read the source's grants and accept them. Nothing carries one by default.
+pub const Decision = enum { deny, ask, allow };
+
+/// A class of permission `--permission` can carry as `.allow`.
+///
+/// **`net.fetch` is here because `ask` is a refusal for a fetch.** Only
+/// `allow` reads a host, so a fetch rule written at `ask` is the same as no
+/// rule, and carrying one would be the inert output this file exists to avoid.
+/// See `docs/configure/actions.md`.
+pub const carryable = [_][]const u8{"net.fetch"};
+
+/// Whether `action` sits under one of the classes named on the command line.
+pub fn isCarried(action: []const u8, carry: []const []const u8) bool {
+    for (carry) |class| {
+        if (std.mem.eql(u8, action, class)) return true;
+        if (action.len > class.len and
+            std.mem.startsWith(u8, action, class) and
+            action[class.len] == '.') return true;
+    }
+    return false;
+}
 
 /// One permission line a foreign source carried.
 pub const Hint = struct {
@@ -124,17 +152,21 @@ pub const Hint = struct {
     said: Said,
     source_file: []const u8,
 
-    pub fn decision(self: Hint) Decision {
+    /// `carry` holds the classes `--permission` named. An allow under one of
+    /// them is the only way a row reaches `.allow`.
+    pub fn decision(self: Hint, carry: []const []const u8) Decision {
         return switch (self.said) {
             .deny => .deny,
-            .allow, .ask => .ask,
+            .ask => .ask,
+            .allow => if (isCarried(self.action, carry)) .allow else .ask,
         };
     }
 
     /// Whether this build wrote something narrower than the source did. An
     /// `ask` upstream lands on `ask` here, so it was carried and not narrowed.
-    pub fn wasNarrowed(self: Hint) bool {
-        return self.said == .allow;
+    /// An allow the command line carried is not narrowed either.
+    pub fn wasNarrowed(self: Hint, carry: []const []const u8) bool {
+        return self.said == .allow and !isCarried(self.action, carry);
     }
 };
 
@@ -250,7 +282,7 @@ pub fn main(
     defer threaded.deinit();
     const io = threaded.io();
 
-    const options = parseOptions(args) catch |err| switch (err) {
+    const options = parseOptions(arena, args) catch |err| switch (err) {
         error.HelpWanted => {
             tty.out(.plain, "{s}", .{usage_text});
             return Exit.finished.code();
@@ -281,7 +313,7 @@ pub fn main(
 
     const project_root = try resolveProject(arena, io, options.project);
     const found = try vet(arena, try reader.read(arena, io, project_root));
-    return finish(arena, io, project_root, found, options.print);
+    return finish(arena, io, project_root, found, options.print, options.permission);
 }
 
 /// Report, then write or print. Split from `main` so a test can drive it
@@ -292,12 +324,13 @@ fn finish(
     project_root: []const u8,
     found: Found,
     print_only: bool,
+    carry: []const []const u8,
 ) !u8 {
-    report(found);
+    report(found, carry);
 
     var stamp_buffer: [chock_core.memory.timestamp_bytes]u8 = undefined;
     const stamp = chock_core.memory.now(io, &stamp_buffer);
-    const text = try render(arena, found, version, stamp[0..10]);
+    const text = try render(arena, found, version, stamp[0..10], carry);
 
     if (print_only) {
         tty.out(.plain, "{s}", .{text});
@@ -343,7 +376,7 @@ fn writeChockZon(io: std.Io, path: []const u8, text: []const u8) !bool {
 
 /// The report every run prints, in three parts: what was carried as is,
 /// what was carried narrowed, and what was refused.
-fn report(found: Found) void {
+fn report(found: Found, carry: []const []const u8) void {
     tty.out(.plain, "carried:\n", .{});
     var carried = false;
     for (found.sources) |one| {
@@ -359,10 +392,10 @@ fn report(found: Found) void {
         carried = true;
     }
     for (found.policy_hints) |hint| {
-        if (hint.wasNarrowed()) continue;
+        if (hint.wasNarrowed(carry)) continue;
         tty.out(.plain, "  policy        {s} -> {t}  (from {s})\n", .{
             hint.action,
-            hint.decision(),
+            hint.decision(carry),
             hint.source_file,
         });
         carried = true;
@@ -372,11 +405,21 @@ fn report(found: Found) void {
     tty.out(.plain, "\nnarrowed, an allow became ask:\n", .{});
     var narrowed = false;
     for (found.policy_hints) |hint| {
-        if (!hint.wasNarrowed()) continue;
+        if (!hint.wasNarrowed(carry)) continue;
         tty.out(.plain, "  {s}  allow -> ask  (from {s})\n", .{ hint.action, hint.source_file });
         narrowed = true;
     }
     if (!narrowed) tty.out(.plain, "  nothing\n", .{});
+
+    var granted = false;
+    for (found.policy_hints) |hint| {
+        if (hint.decision(carry) != .allow) continue;
+        if (!granted) {
+            tty.out(.plain, "\ncarried as allow, because --permission named the class:\n", .{});
+            granted = true;
+        }
+        tty.out(.plain, "  {s}  allow -> allow  (from {s})\n", .{ hint.action, hint.source_file });
+    }
 
     tty.out(.plain, "\nrefused:\n", .{});
     if (found.refused.len == 0) {
@@ -400,6 +443,7 @@ pub fn render(
     found: Found,
     tool_version: []const u8,
     generated_on: []const u8,
+    carry: []const []const u8,
 ) std.mem.Allocator.Error![]const u8 {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(arena);
@@ -422,7 +466,7 @@ pub fn render(
         try text.appendSlice(arena, "    },\n");
     }
 
-    if (found.policy_hints.len != 0) try renderPolicy(arena, &text, found.policy_hints);
+    if (found.policy_hints.len != 0) try renderPolicy(arena, &text, found.policy_hints, carry);
 
     try text.appendSlice(arena, "}\n");
     return text.toOwnedSlice(arena);
@@ -469,11 +513,16 @@ fn renderMcpServer(arena: std.mem.Allocator, text: *std.ArrayList(u8), server: M
     for (server.env) |name| try text.print(arena, "        // reads the environment variable {s}\n", .{name});
 }
 
-fn renderPolicy(arena: std.mem.Allocator, text: *std.ArrayList(u8), hints: []const Hint) !void {
+fn renderPolicy(
+    arena: std.mem.Allocator,
+    text: *std.ArrayList(u8),
+    hints: []const Hint,
+    carry: []const []const u8,
+) !void {
     try text.appendSlice(arena, "    .policy = .{\n        .rules = .{\n");
 
     for (hints) |hint| {
-        if (hint.decision() != .deny) continue;
+        if (hint.decision(carry) != .deny) continue;
         try text.print(arena, "            .{{ .action = \"{f}\", .decision = .deny }}, // from {s}\n", .{
             std.zig.fmtString(hint.action),
             hint.source_file,
@@ -485,12 +534,28 @@ fn renderPolicy(arena: std.mem.Allocator, text: *std.ArrayList(u8), hints: []con
     // carry as an allow.
     var wrote_heading = false;
     for (hints) |hint| {
-        if (hint.decision() != .ask) continue;
+        if (hint.decision(carry) != .ask) continue;
         if (!wrote_heading) {
             try text.appendSlice(arena, "            // narrowed: an allow under another tool becomes an ask here\n");
             wrote_heading = true;
         }
         try text.print(arena, "            .{{ .action = \"{f}\", .decision = .ask }}, // from {s}\n", .{
+            std.zig.fmtString(hint.action),
+            hint.source_file,
+        });
+    }
+
+    // Last, and grouped with the reason, because this is the one shape that
+    // carries another tool's grant unchanged. It is here only because the
+    // command line asked for it by class.
+    var wrote_carried = false;
+    for (hints) |hint| {
+        if (hint.decision(carry) != .allow) continue;
+        if (!wrote_carried) {
+            try text.appendSlice(arena, "            // carried as allow, because --permission named this class\n");
+            wrote_carried = true;
+        }
+        try text.print(arena, "            .{{ .action = \"{f}\", .decision = .allow }}, // from {s}\n", .{
             std.zig.fmtString(hint.action),
             hint.source_file,
         });
@@ -520,12 +585,16 @@ const Options = struct {
     from: []const u8 = "",
     project: ?[]const u8 = null,
     print: bool = false,
+    /// Every class `--permission` named. A grant is carried only under one of
+    /// these, and the list is empty unless a person wrote it out.
+    permission: []const []const u8 = &.{},
 };
 
 const ParseError = error{ HelpWanted, BadArguments };
 
-fn parseOptions(args: []const []const u8) ParseError!Options {
+fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!Options {
     var options = Options{};
+    var carried: std.ArrayList([]const u8) = .empty;
     var index: usize = 0;
 
     while (index < args.len) : (index += 1) {
@@ -547,9 +616,42 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
             options.print = true;
             continue;
         }
+        if (std.mem.eql(u8, argument, "--permission")) {
+            index += 1;
+            if (index >= args.len) return error.BadArguments;
+            const class = args[index];
+            if (!isCarryable(class)) {
+                tty.print(
+                    .err,
+                    "chock migrate: --permission {s} names no class this build carries. It takes: {s}.\n",
+                    .{ class, carryableList() },
+                );
+                return error.BadArguments;
+            }
+            carried.append(arena, class) catch return error.BadArguments;
+            continue;
+        }
         return error.BadArguments;
     }
+    options.permission = carried.items;
     return options;
+}
+
+fn isCarryable(class: []const u8) bool {
+    for (carryable) |known| {
+        if (std.mem.eql(u8, class, known)) return true;
+    }
+    return false;
+}
+
+/// The classes this build carries, for a refusal to name. One today, so this
+/// is a literal rather than a join that allocates.
+fn carryableList() []const u8 {
+    comptime var text: []const u8 = "";
+    inline for (carryable, 0..) |one, index| {
+        text = text ++ (if (index == 0) "" else ", ") ++ one;
+    }
+    return text;
 }
 
 /// The project this command is about, as an absolute path. The same two
@@ -575,18 +677,18 @@ const test_version = "0.1.0-test";
 const test_date = "2026-09-24";
 
 test "the command line takes a harness, a project and a print flag" {
-    try testing.expectEqualStrings("", (try parseOptions(&.{})).from);
-    try testing.expect(!(try parseOptions(&.{})).print);
+    try testing.expectEqualStrings("", (try parseOptions(testing.allocator, &.{})).from);
+    try testing.expect(!(try parseOptions(testing.allocator, &.{})).print);
 
-    const named = try parseOptions(&.{ "--from", "claude-code", "--project", "/somewhere", "--print" });
+    const named = try parseOptions(testing.allocator, &.{ "--from", "claude-code", "--project", "/somewhere", "--print" });
     try testing.expectEqualStrings("claude-code", named.from);
     try testing.expectEqualStrings("/somewhere", named.project.?);
     try testing.expect(named.print);
 
-    try testing.expectError(error.BadArguments, parseOptions(&.{"--from"}));
-    try testing.expectError(error.BadArguments, parseOptions(&.{"--project"}));
-    try testing.expectError(error.BadArguments, parseOptions(&.{"--not-an-option"}));
-    try testing.expectError(error.HelpWanted, parseOptions(&.{"--help"}));
+    try testing.expectError(error.BadArguments, parseOptions(testing.allocator, &.{"--from"}));
+    try testing.expectError(error.BadArguments, parseOptions(testing.allocator, &.{"--project"}));
+    try testing.expectError(error.BadArguments, parseOptions(testing.allocator, &.{"--not-an-option"}));
+    try testing.expectError(error.HelpWanted, parseOptions(testing.allocator, &.{"--help"}));
 }
 
 test "an env value is never rendered while its name is" {
@@ -604,7 +706,7 @@ test "an env value is never rendered while its name is" {
             .source_file = ".mcp.json",
         }},
     };
-    const text = try render(testing.allocator, found, test_version, test_date);
+    const text = try render(testing.allocator, found, test_version, test_date, &.{});
     defer testing.allocator.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null);
@@ -621,7 +723,7 @@ test "render puts a foreign deny at .deny and a foreign allow at .ask" {
             .{ .action = "net.fetch.*", .said = .allow, .source_file = "settings.json" },
         },
     };
-    const text = try render(testing.allocator, found, test_version, test_date);
+    const text = try render(testing.allocator, found, test_version, test_date, &.{});
     defer testing.allocator.free(text);
 
     try testing.expect(std.mem.indexOf(u8, text, "\"git.push\", .decision = .deny") != null);
@@ -654,7 +756,7 @@ test "the rendered header names every source and carries a full 64 character has
             .{ .path = "CLAUDE.md", .hash = hashBytes("# hi\n") },
         },
     };
-    const text = try render(testing.allocator, found, test_version, test_date);
+    const text = try render(testing.allocator, found, test_version, test_date, &.{});
     defer testing.allocator.free(text);
 
     // The version and the date come from the caller, and never from a second
@@ -671,7 +773,7 @@ test "the rendered header names every source and carries a full 64 character has
 
     // With no source at all the header still names the version and the date,
     // and asks for nothing that is not there.
-    const bare = try render(testing.allocator, Found{}, test_version, test_date);
+    const bare = try render(testing.allocator, Found{}, test_version, test_date, &.{});
     defer testing.allocator.free(bare);
     try testing.expect(std.mem.indexOf(u8, bare, "Generated by chock") != null);
     try testing.expect(std.mem.indexOf(u8, bare, "Read from") == null);
@@ -703,7 +805,7 @@ test "an existing chock.zon is never overwritten" {
     const found = Found{
         .policy_hints = &.{.{ .action = "git.push", .said = .deny, .source_file = "settings.json" }},
     };
-    const code = try finish(arena, testing.io, project_root, found, false);
+    const code = try finish(arena, testing.io, project_root, found, false, &.{});
 
     // Never `finished`: nothing was written. See `src/main.zig`'s own top
     // comment.
@@ -738,7 +840,7 @@ test "a project with no chock.zon gets one, once" {
     };
     try testing.expectEqual(
         Exit.finished.code(),
-        try finish(arena, testing.io, project_root, found, false),
+        try finish(arena, testing.io, project_root, found, false, &.{}),
     );
 
     const written = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
@@ -748,7 +850,7 @@ test "a project with no chock.zon gets one, once" {
     // above, but this asserts the write step itself is one shot.
     said.clear();
     try testing.expect(
-        (try finish(arena, testing.io, project_root, found, false)) != Exit.finished.code(),
+        (try finish(arena, testing.io, project_root, found, false, &.{})) != Exit.finished.code(),
     );
     const unchanged = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
     try testing.expectEqualStrings(written, unchanged);
@@ -775,7 +877,7 @@ test "--print never touches chock.zon, even when there is none to protect" {
     };
     try testing.expectEqual(
         Exit.finished.code(),
-        try finish(arena, testing.io, project_root, found, true),
+        try finish(arena, testing.io, project_root, found, true, &.{}),
     );
     try testing.expect(std.mem.indexOf(u8, said.out(), "AGENTS.md") != null);
     try testing.expectError(
@@ -839,4 +941,45 @@ test "every action the guard admits is one the policy reader can carry" {
     try testing.expect(isKnownAction("net.fetch.com.example"));
     try testing.expect(!isKnownAction("Bash(cargo test:*)"));
     try testing.expect(!isKnownAction("sandbox.write"));
+}
+
+test "a fetch grant is ask until --permission names its class" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const found = Found{ .policy_hints = &.{
+        .{ .action = "net.fetch.com.example", .said = .allow, .source_file = "s.json" },
+        .{ .action = "git.push", .said = .allow, .source_file = "s.json" },
+    } };
+
+    const closed = try render(arena, found, test_version, test_date, &.{});
+    try testing.expect(std.mem.indexOf(u8, closed, ".decision = .allow") == null);
+
+    const opened = try render(arena, found, test_version, test_date, &.{"net.fetch"});
+    try testing.expect(std.mem.indexOf(u8, opened, "\"net.fetch.com.example\", .decision = .allow") != null);
+
+    // The flag names one class and widens nothing else.
+    try testing.expect(std.mem.indexOf(u8, opened, "\"git.push\", .decision = .allow") == null);
+}
+
+test "--permission takes a class this build carries and refuses one it does not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const opened = try parseOptions(arena, &.{ "--permission", "net.fetch" });
+    try testing.expectEqual(@as(usize, 1), opened.permission.len);
+    try testing.expectEqualStrings("net.fetch", opened.permission[0]);
+
+    try testing.expectEqual(@as(usize, 0), (try parseOptions(arena, &.{})).permission.len);
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+    try testing.expectError(
+        error.BadArguments,
+        parseOptions(arena, &.{ "--permission", "git.push" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "net.fetch") != null);
 }

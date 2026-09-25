@@ -526,7 +526,7 @@ test "an env value never appears anywhere in the returned Found while its name d
     try testing.expectEqual(@as(usize, 1), server.env.len);
     try testing.expectEqualStrings("OPENAI_API_KEY", server.env[0]);
 
-    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24");
+    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24", &.{});
     try testing.expect(std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null);
     try testing.expect(std.mem.indexOf(u8, text, "sk-live-do-not-leak") == null);
 }

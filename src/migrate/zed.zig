@@ -414,7 +414,7 @@ test "a context server is matched by field shape: command kept, url refused, nei
     try testing.expectEqual(@as(usize, 1), found.mcp_servers[0].env.len);
     try testing.expectEqualStrings("GITHUB_TOKEN", found.mcp_servers[0].env[0]);
 
-    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24");
+    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24", &.{});
     try testing.expect(std.mem.indexOf(u8, text, "GITHUB_TOKEN") != null);
     try testing.expect(std.mem.indexOf(u8, text, "ghp_secret") == null);
 

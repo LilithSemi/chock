@@ -380,8 +380,20 @@ before this harness existed found nine faults, and this run found a tenth.
   tool and an argument pattern, as in `Bash(cargo test:*)`; Zed's are regular
   expressions over command text; oh-my-pi's and OpenCode's are their own tool
   names. None of those is an action name here, so each is refused and named
-  rather than guessed at. `webfetch` and `lsp` in OpenCode are the two that
-  reach a real action.
+  rather than guessed at. `webfetch` and `lsp` in OpenCode reach a real
+  action, and so does `WebFetch(domain:<host>)` in Claude Code: a host is
+  exactly what `net.fetch` names, the labels reverse, and a `*.` prefix
+  becomes the trailing `.*` this table already reads as any host under a
+  name. A host that cannot be read exactly is refused, because a wrongly
+  reversed name would grant reach to a host nobody chose.
+
+  `--permission <class>` carries an allow under that class as `.allow`
+  instead of `.ask`. It takes `net.fetch`, and nothing else today. It exists
+  because `ask` is a refusal for a fetch: only `allow` reads a host, so a
+  fetch rule written at `ask` is the same as no rule. Without the flag
+  nothing is carried as an allow at all. With it, only a host the source
+  named itself is carried, never a wider one, and both the report and the
+  generated file say which rows came in that way and why.
 
   The generated file opens with a header comment naming the version that
   wrote it, the date, and every file a reader read with the SHA-256 of the

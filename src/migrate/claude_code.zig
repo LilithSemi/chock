@@ -13,12 +13,14 @@
 
 const std = @import("std");
 const migrate = @import("../migrate.zig");
+const chock_policy = @import("chock-policy");
 
 const Found = migrate.Found;
 const Source = migrate.Source;
 const ReadSource = migrate.ReadSource;
 const McpServer = migrate.McpServer;
 const Hint = migrate.Hint;
+const Said = migrate.Said;
 const Refusal = migrate.Refusal;
 const hashBytes = migrate.hashBytes;
 const envName = migrate.envName;
@@ -39,8 +41,8 @@ pub fn read(arena: std.mem.Allocator, io: std.Io, project_root: []const u8) anye
     var refused: std.ArrayList(Refusal) = .empty;
 
     try readInstructions(arena, io, project_root, &sources, &instructions);
-    try readSettings(arena, io, project_root, ".claude/settings.json", &sources, &refused);
-    try readSettings(arena, io, project_root, ".claude/settings.local.json", &sources, &refused);
+    try readSettings(arena, io, project_root, ".claude/settings.json", &sources, &policy_hints, &refused);
+    try readSettings(arena, io, project_root, ".claude/settings.local.json", &sources, &policy_hints, &refused);
     try readMcp(arena, io, project_root, &sources, &mcp_servers, &refused);
     try refuseUncarriedDirectories(arena, io, project_root, &refused);
 
@@ -112,6 +114,7 @@ fn readSettings(
     project_root: []const u8,
     rel: []const u8,
     sources: *std.ArrayList(ReadSource),
+    policy_hints: *std.ArrayList(Hint),
     refused: *std.ArrayList(Refusal),
 ) !void {
     const bytes = try readBounded(arena, io, project_root, rel, max_settings_bytes) orelse return;
@@ -137,11 +140,27 @@ fn readSettings(
     const permissions = parsed.permissions orelse return;
 
     // A rule here is a tool and an argument pattern, as in `Bash(cargo
-    // test:*)`. Chock's table matches an action name, so none of these carry:
+    // test:*)`. Chock's table matches an action name, so almost none carry:
     // the name would decide nothing, and an interior `*` is refused by the
     // policy reader outright, which would stop the whole file loading.
-    for ([_][]const []const u8{ permissions.deny, permissions.allow, permissions.ask }) |list| {
-        for (list) |rule| {
+    //
+    // `WebFetch(domain:...)` is the exception. A host is exactly what
+    // `net.fetch` names, and a `*.` prefix is exactly Chock's trailing `.*`.
+    const lists = [_]struct { rules: []const []const u8, said: Said }{
+        .{ .rules = permissions.deny, .said = .deny },
+        .{ .rules = permissions.allow, .said = .allow },
+        .{ .rules = permissions.ask, .said = .ask },
+    };
+    for (lists) |list| {
+        for (list.rules) |rule| {
+            if (try fetchAction(arena, rule)) |action| {
+                try policy_hints.append(arena, .{
+                    .action = action,
+                    .said = list.said,
+                    .source_file = rel,
+                });
+                continue;
+            }
             try refused.append(arena, .{
                 .what = try std.fmt.allocPrint(arena, "permissions rule {s}", .{rule}),
                 .reason = "it names a tool and an argument pattern, and this table decides by action name instead",
@@ -253,6 +272,52 @@ fn refuseUncarriedDirectories(
     }
 }
 
+/// `WebFetch(domain:<host>)` as the `net.fetch` action for that host, or null
+/// for every other rule.
+///
+/// The labels reverse, so `docs.ziglang.org` becomes `org.ziglang.docs`, and a
+/// `*.` prefix becomes the trailing `.*` that Chock reads as any host under
+/// the name. Both spellings are what Claude Code writes.
+///
+/// **A host this cannot read exactly comes back null and is refused.** A
+/// wrongly reversed name would grant reach to a host nobody chose.
+fn fetchAction(arena: std.mem.Allocator, rule: []const u8) !?[]const u8 {
+    const open = "WebFetch(domain:";
+    if (!std.mem.startsWith(u8, rule, open)) return null;
+    if (!std.mem.endsWith(u8, rule, ")")) return null;
+
+    var host = rule[open.len .. rule.len - 1];
+    var under = false;
+    if (std.mem.startsWith(u8, host, "*.")) {
+        under = true;
+        host = host[2..];
+    }
+    if (host.len == 0) return null;
+
+    var labels: std.ArrayList([]const u8) = .empty;
+    var walk = std.mem.splitScalar(u8, host, '.');
+    while (walk.next()) |label| {
+        if (label.len == 0) return null;
+        for (label) |byte| switch (byte) {
+            'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+            else => return null,
+        };
+        try labels.append(arena, label);
+    }
+    if (labels.items.len == 0) return null;
+
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, "net.fetch");
+    var index = labels.items.len;
+    while (index > 0) {
+        index -= 1;
+        try text.append(arena, '.');
+        try text.appendSlice(arena, labels.items[index]);
+    }
+    if (under) try text.appendSlice(arena, ".*");
+    return try text.toOwnedSlice(arena);
+}
+
 const testing = std.testing;
 
 fn writeProjectFile(io: std.Io, project_root: []const u8, rel_path: []const u8, contents: []const u8) !void {
@@ -272,7 +337,7 @@ fn tmpProjectRoot(arena: std.mem.Allocator, tmp: *testing.TmpDir) ![]const u8 {
     return arena.dupe(u8, buffer[0..len]);
 }
 
-test "a permission rule is refused by name, because it is a tool and a pattern" {
+test "a permission rule is refused by name, and a fetch host becomes an action" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -281,23 +346,73 @@ test "a permission rule is refused by name, because it is a tool and a pattern" 
     defer tmp.cleanup();
     const project_root = try tmpProjectRoot(arena, &tmp);
 
-    // The shapes Claude Code actually writes. None is an action name here,
-    // and `Bash(cargo test:*)` would be refused by the policy reader outright
-    // for the `*` in the middle, taking the whole file with it.
+    // `Bash(cargo test:*)` would be refused by the policy reader outright for
+    // the `*` in the middle, taking the whole file with it.
     try writeProjectFile(testing.io, project_root, ".claude/settings.json",
-        \\{"permissions": {"deny": ["Read(//etc/**)"], "allow": ["Bash(cargo test:*)"], "ask": ["WebFetch(domain:example.com)"]}}
+        \\{"permissions": {"deny": ["Read(//etc/**)"], "allow": ["Bash(cargo test:*)", "WebFetch(domain:example.com)"]}}
     );
 
     const found = try read(arena, testing.io, project_root);
 
-    try testing.expectEqual(@as(usize, 0), found.policy_hints.len);
+    try testing.expectEqual(@as(usize, 1), found.policy_hints.len);
+    try testing.expectEqualStrings("net.fetch.com.example", found.policy_hints[0].action);
+    try testing.expectEqual(migrate.Said.allow, found.policy_hints[0].said);
+
     var seen: usize = 0;
     for (found.refused) |one| {
         if (std.mem.indexOf(u8, one.what, "Bash(cargo test:*)") != null) seen += 1;
         if (std.mem.indexOf(u8, one.what, "Read(//etc/**)") != null) seen += 1;
-        if (std.mem.indexOf(u8, one.what, "WebFetch(domain:example.com)") != null) seen += 1;
     }
-    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "a fetch host reverses its labels, and a leading star becomes a trailing one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings(
+        "net.fetch.com.example",
+        (try fetchAction(arena, "WebFetch(domain:example.com)")).?,
+    );
+    try testing.expectEqualStrings(
+        "net.fetch.org.ziglang.docs",
+        (try fetchAction(arena, "WebFetch(domain:docs.ziglang.org)")).?,
+    );
+    // Claude Code's own wildcard is Chock's, once the labels turn round.
+    try testing.expectEqualStrings(
+        "net.fetch.com.google.*",
+        (try fetchAction(arena, "WebFetch(domain:*.google.com)")).?,
+    );
+
+    // Anything this cannot read exactly comes back null and is refused. A
+    // wrongly reversed name would grant reach to a host nobody chose.
+    for ([_][]const u8{
+        "Bash(cargo test:*)",
+        "WebFetch(domain:)",
+        "WebFetch(domain:a..b)",
+        "WebFetch(domain:one*two.com)",
+        "WebFetch(domain:example.com",
+        "WebSearch",
+    }) |rule| {
+        try testing.expectEqual(@as(?[]const u8, null), try fetchAction(arena, rule));
+    }
+}
+
+test "every action a fetch rule yields is one the policy reader can carry" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for ([_][]const u8{
+        "WebFetch(domain:example.com)",
+        "WebFetch(domain:*.google.com)",
+        "WebFetch(domain:a.b.c.d.example.co.uk)",
+    }) |rule| {
+        const action = (try fetchAction(arena, rule)).?;
+        try testing.expect(migrate.isKnownAction(action));
+        try testing.expect(chock_policy.table.patternIsWellFormed(action));
+    }
 }
 
 test "an env value never appears anywhere in the returned Found while its name does" {
@@ -321,7 +436,7 @@ test "an env value never appears anywhere in the returned Found while its name d
     try testing.expectEqual(@as(usize, 1), server.env.len);
     try testing.expectEqualStrings("OPENAI_API_KEY", server.env[0]);
 
-    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24");
+    const text = try migrate.render(arena, found, "0.1.0-test", "2026-09-24", &.{});
     try testing.expect(std.mem.indexOf(u8, text, "OPENAI_API_KEY") != null);
     try testing.expect(std.mem.indexOf(u8, text, "sk-live-do-not-leak") == null);
 }
