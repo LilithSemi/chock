@@ -754,6 +754,13 @@ pub fn build(b: *std.Build) void {
             chock_auth.addSystemFrameworkPath(.{
                 .cwd_relative = b.pathJoin(&.{ sdkroot, "System/Library/Frameworks" }),
             });
+            // A framework names dylibs of its own: CoreFoundation wants
+            // `libobjc.A.dylib`, which lives beside the frameworks and not
+            // among them. Without this the frameworks are found and what they
+            // depend on is not.
+            chock_auth.addLibraryPath(.{
+                .cwd_relative = b.pathJoin(&.{ sdkroot, "usr/lib" }),
+            });
         }
     }
 
