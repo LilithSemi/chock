@@ -30,6 +30,9 @@ pub const network = @import("chock-broker/network.zig");
 /// `robots.txt` is honoured for convention parity. It is not a boundary.
 pub const fetch = @import("chock-broker/fetch.zig");
 
+/// `self_hosted` only. `api` and `scrape` are named and refused.
+pub const search = @import("chock-broker/search.zig");
+
 pub const socket = @import("chock-broker/socket.zig");
 
 pub const handover = @import("chock-broker/handover.zig");

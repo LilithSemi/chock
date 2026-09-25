@@ -6,6 +6,7 @@ const table = @import("table.zig");
 const subagent = @import("subagents.zig");
 const limits_mod = @import("limits.zig");
 const nix_mod = @import("nix.zig");
+const search_mod = @import("search.zig");
 
 pub const file_name = "org-policy.zon";
 
@@ -62,6 +63,9 @@ pub const Bundle = struct {
     subagents: ?subagent.Ceiling = null,
     limits: ?limits_mod.Ceiling = null,
     nix: ?nix_mod.Ceiling = null,
+    /// What the search engine may be. An organisation can pin a kind or a
+    /// base url, and can forbid the `scrape` kind outright.
+    search: ?search_mod.Ceiling = null,
     /// Files every project of this installation must keep out of the sandbox,
     /// on top of its own `deny_read` block.
     ///

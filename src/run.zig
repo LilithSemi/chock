@@ -447,6 +447,7 @@ const Started = struct {
     provisioning: ?Provisioning,
     nix_build: ?NixBuild,
     nix_caps: chock_policy.nix.Resolved,
+    search: chock_policy.search.Search,
     backing: *chock_proto.storage.JsonLines,
     storage: chock_proto.storage.Storage,
     base_url: []const u8,
@@ -1035,6 +1036,8 @@ fn start(
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
 
+    const search = try resolveSearch(arena, io, config_dir, org_bundle);
+
     const flake_inputs = fetchFlakeInputs(
         arena,
         io,
@@ -1378,6 +1381,7 @@ fn start(
         .provisioning = provisioning,
         .nix_build = nix_build,
         .nix_caps = nix_caps,
+        .search = search,
         .backing = backing,
         .storage = storage,
         .base_url = instance.base_url,
@@ -1907,6 +1911,41 @@ fn reportLimits(err: anyerror, diag: *?chock_policy.limits.Diagnostic) StartErro
         tty.print(.err, "chock run: the limits block could not be read: {t}\n", .{err});
     }
     return error.Reported;
+}
+
+/// There is no project layer for `search`: it names the operator's own
+/// infrastructure, the same way a model provider does. An org bundle is a
+/// ceiling over it and can only narrow, so a bundle may pin a kind or forbid
+/// one and a user's own file cannot climb back out.
+fn resolveSearch(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    config_dir: []const u8,
+    org_bundle: ?*const chock_policy.org.Bundle,
+) StartError!chock_policy.search.Search {
+    var diag: ?chock_policy.search.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    const operator = chock_policy.search.loadOperator(arena, io, config_dir, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the search block could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the search block could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+
+    const ceiling = if (org_bundle) |bundle| bundle.search else null;
+    return chock_policy.search.foldLayers(operator, ceiling, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the org bundle does not permit this search engine: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the org bundle does not permit this search engine: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
 }
 
 test "the limits a project and an operator name reach the sandbox this run builds" {
@@ -6913,6 +6952,32 @@ const TablePolicy = struct {
 /// The promises of the sessions above this one are read at session start rather
 /// than per call, which is exact: a parent is blocked inside its own
 /// `spawn_agent` call for the whole life of a child.
+/// The search seam, filled only when the operator's own `config.zon` names an
+/// engine. A null searcher is what `Loop` reports as no engine configured.
+const SessionSearcher = struct {
+    session: chock_broker.search.Session,
+
+    fn searcher(self: *SessionSearcher) chock_core.search.Searcher {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.search.Searcher.VTable{ .search = searchFn };
+
+    fn searchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        ask: chock_core.search.Ask,
+    ) chock_core.search.Error!chock_core.search.Answer {
+        const self: *SessionSearcher = @ptrCast(@alignCast(ptr));
+        // The broker's own `Ask` carries the query alone: the policy question
+        // was already answered live at the tool call, so nothing here reads a
+        // promise or a tool name.
+        const answered = try self.session.search(gpa, io, .{ .query = ask.query });
+        return .{ .text = answered.text, .is_error = answered.is_error };
+    }
+};
+
 const SessionFetcher = struct {
     gpa: std.mem.Allocator,
     session: chock_broker.fetch.Session,
@@ -9827,6 +9892,17 @@ fn runSession(
     };
     defer fetcher.deinit();
 
+    // Only when both halves are named. A block with no kind or no base url is
+    // not an engine, and the seam stays null so the tool says so.
+    var searcher: ?SessionSearcher = if (started.search.kind) |kind| about: {
+        const base = started.search.base_url orelse break :about null;
+        break :about SessionSearcher{ .session = .{
+            .kind = kind,
+            .base_url = base,
+            .clean = chock_core.mcp.textForModel,
+        } };
+    } else null;
+
     var sinks = Sinks{};
     defer sinks.close(io);
     sinks.open(options, started.audit_sinks, started.session_id);
@@ -9896,6 +9972,7 @@ fn runSession(
         .store_closure = started.toolchain.store_paths,
         .handback = session_handback.handback(),
         .fetcher = fetcher.fetcher(),
+        .searcher = if (searcher) |*one| one.searcher() else null,
         .asker = if (screen != null) display_asker.asker() else question_prompt.asker(),
         .redact = started.redact,
     };

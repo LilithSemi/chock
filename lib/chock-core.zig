@@ -129,6 +129,7 @@ pub const arbiter = @import("chock-core/arbiter.zig");
 /// belongs to the broker. See its own top comment, and note that a fetched page
 /// is a stranger's writing and is marked as such.
 pub const fetch = @import("chock-core/fetch.zig");
+pub const search = @import("chock-core/search.zig");
 /// How the agent gives its own work back to the project. **A seam, for the
 /// reason `arbiter` is one**, and it is the one act an agent may ask for by
 /// name. It decides nothing itself: read its own top comment, and note that an
