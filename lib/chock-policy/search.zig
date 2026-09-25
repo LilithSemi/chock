@@ -14,12 +14,23 @@ pub const Kind = enum {
     scrape,
 };
 
-/// Which keyed search vendor an `api` engine talks to. Each one has its own
-/// request shape and its own reply shape, so the kind alone does not say
-/// enough to read a reply.
+/// Which search vendor an engine talks to. Each one has its own request shape
+/// and its own reply shape, so the kind alone does not say enough to read a
+/// reply.
 pub const Provider = enum {
     brave,
     kagi,
+    duckduckgo,
+
+    /// The kind this vendor belongs to. A keyed API and a results page read as
+    /// HTML are different shapes, and a provider fits exactly one of them, so
+    /// naming one the kind does not take is refused instead of half working.
+    pub fn kind(self: Provider) Kind {
+        return switch (self) {
+            .brave, .kagi => .api,
+            .duckduckgo => .scrape,
+        };
+    }
 };
 
 /// Every member is optional, so "no search block" is told apart from a block
@@ -102,6 +113,8 @@ pub const Diagnostic = struct {
         provider_unknown: []const u8,
         provider_missing,
         provider_not_for_kind: Kind,
+        provider_wrong_kind: ProviderMismatch,
+        credential_not_for_kind: Kind,
         base_url_not_a_string,
         base_url_invalid: InvalidBaseUrl,
         base_url_missing,
@@ -112,6 +125,13 @@ pub const Diagnostic = struct {
         base_url_not_permitted: BaseUrlMismatch,
         file_too_large: usize,
         read_failed: anyerror,
+    };
+
+    /// A provider named beside a kind it does not belong to. Both are values,
+    /// so nothing here is owned.
+    pub const ProviderMismatch = struct {
+        provider: Provider,
+        kind: Kind,
     };
 
     pub const InvalidBaseUrl = struct {
@@ -173,12 +193,27 @@ pub const Diagnostic = struct {
                 .{self.source},
             ),
             .provider_unknown => |text| try writer.print(
-                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave or kagi",
+                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave, kagi, or duckduckgo",
                 .{ self.source, text },
             ),
             .provider_missing => try writer.print(
-                "{s}: the search block's kind is api, and a provider naming the vendor is required",
+                "{s}: the search block names no provider, and the api and scrape kinds each need one to name the vendor",
                 .{self.source},
+            ),
+            .provider_wrong_kind => |mismatch| try writer.print(
+                "{s}: the search block names the provider {s}, which is a {s} engine, and the " ++
+                    "kind is {s}",
+                .{
+                    self.source,
+                    @tagName(mismatch.provider),
+                    @tagName(mismatch.provider.kind()),
+                    @tagName(mismatch.kind),
+                },
+            ),
+            .credential_not_for_kind => |kind| try writer.print(
+                "{s}: the search block names a credential, and the {s} kind sends none. Only the " ++
+                    "api kind reads one.",
+                .{ self.source, @tagName(kind) },
             ),
             .provider_not_for_kind => |kind| try writer.print(
                 "{s}: the search block names a provider, and provider applies to the api kind only, not {s}",
@@ -364,19 +399,40 @@ fn parseFields(
     }
 
     const kind = search.kind.?;
-    // A keyed engine with no key cannot work, so the provider and the
-    // credential are required now, not on the agent's first search.
-    if (kind == .api) {
-        if (search.provider == null) {
+
+    // `self_hosted` is SearXNG and nothing else, so its shape is implied and a
+    // provider there would name a second one.
+    if (kind == .self_hosted and search.provider != null) {
+        _ = note(diag, source_name, .{ .provider_not_for_kind = kind });
+        return error.InvalidSearch;
+    }
+
+    // `api` and `scrape` each cover several vendors, so the reply shape is only
+    // known once one is named.
+    if (kind == .api or kind == .scrape) {
+        const named = search.provider orelse {
             _ = note(diag, source_name, .provider_missing);
             return error.InvalidSearch;
+        };
+        if (named.kind() != kind) {
+            _ = note(diag, source_name, .{
+                .provider_wrong_kind = .{ .provider = named, .kind = kind },
+            });
+            return error.InvalidSearch;
         }
+    }
+
+    // A keyed engine with no key cannot work, so the credential is required
+    // now and not on the agent's first search. The other two kinds send none,
+    // and a value that is read and never sent is how somebody comes to believe
+    // they configured something.
+    if (kind == .api) {
         if (search.credential == null) {
             _ = note(diag, source_name, .credential_missing);
             return error.InvalidSearch;
         }
-    } else if (search.provider != null) {
-        _ = note(diag, source_name, .{ .provider_not_for_kind = kind });
+    } else if (search.credential != null) {
+        _ = note(diag, source_name, .{ .credential_not_for_kind = kind });
         return error.InvalidSearch;
     }
     return search;
@@ -571,7 +627,7 @@ test "each of the three kinds parses" {
     try testing.expectEqual(Kind.api, api.kind.?);
 
     var scrape = try parse(gpa,
-        \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.net" } }
+        \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://example.net" } }
     , null);
     defer scrape.deinit(gpa);
     try testing.expectEqual(Kind.scrape, scrape.kind.?);
@@ -714,7 +770,7 @@ test "an org ceiling forbidding scrape beats a user config that asks for it" {
     const gpa = testing.allocator;
 
     var wanted = try parse(gpa,
-        \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.org" } }
+        \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://example.org" } }
     , null);
     defer wanted.deinit(gpa);
 
@@ -764,7 +820,7 @@ test "a ceiling this build was given nothing for changes nothing" {
     const gpa = testing.allocator;
 
     var search = try parse(gpa,
-        \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.org" } }
+        \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://example.org" } }
     , null);
     defer search.deinit(gpa);
 
@@ -833,6 +889,8 @@ test "self_hosted and scrape must not name a provider" {
     );
     try testing.expectEqual(Kind.self_hosted, self_hosted.?.fault.provider_not_for_kind);
 
+    // `scrape` takes a provider now, so naming an api vendor there is a
+    // mismatch rather than a field that does not belong.
     var scrape: ?Diagnostic = null;
     defer if (scrape) |*d| d.deinit(gpa);
     try testing.expectError(
@@ -841,10 +899,11 @@ test "self_hosted and scrape must not name a provider" {
             \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.net", .provider = "brave" } }
         , &scrape),
     );
-    try testing.expectEqual(Kind.scrape, scrape.?.fault.provider_not_for_kind);
+    try testing.expectEqual(Provider.brave, scrape.?.fault.provider_wrong_kind.provider);
+    try testing.expectEqual(Kind.scrape, scrape.?.fault.provider_wrong_kind.kind);
 }
 
-test "the provider_unknown message names both vendors this reader knows" {
+test "the provider_unknown message names every vendor this reader knows" {
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
@@ -857,8 +916,11 @@ test "the provider_unknown message names both vendors this reader knows" {
     );
     const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
     defer gpa.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "brave") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "kagi") != null);
+    // Driven off the enum, so a vendor added later fails this test rather than
+    // quietly leaving the message naming a subset.
+    inline for (@typeInfo(Provider).@"enum".fields) |field| {
+        try testing.expect(std.mem.indexOf(u8, text, field.name) != null);
+    }
 }
 
 test "a self_hosted block with no provider still parses" {
@@ -869,4 +931,63 @@ test "a self_hosted block with no provider still parses" {
     , null);
     defer search.deinit(gpa);
     try testing.expectEqual(@as(?Provider, null), search.provider);
+}
+
+test "a scrape engine names its own vendor and sends no credential" {
+    const gpa = testing.allocator;
+
+    var scrape = try parse(gpa,
+        \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://html.duckduckgo.com" } }
+    , null);
+    defer scrape.deinit(gpa);
+    try testing.expectEqual(Kind.scrape, scrape.kind.?);
+    try testing.expectEqual(Provider.duckduckgo, scrape.provider.?);
+
+    // A scrape engine has nowhere to send a key, so naming one is refused
+    // rather than read and dropped.
+    var keyed: ?Diagnostic = null;
+    defer if (keyed) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://x.example", .credential = "k" } }
+        , &keyed),
+    );
+    try testing.expectEqual(Kind.scrape, keyed.?.fault.credential_not_for_kind);
+
+    var no_provider: ?Diagnostic = null;
+    defer if (no_provider) |*d| d.deinit(gpa);
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa, ".{ .search = .{ .kind = \"scrape\", .base_url = \"https://x.example\" } }", &no_provider),
+    );
+    try testing.expect(no_provider.?.fault == .provider_missing);
+}
+
+test "a scrape vendor named on an api engine is a mismatch, and the message says both kinds" {
+    const gpa = testing.allocator;
+    var diag: ?Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    try testing.expectError(
+        error.InvalidSearch,
+        parse(gpa,
+            \\.{ .search = .{ .kind = "api", .provider = "duckduckgo", .base_url = "https://x.example", .credential = "k" } }
+        , &diag),
+    );
+    try testing.expectEqual(Provider.duckduckgo, diag.?.fault.provider_wrong_kind.provider);
+
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{diag.?});
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "scrape") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "api") != null);
+}
+
+test "every provider belongs to a kind that needs one named" {
+    // `self_hosted` implies SearXNG, so no provider may claim it. A provider
+    // that did would be unreachable: the parser refuses a provider there.
+    inline for (@typeInfo(Provider).@"enum".fields) |field| {
+        const provider: Provider = @enumFromInt(field.value);
+        try testing.expect(provider.kind() != .self_hosted);
+    }
 }

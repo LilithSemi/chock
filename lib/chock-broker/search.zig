@@ -1,9 +1,9 @@
-//! Answers a `web_search` call for the `self_hosted` and `api` search kinds.
-//! `self_hosted` is backed by a SearXNG instance and needs no credential.
-//! `api` is backed by a keyed vendor named in `chock_policy.search.Provider`,
-//! `brave` or `kagi`, and reads a credential the caller hands it. `scrape`
-//! is named in `chock_policy.search.Kind` too and is refused here by name:
-//! it is not built yet.
+//! Answers a `web_search` call for the `self_hosted`, `api`, and `scrape`
+//! search kinds. `self_hosted` is backed by a SearXNG instance and needs no
+//! credential. `api` is backed by a keyed vendor named in
+//! `chock_policy.search.Provider`, `brave` or `kagi`, and reads a credential
+//! the caller hands it. `scrape` is backed by `duckduckgo`, reads a results
+//! page instead of an API, and carries no credential.
 //!
 //! ## The seam this fills
 //!
@@ -57,6 +57,24 @@
 //! documents its error statuses, so this file's Kagi statuses are worded
 //! definitely where Brave's stay a hedge: Brave never documented what a bad
 //! credential answers with, and Kagi does.
+//!
+//! ## DuckDuckGo's own HTML endpoint, verified against a live fetch
+//!
+//! `GET {base_url}/html/?q=<query>` answers HTTP 202 with an anti-bot
+//! challenge on the first request from a cold client, reproducibly. Only
+//! `POST {base_url}/html/` with `q` in a url-encoded form body answers with
+//! real results, so this is the one engine here that sends a form body on a
+//! plain search. A result's title and link come from `<a
+//! class="result__a">`, and its `href` is verified to be the real target URL
+//! with no redirect wrapper, contrary to what is commonly written about this
+//! endpoint. The snippet comes from `<a class="result__snippet">`, which is
+//! verified to carry `<b>` markup around matched terms.
+//!
+//! A scrape engine reads a page built for a browser, not a contract, so a
+//! reply can fail three distinct ways: a bot challenge, a page shape this
+//! build no longer reads, or genuinely no results. `answerFromDuckDuckGo`
+//! tells all three apart, because a broken parser that reads as "no results"
+//! is worse than no scrape engine at all.
 //!
 //! ## A result is written by a stranger
 //!
@@ -127,7 +145,7 @@ pub const Session = struct {
     kind: chock_policy.search.Kind,
     base_url: []const u8,
     clean: Clean,
-    /// Which keyed vendor an `api` session talks to. Unused by `self_hosted`.
+    /// Which vendor an `api` or `scrape` session talks to. Unused by `self_hosted`.
     provider: ?chock_policy.search.Provider = null,
     /// The credential's VALUE, already read out of the credential store by
     /// `src/run.zig`. This is not `chock_policy.search.Search.credential`,
@@ -138,23 +156,10 @@ pub const Session = struct {
         return switch (self.kind) {
             .self_hosted => searchSelfHosted(gpa, io, self.base_url, ask.query, self.clean),
             .api => searchApi(gpa, io, self, ask.query),
-            .scrape => kindNotBuilt(gpa, "scrape"),
+            .scrape => searchScrape(gpa, io, self, ask.query),
         };
     }
 };
-
-fn kindNotBuilt(gpa: std.mem.Allocator, name: []const u8) Error!Answer {
-    return .{
-        .is_error = true,
-        .text = try std.fmt.allocPrint(
-            gpa,
-            "nothing was searched: the {s} search kind is not built in this version of Chock. " ++
-                "self_hosted is; set kind to self_hosted in the operator's config.zon, or wait " ++
-                "for {s} to ship.",
-            .{ name, name },
-        ),
-    };
-}
 
 fn searchSelfHosted(
     gpa: std.mem.Allocator,
@@ -166,7 +171,7 @@ fn searchSelfHosted(
     const url = try buildSearchUrl(gpa, base_url, query);
     defer gpa.free(url);
 
-    const fetched = request(gpa, io, .GET, url, &.{}, .default, null) catch |err| switch (err) {
+    const fetched = request(gpa, io, .GET, url, &.{}, .default, .default, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResponseTooLarge => return .{
             .is_error = true,
@@ -217,6 +222,45 @@ fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []
     return switch (provider) {
         .brave => searchBrave(gpa, io, self.base_url, query, credential, self.clean),
         .kagi => searchKagi(gpa, io, self.base_url, query, credential, self.clean),
+        // duckduckgo is a scrape provider. The policy parser already refuses
+        // it on an api engine, so this arm only keeps the switch exhaustive.
+        .duckduckgo => .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: duckduckgo is a scrape provider and cannot answer an api search.",
+                .{},
+            ),
+        },
+    };
+}
+
+fn searchScrape(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []const u8) Error!Answer {
+    // Same defensive reasoning as searchApi's own provider check: the parser
+    // already refuses a missing provider, so refuse rather than trust that a
+    // second time here.
+    const provider = self.provider orelse return .{
+        .is_error = true,
+        .text = try std.fmt.allocPrint(
+            gpa,
+            "nothing was searched: a scrape search engine must name a provider in the operator's config.zon.",
+            .{},
+        ),
+    };
+
+    return switch (provider) {
+        .duckduckgo => searchDuckDuckGo(gpa, io, self.base_url, query, self.clean),
+        // brave and kagi are api providers. The policy parser already refuses
+        // either on a scrape engine, so this arm only keeps the switch
+        // exhaustive.
+        .brave, .kagi => .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: {s} is an api provider and cannot answer a scrape search.",
+                .{@tagName(provider)},
+            ),
+        },
     };
 }
 
@@ -270,7 +314,7 @@ fn searchBrave(
     const headers = [_]std.http.Header{
         .{ .name = "X-Subscription-Token", .value = credential },
     };
-    const fetched = request(gpa, io, .GET, url, &headers, .default, null) catch |err| switch (err) {
+    const fetched = request(gpa, io, .GET, url, &headers, .default, .default, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResponseTooLarge => return .{
             .is_error = true,
@@ -369,7 +413,16 @@ fn searchKagi(
         gpa.free(auth_value);
     }
 
-    const fetched = request(gpa, io, .POST, url, &.{}, .{ .override = auth_value }, body) catch |err| switch (err) {
+    const fetched = request(
+        gpa,
+        io,
+        .POST,
+        url,
+        &.{},
+        .{ .override = auth_value },
+        .{ .override = "application/json" },
+        body,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ResponseTooLarge => return .{
             .is_error = true,
@@ -406,6 +459,296 @@ fn buildKagiRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{ .query = query, .limit = max_results }, .{});
 }
 
+/// A GET here answers 202 with a bot challenge, reproducibly. Only a POST
+/// with this form body reaches real results, so this is the one caller here
+/// that sends a body on a plain search.
+fn searchDuckDuckGo(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    query: []const u8,
+    clean: Clean,
+) Error!Answer {
+    const url = try buildDuckDuckGoUrl(gpa, base_url);
+    defer gpa.free(url);
+
+    const body = try buildDuckDuckGoRequestBody(gpa, query);
+    defer gpa.free(body);
+
+    // Chock sends its own `actions.user_agent`. Whether DuckDuckGo accepts
+    // that UA was not tested; a bot challenge is the correct, honest failure
+    // here, not a reason to send a fake browser User-Agent.
+    const fetched = request(
+        gpa,
+        io,
+        .POST,
+        url,
+        &.{},
+        .default,
+        .{ .override = "application/x-www-form-urlencoded" },
+        body,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ResponseTooLarge => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: {s} answered with a body larger than {d} bytes.",
+                .{ base_url, max_body_bytes },
+            ),
+        },
+        error.RequestFailed => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: the request to {s} failed.",
+                .{base_url},
+            ),
+        },
+    };
+    defer gpa.free(fetched.body);
+
+    return answerFromDuckDuckGo(gpa, base_url, query, fetched.status, fetched.body, clean);
+}
+
+fn buildDuckDuckGoUrl(gpa: std.mem.Allocator, base_url: []const u8) Error![]u8 {
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(gpa);
+    try url.appendSlice(gpa, base_url);
+    if (base_url.len == 0 or base_url[base_url.len - 1] != '/') try url.append(gpa, '/');
+    try url.appendSlice(gpa, "html/");
+    return url.toOwnedSlice(gpa);
+}
+
+fn buildDuckDuckGoRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "q=");
+    try appendPercentEncoded(gpa, &body, query);
+    return body.toOwnedSlice(gpa);
+}
+
+// Each was observed in a real response fetched live, not read from
+// documentation.
+const duckduckgo_anomaly_marker = "anomaly-modal";
+const duckduckgo_links_marker = "id=\"links\"";
+const duckduckgo_no_result_marker_a = "result--no-result";
+const duckduckgo_no_result_marker_b = "no-results__message";
+const duckduckgo_result_link_class = "class=\"result__a\"";
+const duckduckgo_result_snippet_class = "class=\"result__snippet\"";
+
+/// Turns a DuckDuckGo HTML body into an `Answer`, with no client and no
+/// socket: this is what the tests below drive directly. The order matters:
+/// a bot challenge, then a page shape this build does not read, then a
+/// genuinely empty page, then real results, then a shape change caught by
+/// zero results parsed from a page that named neither.
+fn answerFromDuckDuckGo(
+    gpa: std.mem.Allocator,
+    base_url: []const u8,
+    query: []const u8,
+    status: u16,
+    body: []const u8,
+    clean: Clean,
+) Error!Answer {
+    if (status == 202 or std.mem.indexOf(u8, body, duckduckgo_anomaly_marker) != null) {
+        return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: DuckDuckGo answered with a bot challenge, not results. A " ++
+                    "scrape engine is expected to break this way sometimes, because it reads a " ++
+                    "results page and not an API.",
+                .{},
+            ),
+        };
+    }
+
+    if (std.mem.indexOf(u8, body, duckduckgo_links_marker) == null) {
+        return duckduckgoShapeChangedRefusal(gpa);
+    }
+
+    if (std.mem.indexOf(u8, body, duckduckgo_no_result_marker_a) != null or
+        std.mem.indexOf(u8, body, duckduckgo_no_result_marker_b) != null)
+    {
+        return .{
+            .is_error = false,
+            .text = try writeResultList(gpa, base_url, query, &.{}, clean),
+        };
+    }
+
+    const parsed = try parseDuckDuckGoResults(gpa, body);
+    defer freeDuckDuckGoResults(gpa, parsed);
+    if (parsed.len == 0) return duckduckgoShapeChangedRefusal(gpa);
+
+    var fields: [max_results]ResultFields = undefined;
+    for (parsed, 0..) |one, index| {
+        fields[index] = .{ .title = one.title, .url = one.url, .snippet = one.snippet };
+    }
+
+    return .{
+        .text = try writeResultList(gpa, base_url, query, fields[0..parsed.len], clean),
+        .is_error = false,
+    };
+}
+
+// This is the "broken" answer, and it must never read as zero results: a
+// class rename on DuckDuckGo's side must not become a silent empty page.
+fn duckduckgoShapeChangedRefusal(gpa: std.mem.Allocator) Error!Answer {
+    return .{
+        .is_error = true,
+        .text = try std.fmt.allocPrint(
+            gpa,
+            "nothing was searched: the results page is not the shape this build reads. A scraped " ++
+                "engine changes shape without notice, and this is that, not zero results.",
+            .{},
+        ),
+    };
+}
+
+const DuckDuckGoResult = struct {
+    title: []u8,
+    url: []const u8,
+    snippet: []u8,
+};
+
+fn freeDuckDuckGoResults(gpa: std.mem.Allocator, results: []DuckDuckGoResult) void {
+    for (results) |one| {
+        gpa.free(one.title);
+        gpa.free(one.snippet);
+    }
+    gpa.free(results);
+}
+
+/// Walks the body by bounded string search, never scanning past it and never
+/// assuming a closing tag exists. `url` is borrowed from `body`; `title` and
+/// `snippet` are owned copies, cleaned by `stripAndDecode`.
+fn parseDuckDuckGoResults(gpa: std.mem.Allocator, body: []const u8) Error![]DuckDuckGoResult {
+    var out: std.ArrayList(DuckDuckGoResult) = .empty;
+    errdefer {
+        for (out.items) |one| {
+            gpa.free(one.title);
+            gpa.free(one.snippet);
+        }
+        out.deinit(gpa);
+    }
+
+    var pos: usize = 0;
+    while (out.items.len < max_results) {
+        const link_at = std.mem.indexOfPos(u8, body, pos, duckduckgo_result_link_class) orelse break;
+        const link = extractAnchor(body, link_at) orelse break;
+
+        var snippet_text: []const u8 = "";
+        if (std.mem.indexOfPos(u8, body, link.end, duckduckgo_result_snippet_class)) |snippet_at| {
+            const next_link_at = std.mem.indexOfPos(u8, body, link.end, duckduckgo_result_link_class);
+            if (next_link_at == null or snippet_at < next_link_at.?) {
+                if (extractAnchor(body, snippet_at)) |snippet| snippet_text = snippet.text;
+            }
+        }
+
+        const title = try stripAndDecode(gpa, link.text);
+        errdefer gpa.free(title);
+        const snippet = try stripAndDecode(gpa, snippet_text);
+        errdefer gpa.free(snippet);
+
+        try out.append(gpa, .{ .title = title, .url = link.href, .snippet = snippet });
+
+        pos = link.end;
+    }
+
+    return out.toOwnedSlice(gpa);
+}
+
+const Anchor = struct {
+    href: []const u8,
+    text: []const u8,
+    end: usize,
+};
+
+/// `class_at` is where `class="result__a"` or `class="result__snippet"`
+/// matched. `href` is read forward from there to the tag's own closing `>`,
+/// the order the verified response holds it in. A missing `>`, a missing
+/// `href`, or a missing `</a>` ends the walk with `null`.
+fn extractAnchor(body: []const u8, class_at: usize) ?Anchor {
+    const tag_end = std.mem.indexOfScalarPos(u8, body, class_at, '>') orelse return null;
+
+    const href_marker = "href=\"";
+    const href_at = std.mem.indexOf(u8, body[class_at..tag_end], href_marker) orelse return null;
+    const href_start = class_at + href_at + href_marker.len;
+    const quote_at = std.mem.indexOfScalar(u8, body[href_start..tag_end], '"') orelse return null;
+    const href_end = href_start + quote_at;
+
+    const text_start = tag_end + 1;
+    const close_at = std.mem.indexOfPos(u8, body, text_start, "</a>") orelse return null;
+
+    return .{
+        .href = body[href_start..href_end],
+        .text = body[text_start..close_at],
+        .end = close_at + "</a>".len,
+    };
+}
+
+/// Removing markup and decoding entities is parsing HTML, not editing a
+/// vendor's own content, which is why this differs from how Brave and Kagi's
+/// JSON text is treated further down this file.
+fn stripAndDecode(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
+    const stripped = try stripTags(gpa, raw);
+    defer gpa.free(stripped);
+    return decodeEntities(gpa, stripped);
+}
+
+// The `<b>` markup DuckDuckGo wraps around a matched term is verified
+// present in a snippet, so this removes a known thing rather than guessing.
+fn stripTags(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var pos: usize = 0;
+    while (pos < raw.len) {
+        if (raw[pos] == '<') {
+            pos = if (std.mem.indexOfScalarPos(u8, raw, pos, '>')) |close| close + 1 else raw.len;
+            continue;
+        }
+        try out.append(gpa, raw[pos]);
+        pos += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+const DuckDuckGoEntity = struct { name: []const u8, value: []const u8 };
+
+const duckduckgo_entities = [_]DuckDuckGoEntity{
+    .{ .name = "&amp;", .value = "&" },
+    .{ .name = "&lt;", .value = "<" },
+    .{ .name = "&gt;", .value = ">" },
+    .{ .name = "&quot;", .value = "\"" },
+    .{ .name = "&#39;", .value = "'" },
+    .{ .name = "&#x27;", .value = "'" },
+};
+
+/// Decodes the six entities named above and leaves any other entity as
+/// written, rather than guessing at it.
+fn decodeEntities(gpa: std.mem.Allocator, raw: []const u8) Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var pos: usize = 0;
+    while (pos < raw.len) {
+        var matched = false;
+        if (raw[pos] == '&') {
+            for (duckduckgo_entities) |entity| {
+                if (std.mem.startsWith(u8, raw[pos..], entity.name)) {
+                    try out.appendSlice(gpa, entity.value);
+                    pos += entity.name.len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (matched) continue;
+        try out.append(gpa, raw[pos]);
+        pos += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 const RequestError = error{ RequestFailed, ResponseTooLarge } || Error;
 
 const Fetched = struct {
@@ -417,7 +760,10 @@ const Fetched = struct {
 /// `authorization` is its own parameter because `std.http.Client.Request`
 /// treats it as a first class header: a vendor whose credential header is
 /// literally `Authorization`, like Kagi, must set it there and not through
-/// `extra_headers`, or the request would carry the header twice.
+/// `extra_headers`, or the request would carry the header twice. `content_type`
+/// is a parameter rather than an assumed `application/json` because
+/// DuckDuckGo's form body needs `application/x-www-form-urlencoded`; a
+/// bodiless caller passes `.default`.
 fn request(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -425,6 +771,7 @@ fn request(
     url: []const u8,
     extra_headers: []const std.http.Header,
     authorization: std.http.Client.Request.Headers.Value,
+    content_type: std.http.Client.Request.Headers.Value,
     /// Mutable, because `sendBodyComplete` writes through it. Every caller
     /// that sends a body allocated it, and the type says so rather than a
     /// comment asserting it.
@@ -441,7 +788,7 @@ fn request(
         .headers = .{
             .user_agent = .{ .override = actions.user_agent },
             .authorization = authorization,
-            .content_type = if (body != null) .{ .override = "application/json" } else .default,
+            .content_type = content_type,
         },
         .extra_headers = extra_headers,
     }) catch return error.RequestFailed;
@@ -905,14 +1252,14 @@ test "a response that is not JSON is refused with a reason naming the likely cau
     try testing.expect(std.mem.indexOf(u8, answer.text, "search.formats") != null);
 }
 
-test "the unbuilt scrape kind refuses by name" {
+test "a scrape session with no provider refuses and names the requirement" {
     const gpa = testing.allocator;
 
     const scrape_session = Session{ .kind = .scrape, .base_url = "https://example.org", .clean = testClean };
     const scrape_answer = try scrape_session.search(gpa, testing.io, .{ .query = "q" });
     defer gpa.free(scrape_answer.text);
     try testing.expect(scrape_answer.is_error);
-    try testing.expect(std.mem.indexOf(u8, scrape_answer.text, "scrape") != null);
+    try testing.expect(std.mem.indexOf(u8, scrape_answer.text, "provider") != null);
 }
 
 test "a realistic Brave body parses into a numbered list, with unknown fields ignored" {
@@ -1193,4 +1540,200 @@ test "the Kagi request body is valid JSON, and a query holding a quote and a bac
 
     try testing.expectEqualStrings(query, parsed.value.query);
     try testing.expectEqual(@as(usize, max_results), parsed.value.limit);
+}
+
+test "a realistic DuckDuckGo results page parses into a numbered list with title, url, and snippet" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<div class="result results_links results_links_deep web-result ">
+        \\  <div class="links_main links_deep result__body">
+        \\    <h2 class="result__title">
+        \\      <a rel="nofollow" class="result__a" href="https://ziglang.org/">Zig Programming Language</a>
+        \\    </h2>
+        \\    <a class="result__snippet" href="https://ziglang.org/"><b>Zig</b> is a general-purpose programming <b>language</b>.</a>
+        \\  </div>
+        \\</div>
+        \\<div class="result results_links results_links_deep web-result ">
+        \\  <div class="links_main links_deep result__body">
+        \\    <h2 class="result__title">
+        \\      <a rel="nofollow" class="result__a" href="https://example.com/second">Second Result Title</a>
+        \\    </h2>
+        \\    <a class="result__snippet" href="https://example.com/second">A second snippet with no markup.</a>
+        \\  </div>
+        \\</div>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "zig", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig Programming Language") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://ziglang.org/") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "general-purpose programming") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Second Result Title") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://example.com/second") != null);
+}
+
+test "b tags inside a DuckDuckGo snippet do not survive into the text" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<a class="result__a" href="https://ziglang.org/">Zig</a>
+        \\<a class="result__snippet" href="https://ziglang.org/"><b>Zig</b> is a systems <b>language</b>.</a>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "zig", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "<b>") == null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig is a systems language.") != null);
+}
+
+test "HTML entities in a DuckDuckGo title and snippet are decoded" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<a class="result__a" href="https://example.org/">AT&amp;T &lt;division&gt;</a>
+        \\<a class="result__snippet" href="https://example.org/">It&#39;s here &amp; &lt;tag&gt; &quot;quoted&quot; &#x27;alt&#x27;.</a>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "AT&T <division>") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "It's here & <tag> \"quoted\" 'alt'.") != null);
+}
+
+test "a DuckDuckGo bot challenge refuses, by anomaly-modal marker or by status 202" {
+    const gpa = testing.allocator;
+
+    const by_marker = try answerFromDuckDuckGo(
+        gpa,
+        "https://html.duckduckgo.com",
+        "q",
+        200,
+        "<html><body><div class=\"anomaly-modal\">verify you are human</div></body></html>",
+        testClean,
+    );
+    defer gpa.free(by_marker.text);
+    try testing.expect(by_marker.is_error);
+    try testing.expect(std.mem.indexOf(u8, by_marker.text, "bot challenge") != null);
+
+    const by_status = try answerFromDuckDuckGo(
+        gpa,
+        "https://html.duckduckgo.com",
+        "q",
+        202,
+        "<html><body>an otherwise ordinary body</body></html>",
+        testClean,
+    );
+    defer gpa.free(by_status.text);
+    try testing.expect(by_status.is_error);
+    try testing.expect(std.mem.indexOf(u8, by_status.text, "bot challenge") != null);
+}
+
+test "a DuckDuckGo page holding result--no-result gives zero results, not an error" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<div class="no-results result--no-result">No results.</div>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "0 results") != null);
+}
+
+test "a DuckDuckGo body with no id=links at all refuses as a shape change, not as zero results" {
+    const gpa = testing.allocator;
+    const body = "<html><body>DuckDuckGo changed its page entirely.</body></html>";
+
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "shape") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "0 results") == null);
+}
+
+test "id=links present with no no-result marker and no parseable result refuses as a shape change" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<div class="renamed-result-class">a page DuckDuckGo reshaped</div>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "shape") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "0 results") == null);
+}
+
+test "a DuckDuckGo result count over the bound is cut" {
+    const gpa = testing.allocator;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.appendSlice(gpa, "<div id=\"links\" class=\"results\">");
+    var index: usize = 0;
+    while (index < max_results + 5) : (index += 1) {
+        try body.print(
+            gpa,
+            "<a class=\"result__a\" href=\"https://example.org/{d}\">title-{d}</a>" ++
+                "<a class=\"result__snippet\" href=\"https://example.org/{d}\">snippet</a>",
+            .{ index, index, index },
+        );
+    }
+    try body.appendSlice(gpa, "</div>");
+
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body.items, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "title-" ++ std.fmt.comptimePrint("{d}", .{max_results - 1})) != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "title-" ++ std.fmt.comptimePrint("{d}", .{max_results})) == null);
+}
+
+test "a truncated final DuckDuckGo tag ends the walk without reading past the body" {
+    const gpa = testing.allocator;
+    const body = "<div id=\"links\" class=\"results\">a page cut off mid tag <a class=\"result__a\"";
+
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.text.len > 0);
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "shape") != null);
+}
+
+test "the [chock: ...] prefix marking a stranger's text is present on a DuckDuckGo answer" {
+    const gpa = testing.allocator;
+    const body =
+        \\<div id="links" class="results">
+        \\<a class="result__a" href="https://example.org/">t</a>
+        \\<a class="result__snippet" href="https://example.org/">d</a>
+        \\</div>
+    ;
+    const answer = try answerFromDuckDuckGo(gpa, "https://html.duckduckgo.com", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
+}
+
+test "the DuckDuckGo request body is q= plus a percent encoded query" {
+    const gpa = testing.allocator;
+    const query = "zig std.io = buffered & fast";
+
+    const body = try buildDuckDuckGoRequestBody(gpa, query);
+    defer gpa.free(body);
+
+    try testing.expectEqualStrings("q=zig%20std.io%20%3D%20buffered%20%26%20fast", body);
 }

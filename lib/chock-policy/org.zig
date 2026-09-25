@@ -953,7 +953,7 @@ test "a bundle carries a search ceiling, and it reaches the fold that enforces i
     try testing.expectEqual(@as(usize, 2), ceiling.kinds.?.len);
 
     var wanted = try search_mod.parse(gpa,
-        \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.org" } }
+        \\.{ .search = .{ .kind = "scrape", .provider = "duckduckgo", .base_url = "https://example.org" } }
     , null);
     defer wanted.deinit(gpa);
     try testing.expectError(
