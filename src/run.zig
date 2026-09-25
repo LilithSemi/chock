@@ -985,7 +985,7 @@ fn start(
         .hand_on => unreachable,
     };
 
-    try attachBinds(gpa, arena, io, &workspace, declared_binds, taken == null);
+    try attachBinds(arena, io, &workspace, declared_binds, taken == null);
 
     var sandbox_config = workspace.sandboxConfig(arena, paths.root) catch |err| {
         tty.print(.err, "chock run: the sandbox could not be described: {s}\n", .{@errorName(err)});
@@ -3341,7 +3341,6 @@ fn joinUnder(
 /// A workspace this process took over copies nothing in, the same rule
 /// `handleUncommitted` keeps: its copies are the last owner's agent's own.
 fn attachBinds(
-    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: std.Io,
     workspace: *chock_workspace.Workspace,
@@ -3350,8 +3349,11 @@ fn attachBinds(
 ) StartError!void {
     if (resolved.len == 0) return;
 
+    // The same allocator that fills the report frees it. `attachBinds` below
+    // is given the arena, and the bind list it keeps outlives this call, so
+    // the report's own strings come off the arena too.
     var report = chock_workspace.worktree.ImportReport{};
-    defer report.deinit(gpa);
+    defer report.deinit(arena);
     workspace.attachBinds(arena, io, resolved, copy_in, &report) catch |err| {
         tty.print(.err, "chock run: the workspace binds could not be brought in: {t}\n", .{err});
         return error.Reported;
