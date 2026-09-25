@@ -41,6 +41,7 @@ const config = @import("config.zig");
 const lock = @import("lock.zig");
 const darwin_status = @import("darwin/status.zig");
 const secret_fault = @import("linux/secret_fault.zig");
+const secretspec_driver = @import("secretspec.zig");
 
 /// The index file, in the data directory. Holds no secret.
 pub const index_file_name = "instances.zon";
@@ -165,6 +166,8 @@ pub const Diagnostic = union(enum) {
     keychain_refused: KeychainRefused,
     /// The freedesktop secret service refused, and the fault says which way.
     secret_service_refused: SecretServiceRefused,
+    /// SecretSpec refused, and said so in its own words where it had any.
+    secretspec_refused: SecretSpecRefused,
 
     pub const Failed = struct {
         path: []const u8,
@@ -220,6 +223,15 @@ pub const Diagnostic = union(enum) {
         };
     };
 
+    pub const SecretSpecRefused = struct {
+        /// `reading` or `storing`, always a literal of this module.
+        verb: []const u8,
+        fault: secretspec_driver.Fault,
+        /// What SecretSpec said, cut to its own bound. Null when it said
+        /// nothing this could read.
+        detail: ?[]u8,
+    };
+
     pub const SecretServiceRefused = struct {
         /// `reading` or `storing`, always a literal of this module.
         verb: []const u8,
@@ -261,6 +273,7 @@ pub const Diagnostic = union(enum) {
             .credential_file_not_valid, .name_is_reserved => |text| gpa.free(text),
             .keychain_refused => |failure| gpa.free(failure.name),
             .secret_service_refused => |failure| gpa.free(failure.name),
+            .secretspec_refused => |failure| if (failure.detail) |text| gpa.free(text),
         }
         self.* = undefined;
     }
@@ -354,6 +367,18 @@ pub const Diagnostic = union(enum) {
                     "Run: chmod 600 {s}",
                 .{ failure.path, failure.mode, failure.path },
             ),
+            .secretspec_refused => |failure| {
+                try writer.print(
+                    "secretspec would not {s} the credential",
+                    .{if (std.mem.eql(u8, failure.verb, storing_verb)) "keep" else "give"},
+                );
+                // What it said comes first: it names the secret, or the
+                // provider, and the advice cannot.
+                if (failure.detail) |text| try writer.print(": {s}", .{text});
+                if (secretspec_driver.adviceFor(failure.fault)) |advice| {
+                    try writer.print(". {s}", .{advice});
+                }
+            },
             .secret_service_refused => |failure| {
                 try writer.print(
                     "the secret service would not {s} the credential for {s}",
