@@ -1,13 +1,13 @@
 # Documentation
 
 Start with [running.md](running.md) for a session end to end, and
-[status.md](status.md) for what works today.
+[status.md](status.md) for what is not built yet.
 
 - [running.md](running.md) - `chock run` from the command line to the exit
   code: the session log, devices, getting the work back out of the workspace,
   cost, the task list, and `chock doctor`.
-- [status.md](status.md) - what works, what is not built yet, the red team
-  harness, and the open items. Every claim about the state of play lives here.
+- [status.md](status.md) - what is not built yet, and the faults Chock is known
+  to have.
 
 ## Using a session
 
@@ -48,6 +48,8 @@ Start with [running.md](running.md) for a session end to end, and
 - [security/sandbox.md](security/sandbox.md) - the layers a tool call runs
   inside, the workspace, the mount tree, the limits, device passthrough, what
   macOS gives, and what `chock doctor` reports.
+- [security/red-team.md](security/red-team.md) - the red team harness, what two
+  models proved, and the one boundary that moved.
 
 ## Running the tooling
 

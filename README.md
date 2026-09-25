@@ -81,8 +81,8 @@ Name your providers in `~/.config/chock/config.zon`, which Chock reads and
 never writes. See
 [docs/configure/configuration.md](docs/configure/configuration.md).
 
-Chock is an early prototype. See [docs/status.md](docs/status.md) for what
-works and what does not.
+Chock is an early prototype. See [docs/status.md](docs/status.md) for what is
+not built yet and the faults it is known to have.
 
 ## Documentation
 
