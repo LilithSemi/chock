@@ -19,6 +19,7 @@ Chock ships default rules for the ordinary tool calls, so a project with no
 | `exec.unparsed` | a path Chock would not resolve | none, so `ask` |
 | `net.connect.*` | the sandbox opening a socket | none, so `ask` |
 | `net.fetch.*` | the `fetch_url` tool | none, so `ask` |
+| `web.search` | the `web_search` tool | `ask` |
 | `nix.build.*` | one attribute, built on your machine | none, so `ask` |
 | `nix.net.*` | a host a Nix build reaches | none, so `ask` |
 | `nix.net.build.opaque` | a build that names no URL at all | `allow` |
@@ -148,6 +149,25 @@ that would have asked you is refused instead of queued. Set
 `.background = .none` for a project where a background command should reach
 nothing at all.
 
+## `web.search`
+
+One name, with no host under it, for the `web_search` tool. It ships as `ask`,
+and the question reaches you at the tool call while the agent waits.
+
+That timing is what lets it be `ask` at all. Two actions, `nix.build` and
+`model.select`, are read before the work they govern, when nobody is there to
+answer, so an `ask` on one of those means "never". `web.search` is not one of
+them.
+
+The engine's own host is not gated under `net.fetch`. You name the engine in
+your own `config.zon` and a project does not get to pick it, so a project does
+not have to permit it either. [search.md](search.md) has the block, the kinds,
+and where the key lives.
+
+A result the agent then wants to read is an ordinary `net.fetch` on a host your
+rules probably do not name. Chock asks about that host, once, for the host the
+agent named.
+
 ## The acts
 
 | Action | What it does |
@@ -156,6 +176,7 @@ nothing at all.
 | `git.push` | move a ref on a remote |
 | `git.branch.delete` | delete a branch |
 | `net.fetch` | read one page over http or https |
+| `web.search` | put one query to the configured search engine |
 | `nix.build` | realise a package, outside the sandbox |
 | `file.write` | write a file on the host |
 | `workspace.apply` | carry the session's commit into your repository |

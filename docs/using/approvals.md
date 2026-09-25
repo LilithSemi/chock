@@ -19,7 +19,10 @@ An ordinary tool call is gated as well. `gateToolCall` asks the same arbiter
 about every one, so a project rule of `ask` on `call.write_file`, `exec.*`, or
 any other action `Tool.actionInto` names reaches a person mid session. A
 filtered tool call's own `net.connect.*` question reaches the same person: a
-host no rule names answers `ask`, and that `ask` is a live question. [threat-model.md](../security/threat-model.md)
+host no rule names answers `ask`, and that `ask` is a live question.
+`web_search` is the one ordinary tool call that ships as `ask` rather than
+`allow`, under the name `web.search`, and it is asked while the agent waits.
+[search.md](../configure/search.md) has the engine it puts the query to. [threat-model.md](../security/threat-model.md)
 describes the network descriptor every foreground tool call holds, whether or
 not any host has been named.
 

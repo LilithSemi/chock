@@ -36,6 +36,8 @@ Start with [running.md](running.md) for a session end to end, and
   cannot lift.
 - [configure/actions.md](configure/actions.md) - the reference for every action
   name a rule can carry, and what Chock ships for each.
+- [configure/search.md](configure/search.md) - the web search engine: the three
+  kinds, the key in the credential store, and the org ceiling over both.
 - [configure/org.md](configure/org.md) - the org policy bundle, the budget, the
   subagent limits, and the `limits` and `nix` ceilings.
 

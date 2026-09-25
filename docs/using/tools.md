@@ -31,7 +31,7 @@ The last nine are described here or on a page of their own:
 | `spawn_agent` | a subagent | [subagents.md](subagents.md) |
 | `restrict_self` | a promise the agent cannot take back | [policy.md](../configure/policy.md) |
 | `fetch_url` | one page over http or https | [actions.md](../configure/actions.md) |
-| `web_search` | one query against a search engine | [approvals.md](approvals.md) |
+| `web_search` | one query against a search engine | [search.md](../configure/search.md) |
 | `request_action` | your work carried back into your repository | [approvals.md](approvals.md) |
 | `update_plan` | a task list you can watch | [running.md](../running.md) |
 

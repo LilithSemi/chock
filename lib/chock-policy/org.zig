@@ -936,3 +936,32 @@ test "a limits ceiling that cannot parse is refused when the bundle is read" {
     );
     try testing.expectEqualStrings("memory", other_diag.?.invalid_limits_ceiling.field);
 }
+
+test "a bundle carries a search ceiling, and it reaches the fold that enforces it" {
+    // `Bundle.search` is filled by the struct parser and not by a field table
+    // of its own, so nothing in this module names it. This test is what says
+    // the field is reachable from a real bundle rather than only from a Zig
+    // literal a test wrote.
+    const gpa = testing.allocator;
+
+    const bundle = try parse(gpa,
+        \\.{ .search = .{ .kinds = .{ .self_hosted, .api } } }
+    , null);
+    defer destroy(gpa, bundle);
+
+    const ceiling = bundle.search.?;
+    try testing.expectEqual(@as(usize, 2), ceiling.kinds.?.len);
+
+    var wanted = try search_mod.parse(gpa,
+        \\.{ .search = .{ .kind = "scrape", .base_url = "https://example.org" } }
+    , null);
+    defer wanted.deinit(gpa);
+    try testing.expectError(
+        search_mod.CeilingError.KindNotPermitted,
+        search_mod.foldLayers(wanted, ceiling, null),
+    );
+
+    const none = try parse(gpa, ".{}", null);
+    defer destroy(gpa, none);
+    try testing.expectEqual(@as(?search_mod.Ceiling, null), none.search);
+}
