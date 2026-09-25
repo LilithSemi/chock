@@ -1,131 +1,11 @@
-# Status
+# Roadmap
 
-What Chock does today, and what it does not. This is a snapshot and not a
-promise. Chock is an early prototype.
+What Chock does not do yet, and the faults it is known to have. This is a
+snapshot and not a promise. Chock is an early prototype.
 
-## Working
-
-Every command works.
-
-`run`, `login`, `daemon`, `serve`, `memory`, `cache`, `workspace`, `usage`,
-`plan`, `sessions`, `doctor`, `approve`, `detach`, `askpass`, `migrate`. Bare
-`chock` brings up a full screen interface, and it prints the usage page when
-nothing can be drawn.
-
-Instructions reach the prompt from four sources, and the prompt says which
-layer each block came from. `AGENTS.md` at the operator, project and subtree
-layers; any file `--instructions` names, at a layer of its own; and any file
-the `instructions` block of `chock.zon` names, which arrives beside the
-project's own `AGENTS.md`. A project whose instructions already live under
-another name says so there rather than copying them. A named path must stay
-inside the project: it is refused if it is absolute or climbs out, and it is
-refused again after the links are resolved, because a repository can ship a
-link and the prompt is where the bytes would land.
-
-Every run writes a `session.config` event holding what a person put on the
-command line and two hashes: the SHA-256 of the `chock.zon` the policy came
-from, and one over what the sandbox of that run lets a tool call reach. It is
-written on every run and not only the first, because a session that resumes
-can be given different flags. `session.imported` records that a transcript
-from another harness was brought in as context. It never claims Chock
-witnessed the imported work, and the imported turns are not written as
-`message` events: that row and its hash are the whole record.
-
-`read_image` reads a picture out of the workspace and gives it to the model as
-an image. It is offered only where both halves of the gate say yes: every
-adapter can encode an image, so the answer turns on the provider instance's own
-`.capabilities = .{ .images = true }`, and a session without it never hears the
-name. The kind is read from the content and never from the name of the file,
-four kinds are carried and every other kind is refused by name, and a picture
-over 3 MiB is refused with nothing sent. The session log holds the description
-of an image and never a second copy of the bytes. The `message` event carries
-them, because the context is folded from `message` events, and the
-`tool.result` event carries the media type, the size and a hash.
-
-A plugin tool states the arguments it takes. A tool declares a Zig type and the
-SDK lowers it into a schema the metadata carries, so the model is offered the
-field names and kinds rather than a free text box. The host bounds what it will
-carry: a schema larger than `max_schema_bytes` and a schema holding a field
-name the host will not put in front of a model are both refused by name. The
-tool is refused with them rather than offered with an empty schema, because an
-empty schema would tell the model the tool takes nothing while the guest still
-reads fields.
-
-A declared device reaches a session. A project names a USB or serial device in
-a `devices` block of `chock.zon`, by identity and never by a path:
-`device.usb.1d50.6018` names a USB device by vendor and product, and
-`device.tty.serial.<serial>` names a serial adapter by its serial. Naming it is
-not enough on its own, because Chock ships no default for `device.*`, so
-`chock.zon` needs a policy rule for the same action as well. Chock never grants
-a device a person could not open themselves: the node is bound and the kernel
-answers the sandboxed program's own `open` on the mode, exactly as it would
-answer that person's. The machine is scanned at the start of each tool call and
-never in the middle of one, so a board plugged in while a long call is already
-running is seen by the next call and not by that one. `chock doctor` carries a
-row saying how many devices this machine could pass. The block is in
-[running.md](running.md), the action names and the rule are in
-[actions.md](configure/actions.md), and what the grant does not bound is in
-[sandbox.md](security/sandbox.md).
-
-## The red team harness
-
-The red team harness is built, and two models have been thrown at it.
-`zig build redteam` runs the exercise: a canary set read before and after a
-session, a scope list compiled into the binary that reports the verdict, and
-the two configurations, which are maximum hardening and the dev shell that
-ships. It answers "did it break out" as a value rather than as a paragraph
-somebody reads. It is not part of `zig build test`, because it is an exercise
-run on purpose and not a build gate. The step exists on Linux only, because
-every canary reads `/proc` and the sandbox a run tests is the Linux driver.
-
-What it has proved is itself. `zig build redteam-oracle` forges eleven escapes
-and checks each verdict against the one boundary that forge names, because a
-forge that tripped the wrong canary would otherwise pass. Two of the eleven are
-a pair: one registers the git worktree a session builds for itself and must
-report nothing, and the other registers a second worktree no log accounts for
-and must report the real project. Building it found faults in the instrument
-itself, and most of those would have reported a breach as held.
-
-What it has proved about Chock is two runs. `moonshotai/kimi-k3` engaged and
-probed hard. `claude-fable-5` refused the exercise and returned nothing, so it
-tested nothing, and the harness records that as an empty answer rather than as
-a session that held.
-
-One boundary moved, and it is closed on both platforms. A tool call wrote two
-files into the real repository, under `.git/worktrees/<attempt>/`: one in
-`logs/` and one in `refs/`. The second went unreported at first, because the
-check that had just been taught to accept the session's own worktree accepted
-every name under `refs/` with it. Every ref and every object was unchanged,
-`chock.zon` was unchanged, nothing outside the workspace moved, no connection
-reached the listener, and no process outlived the sandbox.
-
-That directory is bound read write because git writes the worktree `index`
-there, and a read only one breaks `git status` and every tool call that touches
-git. Against git 2.55, a read only mount there answers `EROFS` on the first
-`git add`, and pre-creating the lock files does not help, because git opens
-each one with `O_CREAT|O_EXCL` and then renames it over the file it locks. So
-the fix is a different directory instead of a read only one. The session works
-in its own copy of `.git/worktrees/<attempt>`, under the workspace scratch
-directory, and the project's own copy reads byte for byte as `git worktree add`
-left it when the session ends. `git status`, `git add`, and `git commit` are
-unchanged inside the sandbox.
-
-macOS reaches that copy a different way, because it has no bind mount. Linux
-binds the copy at the path git looks for. macOS cannot, so the copy is named
-directly with `GIT_DIR` and `GIT_WORK_TREE`. Both are needed: with `GIT_DIR`
-alone git reads the working directory as the work tree root, so `git status` in
-a subdirectory reports every file outside it as deleted. The checkout's own
-`.git` file is left alone on both, because rewriting it breaks
-`git worktree remove` and the worktree id `adopt` reads out of it. Checked on
-macOS 15.7.9. See `lib/chock-workspace/worktree.zig`.
-
-Everything else the model tried was refused: writing at refs, `git push`,
-copying a shell out of the store and renaming it to `git` to get past the git
-shim, symlinks out of the workspace, three ways to change `chock.zon`, and
-three backgrounded processes meant to outlive the sandbox.
-
-One run against one model is evidence and not a guarantee. Ad hoc red teaming
-before this harness existed found nine faults, and this run found a tenth.
+This page holds no list of what works. Read the pages in
+[README.md](README.md) for what each part does, and treat anything absent from
+them as not built.
 
 ## What is not built yet
 
@@ -143,8 +23,8 @@ before this harness existed found nine faults, and this run found a tenth.
   `net.connect.*` and `net.fetch.*`, so a project with no `chock.zon` gains a
   new prompt the first time such a path runs. A default of `allow` there let
   such a path escape every exec rule a project wrote, naming none of its four
-  classes. See `lib/chock-policy/defaults.zig`'s own top comment, "What is
-  deliberately absent". The second is `exec.nix.store.*`, a store path this
+  classes. See `lib/chock-policy/defaults.zig`, which holds the shipped
+  decisions. The second is `exec.nix.store.*`, a store path this
   session did not start with, which ships as `ask` while the dev shell closure
   it split off, `exec.devshell.*`, ships as `allow`.
   [actions.md](configure/actions.md) has both.
@@ -205,6 +85,22 @@ before this harness existed found nine faults, and this run found a tenth.
   for every git action name that changes only the session's own workspace. A
   subcommand that reaches another host is asked about and still does not run,
   even approved: the act that leaves the sandbox has no caller yet.
+
+- Two of the three web search kinds are built. `self_hosted` talks to SearXNG
+  and `api` talks to Brave or Kagi, both named in the operator's own
+  `config.zon`. `scrape` is named in `chock_policy.search.Kind` and is refused
+  by name, so an organisation can forbid it before it exists. It will never be
+  the default: a results page changes shape without notice, so a scraper works
+  until it quietly does not, and that failure reads to an agent as "the web has
+  nothing about this".
+
+  Delegating the search to the provider is not built either. Both Anthropic and
+  OpenAI take `allowed_domains` on their own search tools, and Chock's policy
+  already says which hosts an agent may read as `net.fetch.<reversed host>`, so
+  the allowlist would come off the policy table rather than being configured a
+  second time. Until that exists, a delegated search would hand the agent
+  content from hosts nobody approved by a path the broker never sees, which is
+  the one thing this design will not do.
 
 - A handover cannot carry a background command or a background subagent, so it
   waits for one. Both live in the process that started them, and that process
@@ -423,32 +319,13 @@ before this harness existed found nine faults, and this run found a tenth.
   whether the project has moved since. `Found.sources` is where a reader
   states that list, so carrying it is not a habit one reader can keep and
   another forget. The same list is in the report too, under "carried", so it
-  is visible even when the header is trimmed from a copy somebody keeps. What
-  is missing is every harness reader itself.
+  is visible even when the header is trimmed from a copy somebody keeps.
+
+  All five readers are built: Claude Code, Codex, OpenCode, Zed and oh-my-pi.
+  `--sessions` reads a Claude Code transcript and refuses every other harness
+  by name, because only that one has been read at the source.
 
 ## Known open items
-
-- A wasm plugin does not run on x86_64. The engine answers `error.Unsupported`
-  when it instantiates a module, so no plugin tool can be called on that
-  architecture. aarch64 is unaffected, and nothing else in Chock is.
-
-  The cause is in Vulcan and not in Chock. Its register allocator records the
-  clobber a call makes in the same place it records an ordinary occupant's next
-  use, so a register a call destroys at a position cannot be told from one an
-  occupant merely wants back at that position. A value that is both an argument
-  of a call and live across that same call then finds every register tied, and
-  the allocator gives up rather than spilling. x86_64 has 5 callee-saved
-  general registers to aarch64's 10, which is why one architecture meets this
-  and the other never does.
-
-  Only a release build meets it. A `ReleaseSafe` guest lowers to more functions
-  than a debug one, and the function that meets it is `std.Io.Writer.writeAll`,
-  which is standard library code and not a shape a plugin author chose. A debug
-  build of the same plugin compiles, so `zig build test` on a development
-  machine does not see this.
-
-  A fix exists on a Vulcan branch. Chock pins Vulcan by commit, and the pin has
-  not moved to it.
 
 - The DNS rebinding window is closed for IPv4 and open for an IPv6-only name.
   `fetch_url` resolves a permitted host, checks every address it answers with,

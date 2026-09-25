@@ -6,10 +6,10 @@
 //! chock migrate [--from <harness>] [--project <dir>] [--print]
 //! ```
 //!
-//! This file builds the command, the `Found` value every future harness
-//! reader hands back, the writer that turns one into `chock.zon` text, and
-//! the report a person reads on every run. It ships with no reader: `readers`
-//! below is empty, and every `--from` is refused until the first one lands.
+//! This file builds the command, the `Found` value every harness reader hands
+//! back, the writer that turns one into `chock.zon` text, and the report a
+//! person reads on every run. `readers` below names the five harnesses this
+//! build reads, and every other `--from` is refused against that list.
 //!
 //! ## The translation, which is the whole point
 //!
