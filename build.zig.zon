@@ -20,6 +20,10 @@
             .url = "git+https://git.lilithsemi.com/LilithSemi/fix.git?ref=integration#b6d3cf17237f2f77bd7e0532c207f83152ecd1a8",
             .hash = "fix-0.3.0-2pqVLF7MVwBtbO4Rg7qCN7gycwmV5Q1NH48rK5jCByhM",
         },
+        .dbus = .{
+            .url = "git+https://git.lilithsemi.com/LilithSemi/dbus.zig#2d8f179d202f002eb490d4d0636c066003d9fbb4",
+            .hash = "dbus-0.1.0-8F4MwHAvBACyrhHqEeT4UwRn9cHvu5N3mwS7e_hqDyGF",
+        },
     },
     .paths = .{
         "build.zig",

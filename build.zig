@@ -741,6 +741,14 @@ pub fn build(b: *std.Build) void {
         chock_auth.linkFramework("CoreFoundation", .{});
     }
 
+    // The Linux credential driver can keep a value in the freedesktop secret
+    // service, which is reached over the session bus. Imported for Linux alone,
+    // because the driver that names it is compiled for Linux alone.
+    if (target.result.os.tag == .linux) {
+        const dbus = b.dependency("dbus", .{ .target = target, .optimize = optimize });
+        chock_auth.addImport("dbus", dbus.module("dbus"));
+    }
+
     const auth_tests = b.addTest(.{ .root_module = chock_auth });
     const run_auth_tests = b.addRunArtifact(auth_tests);
     // Same reasoning as run_sandbox_tests above.
