@@ -475,8 +475,9 @@ pub const Secrets = struct {
 /// `lib/chock-io.zig` and `lib/chock-sandbox/Sandbox.zig` choose theirs. Only
 /// the branch that matches the real build target is ever imported.
 const driver_impl = switch (builtin.os.tag) {
-    .linux => @import("linux/driver.zig"),
-    .macos => @import("darwin/secrets.zig"),
+    // One chooser for both, because a store can span platforms: SecretSpec is
+    // a program Chock talks to and not a service of the operating system.
+    .linux, .macos => @import("driver.zig"),
     else => @compileError("chock-auth: no credential driver for target os " ++ @tagName(builtin.os.tag)),
 };
 

@@ -1,4 +1,4 @@
-//! Which store a Linux credential goes to, and the two that exist.
+//! Which store a credential goes to, and the ones this platform has.
 //!
 //! ## The choice is configured and never guessed
 //!
@@ -13,15 +13,21 @@
 //! store, `chock_auth.config` refuses one this platform does not have when the
 //! file is read, and this file only does what it was told.
 //!
-//! **Neither store falls back to the other.** A store that cannot work is an
-//! error a person reads, not a quiet move to somewhere less protected.
+//! **No store falls back to another.** One that cannot work is an error a
+//! person reads, not a quiet move to somewhere less protected.
 
 const std = @import("std");
-const store = @import("../store.zig");
-const config = @import("../config.zig");
+const builtin = @import("builtin");
+const store = @import("store.zig");
+const config = @import("config.zig");
 
-pub const file = @import("secrets.zig");
-pub const secret_service = @import("secret_service.zig");
+// **Only the store this platform has is imported.** A comptime `if` analyses
+// the branch it takes and no other, so a Linux build never reaches the Keychain
+// and a macOS build never reaches the D-Bus library.
+const file = if (builtin.os.tag == .linux) @import("linux/secrets.zig") else void;
+const secret_service = if (builtin.os.tag == .linux) @import("linux/secret_service.zig") else void;
+const keychain = if (builtin.os.tag == .macos) @import("darwin/secrets.zig") else void;
+const secretspec = @import("secretspec.zig");
 
 pub const Driver = struct {
     data_dir: []const u8,
@@ -36,8 +42,9 @@ pub const Driver = struct {
     /// Read for `DBUS_SESSION_BUS_ADDRESS`, and needed by the secret service
     /// store alone. Null is what a caller with no environment passes.
     env: ?*const std.process.Environ.Map = null,
-    /// Why the last secret service call failed, when one did.
-    last_fault: ?secret_service.Fault = null,
+    /// Why the last secret service call failed, when one did. Linux only, and
+    /// null everywhere else.
+    last_fault: ?(if (builtin.os.tag == .linux) secret_service.Fault else void) = null,
 
     pub fn secrets(self: *const Driver) store.Secrets {
         return .{ .ptr = @constCast(self), .vtable = &vtable };
@@ -55,16 +62,26 @@ pub const Driver = struct {
         const self: *Driver = @ptrCast(@alignCast(ptr));
         switch (self.store) {
             .file => {
+                if (builtin.os.tag != .linux) return error.StoreUnreadable;
                 var backing = file.Driver{ .data_dir = self.data_dir };
                 return backing.secrets().get(gpa, io, name, diag);
             },
             .secret_service => {
+                if (builtin.os.tag != .linux) return error.StoreUnreadable;
                 const env = self.env orelse return error.StoreUnreadable;
                 var backing = secret_service.Driver{ .env = env };
                 defer self.last_fault = backing.last_fault;
                 return backing.secrets().get(gpa, io, name, diag);
             },
-            .keychain => return error.StoreUnreadable,
+            .keychain => {
+                if (builtin.os.tag != .macos) return error.StoreUnreadable;
+                var backing = keychain.Driver{ .data_dir = self.data_dir };
+                return backing.secrets().get(gpa, io, name, diag);
+            },
+            .secretspec => {
+                var backing = secretspec.Driver{ .env = self.env };
+                return backing.secrets().get(gpa, io, name, diag);
+            },
         }
     }
 
@@ -79,16 +96,26 @@ pub const Driver = struct {
         const self: *Driver = @ptrCast(@alignCast(ptr));
         switch (self.store) {
             .file => {
+                if (builtin.os.tag != .linux) return error.StoreUnwritable;
                 var backing = file.Driver{ .data_dir = self.data_dir };
                 return backing.secrets().put(gpa, io, name, value, diag);
             },
             .secret_service => {
+                if (builtin.os.tag != .linux) return error.StoreUnwritable;
                 const env = self.env orelse return error.StoreUnwritable;
                 var backing = secret_service.Driver{ .env = env };
                 defer self.last_fault = backing.last_fault;
                 return backing.secrets().put(gpa, io, name, value, diag);
             },
-            .keychain => return error.StoreUnwritable,
+            .keychain => {
+                if (builtin.os.tag != .macos) return error.StoreUnwritable;
+                var backing = keychain.Driver{ .data_dir = self.data_dir };
+                return backing.secrets().put(gpa, io, name, value, diag);
+            },
+            .secretspec => {
+                var backing = secretspec.Driver{ .env = self.env };
+                return backing.secrets().put(gpa, io, name, value, diag);
+            },
         }
     }
 };

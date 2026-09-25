@@ -146,9 +146,13 @@ pub const CredentialStore = enum {
     secret_service,
     /// The macOS Keychain. Darwin only.
     keychain,
+    /// SecretSpec, asked over its own protocol. It fronts many stores of its
+    /// own, so Chock maintains none of them. Works on every platform, because
+    /// it is a program Chock talks to and not a system service.
+    secretspec,
 
     /// What this platform uses when the file names nothing. A keystore, so the
-    /// safer place is the one a user gets without asking.
+    /// safer place is the one a user gets without asking for it.
     pub fn default() CredentialStore {
         return switch (builtin.os.tag) {
             .macos => .keychain,
@@ -158,6 +162,7 @@ pub const CredentialStore = enum {
 
     /// Whether this platform has this store at all.
     pub fn availableHere(self: CredentialStore) bool {
+        if (self == .secretspec) return true;
         return switch (builtin.os.tag) {
             .macos => self == .keychain,
             else => self != .keychain,
@@ -167,8 +172,8 @@ pub const CredentialStore = enum {
     /// Every store this platform has, for a message that lists them.
     pub fn hereText() []const u8 {
         return switch (builtin.os.tag) {
-            .macos => "keychain",
-            else => "file or secret_service",
+            .macos => "keychain or secretspec",
+            else => "file, secret_service, or secretspec",
         };
     }
 };
@@ -425,7 +430,7 @@ pub const Diagnostic = union(enum) {
             },
             .unknown_credential_store => |named| try writer.print(
                 "the credentials block names the store \"{s}\", and this reader knows file, " ++
-                    "secret_service, and keychain",
+                    "secret_service, keychain, and secretspec",
                 .{named.spelled},
             ),
             .credential_store_not_here => |named| try writer.print(
@@ -1309,7 +1314,7 @@ test "the credentials block names where a credential is kept" {
     try testing.expect(silent.credential_store != .file);
 }
 
-test "a store this reader does not know is refused, and the message lists the three" {
+test "a store this reader does not know is refused, and the message lists them all" {
     const gpa = testing.allocator;
     var diag: ?Diagnostic = null;
     defer if (diag) |*d| d.deinit(gpa);
