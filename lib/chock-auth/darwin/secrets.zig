@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const store = @import("../store.zig");
+const config = @import("../config.zig");
 
 pub const status = @import("status.zig");
 
@@ -95,6 +96,9 @@ fn refuseToAskAnybody() void {
 /// `Driver` the same way on both platforms.
 pub const Driver = struct {
     data_dir: []const u8,
+    /// Accepted so a caller builds a `Driver` the same way on both platforms.
+    /// macOS has one store, so anything else is refused rather than ignored.
+    store: config.CredentialStore = .keychain,
 
     pub fn secrets(self: *const Driver) store.Secrets {
         return .{ .ptr = @constCast(self), .vtable = &vtable };
@@ -109,8 +113,9 @@ pub const Driver = struct {
         name: []const u8,
         diag: ?*?store.Diagnostic,
     ) store.Error!?[]u8 {
-        _ = ptr;
         _ = io;
+        const self: *Driver = @ptrCast(@alignCast(ptr));
+        if (self.store != .keychain) return error.StoreUnreadable;
         refuseToAskAnybody();
 
         var length: c_uint = 0;
@@ -149,8 +154,9 @@ pub const Driver = struct {
         value: []const u8,
         diag: ?*?store.Diagnostic,
     ) store.Error!void {
-        _ = ptr;
         _ = io;
+        const self: *Driver = @ptrCast(@alignCast(ptr));
+        if (self.store != .keychain) return error.StoreUnwritable;
         refuseToAskAnybody();
 
         const added = SecKeychainAddGenericPassword(

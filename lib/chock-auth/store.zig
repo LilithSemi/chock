@@ -40,6 +40,7 @@ const paths = @import("paths.zig");
 const config = @import("config.zig");
 const lock = @import("lock.zig");
 const darwin_status = @import("darwin/status.zig");
+const secret_fault = @import("linux/secret_fault.zig");
 
 /// The index file, in the data directory. Holds no secret.
 pub const index_file_name = "instances.zon";
@@ -162,6 +163,8 @@ pub const Diagnostic = union(enum) {
     credential_file_not_valid: []const u8,
     /// The Keychain refused, and the status is what it answered.
     keychain_refused: KeychainRefused,
+    /// The freedesktop secret service refused, and the fault says which way.
+    secret_service_refused: SecretServiceRefused,
 
     pub const Failed = struct {
         path: []const u8,
@@ -217,6 +220,13 @@ pub const Diagnostic = union(enum) {
         };
     };
 
+    pub const SecretServiceRefused = struct {
+        /// `reading` or `storing`, always a literal of this module.
+        verb: []const u8,
+        name: []const u8,
+        fault: secret_fault.Fault,
+    };
+
     pub const KeychainRefused = struct {
         /// `reading` or `storing`, always a literal of this module.
         verb: []const u8,
@@ -250,6 +260,7 @@ pub const Diagnostic = union(enum) {
             },
             .credential_file_not_valid, .name_is_reserved => |text| gpa.free(text),
             .keychain_refused => |failure| gpa.free(failure.name),
+            .secret_service_refused => |failure| gpa.free(failure.name),
         }
         self.* = undefined;
     }
@@ -343,6 +354,18 @@ pub const Diagnostic = union(enum) {
                     "Run: chmod 600 {s}",
                 .{ failure.path, failure.mode, failure.path },
             ),
+            .secret_service_refused => |failure| {
+                try writer.print(
+                    "the secret service would not {s} the credential for {s}",
+                    .{
+                        if (std.mem.eql(u8, failure.verb, storing_verb)) "keep" else "give",
+                        failure.name,
+                    },
+                );
+                if (secret_fault.adviceFor(failure.fault)) |advice| {
+                    try writer.print(": {s}", .{advice});
+                }
+            },
             .keychain_refused => |failure| {
                 const storing = std.mem.eql(u8, failure.verb, storing_verb);
                 try writer.print(
@@ -452,7 +475,7 @@ pub const Secrets = struct {
 /// `lib/chock-io.zig` and `lib/chock-sandbox/Sandbox.zig` choose theirs. Only
 /// the branch that matches the real build target is ever imported.
 const driver_impl = switch (builtin.os.tag) {
-    .linux => @import("linux/secrets.zig"),
+    .linux => @import("linux/driver.zig"),
     .macos => @import("darwin/secrets.zig"),
     else => @compileError("chock-auth: no credential driver for target os " ++ @tagName(builtin.os.tag)),
 };
