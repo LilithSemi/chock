@@ -163,7 +163,13 @@ fn readSettings(
             }
             try refused.append(arena, .{
                 .what = try std.fmt.allocPrint(arena, "permissions rule {s}", .{rule}),
-                .reason = "it names a tool and an argument pattern, and this table decides by action name instead",
+                // A rule is either a bare tool name or a tool and an argument
+                // pattern. Neither is an action name, and saying which one it
+                // was is the difference between a reason and a formula.
+                .reason = if (std.mem.indexOfScalar(u8, rule, '(') == null)
+                    "it names a tool, and this table decides by action name instead"
+                else
+                    "it names a tool and an argument pattern, and this table decides by action name instead",
             });
         }
     }

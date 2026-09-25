@@ -631,10 +631,28 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             carried.append(arena, class) catch return error.BadArguments;
             continue;
         }
+        // Naming the option is the whole of the message. A usage page alone
+        // leaves a person unable to tell a typo from an option this build
+        // does not have.
+        tty.print(.err, "chock migrate: there is no option named {s}.\n", .{argument});
+        if (unbuilt(argument)) |note| tty.print(.err, "chock migrate: {s}\n", .{note});
         return error.BadArguments;
     }
     options.permission = carried.items;
     return options;
+}
+
+/// What to say about an option this build has not grown yet, so a person who
+/// read the design and reached for one is told that rather than left guessing.
+fn unbuilt(argument: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, argument, "--sessions")) {
+        return "a transcript from another harness is not read yet. The session log " ++
+            "already carries the event that would record one, and nothing writes it.";
+    }
+    if (std.mem.eql(u8, argument, "--memory")) {
+        return "notes from another harness are not read yet.";
+    }
+    return null;
 }
 
 fn isCarryable(class: []const u8) bool {
@@ -677,6 +695,12 @@ const test_version = "0.1.0-test";
 const test_date = "2026-09-24";
 
 test "the command line takes a harness, a project and a print flag" {
+    // The refusals below name the option on standard error, and a passing
+    // test must not write there.
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
     try testing.expectEqualStrings("", (try parseOptions(testing.allocator, &.{})).from);
     try testing.expect(!(try parseOptions(testing.allocator, &.{})).print);
 
@@ -982,4 +1006,24 @@ test "--permission takes a class this build carries and refuses one it does not"
         parseOptions(arena, &.{ "--permission", "git.push" }),
     );
     try testing.expect(std.mem.indexOf(u8, said.err(), "net.fetch") != null);
+}
+
+test "an option this build does not have is named, and an unbuilt one says so" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--nonsense"}));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--nonsense") != null);
+
+    // Reaching for a flag the design names but this build has not grown is
+    // worth telling apart from a typo.
+    said.clear();
+    try testing.expectError(error.BadArguments, parseOptions(arena, &.{"--sessions"}));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--sessions") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "not read yet") != null);
 }
