@@ -1302,16 +1302,18 @@ test "no two faults of this module read the same" {
 test "the credentials block names where a credential is kept" {
     const gpa = testing.allocator;
 
-    var named = try parse(gpa, ".{ .credentials = .{ .store = \"file\" } }", null);
+    // `secretspec` rather than `file`, because it is the one store every
+    // platform has, and naming one this platform lacks is refused.
+    var named = try parse(gpa, ".{ .credentials = .{ .store = \"secretspec\" } }", null);
     defer named.deinit();
-    try testing.expectEqual(CredentialStore.file, named.credential_store);
+    try testing.expectEqual(CredentialStore.secretspec, named.credential_store);
 
     // A file that names none gets this platform's keystore, so the safer place
     // is what a user gets without asking for it.
     var silent = try parse(gpa, ".{}", null);
     defer silent.deinit();
     try testing.expectEqual(CredentialStore.default(), silent.credential_store);
-    try testing.expect(silent.credential_store != .file);
+    try testing.expect(silent.credential_store != .secretspec);
 }
 
 test "a store this reader does not know is refused, and the message lists them all" {

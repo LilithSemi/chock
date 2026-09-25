@@ -123,6 +123,9 @@ pub const Driver = struct {
 const testing = std.testing;
 
 test "the file store reads back what it wrote, through the chooser" {
+    // The file store is Linux only, so there is nothing here to drive
+    // elsewhere.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -144,6 +147,7 @@ test "the file store reads back what it wrote, through the chooser" {
 }
 
 test "a name the file store does not hold reads back as nothing" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     var tmp = testing.tmpDir(.{});
@@ -161,6 +165,7 @@ test "a name the file store does not hold reads back as nothing" {
 }
 
 test "the secret service store with no environment refuses rather than reaching a bus" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const gpa = testing.allocator;
 
     // A caller that passes no environment cannot name a session bus, so this
@@ -179,9 +184,17 @@ test "the secret service store with no environment refuses rather than reaching 
 test "the store this platform does not have is refused and never dispatched" {
     const gpa = testing.allocator;
 
-    var driver = Driver{ .data_dir = "", .store = .keychain };
+    // Whichever one this platform lacks, so the assertion holds on both.
+    const absent: config.CredentialStore = if (builtin.os.tag == .macos) .file else .keychain;
+    try testing.expect(!absent.availableHere());
+
+    var driver = Driver{ .data_dir = "", .store = absent };
     try testing.expectError(
         error.StoreUnreadable,
         driver.secrets().get(gpa, testing.io, "work", null),
+    );
+    try testing.expectError(
+        error.StoreUnwritable,
+        driver.secrets().put(gpa, testing.io, "work", "x", null),
     );
 }
