@@ -86,21 +86,22 @@ them as not built.
   subcommand that reaches another host is asked about and still does not run,
   even approved: the act that leaves the sandbox has no caller yet.
 
-- Two of the three web search kinds are built. `self_hosted` talks to SearXNG
-  and `api` talks to Brave or Kagi, both named in the operator's own
-  `config.zon`. `scrape` is named in `chock_policy.search.Kind` and is refused
-  by name, so an organisation can forbid it before it exists. It will never be
-  the default: a results page changes shape without notice, so a scraper works
-  until it quietly does not, and that failure reads to an agent as "the web has
-  nothing about this".
+- Delegating a web search to the provider is not built. All three engine kinds
+  run harness side, which is what keeps the egress in the broker and the result
+  cleaned. Both Anthropic and OpenAI accept an allowed-domains list on their own
+  search tools, and Chock's policy already says which hosts an agent may read as
+  `net.fetch.<reversed host>`, so the allowlist would come off the policy table
+  rather than being configured a second time. Until that exists, a delegated
+  search would hand the agent content from hosts nobody approved by a path the
+  broker never sees, which is the one thing this design will not do.
 
-  Delegating the search to the provider is not built either. Both Anthropic and
-  OpenAI take `allowed_domains` on their own search tools, and Chock's policy
-  already says which hosts an agent may read as `net.fetch.<reversed host>`, so
-  the allowlist would come off the policy table rather than being configured a
-  second time. Until that exists, a delegated search would hand the agent
-  content from hosts nobody approved by a path the broker never sees, which is
-  the one thing this design will not do.
+  **And it could not honour its own policy default.** The tool list is built
+  once in `start()`, so whether a provider-side search tool is offered is
+  decided before any work, when nobody is waiting to answer. `web.search` ships
+  `ask`, and an `ask` read at that moment means never, which is exactly why the
+  harness-side tool is gated at the call instead. So delegation is reachable
+  only for a project that sets `web.search` to `allow` outright, and that has to
+  be a decision somebody makes rather than a surprise they meet.
 
 - A handover cannot carry a background command or a background subagent, so it
   waits for one. Both live in the process that started them, and that process

@@ -33,7 +33,7 @@ read.
 |---|---|---|
 | `self_hosted` | a SearXNG instance of your own | built |
 | `api` | a keyed vendor | built, Brave and Kagi |
-| `scrape` | a results page, read as HTML | not built |
+| `scrape` | a results page, read as HTML | built, DuckDuckGo |
 
 Leave the block out and the tool is still offered. It answers that no engine is
 configured and says which file sets one, because "no engine" and "no results"
@@ -75,13 +75,21 @@ way.
 }
 ```
 
-`provider` names the vendor. A keyed vendor answers in its own shape under its
-own field names, so the kind alone does not say enough to read a reply, and a
-reader that guessed would hand the agent zero results rather than an error.
-`brave` and `kagi` are the values today.
+`provider` names the vendor. Each one answers in its own shape under its own
+field names, so the kind alone does not say enough to read a reply, and a reader
+that guessed would hand the agent zero results rather than an error.
+
+A provider belongs to exactly one kind. `brave` and `kagi` are `api`, and
+`duckduckgo` is `scrape`. Naming one beside a kind it does not belong to is
+refused, and the message says which kind it is for. `self_hosted` takes no
+provider at all: it means SearXNG, so its shape is already known.
 
 `credential` is a **name in the credential store**, never the key itself. A
 `key`, `token`, `api_key` or `secret` field in this block is refused by name.
+
+Only the `api` kind reads a credential. Naming one on `self_hosted` or `scrape`
+is refused rather than read and dropped, because a value that goes nowhere is
+how somebody comes to believe they configured something.
 
 Put the key in the store with:
 
@@ -131,14 +139,44 @@ corrupt a snippet that legitimately holds one.
 
 ### scrape
 
-Not built. It is in the kind list because an organisation may want to forbid it
-before it exists.
+```zon
+.search = .{
+    .kind = "scrape",
+    .provider = "duckduckgo",
+    .base_url = "https://html.duckduckgo.com",
+}
+```
 
-It will never be the default, and not on principle. A results page changes
-shape without notice, so a scraper works until it quietly does not, and the
-failure reads to an agent as "the web has nothing about this". Of the four
+No key, so no `credential`. Chock posts the query to DuckDuckGo's own
+no-JavaScript results page and reads the result blocks out of the HTML.
+
+**It will never be the default, and not on principle.** A results page changes
+shape without notice, so a scraper works until it quietly does not. Of the four
 harnesses read while this was designed, the one that scrapes needed a headless
 browser with stealth patches to keep it working.
+
+**What makes it usable anyway is that it tells you which way it failed.** Three
+answers come back, and they do not look alike:
+
+| What happened | What the agent is told |
+|---|---|
+| a bot challenge instead of results | refused, naming the challenge |
+| the page is not the shape this build reads | refused, naming a shape change |
+| the page loaded and matched nothing | zero results, and no error |
+
+That third case is the one a scraper usually gets wrong. "The web has nothing
+about this" and "my parser broke" are the same sentence unless something tells
+them apart, so Chock checks for the marker DuckDuckGo puts on a genuine
+no-results page and treats its absence, with nothing parsed, as a fault.
+
+Chock sends its own user agent and does not pretend to be a browser. If
+DuckDuckGo refuses that, you get the first row of the table, which is the honest
+answer. Claiming to be a browser you are not is the road that ends in stealth
+patches.
+
+Expect this kind to need attention that `self_hosted` and `api` do not. If you
+want search that keeps working without you watching it, run SearXNG or buy a
+key.
 
 ## Asking before it searches
 
