@@ -62,9 +62,14 @@ The same check is made again while the index lock is held, so a login that
 started while another one sat at its prompt is told the name is taken rather
 than writing over what that one stored.
 
-On macOS the lock is also held while the Keychain is written. If your Keychain
-asks you to unlock it, a second login can reach the five second bound while you
-answer. Answer it, then run the second login again.
+On macOS the lock is also held while the Keychain is written. The Keychain is
+never allowed to ask you anything, so it cannot sit waiting: a locked one is
+refused at once, with a message naming what to do about it. Unlock it with
+`security unlock-keychain` and run the login again.
+
+An account reached only over ssh has never had a desktop login, so it has no
+login keychain at all. That is a different problem and unlocking cannot fix it.
+Chock says which of the two it met.
 
 ## Where a lookup goes
 
