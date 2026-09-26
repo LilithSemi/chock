@@ -434,9 +434,18 @@ fn secretLogin(
     // Writing over one would take a session's model credential away and say
     // nothing, and the fault would show up as a login that stopped working.
     const instance = store.get(gpa, io, name, &diag) catch |err| {
-        // An index entry whose value is gone is a fault here and not a free
-        // name: the name is taken either way.
-        reportStoreFault("the credential store could not be read", &diag, err);
+        // The name is taken either way, so nothing is written. Said in this
+        // command's own words: the provider advice `reportStoreFault` carries
+        // would be telling somebody storing a tool secret to log in to a model.
+        tty.print(
+            .err,
+            "chock login: whether \"{s}\" is already a provider instance could not be read, so " ++
+                "the secret was not stored. A tool secret and a provider instance share one set " ++
+                "of names, and writing over an instance would take a session's model credential " ++
+                "away. The fault was: {t}\n",
+            .{ name, err },
+        );
+        if (diag) |*d| tty.print(.err, "chock login: {f}\n", .{d});
         return Exit.usage.code();
     };
     if (instance) |held| {
