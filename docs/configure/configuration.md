@@ -172,6 +172,8 @@ what a project cannot take back. [actions.md](actions.md) has both.
 
 - [policy.md](policy.md) for how a rule is read, and for the denied paths.
 - [actions.md](actions.md) for every action name a rule can carry.
+- [secrets.md](secrets.md) for the `secrets` block, which says what a tool call
+  may be given without the agent ever seeing it.
 - [org.md](org.md) for the bundle an organisation puts above the project.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.

@@ -168,6 +168,25 @@ A result the agent then wants to read is an ordinary `net.fetch` on a host your
 rules probably do not name. Chock asks about that host, once, for the host the
 agent named.
 
+## `secret.use.*`
+
+One name per secret a project's `secrets` block names, spelled
+`secret.use.<name>`. It says whether a tool call may be given that secret, so a
+project can make the one that matters a question and leave the rest a standing
+permission.
+
+The name after `secret.use.` is the secret's own, and a name holds letters,
+digits and underscore for that reason: a dot in it would name a class of
+actions nobody wrote.
+
+Nothing ships as a default here. A secret nobody granted cannot be asked for at
+all, so an unnamed one needs no row. The question reaches you at the tool call,
+the same way `web.search` does, and a refusal refuses the call rather than
+running it with the secret missing.
+
+[secrets.md](secrets.md) has the block, how a secret binds, and what the log
+records.
+
 ## The acts
 
 | Action | What it does |

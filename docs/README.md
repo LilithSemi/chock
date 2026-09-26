@@ -38,6 +38,9 @@ Start with [running.md](running.md) for a session end to end, and
   name a rule can carry, and what Chock ships for each.
 - [configure/search.md](configure/search.md) - the web search engine: the three
   kinds, the key in the credential store, and the org ceiling over both.
+- [configure/secrets.md](configure/secrets.md) - giving a tool call a secret the
+  agent never sees: the mapping, the action every use is asked under, and what
+  the log records.
 - [configure/org.md](configure/org.md) - the org policy bundle, the budget, the
   subagent limits, and the `limits` and `nix` ceilings.
 
