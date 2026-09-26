@@ -270,6 +270,16 @@ const ProbeOptions = struct {
     workspace_floor_bytes: ?u64 = null,
     approval_wait_ms: ?u64 = null,
     routed: bool = false,
+    /// One secret the probe grants to every call it makes. What is under test is
+    /// what `runCommand` does with a grant, so the probe answers the seam itself
+    /// rather than reading a policy and a store.
+    secret: ?Secret = null,
+
+    const Secret = struct {
+        bind: []const u8 = "env",
+        variable: []const u8,
+        value: []const u8,
+    };
 };
 
 fn runToolCallWith(
@@ -337,11 +347,11 @@ fn runToolCallWith(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{
-        tools_probe_path,                     tool,                         "probe-call",                    root_path,                   config.cwd,
-        mounts_blob,                          rules_blob,                   env_blob,                        host_path,                   arguments_json,
-        timeout_word,                         options.memory_dir orelse "", store_blob,                      options.cache_dir orelse "", cancel_word,
-        options.scratch_dir orelse "",        scratch_bytes_word,           options.workspace_dir orelse "", floor_word,                  approval_wait_word,
-        if (options.routed) "routed" else "",
+        tools_probe_path,                     tool,                                       "probe-call",                                   root_path,                                   config.cwd,
+        mounts_blob,                          rules_blob,                                 env_blob,                                       host_path,                                   arguments_json,
+        timeout_word,                         options.memory_dir orelse "",               store_blob,                                     options.cache_dir orelse "",                 cancel_word,
+        options.scratch_dir orelse "",        scratch_bytes_word,                         options.workspace_dir orelse "",                floor_word,                                  approval_wait_word,
+        if (options.routed) "routed" else "", if (options.secret) |one| one.bind else "", if (options.secret) |one| one.variable else "", if (options.secret) |one| one.value else "",
     });
 
     // `zig build` prints a `failed command:` line for any run step that writes
@@ -4844,4 +4854,163 @@ test "no tool call but run_command carries the scratchpad or the task directory"
     defer ran.deinit(allocator);
     try std.testing.expectEqual(@as(?u8, null), ran.fault);
     try std.testing.expect(!ran.is_error);
+}
+
+test "a secret bound as a file is in the sandbox, and the variable names its path" {
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const variable = "GOOGLE_APPLICATION_CREDENTIALS";
+    const value = "not-a-real-key-0123456789";
+
+    const inside = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}",
+        .{ chock_core.tools.secret_file_prefix, variable },
+    );
+    defer allocator.free(inside);
+
+    {
+        var root_tmp = std.testing.tmpDir(.{});
+        defer root_tmp.cleanup();
+
+        const arguments = try std.fmt.allocPrint(allocator, "{{\"argv\":[\"cat\",\"{s}\"]}}", .{inside});
+        defer allocator.free(arguments);
+
+        var outcome = try runToolCallWith(allocator, &workspace, root_tmp, "run_command", arguments, .{
+            .secret = .{ .bind = "file", .variable = variable, .value = value },
+        });
+        defer outcome.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+        try std.testing.expect(!outcome.is_error);
+        // The file is there and holds the value, which is the whole point of the
+        // binding: a program that will not read a variable opens this instead.
+        try std.testing.expect(std.mem.indexOf(u8, outcome.output, value) != null);
+    }
+
+    {
+        var root_tmp = std.testing.tmpDir(.{});
+        defer root_tmp.cleanup();
+
+        // `printenv` and not `env`: `env` runs a program of its own, so it is on
+        // the launcher denylist.
+        const printing = try std.fmt.allocPrint(
+            allocator,
+            "{{\"argv\":[\"printenv\",\"{s}\"]}}",
+            .{variable},
+        );
+        defer allocator.free(printing);
+
+        var outcome = try runToolCallWith(allocator, &workspace, root_tmp, "run_command", printing, .{
+            .secret = .{ .bind = "file", .variable = variable, .value = value },
+        });
+        defer outcome.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+        try std.testing.expect(!outcome.is_error);
+
+        // The variable names the path and never the value, which is what makes a
+        // file binding different from an env one.
+        try std.testing.expect(std.mem.indexOf(u8, outcome.output, inside) != null);
+        try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, outcome.output, value));
+    }
+}
+
+test "a secret bound as env reaches the program under the name it was given" {
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    var root_tmp = std.testing.tmpDir(.{});
+    defer root_tmp.cleanup();
+
+    // `printenv` and not `env`, which is on the launcher denylist.
+    var outcome = try runToolCallWith(
+        allocator,
+        &workspace,
+        root_tmp,
+        "run_command",
+        "{\"argv\":[\"printenv\",\"GITHUB_TOKEN\"]}",
+        .{ .secret = .{ .variable = "GITHUB_TOKEN", .value = "gho_not_a_real_token_0123456789" } },
+    );
+    defer outcome.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), outcome.fault);
+    try std.testing.expect(!outcome.is_error);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        outcome.output,
+        "gho_not_a_real_token_0123456789",
+    ) != null);
+}
+
+test "the secret file belongs to one call, and the next call cannot read it" {
+    const allocator = std.testing.allocator;
+    if (!sandbox.expresses.moved_paths) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var project = try PlainProject.init(allocator, tmp);
+    defer project.deinit();
+    defer allowScratchCleanup(allocator, project.scratch_path);
+
+    var workspace = try Workspace.open(allocator, std.testing.io, &project.env, project.root_path, project.scratch_path, "sess1", null);
+    defer workspace.close(allocator, std.testing.io, &project.env, null) catch unreachable;
+
+    const variable = "A_SECRET_FILE";
+    const value = "not-a-real-one-0123456789";
+    const inside = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}",
+        .{ chock_core.tools.secret_file_prefix, variable },
+    );
+    defer allocator.free(inside);
+
+    const arguments = try std.fmt.allocPrint(allocator, "{{\"argv\":[\"cat\",\"{s}\"]}}", .{inside});
+    defer allocator.free(arguments);
+
+    {
+        var root_tmp = std.testing.tmpDir(.{});
+        defer root_tmp.cleanup();
+
+        var granted = try runToolCallWith(allocator, &workspace, root_tmp, "run_command", arguments, .{
+            .secret = .{ .bind = "file", .variable = variable, .value = value },
+        });
+        defer granted.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?u8, null), granted.fault);
+        try std.testing.expect(std.mem.indexOf(u8, granted.output, value) != null);
+    }
+
+    {
+        var root_tmp = std.testing.tmpDir(.{});
+        defer root_tmp.cleanup();
+
+        // The same path, the same command, and no grant. Nothing is mounted
+        // there, so the value from the call before it is not reachable. A file
+        // that outlived its call would be readable by every later one.
+        var ungranted = try runToolCallWith(allocator, &workspace, root_tmp, "run_command", arguments, .{});
+        defer ungranted.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?u8, null), ungranted.fault);
+        try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, ungranted.output, value));
+    }
 }

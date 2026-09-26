@@ -10,7 +10,8 @@
 //!               <timeout-ms> <memory-dir> <store-paths> <cache-dir>
 //!               <cancel-after-ms> <scratch-dir> <scratch-bytes>
 //!               <workspace-dir> <workspace-floor-bytes>
-//!               <approval-wait-ms> <routed>
+//!               <approval-wait-ms> <routed> <secret-bind> <secret-variable>
+//!               <secret-value>
 //!
 //! Every optional argument is always present and may be empty, so the argument
 //! count never goes ambiguous. Empty means the production default. The blob
@@ -78,12 +79,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const arena = arena_state.allocator();
 
     const args = try init.args.toSlice(arena);
-    if (args.len != 21) {
+    if (args.len != 24) {
         std.debug.print(
             "usage: tools-probe <tool> <call_id> <root> <cwd> <mounts-blob> <rules-blob> " ++
                 "<sandbox-env-blob> <host-path> <arguments-json> <timeout-ms> <memory-dir> " ++
                 "<store-paths> <cache-dir> <cancel-after-ms> <scratch-dir> <scratch-bytes> " ++
-                "<workspace-dir> <workspace-floor-bytes> <approval-wait-ms> <routed>\n",
+                "<workspace-dir> <workspace-floor-bytes> <approval-wait-ms> <routed> " ++
+                "<secret-bind> <secret-variable> <secret-value>\n",
             .{},
         );
         return 1;
@@ -135,6 +137,17 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         null;
     // Any router makes the call a routed one, which writes the resolver files.
     const routed = args[20].len != 0;
+
+    // One secret, granted to every call this probe makes. The real answerer
+    // reads a policy and a store; what is under test here is what `runCommand`
+    // does with an answer, which is the mount and the environment.
+    if (args[21].len != 0) {
+        granting_secret = .{
+            .bind = args[21],
+            .variable = args[22],
+            .value = args[23],
+        };
+    }
 
     if (args[14].len != 0) {
         const cancel_after_ms = std.fmt.parseInt(u64, args[14], 10) catch {
@@ -189,6 +202,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         .session_id = "probe-session",
     };
     if (routed) context.net = refusing_seam.seam();
+    if (granting_secret != null) context.secrets = granting_seam.seam();
     if (store_paths.len != 0) context.store_paths = store_paths;
     if (workspace_floor_bytes) |bytes| context.workspace_free_floor_bytes = bytes;
     if (approval_wait_ms) |ms| {
@@ -347,6 +361,56 @@ fn parseEnvBlob(arena: std.mem.Allocator, blob: []const u8) ParseError![][]const
 
 /// Refuses everything, so a test using it proves only what a routed call places
 /// for the program, and nothing about resolving a name or reaching a host.
+var granting_secret: ?GrantedSecret = null;
+
+const GrantedSecret = struct { bind: []const u8, variable: []const u8, value: []const u8 };
+
+var granting_seam: GrantingSecrets = .{};
+
+/// Grants the one secret the command line named, to every call. The lifetime is
+/// the probe's own process, so `release` has nothing to do.
+const GrantingSecrets = struct {
+    env_entry: [512]u8 = undefined,
+    env_len: usize = 0,
+    env_holder: [1][]const u8 = undefined,
+    file_holder: [1]chock_core.tool_secrets.File = undefined,
+
+    fn seam(self: *GrantingSecrets) chock_core.tool_secrets.Seam {
+        return .{ .ptr = self, .vtable = &secret_vtable };
+    }
+
+    const secret_vtable = chock_core.tool_secrets.Seam.VTable{
+        .grant = grantFn,
+        .release = releaseFn,
+    };
+
+    fn grantFn(
+        ptr: *anyopaque,
+        tool: []const u8,
+        _: []const u8,
+        _: []const u8,
+    ) ?chock_core.tool_secrets.Grant {
+        const self: *GrantingSecrets = @ptrCast(@alignCast(ptr));
+        const one = granting_secret orelse return null;
+        if (!std.mem.eql(u8, tool, "run_command")) return null;
+
+        if (std.mem.eql(u8, one.bind, "file")) {
+            self.file_holder[0] = .{ .variable = one.variable, .value = one.value };
+            return .{ .files = &self.file_holder };
+        }
+
+        const written = std.fmt.bufPrint(&self.env_entry, "{s}={s}", .{
+            one.variable,
+            one.value,
+        }) catch return null;
+        self.env_len = written.len;
+        self.env_holder[0] = self.env_entry[0..self.env_len];
+        return .{ .env = &self.env_holder };
+    }
+
+    fn releaseFn(_: *anyopaque, _: []const u8) void {}
+};
+
 var refusing_seam: RefusingNetwork = .{};
 
 const RefusingNetwork = struct {
