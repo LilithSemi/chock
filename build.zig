@@ -271,6 +271,22 @@ pub fn build(b: *std.Build) void {
     // the `Cost` and `Usage` types the log already carries, and nothing else:
     // it reads `chock.zon` and does arithmetic, so it needs no sandbox, no
     // workspace, and no session.
+    // The Agent Client Protocol, from the agent's side. Like chock-sandbox,
+    // chock-io and chock-policy, it imports no other chock library: it is the
+    // wire and nothing else, so the command that answers ACP is the only thing
+    // that knows both this and a session.
+    const chock_acp = b.addModule("chock-acp", .{
+        .root_source_file = b.path("lib/chock-acp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const acp_tests = b.addTest(.{ .root_module = chock_acp });
+    const run_acp_tests = b.addRunArtifact(acp_tests);
+    // Same reasoning as run_sandbox_tests above.
+    run_acp_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_acp_tests.step);
+
     const chock_cost = b.addModule("chock-cost", .{
         .root_source_file = b.path("lib/chock-cost.zig"),
         .target = target,

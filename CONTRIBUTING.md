@@ -14,8 +14,8 @@ agree to uphold it.
 - `lib/` - the libraries, one module for each concern. `chock-sandbox` holds the
   boundary, `chock-proto` the event log, `chock-policy` the rules, `chock-core`
   the agent loop, `chock-broker` the arbitration, and `chock-nix` the toolchain.
-  `chock-auth`, `chock-container`, `chock-cost`, `chock-io`, `chock-pcsc`,
-  `chock-provider`, `chock-workspace`, `chock-plugin-core` and
+  `chock-acp`, `chock-auth`, `chock-container`, `chock-cost`, `chock-io`,
+  `chock-pcsc`, `chock-provider`, `chock-workspace`, `chock-plugin-core` and
   `chock-plugin-sdk` complete the set.
 - `src/` - the command line. One file for each command, with `main.zig` above
   them.
