@@ -65,12 +65,18 @@ pub const Tool = struct {
     output: []const u8 = "",
 };
 
+/// A context window gauge, which is what ACP's `usage_update` carries. It is not
+/// a billing record: `used` is how much of the window is full and `size` is how
+/// big it is, and both are required.
 pub const Usage = struct {
-    input_tokens: u64 = 0,
-    output_tokens: u64 = 0,
+    /// Tokens in the context now.
+    used: u64,
+    /// How many the window holds.
+    size: u64,
     /// Null when the cost is unknown, which is not the same as free. See
     /// `lib/chock-cost`.
     cost: ?f64 = null,
+    currency: []const u8 = "USD",
 };
 
 /// One thing to tell the client.
@@ -237,13 +243,19 @@ fn usage(
     one: Usage,
 ) std.mem.Allocator.Error![]u8 {
     _ = version;
+    // `cost` is an object with an amount and a currency, and null when nobody
+    // priced it. A zero would say free, which is a different fact.
+    const Money = struct { amount: f64, currency: []const u8 };
     return std.json.Stringify.valueAlloc(arena, .{
         .sessionId = session_id,
         .update = .{
             .sessionUpdate = "usage_update",
-            .inputTokens = one.input_tokens,
-            .outputTokens = one.output_tokens,
-            .cost = one.cost,
+            .used = one.used,
+            .size = one.size,
+            .cost = if (one.cost) |money| Money{
+                .amount = money,
+                .currency = one.currency,
+            } else null,
         },
     }, .{});
 }
@@ -389,23 +401,27 @@ test "an abandoned step is cancelled in version 2 and absent from version 1" {
     try testing.expectEqualStrings("cancelled", two_entries.items[2].object.get("status").?.string);
 }
 
-test "usage carries the tokens, and an unknown cost is null rather than zero" {
+test "usage is a context gauge, and an unknown cost is null rather than zero" {
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
     const arena = state.allocator();
 
     const known = try encoded(arena, .v1, .{ .usage = .{
-        .input_tokens = 120,
-        .output_tokens = 34,
+        .used = 12000,
+        .size = 65536,
         .cost = 0.0021,
     } });
     try testing.expectEqualStrings("usage_update", try field(arena, known, &.{ "update", "sessionUpdate" }));
-    try testing.expectEqualStrings("120", try field(arena, known, &.{ "update", "inputTokens" }));
+    // `used` and `size`, which the schema requires. This is not a token bill:
+    // the first draft sent input and output tokens and a real client refused it.
+    try testing.expectEqualStrings("12000", try field(arena, known, &.{ "update", "used" }));
+    try testing.expectEqualStrings("65536", try field(arena, known, &.{ "update", "size" }));
+    try testing.expectEqualStrings("USD", try field(arena, known, &.{ "update", "cost", "currency" }));
 
     // Free and unknown are different, and `lib/chock-cost` exists because
     // collapsing them is wrong in both directions. Null is what carries that.
-    const unknown = try encoded(arena, .v1, .{ .usage = .{ .input_tokens = 1 } });
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, unknown, .{});
+    const unknown = try encoded(arena, .v1, .{ .usage = .{ .used = 1, .size = 2 } });
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, unknown, .{});
     try testing.expectEqual(std.json.Value.null, parsed.value.object.get("update").?.object.get("cost").?);
 }
 
@@ -421,7 +437,7 @@ test "every update is something both versions can be asked for" {
         .{ .tool = .{ .id = "c", .title = "t", .phase = .started } },
         .{ .tool = .{ .id = "c", .title = "t", .phase = .finished } },
         .{ .plan = &.{} },
-        .{ .usage = .{} },
+        .{ .usage = .{ .used = 1, .size = 2 } },
     };
 
     var seen = std.EnumSet(std.meta.Tag(Update)).initEmpty();
