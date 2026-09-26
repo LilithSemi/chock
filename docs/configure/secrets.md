@@ -76,6 +76,37 @@ name a SecretSpec profile would. If your `credentials` block names
 `secretspec`, name the secret in your profile and there is nothing to log in
 for. See [credentials.md](../operate/credentials.md) for the stores.
 
+## Arriving as a file
+
+Some programs will not read a credential out of the environment at all, and want
+a path to a file. `bind = "file"` is that:
+
+```zon
+.{
+    .secrets = .{
+        .{
+            .name = "GCP_KEY",
+            .to = "exec.path.gcloud",
+            .bind = "file",
+            .as = "GOOGLE_APPLICATION_CREDENTIALS",
+        },
+    },
+}
+```
+
+The variable then names the file and not the value. Chock writes the file before
+the call starts, mounts it read only inside the sandbox, and deletes it when the
+call ends.
+
+The file is written under `TMPDIR` on the host, mode `0600`, for as long as the
+one call runs. That is a real difference from `env`: the value is on a filesystem
+for that time, and a delete is a delete and not an erase. A program that reads
+an environment variable should be given one.
+
+An MCP server is not given a file. It holds what it is given for a whole session,
+so the file would have to live that long too, and Chock says so and gives the
+server nothing rather than writing one.
+
 ## What the agent sees
 
 The value reaches the environment of one tool call and nothing else. It is not
@@ -126,8 +157,6 @@ The value is not in the event, and there is no field it could travel in.
 
 ## What this does not do yet
 
-* `bind = "file"` is refused. A call that asks for one is refused and says so,
-  rather than putting the value where the program expects a path.
 * A plugin is given nothing. An entry naming `plugin.*` reaches nothing today.
 * A background command is given nothing. It outlives the call it was started
   from, and a grant that outlived its call would reach work nobody approved it
