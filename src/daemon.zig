@@ -237,6 +237,10 @@ const Session = struct {
     id: [session_paths.id_length]u8,
     log_path: [:0]u8,
     project: []u8,
+    /// The child running a turn now, or null for a session running none. Held
+    /// under the daemon's own mutex, because the thread that reaps a child
+    /// clears it while another may be reading it.
+    pid: ?std.posix.pid_t = null,
 };
 
 const Daemon = struct {
@@ -271,6 +275,26 @@ const Daemon = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.sessions.append(self.gpa, entry);
+    }
+
+    /// Remember which process is running a session's turn, or that none is.
+    fn notePid(self: *Daemon, id: []const u8, pid: ?std.posix.pid_t) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (std.mem.eql(u8, &entry.id, id)) entry.pid = pid;
+        }
+    }
+
+    /// The process running a session's turn, or null. Read under the lock, so a
+    /// caller never signals a number another thread has just replaced.
+    fn pidFor(self: *Daemon, id: []const u8) ?std.posix.pid_t {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |entry| {
+            if (std.mem.eql(u8, &entry.id, id)) return entry.pid;
+        }
+        return null;
     }
 
     /// The log path of a session this daemon started, or null. Copies the
@@ -579,6 +603,7 @@ fn serve(daemon: *Daemon, arena: std.mem.Allocator, stream: *std.Io.net.Stream) 
         .adopt => |one| handleAdopt(daemon, writer, one),
         .create => |one| handleCreate(daemon, writer, one),
         .prompt => |one| handlePrompt(daemon, writer, one),
+        .cancel => |one| handleCancel(daemon, writer, one),
         .read => |one| handleRead(daemon, arena, writer, one),
         .list => |one| handleList(daemon, arena, writer, one),
         .watch => |one| handleWatch(daemon, arena, writer, stream.socket.handle, one),
@@ -725,6 +750,41 @@ fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Pr
     beginSession(daemon, writer, one.project, id, .{ .say = one.message });
 }
 
+/// `cancel <project directory>\t<session id>`: stop the turn a session is
+/// running now.
+///
+/// **An interrupt and never a kill.** Chock's own handler ends the session with
+/// `canceled_by_user` and writes that to the log, so a client reading the log
+/// learns why it stopped. A killed child would leave the log stopping mid turn
+/// with nothing saying why, which is the fault `src/interrupt.zig` exists to
+/// prevent.
+///
+/// A session running nothing is not a fault: the agent client protocol says a
+/// client may cancel a turn that has already ended, and answering that with a
+/// failure would make a race look like a bug.
+fn handleCancel(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Cancel) void {
+    const id = checkedSession(writer, one.project, one.session) orelse return;
+
+    const pid = daemon.pidFor(&id) orelse {
+        say(writer, .{ .ok = "that session is running nothing" });
+        return;
+    };
+
+    std.posix.kill(pid, .INT) catch |err| switch (err) {
+        // It ended between the read and the signal, which is the same answer as
+        // running nothing.
+        error.ProcessNotFound => {
+            say(writer, .{ .ok = "that session is running nothing" });
+            return;
+        },
+        else => {
+            fail(writer, "that session's turn could not be interrupted");
+            return;
+        },
+    };
+    say(writer, .{ .ok = "interrupted" });
+}
+
 /// Check a project and a session identifier a client sent, together.
 ///
 /// **An identifier is checked before a path is built from it.** A value that
@@ -794,6 +854,15 @@ fn beginSession(
         fail(writer, "out of memory");
         return;
     };
+
+    if (begin == .nothing) {
+        // The log is made here, so the session exists the moment its identifier
+        // is handed out. `watch` refuses a session with no log, and a client that
+        // was given an identifier it cannot yet watch would have been told about
+        // something that is not there.
+        var opened = openLog(daemon, writer, log_path, &id) orelse return;
+        opened.backing.log.close(daemon.io);
+    }
 
     if (begin != .nothing) {
         const owned_message: ?[]u8 = switch (begin) {
@@ -881,6 +950,11 @@ fn runChild(child: Child) void {
         tty.print(.err, "chock daemon: session {s} could not be started: {t}\n", .{ child.id, err });
         return;
     };
+
+    if (process.id) |pid| daemon.notePid(&child.id, pid);
+    // Cleared however the wait ends, so a signal never reaches a number the
+    // kernel has given to somebody else.
+    defer daemon.notePid(&child.id, null);
 
     const term = process.wait(daemon.io) catch |err| {
         tty.print(.err, "chock daemon: session {s} could not be waited for: {t}\n", .{ child.id, err });

@@ -381,6 +381,7 @@ pub const Verb = enum {
     adopt,
     create,
     prompt,
+    cancel,
     read,
     list,
     watch,
@@ -394,6 +395,7 @@ pub const Request = union(Verb) {
     adopt: Adopt,
     create: Create,
     prompt: Prompt,
+    cancel: Cancel,
     read: Read,
     list: List,
     watch: Watch,
@@ -405,6 +407,8 @@ pub const Request = union(Verb) {
     /// session before it has anything to say in it: `session/new` in the agent
     /// client protocol answers with an identifier and no prompt.
     pub const Create = struct { project: []const u8 };
+    /// Stop the turn a session is running now. Nothing when it is running none.
+    pub const Cancel = struct { project: []const u8, session: []const u8 };
     /// One more message in a session that already exists, and the turn it starts.
     /// `start` makes a session and says something in it at once, which a second
     /// message cannot do.
@@ -440,6 +444,10 @@ pub const Request = union(Verb) {
                 .session = try field(asked.rest, 1, 2),
             } },
             .create => .{ .create = .{ .project = try field(asked.rest, 0, 1) } },
+            .cancel => .{ .cancel = .{
+                .project = try field(asked.rest, 0, 2),
+                .session = try field(asked.rest, 1, 2),
+            } },
             .prompt => .{ .prompt = .{
                 .project = try field(asked.rest, 0, 3),
                 .session = try field(asked.rest, 1, 3),
@@ -482,6 +490,7 @@ pub const Request = union(Verb) {
             .start => |one| try writer.print("start {s}\t{s}\n", .{ one.project, one.message }),
             .adopt => |one| try writer.print("adopt {s}\t{s}\n", .{ one.project, one.session }),
             .create => |one| try writer.print("create {s}\n", .{one.project}),
+            .cancel => |one| try writer.print("cancel {s}\t{s}\n", .{ one.project, one.session }),
             .prompt => |one| try writer.print(
                 "prompt {s}\t{s}\t{s}\n",
                 .{ one.project, one.session, one.message },
@@ -802,6 +811,7 @@ test "every verb round trips from a request to a line and back" {
         .{ .start = .{ .project = "/home/ross/chock", .message = "fix the parser please" } },
         .{ .adopt = .{ .project = "/home/ross/chock", .session = id } },
         .{ .create = .{ .project = "/home/ross/chock" } },
+        .{ .cancel = .{ .project = "/home/ross/chock", .session = id } },
         .{ .prompt = .{
             .project = "/home/ross/chock",
             .session = id,
