@@ -86,6 +86,27 @@ pub const Incoming = struct {
     }
 };
 
+/// A reply to something this side asked. It carries an id and no method, which
+/// is what separates it from a request.
+pub const Reply = struct {
+    id: Id,
+    /// The `result` member as raw JSON. Empty when the reply carried an error.
+    result: []const u8,
+    /// The `error.message` when the peer refused, and null when it did not.
+    refusal: ?[]const u8 = null,
+
+    pub fn failed(self: Reply) bool {
+        return self.refusal != null;
+    }
+};
+
+/// Either direction of traffic. A peer that both answers and asks reads every
+/// line through this, because a reply and a request arrive on the same wire.
+pub const Any = union(enum) {
+    request: Incoming,
+    reply: Reply,
+};
+
 pub const ParseError = error{
     OutOfMemory,
     NotAnObject,
@@ -93,6 +114,49 @@ pub const ParseError = error{
     NoMethod,
     BadId,
 };
+
+/// Read one message, whichever direction it is going.
+///
+/// A request has a method; a reply has an id and none. Nothing else tells them
+/// apart, so a caller that only ever parsed requests would refuse every answer
+/// to its own questions.
+pub fn parseAny(arena: std.mem.Allocator, line: []const u8) ParseError!Any {
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, line, .{}) catch
+        return error.NotAnObject;
+
+    const object = switch (parsed.value) {
+        .object => |one| one,
+        else => return error.NotAnObject,
+    };
+
+    const said = object.get("jsonrpc") orelse return error.WrongVersion;
+    switch (said) {
+        .string => |text| if (!std.mem.eql(u8, text, version)) return error.WrongVersion,
+        else => return error.WrongVersion,
+    }
+
+    if (object.get("method") != null) return .{ .request = try parse(arena, line) };
+
+    const id = try readId(arena, object.get("id") orelse return error.BadId) orelse
+        return error.BadId;
+
+    if (object.get("error")) |held| {
+        const message = switch (held) {
+            .object => |one| switch (one.get("message") orelse std.json.Value{ .null = {} }) {
+                .string => |text| text,
+                else => "the peer refused and said nothing",
+            },
+            else => "the peer refused and said nothing",
+        };
+        return .{ .reply = .{ .id = id, .result = "", .refusal = message } };
+    }
+
+    const result = if (object.get("result")) |held| switch (held) {
+        .null => "",
+        else => try std.json.Stringify.valueAlloc(arena, held, .{}),
+    } else "";
+    return .{ .reply = .{ .id = id, .result = result } };
+}
 
 /// Read one message. `line` is one frame with its newline already removed.
 ///
@@ -120,18 +184,7 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ParseError!Incoming {
     };
 
     var id: ?Id = null;
-    if (object.get("id")) |held| {
-        id = switch (held) {
-            .integer => |number| .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{number}) },
-            // `std.json.fmt` writes the quotes itself, so the id is already a
-            // JSON string token here.
-            .string => |text| .{ .raw = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(text, .{})}) },
-            // A null id is a request nothing can answer, and a float or an
-            // object is not an id at all.
-            .null => null,
-            else => return error.BadId,
-        };
-    }
+    if (object.get("id")) |held| id = try readId(arena, held);
 
     const params = if (object.get("params")) |held| switch (held) {
         .null => "",
@@ -139,6 +192,20 @@ pub fn parse(arena: std.mem.Allocator, line: []const u8) ParseError!Incoming {
     } else "";
 
     return .{ .id = id, .method = method, .params = params };
+}
+
+/// An id as the token it arrived as. Null for a `null` id, which is a request
+/// nothing can answer.
+fn readId(arena: std.mem.Allocator, held: std.json.Value) ParseError!?Id {
+    return switch (held) {
+        .integer => |number| .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{number}) },
+        // `std.json.fmt` writes the quotes itself, so the id is already a JSON
+        // string token here.
+        .string => |text| .{ .raw = try std.fmt.allocPrint(arena, "{f}", .{std.json.fmt(text, .{})}) },
+        .null => null,
+        // A float or an object is not an id at all.
+        else => error.BadId,
+    };
 }
 
 pub const WriteError = error{
@@ -192,6 +259,21 @@ pub fn errorBody(
         arena,
         "{{\"jsonrpc\":\"{s}\",\"id\":{s},\"error\":{{\"code\":{d},\"message\":{f}}}}}",
         .{ version, id.raw, @intFromEnum(code), std.json.fmt(said, .{}) },
+    );
+}
+
+/// A request this side asks the peer. The id is this side's to choose, and the
+/// peer echoes it back.
+pub fn requestBody(
+    arena: std.mem.Allocator,
+    id: Id,
+    method: []const u8,
+    params: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"jsonrpc\":\"{s}\",\"id\":{s},\"method\":{f},\"params\":{s}}}",
+        .{ version, id.raw, std.json.fmt(method, .{}), if (params.len == 0) "null" else params },
     );
 }
 
@@ -346,4 +428,46 @@ test "a quote in a message cannot end the JSON string it is in" {
     var reparsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
     const said = reparsed.value.object.get("error").?.object.get("message").?.string;
     try testing.expectEqualStrings("the tool \"gh\" is unknown", said);
+}
+
+test "a reply is told from a request by its method, and by nothing else" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = arenaFor(&state);
+
+    const asked = try parseAny(arena,
+        \\{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}
+    );
+    try testing.expect(asked == .request);
+    try testing.expectEqualStrings("session/prompt", asked.request.method);
+
+    const answered = try parseAny(arena,
+        \\{"jsonrpc":"2.0","id":1,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}
+    );
+    try testing.expect(answered == .reply);
+    try testing.expectEqualStrings("1", answered.reply.id.raw);
+    try testing.expect(!answered.reply.failed());
+    try testing.expect(std.mem.indexOf(u8, answered.reply.result, "selected") != null);
+}
+
+test "a refusal carries what the peer said, and an empty result is not a refusal" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = arenaFor(&state);
+
+    const refused = try parseAny(arena,
+        \\{"jsonrpc":"2.0","id":"a","error":{"code":-32601,"message":"no such method"}}
+    );
+    try testing.expect(refused.reply.failed());
+    try testing.expectEqualStrings("no such method", refused.reply.refusal.?);
+    try testing.expectEqualStrings("\"a\"", refused.reply.id.raw);
+
+    // A null result is a reply that succeeded and returned nothing, which is
+    // what every notification style method answers with.
+    const empty = try parseAny(arena, "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}");
+    try testing.expect(!empty.reply.failed());
+    try testing.expectEqualStrings("", empty.reply.result);
+
+    // A reply with no id is nothing this side can match to a question it asked.
+    try testing.expectError(error.BadId, parseAny(arena, "{\"jsonrpc\":\"2.0\",\"result\":1}"));
 }
