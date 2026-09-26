@@ -180,9 +180,13 @@ digits and underscore for that reason: a dot in it would name a class of
 actions nobody wrote.
 
 Nothing ships as a default here. A secret nobody granted cannot be asked for at
-all, so an unnamed one needs no row. The question reaches you at the tool call,
-the same way `web.search` does, and a refusal refuses the call rather than
-running it with the secret missing.
+all, so an unnamed one needs no row. For a tool call the question reaches you at
+the call, the same way `web.search` does, and a refusal refuses the call rather
+than running it with the secret missing.
+
+For an MCP server the row is read at start, when nobody is there to answer, so
+`ask` means the server is not given it. That is the same reading `nix.build` and
+`model.select` take, and Chock says which rule read that way.
 
 [secrets.md](secrets.md) has the block, how a secret binds, and what the log
 records.

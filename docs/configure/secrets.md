@@ -88,6 +88,32 @@ model, and it is replaced. Chock keeps a redaction slot for every secret a call
 may hold, and a call granted more secrets than there are slots is refused
 rather than run unprotected.
 
+## An MCP server holds one for its whole life
+
+A server is started once and reads its environment once, so it is given its
+secrets at start rather than per call:
+
+```zon
+.{
+    .secrets = .{
+        .{ .name = "GITHUB_TOKEN", .to = "mcp.github.*" },
+    },
+}
+```
+
+`mcp.github.*` names one server, and `mcp.*` names every server. An entry that
+reaches nothing under a server's own namespace gives that server nothing, so one
+server's secret does not reach another.
+
+A server starts before the loop does, so there is nobody to ask. Only `allow`
+gives a server a secret: an `ask` on `secret.use.<name>` reaches nobody at that
+moment, so it means the server is not given it, and Chock says which rule read
+that way. `nix.build` and `model.select` are read the same way, for the same
+reason. [actions.md](actions.md) has both.
+
+The slot that keeps a server's secret out of the log is its own, and it stays
+filled for the whole session. A tool call's slot is cleared when that call ends.
+
 ## What is written down
 
 Each use appends a `secret.used` event to the session log: the secret's name,
@@ -102,9 +128,7 @@ The value is not in the event, and there is no field it could travel in.
 
 * `bind = "file"` is refused. A call that asks for one is refused and says so,
   rather than putting the value where the program expects a path.
-* An MCP server and a plugin are given nothing. They hold a secret for their
-  whole life rather than for one call, so a per-call grant is the wrong shape
-  for them, and an entry naming `mcp.*` reaches nothing today.
+* A plugin is given nothing. An entry naming `plugin.*` reaches nothing today.
 * A background command is given nothing. It outlives the call it was started
   from, and a grant that outlived its call would reach work nobody approved it
   for.
