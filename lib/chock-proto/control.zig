@@ -379,6 +379,8 @@ pub fn writeMismatch(writer: *std.Io.Writer, ours: u32, theirs: u32) std.Io.Writ
 pub const Verb = enum {
     start,
     adopt,
+    create,
+    prompt,
     read,
     list,
     watch,
@@ -390,6 +392,8 @@ pub const Verb = enum {
 pub const Request = union(Verb) {
     start: Start,
     adopt: Adopt,
+    create: Create,
+    prompt: Prompt,
     read: Read,
     list: List,
     watch: Watch,
@@ -397,6 +401,18 @@ pub const Request = union(Verb) {
 
     pub const Start = struct { project: []const u8, message: []const u8 };
     pub const Adopt = struct { project: []const u8, session: []const u8 };
+    /// A session with a log and nothing running. For a caller that has to name a
+    /// session before it has anything to say in it: `session/new` in the agent
+    /// client protocol answers with an identifier and no prompt.
+    pub const Create = struct { project: []const u8 };
+    /// One more message in a session that already exists, and the turn it starts.
+    /// `start` makes a session and says something in it at once, which a second
+    /// message cannot do.
+    pub const Prompt = struct {
+        project: []const u8,
+        session: []const u8,
+        message: []const u8,
+    };
     pub const Read = struct { session: []const u8, after: u64 };
     pub const List = struct { project: []const u8 };
     pub const Watch = struct { project: []const u8, session: []const u8, after: u64 };
@@ -422,6 +438,12 @@ pub const Request = union(Verb) {
             .adopt => .{ .adopt = .{
                 .project = try field(asked.rest, 0, 2),
                 .session = try field(asked.rest, 1, 2),
+            } },
+            .create => .{ .create = .{ .project = try field(asked.rest, 0, 1) } },
+            .prompt => .{ .prompt = .{
+                .project = try field(asked.rest, 0, 3),
+                .session = try field(asked.rest, 1, 3),
+                .message = try field(asked.rest, 2, 3),
             } },
             .read => read: {
                 const space = std.mem.indexOfScalar(u8, asked.rest, ' ') orelse
@@ -459,6 +481,11 @@ pub const Request = union(Verb) {
         switch (self) {
             .start => |one| try writer.print("start {s}\t{s}\n", .{ one.project, one.message }),
             .adopt => |one| try writer.print("adopt {s}\t{s}\n", .{ one.project, one.session }),
+            .create => |one| try writer.print("create {s}\n", .{one.project}),
+            .prompt => |one| try writer.print(
+                "prompt {s}\t{s}\t{s}\n",
+                .{ one.project, one.session, one.message },
+            ),
             .read => |one| try writer.print("read {s} {d}\n", .{ one.session, one.after }),
             .list => |one| try writer.print("list {s}\n", .{one.project}),
             .watch => |one| try writer.print(
@@ -774,6 +801,12 @@ test "every verb round trips from a request to a line and back" {
     const requests = [_]Request{
         .{ .start = .{ .project = "/home/ross/chock", .message = "fix the parser please" } },
         .{ .adopt = .{ .project = "/home/ross/chock", .session = id } },
+        .{ .create = .{ .project = "/home/ross/chock" } },
+        .{ .prompt = .{
+            .project = "/home/ross/chock",
+            .session = id,
+            .message = "and now the tests",
+        } },
         .{ .read = .{ .session = id, .after = 0 } },
         .{ .read = .{ .session = id, .after = 4096 } },
         .{ .list = .{ .project = "/home/ross/chock" } },

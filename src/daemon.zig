@@ -577,6 +577,8 @@ fn serve(daemon: *Daemon, arena: std.mem.Allocator, stream: *std.Io.net.Stream) 
     switch (request) {
         .start => |one| handleStart(daemon, writer, one),
         .adopt => |one| handleAdopt(daemon, writer, one),
+        .create => |one| handleCreate(daemon, writer, one),
+        .prompt => |one| handlePrompt(daemon, writer, one),
         .read => |one| handleRead(daemon, arena, writer, one),
         .list => |one| handleList(daemon, arena, writer, one),
         .watch => |one| handleWatch(daemon, arena, writer, stream.socket.handle, one),
@@ -629,7 +631,7 @@ fn handleStart(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Sta
     }
 
     const id = session_paths.newId(daemon.io);
-    beginSession(daemon, writer, one.project, id, one.message);
+    beginSession(daemon, writer, one.project, id, .{ .say = one.message });
 }
 
 /// `adopt <project directory>\t<session id>`: become the owner of a session
@@ -664,7 +666,63 @@ fn handleAdopt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Ado
         },
     }
 
-    beginSession(daemon, writer, one.project, id, null);
+    beginSession(daemon, writer, one.project, id, .carry_on);
+}
+
+/// `create <project directory>`: a session with a log and nothing running.
+///
+/// For a caller that has to name a session before it has anything to say in it.
+/// `session/new` in the agent client protocol answers with an identifier and no
+/// prompt, and `start` cannot do that: it makes a session and says something in
+/// it at once.
+fn handleCreate(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Create) void {
+    if (one.project.len == 0) {
+        fail(writer, "create needs a project directory, and it cannot be empty");
+        return;
+    }
+    if (!std.fs.path.isAbsolute(one.project)) {
+        fail(writer, "the project directory has to be an absolute path");
+        return;
+    }
+
+    beginSession(daemon, writer, one.project, session_paths.newId(daemon.io), .nothing);
+}
+
+/// `prompt <project directory>\t<session id>\t<message>`: one more message in a
+/// session that already exists, and the turn it starts.
+///
+/// **A session nothing has written yet is not a fault here.** `create` answers
+/// with an identifier before any log exists, so the first `prompt` on it is what
+/// makes the log. `chock_proto.log.Log.open` creates, which is what lets that
+/// work without a verb of its own.
+///
+/// What is refused is a session somebody is running now, the same thing `adopt`
+/// refuses and for the same reason: the process holding the log's lock owns it,
+/// and a second child would be a second owner.
+fn handlePrompt(daemon: *Daemon, writer: *std.Io.Writer, one: control.Request.Prompt) void {
+    const id = checkedSession(writer, one.project, one.session) orelse return;
+    if (one.message.len == 0) {
+        fail(writer, "prompt needs a message, and it cannot be empty");
+        return;
+    }
+
+    var paths = session_paths.pathsFor(daemon.gpa, daemon.env, one.project, &id) catch {
+        fail(writer, "the session path could not be built");
+        return;
+    };
+    defer paths.deinit();
+
+    switch (sessions_cmd.readinessOf(daemon.gpa, daemon.io, paths.log, &id)) {
+        .running => {
+            fail(writer, "that session is running now, and the process holding its log's lock owns it");
+            return;
+        },
+        // Every other reading is a session this may write to, including one no
+        // log exists for yet.
+        .ready, .no_such_session, .nothing_to_carry_on, .unknown => {},
+    }
+
+    beginSession(daemon, writer, one.project, id, .{ .say = one.message });
 }
 
 /// Check a project and a session identifier a client sent, together.
@@ -694,15 +752,26 @@ fn checkedSession(
 
 /// Remember one session, start the child that runs it, and answer the client.
 ///
-/// **One path for `start` and for `adopt`**, because the two differ in exactly
-/// one thing: whether the child is given a message. Everything after that is the
-/// same session, running in the same kind of child, writing the same log.
+/// What a verb wants done with the session it names.
+const Begin = union(enum) {
+    /// Run a turn on this message. `start` and `prompt` both do this.
+    say: []const u8,
+    /// Run, carrying on from what the log already holds. `adopt` does this.
+    carry_on,
+    /// Make the session and run nothing. `create` does this, for a caller that
+    /// has to name a session before it has anything to say in it.
+    nothing,
+};
+
+/// **One path for every verb that names a session**, because they differ in
+/// exactly one thing: what `Begin` says to do. Everything after that is the same
+/// session, in the same kind of child, writing the same log.
 fn beginSession(
     daemon: *Daemon,
     writer: *std.Io.Writer,
     project: []const u8,
     id: [session_paths.id_length]u8,
-    message: ?[]const u8,
+    begin: Begin,
 ) void {
     var paths = session_paths.pathsFor(daemon.gpa, daemon.env, project, &id) catch {
         fail(writer, "the session path could not be built");
@@ -726,27 +795,32 @@ fn beginSession(
         return;
     };
 
-    const owned_message: ?[]u8 = if (message) |text| daemon.gpa.dupe(u8, text) catch {
-        fail(writer, "out of memory");
-        return;
-    } else null;
+    if (begin != .nothing) {
+        const owned_message: ?[]u8 = switch (begin) {
+            .say => |text| daemon.gpa.dupe(u8, text) catch {
+                fail(writer, "out of memory");
+                return;
+            },
+            .carry_on, .nothing => null,
+        };
 
-    const child = Child{
-        .daemon = daemon,
-        .id = id,
-        .project = project_copy,
-        .message = owned_message,
-    };
-    const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
-        if (owned_message) |text| daemon.gpa.free(text);
-        fail(writer, "the session could not be started");
-        return;
-    };
-    // Detached: this daemon does not wait for a session to finish before it
-    // answers the next request, and the child's own exit is reported into the
-    // log, which is the interface. The thread's whole job is to reap the
-    // child so it does not become a zombie.
-    thread.detach();
+        const child = Child{
+            .daemon = daemon,
+            .id = id,
+            .project = project_copy,
+            .message = owned_message,
+        };
+        const thread = std.Thread.spawn(.{}, runChild, .{child}) catch {
+            if (owned_message) |text| daemon.gpa.free(text);
+            fail(writer, "the session could not be started");
+            return;
+        };
+        // Detached: this daemon does not wait for a session to finish before it
+        // answers the next request, and the child's own exit is reported into the
+        // log, which is the interface. The thread's whole job is to reap the
+        // child so it does not become a zombie.
+        thread.detach();
+    }
 
     var text_buffer: [std.fs.max_path_bytes + session_paths.id_length + 8]u8 = undefined;
     const text = std.fmt.bufPrint(&text_buffer, "{s}\t{s}", .{ id, log_path }) catch {
