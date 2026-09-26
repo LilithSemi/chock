@@ -1477,14 +1477,20 @@ fn redactionFor(
         try named.append(arena, .{ .name = one.name, .value = inline_token });
     }
 
-    // One slot more than there are credentials, and the last one is empty. It is
-    // where a git password goes while an approved push runs, and an empty value
-    // is inert.
-    const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + 1);
+    // **Slots past the credentials, all of them empty, and an empty value is
+    // inert.** The tool call's own secrets come first, then the git password
+    // last, because the git path names its slot as the final one. Both kinds
+    // are filled before the value can reach anything, which is what makes the
+    // window zero rather than short.
+    //
+    // Reserved here because a `Policy` is built once and read on every turn,
+    // and a value that arrives later has nowhere to go if no slot was kept.
+    const reserved = tool_secret_slots + 1;
+    const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + reserved);
     for (named.items, secrets[0..named.items.len]) |one, *slot| {
         slot.* = .{ .value = one.value, .source = .credential };
     }
-    secrets[named.items.len] = .{ .value = "", .source = .credential };
+    for (secrets[named.items.len..]) |*slot| slot.* = .{ .value = "", .source = .credential };
 
     for (named.items) |one| {
         if (one.value.len >= chock_core.redact.min_secret_bytes) continue;
@@ -1499,6 +1505,27 @@ fn redactionFor(
     }
 
     return .{ .secrets = secrets };
+}
+
+/// How many secrets one tool call may be granted at once.
+///
+/// **A bound on the redaction slots and therefore on the grant.** A secret with
+/// no slot could not be kept out of the log, so a call wanting more than this
+/// is refused rather than served unprotected. A grant names one or two secrets
+/// in practice.
+pub const tool_secret_slots: usize = 8;
+
+/// The slots a tool call's own secrets go in: every one past the credentials,
+/// and stopping short of the git password's own slot at the end.
+///
+/// `@constCast` is sound here for the reason the git path gives where it takes
+/// the last slot: the slice was allocated mutable in phase 1's arena, and one
+/// owner writes it, from one thread.
+fn toolSecretSlots(policy: chock_core.redact.Policy) []chock_core.redact.Secret {
+    const total = policy.secrets.len;
+    if (total < tool_secret_slots + 1) return &.{};
+    const first = total - tool_secret_slots - 1;
+    return @constCast(policy.secrets)[first .. total - 1];
 }
 
 /// `chock-broker` imports no `chock-core`, so a `chock_core.redact.Policy`
@@ -16995,7 +17022,7 @@ test "this session's own credential is what the redactor is given" {
     const token = "sk-not-a-real-key-0123456789";
     const policy = try redactionFor(arena, "hub", token, &.{}, null);
 
-    try testing.expectEqual(@as(usize, 2), policy.secrets.len);
+    try testing.expectEqual(@as(usize, 1 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
     try testing.expectEqual(chock_core.redact.Source.credential, policy.secrets[0].source);
@@ -17005,6 +17032,45 @@ test "this session's own credential is what the redactor is given" {
 
     try testing.expectEqualStrings("", said.err());
     try testing.expectEqualStrings("", said.out());
+}
+
+test "a tool call's secrets have somewhere to be kept out of the log" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    const policy = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null);
+
+    // The credential, the git password's slot, and one per grantable secret.
+    try testing.expectEqual(@as(usize, 1 + 1 + tool_secret_slots), policy.secrets.len);
+
+    const slots = toolSecretSlots(policy);
+    try testing.expectEqual(tool_secret_slots, slots.len);
+
+    // Empty until something fills them, and an empty slot redacts nothing and
+    // is not counted as a credential too short to match.
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+    try testing.expectEqual(@as(usize, 0), policy.tooShort());
+
+    // **The git password takes the last slot**, named that way where it is
+    // armed, so the tool slots must stop short of it. Without this the two
+    // would write over each other and nobody would notice: both redact.
+    const git_slot = &policy.secrets[policy.secrets.len - 1];
+    for (slots) |*slot| try testing.expect(slot != git_slot);
+
+    // Filled, a slot redacts, which is what a grant relies on.
+    slots[0].value = "tool-secret-not-a-real-one";
+    const cleaned = try chock_core.redact.text(
+        arena,
+        policy,
+        "the token is tool-secret-not-a-real-one here",
+    );
+    try testing.expect(std.mem.indexOf(u8, cleaned, "tool-secret-not-a-real-one") == null);
 }
 
 test "the search key is kept out of the log beside the provider credential" {
@@ -17022,7 +17088,7 @@ test "the search key is kept out of the log beside the provider credential" {
     const policy = try redactionFor(arena, "hub", token, &.{}, search_key);
 
     // Both credentials, plus the empty slot a git password goes in.
-    try testing.expectEqual(@as(usize, 3), policy.secrets.len);
+    try testing.expectEqual(@as(usize, 2 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
     try testing.expectEqualStrings(search_key, policy.secrets[1].value);
 
@@ -17060,7 +17126,7 @@ test "a credential nobody could match is skipped and said out loud, and an absen
 
     said.clear();
     const none = try redactionFor(arena, "local", "", &.{}, null);
-    try testing.expectEqual(@as(usize, 1), none.secrets.len);
+    try testing.expectEqual(@as(usize, 0 + 1 + tool_secret_slots), none.secrets.len);
     try testing.expectEqualStrings("", none.secrets[0].value);
     try testing.expectEqual(@as(usize, 0), none.tooShort());
     try testing.expect(none.isEmpty());
@@ -17142,7 +17208,7 @@ test "every credential the configuration holds is in the set, and not only the o
     };
 
     const policy = try redactionFor(arena, "hub", in_use, &instances, null);
-    try testing.expectEqual(@as(usize, 3), policy.secrets.len);
+    try testing.expectEqual(@as(usize, 2 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
 
     var saw_in_use = false;
