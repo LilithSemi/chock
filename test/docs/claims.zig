@@ -1,4 +1,6 @@
 //! Every test here reads a claim out of a file a person reads and compares it
+//!
+//! Every check here reads the documentation off the disk at run time.
 //! with the code. The truth always comes from the code or from the disk, never
 //! from a second list in this file.
 //!

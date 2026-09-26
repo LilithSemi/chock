@@ -19,6 +19,9 @@ Start with [running.md](running.md) for a session end to end, and
 - [using/approvals.md](using/approvals.md) - what a session asks a person, how
   the question reaches them, where an approved apply lands, and what happens
   when nobody is there.
+- [using/editors.md](using/editors.md) - driving Chock from an editor over the
+  agent client protocol: both versions, what the editor is told, and the four
+  things Chock will not take from one.
 - [using/subagents.md](using/subagents.md) - `spawn_agent`, the depth and width
   limits, the budget slice, and a spawn that waits or carries on.
 - [using/memory.md](using/memory.md) - the notes an agent keeps between
