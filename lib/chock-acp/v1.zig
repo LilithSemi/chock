@@ -28,6 +28,12 @@
 
 const std = @import("std");
 
+const common = @import("common.zig");
+
+pub const StopReason = common.StopReason;
+pub const ToolKind = common.ToolKind;
+pub const PermissionKind = common.PermissionKind;
+
 /// The version this speaks. `initialize` carries an integer, bumped only for a
 /// breaking change; everything else is negotiated by capability.
 pub const protocol_version: u16 = 1;
@@ -150,19 +156,6 @@ pub const Method = enum {
     }
 };
 
-/// Why a prompt turn ended. Returned from `session/prompt`.
-pub const StopReason = enum {
-    end_turn,
-    max_tokens,
-    max_turn_requests,
-    refusal,
-    cancelled,
-
-    pub fn wireName(self: StopReason) []const u8 {
-        return @tagName(self);
-    }
-};
-
 /// The `sessionUpdate` member of a `session/update` notification, which is what
 /// says which variant the rest of the object is.
 pub const UpdateKind = enum {
@@ -183,70 +176,15 @@ pub const UpdateKind = enum {
     }
 };
 
-/// What a tool call is, for a client choosing how to draw it. `other` is the
-/// default, so a tool that fits none of the rest still reports something.
-pub const ToolKind = enum {
-    read,
-    edit,
-    delete,
-    move,
-    search,
-    fetch,
-    execute,
-    think,
-    switch_mode,
-    other,
-
-    pub fn wireName(self: ToolKind) []const u8 {
-        return @tagName(self);
-    }
-};
-
-/// Where a tool call has got to.
-pub const ToolStatus = enum {
+/// Where a tool call has got to. Version 2 adds `cancelled` to this.
+pub const ToolCallStatus = enum {
     pending,
     in_progress,
     completed,
     failed,
 
-    pub fn wireName(self: ToolStatus) []const u8 {
+    pub fn wireName(self: ToolCallStatus) []const u8 {
         return @tagName(self);
-    }
-};
-
-/// What one answer to `session/request_permission` means. `always` is a standing
-/// permission and not one answer, which is why Chock treats it as a policy
-/// change and not as a reply.
-pub const PermissionKind = enum {
-    allow_once,
-    allow_always,
-    reject_once,
-    reject_always,
-
-    pub fn wireName(self: PermissionKind) []const u8 {
-        return @tagName(self);
-    }
-
-    pub fn fromWireName(name: []const u8) ?PermissionKind {
-        inline for (@typeInfo(PermissionKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, field.name, name)) return @enumFromInt(field.value);
-        }
-        return null;
-    }
-
-    pub fn permits(self: PermissionKind) bool {
-        return switch (self) {
-            .allow_once, .allow_always => true,
-            .reject_once, .reject_always => false,
-        };
-    }
-
-    /// Whether this answer is meant to bind later calls as well as this one.
-    pub fn isStanding(self: PermissionKind) bool {
-        return switch (self) {
-            .allow_always, .reject_always => true,
-            .allow_once, .reject_once => false,
-        };
     }
 };
 
@@ -304,38 +242,22 @@ test "a notification takes no reply, and a request does" {
     try testing.expect(!Method.session_request_permission.isNotification());
 }
 
-test "an always answer is a standing one, and a once answer is not" {
-    try testing.expect(PermissionKind.allow_always.isStanding());
-    try testing.expect(PermissionKind.reject_always.isStanding());
-    try testing.expect(!PermissionKind.allow_once.isStanding());
-    try testing.expect(!PermissionKind.reject_once.isStanding());
-
-    try testing.expect(PermissionKind.allow_once.permits());
-    try testing.expect(PermissionKind.allow_always.permits());
-    try testing.expect(!PermissionKind.reject_once.permits());
-    try testing.expect(!PermissionKind.reject_always.permits());
-
-    // All four, because the docs page lists three and the schema lists four,
-    // and a client may send the one the page left out.
-    for ([_][]const u8{ "allow_once", "allow_always", "reject_once", "reject_always" }) |name| {
-        try testing.expect(PermissionKind.fromWireName(name) != null);
-    }
-    try testing.expectEqual(@as(?PermissionKind, null), PermissionKind.fromWireName("maybe"));
-}
-
-test "every enum on the wire spells itself the way the schema does" {
-    // The schema's values are snake case and so are these tags, so `@tagName`
-    // is the wire name. This is what says so, rather than a comment.
-    try testing.expectEqualStrings("end_turn", StopReason.end_turn.wireName());
+test "version 1's own enums spell themselves the way its schema does" {
     try testing.expectEqualStrings("agent_message_chunk", UpdateKind.agent_message_chunk.wireName());
     try testing.expectEqualStrings("tool_call_update", UpdateKind.tool_call_update.wireName());
-    try testing.expectEqualStrings("switch_mode", ToolKind.switch_mode.wireName());
-    try testing.expectEqualStrings("in_progress", ToolStatus.in_progress.wireName());
+    try testing.expectEqualStrings("in_progress", ToolCallStatus.in_progress.wireName());
 
-    inline for (.{ StopReason, UpdateKind, ToolKind, ToolStatus, PermissionKind }) |Kind| {
+    inline for (.{ UpdateKind, ToolCallStatus }) |Kind| {
         inline for (@typeInfo(Kind).@"enum".fields) |field| {
             const one: Kind = @enumFromInt(field.value);
             try testing.expectEqualStrings(field.name, one.wireName());
         }
     }
+
+    // Version 1 has four statuses. Version 2 adds `cancelled`, and reading one
+    // version's set as the other's would report a status a client cannot draw.
+    try testing.expectEqual(@as(usize, 4), @typeInfo(ToolCallStatus).@"enum".fields.len);
+    // `tool_call` is version 1's, and version 2 has no such variant.
+    try testing.expect(std.mem.indexOf(u8, UpdateKind.tool_call.wireName(), "tool_call") != null);
+    try testing.expectEqual(@as(usize, 11), @typeInfo(UpdateKind).@"enum".fields.len);
 }
