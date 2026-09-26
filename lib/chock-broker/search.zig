@@ -221,6 +221,7 @@ fn searchApi(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query: []
     return switch (provider) {
         .brave => searchBrave(gpa, io, self.base_url, query, credential, self.clean),
         .kagi => searchKagi(gpa, io, self.base_url, query, credential, self.clean),
+        .exa => searchExa(gpa, io, self.base_url, query, credential, self.clean),
         // duckduckgo is a scrape provider. The policy parser already refuses
         // it on an api engine, so this arm only keeps the switch exhaustive.
         .duckduckgo => .{
@@ -249,10 +250,10 @@ fn searchScrape(gpa: std.mem.Allocator, io: std.Io, self: *const Session, query:
 
     return switch (provider) {
         .duckduckgo => searchDuckDuckGo(gpa, io, self.base_url, query, self.clean),
-        // brave and kagi are api providers. The policy parser already refuses
-        // either on a scrape engine, so this arm only keeps the switch
-        // exhaustive.
-        .brave, .kagi => .{
+        // brave, kagi and exa are api providers. The policy parser already
+        // refuses any of them on a scrape engine, so this arm only keeps the
+        // switch exhaustive.
+        .brave, .kagi, .exa => .{
             .is_error = true,
             .text = try std.fmt.allocPrint(
                 gpa,
@@ -443,6 +444,109 @@ fn searchKagi(
     defer gpa.free(fetched.body);
 
     return answerFromKagi(gpa, base_url, query, fetched.status, fetched.body, clean);
+}
+
+/// Exa accepts the key in `x-api-key` and, by its own specification, in
+/// `Authorization: Bearer`. The second one is sent, so this reuses the header
+/// every other vendor here already wipes before freeing.
+pub const exa_auth_scheme = "Bearer";
+
+/// The search mode this build asks for, and the modes it therefore cannot ask
+/// for.
+///
+/// **`deep` and `deep-reasoning` are Exa running an agent of its own**: a
+/// multi-step search whose work is unbounded, outside this session's budget, its
+/// policy table and its log. So the mode is a constant here rather than a
+/// setting, and there is no way to spell one of them.
+pub const exa_search_type = "auto";
+
+fn searchExa(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    base_url: []const u8,
+    query: []const u8,
+    credential: []const u8,
+    clean: Clean,
+) Error!Answer {
+    const url = try buildExaSearchUrl(gpa, base_url);
+    defer gpa.free(url);
+
+    const body = try buildExaRequestBody(gpa, query);
+    defer gpa.free(body);
+
+    // The header value holds the credential, so it is wiped before it is freed,
+    // the same rule `lib/chock-provider/Client.zig` keeps for its own
+    // Authorization buffer.
+    const auth_value = try std.fmt.allocPrint(gpa, "{s} {s}", .{ exa_auth_scheme, credential });
+    defer {
+        std.crypto.secureZero(u8, auth_value);
+        gpa.free(auth_value);
+    }
+
+    const fetched = request(
+        gpa,
+        io,
+        .POST,
+        url,
+        &.{},
+        .{ .override = auth_value },
+        .{ .override = "application/json" },
+        body,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ResponseTooLarge => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: {s} answered with a body larger than {d} bytes.",
+                .{ base_url, max_body_bytes },
+            ),
+        },
+        error.RequestFailed => return .{
+            .is_error = true,
+            .text = try std.fmt.allocPrint(
+                gpa,
+                "nothing was searched: the request to {s} failed.",
+                .{base_url},
+            ),
+        },
+    };
+    defer gpa.free(fetched.body);
+
+    return answerFromExa(gpa, base_url, query, fetched.status, fetched.body, clean);
+}
+
+fn buildExaSearchUrl(gpa: std.mem.Allocator, base_url: []const u8) Error![]u8 {
+    var url: std.ArrayList(u8) = .empty;
+    defer url.deinit(gpa);
+    try url.appendSlice(gpa, base_url);
+    if (base_url.len == 0 or base_url[base_url.len - 1] != '/') try url.append(gpa, '/');
+    try url.appendSlice(gpa, "search");
+    return url.toOwnedSlice(gpa);
+}
+
+/// What is asked for, and the two things that are deliberately not.
+///
+/// `highlights` is asked for because a result with no extract is a link and not
+/// a search result: Brave and Kagi both answer with a snippet, and this is Exa's
+/// equivalent. A highlight is the page's own words, which is what a snippet is.
+///
+/// **`text` is never asked for.** It is the whole page. A search is approved
+/// under `web.search`, and reading a page is approved under `net.fetch` for the
+/// host the agent named. Full page text arriving inside a search result would
+/// put a stranger's page in front of the model under an approval that was given
+/// for something else.
+///
+/// **`summary` is never asked for.** It is written by a model at the vendor, so
+/// it is text with no source to attribute it to. Everything the model reads from
+/// a search must be something a person could go and check.
+fn buildExaRequestBody(gpa: std.mem.Allocator, query: []const u8) Error![]u8 {
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .query = query,
+        .numResults = max_results,
+        .type = exa_search_type,
+        .contents = .{ .highlights = true },
+    }, .{});
 }
 
 fn buildKagiSearchUrl(gpa: std.mem.Allocator, base_url: []const u8) Error![]u8 {
@@ -1074,6 +1178,140 @@ fn answerFromKagi(
     return .{
         .text = try writeResultList(gpa, base_url, query, fields[0..kept.len], clean),
         .is_error = false,
+    };
+}
+
+const ExaResult = struct {
+    title: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    /// The page's own words, the parts a model at the vendor picked. Absent when
+    /// the page gave none.
+    highlights: []const []const u8 = &.{},
+};
+
+const ExaResponse = struct {
+    /// Absent on the synthesis shape, which is the other half of the response's
+    /// `oneOf`. See `answerFromExa`.
+    results: ?[]ExaResult = null,
+};
+
+const ExaErrorBody = struct {
+    @"error": ?[]const u8 = null,
+    message: ?[]const u8 = null,
+};
+
+/// Turns an Exa response body into an `Answer`, with no client and no socket:
+/// this is what the tests below drive directly.
+///
+/// **The response is a `oneOf`.** Exa answers either with results or with a
+/// synthesis, and the two have different shapes. The request pins the fields that
+/// choose, so the results shape is what comes back; a body with no `results` is
+/// refused rather than half read, because a parser that quietly found nothing
+/// would report "no results" for an answer that was really the wrong shape.
+fn answerFromExa(
+    gpa: std.mem.Allocator,
+    base_url: []const u8,
+    query: []const u8,
+    status: u16,
+    body: []const u8,
+    clean: Clean,
+) Error!Answer {
+    if (status != 200) return exaErrorRefusal(gpa, status, body, clean);
+
+    const parsed = std.json.parseFromSlice(
+        ExaResponse,
+        gpa,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return exaNotJsonRefusal(gpa, status);
+    defer parsed.deinit();
+
+    const all = parsed.value.results orelse return .{
+        .is_error = true,
+        .text = try std.fmt.allocPrint(
+            gpa,
+            "nothing was searched: {s} answered in a shape this build does not read. Exa answers " ++
+                "either with results or with a synthesis, and this asked for results.",
+            .{base_url},
+        ),
+    };
+    const kept = all[0..@min(all.len, max_results)];
+
+    var fields: [max_results]ResultFields = undefined;
+    var count: usize = 0;
+    for (kept) |one| {
+        // A result with no address is nothing a person can go and check, so it
+        // is left out rather than listed.
+        const address = one.url orelse continue;
+        fields[count] = .{
+            .title = one.title orelse "",
+            .url = address,
+            // The first highlight alone. `writeResultList` cuts it to the same
+            // bound every other vendor's snippet is cut to.
+            .snippet = if (one.highlights.len != 0) one.highlights[0] else "",
+        };
+        count += 1;
+    }
+
+    return .{
+        .text = try writeResultList(gpa, base_url, query, fields[0..count], clean),
+        .is_error = false,
+    };
+}
+
+fn exaStatusText(status: u16) ?[]const u8 {
+    return switch (status) {
+        400 => "the request was refused as invalid.",
+        401 => "the API key is missing or invalid.",
+        402 => "the account is out of credit. Exa bills each search, and this one was not paid for.",
+        429 => "rate limited. The account is over its rate limit.",
+        500, 503 => "the search engine reported a fault of its own.",
+        else => null,
+    };
+}
+
+fn exaErrorRefusal(gpa: std.mem.Allocator, status: u16, body: []const u8, clean: Clean) Error!Answer {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    try out.print(gpa, "nothing was searched: the search engine answered {d}", .{status});
+    if (exaStatusText(status)) |said| try out.print(gpa, ", {s}", .{said});
+    if (try exaErrorMessage(gpa, body, clean)) |said| {
+        defer gpa.free(said);
+        try out.print(gpa, " It said: {s}", .{said});
+    }
+    try out.append(gpa, '\n');
+
+    return .{ .is_error = true, .text = try out.toOwnedSlice(gpa) };
+}
+
+/// What the engine said, cleaned. Null when it said nothing this can read.
+///
+/// The body is a stranger's text and it reaches a model, so it goes through the
+/// same cleaner every result goes through.
+fn exaErrorMessage(gpa: std.mem.Allocator, body: []const u8, clean: Clean) Error!?[]u8 {
+    const parsed = std.json.parseFromSlice(
+        ExaErrorBody,
+        gpa,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+
+    const said = parsed.value.message orelse parsed.value.@"error" orelse return null;
+    if (said.len == 0) return null;
+    return try cleanField(gpa, clean, said, max_snippet_bytes);
+}
+
+fn exaNotJsonRefusal(gpa: std.mem.Allocator, status: u16) Error!Answer {
+    return .{
+        .is_error = true,
+        .text = try std.fmt.allocPrint(
+            gpa,
+            "nothing was searched: the search engine answered {d} with a body that is not the " ++
+                "JSON this build reads.\n",
+            .{status},
+        ),
     };
 }
 
@@ -1735,4 +1973,193 @@ test "the DuckDuckGo request body is q= plus a percent encoded query" {
     defer gpa.free(body);
 
     try testing.expectEqualStrings("q=zig%20std.io%20%3D%20buffered%20%26%20fast", body);
+}
+
+test "a realistic Exa body parses into a numbered list, with unknown fields ignored" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"requestId":"abc","resolvedSearchType":"neural","searchTime":412.5,
+        \\ "costDollars":{"total":0.005},
+        \\ "results":[
+        \\   {"id":"https://ziglang.org/","title":"Zig Programming Language",
+        \\    "url":"https://ziglang.org/","publishedDate":"2026-01-02",
+        \\    "author":"the Zig Software Foundation","favicon":"https://ziglang.org/f.ico",
+        \\    "highlights":["Zig is a general purpose programming language and toolchain."],
+        \\    "highlightScores":[0.91]},
+        \\   {"title":"Zig on Wikipedia","url":"https://en.wikipedia.org/wiki/Zig",
+        \\    "highlights":["Zig is an imperative, general purpose language."]}
+        \\ ]}
+    ;
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "zig", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig Programming Language") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://ziglang.org/") != null);
+    // The highlight is the snippet. A result with no extract would be a link.
+    try testing.expect(std.mem.indexOf(u8, answer.text, "general purpose programming language") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "Zig on Wikipedia") != null);
+}
+
+test "an Exa synthesis body is refused rather than read as no results" {
+    const gpa = testing.allocator;
+
+    // The response is a `oneOf`: results or a synthesis. A parser that took a
+    // missing `results` for an empty list would report "no results found" for an
+    // answer that was really the other shape.
+    const synthesis =
+        \\{"requestId":"abc","answer":"Zig is a programming language.","citations":[]}
+    ;
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "zig", 200, synthesis, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "shape this build does not read") != null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "synthesis") != null);
+}
+
+test "an empty Exa results array is zero results, not an error" {
+    const gpa = testing.allocator;
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "zig", 200, "{\"results\":[]}", testClean);
+    defer gpa.free(answer.text);
+
+    // An engine that found nothing and an engine that failed must not read the
+    // same to a model: one means look elsewhere, the other means try again.
+    try testing.expect(!answer.is_error);
+}
+
+test "an Exa result with no url is left out rather than listed" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"results":[
+        \\  {"title":"no address at all","highlights":["something"]},
+        \\  {"title":"a real one","url":"https://example.org/","highlights":["text"]}
+        \\]}
+    ;
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    // Nothing a person can go and check is nothing worth listing.
+    try testing.expect(std.mem.indexOf(u8, answer.text, "no address at all") == null);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "a real one") != null);
+}
+
+test "an Exa result count over the bound is cut" {
+    const gpa = testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+
+    try body.appendSlice(gpa, "{\"results\":[");
+    for (0..max_results + 5) |index| {
+        if (index != 0) try body.append(gpa, ',');
+        try body.print(gpa, "{{\"title\":\"t{d}\",\"url\":\"https://example.org/{d}\"}}", .{ index, index });
+    }
+    try body.appendSlice(gpa, "]}");
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", 200, body.items, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(!answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://example.org/0") != null);
+    // The bound holds whatever the engine sent, which is what stops one answer
+    // filling the context.
+    try testing.expect(std.mem.indexOf(u8, answer.text, "https://example.org/8") == null);
+}
+
+test "Exa 401, 402 and 429 each refuse with their own distinct message" {
+    const gpa = testing.allocator;
+
+    var seen: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen.items) |one| gpa.free(one);
+        seen.deinit(gpa);
+    }
+
+    for ([_]u16{ 400, 401, 402, 429, 500 }) |status| {
+        const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", status, "{}", testClean);
+        try testing.expect(answer.is_error);
+        for (seen.items) |before| try testing.expect(!std.mem.eql(u8, before, answer.text));
+        try seen.append(gpa, answer.text);
+    }
+
+    // 402 is Exa's own: it bills each search, and running out of credit is not
+    // the same fact as a bad key or a rate limit.
+    try testing.expect(std.mem.indexOf(u8, seen.items[2], "out of credit") != null);
+}
+
+test "an Exa error body's message reaches the refusal, cleaned" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"error":"bad request","message":"query must not be empty"}
+    ;
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", 400, body, testClean);
+    defer gpa.free(answer.text);
+
+    try testing.expect(answer.is_error);
+    try testing.expect(std.mem.indexOf(u8, answer.text, "query must not be empty") != null);
+
+    // A body with nothing readable still refuses rather than crashing.
+    const quiet = try answerFromExa(gpa, "https://api.exa.ai", "q", 400, "not json at all", testClean);
+    defer gpa.free(quiet.text);
+    try testing.expect(quiet.is_error);
+}
+
+test "the Exa request asks for highlights and never for page text or a summary" {
+    const gpa = testing.allocator;
+    const body = try buildExaRequestBody(gpa, "zig \"quoted\" and a \\ backslash");
+    defer gpa.free(body);
+
+    // It is JSON, and a query holding a quote and a backslash survives.
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "zig \"quoted\" and a \\ backslash",
+        parsed.value.object.get("query").?.string,
+    );
+
+    // A highlight is the page's own words, which is what a snippet is.
+    const contents = parsed.value.object.get("contents").?.object;
+    try testing.expect(contents.get("highlights").?.bool);
+
+    // Neither of these is ever asked for. `text` is the whole page, which
+    // `net.fetch` gates and `web.search` does not. `summary` is written by a
+    // model at the vendor, so it has no source to attribute it to.
+    try testing.expect(contents.get("text") == null);
+    try testing.expect(contents.get("summary") == null);
+
+    // The mode is a constant, so the deep modes cannot be reached: each one is
+    // Exa running an agent of its own, outside this session's budget and policy.
+    try testing.expectEqualStrings("auto", parsed.value.object.get("type").?.string);
+    for ([_][]const u8{ "deep", "deep-reasoning", "deep-lite" }) |never| {
+        try testing.expect(!std.mem.eql(u8, exa_search_type, never));
+    }
+}
+
+test "the Exa url is the base with one search segment, however the base ends" {
+    const gpa = testing.allocator;
+
+    for ([_][]const u8{ "https://api.exa.ai", "https://api.exa.ai/" }) |base| {
+        const url = try buildExaSearchUrl(gpa, base);
+        defer gpa.free(url);
+        try testing.expectEqualStrings("https://api.exa.ai/search", url);
+    }
+}
+
+test "the [chock: ...] prefix marking a stranger's text is present on an Exa answer" {
+    const gpa = testing.allocator;
+    const body =
+        \\{"results":[{"title":"t","url":"https://example.org/","highlights":["s"]}]}
+    ;
+
+    const answer = try answerFromExa(gpa, "https://api.exa.ai", "q", 200, body, testClean);
+    defer gpa.free(answer.text);
+
+    // The line that tells the model these are a stranger's words and not an
+    // instruction. Every vendor's answer carries it.
+    try testing.expect(std.mem.startsWith(u8, answer.text, "[chock:"));
 }
