@@ -259,6 +259,11 @@ pub const SessionConfig = struct {
     dev_shell: []const u8 = "",
     /// True when `--allow-dirty` put uncommitted work in the workspace.
     allow_dirty: bool = false,
+    /// How many tokens this session's model holds, when anybody said. Null when
+    /// nobody did, and then no reader may guess: `lib/chock-core/compaction.zig`
+    /// compacts nothing without it, and a gauge against a number nobody wrote
+    /// would read as full or empty by accident.
+    context_limit_tokens: ?u64 = null,
     extra: Extra = .{},
 
     const forward = ForwardCompatible(@This());

@@ -613,6 +613,7 @@ fn sessionConfig(
     options: Options,
     policy: *const chock_policy.table.Table,
     dev_shell_name: ?[]const u8,
+    context_tokens: ?u64,
     sandbox_config: sandbox.Config,
 ) std.mem.Allocator.Error!chock_proto.event.SessionConfig {
     var rules: std.ArrayList([]const u8) = .empty;
@@ -633,6 +634,7 @@ fn sessionConfig(
         .policy_rules = rules.items,
         .dev_shell = dev_shell_name orelse "",
         .allow_dirty = options.allow_dirty,
+        .context_limit_tokens = context_tokens,
     };
 }
 
@@ -1435,7 +1437,14 @@ fn start(
         .prompt_project = prompt_project,
         .prompt_sources = prompt_sources,
         .spawn_chain = chain,
-        .session_config = try sessionConfig(arena, options, policy, dev_shell_name, sandbox_config),
+        .session_config = try sessionConfig(
+            arena,
+            options,
+            policy,
+            dev_shell_name,
+            instance.context_tokens,
+            sandbox_config,
+        ),
         .model = model,
         .model_alias = instance.name,
         .system_prompt = system_prompt,
