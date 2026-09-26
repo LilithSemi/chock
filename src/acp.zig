@@ -371,18 +371,13 @@ const Agent = struct {
             /// The log offset of the approval request, which is what the daemon's
             /// `answer` verb names.
             request_id: u64,
-            /// The action, for the log line that says what was permitted.
-            action: []u8,
         };
     };
 
     fn deinit(self: *Agent) void {
         for (self.sessions.items) |*one| one.deinit(self.gpa);
         self.sessions.deinit(self.gpa);
-        if (self.turn) |one| if (one.pending) |pending| {
-            self.gpa.free(pending.ask);
-            self.gpa.free(pending.action);
-        };
+        if (self.turn) |one| if (one.pending) |pending| self.gpa.free(pending.ask);
     }
 
     fn run(self: *Agent) !u8 {
@@ -530,7 +525,10 @@ const Agent = struct {
 
     /// A reply to a `session/request_permission` this agent sent.
     fn handleReply(self: *Agent, arena: std.mem.Allocator, reply: jsonrpc.Reply) void {
-        var turn = &(self.turn orelse return);
+        // `if (self.turn) |*turn|` and never `&(self.turn orelse ...)`: the
+        // second takes the address of a copy of the payload, so every write to
+        // it is lost. That bug made every permission time out as a refusal.
+        const turn = if (self.turn) |*one| one else return;
         const pending = turn.pending orelse return;
         if (!std.mem.eql(u8, pending.ask, reply.id.raw)) return;
 
@@ -541,7 +539,6 @@ const Agent = struct {
         self.tellDaemon(arena, pending.request_id, permitted);
 
         self.gpa.free(pending.ask);
-        self.gpa.free(pending.action);
         turn.pending = null;
     }
 
@@ -957,13 +954,21 @@ const Agent = struct {
         const Gather = struct {
             arena: std.mem.Allocator,
             found: *std.ArrayList(u8),
+            project: []const u8,
 
             fn take(self_take: *@This(), reply: control.Reply) anyerror!bool {
                 switch (reply) {
                     .record => |one| {
-                        const named = sessionIdIn(self_take.arena, one.payload) orelse return true;
+                        const named = listedSessionIn(self_take.arena, one.payload) orelse return true;
                         if (self_take.found.items.len != 0) try self_take.found.append(self_take.arena, ',');
-                        try self_take.found.print(self_take.arena, "{{\"sessionId\":\"{s}\"}}", .{named});
+                        // `cwd` as well as the identifier: the schema requires
+                        // both, and every session this lists is under the one
+                        // project the daemon was asked about.
+                        try self_take.found.print(
+                            self_take.arena,
+                            "{{\"sessionId\":\"{s}\",\"cwd\":{f}}}",
+                            .{ named, std.json.fmt(self_take.project, .{}) },
+                        );
                     },
                     .failed => return false,
                     .ok => {},
@@ -971,7 +976,7 @@ const Agent = struct {
                 return true;
             }
         };
-        var gather = Gather{ .arena = arena, .found = &found };
+        var gather = Gather{ .arena = arena, .found = &found, .project = self.project };
         var said: control.Handshake = .{ .unreadable = "" };
         control.exchange(
             &stream_reader.interface,
@@ -1086,6 +1091,7 @@ const Agent = struct {
                 }
                 self.sendPlan(arena, which);
             },
+            .session_title => |one| self.send(arena, .{ .title = one.title }),
             .session_config => |one| {
                 if (one.context_limit_tokens) |held| live.window = held;
             },
@@ -1166,7 +1172,7 @@ const Agent = struct {
         one: event.ApprovalRequest,
         offset: u64,
     ) void {
-        var turn = &(self.turn orelse return);
+        const turn = if (self.turn) |*held| held else return;
         // One at a time: the loop asks about one action and waits, so a second
         // request before the first is answered would be the log going wrong.
         if (turn.pending != null) return;
@@ -1183,15 +1189,19 @@ const Agent = struct {
                 .title = one.summary,
                 .kind = toolKindFor("").wireName(),
                 .status = "pending",
+                // The whole effect goes on the call, because the request itself
+                // carries no content member. Chock never puts a command string
+                // here: see `lib/chock-broker`.
+                .content = .{.{
+                    .type = "content",
+                    .content = .{ .type = "text", .text = one.detail },
+                }},
             },
             .options = .{
                 .{ .optionId = "allow_once", .name = "Allow once", .kind = "allow_once" },
                 .{ .optionId = "allow_always", .name = "Allow for this turn", .kind = "allow_always" },
                 .{ .optionId = "reject_once", .name = "Refuse", .kind = "reject_once" },
             },
-            // The whole effect, which is what a person needs to answer. Chock
-            // never puts a command string here: see `lib/chock-broker`.
-            .content = .{.{ .type = "text", .text = one.detail }},
         }, .{}) catch return;
 
         const body = jsonrpc.requestBody(arena, .{ .raw = raw }, self.clientMethod(.request_permission), params) catch return;
@@ -1203,7 +1213,6 @@ const Agent = struct {
         turn.pending = .{
             .ask = self.gpa.dupe(u8, raw) catch return,
             .request_id = offset,
-            .action = self.gpa.dupe(u8, one.action) catch "",
         };
     }
 
@@ -1225,7 +1234,6 @@ const Agent = struct {
             // request cancelled when a turn ends. The daemon already read the
             // silence as a refusal.
             self.gpa.free(pending.ask);
-            self.gpa.free(pending.action);
         }
 
         const result = std.json.Stringify.valueAlloc(arena, .{
@@ -1407,14 +1415,18 @@ fn numberField(arena: std.mem.Allocator, params: []const u8, name: []const u8) ?
     };
 }
 
-/// The session identifier out of a log envelope, for the listing.
-fn sessionIdIn(arena: std.mem.Allocator, payload: []const u8) ?[]const u8 {
+/// The session identifier out of one row of the daemon's `list`.
+///
+/// A listing row is a summary of a session and not a log envelope, so the
+/// identifier is `id` rather than `session`. Reading the envelope's name here
+/// found nothing and listed no sessions at all.
+fn listedSessionIn(arena: std.mem.Allocator, payload: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch return null;
     const object = switch (parsed.value) {
         .object => |one| one,
         else => return null,
     };
-    return switch (object.get("session") orelse return null) {
+    return switch (object.get("id") orelse return null) {
         .string => |text| if (session_paths.isValidId(text)) text else null,
         else => null,
     };
@@ -1780,4 +1792,78 @@ test "the version answered is the newest both sides speak" {
     try testing.expectEqual(chock_acp.Version.v1, chock_acp.negotiate(1).?);
     try testing.expectEqual(chock_acp.Version.v2, chock_acp.negotiate(2).?);
     try testing.expectEqual(@as(?chock_acp.Version, null), chock_acp.negotiate(0));
+}
+
+test "only a selected allow option permits, and anything unreadable refuses" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    // The two that permit.
+    try testing.expect(Agent.permittedBy(arena,
+        \\{"outcome":{"outcome":"selected","optionId":"allow_once"}}
+    ));
+    try testing.expect(Agent.permittedBy(arena,
+        \\{"outcome":{"outcome":"selected","optionId":"allow_always"}}
+    ));
+
+    // The two that refuse.
+    try testing.expect(!Agent.permittedBy(arena,
+        \\{"outcome":{"outcome":"selected","optionId":"reject_once"}}
+    ));
+    try testing.expect(!Agent.permittedBy(arena,
+        \\{"outcome":{"outcome":"selected","optionId":"reject_always"}}
+    ));
+
+    // A client saying nobody answered. `lib/chock-policy` reads an unanswered
+    // question as deny, and this is the same reading.
+    try testing.expect(!Agent.permittedBy(arena, "{\"outcome\":{\"outcome\":\"cancelled\"}}"));
+
+    // Everything unreadable refuses. This is the direction that matters: a reply
+    // this cannot parse must never open an action nobody approved.
+    for ([_][]const u8{
+        "",
+        "null",
+        "{}",
+        "[]",
+        "not json",
+        "{\"outcome\":null}",
+        "{\"outcome\":{}}",
+        "{\"outcome\":{\"outcome\":\"selected\"}}",
+        "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"something-else\"}}",
+        "{\"outcome\":{\"outcome\":\"selected\",\"optionId\":42}}",
+        "{\"outcome\":{\"optionId\":\"allow_once\"}}",
+        "{\"optionId\":\"allow_once\"}",
+    }) |bad| {
+        try testing.expect(!Agent.permittedBy(arena, bad));
+    }
+}
+
+test "the option identifiers offered are the kinds the protocol names" {
+    // `permittedBy` reads the identifier as a kind, so an option offered under
+    // a name that is not one would be refused however the person answered.
+    for ([_][]const u8{ "allow_once", "allow_always", "reject_once" }) |offered| {
+        try testing.expect(chock_acp.common.PermissionKind.fromWireName(offered) != null);
+    }
+}
+
+test "a listing row is read by the name a summary uses, not a log envelope's" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    // What `chock daemon`'s `list` really answers with. The first draft looked
+    // for `session`, which is the log envelope's name, and listed nothing.
+    const row =
+        \\{"id":"01M3F8DT9Z5D43FPM36F1G3556","started_ms":1790439778623,"model":"a-model",
+        \\ "live":"idle","end":"errored","turns":1}
+    ;
+    try testing.expectEqualStrings("01M3F8DT9Z5D43FPM36F1G3556", listedSessionIn(arena, row).?);
+
+    // A row with no identifier, or one that is not an identifier, is skipped
+    // rather than listed as a session nobody can open.
+    try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{\"id\":\"nonsense\"}"));
+    try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{\"id\":7}"));
+    try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "{}"));
+    try testing.expectEqual(@as(?[]const u8, null), listedSessionIn(arena, "not json"));
 }
