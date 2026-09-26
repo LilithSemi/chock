@@ -32,7 +32,7 @@ read.
 | Kind | What it talks to | State |
 |---|---|---|
 | `self_hosted` | a SearXNG instance of your own | built |
-| `api` | a keyed vendor | built, Brave and Kagi |
+| `api` | a keyed vendor | built, Brave, Kagi and Exa |
 | `scrape` | a results page, read as HTML | built, DuckDuckGo |
 
 Leave the block out and the tool is still offered. It answers that no engine is
@@ -79,7 +79,7 @@ way.
 field names, so the kind alone does not say enough to read a reply, and a reader
 that guessed would hand the agent zero results rather than an error.
 
-A provider belongs to exactly one kind. `brave` and `kagi` are `api`, and
+A provider belongs to exactly one kind. `brave`, `kagi` and `exa` are `api`, and
 `duckduckgo` is `scrape`. Naming one beside a kind it does not belong to is
 refused, and the message says which kind it is for. `self_hosted` takes no
 provider at all: it means SearXNG, so its shape is already known.
@@ -136,6 +136,47 @@ A title or snippet from Kagi can hold HTML entities such as `&#39;`, because
 Kagi sends them and documents no way to turn them off. They reach the agent as
 written. Chock does not decode them: undoing markup that may not be there would
 corrupt a snippet that legitimately holds one.
+
+Exa is the third, and it searches differently: it retrieves by meaning rather
+than by keyword, so a query that describes the kind of page you want often finds
+one that a keyword search would miss.
+
+```zon
+.search = .{
+    .kind = "api",
+    .provider = "exa",
+    .base_url = "https://api.exa.ai",
+    .credential = "exa",
+}
+```
+
+Three things Chock asks Exa for, and three it refuses to.
+
+Chock asks for **highlights**, which are extracts of the page in the page's own
+words. That is Exa's equivalent of the snippet Brave and Kagi return, and a
+result with no extract would be a bare link.
+
+Chock never asks for **`text`**, which is the whole page. A search is approved
+under `web.search`; reading a page is approved under `net.fetch`, for the one
+host the agent named. Full page text arriving inside a search result would put a
+stranger's page in front of the model under an approval that was given for
+something else. [actions.md](actions.md) has both actions.
+
+Chock never asks for **`summary`**, which is written by a model at Exa. It would
+be text with no source to attribute it to, and everything the model reads from a
+search has to be something a person can go and check.
+
+Chock never asks for the **deep search modes**. Exa's `type` accepts `deep` and
+`deep-reasoning`, each of which is Exa running an agent of its own: unbounded
+work outside this session's budget, its policy table and its log. The mode is a
+constant in the request builder, so there is no way to name one.
+
+Exa bills each search and answers 402 when an account is out of credit, which is
+a different fact from a bad key or a rate limit, so the refusal says which.
+
+Its reply has two shapes: results, or a synthesis. Chock pins the request so the
+results shape is what comes back, and refuses a synthesis body rather than
+reading it as no results found.
 
 ### scrape
 
