@@ -101,6 +101,7 @@ pub const cache = @import("chock-core/cache.zig");
 /// that act and gone after it. **The lifetime is the whole of the security
 /// property.**
 pub const credentials = @import("chock-core/credentials.zig");
+pub const tool_secrets = @import("chock-core/tool_secrets.zig");
 /// The packages a project's own manifest declares, fetched on the host at
 /// session start and left in the workspace where the build looks for them.
 /// The sandbox has no network, so this is what makes a real build possible at
