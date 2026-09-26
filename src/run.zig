@@ -448,6 +448,12 @@ const Started = struct {
     nix_build: ?NixBuild,
     nix_caps: chock_policy.nix.Resolved,
     search: chock_policy.search.Search,
+    /// Which secret a tool call may be given, out of the project's own file.
+    /// Empty for a project that named none.
+    secrets: chock_policy.secrets.Block,
+    /// Where a granted secret is read from. Never mounted into a sandbox: see
+    /// `lib/chock-auth/store.zig`.
+    store: chock_auth.store.Store,
     /// The key itself, read out of the credential store, and not the name the
     /// `search` block gives. Null when the block names none, or when the store
     /// holds nothing under that name yet.
@@ -813,7 +819,10 @@ fn start(
     // The `credentials` block of the same file the providers came from, read
     // above. A store this platform does not have was refused when the file was
     // read, so nothing here has to check it again.
-    const driver = chock_auth.store.Driver{
+    // In the arena and not on this frame: a `Secrets` points at its own driver,
+    // and phase 3 reads a secret long after this function has returned.
+    const driver = try arena.create(chock_auth.store.Driver);
+    driver.* = .{
         .data_dir = data_dir,
         .store = config.credential_store,
         .env = env,
@@ -1057,6 +1066,8 @@ fn start(
     // reads. `--dev-shell` wins over the file for this one run.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
+
+    const project_secrets = try resolveSecrets(arena, io, project_root);
 
     const flake_inputs = fetchFlakeInputs(
         arena,
@@ -1402,6 +1413,8 @@ fn start(
         .nix_build = nix_build,
         .nix_caps = nix_caps,
         .search = search,
+        .secrets = project_secrets,
+        .store = store,
         .search_credential = search_credential,
         .backing = backing,
         .storage = storage,
@@ -2004,6 +2017,28 @@ fn loadSearchCredential(
         );
     }
     return held;
+}
+
+/// The `secrets` block is the project's alone. An operator layer would let
+/// somebody else decide what a project's tools may hold, and an org bundle is a
+/// ceiling that narrows, so neither one can add an entry here.
+fn resolveSecrets(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError!chock_policy.secrets.Block {
+    var diag: ?chock_policy.secrets.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    return chock_policy.secrets.load(arena, io, project_root, &diag) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the secrets block could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the secrets block could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
 }
 
 /// There is no project layer for `search`: it names the operator's own
@@ -4962,6 +4997,7 @@ const GiveLockedToAll = struct {
     plugins: *chock_core.plugin.Session,
     git: *GitToolRunner,
     nix: *NixBuildToolRunner,
+    secrets: *ToolSecrets,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
         return .{ .ptr = self, .vtable = &vtable };
@@ -4972,7 +5008,7 @@ const GiveLockedToAll = struct {
     fn giveFn(ptr: *anyopaque, locked: *chock_core.arbiter.Locked) void {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
-        giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, locked);
+        giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, self.secrets, locked);
     }
 };
 
@@ -4981,12 +5017,14 @@ fn giveLockedToAskers(
     plugin_session: *chock_core.plugin.Session,
     git_runner: *GitToolRunner,
     nix_runner: *NixBuildToolRunner,
+    secret_runner: *ToolSecrets,
     locked: *chock_core.arbiter.Locked,
 ) void {
     mcp_session.giveLocked(locked);
     plugin_session.giveLocked(locked);
     git_runner.giveLocked(locked);
     nix_runner.giveLocked(locked);
+    secret_runner.giveLocked(locked);
 }
 
 fn logNetworkSummary(
@@ -6864,6 +6902,399 @@ const GitToolRunner = struct {
         };
     }
 };
+
+/// What a project's `secrets` block gives one tool call, and the only place an
+/// entry becomes a value.
+///
+/// A decorator and a seam at once, for the reason `GitCredentials` is one. A
+/// value has to be asked about, read out of the store and put in a redaction
+/// slot, and all three want an allocator, an `Io` and the log's own handle.
+/// `tool_secrets.Seam.grant` is answered deep inside one call and holds none of
+/// them, so `arm` runs here, before the call is handed on, and `grant` is the
+/// lookup that follows it.
+const ToolSecrets = struct {
+    inner: chock_core.Loop.ToolRunner,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    store: chock_auth.store.Store,
+    block: chock_policy.secrets.Block,
+    asker: ?chock_core.arbiter.Asker = null,
+    /// One per secret a call may hold at once. A grant wanting more than there
+    /// are slots is refused: see `tool_secret_slots`.
+    slots: []chock_core.redact.Secret = &.{},
+
+    armed_call: ?[]u8 = null,
+    armed_action: []u8 = &.{},
+    env: []const []const u8 = &.{},
+    used: []chock_core.tool_secrets.Used = &.{},
+    filled: usize = 0,
+
+    fn runner(self: *ToolSecrets) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &runner_vtable };
+    }
+
+    fn seam(self: *ToolSecrets) chock_core.tool_secrets.Seam {
+        return .{ .ptr = self, .vtable = &seam_vtable };
+    }
+
+    fn giveLocked(self: *ToolSecrets, locked: *chock_core.arbiter.Locked) void {
+        if (self.asker) |*one| one.locked = locked;
+    }
+
+    const runner_vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    const seam_vtable = chock_core.tool_secrets.Seam.VTable{
+        .grant = grantFn,
+        .release = releaseFn,
+    };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        const self: *ToolSecrets = @ptrCast(@alignCast(ptr));
+
+        if (try self.arm(gpa, io, call, action)) |refusal| {
+            return .{
+                .call_id = try gpa.dupe(u8, call.call_id),
+                .output = refusal,
+                .is_error = true,
+                .truncated = false,
+            };
+        }
+        // Recorded after the call and not while arming, which is the trap
+        // `GitCredentials.record` documents: a call the loop has not returned
+        // from may not append.
+        defer self.finish(gpa, io);
+
+        return self.inner.dispatch(gpa, io, call, action);
+    }
+
+    fn finish(self: *ToolSecrets, gpa: std.mem.Allocator, io: std.Io) void {
+        self.record(gpa, io);
+        self.disarm();
+    }
+
+    /// Null when the call may run, and the refusal text when it may not.
+    ///
+    /// A secret the project granted and this run cannot produce refuses the
+    /// call rather than running it with the secret missing. A program that
+    /// authenticates would fail on its own anyway, in its own words, and an
+    /// agent reading that has every reason to go looking for a token elsewhere.
+    fn arm(
+        self: *ToolSecrets,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        std.debug.assert(self.armed_call == null);
+        if (self.block.entries.len == 0 or action.len == 0) return null;
+        // Only a command takes a grant today. An MCP server and a plugin hold
+        // one for their whole life rather than for one call, so they are given
+        // their secrets where they are started.
+        if (!std.mem.eql(u8, call.tool, "run_command")) return null;
+
+        // A background command is granted nothing, because it outlives the call
+        // it was started from. So it is not armed either: a question about a
+        // secret that will not be given is a question nobody should be asked.
+        // A call whose arguments do not parse is refused further down, and
+        // arming it would ask the same pointless question.
+        const parsed = std.json.parseFromSlice(
+            struct { background: ?bool = null },
+            gpa,
+            call.arguments,
+            .{ .ignore_unknown_fields = true },
+        ) catch return null;
+        defer parsed.deinit();
+        if (parsed.value.background orelse false) return null;
+
+        var wanted: std.ArrayList(chock_policy.secrets.Entry) = .empty;
+        defer wanted.deinit(gpa);
+        for (self.block.entries) |one| {
+            if (!chock_policy.table.patternMatches(one.to, action)) continue;
+            var already = false;
+            for (wanted.items) |seen| {
+                if (std.mem.eql(u8, seen.name, one.name)) already = true;
+            }
+            if (!already) try wanted.append(gpa, one);
+        }
+        if (wanted.items.len == 0) return null;
+
+        if (wanted.items.len > self.slots.len) {
+            return try std.fmt.allocPrint(
+                gpa,
+                "{s} was not run: the secrets block grants it {d} secrets and this session keeps " ++
+                    "{d} slots for keeping one out of the log. A secret with no slot would reach " ++
+                    "the log and the model, so the call is refused. Grant it fewer.\n",
+                .{ action, wanted.items.len, self.slots.len },
+            );
+        }
+
+        var env: std.ArrayList([]const u8) = .empty;
+        var used: std.ArrayList(chock_core.tool_secrets.Used) = .empty;
+        var refusal: ?[]u8 = null;
+        errdefer self.undo(&env, &used);
+
+        for (wanted.items) |one| {
+            refusal = try self.give(gpa, io, call, action, one, &env, &used);
+            if (refusal != null) break;
+        }
+
+        if (refusal) |text| {
+            self.undo(&env, &used);
+            return text;
+        }
+
+        const owned_env = try env.toOwnedSlice(self.gpa);
+        errdefer {
+            for (owned_env) |one| wipeAndFree(self.gpa, one);
+            self.gpa.free(owned_env);
+        }
+        const owned_used = try used.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(owned_used);
+        const owned_action = try self.gpa.dupe(u8, action);
+        errdefer self.gpa.free(owned_action);
+
+        self.armed_call = try self.gpa.dupe(u8, call.call_id);
+        self.env = owned_env;
+        self.used = owned_used;
+        self.armed_action = owned_action;
+        return null;
+    }
+
+    /// One entry, onto the end of `env` and `used`. The refusal text when this
+    /// one cannot be given, and then nothing was added.
+    fn give(
+        self: *ToolSecrets,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+        entry: chock_policy.secrets.Entry,
+        env: *std.ArrayList([]const u8),
+        used: *std.ArrayList(chock_core.tool_secrets.Used),
+    ) std.mem.Allocator.Error!?[]u8 {
+        if (entry.bind == .file) {
+            return try std.fmt.allocPrint(
+                gpa,
+                "{s} was not run: the secrets block binds the secret \"{s}\" as a file, and this " ++
+                    "version writes no file. Binding it as env gives the value to the program " ++
+                    "under {s} instead.\n",
+                .{ action, entry.name, entry.variable() },
+            );
+        }
+
+        switch (try self.permitted(gpa, io, call, entry)) {
+            .permitted => {},
+            .refused => |text| return text,
+        }
+
+        const value = switch (self.read(gpa, io, entry)) {
+            .held => |one| one,
+            .absent => return try std.fmt.allocPrint(
+                gpa,
+                "{s} was not run: the secrets block grants it the secret \"{s}\" and the " ++
+                    "credential store holds nothing under that name, so there was nothing to " ++
+                    "give it. Put it there and run this again:\n  chock login --tool-secret {s}\n",
+                .{ action, entry.name, entry.name },
+            ),
+            .failed => return try std.fmt.allocPrint(
+                gpa,
+                "{s} was not run: the secret \"{s}\" could not be read out of the credential " ++
+                    "store. This is a fault on this machine and not a refusal, and it was said " ++
+                    "in full on the terminal running chock.\n",
+                .{ action, entry.name },
+            ),
+        };
+        defer wipeAndFree(self.gpa, value);
+
+        const variable = entry.variable();
+        const named = try std.fmt.allocPrint(self.gpa, "{s}={s}", .{ variable, value });
+        errdefer wipeAndFree(self.gpa, named);
+
+        // Recorded before the entry is held, so no failure below can leave the
+        // caller with an entry to free that this one has freed already.
+        try used.append(self.gpa, .{
+            .name = entry.name,
+            .bind = @tagName(entry.bind),
+            .variable = variable,
+        });
+        try env.append(self.gpa, named);
+
+        // Filled before the entry can reach anything. Nothing reads the grant
+        // until `grant` answers, so there is no window rather than a short one.
+        self.slots[self.filled].value = named[variable.len + 1 ..];
+        self.filled += 1;
+        return null;
+    }
+
+    /// Everything one arming made, undone. Written once because a refusal and a
+    /// failure both reach it, and a refusal that left a slot filled would keep
+    /// redacting a value nothing holds any more.
+    fn undo(
+        self: *ToolSecrets,
+        env: *std.ArrayList([]const u8),
+        used: *std.ArrayList(chock_core.tool_secrets.Used),
+    ) void {
+        self.clearSlots();
+        for (env.items) |entry| wipeAndFree(self.gpa, entry);
+        env.deinit(self.gpa);
+        env.* = .empty;
+        used.deinit(self.gpa);
+        used.* = .empty;
+    }
+
+    const Outcome = union(enum) { permitted, refused: []u8 };
+
+    fn permitted(
+        self: *ToolSecrets,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        entry: chock_policy.secrets.Entry,
+    ) std.mem.Allocator.Error!Outcome {
+        const ask_action = try chock_policy.secrets.actionFor(gpa, entry.name);
+        defer gpa.free(ask_action);
+
+        const summary = try std.fmt.allocPrint(
+            gpa,
+            "give the secret {s} to {s}",
+            .{ entry.name, call.tool },
+        );
+        defer gpa.free(summary);
+
+        const detail = try std.fmt.allocPrint(
+            gpa,
+            "The secrets block of this project grants the secret \"{s}\" to {s}. It arrives as " ++
+                "{t}, under the name {s}, for this one call. The model is never shown the value, " ++
+                "and what the program prints is redacted before it reaches the log.\n",
+            .{ entry.name, entry.to, entry.bind, entry.variable() },
+        );
+        defer gpa.free(detail);
+
+        const answer = chock_core.arbiter.Asker.decide(self.asker, gpa, io, .{
+            .action = ask_action,
+            .summary = summary,
+            .detail = detail,
+            .reason = "",
+            .tool = call.tool,
+            .tool_call_id = call.call_id,
+            .source = request_source,
+        });
+        if (answer.permitted) return .permitted;
+
+        return .{ .refused = try chock_core.arbiter.refusalText(gpa, ask_action, answer) };
+    }
+
+    const request_source = "a secret this project granted";
+
+    const Read = union(enum) { held: []u8, absent, failed };
+
+    /// The name is read as the store spells it, with no prefix of Chock's own,
+    /// so a SecretSpec profile naming `GITHUB_TOKEN` is what a project's entry
+    /// names. A name cannot hold a colon, which is what Chock's own keys begin
+    /// with, so no entry can reach one.
+    fn read(
+        self: *ToolSecrets,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        entry: chock_policy.secrets.Entry,
+    ) Read {
+        var diag: ?chock_auth.store.Diagnostic = null;
+        defer if (diag) |*d| d.deinit(gpa);
+
+        const held = self.store.secrets.get(self.gpa, io, entry.name, &diag) catch |err| {
+            if (diag) |*d| {
+                tty.print(.err, "chock run: the secret \"{s}\" could not be read: {f}\n", .{ entry.name, d });
+            } else {
+                tty.print(.err, "chock run: the secret \"{s}\" could not be read: {t}\n", .{ entry.name, err });
+            }
+            return .failed;
+        };
+        return if (held) |one| .{ .held = one } else .absent;
+    }
+
+    fn grantFn(
+        ptr: *anyopaque,
+        tool: []const u8,
+        action: []const u8,
+        call_id: []const u8,
+    ) ?chock_core.tool_secrets.Grant {
+        const self: *ToolSecrets = @ptrCast(@alignCast(ptr));
+        const armed = self.armed_call orelse return null;
+        if (!std.mem.eql(u8, armed, call_id)) return null;
+        // The tool and the action as well as the call, so a grant cannot travel
+        // to anything but the one call it was armed for.
+        if (!std.mem.eql(u8, tool, "run_command")) return null;
+        if (!std.mem.eql(u8, action, self.armed_action)) return null;
+
+        return .{ .env = self.env, .used = self.used };
+    }
+
+    fn releaseFn(ptr: *anyopaque, call_id: []const u8) void {
+        const self: *ToolSecrets = @ptrCast(@alignCast(ptr));
+        const armed = self.armed_call orelse return;
+        if (!std.mem.eql(u8, armed, call_id)) return;
+        // The values alone. `record` has not run yet and it reads what was
+        // used, and a value is the thing that must stop existing the moment the
+        // program has ended.
+        self.clearSlots();
+        for (self.env) |entry| wipeAndFree(self.gpa, entry);
+        self.gpa.free(self.env);
+        self.env = &.{};
+    }
+
+    /// One `secret.used` per secret the call held. The value is not in it: a
+    /// log holding the value would undo the whole arrangement.
+    fn record(self: *ToolSecrets, gpa: std.mem.Allocator, io: std.Io) void {
+        if (self.armed_call == null) return;
+        const handle = (if (self.asker) |one| one.locked else null) orelse return;
+        const time_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+
+        for (self.used) |one| {
+            _ = handle.append(gpa, io, .{ .secret_used = .{
+                .name = one.name,
+                .action = self.armed_action,
+                .bind = one.bind,
+                .variable = one.variable,
+            } }, time_ms) catch return;
+        }
+    }
+
+    fn disarm(self: *ToolSecrets) void {
+        self.clearSlots();
+        if (self.env.len != 0) {
+            for (self.env) |entry| wipeAndFree(self.gpa, entry);
+            self.gpa.free(self.env);
+            self.env = &.{};
+        }
+        if (self.used.len != 0) {
+            self.gpa.free(self.used);
+            self.used = &.{};
+        }
+        if (self.armed_action.len != 0) self.gpa.free(self.armed_action);
+        self.armed_action = &.{};
+        if (self.armed_call) |one| self.gpa.free(one);
+        self.armed_call = null;
+    }
+
+    fn clearSlots(self: *ToolSecrets) void {
+        for (self.slots[0..self.filled]) |*slot| slot.value = "";
+        self.filled = 0;
+    }
+};
+
+/// The bytes are gone before the allocator can hand them to anybody else. The
+/// `@constCast` is sound: every caller owns what it passes and allocated it
+/// mutable.
+fn wipeAndFree(gpa: std.mem.Allocator, value: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(value));
+    gpa.free(value);
+}
 
 /// A language server is long lived and stateful and the registry knows nothing
 /// that outlives one call, so the caller that owns the session holds it.
@@ -9596,7 +10027,19 @@ fn runSession(
         .context = context,
     };
 
-    var git_aware = GitToolRunner{ .inner = tool_runner.runner() };
+    var tool_secrets = ToolSecrets{
+        .inner = tool_runner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = started.store,
+        .block = started.secrets,
+        .slots = toolSecretSlots(started.redact),
+    };
+    defer tool_secrets.disarm();
+
+    tool_runner.context.secrets = tool_secrets.seam();
+
+    var git_aware = GitToolRunner{ .inner = tool_secrets.runner() };
 
     var language_server = chock_core.lsp.Session{};
 
@@ -9891,6 +10334,8 @@ fn runSession(
 
     git_aware.asker = .{ .arbiter = session_arbiter.arbiter() };
 
+    tool_secrets.asker = .{ .arbiter = session_arbiter.arbiter() };
+
     nix_build.asker = .{ .arbiter = session_arbiter.arbiter() };
     nix_build.rule = .{
         .policy = started.policy,
@@ -9956,6 +10401,7 @@ fn runSession(
         .plugins = &plugin_state.session,
         .git = &git_aware,
         .nix = &nix_build,
+        .secrets = &tool_secrets,
     };
 
     var session_handback = SessionHandback{
@@ -15396,7 +15842,7 @@ test "a call to an MCP tool is answered here and never reaches the runners below
     try std.testing.expectEqualStrings("call7", result.call_id);
 }
 
-test "one locked handle reaches all four askers, and one that missed it runs nothing" {
+test "one locked handle reaches every asker, and one that missed it runs nothing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -15429,7 +15875,17 @@ test "one locked handle reaches all four askers, and one that missed it runs not
     plugin_state.session.asker = .{ .arbiter = log.asker().arbiter };
 
     var inner = CountingToolRunner{};
-    var git_aware = GitToolRunner{ .inner = inner.runner(), .asker = .{ .arbiter = log.asker().arbiter } };
+    // An empty block reads no store, so this one never asks its driver for
+    // anything and needs none.
+    var tool_secrets = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = undefined,
+        .block = .{},
+        .asker = .{ .arbiter = log.asker().arbiter },
+    };
+    var git_aware = GitToolRunner{ .inner = tool_secrets.runner(), .asker = .{ .arbiter = log.asker().arbiter } };
     var mcp_aware = McpToolRunner{ .inner = git_aware.runner(), .state = &mcp_state };
     var plugin_aware = PluginToolRunner{ .inner = mcp_aware.runner(), .state = &plugin_state };
 
@@ -15482,15 +15938,20 @@ test "one locked handle reaches all four askers, and one that missed it runs not
     try std.testing.expectEqual(@as(usize, 0), inner.calls);
 
     try std.testing.expect(nix_build.asker.?.locked == null);
+    try std.testing.expect(tool_secrets.asker.?.locked == null);
 
     giveLockedToAskers(
         &mcp_state.session,
         &plugin_state.session,
         &git_aware,
         &nix_build,
+        &tool_secrets,
         &log.locked,
     );
     try std.testing.expect(nix_build.asker.?.locked != null);
+    // Without this a secret would be given and `secret.used` would reach no
+    // log, which is the one part of the arrangement nothing else can replace.
+    try std.testing.expect(tool_secrets.asker.?.locked != null);
 
     const from_server = try plugin_aware.runner().dispatch(gpa, io, .{
         .call_id = "call2",
@@ -17822,4 +18283,562 @@ test "a git daemon host is named in the build namespace, with its own port" {
     try std.testing.expect(
         std.mem.indexOf(u8, said, "nix.net.build.org.sourceware.9418") != null,
     );
+}
+
+/// A store that holds what a test put in it, and fails on demand.
+const FakeSecretStore = struct {
+    const Pair = struct { name: []const u8, value: []const u8 };
+
+    held: []const Pair = &.{},
+    fail: bool = false,
+    reads: usize = 0,
+
+    fn store(self: *FakeSecretStore) chock_auth.store.Store {
+        return .{ .data_dir = "/nowhere", .secrets = .{ .ptr = self, .vtable = &vtable } };
+    }
+
+    const vtable = chock_auth.store.Secrets.VTable{ .get = getFn, .put = putFn };
+
+    fn getFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        name: []const u8,
+        diag: ?*?chock_auth.store.Diagnostic,
+    ) chock_auth.store.Error!?[]u8 {
+        _ = io;
+        _ = diag;
+        const self: *FakeSecretStore = @ptrCast(@alignCast(ptr));
+        self.reads += 1;
+        if (self.fail) return error.StoreUnreadable;
+        for (self.held) |one| {
+            if (std.mem.eql(u8, one.name, name)) return try gpa.dupe(u8, one.value);
+        }
+        return null;
+    }
+
+    fn putFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        name: []const u8,
+        value: []const u8,
+        diag: ?*?chock_auth.store.Diagnostic,
+    ) chock_auth.store.Error!void {
+        _ = ptr;
+        _ = gpa;
+        _ = io;
+        _ = name;
+        _ = value;
+        _ = diag;
+        return error.StoreUnreadable;
+    }
+};
+
+/// Reads the grant the way `chock_core.tools.runCommand` reads it: once, inside
+/// the call, and released when the call ends. It keeps what it saw, and what the
+/// redaction slots held at that moment, which is the ordering that matters.
+const GrantReadingRunner = struct {
+    seam: chock_core.tool_secrets.Seam,
+    slots: []const chock_core.redact.Secret,
+
+    calls: usize = 0,
+    granted: usize = 0,
+    saw_env: [4][128]u8 = undefined,
+    saw_env_len: [4]usize = .{ 0, 0, 0, 0 },
+    saw_used: usize = 0,
+    slot_held: bool = false,
+    released: usize = 0,
+
+    fn runner(self: *GrantReadingRunner) chock_core.Loop.ToolRunner {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = chock_core.Loop.ToolRunner.VTable{ .dispatch = dispatchFn };
+
+    fn dispatchFn(
+        ptr: *anyopaque,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        call: chock_proto.event.ToolCall,
+        action: []const u8,
+    ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        _ = io;
+        const self: *GrantReadingRunner = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        defer {
+            self.seam.release(call.call_id);
+            self.released += 1;
+        }
+
+        if (self.seam.grant(call.tool, action, call.call_id)) |given| {
+            self.granted += 1;
+            self.saw_used = given.used.len;
+            for (given.env, 0..) |entry, index| {
+                if (index >= self.saw_env_len.len) break;
+                const kept = @min(entry.len, self.saw_env[index].len);
+                @memcpy(self.saw_env[index][0..kept], entry[0..kept]);
+                self.saw_env_len[index] = kept;
+            }
+            // Read here and not after the call: a slot filled only once the
+            // program had ended would leave a window where the value could
+            // reach the log.
+            for (self.slots) |slot| {
+                if (slot.value.len != 0) self.slot_held = true;
+            }
+        }
+
+        return .{
+            .call_id = try gpa.dupe(u8, call.call_id),
+            .output = try gpa.dupe(u8, "ran"),
+            .is_error = false,
+            .truncated = false,
+        };
+    }
+
+    fn envAt(self: *const GrantReadingRunner, index: usize) []const u8 {
+        return self.saw_env[index][0..self.saw_env_len[index]];
+    }
+};
+
+const secret_call = chock_proto.event.ToolCall{
+    .call_id = "call-1",
+    .tool = "run_command",
+    .arguments = "{\"argv\":[\"gh\",\"issue\",\"list\"]}",
+};
+
+test "a granted secret reaches the call, and the log says it was used without the value" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const value = "gho_not_a_real_token_0123456789";
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
+
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var subject = ToolSecrets{
+        .inner = undefined,
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    var reader = GrantReadingRunner{ .seam = subject.seam(), .slots = &slots };
+    subject.inner = reader.runner();
+
+    const result = try subject.runner().dispatch(gpa, io, secret_call, "exec.path.gh");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), reader.granted);
+    try testing.expectEqualStrings("GITHUB_TOKEN=" ++ value, reader.envAt(0));
+    try testing.expectEqual(@as(usize, 1), reader.saw_used);
+    // The slot was filled while the call held the value, not after it.
+    try testing.expect(reader.slot_held);
+
+    // Released when the call ended, so nothing is left redacting a value that
+    // no longer exists.
+    try testing.expectEqual(@as(usize, 1), reader.released);
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+
+    const written = log.backing.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, written, "secret.used") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "GITHUB_TOKEN") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "exec.path.gh") != null);
+    // The one thing the log must never hold.
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, value));
+}
+
+test "an action the block does not name is given nothing, and the store is not read" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var subject = ToolSecrets{
+        .inner = undefined,
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    var reader = GrantReadingRunner{ .seam = subject.seam(), .slots = &slots };
+    subject.inner = reader.runner();
+
+    const result = try subject.runner().dispatch(gpa, io, .{
+        .call_id = "call-2",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"curl\",\"https://example.com\"]}",
+    }, "exec.path.curl");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), reader.calls);
+    try testing.expectEqual(@as(usize, 0), reader.granted);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+    try testing.expect(std.mem.indexOf(u8, log.backing.bytes.items, "secret.used") == null);
+}
+
+test "a secret the store does not hold refuses the call and says how to put it there" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var empty = FakeSecretStore{};
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = empty.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, secret_call, "exec.path.gh");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.output, "chock login --tool-secret GITHUB_TOKEN") != null);
+    // Nothing ran, and nothing was left armed.
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+    try testing.expectEqual(@as(?[]u8, null), subject.armed_call);
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+}
+
+test "a refused ask refuses the call, and no slot is left holding a value" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const value = "gho_not_a_real_token_0123456789";
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var refusing = CountingArbiter{ .permitted = false };
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = refusing.asker(&log.locked),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, secret_call, "exec.path.gh");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(result.is_error);
+    try testing.expectEqual(@as(usize, 1), refusing.asks);
+    try testing.expectEqualStrings("secret.use.GITHUB_TOKEN", refusing.action.read());
+    // Refused before the store was read at all, so the value never existed.
+    try testing.expectEqual(@as(usize, 0), held.reads);
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+}
+
+test "more secrets than there are slots is refused rather than served unprotected" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(gpa,
+        \\.{ .secrets = .{
+        \\    .{ .name = "ONE", .to = "exec.path.gh" },
+        \\    .{ .name = "TWO", .to = "exec.path.gh" },
+        \\} }
+    , null);
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{
+        .{ .name = "ONE", .value = "not-a-real-one-0123456789" },
+        .{ .name = "TWO", .value = "not-a-real-two-0123456789" },
+    } };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, secret_call, "exec.path.gh");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.output, "Grant it fewer") != null);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+}
+
+test "a secret bound as a file is refused while no file is written" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GCP_KEY\", .to = \"exec.path.gcloud\", .bind = \"file\", " ++
+            ".as = \"GOOGLE_APPLICATION_CREDENTIALS\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GCP_KEY", .value = "not-a-real-key-0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, .{
+        .call_id = "call-3",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"gcloud\",\"auth\",\"list\"]}",
+    }, "exec.path.gcloud");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    // Refused, and not quietly given the value where a path belongs: a program
+    // reading that name opens it as a file.
+    try testing.expect(result.is_error);
+    try testing.expect(std.mem.indexOf(u8, result.output, "writes no file") != null);
+    try testing.expectEqual(@as(usize, 0), inner.calls);
+}
+
+test "a grant reaches the one call it was armed for and nothing else" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var subject = ToolSecrets{
+        .inner = undefined,
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    var inner = CountingToolRunner{};
+    subject.inner = inner.runner();
+
+    try testing.expectEqual(@as(?[]u8, null), subject.armed_call);
+    try testing.expectEqual(
+        @as(?chock_core.tool_secrets.Grant, null),
+        subject.seam().grant("run_command", "exec.path.gh", "call-1"),
+    );
+
+    try testing.expectEqual(@as(?[]u8, null), try subject.arm(gpa, io, secret_call, "exec.path.gh"));
+    try testing.expect(subject.seam().grant("run_command", "exec.path.gh", "call-1") != null);
+
+    // Another call, another tool, and another action all get nothing.
+    try testing.expectEqual(
+        @as(?chock_core.tool_secrets.Grant, null),
+        subject.seam().grant("run_command", "exec.path.gh", "call-9"),
+    );
+    try testing.expectEqual(
+        @as(?chock_core.tool_secrets.Grant, null),
+        subject.seam().grant("read_file", "exec.path.gh", "call-1"),
+    );
+    try testing.expectEqual(
+        @as(?chock_core.tool_secrets.Grant, null),
+        subject.seam().grant("run_command", "exec.path.curl", "call-1"),
+    );
+
+    subject.seam().release("call-1");
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+    // The record survives the release, because the log is written after the
+    // call and it names what was used.
+    try testing.expectEqual(@as(usize, 1), subject.used.len);
+    subject.record(gpa, io);
+    try testing.expect(std.mem.indexOf(u8, log.backing.bytes.items, "secret.used") != null);
+}
+
+test "a tool that is not a command arms nothing, whatever the block says" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    // An MCP server and a plugin hold a secret for their whole life, so a
+    // per-call grant is the wrong shape for them and is not quietly given.
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"mcp.github.*\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = log.asker(),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, .{
+        .call_id = "call-4",
+        .tool = "create_issue",
+        .arguments = "{}",
+    }, "mcp.github.tool.create_issue");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), inner.calls);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+}
+
+test "a background command is not armed, so nobody is asked about a secret it cannot hold" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 2;
+
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+
+    var asked = CountingArbiter{ .permitted = true };
+    var inner = CountingToolRunner{};
+    var subject = ToolSecrets{
+        .inner = inner.runner(),
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .asker = asked.asker(&log.locked),
+        .slots = &slots,
+    };
+    defer subject.disarm();
+
+    const result = try subject.runner().dispatch(gpa, io, .{
+        .call_id = "call-5",
+        .tool = "run_command",
+        .arguments = "{\"argv\":[\"gh\",\"run\",\"watch\"],\"background\":true}",
+    }, "exec.path.gh");
+    defer gpa.free(result.call_id);
+    defer gpa.free(result.output);
+
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 0), asked.asks);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+    try testing.expectEqual(@as(?[]u8, null), subject.armed_call);
 }
