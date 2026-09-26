@@ -6947,6 +6947,10 @@ const ToolSecrets = struct {
     armed_call: ?[]u8 = null,
     armed_action: []u8 = &.{},
     env: []const []const u8 = &.{},
+    /// A file bind's value, held here rather than in an environment entry: the
+    /// variable will name a path, so the value needs a buffer of its own for the
+    /// redaction slot to point into.
+    files: []chock_core.tool_secrets.File = &.{},
     used: []chock_core.tool_secrets.Used = &.{},
     filled: usize = 0,
 
@@ -7055,40 +7059,53 @@ const ToolSecrets = struct {
             );
         }
 
-        var env: std.ArrayList([]const u8) = .empty;
-        var used: std.ArrayList(chock_core.tool_secrets.Used) = .empty;
+        var held: Held = .{};
         var refusal: ?[]u8 = null;
-        errdefer self.undo(&env, &used);
+        errdefer self.undo(&held);
 
         for (wanted.items) |one| {
-            refusal = try self.give(gpa, io, call, action, one, &env, &used);
+            refusal = try self.give(gpa, io, call, action, one, &held);
             if (refusal != null) break;
         }
 
         if (refusal) |text| {
-            self.undo(&env, &used);
+            self.undo(&held);
             return text;
         }
 
-        const owned_env = try env.toOwnedSlice(self.gpa);
+        const owned_env = try held.env.toOwnedSlice(self.gpa);
         errdefer {
             for (owned_env) |one| wipeAndFree(self.gpa, one);
             self.gpa.free(owned_env);
         }
-        const owned_used = try used.toOwnedSlice(self.gpa);
+        const owned_files = try held.files.toOwnedSlice(self.gpa);
+        errdefer {
+            for (owned_files) |one| wipeAndFree(self.gpa, one.value);
+            self.gpa.free(owned_files);
+        }
+        const owned_used = try held.used.toOwnedSlice(self.gpa);
         errdefer self.gpa.free(owned_used);
         const owned_action = try self.gpa.dupe(u8, action);
         errdefer self.gpa.free(owned_action);
 
         self.armed_call = try self.gpa.dupe(u8, call.call_id);
         self.env = owned_env;
+        self.files = owned_files;
         self.used = owned_used;
         self.armed_action = owned_action;
         return null;
     }
 
-    /// One entry, onto the end of `env` and `used`. The refusal text when this
-    /// one cannot be given, and then nothing was added.
+    /// What one arming builds, before any of it is owned by the seam. One struct
+    /// because every failure and every refusal undoes all three together.
+    const Held = struct {
+        env: std.ArrayList([]const u8) = .empty,
+        files: std.ArrayList(chock_core.tool_secrets.File) = .empty,
+        used: std.ArrayList(chock_core.tool_secrets.Used) = .empty,
+    };
+
+    /// One entry, onto the end of what this arming holds. The refusal text when
+    /// this one cannot be given, and then nothing was added.
     fn give(
         self: *ToolSecrets,
         gpa: std.mem.Allocator,
@@ -7096,19 +7113,8 @@ const ToolSecrets = struct {
         call: chock_proto.event.ToolCall,
         action: []const u8,
         entry: chock_policy.secrets.Entry,
-        env: *std.ArrayList([]const u8),
-        used: *std.ArrayList(chock_core.tool_secrets.Used),
+        held: *Held,
     ) std.mem.Allocator.Error!?[]u8 {
-        if (entry.bind == .file) {
-            return try std.fmt.allocPrint(
-                gpa,
-                "{s} was not run: the secrets block binds the secret \"{s}\" as a file, and this " ++
-                    "version writes no file. Binding it as env gives the value to the program " ++
-                    "under {s} instead.\n",
-                .{ action, entry.name, entry.variable() },
-            );
-        }
-
         switch (try self.permitted(gpa, io, call, entry)) {
             .permitted => {},
             .refused => |text| return text,
@@ -7131,24 +7137,36 @@ const ToolSecrets = struct {
                 .{ action, entry.name },
             ),
         };
-        defer wipeAndFree(self.gpa, value);
-
         const variable = entry.variable();
-        const named = try std.fmt.allocPrint(self.gpa, "{s}={s}", .{ variable, value });
-        errdefer wipeAndFree(self.gpa, named);
 
-        // Recorded before the entry is held, so no failure below can leave the
-        // caller with an entry to free that this one has freed already.
-        try used.append(self.gpa, .{
+        // Recorded first, so no failure below can leave the caller an entry to
+        // free that this one has freed already.
+        try held.used.append(self.gpa, .{
             .name = entry.name,
             .bind = @tagName(entry.bind),
             .variable = variable,
         });
-        try env.append(self.gpa, named);
+
+        // The value itself for a file bind, because the variable will name a
+        // path and the redaction slot has to point at the value.
+        const anchor = switch (entry.bind) {
+            .env => named: {
+                defer wipeAndFree(self.gpa, value);
+                const named = try std.fmt.allocPrint(self.gpa, "{s}={s}", .{ variable, value });
+                errdefer wipeAndFree(self.gpa, named);
+                try held.env.append(self.gpa, named);
+                break :named named[variable.len + 1 ..];
+            },
+            .file => file: {
+                errdefer wipeAndFree(self.gpa, value);
+                try held.files.append(self.gpa, .{ .variable = variable, .value = value });
+                break :file value;
+            },
+        };
 
         // Filled before the entry can reach anything. Nothing reads the grant
         // until `grant` answers, so there is no window rather than a short one.
-        self.slots[self.filled].value = named[variable.len + 1 ..];
+        self.slots[self.filled].value = anchor;
         self.filled += 1;
         return null;
     }
@@ -7156,17 +7174,14 @@ const ToolSecrets = struct {
     /// Everything one arming made, undone. Written once because a refusal and a
     /// failure both reach it, and a refusal that left a slot filled would keep
     /// redacting a value nothing holds any more.
-    fn undo(
-        self: *ToolSecrets,
-        env: *std.ArrayList([]const u8),
-        used: *std.ArrayList(chock_core.tool_secrets.Used),
-    ) void {
+    fn undo(self: *ToolSecrets, held: *Held) void {
         self.clearSlots();
-        for (env.items) |entry| wipeAndFree(self.gpa, entry);
-        env.deinit(self.gpa);
-        env.* = .empty;
-        used.deinit(self.gpa);
-        used.* = .empty;
+        for (held.env.items) |entry| wipeAndFree(self.gpa, entry);
+        held.env.deinit(self.gpa);
+        for (held.files.items) |one| wipeAndFree(self.gpa, one.value);
+        held.files.deinit(self.gpa);
+        held.used.deinit(self.gpa);
+        held.* = .{};
     }
 
     const Outcome = union(enum) { permitted, refused: []u8 };
@@ -7253,7 +7268,7 @@ const ToolSecrets = struct {
         if (!std.mem.eql(u8, tool, "run_command")) return null;
         if (!std.mem.eql(u8, action, self.armed_action)) return null;
 
-        return .{ .env = self.env, .used = self.used };
+        return .{ .env = self.env, .files = self.files, .used = self.used };
     }
 
     fn releaseFn(ptr: *anyopaque, call_id: []const u8) void {
@@ -7264,9 +7279,18 @@ const ToolSecrets = struct {
         // used, and a value is the thing that must stop existing the moment the
         // program has ended.
         self.clearSlots();
+        self.forget();
+    }
+
+    /// The values alone, wiped and freed. What `record` reads is left alone,
+    /// because a log is written after the call and names what was used.
+    fn forget(self: *ToolSecrets) void {
         for (self.env) |entry| wipeAndFree(self.gpa, entry);
-        self.gpa.free(self.env);
+        if (self.env.len != 0) self.gpa.free(self.env);
         self.env = &.{};
+        for (self.files) |one| wipeAndFree(self.gpa, one.value);
+        if (self.files.len != 0) self.gpa.free(self.files);
+        self.files = &.{};
     }
 
     /// One `secret.used` per secret the call held. The value is not in it: a
@@ -7288,11 +7312,7 @@ const ToolSecrets = struct {
 
     fn disarm(self: *ToolSecrets) void {
         self.clearSlots();
-        if (self.env.len != 0) {
-            for (self.env) |entry| wipeAndFree(self.gpa, entry);
-            self.gpa.free(self.env);
-            self.env = &.{};
-        }
+        self.forget();
         if (self.used.len != 0) {
             self.gpa.free(self.used);
             self.used = &.{};
@@ -18557,6 +18577,12 @@ const GrantReadingRunner = struct {
     granted: usize = 0,
     saw_env: [4][128]u8 = undefined,
     saw_env_len: [4]usize = .{ 0, 0, 0, 0 },
+    saw_env_count: usize = 0,
+    saw_files: usize = 0,
+    saw_file_variable: [4][64]u8 = undefined,
+    saw_file_variable_len: [4]usize = .{ 0, 0, 0, 0 },
+    saw_file_value: [4][128]u8 = undefined,
+    saw_file_value_len: [4]usize = .{ 0, 0, 0, 0 },
     saw_used: usize = 0,
     slot_held: bool = false,
     released: usize = 0,
@@ -18585,11 +18611,23 @@ const GrantReadingRunner = struct {
         if (self.seam.grant(call.tool, action, call.call_id)) |given| {
             self.granted += 1;
             self.saw_used = given.used.len;
+            self.saw_env_count = given.env.len;
+            self.saw_files = given.files.len;
             for (given.env, 0..) |entry, index| {
                 if (index >= self.saw_env_len.len) break;
                 const kept = @min(entry.len, self.saw_env[index].len);
                 @memcpy(self.saw_env[index][0..kept], entry[0..kept]);
                 self.saw_env_len[index] = kept;
+            }
+            for (given.files, 0..) |one, index| {
+                if (index >= self.saw_files) break;
+                if (index >= self.saw_file_value_len.len) break;
+                const name_kept = @min(one.variable.len, self.saw_file_variable[index].len);
+                @memcpy(self.saw_file_variable[index][0..name_kept], one.variable[0..name_kept]);
+                self.saw_file_variable_len[index] = name_kept;
+                const kept = @min(one.value.len, self.saw_file_value[index].len);
+                @memcpy(self.saw_file_value[index][0..kept], one.value[0..kept]);
+                self.saw_file_value_len[index] = kept;
             }
             // Read here and not after the call: a slot filled only once the
             // program had ended would leave a window where the value could
@@ -18609,6 +18647,14 @@ const GrantReadingRunner = struct {
 
     fn envAt(self: *const GrantReadingRunner, index: usize) []const u8 {
         return self.saw_env[index][0..self.saw_env_len[index]];
+    }
+
+    fn fileVariable(self: *const GrantReadingRunner, index: usize) []const u8 {
+        return self.saw_file_variable[index][0..self.saw_file_variable_len[index]];
+    }
+
+    fn fileValue(self: *const GrantReadingRunner, index: usize) []const u8 {
+        return self.saw_file_value[index][0..self.saw_file_value_len[index]];
     }
 };
 
@@ -18854,7 +18900,7 @@ test "more secrets than there are slots is refused rather than served unprotecte
     try testing.expectEqual(@as(usize, 0), inner.calls);
 }
 
-test "a secret bound as a file is refused while no file is written" {
+test "a secret bound as a file arrives as a file, and the variable names its path" {
     const gpa = testing.allocator;
     const io = testing.io;
 
@@ -18873,9 +18919,8 @@ test "a secret bound as a file is refused while no file is written" {
     defer log.deinit(io);
     try log.arm(io);
 
-    var inner = CountingToolRunner{};
     var subject = ToolSecrets{
-        .inner = inner.runner(),
+        .inner = undefined,
         .gpa = gpa,
         .io = io,
         .store = held.store(),
@@ -18885,6 +18930,9 @@ test "a secret bound as a file is refused while no file is written" {
     };
     defer subject.disarm();
 
+    var reader = GrantReadingRunner{ .seam = subject.seam(), .slots = &slots };
+    subject.inner = reader.runner();
+
     const result = try subject.runner().dispatch(gpa, io, .{
         .call_id = "call-3",
         .tool = "run_command",
@@ -18893,11 +18941,24 @@ test "a secret bound as a file is refused while no file is written" {
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
-    // Refused, and not quietly given the value where a path belongs: a program
-    // reading that name opens it as a file.
-    try testing.expect(result.is_error);
-    try testing.expect(std.mem.indexOf(u8, result.output, "writes no file") != null);
-    try testing.expectEqual(@as(usize, 0), inner.calls);
+    try testing.expect(!result.is_error);
+    try testing.expectEqual(@as(usize, 1), reader.granted);
+
+    // The value travels as a file and never as an environment entry: naming the
+    // value where a program expects a path would make it open the token.
+    try testing.expectEqual(@as(usize, 0), reader.saw_env_count);
+    try testing.expectEqual(@as(usize, 1), reader.saw_files);
+    try testing.expectEqualStrings("GOOGLE_APPLICATION_CREDENTIALS", reader.fileVariable(0));
+    try testing.expectEqualStrings("not-a-real-key-0123456789", reader.fileValue(0));
+
+    // And the slot held the value while the call did, so what the program prints
+    // is redacted the same as any other secret.
+    try testing.expect(reader.slot_held);
+    for (slots) |slot| try testing.expectEqualStrings("", slot.value);
+
+    const written = log.backing.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, written, "\"bind\":\"file\"") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, "not-a-real-key-0123456789"));
 }
 
 test "a grant reaches the one call it was armed for and nothing else" {
