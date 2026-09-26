@@ -17,6 +17,9 @@
 //!   holds `negotiate`, which picks the version to answer a client with.
 //! * `v1.zig` and `v2.zig` are each version's method table, update variants and
 //!   tool call status.
+//! * `update.zig` is one model of what Chock has to say during a turn, and the
+//!   encoder for each version. It is where every difference between the two
+//!   update streams is spent.
 //!
 //! Version 1 is what clients speak: it is released at 1.9.1, and the Claude
 //! adapter, the reference for wrapping a harness like this one, declares
@@ -42,6 +45,7 @@ pub const jsonrpc = @import("chock-acp/jsonrpc.zig");
 pub const common = @import("chock-acp/common.zig");
 pub const v1 = @import("chock-acp/v1.zig");
 pub const v2 = @import("chock-acp/v2.zig");
+pub const update = @import("chock-acp/update.zig");
 
 pub const Version = common.Version;
 pub const negotiate = common.negotiate;
