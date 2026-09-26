@@ -170,6 +170,17 @@ pub fn actionInto(buffer: []u8, server: []const u8, tool: []const u8) ?[]const u
     }) catch null;
 }
 
+/// Server "github" gives `mcp.github.*`, the pattern that reaches everything one
+/// server can do.
+///
+/// A pattern and not an action, for the one caller that has to read the policy
+/// before the server has said what tools it has: what a server is given at
+/// start cannot wait for a tool name.
+pub fn namespaceInto(buffer: []u8, server: []const u8) ?[]const u8 {
+    if (!nameIsUsable(server)) return null;
+    return std.fmt.bufPrint(buffer, action_prefix ++ ".{s}.*", .{server}) catch null;
+}
+
 /// Server "github" gives `mcp.github.network`. Allow alone reaches nothing: the
 /// broker still refuses every connect that no `net.connect` rule covers.
 pub fn networkActionInto(buffer: []u8, server: []const u8) ?[]const u8 {
@@ -989,6 +1000,33 @@ fn freeSettings(gpa: std.mem.Allocator, settings: []const Settings) void {
         gpa.free(one.command);
     }
     gpa.free(settings);
+}
+
+test "a server's namespace is the pattern that reaches everything it can do" {
+    var buffer: [max_action_bytes]u8 = undefined;
+
+    const namespace = namespaceInto(&buffer, "github").?;
+    try testing.expectEqualStrings("mcp.github.*", namespace);
+    try testing.expect(chock_policy.table.patternIsWellFormed(namespace));
+
+    // Every action this server can carry is under it, and another server's is
+    // not, which is what a caller reading the policy at start relies on.
+    var second: [max_action_bytes]u8 = undefined;
+    try testing.expect(chock_policy.table.patternMatches(
+        namespace,
+        actionInto(&second, "github", "create_issue").?,
+    ));
+    try testing.expect(chock_policy.table.patternMatches(
+        namespace,
+        networkActionInto(&second, "github").?,
+    ));
+    try testing.expect(!chock_policy.table.patternMatches(
+        namespace,
+        actionInto(&second, "githubbing", "x").?,
+    ));
+
+    try testing.expect(namespaceInto(&buffer, "") == null);
+    try testing.expect(namespaceInto(&buffer, "a.b") == null);
 }
 
 test "a tool action names the server and the tool, and a tool cannot name the network rule" {
