@@ -88,6 +88,9 @@ pub const Update = union(enum) {
     /// The whole plan, not a change to it. See this file's own note.
     plan: []const PlanStep,
     usage: Usage,
+    /// What this session is about, in one line. Untrusted text: a client cuts it
+    /// to length and takes out whatever drives a terminal.
+    title: []const u8,
 };
 
 /// The `params` of a `session/update` notification, in `version`'s spelling.
@@ -107,6 +110,7 @@ pub fn encode(
         .tool => |one| try tool(arena, version, session_id, one),
         .plan => |steps| try plan(arena, version, session_id, steps),
         .usage => |one| try usage(arena, version, session_id, one),
+        .title => |text| try title(arena, version, session_id, text),
     };
 }
 
@@ -256,6 +260,23 @@ fn usage(
                 .amount = money,
                 .currency = one.currency,
             } else null,
+        },
+    }, .{});
+}
+
+fn title(
+    arena: std.mem.Allocator,
+    version: Version,
+    session_id: []const u8,
+    text: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    _ = version;
+    // Both versions spell this the same, and every member of it is optional.
+    return std.json.Stringify.valueAlloc(arena, .{
+        .sessionId = session_id,
+        .update = .{
+            .sessionUpdate = "session_info_update",
+            .title = text,
         },
     }, .{});
 }
@@ -438,6 +459,7 @@ test "every update is something both versions can be asked for" {
         .{ .tool = .{ .id = "c", .title = "t", .phase = .finished } },
         .{ .plan = &.{} },
         .{ .usage = .{ .used = 1, .size = 2 } },
+        .{ .title = "what this session is about" },
     };
 
     var seen = std.EnumSet(std.meta.Tag(Update)).initEmpty();
@@ -465,4 +487,19 @@ test "a newline in what the model said survives as an escape, not as a frame" {
     const body = try encoded(arena, .v1, .{ .agent_message = .{ .text = "one\ntwo" } });
     try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, body, '\n'));
     try testing.expectEqualStrings("one\ntwo", try field(arena, body, &.{ "update", "content", "text" }));
+}
+
+test "a session's title reaches the client as its own update" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+
+    for ([_]Version{ .v1, .v2 }) |version| {
+        const body = try encoded(arena, version, .{ .title = "fix the parser" });
+        try testing.expectEqualStrings(
+            "session_info_update",
+            try field(arena, body, &.{ "update", "sessionUpdate" }),
+        );
+        try testing.expectEqualStrings("fix the parser", try field(arena, body, &.{ "update", "title" }));
+    }
 }
