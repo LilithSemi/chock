@@ -880,12 +880,17 @@ fn start(
     const search = try resolveSearch(arena, io, config_dir, org_bundle);
     const search_credential = try loadSearchCredential(arena, io, store, search);
 
+    // Before the redaction too, because the block says how many secrets this
+    // session may have to keep out of the log, and a slot cannot be added later.
+    const project_secrets = try resolveSecrets(arena, io, project_root);
+
     const redaction = try redactionFor(
         arena,
         instance.name,
         credential.token,
         config.instances,
         search_credential,
+        project_secrets.entries.len,
     );
 
     // Copied into the arena: `chock_proto.log.Log` borrows the session string
@@ -1066,8 +1071,6 @@ fn start(
     // reads. `--dev-shell` wins over the file for this one run.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
     const dev_shell_name = options.dev_shell orelse nix_caps.dev_shell;
-
-    const project_secrets = try resolveSecrets(arena, io, project_root);
 
     const flake_inputs = fetchFlakeInputs(
         arena,
@@ -1464,6 +1467,10 @@ fn redactionFor(
     token: []const u8,
     instances: []const chock_auth.config.Instance,
     search_key: ?[]const u8,
+    /// One slot for every entry of the project's `secrets` block, for a secret
+    /// given to something that holds it for a whole session rather than for one
+    /// call. An MCP server is the one that does.
+    session_slots: usize,
 ) std.mem.Allocator.Error!chock_core.redact.Policy {
     const Named = struct { name: []const u8, value: []const u8 };
 
@@ -1491,14 +1498,14 @@ fn redactionFor(
     }
 
     // **Slots past the credentials, all of them empty, and an empty value is
-    // inert.** The tool call's own secrets come first, then the git password
-    // last, because the git path names its slot as the final one. Both kinds
-    // are filled before the value can reach anything, which is what makes the
-    // window zero rather than short.
+    // inert.** A session long secret comes first, then the tool call's own, then
+    // the git password last, because the git path names its slot as the final
+    // one. Every kind is filled before the value can reach anything, which is
+    // what makes the window zero rather than short.
     //
     // Reserved here because a `Policy` is built once and read on every turn,
     // and a value that arrives later has nowhere to go if no slot was kept.
-    const reserved = tool_secret_slots + 1;
+    const reserved = session_slots + tool_secret_slots + 1;
     const secrets = try arena.alloc(chock_core.redact.Secret, named.items.len + reserved);
     for (named.items, secrets[0..named.items.len]) |one, *slot| {
         slot.* = .{ .value = one.value, .source = .credential };
@@ -1539,6 +1546,18 @@ fn toolSecretSlots(policy: chock_core.redact.Policy) []chock_core.redact.Secret 
     if (total < tool_secret_slots + 1) return &.{};
     const first = total - tool_secret_slots - 1;
     return @constCast(policy.secrets)[first .. total - 1];
+}
+
+/// The slots a session long secret goes in: the ones before the tool call's own.
+/// `count` is the number `redactionFor` was given, which is the length of the
+/// project's `secrets` block.
+///
+/// `@constCast` is sound for the reason `toolSecretSlots` gives.
+fn sessionSecretSlots(policy: chock_core.redact.Policy, count: usize) []chock_core.redact.Secret {
+    const reserved = count + tool_secret_slots + 1;
+    if (count == 0 or policy.secrets.len < reserved) return &.{};
+    const first = policy.secrets.len - reserved;
+    return @constCast(policy.secrets)[first .. first + count];
 }
 
 /// `chock-broker` imports no `chock-core`, so a `chock_core.redact.Policy`
@@ -4998,6 +5017,7 @@ const GiveLockedToAll = struct {
     git: *GitToolRunner,
     nix: *NixBuildToolRunner,
     secrets: *ToolSecrets,
+    server_secrets: *ServerSecrets,
 
     fn giveLocked(self: *GiveLockedToAll) chock_core.Loop.GiveLocked {
         return .{ .ptr = self, .vtable = &vtable };
@@ -5009,6 +5029,7 @@ const GiveLockedToAll = struct {
         const self: *GiveLockedToAll = @ptrCast(@alignCast(ptr));
         ToolNetwork.giveFn(self.network, locked);
         giveLockedToAskers(self.mcp, self.plugins, self.git, self.nix, self.secrets, locked);
+        self.server_secrets.giveLocked(locked);
     }
 };
 
@@ -7296,6 +7317,180 @@ fn wipeAndFree(gpa: std.mem.Allocator, value: []const u8) void {
     gpa.free(value);
 }
 
+/// What the project's `secrets` block gives an MCP server, for as long as the
+/// server runs.
+///
+/// A second reader of the same block, and deliberately not the per-call seam. A
+/// server is started once and holds its environment until the session ends, so
+/// there is no call to arm, nothing to release, and the redaction slot stays
+/// filled for the whole session. Keeping the two apart is what stops a
+/// session long value being cleared by the end of some unrelated tool call.
+///
+/// The decision is the table's alone. A server starts before the loop, when
+/// there is nobody to ask, so `ask` here means the server is not given it, the
+/// same reading `nix.build` and `model.select` take.
+const ServerSecrets = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    store: chock_auth.store.Store,
+    block: chock_policy.secrets.Block,
+    /// One per entry of the block. See `sessionSecretSlots`.
+    slots: []chock_core.redact.Secret = &.{},
+
+    filled: usize = 0,
+    kept: [chock_policy.secrets.max_entries]Record = undefined,
+    records: usize = 0,
+
+    /// What to write down once the loop holds the log. A server starts before
+    /// the loop does, and nothing may append to a log it does not hold.
+    const Record = struct {
+        name: []const u8,
+        action: []const u8,
+        variable: []const u8,
+    };
+
+    /// `config.env` with every secret this server was granted added to it, or
+    /// the same slice when it was granted none. Allocated in `keep`, which owns
+    /// the server for as long as it runs.
+    fn forServer(
+        self: *ServerSecrets,
+        keep: std.mem.Allocator,
+        policy: *TablePolicy,
+        server: []const u8,
+        base: []const []const u8,
+    ) std.mem.Allocator.Error![]const []const u8 {
+        if (self.block.entries.len == 0) return base;
+
+        var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
+        const namespace = chock_core.mcp.namespaceInto(&buffer, server) orelse return base;
+
+        var given: std.ArrayList([]const u8) = .empty;
+        defer given.deinit(self.gpa);
+
+        for (self.block.entries) |one| {
+            if (!reaches(one.to, namespace)) continue;
+            if (self.records == self.kept.len or self.filled == self.slots.len) {
+                tty.print(
+                    .warn,
+                    "chock: the MCP server {s} is granted more secrets than this session keeps " ++
+                        "slots for, so {s} was not given to it.\n",
+                    .{ server, one.name },
+                );
+                continue;
+            }
+            if (one.bind == .file) {
+                tty.print(
+                    .warn,
+                    "chock: the secrets block binds {s} as a file and this version writes none, " ++
+                        "so the MCP server {s} was not given it. Bind it as env.\n",
+                    .{ one.name, server },
+                );
+                continue;
+            }
+            if (try self.permitted(keep, policy, server, one)) |named| {
+                try given.append(self.gpa, named);
+            }
+        }
+
+        if (given.items.len == 0) return base;
+        return chock_core.credentials.environment(keep, base, given.items);
+    }
+
+    /// The `KEY=VALUE` this entry adds, or null when the table does not permit
+    /// it or the store does not hold it. The value is in a redaction slot before
+    /// this returns, so nothing can echo it first.
+    ///
+    /// The entry is allocated in `keep`, which the server outlives nothing of:
+    /// the redaction slot points into it, so it has to live as long as the
+    /// session and not as long as this call.
+    fn permitted(
+        self: *ServerSecrets,
+        keep: std.mem.Allocator,
+        policy: *TablePolicy,
+        server: []const u8,
+        entry: chock_policy.secrets.Entry,
+    ) std.mem.Allocator.Error!?[]const u8 {
+        const action = try chock_policy.secrets.actionFor(self.gpa, entry.name);
+        defer self.gpa.free(action);
+
+        const decision = policy.answer(server, action);
+        if (decision != .allow) {
+            tty.print(
+                .warn,
+                "chock: the MCP server {s} was not given the secret {s}, because {s} reads as " ++
+                    "{t} and a server starts with nobody to ask. Write a rule that allows it.\n",
+                .{ server, entry.name, action, decision },
+            );
+            return null;
+        }
+
+        var diag: ?chock_auth.store.Diagnostic = null;
+        defer if (diag) |*d| d.deinit(self.gpa);
+
+        const value = self.store.secrets.get(self.gpa, self.io, entry.name, &diag) catch |err| {
+            if (diag) |*d| {
+                tty.print(.err, "chock: the secret {s} could not be read: {f}\n", .{ entry.name, d });
+            } else {
+                tty.print(.err, "chock: the secret {s} could not be read: {t}\n", .{ entry.name, err });
+            }
+            return null;
+        } orelse {
+            tty.print(
+                .warn,
+                "chock: the credential store holds nothing under {s}, so the MCP server {s} was " ++
+                    "not given it. Put it there with: chock login --tool-secret {s}\n",
+                .{ entry.name, server, entry.name },
+            );
+            return null;
+        };
+        defer wipeAndFree(self.gpa, value);
+
+        const variable = entry.variable();
+        const named = try std.fmt.allocPrint(keep, "{s}={s}", .{ variable, value });
+
+        self.slots[self.filled].value = named[variable.len + 1 ..];
+        self.filled += 1;
+
+        self.kept[self.records] = .{
+            .name = entry.name,
+            .action = entry.to,
+            .variable = variable,
+        };
+        self.records += 1;
+        return named;
+    }
+
+    /// One `secret.used` per secret a server holds, written when the loop first
+    /// hands over the log. The value is not in it.
+    fn giveLocked(self: *ServerSecrets, locked: *chock_core.arbiter.Locked) void {
+        if (self.records == 0) return;
+        const time_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        for (self.kept[0..self.records]) |one| {
+            _ = locked.append(self.gpa, self.io, .{ .secret_used = .{
+                .name = one.name,
+                .action = one.action,
+                .bind = "env",
+                .variable = one.variable,
+            } }, time_ms) catch return;
+        }
+        // Written once. A later handover is a new lock over the same log, not a
+        // new set of secrets.
+        self.records = 0;
+    }
+};
+
+/// Whether `pattern` reaches anything at all under `namespace`, which is itself
+/// a pattern. `mcp.*` reaches one server, `mcp.github.*` reaches that one only,
+/// and `exec.path.gh` reaches no server.
+///
+/// Two patterns rather than a pattern and an action, because a server is given
+/// its environment before it has said what tools it has, so there is no action
+/// to match yet.
+fn reaches(pattern: []const u8, namespace: []const u8) bool {
+    return chock_policy.table.patternCovers(pattern, namespace) or
+        chock_policy.table.patternCovers(namespace, pattern);
+}
+
 /// A language server is long lived and stateful and the registry knows nothing
 /// that outlives one call, so the caller that owns the session holds it.
 const DiagnosticToolRunner = struct {
@@ -7594,6 +7789,7 @@ fn startMcp(
     options: Options,
     context: *const chock_core.tools.Context,
     state: *McpState,
+    secrets: *ServerSecrets,
 ) std.mem.Allocator.Error!struct { []chock_core.tools.Definition, []const u8 } {
     const settings = started.mcp_servers orelse
         return .{ started.tool_definitions, started.system_prompt };
@@ -7639,6 +7835,9 @@ fn startMcp(
         } orelse continue;
 
         var config = prepared.config;
+        // Before the server is started, because a process reads its environment
+        // once and there is no way to hand it one afterwards.
+        config.env = try secrets.forServer(keep, &policy, one.name, config.env);
         const index = state.count;
 
         state.transports[index] = .{};
@@ -10156,6 +10355,16 @@ fn runSession(
     var mcp_state = McpState.init(gpa);
     defer mcp_state.deinit(io);
 
+    // A server holds what it is given until the session ends, so its slots are
+    // not the per-call ones and `startMcp` fills them before it starts anything.
+    var server_secrets = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = started.store,
+        .block = started.secrets,
+        .slots = sessionSecretSlots(started.redact, started.secrets.entries.len),
+    };
+
     const mcp_definitions, const mcp_prompt = try startMcp(
         gpa,
         io,
@@ -10163,6 +10372,7 @@ fn runSession(
         options,
         &context,
         &mcp_state,
+        &server_secrets,
     );
 
     var plugin_state = PluginState.init(gpa);
@@ -10402,6 +10612,7 @@ fn runSession(
         .git = &git_aware,
         .nix = &nix_build,
         .secrets = &tool_secrets,
+        .server_secrets = &server_secrets,
     };
 
     var session_handback = SessionHandback{
@@ -17494,7 +17705,7 @@ test "this session's own credential is what the redactor is given" {
     defer said.stop(testing.io);
 
     const token = "sk-not-a-real-key-0123456789";
-    const policy = try redactionFor(arena, "hub", token, &.{}, null);
+    const policy = try redactionFor(arena, "hub", token, &.{}, null, 0);
 
     try testing.expectEqual(@as(usize, 1 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings(token, policy.secrets[0].value);
@@ -17518,7 +17729,7 @@ test "a tool call's secrets have somewhere to be kept out of the log" {
     said.start(testing.io, gpa);
     defer said.stop(testing.io);
 
-    const policy = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null);
+    const policy = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null, 0);
 
     // The credential, the git password's slot, and one per grantable secret.
     try testing.expectEqual(@as(usize, 1 + 1 + tool_secret_slots), policy.secrets.len);
@@ -17559,7 +17770,7 @@ test "the search key is kept out of the log beside the provider credential" {
 
     const token = "sk-not-a-real-key-0123456789";
     const search_key = "BSA-not-a-real-search-key-0123";
-    const policy = try redactionFor(arena, "hub", token, &.{}, search_key);
+    const policy = try redactionFor(arena, "hub", token, &.{}, search_key, 0);
 
     // Both credentials, plus the empty slot a git password goes in.
     try testing.expectEqual(@as(usize, 2 + 1 + tool_secret_slots), policy.secrets.len);
@@ -17589,7 +17800,7 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     defer said.stop(testing.io);
 
     const short = "abc";
-    const policy = try redactionFor(arena, "hub", short, &.{}, null);
+    const policy = try redactionFor(arena, "hub", short, &.{}, null, 0);
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
     try testing.expect(policy.isEmpty());
 
@@ -17599,7 +17810,7 @@ test "a credential nobody could match is skipped and said out loud, and an absen
     try testing.expect(std.mem.indexOf(u8, warned, short) == null);
 
     said.clear();
-    const none = try redactionFor(arena, "local", "", &.{}, null);
+    const none = try redactionFor(arena, "local", "", &.{}, null, 0);
     try testing.expectEqual(@as(usize, 0 + 1 + tool_secret_slots), none.secrets.len);
     try testing.expectEqualStrings("", none.secrets[0].value);
     try testing.expectEqual(@as(usize, 0), none.tooShort());
@@ -17627,7 +17838,7 @@ test "no line this file writes about redaction can hold a credential" {
             .context_tokens = null,
             .capabilities = .{},
         }};
-        _ = try redactionFor(arena, "hub", token, &others, null);
+        _ = try redactionFor(arena, "hub", token, &others, null, 0);
         try testing.expect(std.mem.indexOf(u8, said.err(), token) == null);
         try testing.expect(std.mem.indexOf(u8, said.out(), token) == null);
     }
@@ -17681,7 +17892,7 @@ test "every credential the configuration holds is in the set, and not only the o
         },
     };
 
-    const policy = try redactionFor(arena, "hub", in_use, &instances, null);
+    const policy = try redactionFor(arena, "hub", in_use, &instances, null, 0);
     try testing.expectEqual(@as(usize, 2 + 1 + tool_secret_slots), policy.secrets.len);
     try testing.expectEqualStrings("", policy.secrets[policy.secrets.len - 1].value);
 
@@ -17720,7 +17931,7 @@ test "a short credential on another provider is named, and the good one still wo
         .capabilities = .{},
     }};
 
-    const policy = try redactionFor(arena, "hub", good, &instances, null);
+    const policy = try redactionFor(arena, "hub", good, &instances, null, 0);
     try testing.expectEqual(@as(usize, 1), policy.tooShort());
     try testing.expect(!policy.isEmpty());
 
@@ -17753,7 +17964,7 @@ test "the broker is given the same values, without the ones nobody can match" {
         .capabilities = .{},
     }};
 
-    const policy = try redactionFor(arena, "hub", good, &instances, null);
+    const policy = try redactionFor(arena, "hub", good, &instances, null, 0);
     const values = try brokerRedaction(arena, policy);
 
     try testing.expectEqual(@as(usize, 1), values.len);
@@ -18841,4 +19052,265 @@ test "a background command is not armed, so nobody is asked about a secret it ca
     try testing.expectEqual(@as(usize, 0), asked.asks);
     try testing.expectEqual(@as(usize, 0), held.reads);
     try testing.expectEqual(@as(?[]u8, null), subject.armed_call);
+}
+
+test "a session long secret has a slot of its own, apart from a call's and from git's" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var said: tty.Capture = undefined;
+    said.start(testing.io, gpa);
+    defer said.stop(testing.io);
+
+    const entries: usize = 3;
+    const policy = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null, entries);
+
+    try testing.expectEqual(@as(usize, 1 + entries + tool_secret_slots + 1), policy.secrets.len);
+
+    const session = sessionSecretSlots(policy, entries);
+    const per_call = toolSecretSlots(policy);
+    const git_slot = &policy.secrets[policy.secrets.len - 1];
+
+    try testing.expectEqual(entries, session.len);
+    try testing.expectEqual(tool_secret_slots, per_call.len);
+
+    // No slot is in two of the three sets. Without this the two kinds would
+    // write over each other and nobody would notice, because both redact.
+    for (session) |*one| {
+        try testing.expect(one != git_slot);
+        for (per_call) |*other| try testing.expect(one != other);
+    }
+    for (per_call) |*one| try testing.expect(one != git_slot);
+
+    // The credential keeps the first slot, so a session secret starts after it.
+    try testing.expectEqualStrings("sk-not-a-real-key-0123456789", policy.secrets[0].value);
+    try testing.expect(&policy.secrets[0] != &session[0]);
+
+    // A project that named nothing keeps no session slot, and the rest of the
+    // layout is unchanged.
+    const none = try redactionFor(arena, "hub", "sk-not-a-real-key-0123456789", &.{}, null, 0);
+    try testing.expectEqual(@as(usize, 0), sessionSecretSlots(none, 0).len);
+    try testing.expectEqual(tool_secret_slots, toolSecretSlots(none).len);
+
+    try testing.expectEqualStrings("", said.err());
+}
+
+/// A table with the rows a test names, so a server start can be given an
+/// `allow`, an `ask` and a rule for nothing at all.
+fn serverSecretsPolicyFor(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+) !*const chock_policy.table.Table {
+    return chock_policy.table.Table.parse(gpa, source, null);
+}
+
+test "an MCP server is given what a rule allows, and the log says so once the loop holds it" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"mcp.github.*\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "secret.use.GITHUB_TOKEN", .decision = .allow } },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    const value = "gho_not_a_real_token_0123456789";
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = value }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const keep = arena_state.allocator();
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+
+    var subject = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    const base = [_][]const u8{"PATH=/usr/bin"};
+    const env = try subject.forServer(keep, &policy, "github", &base);
+
+    var found = false;
+    for (env) |one| {
+        if (std.mem.eql(u8, one, "GITHUB_TOKEN=" ++ value)) found = true;
+    }
+    try testing.expect(found);
+    // The base is kept, not replaced.
+    try testing.expectEqual(@as(usize, 2), env.len);
+
+    // Filled for the whole session, because a server reads its environment once
+    // and holds it. Nothing releases this one.
+    try testing.expectEqualStrings(value, slots[0].value);
+
+    // A server starts before the loop holds the log, so the record waits.
+    var log = try PermittingLog.init(gpa);
+    defer log.deinit(io);
+    try log.arm(io);
+    try testing.expect(std.mem.indexOf(u8, log.backing.bytes.items, "secret.used") == null);
+
+    subject.giveLocked(&log.locked);
+    const written = log.backing.bytes.items;
+    try testing.expect(std.mem.indexOf(u8, written, "secret.used") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "mcp.github.*") != null);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, written, value));
+
+    // Written once. A second handover is a new lock over the same log.
+    const after = written.len;
+    subject.giveLocked(&log.locked);
+    try testing.expectEqual(after, log.backing.bytes.items.len);
+
+    try testing.expectEqualStrings("", said.err());
+}
+
+test "a server is not given a secret an ask would have to reach nobody for" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"mcp.github.*\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    // `ask` at a server start has nobody to ask, so it is not a permission.
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "secret.use.GITHUB_TOKEN", .decision = .ask } },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+    var subject = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    const base = [_][]const u8{"PATH=/usr/bin"};
+    const env = try subject.forServer(arena_state.allocator(), &policy, "github", &base);
+
+    try testing.expectEqual(@as(usize, 1), env.len);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+    try testing.expectEqualStrings("", slots[0].value);
+    // Said out loud, because a server that quietly lacks its token fails in its
+    // own words and the reason is nowhere.
+    try testing.expect(std.mem.indexOf(u8, said.err(), "secret.use.GITHUB_TOKEN") != null);
+}
+
+test "one server's secret does not reach another server" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var block = try chock_policy.secrets.parse(
+        gpa,
+        ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"mcp.github.*\" } } }",
+        null,
+    );
+    defer block.deinit(gpa);
+
+    const table = try serverSecretsPolicyFor(gpa,
+        \\.{ .policy = .{
+        \\    .agents = .{ .{ .kind = "main" } },
+        \\    .rules = .{ .{ .action = "secret.use.GITHUB_TOKEN", .decision = .allow } },
+        \\} }
+    );
+    defer chock_policy.table.Table.destroy(gpa, table);
+
+    var held = FakeSecretStore{ .held = &.{.{ .name = "GITHUB_TOKEN", .value = "gho_not_real_0123456789" }} };
+    var slots = [_]chock_core.redact.Secret{.{ .value = "", .source = .credential }} ** 1;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    const chain = [_][]const u8{"main"};
+    var policy = TablePolicy{
+        .policy = table,
+        .chain = &chain,
+        .agent_kind = "main",
+        .model = "a-model",
+    };
+    var subject = ServerSecrets{
+        .gpa = gpa,
+        .io = io,
+        .store = held.store(),
+        .block = block,
+        .slots = &slots,
+    };
+
+    const base = [_][]const u8{"PATH=/usr/bin"};
+    const other = try subject.forServer(arena_state.allocator(), &policy, "time", &base);
+    try testing.expectEqual(@as(usize, 1), other.len);
+    try testing.expectEqual(@as(usize, 0), held.reads);
+
+    // And the one it was written for still gets it.
+    const mine = try subject.forServer(arena_state.allocator(), &policy, "github", &base);
+    try testing.expectEqual(@as(usize, 2), mine.len);
+
+    try testing.expectEqualStrings("", said.err());
+}
+
+test "a pattern reaches a server's namespace from either side, and another's from neither" {
+    var buffer: [chock_core.mcp.max_action_bytes]u8 = undefined;
+    const github = chock_core.mcp.namespaceInto(&buffer, "github").?;
+
+    // The entry names every server, this one, or one of its tools outright.
+    try testing.expect(reaches("mcp.*", github));
+    try testing.expect(reaches("mcp.github.*", github));
+    try testing.expect(reaches("mcp.github.tool.create_issue", github));
+
+    // And these reach nothing under it.
+    try testing.expect(!reaches("mcp.time.*", github));
+    try testing.expect(!reaches("exec.path.gh", github));
+    try testing.expect(!reaches("exec.*", github));
 }
