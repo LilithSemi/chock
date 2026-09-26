@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const chock_auth = @import("chock-auth");
+const chock_policy = @import("chock-policy");
 
 const Exit = @import("main.zig").Exit;
 const tty = @import("tty.zig");
@@ -33,12 +34,15 @@ const tty = @import("tty.zig");
 const usage_text =
     \\Usage: chock login --provider <kind>[=<url>] [options]
     \\       chock login --search <name> [options]
+    \\       chock login --tool-secret <name> [options]
     \\
     \\Kinds: anthropic, aiand, openai-compat=<url>
     \\
     \\Options:
     \\  --search <name>            Store the key of a web search engine under this name,
     \\                             which is the name your config.zon gives as .credential.
+    \\  --tool-secret <name>       Store a secret a tool call may be given under this name,
+    \\                             which is the name your chock.zon secrets block gives.
     \\  --name <name>              Name this instance. Omitted, the kind is the name.
     \\  --replace                  Replace a credential of this name without asking.
     \\                             A second instance of one kind needs a name of its own.
@@ -77,6 +81,9 @@ const Options = struct {
     /// The web search engine whose key this login stores. Set by `--search`,
     /// and never set at the same time as `provider`.
     search: ?[]const u8 = null,
+    /// The secret a project's `secrets` block may grant to a tool call. Set by
+    /// `--tool-secret`, and never set beside `provider` or `search`.
+    secret: ?[]const u8 = null,
     name: ?[]const u8 = null,
     method: ?Method = null,
     /// Replace a credential of the same name without being asked. For a
@@ -137,6 +144,10 @@ pub fn main(
     // is about a provider and none of it applies.
     if (options.search) |search_name| {
         return searchLogin(gpa, io, driver.secrets(), data_dir, search_name, options);
+    }
+
+    if (options.secret) |secret_name| {
+        return secretLogin(gpa, io, store, data_dir, secret_name, options);
     }
 
     const kind_and_url = splitProvider(options.provider) catch return Exit.usage.code();
@@ -387,6 +398,125 @@ fn searchLogin(
             "  .search = .{{ .kind = \"api\", .provider = \"brave\", " ++
             ".base_url = \"https://api.search.brave.com\", .credential = \"{s}\" }}\n",
         .{name},
+    );
+    return Exit.finished.code();
+}
+
+/// Stores a secret a project's `secrets` block may grant to a tool call, under
+/// the name that block gives.
+///
+/// The name has no prefix of Chock's own, so the store holds it under exactly
+/// the name a SecretSpec profile would. That is what lets a project name one
+/// entry and have it work whichever store the user configured.
+///
+/// Nothing is checked against anything: only the program the secret is granted
+/// to knows whether the value works, and it says so in its own words on the one
+/// call that uses it.
+fn secretLogin(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    store: chock_auth.store.Store,
+    data_dir: []const u8,
+    name: []const u8,
+    options: Options,
+) !u8 {
+    var diag: ?chock_auth.store.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(gpa);
+
+    // Before the prompt, so a directory that cannot be made does not cost the
+    // user the one thing they cannot easily get again.
+    chock_auth.store.ensureDir(io, data_dir, &diag) catch |err| {
+        reportStoreFault("the credential store could not be made", &diag, err);
+        return Exit.usage.code();
+    };
+
+    // The driver holds one flat set of names and a provider instance is in it.
+    // Writing over one would take a session's model credential away and say
+    // nothing, and the fault would show up as a login that stopped working.
+    const instance = store.get(gpa, io, name, &diag) catch |err| {
+        // An index entry whose value is gone is a fault here and not a free
+        // name: the name is taken either way.
+        reportStoreFault("the credential store could not be read", &diag, err);
+        return Exit.usage.code();
+    };
+    if (instance) |held| {
+        var taken = held;
+        defer taken.deinit();
+        tty.print(
+            .err,
+            "chock login: \"{s}\" already names a provider instance of kind {s}, and a secret " ++
+                "granted to a tool shares the same set of names. Pick another name for the " ++
+                "secret, and name that one in the secrets block of your chock.zon.\n",
+            .{ name, taken.kind },
+        );
+        return Exit.usage.code();
+    }
+
+    const method = options.method orelse defaultMethod(io);
+
+    if (!options.replace) {
+        const existing = store.secrets.get(gpa, io, name, &diag) catch |err| {
+            reportStoreFault("the credential store could not be read", &diag, err);
+            return Exit.usage.code();
+        };
+        if (existing) |value| {
+            defer {
+                std.crypto.secureZero(u8, value);
+                gpa.free(value);
+            }
+            tty.print(
+                .warn,
+                "chock login: there is already a secret stored under \"{s}\".\n",
+                .{name},
+            );
+            if (method != .prompt) {
+                tty.print(
+                    .warn,
+                    "This run has nobody to ask. Say it was meant:\n\n" ++
+                        "  chock login --tool-secret {s} --replace\n",
+                    .{name},
+                );
+                return Exit.usage.code();
+            }
+            if (!(confirmReplace(io) catch return Exit.usage.code())) {
+                tty.print(.plain, "chock login: nothing was changed.\n", .{});
+                return Exit.refused.code();
+            }
+        }
+    }
+
+    const credential = readCredential(gpa, io, method, name) catch |err| switch (err) {
+        error.Reported => return Exit.usage.code(),
+        else => |e| return e,
+    };
+    defer {
+        std.crypto.secureZero(u8, credential);
+        gpa.free(credential);
+    }
+    if (credential.len == 0) {
+        tty.print(.warn, "chock login: nothing was given, so nothing was stored.\n", .{});
+        return Exit.usage.code();
+    }
+
+    store.secrets.put(gpa, io, name, credential, &diag) catch |err| {
+        reportStoreFault("the secret could not be stored", &diag, err);
+        return Exit.usage.code();
+    };
+
+    tty.print(
+        .plain,
+        "chock login: stored the secret \"{s}\". No agent is ever shown it.\n",
+        .{name},
+    );
+    tty.print(
+        .plain,
+        "\nThe secrets block of your project's chock.zon says which tool may be given it:\n\n" ++
+            "  .secrets = .{{\n" ++
+            "      .{{ .name = \"{s}\", .to = \"exec.path.gh\" }},\n" ++
+            "  }}\n" ++
+            "\nUsing it is asked about as secret.use.{s}, so a policy rule can make it a " ++
+            "standing permission or a question every time.\n",
+        .{ name, name },
     );
     return Exit.finished.code();
 }
@@ -773,7 +903,9 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
                 "chock login: there is no {s} option, and there will not be one. " ++
                     "A command line is visible to every other user on this machine through ps, " ++
                     "and it lands in your shell history. Pipe the credential in instead:\n\n" ++
-                    "  printf '%s' \"$SECRET\" | chock login --provider <kind> --password-method stdin\n",
+                    "  printf '%s' \"$SECRET\" | chock login --provider <kind> --password-method stdin\n" ++
+                    "\nTo store a secret a tool call may be given, --tool-secret takes its name " ++
+                    "and never its value.\n",
                 .{forbidden},
             );
             return error.BadArguments;
@@ -804,6 +936,18 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
                 index += 1;
                 if (index >= args.len) {
                     tty.print(.err, "chock login: --search needs a value.\n\n{s}", .{usage_text});
+                    return error.BadArguments;
+                }
+                break :next args[index];
+            };
+            continue;
+        }
+
+        if (std.mem.eql(u8, name, "--tool-secret")) {
+            options.secret = inline_value orelse next: {
+                index += 1;
+                if (index >= args.len) {
+                    tty.print(.err, "chock login: --tool-secret needs a value.\n\n{s}", .{usage_text});
                     return error.BadArguments;
                 }
                 break :next args[index];
@@ -850,14 +994,43 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         return error.BadArguments;
     }
 
-    if (options.search != null and options.provider.len != 0) {
-        tty.print(
-            .err,
-            "chock login: --provider and --search store different things, so one command does " ++
-                "one of them. Run it twice.\n",
-            .{},
-        );
-        return error.BadArguments;
+    {
+        var named: usize = 0;
+        if (options.provider.len != 0) named += 1;
+        if (options.search != null) named += 1;
+        if (options.secret != null) named += 1;
+        if (named > 1) {
+            tty.print(
+                .err,
+                "chock login: --provider, --search and --tool-secret store different things, so one " ++
+                    "command does one of them. Run it again for the next.\n",
+                .{},
+            );
+            return error.BadArguments;
+        }
+    }
+    if (options.secret) |secret_name| {
+        // The same rule the `secrets` block reads by, so a name this command
+        // accepts is a name a project can write.
+        if (options.name != null) {
+            tty.print(
+                .err,
+                "chock login: --tool-secret already names the secret, so --name says nothing more. " ++
+                    "Drop it.\n",
+                .{},
+            );
+            return error.BadArguments;
+        }
+        if (!chock_policy.secrets.nameIsWellFormed(secret_name)) {
+            tty.print(
+                .err,
+                "chock login: \"{s}\" cannot name a secret. A name holds letters, digits and " ++
+                    "underscore, because a project asks about it as secret.use.<name>.\n",
+                .{secret_name},
+            );
+            return error.BadArguments;
+        }
+        return options;
     }
     if (options.search) |search_name| {
         // A search credential has no instance in the configuration, so there is
@@ -883,7 +1056,7 @@ fn parseOptions(args: []const []const u8) ParseError!Options {
         return options;
     }
     if (options.provider.len == 0) {
-        tty.print(.err, "chock login: --provider or --search is needed.\n\n", .{});
+        tty.print(.err, "chock login: --provider, --search or --tool-secret is needed.\n\n", .{});
         tty.print(.err, "{s}", .{usage_text});
         return error.BadArguments;
     }
@@ -1110,7 +1283,7 @@ test "an instance with no name takes the kind, and --name names one of its own" 
     // in to, and the usage page is what it gets.
     said.clear();
     try testing.expectError(error.BadArguments, parseOptions(&.{}));
-    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider or --search is needed") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--provider, --search or --tool-secret is needed") != null);
     try testing.expectEqualStrings("", said.out());
 }
 
@@ -1162,7 +1335,7 @@ test "--provider and --search together are refused, and so is neither" {
             error.BadArguments,
             parseOptions(&.{ "--provider", "aiand", "--search", "brave" }),
         );
-        try testing.expect(std.mem.indexOf(u8, said.err(), "Run it twice") != null);
+        try testing.expect(std.mem.indexOf(u8, said.err(), "Run it again") != null);
     }
     {
         var said: tty.Capture = undefined;
@@ -1199,4 +1372,71 @@ test "a search name the credential store cannot hold is refused at the command l
         const options = try parseOptions(&.{ "--search", good });
         try testing.expectEqualStrings(good, options.search.?);
     }
+}
+
+test "--tool-secret names what a project may grant, and stands beside neither other kind" {
+    {
+        const options = try parseOptions(&.{ "--tool-secret", "GITHUB_TOKEN" });
+        try testing.expectEqualStrings("GITHUB_TOKEN", options.secret.?);
+        try testing.expectEqualStrings("", options.provider);
+        try testing.expectEqual(@as(?[]const u8, null), options.search);
+    }
+    {
+        const options = try parseOptions(&.{"--tool-secret=GITHUB_TOKEN"});
+        try testing.expectEqualStrings("GITHUB_TOKEN", options.secret.?);
+    }
+
+    for ([_][]const []const u8{
+        &.{ "--tool-secret", "A", "--provider", "aiand" },
+        &.{ "--tool-secret", "A", "--search", "brave" },
+    }) |both| {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(error.BadArguments, parseOptions(both));
+        try testing.expect(std.mem.indexOf(u8, said.err(), "Run it again") != null);
+    }
+}
+
+test "a secret name a project could not write is refused at the command line" {
+    // The same rule the `secrets` block reads by. A name accepted here and
+    // refused there would store a value nothing could ever be granted.
+    for ([_][]const u8{ "", "has.dot", "has:colon", "with space", "has-dash" }) |bad| {
+        var said: tty.Capture = undefined;
+        said.start(testing.io, testing.allocator);
+        defer said.stop(testing.io);
+        try testing.expectError(error.BadArguments, parseOptions(&.{ "--tool-secret", bad }));
+        try testing.expect(!chock_policy.secrets.nameIsWellFormed(bad));
+    }
+
+    for ([_][]const u8{ "GITHUB_TOKEN", "openai_key", "k3" }) |good| {
+        const options = try parseOptions(&.{ "--tool-secret", good });
+        try testing.expectEqualStrings(good, options.secret.?);
+        try testing.expect(chock_policy.secrets.nameIsWellFormed(good));
+    }
+}
+
+test "--name says nothing next to --tool-secret either" {
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    try testing.expectError(
+        error.BadArguments,
+        parseOptions(&.{ "--tool-secret", "GITHUB_TOKEN", "--name", "work" }),
+    );
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--name") != null);
+}
+
+test "--secret still refuses, and now says which option takes a name" {
+    // The refusal is about a value on a command line, which ps shows to every
+    // other user. `--tool-secret` takes a name, so it is not the same thing and
+    // must not be reached by the same spelling.
+    var said: tty.Capture = undefined;
+    said.start(testing.io, testing.allocator);
+    defer said.stop(testing.io);
+
+    try testing.expectError(error.BadArguments, parseOptions(&.{ "--secret", "a-real-value" }));
+    try testing.expect(std.mem.indexOf(u8, said.err(), "there is no --secret option") != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), "--tool-secret takes its name") != null);
 }
