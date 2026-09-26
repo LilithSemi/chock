@@ -124,6 +124,7 @@ pub const Kind = enum {
     sandbox_supervisor,
     sandbox_syscalls,
     device_exposed,
+    secret_used,
     network_summary,
     unknown,
 
@@ -169,6 +170,7 @@ const wire_names = std.EnumArray(Kind, []const u8).init(.{
     .sandbox_supervisor = "sandbox.supervisor",
     .sandbox_syscalls = "sandbox.syscalls",
     .device_exposed = "device.exposed",
+    .secret_used = "secret.used",
     .network_summary = "network.summary",
     .unknown = "unknown",
 });
@@ -1016,6 +1018,27 @@ pub const DeviceExposed = struct {
     pub const jsonParse = forward.jsonParse;
 };
 
+/// A secret was given to a tool call.
+///
+/// **The value is never here.** This records that a grant was acted on, so a
+/// person reading the log afterwards can see which secret reached which tool
+/// and when, which is the whole point of granting one narrowly.
+pub const SecretUsed = struct {
+    /// The secret's own name, as the project's `secrets` block spells it.
+    name: []const u8,
+    /// The action it was given to, which is what the grant matched.
+    action: []const u8,
+    /// How it arrived: `env` or `file`.
+    bind: []const u8 = "env",
+    /// The environment variable it arrived under, or that named its file.
+    variable: []const u8 = "",
+    extra: Extra = .{},
+
+    const forward = ForwardCompatible(@This());
+    pub const jsonStringify = forward.jsonStringify;
+    pub const jsonParse = forward.jsonParse;
+};
+
 pub const NetworkSummary = struct {
     granted: u64 = 0,
     refused: u64 = 0,
@@ -1159,6 +1182,7 @@ pub const Event = union(Kind) {
     sandbox_supervisor: SandboxSupervisor,
     sandbox_syscalls: SandboxSyscalls,
     device_exposed: DeviceExposed,
+    secret_used: SecretUsed,
     network_summary: NetworkSummary,
     unknown: UnknownEvent,
 
@@ -2383,4 +2407,41 @@ test "two imports of different bytes produce different JSON" {
 
     // A swapped transcript hashes differently, so the chain over it says so.
     try std.testing.expect(!std.mem.eql(u8, first_text, second_text));
+}
+
+test "a secret use records what reached which tool and never the value" {
+    const gpa = std.testing.allocator;
+
+    const used = Event{ .secret_used = .{
+        .name = "GITHUB_TOKEN",
+        .action = "exec.path.gh",
+        .bind = "env",
+        .variable = "GITHUB_TOKEN",
+    } };
+
+    const text = try std.json.Stringify.valueAlloc(gpa, used, .{});
+    defer gpa.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret.used") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "GITHUB_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "exec.path.gh") != null);
+
+    // The struct carries no field a value could travel in, so this asserts the
+    // shape rather than one example of it.
+    inline for (@typeInfo(SecretUsed).@"struct".fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.name, "value"));
+        try std.testing.expect(!std.mem.eql(u8, field.name, "secret"));
+    }
+}
+
+test "every event kind has a wire name and reads back as itself" {
+    // `secret.used` is new, and this is what stops a kind being added to the
+    // enum and forgotten in the name table.
+    inline for (@typeInfo(Kind).@"enum".fields) |field| {
+        const kind: Kind = @enumFromInt(field.value);
+        if (kind == .unknown) continue;
+        const name = kind.wireName();
+        try std.testing.expect(name.len != 0);
+        try std.testing.expectEqual(kind, Kind.fromWireName(name).?);
+    }
 }
