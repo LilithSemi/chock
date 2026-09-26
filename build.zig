@@ -1486,6 +1486,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chock-sandbox", .module = chock_sandbox },
         .{ .name = "chock-io", .module = chock_io },
         .{ .name = "chock-proto", .module = chock_proto },
+        // `chock acp` is the one caller. It is the wire and holds no session, so
+        // the binary is where it meets one.
+        .{ .name = "chock-acp", .module = chock_acp },
         .{ .name = "chock-provider", .module = chock_provider },
         .{ .name = "chock-policy", .module = chock_policy },
         // `chock sessions seal` writes a seal beside a log and `chock sessions

@@ -46,6 +46,7 @@ const plugin_host_cmd = @import("plugin-host.zig");
 const run_cmd = @import("run.zig");
 const login_cmd = @import("login.zig");
 const daemon_cmd = @import("daemon.zig");
+const acp_cmd = @import("acp.zig");
 const serve_cmd = @import("serve.zig");
 const detach_cmd = @import("detach.zig");
 const memory_cmd = @import("memory.zig");
@@ -399,6 +400,11 @@ pub const commands = [_]Command{
         .name = "serve",
         .summary = "Put a browser in front of a daemon. Owns no session itself.",
         .run = serve_cmd.main,
+    },
+    .{
+        .name = "acp",
+        .summary = "Speak the agent client protocol, so an editor can drive Chock.",
+        .run = acp_cmd.main,
     },
     .{
         .name = "memory",
