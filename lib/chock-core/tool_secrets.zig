@@ -39,6 +39,19 @@ pub const Used = struct {
     variable: []const u8,
 };
 
+/// One secret that must arrive as a file, because the program will not read an
+/// environment variable for it.
+///
+/// The value is here and the path is not: only `chock-core` knows what a path
+/// inside a sandbox is, so it writes the file, mounts it read only, and puts its
+/// own path in the environment under `variable`.
+pub const File = struct {
+    /// The variable that names the file's path.
+    variable: []const u8,
+    /// The bytes the file holds.
+    value: []const u8,
+};
+
 /// What one tool call is given.
 pub const Grant = struct {
     /// `KEY=VALUE` entries to add to the call's environment. For a file bind
@@ -48,6 +61,9 @@ pub const Grant = struct {
     /// **A value, unlike `credentials.Grant.env`.** That is the difference
     /// between the two seams and the reason there are two.
     env: []const []const u8 = &.{},
+    /// Secrets that arrive as a file. The caller of this seam does not write
+    /// them: see `File`.
+    files: []const File = &.{},
     /// What to record, one entry per secret, in the same order.
     used: []const Used = &.{},
 };
@@ -160,4 +176,22 @@ test "release is called for a call that was granted nothing" {
     var fake = Fake{ .granted_for = "exec.path.gh" };
     fake.seam().release("call-2");
     try testing.expectEqual(@as(usize, 1), fake.released);
+}
+
+test "a file bind carries the value and never a path" {
+    // The path is the sandbox's to choose, so a seam that named one would be
+    // deciding something only `chock-core` can know.
+    inline for (@typeInfo(File).@"struct".fields) |field| {
+        try testing.expect(!std.mem.eql(u8, field.name, "path"));
+        try testing.expect(!std.mem.eql(u8, field.name, "host_path"));
+    }
+
+    const one = File{ .variable = "GOOGLE_APPLICATION_CREDENTIALS", .value = "{}" };
+    const grant = Grant{ .files = &.{one}, .used = &.{
+        .{ .name = "GCP_KEY", .bind = "file", .variable = one.variable },
+    } };
+
+    try testing.expectEqual(@as(usize, 0), grant.env.len);
+    try testing.expectEqual(@as(usize, 1), grant.files.len);
+    try testing.expectEqualStrings("file", grant.used[0].bind);
 }

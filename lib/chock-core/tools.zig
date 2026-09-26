@@ -999,6 +999,11 @@ pub const NetSeam = struct {
 
 pub const trust_store_inside = sandbox.trust_store_inside;
 
+/// Where a secret bound as a file lands, with the variable's own name after it.
+/// Directly under the runtime prefix, the way the trust store is, so it needs no
+/// directory the sandbox does not already make.
+pub const secret_file_prefix = sandbox.runtime_prefix ++ "/secret-";
+
 /// The host paths a trust store is kept at, most specific first. The third is
 /// what Alpine and macOS write.
 const host_trust_stores = [_][]const u8{
@@ -1575,11 +1580,58 @@ fn runCommand(
     // Asked right before the sandbox is built, so a value lives for the length
     // of one program. A background command outlives its call, so a grant for one
     // would reach work that nobody approved it for.
+    var staged_secrets: std.ArrayList(Staged) = .empty;
+    defer {
+        for (staged_secrets.items) |*one| one.deinit(allocator, io);
+        staged_secrets.deinit(allocator);
+    }
+
     if (!in_background) {
         if (context.secrets) |seam| {
             if (seam.grant(call.tool, context.action, call.call_id)) |granted| {
-                if (granted.env.len != 0) {
-                    config.env = try credentials_mod.environment(allocator, config.env, granted.env);
+                var entries: std.ArrayList([]const u8) = .empty;
+                defer {
+                    for (entries.items) |one| allocator.free(one);
+                    entries.deinit(allocator);
+                }
+                for (granted.env) |one| try entries.append(allocator, try allocator.dupe(u8, one));
+
+                for (granted.files) |one| {
+                    const staged = stageContent(allocator, io, env, one.value) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.StagingFailed => return toolErrorResult(
+                            allocator,
+                            call,
+                            try std.fmt.allocPrint(allocator, secret_file_failed, .{one.variable}),
+                        ),
+                    };
+                    try staged_secrets.append(allocator, staged);
+
+                    const inside = try std.fmt.allocPrint(
+                        allocator,
+                        secret_file_prefix ++ "{s}",
+                        .{one.variable},
+                    );
+                    defer allocator.free(inside);
+
+                    try extra_mounts.append(allocator, .{ .bind = .{
+                        .source = staged.host_path,
+                        .target = try allocator.dupe(u8, inside),
+                        .read_only = true,
+                    } });
+                    try extra_rules.append(allocator, .{
+                        .path = try allocator.dupe(u8, inside),
+                        .access = .{ .read_file = true },
+                    });
+                    try entries.append(allocator, try std.fmt.allocPrint(
+                        allocator,
+                        "{s}={s}",
+                        .{ one.variable, inside },
+                    ));
+                }
+
+                if (entries.items.len != 0) {
+                    config.env = try credentials_mod.environment(allocator, config.env, entries.items);
                 }
             }
         }
@@ -1776,6 +1828,12 @@ fn workspaceRefusal(
         .{ free / (1024 * 1024), context.workspace_free_floor_bytes / (1024 * 1024) },
     );
 }
+
+/// A secret bound as a file could not be written. A fault on this machine, and
+/// the call is refused rather than run with the variable naming nothing.
+pub const secret_file_failed = "the command was not run: the secret that arrives as {s} could not " ++
+    "be written to a file for it. This is a fault on this machine and not a refusal, and nothing " ++
+    "was given to the command.\n";
 
 pub const background_needs_a_session = "no background task was started: a task outlives the tool " ++
     "call that asked for it, so it needs the session that would own it, and this tool call was " ++
