@@ -14,6 +14,7 @@ const idle_mod = @import("idle.zig");
 const guidance = @import("guidance.zig");
 const cache = @import("cache.zig");
 const credentials_mod = @import("credentials.zig");
+const tool_secrets_mod = @import("tool_secrets.zig");
 const scratchpad = @import("scratchpad.zig");
 const tasks = @import("tasks.zig");
 const handback = @import("handback.zig");
@@ -1045,6 +1046,9 @@ pub const Context = struct {
     /// The action name this call was gated under. Empty for a caller that
     /// names none, and then nothing that reads it grants anything.
     action: []const u8 = "",
+    /// What secrets this call may be given. Null for a session that grants
+    /// none, which is every session whose project named none.
+    secrets: ?tool_secrets_mod.Seam = null,
     memory_dir: ?[]const u8 = null,
     cache_dir: ?[]const u8 = null,
     scratch_dir: ?[]const u8 = null,
@@ -1544,6 +1548,10 @@ fn runCommand(
         }
     }
 
+    // Released however the call ends, including a failure to start the program.
+    // `release` takes a call that was granted nothing.
+    defer if (context.secrets) |seam| seam.release(call.call_id);
+
     var armed: ?credentials_mod.Armed = null;
     defer if (armed) |*one| one.deinit(allocator);
     var credential_chain = credentials_mod.Chain{ .inner = context.idle };
@@ -1560,6 +1568,19 @@ fn runCommand(
                 );
                 config.env = armed.?.env;
                 credential_chain.seam = seam;
+            }
+        }
+    }
+
+    // Asked right before the sandbox is built, so a value lives for the length
+    // of one program. A background command outlives its call, so a grant for one
+    // would reach work that nobody approved it for.
+    if (!in_background) {
+        if (context.secrets) |seam| {
+            if (seam.grant(call.tool, context.action, call.call_id)) |granted| {
+                if (granted.env.len != 0) {
+                    config.env = try credentials_mod.environment(allocator, config.env, granted.env);
+                }
             }
         }
     }
