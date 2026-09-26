@@ -20,6 +20,7 @@ pub const Kind = enum {
 pub const Provider = enum {
     brave,
     kagi,
+    exa,
     duckduckgo,
 
     /// The kind this vendor belongs to. A keyed API and a results page read as
@@ -27,10 +28,23 @@ pub const Provider = enum {
     /// naming one the kind does not take is refused instead of half working.
     pub fn kind(self: Provider) Kind {
         return switch (self) {
-            .brave, .kagi => .api,
+            .brave, .kagi, .exa => .api,
             .duckduckgo => .scrape,
         };
     }
+};
+
+/// Every provider this reader knows, for the message that says so. Built from
+/// the enum, so a vendor added to it cannot be missing from the refusal that
+/// lists them.
+pub const provider_names = text: {
+    var built: []const u8 = "";
+    const names = std.enums.values(Provider);
+    for (names, 0..) |one, index| {
+        if (index != 0) built = built ++ (if (index + 1 == names.len) " or " else ", ");
+        built = built ++ @tagName(one);
+    }
+    break :text built;
 };
 
 /// Every member is optional, so "no search block" is told apart from a block
@@ -193,8 +207,8 @@ pub const Diagnostic = struct {
                 .{self.source},
             ),
             .provider_unknown => |text| try writer.print(
-                "{s}: the search block's provider field holds \"{s}\", and this reader knows brave, kagi, or duckduckgo",
-                .{ self.source, text },
+                "{s}: the search block's provider field holds \"{s}\", and this reader knows {s}",
+                .{ self.source, text, provider_names },
             ),
             .provider_missing => try writer.print(
                 "{s}: the search block names no provider, and the api and scrape kinds each need one to name the vendor",
