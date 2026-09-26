@@ -26,6 +26,7 @@ const limits_mod = @import("limits.zig");
 const table = @import("table.zig");
 
 pub const file_name = limits_mod.file_name;
+pub const max_file_bytes = limits_mod.max_file_bytes;
 
 pub const block_name = "secrets";
 
@@ -161,6 +162,8 @@ pub const Diagnostic = struct {
         bind_unknown: []const u8,
         as_not_a_string,
         as_not_well_formed: []const u8,
+        file_too_large: usize,
+        read_failed: anyerror,
     };
 
     pub fn deinit(self: *Diagnostic, gpa: std.mem.Allocator) void {
@@ -236,6 +239,14 @@ pub const Diagnostic = struct {
                     "and underscore, and does not begin with a digit.",
                 .{ self.source, text },
             ),
+            .file_too_large => |bound| try writer.print(
+                "{s}: the file is larger than {d} bytes",
+                .{ self.source, bound },
+            ),
+            .read_failed => |err| try writer.print(
+                "{s}: the file could not be read: {t}",
+                .{ self.source, err },
+            ),
             .to_not_well_formed => |text| try writer.print(
                 "{s}: \"{s}\" is not an action name this table reads. A pattern ends with .* or " ++
                     "names an action outright, and never holds a * anywhere else.",
@@ -277,6 +288,46 @@ pub fn parseFrom(
 
     const node = try findBlock(zoir, source_name, diag) orelse return .{};
     return readEntries(gpa, zoir, node, source_name, diag);
+}
+
+pub const LoadError = ParseError || error{
+    SecretsFileTooLarge,
+    ReadFailed,
+};
+
+/// The block in the project's own `chock.zon`. A project with no such file
+/// grants nothing, which is every project that never asked for a secret.
+pub fn load(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+    diag: ?*?Diagnostic,
+) LoadError!Block {
+    const path = try std.fs.path.join(gpa, &.{ project_root, file_name });
+    defer gpa.free(path);
+
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        path,
+        gpa,
+        .limited(max_file_bytes),
+        .of(u8),
+        0,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound, error.NotDir => return .{},
+        error.StreamTooLong => {
+            _ = note(diag, file_name, .{ .file_too_large = max_file_bytes });
+            return error.SecretsFileTooLarge;
+        },
+        else => {
+            _ = note(diag, file_name, .{ .read_failed = err });
+            return error.ReadFailed;
+        },
+    };
+    defer gpa.free(source);
+
+    return parseFrom(gpa, source, file_name, diag);
 }
 
 fn findBlock(
@@ -631,4 +682,44 @@ test "a variable a shell would not read is refused" {
         parse(gpa, ".{ .secrets = .{ .{ .name = \"A\", .to = \"exec.path.gh\", .as = \"9LIVES\" } } }", &diag),
     );
     try testing.expect(diag.?.fault == .as_not_well_formed);
+}
+
+/// `std.testing.tmpDir` hands back a directory only a relative path reaches,
+/// and the loader needs a root independent of the test binary's cwd.
+fn absoluteDirPath(buffer: []u8, dir: std.Io.Dir) ![]u8 {
+    const len = dir.realPath(testing.io, buffer) catch return error.RealPathFailed;
+    return buffer[0..len];
+}
+
+test "the block comes off the disk, and a project with no file grants nothing" {
+    const gpa = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absoluteDirPath(&path_buffer, tmp.dir);
+
+    var missing = try load(gpa, testing.io, root, null);
+    defer missing.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), missing.entries.len);
+
+    {
+        var file = try tmp.dir.createFile(testing.io, file_name, .{});
+        defer file.close(testing.io);
+        try file.writeStreamingAll(
+            testing.io,
+            ".{ .secrets = .{ .{ .name = \"GITHUB_TOKEN\", .to = \"exec.path.gh\" } } }",
+        );
+    }
+
+    var written = try load(gpa, testing.io, root, null);
+    defer written.deinit(gpa);
+    try testing.expect(written.permits("GITHUB_TOKEN", "exec.path.gh"));
+}
+
+test "a name a project could write cannot reach a name chock keeps for itself" {
+    // The store holds one flat set of names and Chock's own begin with a colon.
+    // A colon is not a shape a name takes, so no entry can spell one.
+    try testing.expect(!nameIsWellFormed("chock:signing"));
 }
