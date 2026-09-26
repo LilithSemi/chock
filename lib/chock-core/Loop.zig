@@ -38,11 +38,16 @@ pub const ToolRunner = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// `action` is the name this call was gated under, and it is passed
+        /// rather than recomputed: a grant checked against a second reading of
+        /// the same call could be checked against a different answer, and
+        /// nothing would say so.
         dispatch: *const fn (
             ptr: *anyopaque,
             allocator: std.mem.Allocator,
             io: std.Io,
             call: event.ToolCall,
+            action: []const u8,
         ) DispatchError!event.ToolResult,
     };
 
@@ -51,8 +56,9 @@ pub const ToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
-        return self.vtable.dispatch(self.ptr, allocator, io, call);
+        return self.vtable.dispatch(self.ptr, allocator, io, call, action);
     }
 };
 
@@ -72,9 +78,14 @@ pub const SandboxToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
         const self: *SandboxToolRunner = @ptrCast(@alignCast(ptr));
-        return tools.Registry.dispatchWith(allocator, io, self.env, self.sandbox_config, call, self.context);
+        // The context is copied so the action belongs to this call and not to
+        // the session, which is the whole point of passing it.
+        var per_call = self.context;
+        per_call.action = action;
+        return tools.Registry.dispatchWith(allocator, io, self.env, self.sandbox_config, call, per_call);
     }
 };
 
@@ -1250,6 +1261,10 @@ fn gateToolCall(
     locked: anytype,
     deps: Deps,
     call: event.ToolCall,
+    /// Written with the name this call was gated under, so the runner acts on
+    /// the same answer the gate did rather than reading the call again.
+    action_buffer: []u8,
+    action_out: *[]const u8,
 ) Error!?event.ToolResult {
     const tool = std.meta.stringToEnum(tools.Tool, call.tool) orelse return null;
 
@@ -1272,8 +1287,6 @@ fn gateToolCall(
     defer if (argv0_owned) |owned| allocator.free(owned);
     if (tool == .run_command) argv0_owned = try tools.firstArgvIn(allocator, call.arguments);
 
-    var action_buffer: [gate_action_bytes]u8 = undefined;
-
     // The one call named after what it asks for, and the one that can ask twice.
     // Both questions must pass, so a rule a project wrote for its own attribute
     // does not authorise the same attribute of anybody else's flake.
@@ -1281,7 +1294,7 @@ fn gateToolCall(
         var flake_buffer: [gate_action_bytes]u8 = undefined;
         const actions = try nix_action.buildActionsFor(
             allocator,
-            &action_buffer,
+            action_buffer,
             &flake_buffer,
             call.arguments,
         ) orelse
@@ -1305,12 +1318,13 @@ fn gateToolCall(
     }
 
     const action = tool.actionInto(
-        &action_buffer,
+        action_buffer,
         argv0_owned,
         deps.project_root,
         deps.store_closure,
     ) orelse
         return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
+    action_out.* = action;
 
     const answer = try decideAction(allocator, io, locked, deps, call, action);
     if (answer.permitted) return null;
@@ -1381,6 +1395,9 @@ fn runTool(
     // An arbitrator holds no tools, enforced here for the calls the tool runner
     // never sees. The policy gate comes second, once an arbitrator is ruled out,
     // so no `approval.response` is spent on a call that cannot run either way.
+    var gated_action_buffer: [gate_action_bytes]u8 = undefined;
+    var gated_action: []const u8 = "";
+
     const dispatched = if (!deps.role.holdsTools())
         event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
@@ -1388,7 +1405,7 @@ fn runTool(
             .is_error = true,
             .truncated = false,
         }
-    else if (try gateToolCall(allocator, io, locked, deps, call)) |refusal|
+    else if (try gateToolCall(allocator, io, locked, deps, call, &gated_action_buffer, &gated_action)) |refusal|
         refusal
     else if (std.mem.eql(u8, call.tool, spawn_tool_name))
         try runSpawn(allocator, io, locked, session, deps, call)
@@ -1407,7 +1424,7 @@ fn runTool(
     else if (std.mem.eql(u8, call.tool, request_tool_name))
         try runRequestAction(allocator, io, locked, deps, call)
     else
-        deps.tool_runner.dispatch(allocator, io, call) catch |err| event.ToolResult{
+        deps.tool_runner.dispatch(allocator, io, call, gated_action) catch |err| event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
             .output = try std.fmt.allocPrint(allocator, "tool dispatch failed: {s}", .{@errorName(err)}),
             .is_error = true,
@@ -2750,7 +2767,9 @@ const FakeToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
+        _ = action;
         const self: *FakeToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         if (self.storage_to_check) |storage| {
@@ -2786,7 +2805,9 @@ const FailsOnceToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
+        _ = action;
         _ = io;
         const self: *FailsOnceToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -4441,7 +4462,9 @@ const CancelingToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
+        _ = action;
         _ = io;
         const self: *CancelingToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -4481,7 +4504,9 @@ const HandingOverToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
+        _ = action;
         _ = io;
         const self: *HandingOverToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -7167,7 +7192,9 @@ const ScriptedToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: event.ToolCall,
+        action: []const u8,
     ) DispatchError!event.ToolResult {
+        _ = action;
         _ = io;
         const self: *ScriptedToolRunner = @ptrCast(@alignCast(ptr));
         const output = self.outputs[@min(self.calls, self.outputs.len - 1)];

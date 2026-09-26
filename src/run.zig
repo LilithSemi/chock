@@ -6773,6 +6773,7 @@ const GitToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *GitToolRunner = @ptrCast(@alignCast(ptr));
         defer self.finishPush(gpa, io);
@@ -6785,7 +6786,7 @@ const GitToolRunner = struct {
                 .truncated = false,
             };
         }
-        return self.inner.dispatch(gpa, io, call);
+        return self.inner.dispatch(gpa, io, call, action);
     }
 
     fn finishPush(self: *GitToolRunner, gpa: std.mem.Allocator, io: std.Io) void {
@@ -6881,9 +6882,10 @@ const DiagnosticToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *DiagnosticToolRunner = @ptrCast(@alignCast(ptr));
-        const result = try self.inner.dispatch(gpa, io, call);
+        const result = try self.inner.dispatch(gpa, io, call, action);
 
         if (result.is_error) return result;
 
@@ -6927,11 +6929,12 @@ const McpToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *McpToolRunner = @ptrCast(@alignCast(ptr));
 
         const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
-            return self.inner.dispatch(gpa, io, call);
+            return self.inner.dispatch(gpa, io, call, action);
 
         self.noteWidening();
 
@@ -7339,11 +7342,12 @@ const PluginToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *PluginToolRunner = @ptrCast(@alignCast(ptr));
 
         const outcome = (try self.state.session.dispatch(gpa, io, call)) orelse
-            return self.inner.dispatch(gpa, io, call);
+            return self.inner.dispatch(gpa, io, call, action);
 
         errdefer gpa.free(outcome.text);
         return .{
@@ -7682,10 +7686,11 @@ const ProvisionToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *ProvisionToolRunner = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.provide_tool))) {
-            return self.inner.dispatch(gpa, io, call);
+            return self.inner.dispatch(gpa, io, call, action);
         }
 
         const answer = try self.provide(gpa, call);
@@ -7936,10 +7941,11 @@ const NixEvalToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *NixEvalToolRunner = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_eval))) {
-            return self.inner.dispatch(gpa, io, call);
+            return self.inner.dispatch(gpa, io, call, action);
         }
 
         const answer = try self.evaluate(gpa, io, call);
@@ -8553,10 +8559,11 @@ const NixBuildToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
         const self: *NixBuildToolRunner = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, call.tool, @tagName(chock_core.tools.Tool.nix_build))) {
-            return self.inner.dispatch(gpa, io, call);
+            return self.inner.dispatch(gpa, io, call, action);
         }
 
         const answer = try self.build(gpa, io, call);
@@ -11852,7 +11859,9 @@ const CountingToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        _ = action;
         _ = io;
         const self: *CountingToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -11936,7 +11945,7 @@ fn driveGitRunner(
         .call_id = "call1",
         .tool = "run_command",
         .arguments = arguments,
-    });
+    }, "");
 }
 
 test "a subcommand the shim classifies reaches a person, and is refused when nobody can answer" {
@@ -11955,7 +11964,7 @@ test "a subcommand the shim classifies reaches a person, and is refused when nob
             .call_id = "call1",
             .tool = "run_command",
             .arguments = arguments,
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -12081,7 +12090,7 @@ test "a read only subcommand reaches the real git and asks nobody at all" {
         .call_id = "call1",
         .tool = "write_file",
         .arguments = "{\"path\":\"x\",\"content\":\"{\\\"argv\\\":[\\\"git\\\",\\\"fetch\\\"]}\"}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
     try testing.expectEqual(@as(usize, 0), arbitrator.asks);
@@ -12190,7 +12199,9 @@ const StubToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        _ = action;
         _ = io;
         const self: *StubToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -12252,7 +12263,7 @@ test "a write that worked carries what the language server said, on the same res
             .call_id = "call1",
             .tool = tool,
             .arguments = "{\"path\":\"src/main.zig\",\"content\":\"x\",\"old_string\":\"a\",\"new_string\":\"b\"}",
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -12274,7 +12285,7 @@ test "a session with no language server hands back the tool result byte for byte
         .call_id = "call1",
         .tool = "write_file",
         .arguments = "{\"path\":\"src/main.zig\",\"content\":\"x\"}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -12298,7 +12309,7 @@ test "a refused write and a call that is not a write are both passed straight th
             .call_id = "call1",
             .tool = "edit_file",
             .arguments = "{\"path\":\"src/main.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}",
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -12317,7 +12328,7 @@ test "a refused write and a call that is not a write are both passed straight th
             .call_id = "call1",
             .tool = tool,
             .arguments = "{\"path\":\"src/main.zig\",\"pattern\":\"x\",\"argv\":[\"zig\",\"build\"]}",
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -12914,7 +12925,9 @@ const RecordingToolRunner = struct {
         gpa: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) chock_core.Loop.DispatchError!chock_proto.event.ToolResult {
+        _ = action;
         _ = io;
         const self: *RecordingToolRunner = @ptrCast(@alignCast(ptr));
         self.calls += 1;
@@ -12963,7 +12976,7 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
         .arguments = "{\"argv\":[\"rg\"]}",
     };
 
-    const before = try runner.dispatch(gpa, std.testing.io, call);
+    const before = try runner.dispatch(gpa, std.testing.io, call, "");
     gpa.free(before.call_id);
     gpa.free(before.output);
     try std.testing.expectEqual(@as(usize, 1), recorder.last_store_paths.len);
@@ -12981,7 +12994,7 @@ test "a program taken into the toolchain is mounted by the next tool call, and n
         .store_paths = &store_paths,
     });
 
-    const after = try runner.dispatch(gpa, std.testing.io, call);
+    const after = try runner.dispatch(gpa, std.testing.io, call, "");
     gpa.free(after.call_id);
     gpa.free(after.output);
     try std.testing.expectEqual(@as(usize, 3), recorder.last_store_paths.len);
@@ -13038,7 +13051,7 @@ test "what a build produced is mounted by the next tool call, and not by the one
         .arguments = "{\"argv\":[\"myproject\"]}",
     };
 
-    const before = try runner.dispatch(gpa, std.testing.io, call);
+    const before = try runner.dispatch(gpa, std.testing.io, call, "");
     gpa.free(before.call_id);
     gpa.free(before.output);
     try std.testing.expectEqual(@as(usize, 1), recorder.last_store_paths.len);
@@ -13051,7 +13064,7 @@ test "what a build produced is mounted by the next tool call, and not by the one
         .store_paths = &closure,
     });
 
-    const after = try runner.dispatch(gpa, std.testing.io, call);
+    const after = try runner.dispatch(gpa, std.testing.io, call, "");
     gpa.free(after.call_id);
     gpa.free(after.output);
 
@@ -13345,7 +13358,7 @@ test "a session that cannot provision refuses the call and names no package mana
         .call_id = "c1",
         .tool = "provide_tool",
         .arguments = "{\"program\":\"ripgrep\"}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -13383,7 +13396,7 @@ fn evaluateThrough(
         .call_id = "c1",
         .tool = "nix_eval",
         .arguments = arguments,
-    });
+    }, "");
 }
 
 test "an expression is evaluated in this process and the rendered value reaches the model" {
@@ -13615,7 +13628,7 @@ test "a session that cannot evaluate refuses the call and never says it evaluate
         .call_id = "c2",
         .tool = "read_file",
         .arguments = "{\"path\":\"a\"}",
-    });
+    }, "");
     defer gpa.free(other.call_id);
     defer gpa.free(other.output);
     try std.testing.expectEqual(@as(usize, 1), recorder.calls);
@@ -13684,7 +13697,7 @@ test "asking twice for the same program builds nothing the second time" {
         .call_id = "c1",
         .tool = "provide_tool",
         .arguments = "{\"program\":\"ripgrep\"}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -15338,7 +15351,7 @@ test "a session with no MCP server passes every tool call through, byte for byte
             .call_id = "call1",
             .tool = name,
             .arguments = "{\"argv\":[\"git\",\"status\"]}",
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -15373,7 +15386,7 @@ test "a call to an MCP tool is answered here and never reaches the runners below
         .call_id = "call7",
         .tool = "probe_tool",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -15439,7 +15452,7 @@ test "one locked handle reaches all four askers, and one that missed it runs not
             .call_id = "call1",
             .tool = name,
             .arguments = "{}",
-        });
+        }, "");
         defer gpa.free(early.call_id);
         defer gpa.free(early.output);
         try std.testing.expect(early.is_error);
@@ -15454,7 +15467,7 @@ test "one locked handle reaches all four askers, and one that missed it runs not
             .call_id = "call1",
             .tool = "run_command",
             .arguments = "{\"argv\":[\"git\",\"add\",\"-A\"]}",
-        });
+        }, "");
         defer gpa.free(early.call_id);
         defer gpa.free(early.output);
         try std.testing.expect(early.is_error);
@@ -15483,7 +15496,7 @@ test "one locked handle reaches all four askers, and one that missed it runs not
         .call_id = "call2",
         .tool = "server_tool",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(from_server.call_id);
     defer gpa.free(from_server.output);
     try std.testing.expectEqualStrings("the server answered", from_server.output);
@@ -15492,7 +15505,7 @@ test "one locked handle reaches all four askers, and one that missed it runs not
         .call_id = "call3",
         .tool = "plugin_tool",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(from_plugin.call_id);
     defer gpa.free(from_plugin.output);
     try std.testing.expectEqualStrings("the plugin answered", from_plugin.output);
@@ -15501,7 +15514,7 @@ test "one locked handle reaches all four askers, and one that missed it runs not
         .call_id = "call4",
         .tool = "run_command",
         .arguments = "{\"argv\":[\"git\",\"add\",\"-A\"]}",
-    });
+    }, "");
     defer gpa.free(from_git.call_id);
     defer gpa.free(from_git.output);
     try std.testing.expect(!from_git.is_error);
@@ -15656,7 +15669,7 @@ test "a session with no plugin passes every tool call through, byte for byte" {
             .call_id = "call1",
             .tool = name,
             .arguments = "{\"argv\":[\"git\",\"status\"]}",
-        });
+        }, "");
         defer gpa.free(result.call_id);
         defer gpa.free(result.output);
 
@@ -15707,7 +15720,7 @@ test "a call to a plugin tool is answered here, with the guest's own words, and 
         .call_id = "call9",
         .tool = "hello",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -15771,7 +15784,7 @@ test "a plugin tool this project's policy refuses is refused before the plugin i
         .call_id = "call10",
         .tool = "hello",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(result.call_id);
     defer gpa.free(result.output);
 
@@ -15812,7 +15825,7 @@ test "a plugin whose tool is named after a built-in loads none of its tools, and
         .call_id = "call11",
         .tool = "read_file",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(built_in.call_id);
     defer gpa.free(built_in.output);
     try std.testing.expectEqual(@as(usize, 1), inner.calls);
@@ -15822,7 +15835,7 @@ test "a plugin whose tool is named after a built-in loads none of its tools, and
         .call_id = "call12",
         .tool = "harmless",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(other.call_id);
     defer gpa.free(other.output);
     try std.testing.expectEqual(@as(usize, 2), inner.calls);
@@ -15882,7 +15895,7 @@ test "a plugin tool cannot take a name an MCP server already declared" {
         .call_id = "call13",
         .tool = "shared",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(shared.call_id);
     defer gpa.free(shared.output);
     try std.testing.expectEqualStrings("the server answered", shared.output);
@@ -15893,7 +15906,7 @@ test "a plugin tool cannot take a name an MCP server already declared" {
         .call_id = "call14",
         .tool = "own",
         .arguments = "{}",
-    });
+    }, "");
     defer gpa.free(own.call_id);
     defer gpa.free(own.output);
     try std.testing.expectEqualStrings("the plugin answered", own.output);

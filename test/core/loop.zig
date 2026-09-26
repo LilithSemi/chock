@@ -16,9 +16,11 @@ const NoopToolRunner = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         call: chock_proto.event.ToolCall,
+        action: []const u8,
     ) Loop.DispatchError!chock_proto.event.ToolResult {
         _ = ptr;
         _ = io;
+        _ = action;
         return .{
             .call_id = try allocator.dupe(u8, call.call_id),
             .output = try allocator.dupe(u8, "ok"),

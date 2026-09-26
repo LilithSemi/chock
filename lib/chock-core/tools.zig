@@ -1042,6 +1042,9 @@ pub const Context = struct {
     approval_wait_ns: ?*const std.atomic.Value(u64) = null,
     net: ?NetSeam = null,
     credentials: ?credentials_mod.Seam = null,
+    /// The action name this call was gated under. Empty for a caller that
+    /// names none, and then nothing that reads it grants anything.
+    action: []const u8 = "",
     memory_dir: ?[]const u8 = null,
     cache_dir: ?[]const u8 = null,
     scratch_dir: ?[]const u8 = null,
