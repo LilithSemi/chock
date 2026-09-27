@@ -371,6 +371,10 @@ fn makeDirAll(io: std.Io, path: []const u8, diag: ?Sink) LayoutError!void {
 /// spelling of the layout is how two paths quietly stop agreeing.
 fn makeDirAllInner(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
+    // `createDirAbsolute` asserts this, and an assert is `unreachable` in a
+    // release build: a caller that passed a relative path would abort the
+    // process rather than be told. An error is what a caller can act on.
+    if (!std.fs.path.isAbsolute(path)) return error.NotAbsolute;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         error.FileNotFound => {
@@ -667,4 +671,24 @@ fn dirtyTheFrame() u64 {
     var sum: u64 = 0;
     for (scratch) |byte| sum +%= byte;
     return sum;
+}
+
+test "a relative path is refused by name rather than asserting inside the standard library" {
+    // `createDirAbsolute` asserts an absolute path, and an assert is
+    // `unreachable` in a release build, so a relative path aborted the process.
+    // `makeDirAll` turns it into a diagnostic a caller can read.
+    try testing.expectError(error.NotAbsolute, makeDirAllInner(testing.io, "relative/path"));
+    try testing.expectError(error.NotAbsolute, makeDirAllInner(testing.io, "."));
+    try makeDirAllInner(testing.io, "");
+
+    // And the wrapper turns it into the error a caller reads, with a diagnostic
+    // naming the path rather than only the error.
+    var noted: ?Diagnostic = null;
+    defer if (noted) |*one| one.deinit(testing.allocator);
+    try testing.expectError(error.CacheDirectoryUnwritable, makeDirAll(
+        testing.io,
+        "relative/path",
+        Sink{ .allocator = testing.allocator, .slot = &noted },
+    ));
+    try testing.expect(noted != null);
 }
