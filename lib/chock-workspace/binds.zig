@@ -191,7 +191,22 @@ fn copyTree(
     };
     defer walker.deinit();
 
-    while (walker.next(io) catch null) |entry| {
+    // **A walk that fails is said out loud, never read as the end of the tree.**
+    // `catch null` here made any error look like "there is nothing more": the
+    // copy stopped partway and the bind reported success. A git repository bound
+    // this way arrived with some of its objects missing, and the agent inside met
+    // `fatal: bad object HEAD` with nothing anywhere saying the copy was cut
+    // short. One skip naming the fault is what a person can act on.
+    while (true) {
+        const next = walker.next(io) catch |err| {
+            const reason = try std.fmt.allocPrint(
+                gpa,
+                "reading {s} stopped partway: {t}. What was copied before this is incomplete.",
+                .{ from, err },
+            );
+            return worktree_mod.Worktree.recordSkip(report, gpa, named, reason);
+        };
+        const entry = next orelse break;
         const shown = try std.fs.path.join(gpa, &.{ named, entry.path });
         defer gpa.free(shown);
         const source = try std.fs.path.join(gpa, &.{ from, entry.path });
@@ -480,4 +495,85 @@ test "a copy the caller did not permit is left in the workspace" {
     const kept = try work.dir.readFileAlloc(testing.io, "generated.conf", gpa, .limited(64));
     defer gpa.free(kept);
     try testing.expectEqualStrings("a=2\n", kept);
+}
+
+test "a copy that stops partway says so, and does not report an incomplete tree as done" {
+    const gpa = testing.allocator;
+
+    var project = testing.tmpDir(.{});
+    defer project.cleanup();
+    var work = testing.tmpDir(.{});
+    defer work.cleanup();
+
+    // A tree holding a readable file and a directory the walk cannot read. The
+    // real case was a git repository of several gigabytes where the walk stopped
+    // partway and the bind reported success, so the agent met `fatal: bad object
+    // HEAD` with nothing saying the copy had been cut short.
+    try project.dir.createDirPath(testing.io, "tree/readable");
+    {
+        var file = try project.dir.createFile(testing.io, "tree/readable/kept.txt", .{});
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, "this one is fine\n");
+    }
+    try project.dir.createDirPath(testing.io, "tree/closed");
+    {
+        var file = try project.dir.createFile(testing.io, "tree/closed/hidden.txt", .{});
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, "unreachable\n");
+    }
+    // No read and no search, so iterating it fails rather than answering empty.
+    // The handle is kept open, because a directory with no search permission
+    // cannot be opened again to put its permissions back.
+    //
+    // **`iterate` is what makes the handle a real descriptor.** Without it
+    // Linux opens the directory with `O_PATH`, and `fchmod` on such a
+    // descriptor answers `EBADF`, which the standard library treats as a
+    // programmer bug and panics on in a debug build.
+    var closed = try project.dir.openDir(testing.io, "tree/closed", .{ .iterate = true });
+    defer closed.close(testing.io);
+    closed.setPermissions(testing.io, .fromMode(0o000)) catch return error.SkipZigTest;
+    // Put it back whatever happens, or the temporary directory cannot be removed.
+    defer closed.setPermissions(testing.io, .fromMode(0o755)) catch {};
+
+    // A process that overrides the permission bits reads the directory anyway,
+    // so there is nothing here to prove and the test says so.
+    if (project.dir.openDir(testing.io, "tree/closed", .{ .iterate = true })) |*open| {
+        @constCast(open).close(testing.io);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    var project_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const project_root = try realPathOf(&project_buffer, project.dir);
+    var work_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const work_root = try realPathOf(&work_buffer, work.dir);
+
+    const tree = try std.fs.path.join(gpa, &.{ project_root, "tree" });
+    defer gpa.free(tree);
+
+    const resolved = [_]Resolved{.{
+        .name = "tree",
+        .relative = "tree",
+        .host_path = tree,
+        .mode = .temp_copy,
+        .is_directory = true,
+    }};
+
+    var report = Report{};
+    defer report.deinit(gpa);
+    const attached = try attach(gpa, testing.io, work_root, "/project", &resolved, true, &report);
+    defer {
+        for (attached) |*one| @constCast(one).deinit(gpa);
+        gpa.free(attached);
+    }
+
+    // The point of the test: something was recorded. A silent partial copy is
+    // the bug, and an empty report is what that looked like.
+    try testing.expect(report.skipped.items.len > 0);
+
+    var said_partway = false;
+    for (report.skipped.items) |one| {
+        if (std.mem.indexOf(u8, one.reason, "stopped partway") != null) said_partway = true;
+        if (std.mem.indexOf(u8, one.reason, "incomplete") != null) said_partway = true;
+    }
+    try testing.expect(said_partway);
 }
