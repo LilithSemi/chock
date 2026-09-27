@@ -677,6 +677,20 @@ pub fn writeRefusal(
                 "ran. Tell the user, because this is the machine and not your request.",
             .{installable},
         ),
+        // **Chock's own bound, named as Chock's.** Both spellings reach here:
+        // `lib/chock-nix/proc.zig` maps the standard library's own to
+        // `OutputTooLong`, and a path that has not mapped it yet arrives as
+        // `StreamTooLong`. Either way the evaluation finished and it was the
+        // reading of its output that stopped, so reporting "it did not evaluate"
+        // sends an agent to rewrite an expression that was never the problem.
+        error.OutputTooLong, error.StreamTooLong => try std.fmt.allocPrint(
+            allocator,
+            "{s} was not built: it evaluated, and its output was larger than this session " ++
+                "reads, so nothing was built and the result was not kept. The expression is " ++
+                "not at fault. Build one attribute rather than a set of them, or ask the user " ++
+                "to raise the output bound.",
+            .{installable},
+        ),
         else => null,
     };
 }
@@ -1725,4 +1739,30 @@ test "a yes to a fetch with no url builds, and a closure with none never asks it
         try testing.expectEqual(@as(usize, 1), gate.asked.items.len);
         try testing.expectEqualStrings("files.example.com", gate.asked.items[0]);
     }
+}
+
+test "an output larger than this session reads is named as that, not as a failed evaluation" {
+    const gpa = std.testing.allocator;
+
+    // The session that found this asked for `formatter.aarch64-linux` and was
+    // told "it did not evaluate (StreamTooLong)". It had evaluated: the output
+    // was bigger than the bound Chock reads, which is Chock's limit and not a
+    // fault in the expression. An agent told the first thing rewrites its
+    // expression for ever.
+    for ([_]anyerror{ error.OutputTooLong, error.StreamTooLong }) |err| {
+        const said = (try writeRefusal(gpa, "flake#formatter.aarch64-linux", err)).?;
+        defer gpa.free(said);
+
+        try std.testing.expect(std.mem.indexOf(u8, said, "it evaluated") != null);
+        try std.testing.expect(std.mem.indexOf(u8, said, "not at fault") != null);
+        // And it says what to do, because a bound nobody can act on is a dead end.
+        try std.testing.expect(std.mem.indexOf(u8, said, "one attribute") != null);
+    }
+
+    // An error this does not name still answers null, so the caller's own
+    // sentence is what a reader gets.
+    try std.testing.expectEqual(
+        @as(?[]u8, null),
+        try writeRefusal(gpa, "flake#thing", error.SomethingElseEntirely),
+    );
 }
