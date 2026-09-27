@@ -174,9 +174,26 @@ what a project cannot take back. [actions.md](actions.md) has both.
 - [actions.md](actions.md) for every action name a rule can carry.
 - [secrets.md](secrets.md) for the `secrets` block, which says what a tool call
   may be given without the agent ever seeing it.
+- [skills.md](../using/skills.md) for the `skills` block, which says which
+  directories of this project hold skills.
 - [org.md](org.md) for the bundle an organisation puts above the project.
 - [subagents.md](../using/subagents.md) for the subagent limits.
 - [plugins.md](../extend/plugins.md) for the plugin list.
+
+### The project's own skills
+
+The `skills` block names directories that hold skill directories. Each path must
+be under the project and must not climb out of it:
+
+```zon
+.{
+    .skills = .{ ".chock/skills" },
+}
+```
+
+At most four. Leave the block out and the project ships none, which is what
+every project does today. [skills.md](../using/skills.md) has the format and the
+three layers.
 
 ### The dev shell the agent gets
 

@@ -11,7 +11,7 @@ Start with [running.md](running.md) for a session end to end, and
 
 ## Using a session
 
-- [using/tools.md](using/tools.md) - the 22 tools, what each one asks for, how
+- [using/tools.md](using/tools.md) - the 23 tools, what each one asks for, how
   every call is gated, and `provide_tool` for a program the session has not
   got.
 - [using/nix.md](using/nix.md) - `nix_eval` and `nix_build`, what a build may
@@ -28,6 +28,8 @@ Start with [running.md](running.md) for a session end to end, and
   sessions, their bounds, and the hazard a writable memory directory is.
 - [using/instructions.md](using/instructions.md) - the three layers of
   `AGENTS.md`, why they are never flattened, and how they differ from a note.
+- [using/skills.md](using/skills.md) - Agent Skills read off disk, the three
+  layers and their defaults, and the four things a skill may never do.
 
 ## Configuring a project
 

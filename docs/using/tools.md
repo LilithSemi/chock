@@ -1,6 +1,6 @@
 # The tools
 
-The agent has 22 tools, and every one that touches the machine goes through the
+The agent has 23 tools, and every one that touches the machine goes through the
 sandbox: `read_file`, `list_directory`, `glob`, `grep`, `write_file`,
 `edit_file`, `run_command`, `read_memory` and `write_memory`. Only
 `run_command` takes a command. The rest name a path, a pattern, or the text to
@@ -20,6 +20,11 @@ name, so a text file called `plot.png` is refused. At most 3145728 bytes.
 the machine at all. `ask_user` puts one question to the person who started the
 session, and it grants nothing: a yes there permits no act. `set_title` names
 the session, so `chock sessions` reads as more than a list of identifiers.
+
+`read_skill` reads one skill: somebody's written procedure for a task, found on
+disk at session start. It is offered only to a session that found at least one,
+and the answer says who wrote it, because a skill from a repository or a package
+is a stranger's writing. [skills.md](skills.md) is the whole of it.
 
 The last nine are described here or on a page of their own:
 

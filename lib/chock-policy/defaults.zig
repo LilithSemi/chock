@@ -59,6 +59,16 @@ pub const rules: []const table.Rule = &.{
     // same `ask`, and this row states it so a reader does not have to check.
     .{ .action = "web.search", .decision = .ask },
 
+    // **Reading a skill is a question about who wrote it, not about the skill.**
+    // The operator's own directory holds what the user put there, so it reads
+    // like their `AGENTS.md`. The other two hold a stranger's instructions, and
+    // the action is per layer so a name a package chose never reaches the table:
+    // see `lib/chock-core/skills.zig`. A project that trusts its own skills
+    // writes one `allow` for `skill.read.project`.
+    .{ .action = "skill.read.operator", .decision = .allow },
+    .{ .action = "skill.read.project", .decision = .ask },
+    .{ .action = "skill.read.packaged", .decision = .ask },
+
     // **Using a secret is a question, not a standing permission.** The project
     // already said which tool may be given which secret, and this says whether
     // a person hears about it each time. Asked live, the same way `web.search`
@@ -265,6 +275,45 @@ test "web.search answers ask with no chock.zon at all" {
     defer table.Table.destroy(gpa, t);
 
     try std.testing.expectEqual(table.Decision.ask, t.evaluateKindAlone(key("web.search")));
+}
+
+test "the operator's own skills read without a question, and a stranger's ask" {
+    const gpa = std.testing.allocator;
+    const t = try emptyTable(gpa);
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(
+        table.Decision.allow,
+        t.evaluateKindAlone(key("skill.read.operator")),
+    );
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        t.evaluateKindAlone(key("skill.read.project")),
+    );
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        t.evaluateKindAlone(key("skill.read.packaged")),
+    );
+}
+
+test "a project that trusts its own skills writes one rule, and the other layers stand" {
+    const gpa = std.testing.allocator;
+    const t = try table.Table.parse(
+        gpa,
+        ".{ .policy = .{ .rules = .{ .{ .action = \"skill.read.project\", .decision = .allow } } } }",
+        null,
+    );
+    defer table.Table.destroy(gpa, t);
+
+    try std.testing.expectEqual(
+        table.Decision.allow,
+        t.evaluateKindAlone(key("skill.read.project")),
+    );
+    // A project cannot widen what a package brought in by naming its own layer.
+    try std.testing.expectEqual(
+        table.Decision.ask,
+        t.evaluateKindAlone(key("skill.read.packaged")),
+    );
 }
 
 test "a tool this file forgot still answers ask" {

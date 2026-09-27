@@ -146,6 +146,9 @@ pub const Sources = struct {
     instructions: instructions.Loaded = .{},
     /// One line per piece of guidance on the shelf. See `guidance.zig`.
     guidance: []const index.Entry = &.{},
+    /// Every skill this session found, bodies and all. The prompt takes one
+    /// line each and never a body: see `skills.zig`.
+    skills: []const skills.Skill = &.{},
     /// One line per knowledgebase entry this project has. See `memory.zig`.
     memory: []const index.Entry = &.{},
 };
@@ -230,6 +233,25 @@ pub fn build(
     if (sources.guidance.len != 0) {
         try appendHeading(allocator, &out, guidance_heading);
         try index.renderInto(allocator, &out, sources.guidance);
+    }
+
+    // **One index a layer, and never one list.** The layer is the whole of what
+    // tells a model how much weight to give what it is about to read, so
+    // flattening the three would throw away the only thing that makes a
+    // stranger's procedure safe to put in front of it.
+    if (sources.skills.len != 0) {
+        // Declaration order is trust order, so the user's own come first.
+        for (std.enums.values(skills.Layer)) |layer| {
+            const entries = try skills.indexEntriesFor(allocator, sources.skills, layer);
+            defer {
+                for (entries) |entry| allocator.free(entry.description);
+                allocator.free(entries);
+            }
+            if (entries.len != 0) {
+                try appendHeading(allocator, &out, layer.heading());
+                try index.renderInto(allocator, &out, entries);
+            }
+        }
     }
 
     if (sources.memory.len != 0) {
@@ -517,6 +539,7 @@ test "the constitution is Chock's own, and it is not the operator's, the project
 }
 
 const guidance = @import("guidance.zig");
+const skills = @import("skills.zig");
 
 test "the operator's block and the project's block arrive distinguishable, never as one block" {
     // **Pin the labelling, not merely that both texts appear.** A prompt
@@ -666,6 +689,68 @@ test "the guidance shelf reaches the prompt as one line each, with its bodies le
     }
     try std.testing.expect(text.len < body_bytes);
     try std.testing.expect(std.mem.indexOf(u8, text, "read_guidance") != null);
+}
+
+test "a skill is one line in the prompt, under a heading saying who wrote it" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const body = "Step one, and a body long enough to notice. " ** 40;
+    var found = [_]skills.Skill{
+        .{
+            .layer = .operator,
+            .dir = "/config/skills/deploy",
+            .name = "deploy",
+            .description = "How the user deploys.",
+            .body = body,
+        },
+        .{
+            .layer = .project,
+            .dir = "/project/.chock/skills/review-a-diff",
+            .name = "review-a-diff",
+            .description = "How this repository reviews a diff.",
+            .body = body,
+        },
+    };
+
+    const text = try build(arena, .{}, &.{}, .{ .skills = &found });
+
+    for (&found) |one| {
+        try std.testing.expect(std.mem.indexOf(u8, text, one.name) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, one.description) != null);
+        // The body stays on disk until `read_skill` asks for it, which is the
+        // whole of the disclosure.
+        try std.testing.expect(std.mem.indexOf(u8, text, one.body) == null);
+    }
+    try std.testing.expect(text.len < body.len);
+    try std.testing.expect(std.mem.indexOf(u8, text, "read_skill") != null);
+
+    // **The two layers are two headings.** Flattening them would throw away the
+    // one thing that tells a model how much weight to give what it reads.
+    try std.testing.expect(std.mem.indexOf(u8, text, skills.Layer.operator.heading()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, skills.Layer.project.heading()) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, skills.Layer.packaged.heading()) == null);
+
+    // And the operator's comes first, which is the order trust runs in.
+    const mine = std.mem.indexOf(u8, text, "deploy").?;
+    const theirs = std.mem.indexOf(u8, text, "review-a-diff").?;
+    try std.testing.expect(mine < theirs);
+}
+
+test "a session with no skill is not given the heading, and never the word" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const text = try build(arena, .{}, &.{}, .{});
+    try std.testing.expect(std.mem.indexOf(u8, text, "read_skill") == null);
+    inline for (@typeInfo(skills.Layer).@"enum".fields) |field| {
+        const layer = @field(skills.Layer, field.name);
+        try std.testing.expect(std.mem.indexOf(u8, text, layer.heading()) == null);
+    }
 }
 
 test "a subtree instruction file is a line in the prompt and its body is not" {

@@ -20,6 +20,7 @@ Chock ships default rules for the ordinary tool calls, so a project with no
 | `net.connect.*` | the sandbox opening a socket | none, so `ask` |
 | `net.fetch.*` | the `fetch_url` tool | none, so `ask` |
 | `web.search` | the `web_search` tool | `ask` |
+| `skill.read.<layer>` | reading a skill of that layer | `allow` for yours, `ask` for the rest |
 | `nix.build.*` | one attribute, built on your machine | none, so `ask` |
 | `nix.net.*` | a host a Nix build reaches | none, so `ask` |
 | `nix.net.build.opaque` | a build that names no URL at all | `allow` |
@@ -167,6 +168,36 @@ and where the key lives.
 A result the agent then wants to read is an ordinary `net.fetch` on a host your
 rules probably do not name. Chock asks about that host, once, for the host the
 agent named.
+
+## `skill.read.<layer>`
+
+Three names, and only three: `skill.read.operator`, `skill.read.project` and
+`skill.read.packaged`. Each says whether the agent may read a skill that came
+from that layer.
+
+**The name is the layer and never the skill.** A per skill action would put a
+name a package chose into your action namespace, which is the thing a policy
+namespace must never accept from a stranger. So a project with forty skills adds
+no rows, and one rule covers every skill of a layer.
+
+`skill.read.operator` ships as `allow`, because that directory holds what you put
+there. The other two ship as `ask`, because a repository's or a package's skill
+is a stranger's written instruction. A project that trusts its own writes one
+rule:
+
+```zig
+.{
+    .policy = .{
+        .rules = .{
+            .{ .action = "skill.read.project", .decision = .allow },
+        },
+    },
+}
+```
+
+The question reaches you at the call, the same way `web.search` does, and a
+refusal refuses that read and nothing else. [skills.md](../using/skills.md) has
+the format, the layers and what a skill can never do.
 
 ## `secret.use.*`
 

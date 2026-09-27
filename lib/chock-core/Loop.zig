@@ -9,6 +9,7 @@ const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
 const sandbox = @import("chock-sandbox");
 const tools = @import("tools.zig");
+const skills_mod = @import("skills.zig");
 const nix_action = @import("nix.zig");
 const context = @import("context.zig");
 const compaction = @import("compaction.zig");
@@ -231,6 +232,10 @@ pub const Deps = struct {
     /// `arbiter.not_asked`, so a session with no arbiter runs no sandboxed tool,
     /// and the model is told nobody could be asked.
     arbiter: ?arbiter_mod.Arbiter = null,
+    /// Every skill this session found. The gate reads it to turn the name a
+    /// call gives into the layer that names the action, and `Context.skills`
+    /// carries the same list to the tool that answers.
+    skills: []const skills_mod.Skill = &.{},
     /// The workspace's own absolute root, handed to `tools.Tool.actionInto`.
     /// Empty is safe: the path is then read as written, which still names a real
     /// if less specific action, and nothing falls back to `allow`.
@@ -1317,6 +1322,33 @@ fn gateToolCall(
         );
     }
 
+    // The action names the layer of the skill this call asks for, so the name
+    // has to be resolved before anybody is asked. A name that is not there is
+    // refused without a question: there is nothing to decide about a skill that
+    // does not exist, and the refusal says what does.
+    if (tool == .read_skill) {
+        const named = try skills_mod.namedIn(allocator, deps.skills, call.arguments);
+        const one = switch (named) {
+            .skill => |it| it,
+            .unparsed, .unknown => return try gateRefusal(
+                allocator,
+                call,
+                try skills_mod.detailFor(allocator, named, deps.skills),
+            ),
+        };
+        const action = writeInto(action_buffer, one.layer.actionName()) orelse
+            return try gateRefusal(allocator, call, try allocator.dupe(u8, gate_unnamed_detail));
+        action_out.* = action;
+
+        const answer = try decideAction(allocator, io, locked, deps, call, action);
+        if (answer.permitted) return null;
+        return try gateRefusal(
+            allocator,
+            call,
+            try arbiter_mod.refusalText(allocator, call.tool, answer),
+        );
+    }
+
     const action = tool.actionInto(
         action_buffer,
         argv0_owned,
@@ -1353,6 +1385,14 @@ fn decideAction(
         .tool = call.tool,
         .tool_call_id = call.call_id,
     });
+}
+
+/// `text` copied into `buffer`, or null when it does not fit. A name that was
+/// cut would be a different, broader action.
+fn writeInto(buffer: []u8, text: []const u8) ?[]const u8 {
+    if (text.len > buffer.len) return null;
+    @memcpy(buffer[0..text.len], text);
+    return buffer[0..text.len];
 }
 
 const gate_action_bytes = @max(tools.Tool.max_action_bytes, nix_action.max_action_bytes);

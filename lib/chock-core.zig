@@ -39,6 +39,10 @@ pub const memory = @import("chock-core/memory.zig");
 /// The guidance shelf: the engineering process the harness carries so a small
 /// model does not have to hold it.
 pub const guidance = @import("chock-core/guidance.zig");
+/// Agent Skills: a skill directory on disk, read with `guidance`'s disclosure
+/// and `instructions`' trust marking. Read its own top comment for why
+/// `allowed-tools` is never a grant.
+pub const skills = @import("chock-core/skills.zig");
 /// The facts only the harness can know, told to the agent on the turn they
 /// matter and never in the system prompt. See its own top comment.
 pub const notices = @import("chock-core/notices.zig");

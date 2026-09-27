@@ -443,6 +443,11 @@ const Started = struct {
     /// session has one of this and `dev_shell`, never both.
     image: ?chock_container.Image,
     toolchain: Toolchain,
+    /// The toolchain's own read only binds, plus one for each operator skill.
+    read_only_mounts: []const chock_core.tools.ToolchainMount,
+    /// Every skill this session found, bodies and all. The prompt carries one
+    /// line each and `read_skill` answers out of this.
+    skills: chock_core.skills.Found,
     tool_env: *std.process.Environ.Map,
     provisioning: ?Provisioning,
     nix_build: ?NixBuild,
@@ -1317,12 +1322,27 @@ fn start(
         flake_inputs,
     );
 
+    const found_skills = try skillsFor(arena, io, config_dir, project_root, toolchain.store_paths);
+    const skill_mounts = try placeSkills(
+        arena,
+        found_skills.skills,
+        project_root,
+        workspace.sandboxRoot(),
+    );
+    const read_only_mounts = try std.mem.concat(
+        arena,
+        chock_core.tools.ToolchainMount,
+        &.{ toolchain.mounts, skill_mounts },
+    );
+    reportSkills(found_skills);
+
     const support = chock_core.tools.Support{
         .adapter = adapter,
         .provider = .{ .images = instance.capabilities.images },
         .memory = memory_ready,
         .provisioning = provisioning != null,
         .nix_build = nix_build != null,
+        .skills = found_skills.skills.len != 0,
         // An evaluation runs in this process, so it needs no `nix` binary,
         // no daemon and no store.
         .nix_eval = true,
@@ -1378,6 +1398,7 @@ fn start(
     const prompt_sources = chock_core.prompt.Sources{
         .instructions = loaded_instructions,
         .guidance = chock_core.guidance.indexEntries(arena) catch return error.OutOfMemory,
+        .skills = found_skills.skills,
         .memory = note_index,
     };
     const system_prompt = chock_core.prompt.build(
@@ -1413,6 +1434,8 @@ fn start(
         .dev_shell = dev_shell,
         .image = image,
         .toolchain = toolchain,
+        .read_only_mounts = read_only_mounts,
+        .skills = found_skills,
         .tool_env = tool_env,
         .provisioning = provisioning,
         .nix_build = nix_build,
@@ -4325,6 +4348,142 @@ fn projectNamedInstructions(
         };
     }
     return resolved;
+}
+
+/// Every skill this session found, the layer the user trusts most first.
+///
+/// Order is precedence: `skills.discover` gives a name to the first root that
+/// holds it, so the user's own skill wins over a repository's and a
+/// repository's over a package's.
+fn skillsFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    config_dir: ?[]const u8,
+    project_root: []const u8,
+    store_paths: []const []const u8,
+) StartError!chock_core.skills.Found {
+    var roots: std.ArrayList(chock_core.skills.Root) = .empty;
+
+    if (config_dir) |dir| try roots.append(arena, .{
+        .layer = .operator,
+        .path = try std.fs.path.join(arena, &.{ dir, chock_core.skills.operator_dir_name }),
+    });
+
+    for (try projectSkillDirs(arena, io, project_root)) |path| {
+        try roots.append(arena, .{ .layer = .project, .path = path });
+    }
+
+    for (try chock_core.skills.packagedRootsIn(arena, io, store_paths)) |one| {
+        try roots.append(arena, one);
+    }
+
+    return chock_core.skills.discover(arena, io, roots.items);
+}
+
+/// Where each skill's own directory is inside the sandbox, and the extra read
+/// only mounts that makes true.
+///
+/// Three layers, three answers. A package's skills are inside a store path the
+/// session already mounts, so the host path is the path. A project's are in the
+/// workspace, so the same relative path under the workspace root is. The
+/// operator's are in the configuration directory, which nothing mounts, so each
+/// one is bound under `inside_root` and that is what the agent is told.
+fn placeSkills(
+    arena: std.mem.Allocator,
+    found: []chock_core.skills.Skill,
+    project_root: []const u8,
+    sandbox_root: []const u8,
+) std.mem.Allocator.Error![]const chock_core.tools.ToolchainMount {
+    var mounts: std.ArrayList(chock_core.tools.ToolchainMount) = .empty;
+
+    for (found) |*one| {
+        switch (one.layer) {
+            .packaged => one.inside = one.dir,
+            .project => one.inside = if (underneath(one.dir, project_root)) |rest|
+                try std.fs.path.join(arena, &.{ sandbox_root, rest })
+            else
+                "",
+            .operator => {
+                const target = try std.fs.path.join(
+                    arena,
+                    &.{ chock_core.skills.inside_root, one.name },
+                );
+                one.inside = target;
+                try mounts.append(arena, .{
+                    .source = one.dir,
+                    .target = target,
+                    .kind = .directory,
+                });
+            },
+        }
+    }
+
+    return mounts.toOwnedSlice(arena);
+}
+
+/// `path` relative to `root`, or null when it is not under it.
+fn underneath(path: []const u8, root: []const u8) ?[]const u8 {
+    if (root.len == 0) return null;
+    if (!std.mem.startsWith(u8, path, root)) return null;
+    if (path.len <= root.len or path[root.len] != '/') return null;
+    return path[root.len + 1 ..];
+}
+
+fn projectSkillDirs(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) StartError![]const []const u8 {
+    var diag: ?chock_policy.skills.Diagnostic = null;
+    defer if (diag) |*d| d.deinit(arena);
+
+    const block = chock_policy.skills.load(arena, io, project_root, &diag) catch |err| {
+        if (diag) |*d| {
+            tty.print(.err, "chock run: the skills block in chock.zon could not be read: {f}\n", .{d});
+        } else {
+            tty.print(.err, "chock run: the skills block in chock.zon could not be read: {t}\n", .{err});
+        }
+        return error.Reported;
+    };
+
+    const resolved = try arena.alloc([]const u8, block.dirs.len);
+    for (block.dirs, 0..) |name, at| {
+        resolved[at] = chock_policy.skills.resolve(arena, io, project_root, name, &diag) catch |err| {
+            if (diag) |*d| {
+                tty.print(.err, "chock run: the skills block in chock.zon could not be read: {f}\n", .{d});
+            } else {
+                tty.print(.err, "chock run: the skills block in chock.zon could not be read: {t}\n", .{err});
+            }
+            return error.Reported;
+        };
+    }
+    return resolved;
+}
+
+/// Say what was found, the way `reportInstructions` does. A user who clones a
+/// repository and sees eleven skills appear has learned something worth knowing,
+/// and a skill that was refused must not be silently absent.
+fn reportSkills(found: chock_core.skills.Found) void {
+    if (found.skills.len != 0) {
+        tty.print(.plain, "chock: skills", .{});
+        for (found.skills, 0..) |one, at| {
+            tty.print(.plain, "{s} {s} ({t})", .{ if (at == 0) "" else ",", one.name, one.layer });
+        }
+        tty.print(.plain, "\n", .{});
+    }
+    for (found.skills) |one| {
+        tty.detail("chock: skill {s} ({t}, {s})\n", .{ one.name, one.layer, one.dir });
+    }
+    for (found.refused) |one| {
+        tty.print(.warn, "chock: {s} is not a skill: {s}\n", .{ one.dir, one.fault.sentence() });
+    }
+    if (found.left_out != 0) {
+        tty.print(
+            .warn,
+            "chock: {d} more skills were found and are not listed to the agent\n",
+            .{found.left_out},
+        );
+    }
 }
 
 fn reportInstructions(loaded: chock_core.instructions.Loaded) void {
@@ -7910,7 +8069,7 @@ fn startMcp(
                 io,
                 started.sandbox_config,
                 context.store_paths,
-                context.toolchain_mounts,
+                context.read_only_mounts,
             ) catch break :blk null;
             break :blk chock_core.tools.prepare(
                 keep,
@@ -8200,7 +8359,7 @@ fn startPlugins(
             io,
             started.sandbox_config,
             context.store_paths,
-            context.toolchain_mounts,
+            context.read_only_mounts,
             host_path,
             module_path,
         );
@@ -8323,7 +8482,7 @@ fn pluginSandbox(
     io: std.Io,
     workspace_config: sandbox.Config,
     store_paths: []const []const u8,
-    toolchain_mounts: []const chock_core.tools.ToolchainMount,
+    read_only_mounts: []const chock_core.tools.ToolchainMount,
     host_path: []const u8,
     module_path: []const u8,
 ) std.mem.Allocator.Error!sandbox.Config {
@@ -8331,7 +8490,7 @@ fn pluginSandbox(
     base.cwd = "/";
     base.rules = &.{};
 
-    const with_store = try chock_core.tools.withStore(keep, io, base, store_paths, toolchain_mounts);
+    const with_store = try chock_core.tools.withStore(keep, io, base, store_paths, read_only_mounts);
 
     var mounts: std.ArrayList(sandbox.namespace.Mount) = .empty;
     try mounts.appendSlice(keep, with_store.mounts);
@@ -10295,7 +10454,8 @@ fn runSession(
         .session_id = started.session_id,
     };
     context.store_paths = started.toolchain.store_paths;
-    context.toolchain_mounts = started.toolchain.mounts;
+    context.skills = started.skills.skills;
+    context.read_only_mounts = started.read_only_mounts;
     context.provisioning = started.provisioning != null;
     context.role = agentRole(options);
 
@@ -10367,7 +10527,7 @@ fn runSession(
                 io,
                 started.sandbox_config,
                 context.store_paths,
-                context.toolchain_mounts,
+                context.read_only_mounts,
             ) catch break :blk null;
             break :blk chock_core.tools.prepare(
                 server_arena.allocator(),
@@ -10805,6 +10965,9 @@ fn runSession(
         .agent_kind = options.agent_kind,
         .role = agentRole(options),
         .system_prompt = system_prompt,
+        // The gate reads it to turn the name a `read_skill` call gives into the
+        // layer that names the action. The same list the prompt was built from.
+        .skills = started.skills.skills,
         .observer = if (sinks.count != 0) exporter.observer() else exporter.inner,
         .canceled = interrupt.requested,
         // Only at a turn boundary, which is why this is not `canceled`. A session
