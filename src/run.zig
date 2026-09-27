@@ -1614,7 +1614,12 @@ fn auditSinks(
 
     if (options.export_dir) |dir| try addPlannedSink(arena, &planned, .{
         .kind = .directory,
-        .path = try dropPathIn(arena, io, dir, session_id),
+        // Resolved against the working directory, because a person typed it and
+        // a relative path is what they meant. The org bundle refuses one instead,
+        // and the difference is who chose it: a bundle's sink is a control over
+        // the person being observed, so it must not land where they decide. See
+        // `chock_policy.org.RequiredSink`.
+        .path = try dropPathIn(arena, io, try absoluteDir(arena, io, dir), session_id),
     });
     if (options.export_syslog) |path| try addPlannedSink(arena, &planned, .{
         .kind = .syslog,
@@ -1637,6 +1642,11 @@ fn addPlannedSink(
 
 fn makeDirAll(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
+    // `createDirAbsolute` asserts this, and an assert is `unreachable` in a
+    // release build, so a relative path reached here aborted the process before
+    // the session log existed to say why. `dropPathIn` catches an error and
+    // carries on; it cannot catch a panic.
+    if (!std.fs.path.isAbsolute(path)) return error.NotAbsolute;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         error.FileNotFound => {
@@ -1649,6 +1659,26 @@ fn makeDirAll(io: std.Io, path: []const u8) !void {
         },
         else => return err,
     };
+}
+
+/// `dir` as an absolute path, whether or not it exists yet.
+///
+/// Not `realPath`, which needs the directory to be there: this runs before the
+/// directory is made. So the working directory is resolved and `dir` is joined
+/// to it, which also takes out any `..` and `.` on the way.
+fn absoluteDir(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    dir: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    if (std.fs.path.isAbsolute(dir)) return dir;
+
+    var here = std.Io.Dir.cwd().openDir(io, ".", .{}) catch return dir;
+    defer here.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = here.realPath(io, &buffer) catch return dir;
+
+    return std.fs.path.resolve(arena, &.{ buffer[0..length], dir });
 }
 
 fn dropPathIn(
@@ -19383,4 +19413,39 @@ test "a pattern reaches a server's namespace from either side, and another's fro
     try testing.expect(!reaches("mcp.time.*", github));
     try testing.expect(!reaches("exec.path.gh", github));
     try testing.expect(!reaches("exec.*", github));
+}
+
+test "a relative export directory is resolved rather than aborting the session" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The crash this fixes: `createDirAbsolute` asserts an absolute path, an
+    // assert is `unreachable` in a release build, and `dropPathIn` catches
+    // errors and not panics. So `--export-dir logs` aborted the process in
+    // `auditSinks`, before the session log existed to record why.
+    const resolved = try absoluteDir(arena, testing.io, "logs/audit");
+    try testing.expect(std.fs.path.isAbsolute(resolved));
+    try testing.expect(std.mem.endsWith(u8, resolved, "logs/audit"));
+
+    // An absolute one is handed back as it came.
+    try testing.expectEqualStrings("/var/log/chock", try absoluteDir(arena, testing.io, "/var/log/chock"));
+
+    // `.` and `..` are taken out on the way, so the path a sink is opened at is
+    // the one a person would read back.
+    const tidied = try absoluteDir(arena, testing.io, "./logs/../audit");
+    try testing.expect(std.mem.endsWith(u8, tidied, "/audit"));
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, tidied, ".."));
+}
+
+test "a relative path reaching makeDirAll is refused by name and never asserted" {
+    // The guard that makes the failure an error a caller can act on rather than
+    // an abort. Both copies of this function have it: the other is in
+    // `lib/chock-core/cache.zig`, which reaches it from the session directory.
+    try testing.expectError(error.NotAbsolute, makeDirAll(testing.io, "relative/path"));
+    try testing.expectError(error.NotAbsolute, makeDirAll(testing.io, "."));
+
+    // An empty path is not an error: nothing was asked for.
+    try makeDirAll(testing.io, "");
 }
