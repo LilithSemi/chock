@@ -5813,12 +5813,23 @@ const SessionHandback = struct {
         defer carried.deinit(gpa);
 
         return switch (carried) {
-            .already_there => .{ .carried = true, .output = try std.fmt.allocPrint(
-                gpa,
-                "already carried back: the ref {s} in {s} is at this very commit, so nothing " ++
-                    "moved and nobody was asked again. The user reads it with `git log {s}`.",
-                .{ ref, tree.project_root, ref },
-            ) },
+            .already_there => |park| already: {
+                const note = try branchNote(gpa, park);
+                defer if (note) |it| gpa.free(it);
+                const said = if (note) |it| try std.fmt.allocPrint(
+                    gpa,
+                    " **No branch of theirs moved**: {s}.",
+                    .{it},
+                ) else try gpa.dupe(u8, "");
+                defer gpa.free(said);
+                break :already .{ .carried = true, .output = try std.fmt.allocPrint(
+                    gpa,
+                    "already carried back: the ref {s} in {s} is at this very commit, so nothing " ++
+                        "moved and nobody was asked again. The user reads it with " ++
+                        "`git log {s}`.{s}",
+                    .{ ref, tree.project_root, ref, said },
+                ) };
+            },
             .not_described => .{ .carried = false, .output = try gpa.dupe(
                 u8,
                 "nothing was carried back and nobody was asked: what your commit would change " ++
@@ -5917,6 +5928,22 @@ fn reviewNote(outcome: chock_broker.Broker.Outcome) []const u8 {
     return chock_broker.review.requesterText(review);
 }
 
+/// What became of the branch, in words to put after "the branch did not move".
+/// `already_there` is the one reason with nothing to add: it says the branch
+/// reaches the commit, and a caller only reaches here when it has said that.
+fn branchNote(
+    gpa: std.mem.Allocator,
+    park: chock_broker.integrate.Parked,
+) std.mem.Allocator.Error!?[]u8 {
+    if (park.why == .already_there) return null;
+    const wanted = park.wanted orelse return try gpa.dupe(u8, park.why.sentence());
+    return try std.fmt.allocPrint(
+        gpa,
+        "the {s} this project asks for did not happen, because {s}",
+        .{ wanted.wireName(), park.why.sentence() },
+    );
+}
+
 /// Carry the session's own commit back into the user's repository, through the
 /// broker, after an approval. The worktree is thrown away at the end of the run,
 /// so without this the agent's work has no path back at all. Nothing here widens
@@ -5964,14 +5991,22 @@ fn applyWork(
 
     switch (carried) {
         .not_described, .failed => return .failed,
-        .already_there => {
+        .already_there => |park| {
             tty.print(
                 .plain,
                 "chock run: the ref {s} is already at the session's commit {s} in {s}, " ++
-                    "so nothing was carried and nobody was asked again.\n" ++
-                    "chock run: read it with `git log {s}`, and take it with " ++
+                    "so nothing was carried and nobody was asked again.\n",
+                .{ ref, new_id, tree.project_root },
+            );
+            if (try branchNote(gpa, park)) |note| {
+                defer gpa.free(note);
+                tty.print(.warn, "chock run: your branch did not move: {s}.\n", .{note});
+            }
+            tty.print(
+                .plain,
+                "chock run: read it with `git log {s}`, and take it with " ++
                     "`git merge {s}`.\n",
-                .{ ref, new_id, tree.project_root, ref, ref },
+                .{ ref, ref },
             );
             return .landed;
         },
@@ -6032,7 +6067,9 @@ fn applyWork(
 
 const CarryOut = union(enum) {
     not_described,
-    already_there,
+    /// The ref is at this commit already. The `Parked` is the branch's own
+    /// answer, which is a different question and not always the same one.
+    already_there: chock_broker.integrate.Parked,
     refused: chock_broker.Broker.Outcome,
     /// This one owns memory. The branch names and the two object ids come out of
     /// the broker's own `Result` and are handed on rather than copied, so nothing
@@ -6109,12 +6146,13 @@ fn carryCommit(
     // Before anybody is asked: a compare and swap from an id to itself moves
     // nothing. The branch has to have nothing to gain either, because a mode that
     // integrates can leave the branch untouched when the working tree was dirty
-    // at the moment of the first request.
+    // at the moment of the first request. That is why the plan's own reason is
+    // carried out rather than replaced: `already_there` would say the branch
+    // reaches this commit, and a parked branch does not.
     if (std.mem.eql(u8, apply.old_id, apply.new_id) and apply.integration == .park) {
-        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{
-            .park = .{ .wanted = wanted.landing(), .why = .already_there },
-        });
-        return .already_there;
+        const park = apply.integration.park;
+        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{ .park = park });
+        return .{ .already_there = park };
     }
 
     var session = chock_proto.state.Session.init(gpa);
@@ -13204,13 +13242,37 @@ test "an agent that has made no commit is answered before anything is put to any
 }
 
 test "every ending of an apply writes down what it did to the branch" {
-    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n            .park = .{ .wanted = wanted.landing(), .why = .already_there },");
+    _ = try callAt("\n        recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{ .park = park });");
     _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, .{\n                .park = .{ .wanted = wanted.landing(), .why = .apply_refused },");
     _ = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
 
     const recorded = try callAt("\n            recordIntegration(gpa, io, params.locked, started.apply_mode, params.ref, carried.integration);");
     const answered = try callAt("\n            return .{ .landed = .{\n                .objects = carried.objects_moved,");
     try testing.expect(recorded < answered);
+}
+
+test "the branch's own answer survives a ref that is already at the commit" {
+    const gpa = std.testing.allocator;
+
+    const dirty = (try branchNote(gpa, .{ .wanted = .merge, .why = .dirty_tree })).?;
+    defer gpa.free(dirty);
+    try testing.expectEqualStrings(
+        "the merge this project asks for did not happen, because the working tree holds " ++
+            "changes that are not committed",
+        dirty,
+    );
+
+    const unasked = (try branchNote(gpa, .{ .wanted = null, .why = .nobody_answered })).?;
+    defer gpa.free(unasked);
+    try testing.expectEqualStrings(
+        "this project asks how the work should land, and nobody answered",
+        unasked,
+    );
+
+    try testing.expectEqual(
+        @as(?[]u8, null),
+        try branchNote(gpa, .{ .wanted = .merge, .why = .already_there }),
+    );
 }
 
 test "the log records the landing that happened, and not the mode the project configured" {
