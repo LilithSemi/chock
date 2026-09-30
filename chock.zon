@@ -1,0 +1,13 @@
+.{
+    .apply = .{ .mode = .rebase },
+    .policy = .{
+        .rules = .{
+            .{ .action = "net.connect.com.lilithsemi.*", .decision = .allow },
+            .{ .action = "net.connect.com.github.*", .decision = .allow },
+            .{ .action = "net.connect.org.freedesktop.gitlab.*", .decision = .allow },
+            .{ .action = "nix.net.eval.com.github.*", .decision = .allow },
+            .{ .action = "nix.net.org.nixos.cache.*", .decision = .allow },
+            .{ .action = "net.fetch.org.ziglang.*", .decision = .allow },
+        },
+    },
+}
