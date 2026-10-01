@@ -10871,12 +10871,15 @@ fn runSession(
     defer gpa.free(credential_dir);
     defer std.Io.Dir.cwd().deleteTree(io, credential_dir) catch {};
 
+    // The fallback keeps the sentinel `realPathFileAlloc` answers with. A plain
+    // slice makes the common type an ordinary one, and the free then releases a
+    // byte less than the allocation.
     const credential_helper = std.Io.Dir.realPathFileAlloc(
         .cwd(),
         io,
         started.exe_path,
         gpa,
-    ) catch try gpa.dupe(u8, "");
+    ) catch try gpa.dupeZ(u8, "");
     defer gpa.free(credential_helper);
 
     const credential_chain = try policyChain(gpa, started, options);
