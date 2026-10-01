@@ -82,6 +82,20 @@ const SpawnError = iface.SpawnError;
 ///
 /// `syscall_restricted` and `workspace_mounted` are absent on purpose, and this
 /// file's top comment says what was measured for each.
+/// A Seatbelt profile names paths and does not move them, so one of the five.
+/// **This is the native driver's limit and not the platform's**: a Mac running a
+/// Linux guest expresses all five, because the guest has a kernel of its own.
+pub const expresses: iface.Expresses = .{
+    .moved_paths = false,
+    .scratch_area = false,
+    .procfs = false,
+    .cgroup_placement = false,
+    .device_passthrough = false,
+};
+
+/// What `chock doctor` prints and what a log row names: a Seatbelt profile.
+pub const driver_name = "darwin";
+
 pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
     .network_isolated,
     .signal_isolated,

@@ -30,6 +30,19 @@ const LimitsReport = iface.LimitsReport;
 /// with one name is two callers writing limits into one cgroup.
 var cgroup_seed: std.atomic.Value(u64) = .init(0);
 
+/// Namespaces give every one of these: a bind can move a path, a tmpfs can be
+/// capped, `procfs` exists to mask, and a cgroup can be delegated.
+pub const expresses: iface.Expresses = .{
+    .moved_paths = true,
+    .scratch_area = true,
+    .procfs = true,
+    .cgroup_placement = true,
+    .device_passthrough = true,
+};
+
+/// What `chock doctor` prints and what a log row names: namespaces, seccomp, Landlock and a cgroup.
+pub const driver_name = "linux";
+
 pub const guarantees: iface.Guarantees = iface.Guarantees.initMany(&.{
     .network_isolated,
     .signal_isolated,

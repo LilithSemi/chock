@@ -420,6 +420,15 @@ project's own `.git` and the scratch object store each keep their real path, so
 the workspace becomes a set of rules instead of a set of mounts. This is why
 `workspace_mounted` is absent and a tool call still works.
 
+**This table is the native Darwin driver's limit and not the platform's.** What a
+way of sandboxing can express is a property of the driver, which is why
+`Sandbox.Driver` carries an `Expresses` of its own and `Sandbox.expresses` is a
+view of the one for this build's native driver. A driver that boots a Linux guest
+on a Mac expresses all five, because the guest has a kernel of its own: bind
+mounts, a capped area, a `procfs` to mask, cgroup placement and a device node to
+hand in. Every row above then names something the native driver cannot do, and
+none of them names something a Mac cannot do.
+
 Two things follow from having no mount tree. An absolute path that a program
 writes into a file names a directory that is deleted with the session. `TMPDIR`
 and `CHOCK_SCRATCHPAD` name one directory, and a file written through either

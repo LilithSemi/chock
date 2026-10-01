@@ -1,5 +1,10 @@
-//! The public interface of chock-sandbox: one driver per way of sandboxing,
-//! chosen at compile time from `builtin.os.tag`.
+//! The public interface of chock-sandbox: one driver per way of sandboxing.
+//!
+//! `native_driver` is the one for the machine this build runs on, chosen from
+//! `builtin.os.tag`, and it is what a caller that names none gets. A `Driver` is
+//! a value, so a caller can hold another: see its own doc comment for what the
+//! four calls are and why a second way of sandboxing is a table rather than a
+//! second copy of this file.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,16 +24,42 @@ pub const runtime_prefix = "/run/chock";
 
 pub const trust_store_inside = runtime_prefix ++ "/ca-bundle.crt";
 
+/// What a way of sandboxing can say at all, as against what it promises. A
+/// `Guarantee` is a property of the boundary; one of these is a property of the
+/// machinery, and a caller reads it to know which shape of answer to build.
+///
+/// **It belongs to the driver and not to the platform.** A guest has a kernel of
+/// its own, so a driver that boots one expresses what the host cannot: a Mac
+/// running a Linux guest has bind mounts, a real `procfs` to mask and cgroup
+/// placement, none of which the native Darwin driver has. See
+/// `docs/security/sandbox.md`.
+pub const Expresses = struct {
+    /// A path can be bound somewhere other than where it lives.
+    moved_paths: bool,
+    /// A capped area can be given, which is the only capacity limit an
+    /// unprivileged process can put on a filesystem.
+    scratch_area: bool,
+    /// There is a `procfs` to mount, and therefore one to mask.
+    procfs: bool,
+    /// A tool call can be put in a cgroup of its own.
+    cgroup_placement: bool,
+    /// A host device node can be handed in.
+    device_passthrough: bool,
+};
+
+/// What the native driver can say. **A comptime view of `native.expresses`**, so
+/// the platform facts live in the driver that has them and this cannot drift
+/// from the value a caller holding a `Driver` reads.
 pub const expresses = struct {
-    pub const moved_paths = builtin.os.tag != .macos;
+    pub const moved_paths = native.expresses.moved_paths;
 
-    pub const scratch_area = builtin.os.tag == .linux;
+    pub const scratch_area = native.expresses.scratch_area;
 
-    pub const procfs = builtin.os.tag == .linux;
+    pub const procfs = native.expresses.procfs;
 
-    pub const cgroup_placement = builtin.os.tag == .linux;
+    pub const cgroup_placement = native.expresses.cgroup_placement;
 
-    pub const device_passthrough = builtin.os.tag == .linux;
+    pub const device_passthrough = native.expresses.device_passthrough;
 };
 
 /// macOS reaches `$TMPDIR` below `/var`, a link to `/private/var`, so a rule
@@ -827,27 +858,159 @@ pub const SignalError = error{
     Unexpected,
 };
 
-const driver = switch (builtin.os.tag) {
+const native = switch (builtin.os.tag) {
     .linux => @import("linux/driver.zig"),
     .macos => @import("darwin/driver.zig"),
     else => @compileError("chock-sandbox: no driver for target os " ++ @tagName(builtin.os.tag)),
 };
 
-pub const guarantees: Guarantees = driver.guarantees;
+/// Either error a driver answers when it cannot put the caller on a keyring of
+/// its own. The union of the two, because a driver that has no keyring at all
+/// refuses rather than failing to join one.
+pub const KeyringError = error{ JoinFailed, Refused };
+
+/// One way of sandboxing, as a value. **The four calls and the one data field
+/// are the whole of what a driver is**, which is why a second one is a table
+/// and not a second copy of this file.
+///
+/// A guest is a layer and not an alternative: a VM driver boots a kernel and
+/// then runs the driver that already exists inside it, so `guarantees` there is
+/// the inner driver's and not a weaker set.
+pub const Driver = struct {
+    /// **A pointer and a table, the shape `NetBroker` and `NetRouter` already
+    /// have.** A driver with state needs one: the microVM driver holds the stream
+    /// into its guest and the set of directories that guest was offered. The two
+    /// native drivers are modules with no state and point this at nothing.
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    /// What `chock doctor` prints, and what a log row names.
+    name: []const u8,
+    guarantees: Guarantees,
+    expresses: Expresses,
+
+    pub const VTable = struct {
+        spawn: *const fn (
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            config: Config,
+            argv: []const []const u8,
+            landlock_report: ?*LandlockReport,
+            middle: ?*Middle,
+        ) SpawnError!std.process.Child.Term,
+        signalMiddle: *const fn (
+            ptr: *anyopaque,
+            fd: std.posix.fd_t,
+            sig: std.posix.SIG,
+        ) SignalError!void,
+        closeMiddle: *const fn (ptr: *anyopaque, middle: *Middle) void,
+        joinFreshSessionKeyring: *const fn (
+            ptr: *anyopaque,
+            stderr_fd: std.posix.fd_t,
+        ) KeyringError!void,
+    };
+
+    pub fn spawn(
+        self: Driver,
+        allocator: std.mem.Allocator,
+        config: Config,
+        argv: []const []const u8,
+        landlock_report: ?*LandlockReport,
+        middle: ?*Middle,
+    ) SpawnError!std.process.Child.Term {
+        return self.vtable.spawn(self.ptr, allocator, config, argv, landlock_report, middle);
+    }
+
+    pub fn signalMiddle(self: Driver, fd: std.posix.fd_t, sig: std.posix.SIG) SignalError!void {
+        return self.vtable.signalMiddle(self.ptr, fd, sig);
+    }
+
+    pub fn closeMiddle(self: Driver, middle: *Middle) void {
+        return self.vtable.closeMiddle(self.ptr, middle);
+    }
+
+    pub fn joinFreshSessionKeyring(self: Driver, stderr_fd: std.posix.fd_t) KeyringError!void {
+        return self.vtable.joinFreshSessionKeyring(self.ptr, stderr_fd);
+    }
+};
+
+/// What a stateless driver's `ptr` points at. A real address, because a null one
+/// would be a pointer nothing may dereference and this one nothing does.
+var no_state: u8 = 0;
+
+/// A `Driver` over one driver module. Every call is wrapped to drop the state
+/// pointer a module has no use for, and the keyring one also widens the error
+/// set, because the two modules answer different ones.
+pub fn driverOf(comptime module: type) Driver {
+    const wrapped = struct {
+        fn spawn(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            config: Config,
+            argv: []const []const u8,
+            landlock_report: ?*LandlockReport,
+            middle: ?*Middle,
+        ) SpawnError!std.process.Child.Term {
+            _ = ptr;
+            return module.spawn(allocator, config, argv, landlock_report, middle);
+        }
+
+        fn signalMiddle(
+            ptr: *anyopaque,
+            fd: std.posix.fd_t,
+            sig: std.posix.SIG,
+        ) SignalError!void {
+            _ = ptr;
+            return module.signalMiddle(fd, sig);
+        }
+
+        fn closeMiddle(ptr: *anyopaque, middle: *Middle) void {
+            _ = ptr;
+            module.closeMiddle(middle);
+        }
+
+        fn joinFreshSessionKeyring(ptr: *anyopaque, stderr_fd: std.posix.fd_t) KeyringError!void {
+            _ = ptr;
+            return module.joinFreshSessionKeyring(stderr_fd);
+        }
+
+        const table: Driver.VTable = .{
+            .spawn = @This().spawn,
+            .signalMiddle = @This().signalMiddle,
+            .closeMiddle = @This().closeMiddle,
+            .joinFreshSessionKeyring = @This().joinFreshSessionKeyring,
+        };
+    };
+    return .{
+        .ptr = &no_state,
+        .vtable = &wrapped.table,
+        .name = module.driver_name,
+        .guarantees = module.guarantees,
+        .expresses = module.expresses,
+    };
+}
+
+/// The driver for the machine this build runs on. A caller that names no driver
+/// gets this one, which is every caller today.
+pub const native_driver: Driver = driverOf(native);
+
+/// What the native driver promises. **Still comptime**: every reader of this is
+/// asking what this build can do, and a second driver does not change that
+/// answer. A caller holding a `Driver` reads `Driver.guarantees` instead.
+pub const guarantees: Guarantees = native.guarantees;
 
 pub const network_modules: []const u8 = switch (builtin.os.tag) {
-    .linux => driver.network_modules,
+    .linux => native.network_modules,
     else => "",
 };
 pub const filter_modules: []const u8 = switch (builtin.os.tag) {
-    .linux => driver.filter_modules,
+    .linux => native.filter_modules,
     else => "",
 };
 
 /// `namespace.substitute` refuses a `text` target that is a symbolic link rather
 /// than following it, which is what `chock doctor` reads this list to check.
 pub const resolver_substitutions: []const namespace.Substitution = switch (builtin.os.tag) {
-    .linux => &driver.resolver_substitutions,
+    .linux => &native.resolver_substitutions,
     else => &.{},
 };
 
@@ -858,20 +1021,38 @@ pub fn spawn(
     landlock_report: ?*LandlockReport,
     middle: ?*Middle,
 ) SpawnError!std.process.Child.Term {
-    return driver.spawn(allocator, config, argv, landlock_report, middle);
+    return spawnWith(native_driver, allocator, config, argv, landlock_report, middle);
+}
+
+/// `spawn` through a driver the caller names.
+///
+/// **The single threaded caller rule holds whichever driver this is**: the
+/// driver forks, and a fork carries only the calling thread. See
+/// `lib/chock-core/tools.zig`'s own top comment.
+pub fn spawnWith(
+    sandbox_driver: Driver,
+    allocator: std.mem.Allocator,
+    config: Config,
+    argv: []const []const u8,
+    landlock_report: ?*LandlockReport,
+    middle: ?*Middle,
+) SpawnError!std.process.Child.Term {
+    return sandbox_driver.spawn(allocator, config, argv, landlock_report, middle);
 }
 
 /// Safe to call from a signal handler: one syscall over a descriptor already held.
 pub fn signalMiddle(fd: std.posix.fd_t, sig: std.posix.SIG) SignalError!void {
-    return driver.signalMiddle(fd, sig);
+    return native_driver.signalMiddle(fd, sig);
 }
 
 /// Call it only after the `spawn` that filled the handle in has returned.
 pub fn closeMiddle(middle: *Middle) void {
-    driver.closeMiddle(middle);
+    native_driver.closeMiddle(middle);
 }
 
-pub const joinFreshSessionKeyring = driver.joinFreshSessionKeyring;
+pub fn joinFreshSessionKeyring(stderr_fd: std.posix.fd_t) KeyringError!void {
+    return native_driver.joinFreshSessionKeyring(stderr_fd);
+}
 
 test "the audit counts each of the three answers apart, and keeps the first fault" {
     var audit: SupervisorAudit = .{};
@@ -1061,14 +1242,144 @@ const StubRouter = struct {
     }
 };
 
+/// A driver that runs nothing and records that it was asked. It proves the
+/// dispatch goes through the table: a `spawnWith` that reached the native driver
+/// instead would fork, and this one cannot.
+const CountingDriver = struct {
+    var spawns: usize = 0;
+    var signals: usize = 0;
+    var closes: usize = 0;
+    var joins: usize = 0;
+
+    fn reset() void {
+        spawns = 0;
+        signals = 0;
+        closes = 0;
+        joins = 0;
+    }
+
+    fn spawn(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        config: Config,
+        argv: []const []const u8,
+        landlock_report: ?*LandlockReport,
+        middle: ?*Middle,
+    ) SpawnError!std.process.Child.Term {
+        _ = ptr;
+        _ = allocator;
+        _ = config;
+        _ = argv;
+        _ = landlock_report;
+        _ = middle;
+        spawns += 1;
+        return .{ .exited = 7 };
+    }
+
+    fn signalMiddle(ptr: *anyopaque, fd: std.posix.fd_t, sig: std.posix.SIG) SignalError!void {
+        _ = ptr;
+        _ = fd;
+        _ = sig;
+        signals += 1;
+    }
+
+    fn closeMiddle(ptr: *anyopaque, middle: *Middle) void {
+        _ = ptr;
+        middle.fd = -1;
+        closes += 1;
+    }
+
+    fn joinFreshSessionKeyring(ptr: *anyopaque, stderr_fd: std.posix.fd_t) KeyringError!void {
+        _ = ptr;
+        _ = stderr_fd;
+        joins += 1;
+        return error.Refused;
+    }
+
+    const table: Driver.VTable = .{
+        .spawn = CountingDriver.spawn,
+        .signalMiddle = CountingDriver.signalMiddle,
+        .closeMiddle = CountingDriver.closeMiddle,
+        .joinFreshSessionKeyring = CountingDriver.joinFreshSessionKeyring,
+    };
+
+    const driver: Driver = .{
+        .ptr = &no_state,
+        .vtable = &table,
+        .name = "counting",
+        .guarantees = Guarantees.initMany(&.{.network_isolated}),
+        .expresses = .{
+            .moved_paths = false,
+            .scratch_area = false,
+            .procfs = false,
+            .cgroup_placement = false,
+            .device_passthrough = false,
+        },
+    };
+};
+
+test "a driver a caller names is the one that runs, and the native one is untouched" {
+    CountingDriver.reset();
+
+    const config = Config{ .root = "/", .mounts = &.{}, .rules = &.{}, .cwd = "/", .env = &.{} };
+    const term = try spawnWith(
+        CountingDriver.driver,
+        std.testing.allocator,
+        config,
+        &.{"/nonexistent"},
+        null,
+        null,
+    );
+
+    // Nothing forked, and the answer is this driver's own.
+    try std.testing.expectEqual(@as(usize, 1), CountingDriver.spawns);
+    try std.testing.expectEqual(@as(u8, 7), term.exited);
+
+    try CountingDriver.driver.signalMiddle(-1, .TERM);
+    var middle: Middle = .{ .fd = 3 };
+    CountingDriver.driver.closeMiddle(&middle);
+    try std.testing.expectEqual(@as(std.posix.fd_t, -1), middle.fd);
+    try std.testing.expectError(
+        error.Refused,
+        CountingDriver.driver.joinFreshSessionKeyring(-1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), CountingDriver.signals);
+    try std.testing.expectEqual(@as(usize, 1), CountingDriver.closes);
+    try std.testing.expectEqual(@as(usize, 1), CountingDriver.joins);
+}
+
+test "the native driver's table answers exactly what its own module does" {
+    // The table is built from the module, so a field wired to the wrong
+    // declaration is what this catches.
+    try std.testing.expectEqualStrings(native.driver_name, native_driver.name);
+    try std.testing.expectEqual(native.guarantees, native_driver.guarantees);
+    try std.testing.expectEqual(guarantees, native_driver.guarantees);
+
+    // A stateless driver points at nothing it dereferences, and every call of it
+    // reaches the module's own.
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&no_state)), native_driver.ptr);
+
+    // A handle nothing filled in is refused without a syscall, whichever driver
+    // this build has, so the wrapper is reached and answers the module's own.
+    try std.testing.expectError(error.NoHandle, signalMiddle(-1, .TERM));
+}
+
 test "the linux driver and the darwin driver expose the same public shape" {
     if (builtin.os.tag != .linux) return;
 
     const linux_driver = @import("linux/driver.zig");
     const darwin_driver = @import("darwin/driver.zig");
 
-    // Add a name here whenever the dispatch above reads a new driver declaration.
-    const shape = .{ "spawn", "guarantees", "joinFreshSessionKeyring", "signalMiddle", "closeMiddle" };
+    // Add a name here whenever `driverOf` reads a new driver declaration.
+    const shape = .{
+        "spawn",
+        "guarantees",
+        "joinFreshSessionKeyring",
+        "signalMiddle",
+        "closeMiddle",
+        "driver_name",
+        "expresses",
+    };
     inline for (shape) |name| {
         if (!@hasDecl(linux_driver, name)) @compileError("linux driver is missing " ++ name);
         if (!@hasDecl(darwin_driver, name)) @compileError("darwin driver is missing " ++ name);
@@ -1341,4 +1652,37 @@ test "two paths that run together are told apart by the length before each" {
     var two = one;
     two.mounts = &right;
     try std.testing.expect(!std.mem.eql(u8, &one.shapeHash(), &two.shapeHash()));
+}
+
+test "what the native driver can say is the driver's own answer, not a second copy" {
+    // `expresses` above is a view of `native.expresses`, so a platform fact
+    // written in two places cannot disagree. This is what would catch a later
+    // change that edited one and not the other.
+    try std.testing.expectEqual(native.expresses, native_driver.expresses);
+    try std.testing.expectEqual(expresses.moved_paths, native_driver.expresses.moved_paths);
+    try std.testing.expectEqual(expresses.scratch_area, native_driver.expresses.scratch_area);
+    try std.testing.expectEqual(expresses.procfs, native_driver.expresses.procfs);
+    try std.testing.expectEqual(
+        expresses.cgroup_placement,
+        native_driver.expresses.cgroup_placement,
+    );
+    try std.testing.expectEqual(
+        expresses.device_passthrough,
+        native_driver.expresses.device_passthrough,
+    );
+
+    // And the two native drivers still differ in the way this build documents:
+    // a Seatbelt profile names paths and does not move them.
+    const linux_driver = @import("linux/driver.zig");
+    const darwin_driver = @import("darwin/driver.zig");
+    try std.testing.expect(linux_driver.expresses.moved_paths);
+    try std.testing.expect(!darwin_driver.expresses.moved_paths);
+
+    // The Darwin driver expresses none of the five, which is the gap a guest
+    // closes. A driver that expressed one of them without saying so here would
+    // have this read the wrong way round.
+    inline for (@typeInfo(Expresses).@"struct".fields) |field| {
+        try std.testing.expect(!@field(darwin_driver.expresses, field.name));
+        try std.testing.expect(@field(linux_driver.expresses, field.name));
+    }
 }

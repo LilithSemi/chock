@@ -79,9 +79,28 @@
       );
 
       packages = forAllSystems (
-        { pkgs, ... }:
+        { system, pkgs, ... }:
+        let
+          # A guest is Linux whatever the host is, which is the whole reason the
+          # microVM driver closes the Darwin gap. An aarch64 Mac's guest is
+          # `aarch64-linux`, and building it needs a Linux builder.
+          guestSystem = if lib.hasSuffix "-darwin" system then "aarch64-linux" else system;
+          guest = import ./pkgs/chock/guest.nix {
+            inherit lib;
+            hostPkgs = pkgs;
+            guestPkgs = import nixpkgs {
+              system = guestSystem;
+              overlays = [ self.overlays.default ];
+            };
+          };
+        in
         {
           default = pkgs.chock;
+          # The two things a microVM guest boots, each its own derivation, so a
+          # release tarball carries them beside the binary. See
+          # `docs/security/microvm.md`.
+          guest-kernel = guest.kernel;
+          guest-initrd = guest.initrd;
         }
       );
 
