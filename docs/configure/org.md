@@ -70,6 +70,13 @@ narrow a number. A bundle therefore carries four blocks of its own:
   how large one object may be, and how much a whole session may add in total.
   [Nix store byte caps](#nix-store-byte-caps) below has the block itself. A
   project above the bundle's number is held to it and is not refused.
+- `sandbox` sets which ways of sandboxing a session may use, as
+  `.{ .drivers = .{ .microvm } }`. This one **refuses** rather than holding a
+  session to a number: a driver is not a quantity, and an installation that
+  requires a guest requires it, so a machine that cannot boot one does not start
+  a session. A bundle that says nothing permits every driver, because absent is
+  not empty. The operator names their own choice in `config.zon`, never a
+  project: see [microvm.md](../security/microvm.md#who-chooses-the-driver).
 
 ## Sandbox resource limits
 

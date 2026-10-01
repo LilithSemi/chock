@@ -100,6 +100,23 @@ pub const Config = struct {
     /// Null for `/dev/null`, which is what every tool call gets. A pipe here is not
     /// a terminal, so the kernel answers `ENOTTY` to `TIOCSTI` on it.
     stdin_fd: ?std.posix.fd_t = null,
+    /// Whether the processes this driver runs beside the call are invisible to it.
+    ///
+    /// **A pair and never a flag.** The call's own user is mapped, a second is
+    /// mapped for the helpers, they become it, and the procfs carries
+    /// `hidepid=2`. Asking for the last without the first two hides nothing:
+    /// `hidepid` hides by user, and one user has nothing to hide from itself.
+    ///
+    /// **Only where a second user can be mapped.** The kernel takes a range from
+    /// a namespace that owns it, so a guest, whose driver is root, can, and an
+    /// ordinary user on a host cannot without `newuidmap` and a configured
+    /// `/etc/subuid`. A call that asks and cannot is refused rather than run as
+    /// though it had.
+    ///
+    /// What it closes: a helper is forked and never `execve`d, so its
+    /// `/proc/<pid>/environ` holds this process's own environment rather than the
+    /// curated one the call was given.
+    hide_helpers: bool = false,
     limits: Limits = .{},
     containment: Containment = .best_effort,
     /// A tmpfs with a hard cap is the only capacity limit an unprivileged process
@@ -834,6 +851,17 @@ pub const SpawnError = error{
     /// window in which the child is outside the cgroup the caller asked for.
     CgroupPlacementUnsupported,
     CgroupPlacementRefused,
+    /// The guest ran nothing and said why. Three names and not one, because
+    /// `Unexpected` is what the tool path shows a person, and "unexpected" is
+    /// the one thing a refusal with a reason is not.
+    GuestRefused,
+    /// No directory the guest was offered holds a path the call needs, or a
+    /// mount writes into one offered read only.
+    GuestCannotPlacePath,
+    /// The config holds something no guest can be asked for.
+    GuestCannotExpress,
+    /// The stream to the guest is gone, so the guest is.
+    GuestGone,
 } || SetupError || std.mem.Allocator.Error;
 
 /// The Landlock ruleset masks a right out of every rule when the running
@@ -847,9 +875,16 @@ pub const LandlockReport = struct {
 /// after that reaches whatever started next: one teardown path sent `SIGKILL` to
 /// a process group holding an unrelated build. Signal through `fd`, never `pid`.
 pub const Middle = struct {
-    /// For reporting and never for signalling.
+    /// For reporting and never for signalling. `elsewhere` when the process is
+    /// not this kernel's to name.
     pid: std.posix.pid_t = 0,
     fd: std.posix.fd_t = -1,
+
+    /// What `pid` holds when a guest runs the call. A caller waiting for a
+    /// driver to fill a middle waits for `pid` to leave zero, so a driver with
+    /// no pid to report still has to say that a call began, and a caller that
+    /// prints one must not print this as a number.
+    pub const elsewhere: std.posix.pid_t = -1;
 };
 
 pub const SignalError = error{
@@ -907,6 +942,13 @@ pub const Driver = struct {
             ptr: *anyopaque,
             stderr_fd: std.posix.fd_t,
         ) KeyringError!void,
+        /// Why the last `spawn` on this driver refused, in words for a person.
+        ///
+        /// **A driver that builds a reason must be able to give it back.** A
+        /// `SpawnError` is a name, and a name that says a path could not be
+        /// placed does not say which path. The answer borrows the driver's own
+        /// memory and is good until its next call.
+        whyLast: *const fn (ptr: *anyopaque) ?[]const u8,
     };
 
     pub fn spawn(
@@ -930,6 +972,10 @@ pub const Driver = struct {
 
     pub fn joinFreshSessionKeyring(self: Driver, stderr_fd: std.posix.fd_t) KeyringError!void {
         return self.vtable.joinFreshSessionKeyring(self.ptr, stderr_fd);
+    }
+
+    pub fn whyLast(self: Driver) ?[]const u8 {
+        return self.vtable.whyLast(self.ptr);
     }
 };
 
@@ -973,11 +1019,19 @@ pub fn driverOf(comptime module: type) Driver {
             return module.joinFreshSessionKeyring(stderr_fd);
         }
 
+        /// A native driver refuses with the kernel's own errors, which the error
+        /// name already carries, so there is nothing to add here.
+        fn whyLast(ptr: *anyopaque) ?[]const u8 {
+            _ = ptr;
+            return null;
+        }
+
         const table: Driver.VTable = .{
             .spawn = @This().spawn,
             .signalMiddle = @This().signalMiddle,
             .closeMiddle = @This().closeMiddle,
             .joinFreshSessionKeyring = @This().joinFreshSessionKeyring,
+            .whyLast = @This().whyLast,
         };
     };
     return .{
@@ -1296,11 +1350,17 @@ const CountingDriver = struct {
         return error.Refused;
     }
 
+    fn whyLast(ptr: *anyopaque) ?[]const u8 {
+        _ = ptr;
+        return null;
+    }
+
     const table: Driver.VTable = .{
         .spawn = CountingDriver.spawn,
         .signalMiddle = CountingDriver.signalMiddle,
         .closeMiddle = CountingDriver.closeMiddle,
         .joinFreshSessionKeyring = CountingDriver.joinFreshSessionKeyring,
+        .whyLast = CountingDriver.whyLast,
     };
 
     const driver: Driver = .{
@@ -1670,6 +1730,13 @@ test "what the native driver can say is the driver's own answer, not a second co
         expresses.device_passthrough,
         native_driver.expresses.device_passthrough,
     );
+
+    // **Linux only from here, and the guard is the first thing after it.**
+    // Importing the other driver's module pulls that file's own tests into this
+    // binary, and the Linux ones do not compile for another platform: its `kill`
+    // takes `std.os.linux.SIG` and `std.posix.SIG` there is the C one. The test
+    // below this one keeps the same rule for the same reason.
+    if (builtin.os.tag != .linux) return;
 
     // And the two native drivers still differ in the way this build documents:
     // a Seatbelt profile names paths and does not move them.

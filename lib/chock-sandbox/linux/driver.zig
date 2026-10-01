@@ -366,6 +366,31 @@ pub fn spawn(
     const path_record: ?*notify.PathRecord = if (recording) mapPathRecord() else null;
     defer if (path_record) |record| unmapPathRecord(record);
 
+    // **The one channel that runs the other way.** A process cannot map a second
+    // identity for itself: the kernel wants `CAP_SETUID` in the parent namespace
+    // and the credential is in the child's by then. So A unshares, asks here, and
+    // waits, and this side writes the map while it is still outside.
+    var map_fds: [2]i32 = .{ -1, -1 };
+    if (config.hide_helpers) {
+        const map_pair_rc = linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+            0,
+            &map_fds,
+        );
+        if (linux.errno(map_pair_rc) != .SUCCESS) {
+            _ = linux.close(read_fd);
+            _ = linux.close(write_fd);
+            _ = linux.close(middle_read_fd);
+            _ = linux.close(middle_write_fd);
+            closeBrokerPair(&broker_fds);
+            closeBrokerPair(&router_fds);
+            closeBrokerPair(&device_fds);
+            return error.Unexpected;
+        }
+    }
+    errdefer closeBrokerPair(&map_fds);
+
     // A supplied cgroup is not joined after the fork: the child is created inside
     // it, so there is no instant at which it exists anywhere else. The plain
     // `fork` stays on the best effort path, which has to work where `clone3` is refused.
@@ -419,12 +444,17 @@ pub fn spawn(
         // `device_fds[1]` is its own argument and never folded into the `@max` above:
         // a device source is exclusive with neither seam, so the `@max` trick would
         // silently drop whichever pair was smaller.
+        if (map_fds[0] >= 0) {
+            _ = linux.close(map_fds[0]);
+            map_fds[0] = -1;
+        }
         enterNamespaces(
             config,
             write_fd,
             middle_write_fd,
             @max(broker_fds[1], router_fds[1]),
             device_fds[1],
+            map_fds[1],
         );
 
         // A holds `CAP_NET_ADMIN` in the user namespace that owns this network
@@ -498,7 +528,14 @@ pub fn spawn(
         const keeper_pid: linux.pid_t = @intCast(keeper_fork_rc);
         if (keeper_pid == 0) {
             _ = linux.close(keeper_fds[0]);
-            runKeeper(keeper_fds[1], middle_pidfd, write_fd, config.stderr_fd, keeper_insns);
+            runKeeper(
+                keeper_fds[1],
+                middle_pidfd,
+                write_fd,
+                config.stderr_fd,
+                keeper_insns,
+                config.hide_helpers,
+            );
         }
 
         _ = linux.close(keeper_fds[1]);
@@ -556,6 +593,7 @@ pub fn spawn(
                     router_insns,
                     write_fd,
                     config.stderr_fd,
+                    config.hide_helpers,
                 );
             }
             router_pid = @intCast(router_fork_rc);
@@ -621,6 +659,7 @@ pub fn spawn(
                     device_insns,
                     write_fd,
                     config.stderr_fd,
+                    config.hide_helpers,
                 );
             }
             device_pid = @intCast(device_fork_rc);
@@ -793,6 +832,16 @@ pub fn spawn(
         // `fd` first and `pid` second, with a release store, because a caller watches
         // `pid` from another thread and then reads `fd` with an acquire load.
         @atomicStore(std.posix.pid_t, &out.pid, pid, .release);
+    }
+
+    // Before the setup report, because A is blocked on this and will report nothing
+    // until it is answered.
+    if (map_fds[0] >= 0) {
+        _ = linux.close(map_fds[1]);
+        map_fds[1] = -1;
+        mapForChild(map_fds[0], pid);
+        _ = linux.close(map_fds[0]);
+        map_fds[0] = -1;
     }
 
     _ = linux.close(write_fd);
@@ -1673,7 +1722,10 @@ fn waitAndRelay(
 }
 
 fn reapRouter(watch: RouterWatch) void {
-    if (watch.control_fd >= 0) _ = linux.close(watch.control_fd);
+    if (watch.control_fd >= 0) {
+        reportRouterCounts(watch.control_fd);
+        _ = linux.close(watch.control_fd);
+    }
 
     var status: u32 = undefined;
     var rc: usize = 0;
@@ -1798,6 +1850,7 @@ fn runRouter(
     insns: []const bpf.Insn,
     write_fd: i32,
     stderr_fd: i32,
+    hide: bool,
 ) noreturn {
     armPdeathsig(write_fd, stderr_fd, middle_pidfd);
 
@@ -1819,6 +1872,10 @@ fn runRouter(
         instance.resolver_fd,
     });
 
+    // The listeners above are bound by then, which is why this is not earlier:
+    // the resolver takes port 53 and only a privileged user may.
+    becomeHelper(hide, stderr_fd);
+
     var cap_diag: ?capabilities.Diagnostic = null;
     capabilities.keepOnly(linux.CAP.NET_ADMIN, &cap_diag) catch linux.exit(1);
     seccomp.install(bpf.Prog.init(insns)) catch linux.exit(1);
@@ -1830,11 +1887,21 @@ fn runRouter(
     const said = linux.sendto(ready_fd, &ready, ready.len, linux.MSG.NOSIGNAL, null, 0);
     if (linux.errno(said) != .SUCCESS or said != ready.len) linux.exit(1);
 
+    // **Over `ready_fd` and never onto standard error.** `write` is not on the
+    // router's allowlist, on purpose, so a report written there dies with `SIGSYS`
+    // and takes the router with it. `ready_fd` is a socketpair, which `sendto`
+    // reaches, and A reads it in `reapRouter`.
+    var last_counts = instance.counts;
+    sendCounts(ready_fd, &instance.counts);
     while (!peerHasGone(ready_fd)) {
         // A monotonic clock that counts suspended time, never the wall clock: every
         // deadline in the router is a span, so a clock NTP can move would expire a
         // name early or hold one late.
         instance.step(monotonicMilliseconds(), router_idle_step_ms, null) catch linux.exit(1);
+        if (!std.meta.eql(last_counts, instance.counts)) {
+            last_counts = instance.counts;
+            sendCounts(ready_fd, &instance.counts);
+        }
     }
 
     var drained: usize = 0;
@@ -1843,6 +1910,76 @@ fn runRouter(
         if (instance.pendingBytes() == 0) break;
     }
     linux.exit(0);
+}
+
+/// What the router says about its own work, for A to report. Fixed size and sent
+/// whole, so a reader needs no framing: `router.Counts` is all `u64`.
+const CountsRecord = struct {
+    magic: u64 = counts_magic,
+    counts: router.Counts,
+};
+
+const counts_magic: u64 = 0x43_4f_55_4e_54_53_31_00;
+
+/// Send the counts to A. **Dropped rather than waited on**: the router's work is
+/// the point and a full socket is not worth a stall, so A reads the newest record
+/// that fitted.
+fn sendCounts(ready_fd: i32, counts: *const router.Counts) void {
+    const record = CountsRecord{ .counts = counts.* };
+    const bytes = std.mem.asBytes(&record);
+    _ = linux.sendto(
+        ready_fd,
+        bytes.ptr,
+        bytes.len,
+        linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT,
+        null,
+        0,
+    );
+}
+
+/// Read whatever the router sent and say what it did. **Before the descriptor is
+/// closed**, because closing it is what tells the router to stop.
+fn reportRouterCounts(control_fd: i32) void {
+    var newest: ?router.Counts = null;
+    while (true) {
+        var record: CountsRecord = undefined;
+        const bytes = std.mem.asBytes(&record);
+        const rc = linux.recvfrom(
+            control_fd,
+            bytes.ptr,
+            bytes.len,
+            linux.MSG.DONTWAIT,
+            null,
+            null,
+        );
+        if (linux.errno(rc) != .SUCCESS or rc != bytes.len) break;
+        if (record.magic != counts_magic) break;
+        newest = record.counts;
+    }
+    // **Zeros are reported too.** A router still inside a query when the call ended
+    // has sent only its opening record, and that all-zero line is exactly the
+    // evidence that it never finished one.
+    const counts = newest orelse {
+        writeStderr(std.posix.STDERR_FILENO, "sandbox: the router said nothing about its work\n");
+        return;
+    };
+    var room: [320]u8 = undefined;
+    const said = std.fmt.bufPrint(
+        &room,
+        "sandbox: router queries {d} answered {d} refused_names {d} refused_types {d} " ++
+            "empty {d} allow_failures {d} malformed {d}; accepted {d} linked {d} " ++
+            "no_destination {d} refused_destinations {d} no_link {d} no_upstream {d}\n",
+        .{
+            counts.queries,              counts.answered,
+            counts.refused_names,        counts.refused_types,
+            counts.empty_answers,        counts.allow_failures,
+            counts.malformed_queries,    counts.accepted,
+            counts.linked,               counts.without_destination,
+            counts.refused_destinations, counts.without_link,
+            counts.without_upstream,
+        },
+    ) catch return;
+    writeStderr(std.posix.STDERR_FILENO, said);
 }
 
 const router_idle_step_ms: i32 = 20;
@@ -1869,6 +2006,7 @@ fn runDevice(
     insns: []const bpf.Insn,
     write_fd: i32,
     stderr_fd: i32,
+    hide: bool,
 ) noreturn {
     armPdeathsig(write_fd, stderr_fd, middle_pidfd);
 
@@ -1876,6 +2014,9 @@ fn runDevice(
 
     var tree_buffer: [device_path_capacity]u8 = undefined;
     if (!bindDeviceTree(&tree_buffer, root, hidden_inside, hidden_host)) linux.exit(1);
+
+    // The tree above is bound by then: mounting needs a privileged user.
+    becomeHelper(hide, stderr_fd);
 
     var cap_diag: ?capabilities.Diagnostic = null;
     capabilities.keepOnly(linux.CAP.SYS_ADMIN, &cap_diag) catch linux.exit(1);
@@ -2100,15 +2241,89 @@ fn monotonicMilliseconds() i64 {
         @divTrunc(@as(i64, now.nsec), std.time.ns_per_ms);
 }
 
+/// Become the second user this namespace mapped, so `hidepid=2` has something to
+/// hide from the call.
+///
+/// **After the privileged setup and before the capabilities go.** Changing user
+/// needs `CAP_SETUID`, which `dropAll` and `keepOnly` take away, and a helper that
+/// still binds a port or mounts a tree needs to do that as root first.
+///
+/// A helper that cannot become the second user ends rather than carrying on as
+/// the call's own: the procfs would hide nothing and nobody would be told.
+/// Write the maps of the child that just unshared, and tell it whether they went
+/// in. **Only this side can**: see `namespace.writeIdMapsFor`.
+///
+/// A refusal is answered rather than left silent: the child is waiting, and a
+/// child that waited for ever would hang the call instead of failing it.
+/// Tell the far side this process has unshared, and wait for it to say the maps
+/// are in. A no, or a closed channel, ends this process: carrying on unmapped
+/// would run the call as the overflow user.
+fn askForMaps(fd: i32, write_fd: i32, stderr_fd: i32) void {
+    const ask = [1]u8{1};
+    var write_rc = linux.write(fd, &ask, ask.len);
+    while (linux.errno(write_rc) == .INTR) write_rc = linux.write(fd, &ask, ask.len);
+    if (linux.errno(write_rc) != .SUCCESS or write_rc != ask.len) {
+        dieErrno(write_fd, stderr_fd, .namespace, "asking for the second user", linux.errno(write_rc));
+    }
+
+    var answer: [1]u8 = undefined;
+    var read_rc = linux.read(fd, &answer, answer.len);
+    while (linux.errno(read_rc) == .INTR) read_rc = linux.read(fd, &answer, answer.len);
+    if (linux.errno(read_rc) != .SUCCESS or read_rc != answer.len or answer[0] != 1) {
+        writeStderr(
+            stderr_fd,
+            "sandbox: the second user this call hides its helpers behind could not be mapped.\n",
+        );
+        dieErrno(write_fd, stderr_fd, .namespace, "waiting for the second user", linux.errno(read_rc));
+    }
+    _ = linux.close(fd);
+}
+
+fn mapForChild(fd: i32, pid: linux.pid_t) void {
+    var asked: [1]u8 = undefined;
+    var read_rc = linux.read(fd, &asked, asked.len);
+    while (linux.errno(read_rc) == .INTR) read_rc = linux.read(fd, &asked, asked.len);
+    if (linux.errno(read_rc) != .SUCCESS or read_rc != asked.len) return;
+
+    var diag: ?namespace.Diagnostic = null;
+    const ok = if (namespace.writeIdMapsFor(
+        pid,
+        linux.getuid(),
+        linux.getgid(),
+        true,
+        &diag,
+    )) |_| true else |_| false;
+
+    const answer = [1]u8{if (ok) 1 else 0};
+    var write_rc = linux.write(fd, &answer, answer.len);
+    while (linux.errno(write_rc) == .INTR) write_rc = linux.write(fd, &answer, answer.len);
+}
+
+fn becomeHelper(hide: bool, stderr_fd: i32) void {
+    if (!hide) return;
+    var diag: ?capabilities.Diagnostic = null;
+    capabilities.becomeUser(
+        linux.getuid() + namespace.helper_id_offset,
+        linux.getgid() + namespace.helper_id_offset,
+        &diag,
+    ) catch {
+        writeStderr(stderr_fd, "sandbox: a helper could not become the user that hides it.\n");
+        linux.exit(1);
+    };
+}
+
 fn runKeeper(
     control_fd: i32,
     middle_pidfd: i32,
     write_fd: i32,
     stderr_fd: i32,
     insns: []const bpf.Insn,
+    hide: bool,
 ) noreturn {
     armPdeathsig(write_fd, stderr_fd, middle_pidfd);
     keepOnlyDescriptors(control_fd, control_fd);
+
+    becomeHelper(hide, stderr_fd);
 
     var cap_diag: ?capabilities.Diagnostic = null;
     capabilities.dropAll(&cap_diag) catch linux.exit(1);
@@ -2156,7 +2371,14 @@ fn runKeeper(
 // 6. seccomp last, because the filter blocks `unshare`, the mount family, and
 //    the `keyctl` step 5 itself uses.
 
-fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_fd: i32, device_fd: i32) void {
+fn enterNamespaces(
+    config: Config,
+    write_fd: i32,
+    middle_write_fd: i32,
+    broker_fd: i32,
+    device_fd: i32,
+    map_fd: i32,
+) void {
     closeInheritedFds(
         write_fd,
         middle_write_fd,
@@ -2165,11 +2387,21 @@ fn enterNamespaces(config: Config, write_fd: i32, middle_write_fd: i32, broker_f
         config.stdin_fd,
         broker_fd,
         device_fd,
+        map_fd,
     );
 
     var diag: ?namespace.Diagnostic = null;
-    namespace.enter(.{ .network = config.network, .mount = true }, &diag) catch |err|
+    namespace.enter(.{
+        .network = config.network,
+        .mount = true,
+        .helper_user = config.hide_helpers,
+        .map_from_parent = config.hide_helpers,
+    }, &diag) catch |err|
         dieNamespace(write_fd, config.stderr_fd, .namespace, err, diag);
+
+    // Ask whoever forked this to write the maps, and wait. Nothing below may run
+    // unmapped: this process would be the overflow user and own no file it needs.
+    if (config.hide_helpers) askForMaps(map_fd, write_fd, config.stderr_fd);
 }
 
 const applied_by_b = [_]iface.LayerName{
@@ -2283,7 +2515,7 @@ fn applyLayers(
     }
 
     var diag: ?namespace.Diagnostic = null;
-    namespace.buildRoot(allocator, config.root, config.mounts, &diag) catch |err|
+    namespace.buildRoot(allocator, config.root, config.mounts, config.hide_helpers, &diag) catch |err|
         dieNamespace(write_fd, config.stderr_fd, .mount_tree, err, diag);
 
     // After the whole mount tree, so a bind the caller asked for cannot cover
@@ -2603,9 +2835,13 @@ const last_reset_signal: u32 = 31;
 /// this process did not die, and the timeout cancelled nothing. A blocked
 /// signal defeats the same cancellation as a caught one.
 fn resetSignalState() void {
-    const to_default = std.posix.Sigaction{
+    // **Every type here is `linux`'s, because every call here is.** `std.posix`
+    // carries the POSIX shapes and the raw calls below carry the kernel's, and the
+    // two differ: a `sigset_t` is one word to the kernel and sixteen to POSIX, so
+    // a mask built by one and passed to the other is the wrong size.
+    const to_default = linux.Sigaction{
         .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.posix.sigemptyset(),
+        .mask = std.mem.zeroes(linux.sigset_t),
         .flags = 0,
     };
     var number: u32 = 1;
@@ -2615,7 +2851,7 @@ fn resetSignalState() void {
         _ = linux.sigaction(sig, &to_default, null);
     }
 
-    const empty = std.posix.sigemptyset();
+    const empty = std.mem.zeroes(linux.sigset_t);
     _ = linux.sigprocmask(std.posix.SIG.SETMASK, &empty, null);
 }
 
@@ -2676,6 +2912,7 @@ fn closeInheritedFds(
     stdin_fd: ?i32,
     broker_fd: i32,
     device_fd: i32,
+    map_fd: i32,
 ) void {
     const dir_rc = linux.open(
         "/proc/self/fd",
@@ -2710,6 +2947,7 @@ fn closeInheritedFds(
             if (std.fmt.parseInt(i32, name, 10)) |fd| {
                 if (fd > std.posix.STDERR_FILENO and fd != dir_fd and fd != write_fd and
                     fd != middle_write_fd and fd != broker_fd and fd != device_fd and
+                    fd != map_fd and
                     fd != stdout_fd and fd != stderr_fd and fd != (stdin_fd orelse -1))
                 {
                     const close_errno = linux.errno(linux.close(fd));
@@ -3024,7 +3262,7 @@ test "closeInheritedFds closes every descriptor above stderr, and leaves stderr 
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, -1, -1, -1, null, -1, -1);
+        closeInheritedFds(-1, -1, -1, -1, null, -1, -1, -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
@@ -3057,7 +3295,7 @@ test "closeInheritedFds keeps exactly the middle pipe's write end, and no other"
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, @intCast(extra_b), -1, -1, null, -1, -1);
+        closeInheritedFds(-1, @intCast(extra_b), -1, -1, null, -1, -1, -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
@@ -3089,13 +3327,46 @@ test "closeInheritedFds keeps exactly the device link's own child end, and no ot
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, -1, -1, -1, null, -1, @intCast(extra_b));
+        closeInheritedFds(-1, -1, -1, -1, null, -1, @intCast(extra_b), -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
         const closed_the_other = linux.errno(a_result) == .BADF;
         const kept_the_device_fd = linux.errno(b_result) == .SUCCESS;
         std.process.exit(if (closed_the_other and kept_the_device_fd) 0 else 1);
+    }
+
+    var status: u32 = undefined;
+    const wait_rc = linux.waitpid(pid, &status, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(wait_rc));
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+}
+
+test "closeInheritedFds keeps the channel the second user is asked for on" {
+    // **The one this caught.** A call that hides its helpers unshares and then asks
+    // whoever forked it to write its maps, on a descriptor made before the fork.
+    // Closing it here left that ask answering `EBADF`, and every call in a guest
+    // refused with a namespace fault that named nothing.
+    const extra_a = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(extra_a));
+    const extra_b = linux.open("/dev/null", .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(extra_b));
+    defer _ = linux.close(@intCast(extra_a));
+    defer _ = linux.close(@intCast(extra_b));
+
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    const pid: linux.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        closeInheritedFds(-1, -1, -1, -1, null, -1, -1, @intCast(extra_b));
+
+        const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
+        const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);
+        const closed_the_other = linux.errno(a_result) == .BADF;
+        const kept_the_map_fd = linux.errno(b_result) == .SUCCESS;
+        std.process.exit(if (closed_the_other and kept_the_map_fd) 0 else 1);
     }
 
     var status: u32 = undefined;
@@ -3118,7 +3389,7 @@ test "closeInheritedFds keeps exactly the descriptor Config.stdin_fd names, and 
     const pid: linux.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
-        closeInheritedFds(-1, -1, -1, -1, @intCast(extra_b), -1, -1);
+        closeInheritedFds(-1, -1, -1, -1, @intCast(extra_b), -1, -1, -1);
 
         const a_result = linux.fcntl(@intCast(extra_a), linux.F.GETFD, 0);
         const b_result = linux.fcntl(@intCast(extra_b), linux.F.GETFD, 0);

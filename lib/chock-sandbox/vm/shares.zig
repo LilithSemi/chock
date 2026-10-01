@@ -5,14 +5,23 @@
 //! guest has never heard of: `/nix/store` on this machine is
 //! `<root>/store` in there. This module rewrites one into the other.
 //!
-//! ## The share set is given and never derived
+//! ## The share set is derived from the mounts it has to cover
 //!
-//! `Config.mounts` holds one entry per store path, which is thousands for a real
-//! dev shell closure, and a guest takes 32 offers. So the share set is what the
-//! session already knows: the store read only, the workspace writable, the cache
-//! writable. Deriving it from the mounts would either exceed the bound or merge
-//! paths of different writability into one name, and the second is worse than the
-//! first.
+//! `offersFor` walks a `Config` and offers one directory per source it binds.
+//! **A set written out beside the mounts goes stale the moment a mount is
+//! added**, which is how a session reached a guest that could not place its own
+//! git directory: the set named the store, the workspace and the cache, and the
+//! workspace's backing binds four more.
+//!
+//! Two things keep the count inside a guest's 32 offers. Every path under the
+//! store folds into one share, which is what makes a dev shell closure of
+//! thousands of entries a single offer. And a source already inside an offer of
+//! the same writability adds none.
+//!
+//! **Writability is never merged.** A writable directory inside a read only one
+//! stays an offer of its own rather than making the whole parent writable: the
+//! share's writability is what the guest's kernel may do, and widening it to save
+//! a name widens the boundary.
 //!
 //! ## What a wrong answer here breaks
 //!
@@ -86,10 +95,12 @@ pub const Fault = union(enum) {
     not_offered: []const u8,
     /// The mount writes, and the share holding it is read only.
     needs_writing: []const u8,
+    /// A device node of this host's that is not one every kernel makes.
+    host_device: []const u8,
 
     pub fn path(self: Fault) []const u8 {
         return switch (self) {
-            .not_offered, .needs_writing => |one| one,
+            .not_offered, .needs_writing, .host_device => |one| one,
         };
     }
 
@@ -97,14 +108,192 @@ pub const Fault = union(enum) {
         return switch (self) {
             .not_offered => "no directory offered to the guest holds it",
             .needs_writing => "the mount writes there and the directory offered is read only",
+            .host_device => "a guest has only the device nodes its own kernel makes",
         };
     }
 };
+
+/// The device nodes every Linux kernel makes.
+///
+/// **These cross as they are and never through a share.** A guest mounts its own
+/// devtmpfs, so `/dev/null` in there is the same device as `/dev/null` out here,
+/// and a bind of one names what the host meant. Sharing the host's node instead
+/// would put a file where a device belongs.
+///
+/// A path under `/dev` that is not one of these is refused rather than passed
+/// through: a guest does not have the host's other devices, and a mount of one
+/// would fail inside for a reason nobody could trace back to here.
+pub const guest_device_nodes = [_][]const u8{
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+};
+
+fn isGuestDevice(path: []const u8) bool {
+    for (guest_device_nodes) |one| {
+        if (std.mem.eql(u8, path, one)) return true;
+    }
+    return false;
+}
 
 pub const Error = std.mem.Allocator.Error || error{
     /// A host path could not be placed in the guest. `fault` says which and why.
     NotPlaceable,
 };
+
+/// The most a guest takes. `mirage-fs.Export`'s own bound, and a set past it is
+/// refused here rather than by a guest that has already booted.
+pub const max_offers: usize = 32;
+
+/// The name the store folds into. Every path under `store_root` is read only, so
+/// one name covers a closure of any size.
+pub const store_share_name = "store";
+
+/// A directory a caller knows a tool call needs, which the session's own config
+/// does not name. `offersFor` gives it a name like any other.
+pub const Wanted = struct {
+    host_path: []const u8,
+    writable: bool,
+};
+
+pub const OfferError = std.mem.Allocator.Error || error{
+    /// More directories than a guest takes. The caller says which session, so
+    /// this carries no path of its own.
+    TooManyOffers,
+};
+
+/// One directory per source `config` binds, so every path it names can be placed.
+///
+/// `extra` holds sources a tool call adds that the session's own config does not,
+/// such as a toolchain's read only mounts. `store_root` folds every path under it
+/// into one read only offer, and null offers the store nothing.
+///
+/// **Give it an arena.** Every name and every path is its own allocation.
+pub fn offersFor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: iface.Config,
+    extra: []const Wanted,
+    store_root: ?[]const u8,
+) OfferError![]const Share {
+    var out: std.ArrayList(Share) = .empty;
+
+    // **Offered whether or not this config names a path in it.** A session's own
+    // config binds no store path: the closure is added per call, by `withStore`,
+    // and a set derived from the session alone would have no store in it when the
+    // first call arrived. One offer is also the only shape that fits, because a
+    // dev shell closure is thousands of paths and a guest takes 32.
+    if (store_root) |root| {
+        if (std.Io.Dir.cwd().statFile(io, root, .{})) |_| {
+            try out.append(allocator, .{
+                .name = store_share_name,
+                .host_path = root,
+                .writable = false,
+            });
+        } else |_| {}
+    }
+
+    for (config.mounts) |one| switch (one) {
+        .bind => |bind| try offer(allocator, io, &out, bind.source, !bind.read_only, store_root),
+        .overlay => |over| {
+            try offer(allocator, io, &out, over.lower, false, store_root);
+            try offer(allocator, io, &out, over.upper, true, store_root);
+            try offer(allocator, io, &out, over.work, true, store_root);
+        },
+        // Neither names a path of the host's.
+        .proc, .deny => {},
+    };
+    for (extra) |one| try offer(allocator, io, &out, one.host_path, one.writable, store_root);
+
+    if (out.items.len > max_offers) return error.TooManyOffers;
+    return out.toOwnedSlice(allocator);
+}
+
+/// Add the directory holding `source`, unless an offer already covers it.
+fn offer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    out: *std.ArrayList(Share),
+    source: []const u8,
+    writes: bool,
+    store_root: ?[]const u8,
+) std.mem.Allocator.Error!void {
+    if (source.len == 0) return;
+    // A device node is the guest's own, so no directory is offered for it.
+    if (underneath(source, "/dev")) return;
+
+    if (store_root) |root| {
+        if (underneath(source, root)) {
+            for (out.items) |had| if (std.mem.eql(u8, had.host_path, root)) return;
+            try out.append(allocator, .{
+                .name = store_share_name,
+                .host_path = root,
+                .writable = false,
+            });
+            return;
+        }
+    }
+
+    // A share is a directory, so a bind of one file offers the directory it is
+    // in. A path this cannot stat is left out: `translate` then refuses and names
+    // it, which says more than an offer of a parent nobody asked for.
+    const stat = std.Io.Dir.cwd().statFile(io, source, .{}) catch return;
+    const directory = if (stat.kind == .directory) source else std.fs.path.dirname(source) orelse return;
+
+    // An offer of the same writability that already holds it covers it. A
+    // writable one inside a read only offer is added, because the alternative is
+    // making the parent writable.
+    for (out.items) |had| {
+        if (!underneath(directory, had.host_path)) continue;
+        if (had.writable or !writes) return;
+    }
+
+    try out.append(allocator, .{
+        .name = try nameFor(allocator, out.items, directory),
+        .host_path = directory,
+        .writable = writes,
+    });
+}
+
+/// A name for a directory that no other offer has taken. The basename where it
+/// reads as one, so a rewritten path in a mount error still says where it came
+/// from, and a number after it when two directories share a basename.
+fn nameFor(
+    allocator: std.mem.Allocator,
+    taken: []const Share,
+    directory: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    var buffer: [64]u8 = undefined;
+    var len: usize = 0;
+    for (std.fs.path.basename(directory)) |byte| {
+        if (len == buffer.len) break;
+        buffer[len] = switch (byte) {
+            'A'...'Z' => byte + 32,
+            'a'...'z', '0'...'9' => byte,
+            else => '-',
+        };
+        len += 1;
+    }
+    const base = if (len == 0) "share" else std.mem.trim(u8, buffer[0..len], "-");
+    const wanted = if (base.len == 0) "share" else base;
+
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const name = if (attempt == 0)
+            try allocator.dupe(u8, wanted)
+        else
+            try std.fmt.allocPrint(allocator, "{s}-{d}", .{ wanted, attempt });
+        var clash = false;
+        for (taken) |had| {
+            if (std.mem.eql(u8, had.name, name)) clash = true;
+        }
+        if (!clash) return name;
+        allocator.free(name);
+    }
+}
 
 /// `config` with every host path rewritten to where the guest sees it.
 ///
@@ -157,6 +346,12 @@ fn place(
     writes: bool,
     fault: *?Fault,
 ) Error![]const u8 {
+    if (isGuestDevice(host_path)) return host_path;
+    if (underneath(host_path, "/dev")) {
+        fault.* = .{ .host_device = host_path };
+        return error.NotPlaceable;
+    }
+
     const share = set.holding(host_path) orelse {
         fault.* = .{ .not_offered = host_path };
         return error.NotPlaceable;
@@ -357,3 +552,216 @@ test "an overlay's upper and work must be writable even when the mount does not 
     try testing.expectEqualStrings("/mnt/shares/store/aaa-lower", moved.mounts[0].overlay.lower);
     try testing.expectEqualStrings("/mnt/shares/workspace/upper", moved.mounts[0].overlay.upper);
 }
+
+test "the offers cover every path a worktree config binds, and the store folds into one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+
+    try tmp.dir.createDirPath(testing.io, "repo/.git");
+    try tmp.dir.createDirPath(testing.io, "work");
+    try tmp.dir.createDirPath(testing.io, "state/objects");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "repo/.git/commondir", .data = "x" });
+
+    const work = try std.fs.path.join(arena, &.{ base, "work" });
+    const git = try std.fs.path.join(arena, &.{ base, "repo/.git" });
+    const objects = try std.fs.path.join(arena, &.{ base, "state/objects" });
+    const commondir = try std.fs.path.join(arena, &.{ base, "repo/.git/commondir" });
+
+    const config = iface.Config{
+        .root = "/sandbox",
+        .cwd = "/",
+        .rules = &.{},
+        .env = &.{},
+        .mounts = &.{
+            .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
+            .{ .bind = .{ .source = git, .target = "/work/.git", .read_only = true } },
+            .{ .bind = .{ .source = objects, .target = "/objects", .read_only = false } },
+            // A file, so the directory holding it is what is offered.
+            .{ .bind = .{ .source = commondir, .target = "/work/.git/commondir", .read_only = true } },
+            // Two store paths of thousands, and one offer between them.
+            .{ .bind = .{ .source = "/nix/store/aaa-jq/bin/jq", .target = "/bin/jq", .read_only = true } },
+            .{ .bind = .{ .source = "/nix/store/bbb-git", .target = "/git", .read_only = true } },
+            .{ .proc = .{ .target = "/proc" } },
+        },
+    };
+
+    const offers = try offersFor(arena, testing.io, config, &.{}, "/nix/store");
+    const set = Set{ .root = "/mnt/shares", .shares = offers };
+
+    // The store is one offer whatever the closure holds, and the file's own
+    // directory is already the git offer.
+    try testing.expectEqual(@as(usize, 4), offers.len);
+    try testing.expectEqualStrings(store_share_name, set.holding("/nix/store/ccc-zig").?.name);
+    try testing.expectEqualStrings(git, set.holding(commondir).?.host_path);
+
+    // And the whole point: every source the config names can now be placed.
+    var fault: ?Fault = null;
+    _ = try translate(arena, config, set, &fault);
+    try testing.expectEqual(@as(?Fault, null), fault);
+}
+
+test "a writable directory inside a read only one is its own offer" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+
+    try tmp.dir.createDirPath(testing.io, "git/chock-objects");
+    const git = try std.fs.path.join(arena, &.{ base, "git" });
+    const objects = try std.fs.path.join(arena, &.{ base, "git/chock-objects" });
+
+    const config = iface.Config{
+        .root = "/sandbox",
+        .cwd = "/",
+        .rules = &.{},
+        .env = &.{},
+        .mounts = &.{
+            .{ .bind = .{ .source = git, .target = "/g", .read_only = true } },
+            .{ .bind = .{ .source = objects, .target = "/o", .read_only = false } },
+        },
+    };
+
+    const offers = try offersFor(arena, testing.io, config, &.{}, null);
+    try testing.expectEqual(@as(usize, 2), offers.len);
+
+    // The parent stays read only. Widening it to save a name would give the
+    // guest's kernel the whole repository to write.
+    const set = Set{ .root = "/mnt/shares", .shares = offers };
+    try testing.expect(!set.holding(git).?.writable);
+    try testing.expect(set.holding(objects).?.writable);
+}
+
+test "two directories with one basename get names of their own" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+
+    try tmp.dir.createDirPath(testing.io, "one/build");
+    try tmp.dir.createDirPath(testing.io, "two/build");
+    const first = try std.fs.path.join(arena, &.{ base, "one/build" });
+    const second = try std.fs.path.join(arena, &.{ base, "two/build" });
+
+    const config = iface.Config{
+        .root = "/sandbox",
+        .cwd = "/",
+        .rules = &.{},
+        .env = &.{},
+        .mounts = &.{
+            .{ .bind = .{ .source = first, .target = "/a", .read_only = true } },
+            .{ .bind = .{ .source = second, .target = "/b", .read_only = true } },
+        },
+    };
+
+    const offers = try offersFor(arena, testing.io, config, &.{}, null);
+    try testing.expectEqual(@as(usize, 2), offers.len);
+    try testing.expectEqualStrings("build", offers[0].name);
+    try testing.expectEqualStrings("build-1", offers[1].name);
+}
+
+test "the store is offered to a session whose own config binds nothing in it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const base = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+
+    try tmp.dir.createDirPath(testing.io, "store");
+    try tmp.dir.createDirPath(testing.io, "work");
+    const store = try std.fs.path.join(arena, &.{ base, "store" });
+    const work = try std.fs.path.join(arena, &.{ base, "work" });
+
+    const config = iface.Config{
+        .root = "/sandbox",
+        .cwd = "/",
+        .rules = &.{},
+        .env = &.{},
+        .mounts = &.{
+            .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
+        },
+    };
+
+    // The closure a tool call binds is not in this config, so a set derived from
+    // it alone would leave every one of those paths unplaceable.
+    const offers = try offersFor(arena, testing.io, config, &.{}, store);
+    const set = Set{ .root = "/mnt/shares", .shares = offers };
+
+    const one_of_thousands = try std.fs.path.join(arena, &.{ store, "aaa-libmpc-1.4.1" });
+    try testing.expectEqualStrings(store_share_name, set.holding(one_of_thousands).?.name);
+    try testing.expect(!set.holding(one_of_thousands).?.writable);
+}
+
+test "a store root that is not there is offered to nobody" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const config = iface.Config{
+        .root = "/sandbox",
+        .cwd = "/",
+        .rules = &.{},
+        .env = &.{},
+        .mounts = &.{},
+    };
+
+    const offers = try offersFor(arena, testing.io, config, &.{}, "/no/store/on/this/machine");
+    try testing.expectEqual(@as(usize, 0), offers.len);
+}
+
+test "a device node every kernel makes crosses as it is, and another is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var config = plainConfig;
+    config.mounts = &.{
+        .{ .bind = .{ .source = "/dev/null", .target = "/dev/null", .read_only = false } },
+    };
+
+    // No offer is made for it, and the source is untouched: the guest's own
+    // devtmpfs holds the same device.
+    const offers = try offersFor(arena, testing.io, config, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), offers.len);
+
+    var fault: ?Fault = null;
+    const moved = try translate(arena, config, .{ .root = "/mnt/shares", .shares = offers }, &fault);
+    try testing.expectEqual(@as(?Fault, null), fault);
+    try testing.expectEqualStrings("/dev/null", moved.mounts[0].bind.source);
+
+    // A device this host has and a guest does not is named rather than placed
+    // somewhere it would fail for another reason.
+    var passthrough = plainConfig;
+    passthrough.mounts = &.{
+        .{ .bind = .{ .source = "/dev/ttyUSB0", .target = "/dev/ttyUSB0", .read_only = false } },
+    };
+    try testing.expectError(
+        error.NotPlaceable,
+        translate(arena, passthrough, .{ .root = "/mnt/shares", .shares = offers }, &fault),
+    );
+    try testing.expectEqualStrings("/dev/ttyUSB0", fault.?.host_device);
+}
+
+const plainConfig = iface.Config{
+    .root = "/sandbox",
+    .cwd = "/",
+    .rules = &.{},
+    .env = &.{},
+    .mounts = &.{},
+};

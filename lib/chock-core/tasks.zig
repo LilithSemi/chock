@@ -158,6 +158,10 @@ pub const Request = struct {
     config: sandbox.Config,
     argv: []const []const u8,
     timeout_ns: u64 = default_timeout_ns,
+    /// Which way of sandboxing this command gets. A background task meets the same
+    /// boundary a foreground call does, and this table holds no context, so the
+    /// driver travels with the request.
+    driver: sandbox.Sandbox.Driver = sandbox.Sandbox.native_driver,
 };
 
 /// What a `Runner` answers with once the command has ended.

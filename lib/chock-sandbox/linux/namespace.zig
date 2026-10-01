@@ -63,6 +63,13 @@ pub const Options = struct {
     network: Network = .none,
     /// Give the process its own mount tree.
     mount: bool = true,
+    /// Map a second user and group, for the processes this driver runs beside
+    /// the call. See `writeIdMaps`, and `buildRoot`'s `hide_other_users` for what
+    /// it is for.
+    helper_user: bool = false,
+    /// Whether whoever forked this process writes its maps. **Required for
+    /// `helper_user`**: see `unshareOnly`.
+    map_from_parent: bool = false,
 };
 
 pub const Error = error{
@@ -93,9 +100,27 @@ pub const Error = error{
 /// what errno. See `probeAvailability`, which asks this same question in a
 /// child and reports the answer.
 pub fn enter(options: Options, diag: ?*?Diagnostic) Error!void {
+    // **Read before the namespace changes.** With no map written yet this process
+    // is the overflow user inside the new namespace, and mapping that identity is
+    // refused: the only one it may map unprivileged is the one it had out here.
     const uid = linux.getuid();
     const gid = linux.getgid();
 
+    try unshareOnly(options, diag);
+    if (options.map_from_parent) return;
+    try writeIdMaps(uid, gid, options.helper_user, diag);
+}
+
+/// The namespaces, and none of the mapping.
+///
+/// **Split out because a range can only be mapped from outside.** The kernel
+/// checks `CAP_SETUID` in the parent namespace against the credential the map
+/// file was opened with, and after this call that credential belongs to the new
+/// namespace, which is not an ancestor of its parent. So a process that wants
+/// more than the one identity it already had asks whoever forked it to write the
+/// map, through `writeIdMapsFor`. Measured in a guest on 2026-09-29: root itself
+/// was refused a range this way round.
+pub fn unshareOnly(options: Options, diag: ?*?Diagnostic) Error!void {
     // NEWPID and NEWIPC are not optional and have no configuration field, the same
     // as NEWNET below. Without NEWPID every process the user owns is a legal
     // signal target, including chockd itself, and prlimit64 and setpriority reach
@@ -134,23 +159,68 @@ pub fn enter(options: Options, diag: ?*?Diagnostic) Error!void {
             return error.Unexpected;
         },
     }
-
-    try writeIdMaps(uid, gid, diag);
 }
 
 /// Map the user to itself inside the new user namespace. Without a map, the process has
 /// the overflow user and cannot own a file.
-pub fn writeIdMaps(uid: linux.uid_t, gid: linux.gid_t, diag: ?*?Diagnostic) Error!void {
+/// How many ids the namespace maps when the helpers get one of their own. The
+/// call keeps the first and every helper takes the second.
+pub const helper_id_offset: u32 = 1;
+
+/// Write the maps of a process that has unshared and is waiting for them.
+///
+/// **Called by whoever forked it, and never by the process itself.** Only a
+/// credential in the parent namespace carries `CAP_SETUID` there, and mapping
+/// more than the one identity the process already had needs it.
+pub fn writeIdMapsFor(
+    pid: linux.pid_t,
+    uid: linux.uid_t,
+    gid: linux.gid_t,
+    helpers: bool,
+    diag: ?*?Diagnostic,
+) Error!void {
+    var path: [64]u8 = undefined;
+    var line: [64]u8 = undefined;
+    const span: u32 = if (helpers) helper_id_offset + 1 else 1;
+
+    const deny = std.fmt.bufPrintZ(&path, "/proc/{d}/setgroups", .{pid}) catch unreachable;
+    try writeFile(deny.ptr, "deny", .setgroups_open, .setgroups_write, diag);
+
+    const uid_at = std.fmt.bufPrintZ(&path, "/proc/{d}/uid_map", .{pid}) catch unreachable;
+    const uid_line = std.fmt.bufPrint(&line, "{d} {d} {d}", .{ uid, uid, span }) catch unreachable;
+    try writeFile(uid_at.ptr, uid_line, .uid_map_open, .uid_map_write, diag);
+
+    const gid_at = std.fmt.bufPrintZ(&path, "/proc/{d}/gid_map", .{pid}) catch unreachable;
+    const gid_line = std.fmt.bufPrint(&line, "{d} {d} {d}", .{ gid, gid, span }) catch unreachable;
+    try writeFile(gid_at.ptr, gid_line, .gid_map_open, .gid_map_write, diag);
+}
+
+/// Map this process's own user and group into the new namespace.
+///
+/// **`helpers` asks for a second of each**, so the processes this driver runs
+/// beside a call can be a user the call is not, and `Mount.Proc.hide_other_users`
+/// then has something to hide. The kernel takes a range only from a namespace
+/// that owns it: a call made by root maps two, and one made by an ordinary user
+/// is refused rather than quietly given one. **That refusal is the point.** A
+/// sandbox that asked to hide its helpers and did not must not run as though it
+/// had.
+pub fn writeIdMaps(
+    uid: linux.uid_t,
+    gid: linux.gid_t,
+    helpers: bool,
+    diag: ?*?Diagnostic,
+) Error!void {
     var buffer: [64]u8 = undefined;
+    const span: u32 = if (helpers) helper_id_offset + 1 else 1;
 
     // The write to setgroups must happen first. Without it the write to gid_map fails
     // with EPERM, because a user could otherwise drop a group to gain access.
     try writeFile("/proc/self/setgroups", "deny", .setgroups_open, .setgroups_write, diag);
 
-    const uid_line = std.fmt.bufPrint(&buffer, "{d} {d} 1", .{ uid, uid }) catch unreachable;
+    const uid_line = std.fmt.bufPrint(&buffer, "{d} {d} {d}", .{ uid, uid, span }) catch unreachable;
     try writeFile("/proc/self/uid_map", uid_line, .uid_map_open, .uid_map_write, diag);
 
-    const gid_line = std.fmt.bufPrint(&buffer, "{d} {d} 1", .{ gid, gid }) catch unreachable;
+    const gid_line = std.fmt.bufPrint(&buffer, "{d} {d} {d}", .{ gid, gid, span }) catch unreachable;
     try writeFile("/proc/self/gid_map", gid_line, .gid_map_open, .gid_map_write, diag);
 }
 
@@ -922,6 +992,7 @@ pub fn buildRoot(
     allocator: std.mem.Allocator,
     root: []const u8,
     mounts: []const Mount,
+    hide_other_users: bool,
     diag: ?*?Diagnostic,
 ) MountError!void {
     // Make every mount private first. Without this, a mount inside the namespace can
@@ -937,7 +1008,10 @@ pub fn buildRoot(
         switch (m) {
             .bind => |b| try buildBindMount(allocator, root, b, diag),
             .overlay => |o| try buildOverlayMount(allocator, root, o, diag),
-            .proc => |p| try buildProcMount(allocator, root, p, diag),
+            // **Asked for here and not in the mount.** The flag hides by user, so it
+            // is worth having only when a second user was mapped, and one field
+            // decides both: see `writeIdMaps`.
+            .proc => |p| try buildProcMount(allocator, root, p, hide_other_users, diag),
             // A second pass, below. See `applyDenyMounts`.
             .deny => {},
         }
@@ -1392,7 +1466,29 @@ fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSo
 /// The kernel gives a procfs mounted from inside a PID namespace the view of
 /// that namespace, so this needs no filtering of its own: `enter` always takes
 /// `CLONE_NEWPID`, and the processes in it are this sandbox's own.
-fn buildProcMount(allocator: std.mem.Allocator, root: []const u8, p: Mount.Proc, diag: ?*?Diagnostic) MountError!void {
+/// Room for what `procfsOptions` writes.
+pub const procfs_option_bytes: usize = 48;
+
+/// The mount options a procfs takes, or null when it takes none.
+///
+/// **`gid` names the group that still sees everything, and it must not be the
+/// call's own.** The kernel lets a reader through on `in_group_p(gid)` before it
+/// ever asks whether the reader could ptrace, and the option defaults to group
+/// zero: a call running as group zero, which is what a guest gives it, was let
+/// straight through and `hidepid` hid nothing at all. Naming the helpers' group
+/// leaves them able to see each other and the call unable to see them.
+pub fn procfsOptions(into: []u8, hide_other_users: bool, gid: linux.gid_t) ?[:0]const u8 {
+    if (!hide_other_users) return null;
+    return std.fmt.bufPrintZ(into, "hidepid=2,gid={d}", .{gid + helper_id_offset}) catch null;
+}
+
+fn buildProcMount(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    p: Mount.Proc,
+    hide_other_users: bool,
+    diag: ?*?Diagnostic,
+) MountError!void {
     const target = try std.fs.path.join(allocator, &.{ root, p.target });
     defer allocator.free(target);
 
@@ -1401,12 +1497,22 @@ fn buildProcMount(allocator: std.mem.Allocator, root: []const u8, p: Mount.Proc,
     const target_z = try allocator.dupeZ(u8, target);
     defer allocator.free(target_z);
 
+    // **`gid` names the group that still sees everything, and it must not be the
+    // call's own.** The kernel lets a reader through on `in_group_p(gid)` before
+    // it ever asks whether the reader could ptrace, and the option defaults to
+    // group zero: a call running as group zero, which is what a guest gives it,
+    // was let straight through and `hidepid` hid nothing. Naming the helpers'
+    // group instead leaves them able to see each other and the call unable to see
+    // them.
+    var option_room: [procfs_option_bytes]u8 = undefined;
+    const options = procfsOptions(&option_room, hide_other_users, linux.getgid());
+
     try mountCall(
         "proc",
         target_z,
         "proc",
         linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC,
-        0,
+        if (options) |one| @intFromPtr(one.ptr) else 0,
         diag,
     );
     // Before the mount is made read only, because every mask is itself a
@@ -2703,4 +2809,22 @@ test "a substitution that names nothing makes no call at all" {
 
     try substitute(gpa, root, &.{}, null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, substitute_source_name, .{}));
+}
+
+test "a procfs that hides other users names a group the call is not in" {
+    var room: [procfs_option_bytes]u8 = undefined;
+
+    // Nothing asked for, nothing given: the ordinary mount takes no options.
+    try std.testing.expectEqual(@as(?[:0]const u8, null), procfsOptions(&room, false, 0));
+
+    // **Never the call's own group.** A call in the named group is let through
+    // before the kernel asks whether it could ptrace, so naming group zero beside
+    // a call that runs as group zero hides nothing: measured in a guest on
+    // 2026-09-29, where `/proc/1` stayed readable until this named group one.
+    const said = procfsOptions(&room, true, 0).?;
+    try std.testing.expectEqualStrings("hidepid=2,gid=1", said);
+    try std.testing.expect(std.mem.indexOf(u8, said, "gid=0") == null);
+
+    // And it follows the call's group rather than assuming zero.
+    try std.testing.expectEqualStrings("hidepid=2,gid=1001", procfsOptions(&room, true, 1000).?);
 }

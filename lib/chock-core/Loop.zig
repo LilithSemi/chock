@@ -168,6 +168,15 @@ pub const no_progress_window: usize = 5;
 /// inside five and is healthy work. A longer cycle still gets through.
 pub const no_progress_distinct: usize = 2;
 
+/// How many dispatch failures in a row with the same reason mean the sandbox will
+/// not recover, so the session ends instead of asking a model to try again.
+///
+/// **Separate from `no_progress`, which keys on the call.** A sandbox that cannot
+/// be built refuses every call alike, so the calls differ and only the reason
+/// repeats: a guest whose filesystem wedged failed ten calls in a row, each one a
+/// model turn, and the loop went on because no two of them were the same call.
+pub const same_failure_repeats: usize = 3;
+
 pub const InFlight = struct {
     tasks: usize = 0,
     children: usize = 0,
@@ -321,11 +330,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, deps: Deps) Error!void {
 
     var progress = Progress{};
     defer progress.deinit(allocator);
+    var failing = Failing{};
+    defer failing.deinit(allocator);
     var watch = ContextWatch{};
 
     var turn: usize = 0;
     while (deps.max_turns == null or turn < deps.max_turns.?) : (turn += 1) {
-        if (try runTurn(allocator, io, &locked, &session, deps, &progress, &watch, &telling, turn)) {
+        if (try runTurn(allocator, io, &locked, &session, deps, &progress, &failing, &watch, &telling, turn)) {
             return recordAtTheEnd(allocator, io, &locked, &session, deps);
         }
     }
@@ -370,6 +381,42 @@ const Observation = struct {
 
     fn isLoop(self: Observation) bool {
         return self.repeats >= no_progress_repeats and self.distinct <= no_progress_distinct;
+    }
+};
+
+/// The reason the last dispatch failed, and how many times in a row it has been
+/// that reason. A dispatch that returned anything clears it.
+const Failing = struct {
+    last: ?[]u8 = null,
+    repeats: usize = 0,
+
+    fn deinit(self: *Failing, allocator: std.mem.Allocator) void {
+        if (self.last) |owned| allocator.free(owned);
+        self.* = undefined;
+    }
+
+    fn clear(self: *Failing, allocator: std.mem.Allocator) void {
+        if (self.last) |owned| allocator.free(owned);
+        self.last = null;
+        self.repeats = 0;
+    }
+
+    fn observe(
+        self: *Failing,
+        allocator: std.mem.Allocator,
+        reason: []const u8,
+    ) std.mem.Allocator.Error!usize {
+        if (self.last) |prev| {
+            if (std.mem.eql(u8, prev, reason)) {
+                self.repeats += 1;
+                return self.repeats;
+            }
+            allocator.free(prev);
+            self.last = null;
+        }
+        self.last = try allocator.dupe(u8, reason);
+        self.repeats = 1;
+        return 1;
     }
 };
 
@@ -422,6 +469,7 @@ fn runTurn(
     session: *chock_proto.state.Session,
     deps: Deps,
     progress: *Progress,
+    failing: *Failing,
     watch: *ContextWatch,
     telling: *notices.State,
     turn_index: usize,
@@ -585,7 +633,20 @@ fn runTurn(
                     observed.repeats,
                 );
                 ran_a_tool = true;
-                try runTool(allocator, io, locked, session, deps, telling, part.tool_use);
+                try runTool(allocator, io, locked, session, deps, telling, failing, part.tool_use);
+                if (failing.repeats >= same_failure_repeats) {
+                    const detail = try std.fmt.allocPrint(
+                        allocator,
+                        "the last {d} tool calls all failed the same way, so the sandbox is not " ++
+                            "going to answer the next one: {s}",
+                        .{ failing.repeats, failing.last orelse "no reason kept" },
+                    );
+                    defer allocator.free(detail);
+                    _ = try appendAndApply(allocator, io, locked, session, deps, .{
+                        .session_end = .{ .reason = .no_progress, .detail = detail },
+                    });
+                    return true;
+                }
                 if (try endIfCanceled(allocator, io, locked, session, deps)) return true;
             }
 
@@ -1423,6 +1484,7 @@ fn runTool(
     session: *chock_proto.state.Session,
     deps: Deps,
     telling: *notices.State,
+    failing: *Failing,
     tool_use: message.ToolCall,
 ) Error!void {
     const call = event.ToolCall{
@@ -1463,13 +1525,31 @@ fn runTool(
         try runSetTitle(allocator, io, locked, session, deps, call)
     else if (std.mem.eql(u8, call.tool, request_tool_name))
         try runRequestAction(allocator, io, locked, deps, call)
-    else
-        deps.tool_runner.dispatch(allocator, io, call, gated_action) catch |err| event.ToolResult{
+    else if (deps.tool_runner.dispatch(allocator, io, call, gated_action)) |ran| good: {
+        // A dispatch that answered at all means the sandbox is still there.
+        failing.clear(allocator);
+        break :good ran;
+    } else |err| blk: {
+        // The driver's own words when it has any. A name alone says a path
+        // could not be placed and never says which path.
+        const said = tools.driverNow().whyLast();
+        // The reason and not the call, because a sandbox that cannot be built
+        // refuses every call alike. See `same_failure_repeats`.
+        _ = try failing.observe(allocator, said orelse @errorName(err));
+        break :blk event.ToolResult{
             .call_id = try allocator.dupe(u8, call.call_id),
-            .output = try std.fmt.allocPrint(allocator, "tool dispatch failed: {s}", .{@errorName(err)}),
+            .output = if (said) |one|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "tool dispatch failed: {s}: {s}",
+                    .{ @errorName(err), one },
+                )
+            else
+                try std.fmt.allocPrint(allocator, "tool dispatch failed: {s}", .{@errorName(err)}),
             .is_error = true,
             .truncated = false,
         };
+    };
     defer allocator.free(dispatched.call_id);
     defer allocator.free(dispatched.output);
     defer if (dispatched.note.len != 0) allocator.free(dispatched.note);
@@ -2933,6 +3013,31 @@ fn testDeps(client: chock_provider.Client.Client, storage: chock_proto.storage.S
         .system_prompt = "you are a test agent",
         .arbiter = AlwaysPermitArbiter.arbiter(),
     };
+}
+
+test "the same dispatch failure three times in a row ends the session" {
+    const allocator = std.testing.allocator;
+    var failing = Failing{};
+    defer failing.deinit(allocator);
+
+    // **The reason repeats where the call does not.** A sandbox that cannot be
+    // built refuses every call alike, so `Progress` never sees a loop and ten
+    // model turns went into a guest that could not answer one.
+    const wedged = "the sandbox could not be built: MountTreeFailed";
+    try std.testing.expectEqual(@as(usize, 1), try failing.observe(allocator, wedged));
+    try std.testing.expectEqual(@as(usize, 2), try failing.observe(allocator, wedged));
+    try std.testing.expectEqual(@as(usize, 3), try failing.observe(allocator, wedged));
+    try std.testing.expect(failing.repeats >= same_failure_repeats);
+
+    // A different reason is a different fault, and starts again.
+    try std.testing.expectEqual(@as(usize, 1), try failing.observe(allocator, "GuestCannotPlacePath"));
+    try std.testing.expect(failing.repeats < same_failure_repeats);
+
+    // A dispatch that answered means the sandbox is still there.
+    _ = try failing.observe(allocator, wedged);
+    failing.clear(allocator);
+    try std.testing.expectEqual(@as(usize, 0), failing.repeats);
+    try std.testing.expectEqual(@as(usize, 1), try failing.observe(allocator, wedged));
 }
 
 test "a turn with no tool call appends a message event and stops" {

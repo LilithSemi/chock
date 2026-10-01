@@ -195,6 +195,43 @@ At most four. Leave the block out and the project ships none, which is what
 every project does today. [skills.md](../using/skills.md) has the format and the
 three layers.
 
+### Which way of sandboxing a session uses
+
+`config.zon` is the only file that names this, and it is deliberate: a project
+may only narrow what it may do, and a project that could name its own sandbox
+driver could name a weaker one.
+
+```zon
+.{
+    .sandbox = .{ .driver = "microvm" },
+}
+```
+
+`native` is the default and is today's behaviour. See
+[microvm.md](../security/microvm.md) for what a guest adds, and
+[org.md](org.md) for how an organisation pins or forbids one.
+
+### How big a guest is
+
+The same block names how many processors a guest gets and how much memory. Both
+are optional, and a number here is used as it is.
+
+```zon
+.{
+    .sandbox = .{ .driver = "microvm", .cores = 4, .memory_mb = 4096 },
+}
+```
+
+Leave them out and both scale with the machine. A host with 128 cores and 511GB
+gives a guest 12 processors and 12GB, one with 8 cores and 8GB gives 2 processors
+and 1GB, and a guest never gets more than one eighth of the memory of the machine
+it runs on. The processor count is also limited by that share of memory, because a
+build runner starts one job for each processor and a guest with more processors
+than memory loses a compiler to the kernel. `cores` is further limited to 8 on a
+Mac, where the interrupt controller a guest gets has no more. The curves and the
+reasons for them are in
+[microvm.md](../security/microvm.md#how-big-a-guest-is).
+
 ### The dev shell the agent gets
 
 The `nix` block of `chock.zon` names which `devShells` attribute the tool

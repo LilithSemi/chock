@@ -1478,7 +1478,38 @@ pub fn build(b: *std.Build) void {
     //   than the one that ships.
     const vulcan = b.dependency("vulcan", .{ .target = target, .optimize = optimize });
 
+    // **Running a guest is Linux on aarch64 and nothing else yet.** Mirage's machine
+    // setup is KVM and the device layout `mirage-arm64` states is that
+    // architecture's.
+    //
+    // Two files behind one module name, so every build compiles: the one that cannot
+    // run a guest answers `available = false`, which the daemon reads before it
+    // offers a session one. See `src/vmm_absent.zig`.
+    const can_run_a_guest = target.result.os.tag == .linux and target.result.cpu.arch == .aarch64;
+    const mirage = if (can_run_a_guest)
+        b.dependency("mirage", .{ .target = target, .optimize = optimize })
+    else
+        null;
+
+    const vmm_module = b.createModule(.{
+        .root_source_file = b.path(if (can_run_a_guest) "src/vmm.zig" else "src/vmm_absent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = if (mirage) |dep| &.{
+            .{ .name = "chock-sandbox", .module = chock_sandbox },
+            .{ .name = "mirage-backend", .module = dep.module("mirage-backend") },
+            .{ .name = "mirage-core", .module = dep.module("mirage-core") },
+            .{ .name = "mirage-arm64", .module = dep.module("mirage-arm64") },
+            .{ .name = "mirage-device", .module = dep.module("mirage-device") },
+            .{ .name = "mirage-memory", .module = dep.module("mirage-memory") },
+            .{ .name = "mirage-attest", .module = dep.module("mirage-attest") },
+            .{ .name = "mirage-session", .module = dep.module("mirage-session") },
+            .{ .name = "mirage-fs", .module = dep.module("mirage-fs") },
+        } else &.{},
+    });
+
     const exe_imports = [_]std.Build.Module.Import{
+        .{ .name = "chock-vmm", .module = vmm_module },
         .{ .name = "phantom", .module = phantom.module("phantom") },
         // What `chock --version` prints. See the block above.
         .{ .name = "chock-version", .module = chock_version_module },
@@ -1523,6 +1554,16 @@ pub fn build(b: *std.Build) void {
         .use_llvm = evaluator_llvm,
     });
     b.installArtifact(exe);
+
+    // The tests of `src/vmm.zig` are the drift guard: they name every Mirage
+    // declaration this file's copy of the setup reaches, so an upgrade that moves
+    // one fails a build instead of leaving two versions of the same loop.
+    if (can_run_a_guest) {
+        const vmm_tests = b.addTest(.{ .root_module = vmm_module });
+        const run_vmm_tests = b.addRunArtifact(vmm_tests);
+        run_vmm_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_vmm_tests.step);
+    }
 
     // **Its own step, and never on `test_step`.** This is not a test that
     // passes or fails a build. It is an exercise that is run deliberately. A
