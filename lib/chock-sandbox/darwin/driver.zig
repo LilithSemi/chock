@@ -419,12 +419,16 @@ fn spawnDarwin(
         @atomicStore(std.c.pid_t, &handle.pid, a_pid, .release);
     }
 
-    const record = readSetupReport(setup_fds[0]);
+    const record = try readSetupReport(setup_fds[0]);
     _ = std.c.close(setup_fds[0]);
 
+    // **A wait that failed is never an exit.** Breaking out with `status` left at
+    // zero made `termFor` answer `exited 0`, so a call whose wait failed reported
+    // success and that exit code was what reached the log. The Linux driver
+    // refuses here, and so does this one.
     var status: c_int = 0;
     while (std.c.waitpid(a_pid, &status, 0) < 0) {
-        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) break;
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return error.Unexpected;
     }
 
     if (record) |step| return setupErrorFor(step);
@@ -473,7 +477,10 @@ const SetupRecord = extern struct {
     errno: i32,
 };
 
-fn readSetupReport(read_fd: std.c.fd_t) ?SetupStep {
+/// **A read that failed is not an empty report.** Null is how a successful
+/// `execve` reports itself, so answering null on a broken pipe made a call that
+/// never started look like one that ran. The Linux driver refuses here too.
+fn readSetupReport(read_fd: std.c.fd_t) SpawnError!?SetupStep {
     var record: SetupRecord = undefined;
     var filled: usize = 0;
     const bytes = std.mem.asBytes(&record);
@@ -481,7 +488,7 @@ fn readSetupReport(read_fd: std.c.fd_t) ?SetupStep {
         const n = std.c.read(read_fd, bytes[filled..].ptr, bytes.len - filled);
         if (n < 0) {
             if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
-            return null;
+            return error.Unexpected;
         }
         if (n == 0) break;
         filled += @intCast(n);
