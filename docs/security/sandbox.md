@@ -1,8 +1,8 @@
 # The sandbox
 
-Every tool call runs inside a sandbox, in a throwaway copy of the project. Your
-real project is never written by a tool call. This page says what the boundary
-is made of.
+Every tool call runs inside a sandbox, in a throwaway copy of the project. No
+tool call writes your real project unless you approved a `workspace` bind in
+write mode. This page says what the boundary is made of.
 
 The layers below are the Linux ones. macOS builds the boundary out of Seatbelt,
 and it gives less.
@@ -45,10 +45,13 @@ it. Chock configures no interface at all, so a call reaches no host.
 There are three modes, and a tool call gets the first:
 
 - `none`, the default. No route out at all.
-- `filtered`. The same closed namespace, plus one descriptor to a broker passed
-  in over a socket, so a named connection can be brokered against the policy
-  table. In practice this is set only when a rule allows an MCP server's
-  `net.connect`.
+- `filtered`. The same closed namespace, plus a router inside it: a resolver, a
+  relay and an nftables ruleset that drops by default. A call reaches a host only
+  after the policy table permits the name and then permits the address and port.
+  This is set when the policy permits anything under `net`, which is any rule
+  under `net.connect.*` or `net.fetch.*`. A second shape exists in
+  `lib/chock-sandbox/linux/netbroker.zig`, one descriptor to a broker, and
+  nothing in Chock sets it: that file's own comment says so.
 - `host`. The host's own namespace, with nothing removed. `chock doctor` uses
   this for its own probes.
 
@@ -70,7 +73,8 @@ Chock asks the kernel which ABI it has and takes the answer, rather than
 requesting a version. The ruleset then handles every filesystem right that
 kernel knows, masked to the ABI it reported, because an unhandled right stays
 permitted everywhere. Rights the running kernel does not have are masked out of
-each rule and reported back, so a session on an older kernel says what it did
+each rule, with no error. `chock doctor` prints the ABI version it found, and a
+session does not report which rights it did
 not get.
 
 Three grant sets are used: read only, read only for one regular file, and read
@@ -279,7 +283,9 @@ so the first signal is `SIGXCPU` and not `SIGKILL`.
 `RLIMIT_SIGPENDING` and `RLIMIT_MSGQUEUE` are not set, each for a reason
 written next to it in the code.
 
-A project's `chock.zon` can lower any of these and can never raise one. It is
+A project's `chock.zon` can set `processes` and `memory`, and the value it
+names is the value used, above or below the default. Only an organisation's
+ceiling lowers it. This is not
 the same ratchet the policy table keeps.
 
 One setting widens, and it is not one of these. The write and execute rule is
@@ -381,9 +387,12 @@ identical lookup outside any profile succeeds. See
 `test/sandbox/darwin_escape.zig`'s own mach-lookup tests.
 
 A layer this driver reports as on, and does not enforce, is worse than a
-refusal. Chock compares a policy against a driver and refuses a driver that
-claims too little, and it trusts a driver that claims too much. So every claim
-above comes from a run on Apple Silicon, macOS 15.7.9, arm64. Two layers were
+refusal. What a driver declares is reported by `chock doctor` and refuses
+nothing: no policy field names a guarantee, and `Sandbox.Guarantee`'s own comment
+says nothing compares against the set yet. What is refused is a config a driver
+cannot express, which is a different question and makes no claim about a driver
+overstating itself. So every claim above comes from a run on Apple Silicon,
+macOS 15.7.9, arm64. Two layers were
 tried and then dropped:
 
 - There is no system call filter. `(deny syscall-unix (syscall-number 26))`

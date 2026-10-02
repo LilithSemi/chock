@@ -94,7 +94,8 @@ them as a control would be a mistake.
   cannot be taken out again without breaking the chain. That is why the
   replacement happens before the record is written, and why there is no command
   that cleans a log after the fact.
-  Four things are still not covered. A project cannot declare a secret of its
+  Four things are still not covered. A project can declare a secret of its own, and the `{{secret:name}}` handle path
+  is not wired. A project cannot name a secret of its
   own yet. A git password and a `{{secret:name}}` credential have mechanisms
   built and nothing that fills them, so they protect nothing today. A block of
   model reasoning is signed by the provider and is passed through untouched.
@@ -122,8 +123,8 @@ On Linux a tool call runs in its own user, mount, PID, IPC and network
 namespaces, under a Landlock rule set and a seccomp filter, in a throwaway copy
 of the project. The credential store is never mounted into the sandbox.
 
-**The real project is never written by a tool call**, and that sentence is
-stronger than it was. A git worktree keeps its own metadata inside the real
+**No tool call writes the real project unless you approved a `workspace` bind in
+write mode**, and that sentence is stronger than it was. A git worktree keeps its own metadata inside the real
 repository, at `.git/worktrees/<id>`, and git must write the index there for
 `git status` to work at all. Chock used to give that directory to the tool call
 itself. A red team run wrote two files into it, so now the directory is copied
@@ -148,11 +149,13 @@ Two things macOS does not give you, and both are permanent:
   its own host path instead, and there is no capped temporary area, so a file
   written through `TMPDIR` or `CHOCK_SCRATCHPAD` survives the call.
 
-The driver reports no guarantee it has not proved, so a policy that asks for
-more than macOS gives is refused rather than quietly accepted. Run
+The driver reports no guarantee it has not proved, and a config that needs a
+layer macOS does not have is refused rather than quietly accepted. What a driver
+declares is reported and refuses nothing on its own. Run
 `chock doctor` on the machine you are on: it names each layer and what is lost.
 
-The session log is append only. Each record carries a hash of the bytes of the
+The session log is append only, with one exception: a torn trailing fragment from
+a killed process is cut, and the chain verifier has a verdict for exactly that. Each record carries a hash of the bytes of the
 record before it, so a change anywhere breaks the chain from that point on. A
 seal signs the head of that chain, which is what a rewrite of the whole log
 cannot forge without the key. What a seal is worth is what its key is worth, and

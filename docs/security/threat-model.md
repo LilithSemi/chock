@@ -128,6 +128,21 @@ Landlock ruleset failed to load has no sandbox at all.
 A threat model that only lists what holds is marketing. These are gaps that
 were found by trying, and not a hedge.
 
+A language server cannot start in a project that permits a host. The language
+server config is built by `lib/chock-core/tools.zig`'s `prepare`, which carries
+the session's network mode through and attaches no router, because only a tool
+call has one. So the config is `filtered` with no seam, and
+`lib/chock-sandbox/linux/driver.zig` refuses it before the fork rather than
+running a server with a network nothing filters. The refusal is the correct end
+of a wrong state. A language server needs no socket and should be given
+`Network.none`, which is not what the code does today.
+
+The session log is tamper evident and not confidential. It is created readable by
+anybody with an account on the machine, and the directory holding it is too, while
+the approval socket beside it is not. So a hash chain tells you whether a record
+was changed and tells you nothing about who read it. On a shared build host, treat
+a session log as readable by every user of that host.
+
 macOS has no system call filter, and this is permanent rather than a missing
 feature. `(deny syscall-unix (syscall-number 26))` compiles in a Seatbelt
 profile, applies with no error, and `ptrace` still returns 0. Only the
@@ -183,24 +198,23 @@ session still bites. And the set of tools a session holds is fixed at the
 start, so a server that gains a tool mid session is proposing a widening with
 nowhere to land.
 
-A foreground tool call holds a network descriptor whether or not any policy
-rule grants a host. `lib/chock-core/tools.zig`
-gives every foreground tool call `Network.filtered` unconditionally, so the
-sandboxed process always has the one connected descriptor a filtered process
-uses to ask for a connection, even in a session whose policy table grants no
-host at all. The descriptor being present does not mean a connection happens
-on its own, but it does not mean a host with no rule stays out of reach
-either. A host no rule names resolves to `ask`, the same as any other
-unnamed action, and that `ask` reaches a person, through the same wait every
-other mid session approval uses. A person who answers yes makes the
-connection happen, so a foreground call on a project with an empty policy
-table can still reach any host at all, one approval at a time. The file
-descriptor itself is there from the first foreground call onward, on every
-project, whether or not the project has ever named a host. A background
-`run_command` call and a language server do not get this. A background call
-is reset to `Network.none` before it starts, because nothing today can carry
-an `ask` question out of a task with no turn of the loop waiting on it, and a
-language server gets `Network.none` because nothing it does needs a socket.
+A session is given a network only when its policy permits one.
+`src/run.zig` reads `policy.wantsRouter()`, which is true when any rule
+permits something under `net`, and a project that permits nothing there gets
+`Network.none`: no interface that can deliver a packet, and no seam to ask on.
+Nothing shipped makes `wantsRouter` true, so a project with no `chock.zon` has
+no network in a tool call at all.
+
+A project that does permit a host gets a router, and then every name is judged
+before DNS runs. `lib/chock-broker/network.zig` refuses a name no rule reaches
+without asking anybody: a host outside the permitted set is not a question a
+person can answer yes to, it is a refusal at the resolver. So a single `net`
+rule opens the hosts that rule names and no others.
+
+A background `run_command` call gets the same router, not `Network.none`. What
+makes it safe is narrower: a background slot has nobody to ask, so only a table
+`allow` passes and a host that would have raised a question is refused instead
+of queued.
 
 If any point above stops being true, this document is wrong until it is
 corrected. Each one was checked against the code, not carried forward from an

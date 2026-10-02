@@ -20,11 +20,10 @@ pub const Network = enum {
     /// **Nothing can be reached.** Its own network namespace, with no route out
     /// and no descriptor to ask on.
     ///
-    /// This is `Sandbox.Config.network`'s own zero value, and it is no longer
-    /// what a foreground tool call gets. See `lib/chock-core/tools.zig`'s
-    /// `Context.net`, which moves every foreground call to `filtered` instead.
-    /// A background `run_command` call, a language server, and an MCP server a
-    /// policy has not let out still get this.
+    /// This is `Sandbox.Config.network`'s own zero value and what a session gets
+    /// when no rule permits anything under `net`: `src/run.zig` reads
+    /// `policy.wantsRouter()`, which is false for the shipped defaults. A project
+    /// that permits a host gets `filtered` instead.
     none,
     /// **Only the hosts a policy names can be reached, one connection at a
     /// time.** Its own network namespace, and a unix socket to the parent. The

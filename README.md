@@ -15,8 +15,10 @@ under Landlock and a system call filter, in a workspace that is a copy. On
 macOS it gets Seatbelt for paths, for the network and for signals, and Darwin's
 own resource limits. macOS gives no bind mount and no usable system call
 filter, so Chock does not claim those two layers there. Your real project is
-never written by a tool call. A layer that fails to apply fails the tool call,
-and is never quietly skipped.
+never written by a tool call, unless you approved a `workspace` bind in write
+mode. Every layer that confines the call fails the call if it cannot be applied.
+The limit layer is the exception: cgroups are best effort, and `chock doctor`
+says so on its own row.
 
 The other half is that every action is reviewable. The session log is the
 session: every turn, every tool call, every approval and every cost is an
