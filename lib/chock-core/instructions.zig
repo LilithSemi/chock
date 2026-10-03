@@ -81,7 +81,24 @@ pub const max_subtree_depth: usize = 4;
 
 /// A directory the walk never enters. `.git` holds no instructions and
 /// walking it costs the most of any directory in a repository.
-const skipped_dirs = [_][]const u8{ ".git", ".zig-cache", "zig-out", "node_modules", "target" };
+///
+/// **`zig-pkg` is here because a dependency wrote instructions into a session.**
+/// Zig unpacks every fetched package under it, and one of them, the Public Suffix
+/// List, ships an `AGENTS.md` about its own pull request template. Every session
+/// on this project read it as a `subtree` block and printed it to the model. A
+/// dependency is not a layer of this project, and whatever it says about how to
+/// work is about itself. The same goes for the other vendored trees below: an
+/// instruction that arrives with a package is an instruction nobody here wrote.
+const skipped_dirs = [_][]const u8{
+    ".git",
+    ".zig-cache",
+    "zig-out",
+    "zig-pkg",
+    "node_modules",
+    "target",
+    "vendor",
+    ".direnv",
+};
 
 /// Which of the three layers a block came from. **The layer is what the
 /// prompt prints**, so it is a value and not a comment: a block that reached
@@ -557,6 +574,40 @@ test "the git directory is never walked for instruction files" {
 
     const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
     try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
+}
+
+test "a dependency's own AGENTS.md is never read as this project's instructions" {
+    const allocator = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The shape that reached a model: zig unpacks each package under `zig-pkg`,
+    // and the Public Suffix List ships an `AGENTS.md` about its own pull request
+    // template. It was printed as a `subtree` block in every session.
+    try writeAt(
+        testing.io,
+        tmp.dir,
+        "zig-pkg/N-V-__8AAK5QFgB8/" ++ file_name,
+        "# Pull Request Requirements\n",
+    );
+    try writeAt(testing.io, tmp.dir, "vendor/somebody/" ++ file_name, "# Theirs\n");
+    try writeAt(testing.io, tmp.dir, "node_modules/pkg/" ++ file_name, "# Theirs\n");
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try absolutePath(&buffer, testing.io, tmp.dir);
+
+    const loaded = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
+    try testing.expectEqual(@as(usize, 0), loaded.subtrees.len);
+
+    // And a real subdirectory of the project still is read, so the skip is the
+    // vendored trees and not the walk.
+    try writeAt(testing.io, tmp.dir, "src/parser/" ++ file_name, "# Ours\n");
+    const again = try load(arena, testing.io, null, root, &.{}, null, &.{}, null);
+    try testing.expectEqual(@as(usize, 1), again.subtrees.len);
 }
 
 test "a file past the block bound is cut, says so, and still reports its real size" {
