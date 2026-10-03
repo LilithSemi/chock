@@ -51,6 +51,9 @@ Start with [running.md](running.md) for a session end to end, and
 
 ## Security
 
+- [security/microvm.md](security/microvm.md) - the microVM driver: why a guest is
+  a layer and not an alternative, what `chock guest` does inside one, and what
+  crosses the wire.
 - [security/threat-model.md](security/threat-model.md) - what the sandbox is
   built against, one attack walked end to end, and what is not covered.
 - [security/sandbox.md](security/sandbox.md) - the layers a tool call runs

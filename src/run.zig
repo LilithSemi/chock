@@ -15,6 +15,7 @@ const chock_proto = @import("chock-proto");
 const chock_provider = @import("chock-provider");
 const chock_workspace = @import("chock-workspace");
 const sandbox = @import("chock-sandbox");
+const vmm = @import("chock-vmm");
 
 const subagent = chock_core.subagent;
 
@@ -112,6 +113,10 @@ const Options = struct {
     policy_rules: []const chock_policy.table.Rule = &.{},
     continue_newest: bool = false,
     adopt: bool = false,
+    /// Where this session's microVM guest is listening. Given by `chock daemon`,
+    /// which owns the guest: a person never types it. Null for a session whose
+    /// operator chose the native driver.
+    guest: ?[]const u8 = null,
     allow_dirty: bool = false,
     no_notices: bool = false,
     export_dir: ?[]const u8 = null,
@@ -443,6 +448,11 @@ const Started = struct {
     /// session has one of this and `dev_shell`, never both.
     image: ?chock_container.Image,
     toolchain: Toolchain,
+    /// What the operator's own `config.zon` says about sandboxing. Owned by the
+    /// session's arena.
+    sandbox_choice: chock_policy.sandbox.Block,
+    /// Chock's own state directory. Short, which is what a unix socket path needs.
+    state_dir: []const u8,
     /// The toolchain's own read only binds, plus one for each operator skill.
     read_only_mounts: []const chock_core.tools.ToolchainMount,
     /// Every skill this session found, bodies and all. The prompt carries one
@@ -752,6 +762,12 @@ fn start(
     };
     const data_dir = chock_auth.paths.dataDir(arena, env) catch |err| {
         tty.print(.err, "chock run: the data directory is unknown: {s}\n", .{@errorName(err)});
+        return error.Reported;
+    };
+
+    const sandbox_choice = try sandboxChoice(arena, io, config_dir);
+    const state_dir = chock_auth.paths.stateDir(arena, env) catch |err| {
+        tty.print(.err, "chock run: the state directory is unknown: {s}\n", .{@errorName(err)});
         return error.Reported;
     };
 
@@ -1433,6 +1449,8 @@ fn start(
         .sandbox_config = sandbox_config,
         .dev_shell = dev_shell,
         .image = image,
+        .sandbox_choice = sandbox_choice,
+        .state_dir = state_dir,
         .toolchain = toolchain,
         .read_only_mounts = read_only_mounts,
         .skills = found_skills,
@@ -10459,6 +10477,38 @@ fn runSession(
     context.provisioning = started.provisioning != null;
     context.role = agentRole(options);
 
+    // **Every tool call of this session now goes through the guest.** Set before
+    // the first one and never after: see `chock_core.tools.useDriver`, and
+    // `docs/security/microvm.md` for why the daemon owns the guest and this only
+    // reaches into it.
+    // An arena of its own, freed with the session: the share names, the buffers and
+    // the link outlive every turn and none of them outlives the run.
+    var guest_arena = std.heap.ArenaAllocator.init(gpa);
+    defer guest_arena.deinit();
+
+    var guest_link: ?*GuestLink = null;
+    var own_guest: ?*OwnGuest = null;
+    defer if (own_guest) |one| one.stop();
+
+    // The daemon hands a socket in when it owns the guest. A session nobody handed
+    // one to starts its own, because a `chock run` of its own is one process for the
+    // whole session: it is only under the daemon that a child exits every turn.
+    const guest_socket: ?[]const u8 = options.guest orelse socket: {
+        if (started.sandbox_choice.chosen() != .microvm) break :socket null;
+        const one = try startOwnGuest(guest_arena.allocator(), io, started.state_dir, started);
+        own_guest = one;
+        break :socket one.socket;
+    };
+
+    if (guest_socket) |socket_path| {
+        const room = guest_arena.allocator();
+        const link = try attachGuest(room, io, socket_path, try guestShares(room, io, started));
+        chock_core.tools.useDriver(link.guest.driver());
+        guest_link = link;
+        tty.print(.plain, "chock: tool calls run in a microVM guest\n", .{});
+    }
+    defer if (guest_link) |link| link.close(io);
+
     // The page allocator, and never `gpa`. A task's own thread allocates from
     // this beside a thread that may be inside `Sandbox.spawn`, and `fork` carries
     // only the calling thread.
@@ -10821,12 +10871,15 @@ fn runSession(
     defer gpa.free(credential_dir);
     defer std.Io.Dir.cwd().deleteTree(io, credential_dir) catch {};
 
+    // The fallback keeps the sentinel `realPathFileAlloc` answers with. A plain
+    // slice makes the common type an ordinary one, and the free then releases a
+    // byte less than the allocation.
     const credential_helper = std.Io.Dir.realPathFileAlloc(
         .cwd(),
         io,
         started.exe_path,
         gpa,
-    ) catch try gpa.dupe(u8, "");
+    ) catch try gpa.dupeZ(u8, "");
     defer gpa.free(credential_helper);
 
     const credential_chain = try policyChain(gpa, started, options);
@@ -11666,6 +11719,416 @@ fn refuseAdoptWithNothingToAdopt(
 const busy_detail = "another process took the session's log lock first, so it owns that session " ++
     "now. Nothing was lost: the log is whole, and `chock sessions` says who is running.";
 
+/// One guest this session runs itself, on a thread of its own.
+///
+/// **This process forks for a tool call under the native driver, and does not under
+/// this one.** `Registry.dispatch` reaches `Sandbox.spawn` only for the native
+/// driver; with a guest every call crosses a wire instead, so the threads below are
+/// never live at a fork. The guest is given an allocator of its own all the same, so
+/// nothing it holds is the allocator the rest of this process uses.
+const OwnGuest = struct {
+    thread: std.Thread,
+    socket: [:0]const u8,
+    /// Where the guest's console goes.
+    console: [:0]const u8,
+    ready: std.atomic.Value(bool) = .init(false),
+    stopping: std.atomic.Value(bool) = .init(false),
+    ended: std.atomic.Value(bool) = .init(false),
+
+    fn stop(self: *OwnGuest) void {
+        self.stopping.store(true, .release);
+        self.thread.join();
+    }
+};
+
+fn runOwnGuest(one: *OwnGuest, io: std.Io, options: vmm.Options) void {
+    defer one.ended.store(true, .release);
+
+    var guest_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = guest_state.deinit();
+
+    // **A file beside the session and not this process's own output.** The agent's
+    // transcript is on standard output, and a kernel boot interleaved with it is
+    // unreadable for both. It also means a guest that says why it failed is still
+    // saying it where somebody can look, which standard output did not: a session
+    // whose display owns that stream threw the whole boot away.
+    var file = std.Io.Dir.cwd().createFile(io, one.console, .{}) catch {
+        tty.print(.err, "chock: the guest's console could not be opened at {s}\n", .{one.console});
+        return;
+    };
+    defer file.close(io);
+
+    var out_buffer: [16 * 1024]u8 = undefined;
+    var console = file.writer(io, &out_buffer);
+
+    var fault: ?vmm.Fault = null;
+    const code = vmm.host(guest_state.allocator(), io, options, &console.interface, &fault) catch |err| {
+        console.interface.flush() catch {};
+        tty.print(.err, "chock: the guest ended badly: {t}\n", .{err});
+        return;
+    };
+    // The guest's console is buffered, and a guest that stopped early has its whole
+    // boot still in there. Without this the reason is thrown away.
+    console.interface.flush() catch {};
+    tty.detail("chock: the guest's own loop ended, answering {d}\n", .{code});
+    if (fault) |said| {
+        if (said.detail.len == 0) {
+            tty.print(.err, "chock: the guest: {s}.\n", .{said.said});
+        } else {
+            tty.print(.err, "chock: the guest: {s}: {s}\n", .{ said.said, said.detail });
+        }
+    }
+}
+
+/// Start this session's own guest and wait for its socket.
+///
+/// **A guest that will not come up stops the session.** Carrying on with the native
+/// driver would sandbox it more weakly than the operator asked for, and on a Mac far
+/// more weakly, with nothing saying so.
+fn startOwnGuest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    state_dir: []const u8,
+    started: *const Started,
+) StartError!*OwnGuest {
+    if (!vmm.available) {
+        tty.print(
+            .err,
+            "chock run: this build runs no guest, and the configuration asks for one. A guest " ++
+                "needs KVM and the aarch64 device layout.\n",
+            .{},
+        );
+        return error.Reported;
+    }
+
+    // **In the state directory's own root, and not under the session.** A unix
+    // socket path takes 108 bytes; a session directory is that root plus a project
+    // name and a hash, and a real one came to 137. This is where the daemon puts its
+    // guest sockets for the same reason.
+    const socket = std.fmt.allocPrintSentinel(
+        arena,
+        "{s}/g-{s}.sock",
+        .{ state_dir, started.session_id[started.session_id.len - 12 ..] },
+        0,
+    ) catch return error.OutOfMemory;
+
+    if (socket.len > std.Io.net.UnixAddress.max_len) {
+        tty.print(
+            .err,
+            "chock run: a guest socket at {s} would be {d} bytes and a unix socket path takes " ++
+                "{d}.\n",
+            .{ socket, socket.len, std.Io.net.UnixAddress.max_len },
+        );
+        return error.Reported;
+    }
+
+    const console = std.fmt.allocPrintSentinel(
+        arena,
+        "{s}/{s}.guest-console",
+        .{ started.paths.dir, started.session_id },
+        0,
+    ) catch return error.OutOfMemory;
+
+    const held = arena.create(OwnGuest) catch return error.OutOfMemory;
+    held.* = .{ .thread = undefined, .socket = socket, .console = console };
+
+    // Read once, so the processor count and the memory size are chosen against
+    // the same numbers.
+    const guest_machine = chock_policy.sandbox.Machine.now();
+
+    held.thread = std.Thread.spawn(.{}, runOwnGuest, .{ held, io, vmm.Options{
+        .kernel = started.sandbox_choice.kernel.?,
+        .initrd = started.sandbox_choice.initrd,
+        .session = socket,
+        .memory_mb = started.sandbox_choice.memory(guest_machine, builtin.os.tag),
+        .cpus = started.sandbox_choice.processors(guest_machine, builtin.os.tag),
+        .ready = &held.ready,
+        .stopping = &held.stopping,
+    } }) catch |err| {
+        tty.print(.err, "chock run: the guest's thread could not be started: {t}\n", .{err});
+        return error.Reported;
+    };
+
+    var waited: u64 = 0;
+    while (waited < guest_boot_ms) : (waited += guest_look_ms) {
+        if (held.ready.load(.acquire)) return held;
+        if (held.ended.load(.acquire)) break;
+        std.Io.sleep(io, .fromNanoseconds(guest_look_ms * std.time.ns_per_ms), .awake) catch break;
+    }
+
+    tty.print(
+        .err,
+        "chock run: the guest did not come up, so the session does not start. Its console is " ++
+            "at {s}.\n",
+        .{held.console},
+    );
+    held.stopping.store(true, .release);
+    held.thread.join();
+    return error.Reported;
+}
+
+/// How long to wait for a guest to bind its socket, and how often to look. It reads
+/// and measures a kernel first, which is not instant on a 59MB image.
+const guest_boot_ms: u64 = 30 * std.time.ms_per_s;
+const guest_look_ms: u64 = 100;
+
+/// What the operator's own `config.zon` says about sandboxing.
+///
+/// **A file that is not there is not a fault**, and neither is one that names
+/// nothing: both mean the native driver, which is what every session used before
+/// this existed. One that names a driver and not the images it needs is a refusal,
+/// because a session that answered `native` to an operator who asked for a guest
+/// would be sandboxed more weakly than they asked, silently.
+fn sandboxChoice(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    config_dir: []const u8,
+) StartError!chock_policy.sandbox.Block {
+    const path = std.fs.path.joinZ(arena, &.{ config_dir, chock_auth.config.file_name }) catch
+        return error.OutOfMemory;
+
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        path,
+        arena,
+        .limited(chock_auth.config.max_file_bytes),
+        .of(u8),
+        0,
+    ) catch return .{};
+
+    var diag: ?chock_policy.sandbox.Diagnostic = null;
+    const block = chock_policy.sandbox.parse(arena, source, &diag) catch {
+        if (diag) |*one| {
+            tty.print(.err, "chock run: {s}: {f}\n", .{ path, one });
+        } else {
+            tty.print(.err, "chock run: the sandbox block of {s} could not be read\n", .{path});
+        }
+        return error.Reported;
+    };
+
+    if (block.missing()) |key| {
+        tty.print(
+            .err,
+            "chock run: {s} chose the microvm sandbox driver and names no {s}. Add " ++
+                ".sandbox = .{{ .{s} = \"...\" }} to it. The images are the flake's own " ++
+                "guest-kernel and guest-initrd outputs.\n",
+            .{ path, key, key },
+        );
+        return error.Reported;
+    }
+    return block;
+}
+
+/// Where every share appears inside a guest. One virtiofs mount, and each
+/// directory the host offered is a name inside it: see
+/// `lib/chock-sandbox/vm/shares.zig`.
+const guest_share_root = "/mnt/shares";
+
+/// The guest this session's tool calls run in, and everything it holds open.
+///
+/// **The daemon owns the guest and this owns the reach into it.** `chock run` exits
+/// at the end of every turn, so a guest started here would boot and die each time:
+/// see `docs/security/microvm.md`.
+const GuestLink = struct {
+    /// The session socket, and the stream `chock guest` opened inside the guest.
+    control: std.posix.fd_t,
+    stream: std.posix.fd_t,
+    guest: sandbox.vm_driver.Guest,
+
+    /// The thread that answers a guest reaching out, and the flag that ends it.
+    reaching: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    /// Where the call running now may reach, as `src/vmm.zig` asks it.
+    ///
+    /// **The router belongs to the call and not to the session.** A tool call
+    /// carries its own policy and its own approvals, so a guest reaching between
+    /// calls is answered by nobody, which is the honest answer: there is no call
+    /// to reach on behalf of.
+    fn decide(ptr: *anyopaque, text: []const u8, port: u16) vmm.Reached {
+        const self: *GuestLink = @ptrCast(@alignCast(ptr));
+        const router = self.guest.routerNow() orelse return .refused;
+        // An address this host handed out, or nothing. The router refuses one it
+        // never granted, which is what stops a guest naming its own.
+        const address = sandbox.vm_wire.addressIn(text) orelse return .refused;
+        return switch (router.open(address, port)) {
+            .granted => |fd| .{ .connected = fd },
+            .refused => .refused,
+        };
+    }
+
+    fn reaches(self: *GuestLink) vmm.Reaches {
+        return .{ .ptr = self, .decide = GuestLink.decide };
+    }
+
+    fn close(self: *GuestLink, io: std.Io) void {
+        if (self.reaching) |one| {
+            self.stopping.store(true, .release);
+            one.join();
+        }
+        std.Io.File.close(.{ .handle = self.stream, .flags = .{ .nonblocking = false } }, io);
+        std.Io.File.close(.{ .handle = self.control, .flags = .{ .nonblocking = false } }, io);
+        self.* = undefined;
+    }
+};
+
+/// Connect to the guest the daemon started, offer it this session's own
+/// directories, and answer the driver every tool call then uses.
+///
+/// **A guest that cannot be reached is a refusal and never a fallback.** Falling
+/// back to the native driver would sandbox the session more weakly than the
+/// operator asked for, and on a Mac far more weakly, with nothing saying so.
+fn attachGuest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    socket_path: []const u8,
+    shares: []const sandbox.vm_shares.Share,
+) StartError!*GuestLink {
+    const reached = vmm.attach(io, socket_path, shares, guest_port) catch |err| {
+        switch (err) {
+            error.NoGuest => tty.print(
+                .err,
+                "chock run: the guest at {s} could not be reached. This session was told to " ++
+                    "run its tool calls in one, so it does not run them another way.\n",
+                .{socket_path},
+            ),
+            error.ShareRefused => tty.print(
+                .err,
+                "chock run: the guest would not take one of this session's directories, so " ++
+                    "the session does not start.\n",
+                .{},
+            ),
+            error.NoStream => tty.print(
+                .err,
+                "chock run: no stream into the guest at {s}. Its own chock guest may not be " ++
+                    "running.\n",
+                .{socket_path},
+            ),
+        }
+        return error.Reported;
+    };
+
+    const link = try arena.create(GuestLink);
+    link.* = .{
+        .control = reached.control,
+        .stream = reached.stream,
+        .guest = .{
+            .stream = .{ .handle = reached.stream, .flags = .{ .nonblocking = false } },
+            .io = io,
+            .shares = .{ .root = guest_share_root, .shares = shares },
+            .read_buffer = try arena.alloc(u8, sandbox.vm_wire.max_message_bytes + 1),
+            .write_buffer = try arena.alloc(u8, 64 * 1024),
+        },
+    };
+    // Nothing answers a guest reaching out until this runs, and a session whose
+    // thread would not start is a session with no network rather than none at all:
+    // every reach is then refused, which is what `decide` answers anyway.
+    link.reaching = std.Thread.spawn(
+        .{},
+        vmm.serveReaching,
+        .{ io, link.control, link.reaches(), &link.stopping },
+    ) catch null;
+
+    // **Wait for the guest's own hello before the first request.** Mirage's signal
+    // says the kernel booted, and `chock guest` dials after that, so a request
+    // written on the boot alone raced the dial and the first tool call of every
+    // session answered `GuestGone`.
+    if (!waitForHello(io, link)) {
+        tty.print(
+            .err,
+            "chock run: the guest at {s} booted but its chock guest never said hello, so " ++
+                "this session does not start.\n",
+            .{socket_path},
+        );
+        return error.Reported;
+    }
+
+    return link;
+}
+
+/// How long a guest has to say hello once its kernel is up.
+const hello_wait_ms: i32 = 20_000;
+
+fn waitForHello(io: std.Io, link: *GuestLink) bool {
+    var watching = [1]std.posix.pollfd{.{
+        .fd = link.stream,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&watching, hello_wait_ms) catch return false;
+    if (ready == 0) return false;
+
+    var reader = link.guest.stream.readerStreaming(io, link.guest.read_buffer);
+    const line = sandbox.vm_wire.readLine(&reader.interface) catch return false;
+    return sandbox.vm_wire.helloIn(line);
+}
+
+/// The port `chock guest` dials, which is the one `chock vmm` was given.
+const guest_port: u32 = 1024;
+
+/// Every directory this session's guest is offered.
+///
+/// **Derived from the config and never listed here.** A list beside the mounts
+/// misses the ones the workspace's own backing adds: the repository's git
+/// directory, the scratch object store and the worktree metadata are four binds
+/// a session makes and a hand written set named none of them.
+fn guestShares(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    started: *const Started,
+) StartError![]const sandbox.vm_shares.Share {
+    var wanted: std.ArrayList(sandbox.vm_shares.Wanted) = .empty;
+
+    // What a tool call's own config adds and the session's does not hold.
+    for (started.toolchain.mounts) |one| {
+        try wanted.append(arena, .{ .host_path = one.source, .writable = false });
+    }
+    if (started.cache_dir) |dir| {
+        try wanted.append(arena, .{ .host_path = dir, .writable = true });
+    }
+    if (started.scratch_dir) |dir| {
+        try wanted.append(arena, .{ .host_path = dir, .writable = true });
+    }
+    if (started.tasks_dir) |dir| {
+        try wanted.append(arena, .{ .host_path = dir, .writable = true });
+    }
+    if (started.memory_dir) |dir| {
+        try wanted.append(arena, .{ .host_path = dir, .writable = true });
+    }
+
+    // **Where a call stages a file.** `run_command` writes a program's own input
+    // under `TMPDIR` and binds it in, and the name is made per call, so nothing
+    // derived from the session's config can name it: the directory holding them
+    // is what a guest needs.
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    const staging = sandbox.resolvedPath(io, started.tool_env.get("TMPDIR") orelse "/tmp", &resolved);
+    // Duped, because `resolvedPath` answers into the buffer above and that buffer
+    // is gone the moment this returns.
+    try wanted.append(arena, .{ .host_path = try arena.dupe(u8, staging), .writable = true });
+
+    return sandbox.vm_shares.offersFor(
+        arena,
+        io,
+        started.sandbox_config,
+        wanted.items,
+        store_root,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TooManyOffers => {
+            tty.print(
+                .err,
+                "chock run: this session binds more directories than the {d} a guest takes, " ++
+                    "so it does not start.\n",
+                .{sandbox.vm_shares.max_offers},
+            );
+            return error.Reported;
+        },
+    };
+}
+
+/// Every path under this is read only, so one offer covers a closure of any size.
+const store_root = "/nix/store";
+
 fn projectKind(io: std.Io, project_root: []const u8) chock_core.prompt.Project {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const build_zig = std.fmt.bufPrint(&buffer, "{s}/build.zig", .{project_root}) catch return .{};
@@ -11680,6 +12143,7 @@ const value_options = [_][]const u8{
     "--model",
     "--project",
     "--session",
+    "--guest",
     "--agent-kind",
     "--org-bundle",
     "--instructions",
@@ -11778,6 +12242,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const []const u8) ParseError!O
             options.project = value;
         } else if (std.mem.eql(u8, argument, "--session")) {
             options.session = value;
+        } else if (std.mem.eql(u8, argument, "--guest")) {
+            options.guest = value;
         } else if (std.mem.eql(u8, argument, "--agent-kind")) {
             options.agent_kind = value;
         } else if (std.mem.eql(u8, argument, "--org-bundle")) {

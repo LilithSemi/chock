@@ -166,8 +166,11 @@
 //! front of a TCP listener is the proxy's job: see `--host` above.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chock_auth = @import("chock-auth");
 const chock_broker = @import("chock-broker");
+const chock_policy = @import("chock-policy");
+const vmm = @import("chock-vmm");
 const chock_proto = @import("chock-proto");
 
 const session_paths = @import("session.zig");
@@ -241,7 +244,64 @@ const Session = struct {
     /// under the daemon's own mutex, because the thread that reaps a child
     /// clears it while another may be reading it.
     pid: ?std.posix.pid_t = null,
+    /// The guest this session's tool calls run in, for a daemon whose operator
+    /// chose the microVM driver. Null for every other session.
+    guest: ?Guest = null,
 };
+
+/// One guest running on a thread of this daemon's, and the socket a `chock run`
+/// child reaches it through.
+///
+/// **It outlives a turn and not the daemon.** `chock run` exits at the end of every
+/// turn, so a guest owned by the child would boot and die each time. The daemon owns
+/// it instead, which is also what keeps the vCPU threads out of the process that
+/// dispatches tool calls: that one forks, and a fork carries one thread. This one
+/// spawns and never forks, so a thread here is free.
+const Guest = struct {
+    /// Everything the guest's own thread reads and writes. On the heap, because the
+    /// thread outlives the call that started it.
+    running: *Running,
+    /// Where the guest is listening. Owned.
+    socket: [:0]u8,
+    /// Bumped as each turn starts. The thread that reaps a turn stops the guest
+    /// only if this has not moved while it waited, so a session whose next turn
+    /// arrived keeps the guest it already has.
+    turns: u64 = 0,
+};
+
+/// What a guest's thread and the daemon share.
+const Running = struct {
+    thread: std.Thread,
+    /// Set by the guest once its socket is bound, so the daemon waits on a flag
+    /// rather than looking for a file to appear.
+    ready: std.atomic.Value(bool) = .init(false),
+    /// Set by the daemon to ask the guest to stop.
+    stopping: std.atomic.Value(bool) = .init(false),
+    /// Set by the thread when it has left `vmm.host`, so a `ready` that never
+    /// arrives can be told from a guest still coming up.
+    ended: std.atomic.Value(bool) = .init(false),
+};
+
+/// How long a guest is kept after a turn ends.
+///
+/// **A window and not a session end event, because the daemon has none.**
+/// `session.end` is written at the end of every turn and a session can be taken up
+/// again with `--adopt`, so nothing in the log says a session will never run
+/// another turn. Keeping the guest for a while covers the turns of one
+/// conversation, and letting it go bounds what a daemon left running holds.
+const guest_idle_ms: u64 = 5 * std.time.ms_per_min;
+
+/// How long to wait for a guest to come up. `chock vmm` binds its socket after it
+/// has read and measured the kernel, which takes a moment on a 17MB image.
+const guest_boot_ms: u64 = 30 * std.time.ms_per_s;
+
+/// How often to look for the socket while waiting.
+const guest_look_ms: u64 = 100;
+
+/// How many guests one daemon will hold at once. Each is a kernel and its memory,
+/// so this is a real bound and not a round number: a client that opened sessions
+/// in a loop must not be able to fill the machine.
+const max_guests: usize = 4;
 
 const Daemon = struct {
     gpa: std.mem.Allocator,
@@ -262,13 +322,92 @@ const Daemon = struct {
     sessions: std.ArrayList(Session) = .empty,
     /// How many connections are being served right now. See `max_connections`.
     live: std.atomic.Value(usize) = .init(0),
+    /// What the operator's own `config.zon` says about sandboxing. Read once at
+    /// start: a file edited under a running daemon changes the next daemon.
+    sandbox: chock_policy.sandbox.Block = .{},
+    /// The directory the daemon's own socket is in, which is where a guest's goes.
+    /// Short on purpose: see `guestSocketPath`.
+    socket_dir: []const u8 = "",
 
     fn deinit(self: *Daemon) void {
         for (self.sessions.items) |entry| {
             self.gpa.free(entry.log_path);
             self.gpa.free(entry.project);
+            if (entry.guest) |one| {
+                // The daemon is going, so every guest goes with it.
+                one.running.stopping.store(true, .release);
+                one.running.thread.join();
+                self.gpa.destroy(one.running);
+                self.gpa.free(one.socket);
+            }
         }
         self.sessions.deinit(self.gpa);
+        self.sandbox.deinit(self.gpa);
+    }
+
+    /// The guest of a session, and the turn number it is now on. Null when the
+    /// session has none.
+    fn guestFor(self: *Daemon, id: []const u8) ?Guest {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |entry| {
+            if (std.mem.eql(u8, &entry.id, id)) return entry.guest;
+        }
+        return null;
+    }
+
+    /// Remember a guest, and say whether it was taken. False means another thread
+    /// put one there first, and the caller stops the one it started.
+    fn rememberGuest(self: *Daemon, id: []const u8, one: Guest) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            if (entry.guest != null) return false;
+            entry.guest = one;
+            return true;
+        }
+        return false;
+    }
+
+    /// Say a turn has begun, and answer which turn it is. The number is what a
+    /// reaping thread compares against to know whether a later turn arrived.
+    fn noteTurn(self: *Daemon, id: []const u8) ?u64 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            const one = &(entry.guest orelse return null);
+            one.turns += 1;
+            return one.turns;
+        }
+        return null;
+    }
+
+    /// Take a session's guest away, but only if it is still on `turns`. Answers the
+    /// guest the caller now owns and must stop.
+    fn takeGuest(self: *Daemon, id: []const u8, turns: u64) ?Guest {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |*entry| {
+            if (!std.mem.eql(u8, &entry.id, id)) continue;
+            const one = entry.guest orelse return null;
+            if (one.turns != turns) return null;
+            entry.guest = null;
+            return one;
+        }
+        return null;
+    }
+
+    /// How many sessions hold a guest right now.
+    fn guestCount(self: *Daemon) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var count: usize = 0;
+        for (self.sessions.items) |entry| {
+            if (entry.guest != null) count += 1;
+        }
+        return count;
     }
 
     fn remember(self: *Daemon, entry: Session) !void {
@@ -342,6 +481,24 @@ pub fn main(
     };
     defer daemon.deinit();
 
+    // **Refused rather than narrowed.** An operator who asked for a guest and is
+    // given the native driver instead gets a weaker boundary than they asked for,
+    // and nothing would say so. The refusal names the key that is missing.
+    daemon.sandbox = readSandbox(gpa, io, arena, &env) orelse return Exit.usage.code();
+    if (daemon.sandbox.missing()) |key| {
+        tty.print(
+            .err,
+            "chock daemon: config.zon chose the microvm sandbox driver and names no {s}. " ++
+                "Add .sandbox = .{{ .{s} = \"...\" }} to it. The guest images are the flake's " ++
+                "own guest-kernel and guest-initrd outputs.\n",
+            .{ key, key },
+        );
+        return Exit.usage.code();
+    }
+    if (daemon.sandbox.chosen() == .microvm) {
+        tty.print(.plain, "chock daemon: tool calls run in a microVM guest, one a session\n", .{});
+    }
+
     const socket_path = options.socket orelse path: {
         const state = chock_auth.paths.stateDir(arena, &env) catch |err| {
             tty.print(.err, "chock daemon: the state directory could not be found: {t}\n", .{err});
@@ -353,6 +510,9 @@ pub fn main(
         };
         break :path control.socketPathIn(arena, state) catch return Exit.faulted.code();
     };
+
+    // A guest's socket goes here too, so the length that matters is this one's.
+    daemon.socket_dir = std.fs.path.dirname(socket_path) orelse ".";
 
     var wanted_buffer: [max_listeners]control.Address = undefined;
     const wanted = listenSet(&wanted_buffer, socket_path, options);
@@ -402,6 +562,39 @@ pub fn main(
 ///
 /// Its own small copy rather than `session.zig`'s, which is private to that
 /// file and reports its own fault text. Both are the same three lines.
+/// The `sandbox` block of the operator's own `config.zon`, or null when the file
+/// is there and does not read. **A file that is not there is not a fault**: most
+/// machines have none, and one that says nothing means the native driver.
+fn readSandbox(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+) ?chock_policy.sandbox.Block {
+    const dir = chock_auth.paths.configDir(arena, env) catch return .{};
+    const path = std.fs.path.joinZ(arena, &.{ dir, chock_auth.config.file_name }) catch return .{};
+
+    const source = std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        path,
+        arena,
+        .limited(chock_auth.config.max_file_bytes),
+        .of(u8),
+        0,
+    ) catch return .{};
+
+    var diag: ?chock_policy.sandbox.Diagnostic = null;
+    defer if (diag) |*one| one.deinit(gpa);
+    return chock_policy.sandbox.parse(gpa, source, &diag) catch {
+        if (diag) |*one| {
+            tty.print(.err, "chock daemon: {s}: {f}\n", .{ path, one });
+        } else {
+            tty.print(.err, "chock daemon: {s} could not be read\n", .{path});
+        }
+        return null;
+    };
+}
+
 fn makeDirAll(io: std.Io, path: []const u8) !void {
     if (path.len == 0) return;
     std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
@@ -918,11 +1111,25 @@ fn runChild(child: Child) void {
     const daemon = child.daemon;
     defer if (child.message) |text| daemon.gpa.free(text);
 
-    var argv_buffer: [8][]const u8 = undefined;
+    // The guest this session's tool calls run in, started before the child so the
+    // socket is there when it connects. A session that never runs a turn boots
+    // none.
+    const guest = startGuest(daemon, &child.id);
+    const turn = daemon.noteTurn(&child.id);
+    // Let it go after a while, unless another turn arrives first. See
+    // `guest_idle_ms`: the daemon has no signal that a session is finished.
+    defer if (turn) |which| releaseGuestLater(daemon, child.id, which);
+
+    var argv_buffer: [10][]const u8 = undefined;
     var argv_len: usize = 0;
     for ([_][]const u8{ daemon.exe_path, "run", "--project", child.project, "--session", &child.id }) |word| {
         argv_buffer[argv_len] = word;
         argv_len += 1;
+    }
+    if (guest) |socket| {
+        argv_buffer[argv_len] = "--guest";
+        argv_buffer[argv_len + 1] = socket;
+        argv_len += 2;
     }
     if (child.message) |text| {
         // `--` first, so a message that starts with a dash is a message and not
@@ -964,6 +1171,205 @@ fn runChild(child: Child) void {
         .exited => |status| tty.print(.plain, "chock daemon: session {s} exited {d}\n", .{ child.id, status }),
         else => tty.print(.warn, "chock daemon: session {s} did not exit normally\n", .{child.id}),
     }
+}
+
+/// The socket of this session's guest, starting one if it has none. Null for a
+/// daemon whose operator did not choose the microVM driver, and for a guest that
+/// would not come up.
+///
+/// **A guest that will not start is not a session that runs without one.** The
+/// child would sandbox tool calls with the native driver, which on a Mac is a
+/// weaker boundary than the operator asked for. So the socket is null, the child
+/// is told nothing, and `chock run` refuses: see `src/run.zig`.
+fn startGuest(daemon: *Daemon, id: *const [session_paths.id_length]u8) ?[:0]const u8 {
+    if (daemon.sandbox.chosen() != .microvm) return null;
+    if (daemon.guestFor(id)) |had| return had.socket;
+
+    if (daemon.guestCount() >= max_guests) {
+        tty.print(
+            .warn,
+            "chock daemon: session {s} gets no guest: this daemon already holds {d}, which is " ++
+                "all it will\n",
+            .{ id, max_guests },
+        );
+        return null;
+    }
+
+    const socket = guestSocketPath(daemon, id) orelse return null;
+    var socket_owned = true;
+    defer if (socket_owned) daemon.gpa.free(socket);
+
+    const shares = guestShares(daemon, id) orelse return null;
+
+    const running = daemon.gpa.create(Running) catch return null;
+    var running_owned = true;
+    defer if (running_owned) daemon.gpa.destroy(running);
+    running.* = .{ .thread = undefined };
+
+    // Read once, so the processor count and the memory size are chosen against
+    // the same numbers.
+    const guest_machine = chock_policy.sandbox.Machine.now();
+
+    const work = GuestWork{
+        .daemon = daemon,
+        .running = running,
+        .options = .{
+            .kernel = daemon.sandbox.kernel.?,
+            .initrd = daemon.sandbox.initrd,
+            .session = socket,
+            .memory_mb = daemon.sandbox.memory(guest_machine, builtin.os.tag),
+            .cpus = daemon.sandbox.processors(guest_machine, builtin.os.tag),
+            .shares = shares,
+            .ready = &running.ready,
+            .stopping = &running.stopping,
+        },
+    };
+
+    running.thread = std.Thread.spawn(.{}, runGuest, .{work}) catch |err| {
+        tty.print(.err, "chock daemon: session {s} could not be given a guest: {t}\n", .{ id, err });
+        return null;
+    };
+
+    if (!waitForGuest(daemon.io, running)) {
+        tty.print(
+            .err,
+            "chock daemon: the guest of session {s} did not come up, so the session runs none\n",
+            .{id},
+        );
+        running.stopping.store(true, .release);
+        running.thread.join();
+        return null;
+    }
+
+    if (!daemon.rememberGuest(id, .{ .running = running, .socket = socket })) {
+        // Another turn of this session got there first, so this one is spare.
+        running.stopping.store(true, .release);
+        running.thread.join();
+        return daemon.guestFor(id).?.socket;
+    }
+    socket_owned = false;
+    running_owned = false;
+    tty.detail("chock daemon: session {s} has a guest at {s}\n", .{ id, socket });
+    return socket;
+}
+
+/// What one guest's thread is given. Every part of it outlives the call that
+/// started the thread.
+const GuestWork = struct {
+    daemon: *Daemon,
+    running: *Running,
+    options: vmm.Options,
+};
+
+/// Run one guest until it stops. **The whole of the daemon's use of Mirage is on
+/// this thread**, which is why the tick that interrupts a blocked hypervisor call
+/// signals one thread and not the process: see `src/vmm.zig`.
+fn runGuest(work: GuestWork) void {
+    const daemon = work.daemon;
+    defer work.running.ended.store(true, .release);
+
+    var out_buffer: [16 * 1024]u8 = undefined;
+    var console = std.Io.File.stdout().writer(daemon.io, &out_buffer);
+
+    var fault: ?vmm.Fault = null;
+    _ = vmm.host(daemon.gpa, daemon.io, work.options, &console.interface, &fault) catch |err| {
+        tty.print(.err, "chock daemon: a guest ended badly: {t}\n", .{err});
+        return;
+    };
+    if (fault) |said| {
+        if (said.detail.len == 0) {
+            tty.print(.err, "chock daemon: a guest: {s}.\n", .{said.said});
+        } else {
+            tty.print(.err, "chock daemon: a guest: {s}: {s}\n", .{ said.said, said.detail });
+        }
+    }
+}
+
+/// The directories a session's guest is offered. The store read only and the
+/// session's own writable, which is the same split the native driver's mounts make.
+///
+/// **The workspace is not here.** `chock run` makes it, so the child offers it
+/// itself once it exists: see `src/run.zig`.
+fn guestShares(
+    daemon: *Daemon,
+    id: *const [session_paths.id_length]u8,
+) ?[]const vmm.Options.Share {
+    _ = id;
+    const one = daemon.gpa.alloc(vmm.Options.Share, 1) catch return null;
+    one[0] = .{ .name = "store", .at = "/nix/store", .writable = false };
+    return one;
+}
+
+/// Whether the guest bound its socket. It says so with a flag, so nothing here
+/// looks for a file and calls its absence a failure to boot.
+fn waitForGuest(io: std.Io, running: *Running) bool {
+    var waited: u64 = 0;
+    while (waited < guest_boot_ms) : (waited += guest_look_ms) {
+        if (running.ready.load(.acquire)) return true;
+        if (running.ended.load(.acquire)) return false;
+        std.Io.sleep(io, .fromNanoseconds(guest_look_ms * std.time.ns_per_ms), .awake) catch
+            return false;
+    }
+    return false;
+}
+
+/// How much of a session's identifier names its guest socket. A ULID's first ten
+/// characters are its time to the millisecond, and the rest is random, so the tail
+/// is what tells two sessions of one moment apart.
+const guest_name_bytes: usize = 12;
+
+/// Where a session's guest listens.
+///
+/// **Beside the daemon's own socket, and not beside the session's log.** A unix
+/// socket path is bounded at `std.Io.net.UnixAddress.max_len`, 108 bytes, and the
+/// log lives under a state directory, a project directory and a session
+/// identifier: one real path came to 132 and `bind` refused it. The refusal said
+/// only that nothing could hold a session there, which is why this now measures
+/// the path and says the number.
+fn guestSocketPath(
+    daemon: *Daemon,
+    id: *const [session_paths.id_length]u8,
+) ?[:0]u8 {
+    const tail = id[id.len - guest_name_bytes ..];
+    const path = std.fmt.allocPrintSentinel(
+        daemon.gpa,
+        "{s}/g-{s}.sock",
+        .{ daemon.socket_dir, tail },
+        0,
+    ) catch return null;
+
+    if (path.len > std.Io.net.UnixAddress.max_len) {
+        tty.print(
+            .err,
+            "chock daemon: a guest socket at {s} would be {d} bytes and a unix socket path " ++
+                "takes {d}. Give the daemon a shorter --socket path: its own directory is " ++
+                "where a guest's goes.\n",
+            .{ path, path.len, std.Io.net.UnixAddress.max_len },
+        );
+        daemon.gpa.free(path);
+        return null;
+    }
+    return path;
+}
+
+/// Stop a session's guest once `guest_idle_ms` has passed with no further turn.
+/// Runs on the thread that reaped the turn, which has nothing else to do.
+fn releaseGuestLater(daemon: *Daemon, id: [session_paths.id_length]u8, turn: u64) void {
+    std.Io.sleep(
+        daemon.io,
+        .fromNanoseconds(guest_idle_ms * std.time.ns_per_ms),
+        .awake,
+    ) catch return;
+
+    // Only if no later turn arrived. A turn that did bumped the count, and its own
+    // thread is now the one that will let the guest go.
+    const one = daemon.takeGuest(&id, turn) orelse return;
+    defer daemon.gpa.free(one.socket);
+    defer daemon.gpa.destroy(one.running);
+
+    one.running.stopping.store(true, .release);
+    one.running.thread.join();
+    tty.detail("chock daemon: the guest of session {s} was let go after an idle spell\n", .{id});
 }
 
 fn handleRead(

@@ -128,6 +128,21 @@ pub const trust_store_inside = Sandbox.trust_store_inside;
 /// caller that places a path under that prefix is exactly the caller that has
 /// to know whether this build can put it there.
 pub const expresses = Sandbox.expresses;
+
+/// What crosses between a host and a guest when the sandbox runs in a microVM:
+/// one request holding a `Config`'s geometry, one answer. Read its own top
+/// comment for what stays on the host and why none of it is a gap.
+pub const vm_wire = @import("chock-sandbox/vm/wire.zig");
+
+/// Where a host path is inside a guest. The share set is given and never derived:
+/// read its own top comment for why, and for the two things a wrong answer here
+/// breaks.
+pub const vm_shares = @import("chock-sandbox/vm/shares.zig");
+
+/// The host half of the microVM driver: one `Sandbox.Driver` over a stream into a
+/// guest. It builds no boundary of its own, which is the whole design: read its
+/// own top comment.
+pub const vm_driver = @import("chock-sandbox/vm/driver.zig");
 /// See `Sandbox.resolvedPath`.
 pub const resolvedPath = Sandbox.resolvedPath;
 /// See `Sandbox.firstGap`. Re-exported because the two lists it compares are

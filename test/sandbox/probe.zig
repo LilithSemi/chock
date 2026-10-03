@@ -79,7 +79,7 @@ fn enterTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
         .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
         .{ .bind = .{ .source = guarded, .target = "/work/chock.zon", .read_only = true } },
         .{ .bind = .{ .source = "/nix/store", .target = "/nix/store", .read_only = true } },
-    }, null);
+    }, false, null);
     try sandbox.namespace.pivotInto(arena, root, null);
 }
 
@@ -1855,7 +1855,7 @@ fn enterFileOverFileTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
     enterOrEndUnmeasured(.{ .network = .none, .mount = true });
     try sandbox.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = source, .target = "/marker", .read_only = false } },
-    }, null);
+    }, false, null);
     try sandbox.namespace.pivotInto(arena, root, null);
 }
 
@@ -1873,7 +1873,7 @@ fn enterSubmountTestRoot(arena: std.mem.Allocator, root: []const u8) !void {
 
     try sandbox.namespace.buildRoot(arena, root, &.{
         .{ .bind = .{ .source = guarded, .target = "/guarded", .read_only = true } },
-    }, null);
+    }, false, null);
     try sandbox.namespace.pivotInto(arena, root, null);
 }
 
@@ -3574,7 +3574,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
             .{ .deny = .{ .target = "/work/.env" } },
-        }, null);
+        }, false, null);
 
         // Still reachable by that name, because `buildRoot` never pivots. The
         // buffer holds the whole deny notice, or the read truncates.
@@ -3608,7 +3608,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         enterOrEndUnmeasured(.{ .network = .none, .mount = true });
         const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = link_path, .target = "/work/chock.zon", .read_only = true } },
-        }, null);
+        }, false, null);
 
         // Still reachable by that absolute name, because `buildRoot` never
         // pivots. A bind that followed the link holds the host secret here.
@@ -3646,7 +3646,7 @@ fn runOperation(init: std.process.Init.Minimal) !u8 {
         const build_result = sandbox.namespace.buildRoot(arena, root_arg, &.{
             .{ .bind = .{ .source = work, .target = "/work", .read_only = false } },
             .{ .deny = .{ .target = "/work/link/creds/token" } },
-        }, null);
+        }, false, null);
 
         // Still reachable by that name, because `buildRoot` never pivots. A
         // followed component leaves the deny notice outside the root.

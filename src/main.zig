@@ -59,6 +59,7 @@ const migrate_cmd = @import("migrate.zig");
 const approve_cmd = @import("approve.zig");
 const doctor_cmd = @import("doctor.zig");
 const askpass_cmd = @import("askpass.zig");
+const guest_cmd = @import("guest.zig");
 const tty = @import("tty.zig");
 const ui = @import("ui.zig");
 
@@ -460,6 +461,11 @@ pub const commands = [_]Command{
         .name = "askpass",
         .summary = "Answer a password prompt from git or ssh.",
         .run = askpass_cmd.main,
+    },
+    .{
+        .name = "guest",
+        .summary = "Sandbox tool calls inside a microVM. Started by a guest's own init.",
+        .run = guest_cmd.main,
     },
 };
 
