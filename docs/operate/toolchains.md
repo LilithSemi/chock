@@ -141,7 +141,12 @@ somewhere else, and the mount list becomes a set of path rules instead. The
 modes above are unchanged, the task records are still read only, and the
 environment still names each directory, so nothing has to be learned twice: a
 program reads `HOME`, `XDG_CACHE_HOME`, `TMPDIR` or `CHOCK_SCRATCHPAD` and gets
-the right answer on both platforms. Two differences a person can see. An
+the right answer on both platforms. **`TMPDIR` is the only name Chock answers for
+a temporary directory**, and `TMP`, `TEMP`, `TEMPDIR` and `NIX_BUILD_TOP` are
+taken out of a tool call's environment rather than answered again: a dev shell
+exports all five naming one directory of the host's that the sandbox mounts
+nowhere, so a program that read one of the other four used to get `ENOENT` where
+`TMPDIR` would have worked. Two differences a person can see. An
 absolute path a program writes into a file, such as a `compile_commands.json`
 or a debug binary's `DW_AT_comp_dir`, names a session directory that is deleted
 when the session ends. And there is no `/run/chock/tmp`, because an ordinary

@@ -798,3 +798,227 @@ test "the sandbox page counts the calls it blocks and the proc entries it masks"
 
     try testing.expectEqualStrings("", wrong.items);
 }
+
+/// Every ```` ```zon ```` block of one page, each with the line its fence opened
+/// on. A block and not a line, because a `.zon` value spans lines.
+fn zonBlocksIn(arena: std.mem.Allocator, doc: Doc) ![]const Span {
+    var out: std.ArrayList(Span) = .empty;
+    var lines = std.mem.splitScalar(u8, doc.text, '\n');
+    var number: usize = 0;
+    var body: std.ArrayList(u8) = .empty;
+    var opened: usize = 0;
+    var inside = false;
+    while (lines.next()) |line| {
+        number += 1;
+        if (std.mem.startsWith(u8, line, "```")) {
+            if (inside) {
+                try out.append(arena, .{
+                    .doc = doc.path,
+                    .line = opened,
+                    .text = try body.toOwnedSlice(arena),
+                    .fenced = true,
+                });
+                inside = false;
+                continue;
+            }
+            if (!std.mem.eql(u8, std.mem.trim(u8, line, "`\r\n "), "zon")) continue;
+            inside = true;
+            opened = number;
+            continue;
+        }
+        if (!inside) continue;
+        try body.appendSlice(arena, line);
+        try body.append(arena, '\n');
+    }
+    return out.items;
+}
+
+test "the microVM page counts the roots a guest is granted and the offers it takes" {
+    // Both numbers bound how much of the host a compromised VMM can name, so both
+    // are worth saying out loud on a page an operator reads, and a number a reader
+    // has to trust is a number that rots.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    try checkCount(
+        arena,
+        docs,
+        "docs/security/microvm.md",
+        "roots",
+        chock_main.daemon.max_granted_roots,
+        &wrong,
+    );
+    try checkCount(
+        arena,
+        docs,
+        "docs/security/microvm.md",
+        "offers",
+        chock_sandbox.vm_shares.max_offers,
+        &wrong,
+    );
+
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "the guest size table is the size the code chooses for that machine" {
+    // The two curves are the one place an operator reads how much of their machine
+    // a guest takes. A table written by hand beside them agrees with itself for
+    // ever, so every row here is recomputed from the code that answers.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+    const page = try docText(docs, "docs/security/microvm.md");
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var rows: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, page, '\n');
+    var number: usize = 0;
+    while (lines.next()) |line| {
+        number += 1;
+        if (!std.mem.startsWith(u8, line, "| ")) continue;
+
+        var cells = std.mem.splitScalar(u8, line, '|');
+        _ = cells.next();
+        const machine_cell = std.mem.trim(u8, cells.next() orelse continue, " ");
+        const processor_cell = std.mem.trim(u8, cells.next() orelse continue, " ");
+        const memory_cell = std.mem.trim(u8, cells.next() orelse continue, " ");
+
+        const machine = machineIn(machine_cell) orelse continue;
+        const said_processors = std.fmt.parseInt(u32, processor_cell, 10) catch continue;
+        const said_memory_mb = megabytesIn(memory_cell) orelse continue;
+        rows += 1;
+
+        // Linux, which is what the table says it is: a Mac's count is clamped by
+        // the interrupt controller and the page says so in words beside it.
+        const processors = chock_policy.sandbox.processorsOn(machine, .linux);
+        const memory_mb = chock_policy.sandbox.memoryOn(machine, .linux);
+        if (said_processors != processors or said_memory_mb != memory_mb) {
+            try wrong.print(arena, "docs/security/microvm.md:{d}: says {d} and {d}MB, " ++
+                "and the code answers {d} and {d}MB\n", .{
+                number,
+                said_processors,
+                said_memory_mb,
+                processors,
+                memory_mb,
+            });
+        }
+    }
+
+    // A table nobody could read is not a table that agrees.
+    if (rows != 5) {
+        try wrong.print(arena, "docs/security/microvm.md: {d} machine rows were read, wanted 5\n", .{rows});
+    }
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+/// `128 cores, 511GB`, or the row for a machine nothing could be read from.
+fn machineIn(cell: []const u8) ?chock_policy.sandbox.Machine {
+    if (std.mem.indexOf(u8, cell, "nothing could be read") != null) {
+        return chock_policy.sandbox.Machine.unknown;
+    }
+    const comma = std.mem.indexOfScalar(u8, cell, ',') orelse return null;
+    const cores_word = std.mem.trim(u8, cell[0..comma], " ");
+    const cores_end = std.mem.indexOfScalar(u8, cores_word, ' ') orelse return null;
+    const cores = std.fmt.parseInt(usize, cores_word[0..cores_end], 10) catch return null;
+    const total_mb = megabytesIn(std.mem.trim(u8, cell[comma + 1 ..], " ")) orelse return null;
+    return .{ .total_mb = total_mb, .cores = cores };
+}
+
+/// `12GB` or `512MB`, in megabytes.
+fn megabytesIn(cell: []const u8) ?u64 {
+    if (std.mem.endsWith(u8, cell, "GB")) {
+        const value = std.fmt.parseInt(u64, cell[0 .. cell.len - 2], 10) catch return null;
+        return value * 1024;
+    }
+    if (std.mem.endsWith(u8, cell, "MB")) {
+        return std.fmt.parseInt(u64, cell[0 .. cell.len - 2], 10) catch null;
+    }
+    return null;
+}
+
+test "every sandbox block the documentation shows is read the way the page says" {
+    // `sandbox.parse` answers an empty block for a value it cannot read, which is
+    // a page showing a driver that silently means `native`. So each block is
+    // parsed and the driver it came back with is compared against the name the
+    // block spells.
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    var wrong: std.ArrayList(u8) = .empty;
+    var seen: usize = 0;
+
+    for (docs) |doc| {
+        for (try zonBlocksIn(arena, doc)) |block| {
+            if (std.mem.indexOf(u8, block.text, ".driver") == null) continue;
+            // `.drivers` is the org bundle's own list and a different reader.
+            if (std.mem.indexOf(u8, block.text, ".drivers") != null) continue;
+            seen += 1;
+
+            const source = try arena.dupeZ(u8, block.text);
+            var read = chock_policy.sandbox.parse(gpa, source, null) catch |err| {
+                try wrong.print(arena, "{s}:{d}: {t}\n", .{ doc.path, block.line, err });
+                continue;
+            };
+            defer read.deinit(gpa);
+
+            const named = for (std.enums.values(chock_policy.sandbox.Driver)) |one| {
+                const quoted = try std.fmt.allocPrint(arena, "\"{s}\"", .{one.wireName()});
+                if (std.mem.indexOf(u8, block.text, quoted) != null) break one;
+            } else {
+                try wrong.print(arena, "{s}:{d}: names no driver this build has\n", .{ doc.path, block.line });
+                continue;
+            };
+            if (read.chosen() != named) {
+                try wrong.print(arena, "{s}:{d}: spells {s} and is read as {s}\n", .{
+                    doc.path,
+                    block.line,
+                    named.wireName(),
+                    read.chosen().wireName(),
+                });
+            }
+        }
+    }
+
+    // A page whose blocks stopped being found would pass this test silently.
+    if (seen == 0) try wrong.appendSlice(arena, "no sandbox block was found at all\n");
+    try testing.expectEqualStrings("", wrong.items);
+}
+
+test "the microVM page's memory encryption claims are the ones the code makes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const docs = try loadDocs(arena, testing.io);
+
+    const page = try docText(docs, "docs/security/microvm.md");
+    const code = try loadSources(arena, testing.io, &all_code);
+
+    var wrong: std.ArrayList(u8) = .empty;
+
+    // The page says the policy is zero, and a policy that allowed debugging
+    // would undo what encryption is for. A change to either end has to change
+    // both.
+    const says_zero = std.mem.indexOf(u8, page, "The launch policy is zero") != null;
+    const is_zero = std.mem.indexOf(u8, code, "const sev_policy: u32 = 0;") != null;
+    if (says_zero != is_zero) {
+        try wrong.print(arena, "the page says the policy is zero: {}, the code sets zero: {}\n", .{ says_zero, is_zero });
+    }
+
+    // The page says SEV-ES is not selected. The call that would select it is
+    // Mirage's `createSevEs`, so the claim holds exactly while nothing names it.
+    const says_no_es = std.mem.indexOf(u8, page, "SEV-ES is not selected") != null;
+    const names_es = std.mem.indexOf(u8, code, "createSevEs") != null;
+    if (says_no_es and names_es) {
+        try wrong.appendSlice(arena, "the page says SEV-ES is not selected and the code names createSevEs\n");
+    }
+
+    try testing.expectEqualStrings("", wrong.items);
+}

@@ -21,6 +21,17 @@ let
   # needs a recent feature.
   kernel = guestPkgs.linuxKernel.kernels.linux_6_1;
 
+  # **The console's name is the architecture's, and an unknown one is refused.** A
+  # kernel told to print to a port it has not got prints nowhere. `src/vmm.zig`
+  # holds the same two names and refuses the same way, and the two must agree.
+  console =
+    if guestPkgs.stdenv.hostPlatform.isx86_64 then
+      "ttyS0"
+    else if guestPkgs.stdenv.hostPlatform.isAarch64 then
+      "ttyAMA0"
+    else
+      throw "chock has no microVM guest for ${guestPkgs.stdenv.hostPlatform.system}";
+
   # **Only the modules the guest needs, and not the whole tree.** A guest booted
   # with every module of a kernel is a 146MB initramfs, and one that size does not
   # unpack: the guest came up, `/lib/modules` was there, and every file under it
@@ -29,10 +40,16 @@ let
   #
   # `makeModulesClosure` is what NixOS builds its own stage 1 with, so the
   # dependencies of each name below come in without being listed.
+  #
+  # **One list for both architectures.** Every driver named is generic, and where
+  # the two kernels differ is whether a name is a module or built in: on arm64 the
+  # virtio transports are built in, on x86_64 they are modules. A name that is
+  # neither fails this build rather than leaving a guest short of a driver.
   modules = guestPkgs.makeModulesClosure {
     # **`kernel.modules` and not `kernel`.** A nixpkgs kernel's main output holds
-    # `Image`, `dtbs` and `System.map` and no `lib/modules` at all, and this builder
-    # answers "no modules were provided" rather than saying which path it looked in.
+    # the image, `dtbs` and `System.map` and no `lib/modules` at all, and this
+    # builder answers "no modules were provided" rather than saying which path it
+    # looked in.
     kernel = kernel.modules;
     firmware = guestPkgs.emptyDirectory;
     rootModules = [
@@ -230,11 +247,13 @@ in
   # caller reads one place. `chock guest` dials `port` itself.
   boot = {
     inherit tag shares;
-    cmdline = "console=ttyAMA0 loglevel=7 init=/init";
+    cmdline = "console=${console} loglevel=7 init=/init";
     port = 1024;
     # What `.sandbox.kernel` in `config.zon` is set to. The derivation is a
-    # directory: the image inside it is what a guest boots.
-    image = "${kernel}/Image";
+    # directory, and the image inside it is named by the architecture: `kernel.target`
+    # is `bzImage` on x86 and `Image` on arm64. Mirage's x86 boot path reads a real
+    # mode bzImage header, so the name and the format go together.
+    image = "${kernel}/${kernel.target}";
   };
 
   meta = {

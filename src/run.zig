@@ -453,6 +453,10 @@ const Started = struct {
     sandbox_choice: chock_policy.sandbox.Block,
     /// Chock's own state directory. Short, which is what a unix socket path needs.
     state_dir: []const u8,
+    /// This session's own guest, forked before the credential was read and waiting
+    /// for the directories it may serve. Null for a session the daemon handed a
+    /// guest to, and for one whose tool calls run natively.
+    own_guest: ?*OwnGuest,
     /// The toolchain's own read only binds, plus one for each operator skill.
     read_only_mounts: []const chock_core.tools.ToolchainMount,
     /// Every skill this session found, bodies and all. The prompt carries one
@@ -773,6 +777,36 @@ fn start(
 
     const org_bundle = try loadOrgBundle(arena, io, data_dir, options);
 
+    // Copied into the arena: `chock_proto.log.Log` borrows the session string
+    // and stamps it onto every envelope for as long as the log is open.
+    const stack_id = try chooseSessionId(arena, io, env, project_root, options);
+    const id = try arena.dupe(u8, &stack_id);
+
+    const paths = session_paths.pathsFor(arena, env, project_root, id) catch |err| {
+        tty.print(.err, "chock run: the session path could not be built: {s}\n", .{@errorName(err)});
+        return error.Reported;
+    };
+
+    if (options.adopt) try refuseAdoptWithNothingToAdopt(gpa, io, paths.log, id);
+
+    session_paths.create(io, paths) catch return error.Reported;
+
+    // **Forked here, above the provider configuration and below the sandbox
+    // block.** A forked process keeps a copy of this one's memory, so a guest
+    // started after the credential was read would hold the token for as long as
+    // the session runs. The directories it serves are not known yet: they cross
+    // the control channel later, which is what lets the fork come first.
+    var own_guest: ?*OwnGuest = null;
+    errdefer if (own_guest) |one| one.stop(io);
+    if (sandbox_choice.chosen() == .microvm) {
+        // Before the fork, and before a socket a daemon gave this run is used,
+        // because either way a guest ends up holding a grant over the project.
+        try refuseGuestOverChockOwn(arena, io, env, project_root);
+        if (options.guest == null) {
+            own_guest = try forkOwnGuest(arena, io, state_dir, sandbox_choice, paths.dir, id);
+        }
+    }
+
     var config_diag: ?chock_auth.config.Diagnostic = null;
     defer if (config_diag) |*d| d.deinit(arena);
     var config = chock_auth.config.load(arena, io, config_dir, &config_diag) catch |err| switch (err) {
@@ -915,20 +949,6 @@ fn start(
         search_credential,
         project_secrets.entries.len,
     );
-
-    // Copied into the arena: `chock_proto.log.Log` borrows the session string
-    // and stamps it onto every envelope for as long as the log is open.
-    const stack_id = try chooseSessionId(arena, io, env, project_root, options);
-    const id = try arena.dupe(u8, &stack_id);
-
-    const paths = session_paths.pathsFor(arena, env, project_root, id) catch |err| {
-        tty.print(.err, "chock run: the session path could not be built: {s}\n", .{@errorName(err)});
-        return error.Reported;
-    };
-
-    if (options.adopt) try refuseAdoptWithNothingToAdopt(gpa, io, paths.log, id);
-
-    session_paths.create(io, paths) catch return error.Reported;
 
     const resuming = options.adopt or options.continue_newest or options.session != null;
     const taken = if (resuming) takenOver(gpa, io, arena, paths.log, paths.work) else null;
@@ -1090,6 +1110,12 @@ fn start(
 
     const dev_shell_dir = devShellDirFor(arena, io, env, project_root);
 
+    // **Where the dev shell's own temporary directory goes, named rather than
+    // left to `nix`.** An evaluation ends in `mktemp -d -t nix-shell.XXXXXX`, so
+    // left alone it leaves a directory under `/tmp` that nothing can find again
+    // and nothing takes off. See `session_paths.devShellStagingDir`.
+    const staging_dir = devShellStagingDirFor(arena, io, env, project_root);
+
     // Before the dev shell, because the `nix` block names the attribute it
     // reads. `--dev-shell` wins over the file for this one run.
     const nix_caps = try resolveNixCaps(arena, io, project_root, config_dir, org_bundle);
@@ -1112,7 +1138,7 @@ fn start(
     const dev_shell = if (image != null)
         null
     else
-        try loadDevShell(gpa, io, env, project_root, dev_shell_dir, dev_shell_name);
+        try loadDevShell(gpa, io, env, project_root, dev_shell_dir, dev_shell_name, staging_dir);
 
     const tool_env = if (image) |*one|
         try imageToolEnvironment(arena, one)
@@ -1316,6 +1342,12 @@ fn start(
     else
         null;
 
+    // Here, because the scratchpad it sits beside is made just above and nothing
+    // between reads this variable. A guest is offered what this names.
+    if (try toolStagingDir(arena, scratch_dir)) |dir| {
+        try tool_env.put("TMPDIR", dir);
+    }
+
     const chain = spawnChain(options);
     const provisioning = try provisioningFor(
         arena,
@@ -1451,6 +1483,7 @@ fn start(
         .image = image,
         .sandbox_choice = sandbox_choice,
         .state_dir = state_dir,
+        .own_guest = own_guest,
         .toolchain = toolchain,
         .read_only_mounts = read_only_mounts,
         .skills = found_skills,
@@ -2539,6 +2572,7 @@ fn loadDevShell(
     project_root: []const u8,
     cache_dir: ?[]const u8,
     shell_name: ?[]const u8,
+    staging_dir: ?[]const u8,
 ) StartError!?chock_nix.DevShell {
     const dir = cache_dir orelse return null;
 
@@ -2555,6 +2589,7 @@ fn loadDevShell(
         .shell_name = shell_name,
         .host_env = env,
         .on_evaluate = reportEvaluatingDevShell,
+        .staging_dir = staging_dir,
         .diag = &diag,
     }) catch |err| loaded: {
         if (diag) |*fault| {
@@ -2611,6 +2646,26 @@ fn devShellDirFor(
     return dir;
 }
 
+/// The dev shell's staging directory, made. Null leaves `nix` to pick its own,
+/// which a session with no guest does not mind.
+fn devShellStagingDirFor(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+) ?[]const u8 {
+    const dir = session_paths.devShellStagingDir(arena, env, project_root) catch |err| {
+        tty.print(
+            .warn,
+            "chock: the dev shell staging directory is unknown ({t}), so nix picks its own\n",
+            .{err},
+        );
+        return null;
+    };
+    session_paths.createDevShellStagingDir(io, dir) catch return null;
+    return dir;
+}
+
 fn reportEvaluatingDevShell(project_root: []const u8) void {
     tty.print(.plain, "chock: reading the dev shell of {s} with nix\n", .{project_root});
 }
@@ -2647,7 +2702,11 @@ pub const host_toolchain_candidates: []const []const u8 = &.{
     "/opt",
 };
 
-fn hostToolchainPaths(
+/// The host directories this machine can run a program from, read only. One
+/// answer, read by `chock run` for its own mounts and by `chock daemon` for the
+/// grant it gives a guest: two spellings is a guest granted a different set from
+/// the one its session binds.
+pub fn hostToolchainPaths(
     arena: std.mem.Allocator,
     io: std.Io,
 ) std.mem.Allocator.Error![]const []const u8 {
@@ -2668,6 +2727,83 @@ fn hostToolchainPaths(
 fn pathIsDirectory(io: std.Io, path: []const u8) bool {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return stat.kind == .directory;
+}
+
+/// A directory of Chock's own that a guest's grant over a project would hold.
+pub const ChockOwnHeld = struct {
+    /// The directory the grant covers, which is what a refusal names first.
+    project: []const u8,
+    /// Chock's own directory inside it.
+    own: []const u8,
+};
+
+pub const ChockOwnError = std.mem.Allocator.Error || chock_auth.paths.DirError;
+
+/// The one directory of a project that reaches a guest's grant: its own `.git`
+/// when it is a repository, because that is all the workspace binds of it, and
+/// the project itself otherwise, because an overlay's lower layer is the project.
+///
+/// One answer, read by the daemon for the root it grants and by
+/// `chockOwnInProject` for the root it checks. Two spellings is a check against
+/// a directory other than the one granted.
+pub fn projectGrantDir(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    project_root: []const u8,
+) std.mem.Allocator.Error![]const u8 {
+    const git_dir = try std.fs.path.join(arena, &.{ project_root, ".git" });
+    return if (pathIsDirectory(io, git_dir)) git_dir else project_root;
+}
+
+/// Whether a guest started for this project would be granted a directory of
+/// Chock's own, naming both when it would.
+///
+/// **Whoever starts a session names the project and nothing bounds where it
+/// is.** A project at or above the configuration, data or state directory, and
+/// `--project /` is the same shape, puts `credentials.zon` inside a guest's read
+/// grant. Two processes can start a guest: the daemon starts one per session, and
+/// `chock run` forks its own whenever it was given none. So both ask this, and a
+/// check in one alone only moves which process holds the grant.
+///
+/// The directory named is the one that reaches the grant: the project's own
+/// `.git` when it is a repository, because that is all the workspace binds, and
+/// the project itself otherwise, because an overlay's lower layer is the project.
+///
+/// It is here, beside `hostToolchainPaths`, because the answer needs
+/// `chock-auth`'s paths and `chock-sandbox` imports none of that, and because
+/// that function is already the one derivation both this session's mounts and
+/// the daemon's grant read.
+pub fn chockOwnInProject(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+) ChockOwnError!?ChockOwnHeld {
+    // Resolved first, so a project named through a symbolic link is checked as
+    // the directory it really is. A path that resolves to nothing is checked as
+    // it was given: a project that is not there fails on its own further down.
+    var resolved: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root: {
+        var dir = std.Io.Dir.cwd().openDir(io, project_root, .{}) catch break :root project_root;
+        defer dir.close(io);
+        const length = dir.realPath(io, &resolved) catch break :root project_root;
+        break :root resolved[0..length];
+    };
+
+    const granted = try projectGrantDir(arena, io, root);
+    const chock_own = [_][]const u8{
+        try chock_auth.paths.configDir(arena, env),
+        try chock_auth.paths.dataDir(arena, env),
+        try chock_auth.paths.stateDir(arena, env),
+    };
+    for (chock_own) |own| {
+        // The direction is what makes this a guard: the question is whether
+        // Chock's own directory is inside the one granted, and asked the other
+        // way round it refuses every ordinary project instead.
+        if (!vmm.shareCovers(own, granted)) continue;
+        return .{ .project = try arena.dupe(u8, granted), .own = own };
+    }
+    return null;
 }
 
 /// The mount set of a container image, minus any entry that would sit above
@@ -4213,12 +4349,85 @@ fn provisioningFor(
     };
 }
 
+/// The `TMPDIR` a session's tool environment gets, or null to keep the one the
+/// environment already states.
+///
+/// **This is where a tool call stages a program's input on the host**, and it is
+/// not the harness's own temporary directory. That one is the user's `TMPDIR`, or
+/// `/tmp`, and a guest that has to reach a staged file would be granted every
+/// other process's temporary files along with it. This is one directory of this
+/// session's own, beside the scratchpad and outside the part of it the sandbox
+/// mounts, so a staged file is reachable by the guest that serves the bind and by
+/// nothing the agent runs. See `chock_core.scratchpad.stage_leaf`.
+///
+/// **One answer whether or not this project has a dev shell.** A dev shell
+/// exports a `TMPDIR` of its own, and staging there would make a guest's offer
+/// list depend on which of the two cases a project is in: a grant that holds for
+/// half the projects is a root a compromised VMM may read for all of them. This
+/// directory is inside the session scratchpad a guest is granted anyway.
+///
+/// Null only for a session whose scratchpad could not be made, which has nowhere
+/// better to go and is already running degraded.
+pub fn toolStagingDir(
+    arena: std.mem.Allocator,
+    scratch_dir: ?[]const u8,
+) std.mem.Allocator.Error!?[]const u8 {
+    const dir = scratch_dir orelse return null;
+    return try chock_core.scratchpad.stageDir(arena, dir);
+}
+
+test "the directory a tool call stages into is inside the scratchpad and built with it" {
+    // A daemon grants this session's scratchpad and nothing wider, so a staging
+    // directory outside it is every tool call of the session refused. It also has
+    // to be a directory `makeLayout` builds, because `offersFor` leaves out a
+    // path it cannot stat and would offer this one to no guest at all.
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const io = testing.io;
+
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var where: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try temp.dir.realPath(io, &where);
+
+    const scratch = try std.fs.path.join(arena, &.{ where[0..length], "chock", "01SESSION" });
+    try chock_core.scratchpad.makeLayout(io, scratch, null);
+
+    const staging = (try toolStagingDir(arena, scratch)).?;
+    try testing.expect(std.mem.startsWith(u8, staging, scratch));
+    try testing.expect(pathIsDirectory(io, staging));
+
+    // And outside the half of the scratchpad the sandbox mounts, so a staged
+    // secret is not also a file the agent reads out of its own notes.
+    const mounted = try std.fs.path.join(arena, &.{ scratch, chock_core.scratchpad.scratch_leaf });
+    try testing.expect(!std.mem.startsWith(u8, staging, mounted));
+
+    // A session with no scratchpad has nowhere better, so it keeps what the
+    // environment states.
+    try testing.expectEqual(@as(?[]const u8, null), try toolStagingDir(arena, null));
+}
+
+/// The environment the harness itself runs a tool call's setup with: the dev
+/// shell's, or a copy of this process's own when there is no dev shell.
+///
+/// **A copy and never the process's own map.** This session gives the tool
+/// environment a `TMPDIR` of its own, and `session_paths.scratchpadDir` derives
+/// that directory from the `TMPDIR` the process was started with: one map for
+/// both would have the second answer depend on the first.
 fn toolEnvironment(
     arena: std.mem.Allocator,
     host_env: *std.process.Environ.Map,
     dev_shell: ?chock_nix.DevShell,
 ) std.mem.Allocator.Error!*std.process.Environ.Map {
-    const shell = dev_shell orelse return host_env;
+    const shell = dev_shell orelse {
+        const copy = try arena.create(std.process.Environ.Map);
+        copy.* = try host_env.clone(arena);
+        return copy;
+    };
 
     const map = try arena.create(std.process.Environ.Map);
     map.* = std.process.Environ.Map.init(arena);
@@ -10487,22 +10696,26 @@ fn runSession(
     defer guest_arena.deinit();
 
     var guest_link: ?*GuestLink = null;
-    var own_guest: ?*OwnGuest = null;
-    defer if (own_guest) |one| one.stop();
+    // Stopped here and not where it was forked, because the guest has to outlive
+    // every tool call and nothing of this session's work is left by now.
+    defer if (started.own_guest) |one| one.stop(io);
 
     // The daemon hands a socket in when it owns the guest. A session nobody handed
-    // one to starts its own, because a `chock run` of its own is one process for the
-    // whole session: it is only under the daemon that a child exits every turn.
+    // one to forked its own in `start`, because a `chock run` of its own is one
+    // process for the whole session: it is only under the daemon that a child exits
+    // every turn.
     const guest_socket: ?[]const u8 = options.guest orelse socket: {
-        if (started.sandbox_choice.chosen() != .microvm) break :socket null;
-        const one = try startOwnGuest(guest_arena.allocator(), io, started.state_dir, started);
-        own_guest = one;
+        const one = started.own_guest orelse break :socket null;
         break :socket one.socket;
     };
 
     if (guest_socket) |socket_path| {
         const room = guest_arena.allocator();
-        const link = try attachGuest(room, io, socket_path, try guestShares(room, io, started));
+        const shares = try guestShares(room, io, started);
+        // The guest boots on this message, so it comes before anything reaches for
+        // its socket.
+        if (started.own_guest) |one| try readyOwnGuest(room, io, one, shares);
+        const link = try attachGuest(room, io, socket_path, shares);
         chock_core.tools.useDriver(link.guest.driver());
         guest_link = link;
         tty.print(.plain, "chock: tool calls run in a microVM guest\n", .{});
@@ -11719,83 +11932,103 @@ fn refuseAdoptWithNothingToAdopt(
 const busy_detail = "another process took the session's log lock first, so it owns that session " ++
     "now. Nothing was lost: the log is whole, and `chock sessions` says who is running.";
 
-/// One guest this session runs itself, on a thread of its own.
+/// One guest this session runs itself, in a forked process of its own.
 ///
-/// **This process forks for a tool call under the native driver, and does not under
-/// this one.** `Registry.dispatch` reaches `Sandbox.spawn` only for the native
-/// driver; with a guest every call crosses a wire instead, so the threads below are
-/// never live at a fork. The guest is given an allocator of its own all the same, so
-/// nothing it holds is the allocator the rest of this process uses.
+/// **A process and not a thread, so the boundary round it can be installed.** A
+/// seccomp filter and a Landlock domain go on a whole process and cannot be taken
+/// off again, so a guest hosted on a thread of this one could only be confined by
+/// confining the session with it: see `src/vmm.zig`.
 const OwnGuest = struct {
-    thread: std.Thread,
+    child: vmm.Child,
     socket: [:0]const u8,
     /// Where the guest's console goes.
     console: [:0]const u8,
-    ready: std.atomic.Value(bool) = .init(false),
-    stopping: std.atomic.Value(bool) = .init(false),
-    ended: std.atomic.Value(bool) = .init(false),
 
-    fn stop(self: *OwnGuest) void {
-        self.stopping.store(true, .release);
-        self.thread.join();
+    /// **This end removes the socket, and not the guest.** The path is not in the
+    /// share set, so the confined process cannot unlink its own: Landlock refuses
+    /// it, and a file left behind is one the next session of this name trips over.
+    fn stop(self: *OwnGuest, io: std.Io) void {
+        self.child.stop();
+        const code = self.child.wait();
+        // **A guest that ended badly says so, and not only under `--detail`.** Its
+        // own reason is written to the control channel after `host` returns, by
+        // which time the line above has closed this end, so nothing reads it. The
+        // console is where it still lands.
+        if (code == 0) {
+            tty.detail("chock: the guest's own process ended, answering 0\n", .{});
+        } else {
+            tty.print(
+                .err,
+                "chock: the guest's own process ended badly, answering {d}. Its console is at " ++
+                    "{s}.\n",
+                .{ code, self.console },
+            );
+        }
+        std.Io.Dir.deleteFileAbsolute(io, self.socket) catch {};
     }
 };
 
-fn runOwnGuest(one: *OwnGuest, io: std.Io, options: vmm.Options) void {
-    defer one.ended.store(true, .release);
+/// Refuse a guest for a project that holds a directory of Chock's own, naming
+/// both.
+///
+/// **Asked for every session that runs in a guest, and not only for one this
+/// process forks.** A daemon that refuses a project answers no socket, and the
+/// child then forks its own, so a check on the fork alone would leave the grant
+/// with this process instead of closing it. See `chockOwnInProject`.
+fn refuseGuestOverChockOwn(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+) StartError!void {
+    const held = chockOwnInProject(arena, io, env, project_root) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NoHomeDirectory => {
+            tty.print(
+                .err,
+                "chock run: this machine says where none of Chock's own directories are, so " ++
+                    "whether a guest for {s} would be granted one cannot be answered and the " ++
+                    "session does not start.\n",
+                .{project_root},
+            );
+            return error.Reported;
+        },
+    } orelse return;
 
-    var guest_state = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer _ = guest_state.deinit();
-
-    // **A file beside the session and not this process's own output.** The agent's
-    // transcript is on standard output, and a kernel boot interleaved with it is
-    // unreadable for both. It also means a guest that says why it failed is still
-    // saying it where somebody can look, which standard output did not: a session
-    // whose display owns that stream threw the whole boot away.
-    var file = std.Io.Dir.cwd().createFile(io, one.console, .{}) catch {
-        tty.print(.err, "chock: the guest's console could not be opened at {s}\n", .{one.console});
-        return;
-    };
-    defer file.close(io);
-
-    var out_buffer: [16 * 1024]u8 = undefined;
-    var console = file.writer(io, &out_buffer);
-
-    var fault: ?vmm.Fault = null;
-    const code = vmm.host(guest_state.allocator(), io, options, &console.interface, &fault) catch |err| {
-        console.interface.flush() catch {};
-        tty.print(.err, "chock: the guest ended badly: {t}\n", .{err});
-        return;
-    };
-    // The guest's console is buffered, and a guest that stopped early has its whole
-    // boot still in there. Without this the reason is thrown away.
-    console.interface.flush() catch {};
-    tty.detail("chock: the guest's own loop ended, answering {d}\n", .{code});
-    if (fault) |said| {
-        if (said.detail.len == 0) {
-            tty.print(.err, "chock: the guest: {s}.\n", .{said.said});
-        } else {
-            tty.print(.err, "chock: the guest: {s}: {s}\n", .{ said.said, said.detail });
-        }
-    }
+    tty.print(
+        .err,
+        "chock run: the project {s} holds {s}, which is Chock's own, so no guest is started " ++
+            "for it and the session does not start. A guest granted that directory reads this " ++
+            "user's credentials. Name the project itself.\n",
+        .{ held.project, held.own },
+    );
+    return error.Reported;
 }
 
-/// Start this session's own guest and wait for its socket.
+/// Fork this session's own guest, before anything of this process's memory holds a
+/// credential.
+///
+/// **It returns before the guest boots.** The forked process waits for the
+/// directories it may serve, which are derived from a workspace that does not
+/// exist yet, so the boot is `readyOwnGuest`'s half of the work.
 ///
 /// **A guest that will not come up stops the session.** Carrying on with the native
 /// driver would sandbox it more weakly than the operator asked for, and on a Mac far
 /// more weakly, with nothing saying so.
-fn startOwnGuest(
+fn forkOwnGuest(
     arena: std.mem.Allocator,
     io: std.Io,
     state_dir: []const u8,
-    started: *const Started,
+    choice: chock_policy.sandbox.Block,
+    session_dir: []const u8,
+    session_id: []const u8,
 ) StartError!*OwnGuest {
     if (!vmm.available) {
         tty.print(
             .err,
             "chock run: this build runs no guest, and the configuration asks for one. A guest " ++
-                "needs KVM and the aarch64 device layout.\n",
+                "runs on aarch64 or x86_64 Linux under KVM, and on aarch64 macOS under " ++
+                "Hypervisor.framework.\n",
             .{},
         );
         return error.Reported;
@@ -11808,7 +12041,7 @@ fn startOwnGuest(
     const socket = std.fmt.allocPrintSentinel(
         arena,
         "{s}/g-{s}.sock",
-        .{ state_dir, started.session_id[started.session_id.len - 12 ..] },
+        .{ state_dir, session_id[session_id.len - 12 ..] },
         0,
     ) catch return error.OutOfMemory;
 
@@ -11825,52 +12058,194 @@ fn startOwnGuest(
     const console = std.fmt.allocPrintSentinel(
         arena,
         "{s}/{s}.guest-console",
-        .{ started.paths.dir, started.session_id },
+        .{ session_dir, session_id },
         0,
     ) catch return error.OutOfMemory;
 
-    const held = arena.create(OwnGuest) catch return error.OutOfMemory;
-    held.* = .{ .thread = undefined, .socket = socket, .console = console };
+    // **A file beside the session and not this process's own output.** The agent's
+    // transcript is on standard output, and a kernel boot interleaved with it is
+    // unreadable for both. It also means a guest that says why it failed is still
+    // saying it where somebody can look, which standard output did not: a session
+    // whose display owns that stream threw the whole boot away.
+    //
+    // Opened here, because the confined process cannot open it: the console is not
+    // a directory it serves. It crosses the fork as a descriptor.
+    var file = std.Io.Dir.cwd().createFile(io, console, .{}) catch {
+        tty.print(.err, "chock run: the guest's console could not be opened at {s}\n", .{console});
+        return error.Reported;
+    };
+    // The guest's own process keeps it. Nothing this one writes goes there.
+    defer file.close(io);
 
     // Read once, so the processor count and the memory size are chosen against
     // the same numbers.
     const guest_machine = chock_policy.sandbox.Machine.now();
 
-    held.thread = std.Thread.spawn(.{}, runOwnGuest, .{ held, io, vmm.Options{
-        .kernel = started.sandbox_choice.kernel.?,
-        .initrd = started.sandbox_choice.initrd,
+    // **Room for the handle before the fork, not after.** A failure to allocate
+    // once the child exists would leave its bound socket behind with nothing
+    // holding the path to unlink.
+    const held = arena.create(OwnGuest) catch return error.OutOfMemory;
+
+    const child = vmm.forkHost(io, .{
+        .kernel = choice.kernel.?,
+        .initrd = choice.initrd,
         .session = socket,
-        .memory_mb = started.sandbox_choice.memory(guest_machine, builtin.os.tag),
-        .cpus = started.sandbox_choice.processors(guest_machine, builtin.os.tag),
-        .ready = &held.ready,
-        .stopping = &held.stopping,
-    } }) catch |err| {
-        tty.print(.err, "chock run: the guest's thread could not be started: {t}\n", .{err});
+        .memory_mb = choice.memory(guest_machine, builtin.os.tag),
+        .cpus = choice.processors(guest_machine, builtin.os.tag),
+        .control = vmm.fork_sets_control,
+    }, file.handle) catch |err| {
+        tty.print(
+            .err,
+            "chock run: the guest's own process could not be started: {t}. The session does not " ++
+                "start, because its tool calls would otherwise run unsandboxed.\n",
+            .{err},
+        );
         return error.Reported;
     };
 
-    var waited: u64 = 0;
-    while (waited < guest_boot_ms) : (waited += guest_look_ms) {
-        if (held.ready.load(.acquire)) return held;
-        if (held.ended.load(.acquire)) break;
-        std.Io.sleep(io, .fromNanoseconds(guest_look_ms * std.time.ns_per_ms), .awake) catch break;
-    }
-
-    tty.print(
-        .err,
-        "chock run: the guest did not come up, so the session does not start. Its console is " ++
-            "at {s}.\n",
-        .{held.console},
-    );
-    held.stopping.store(true, .release);
-    held.thread.join();
-    return error.Reported;
+    held.* = .{ .child = child, .socket = socket, .console = console };
+    return held;
 }
 
-/// How long to wait for a guest to bind its socket, and how often to look. It reads
-/// and measures a kernel first, which is not instant on a 59MB image.
+/// Give the guest the directories it may serve, then wait for its socket.
+///
+/// **The set crosses the control channel and not the fork.** It is derived from
+/// this session's workspace, and the guest is forked before that exists: see
+/// `forkOwnGuest`.
+fn readyOwnGuest(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    one: *OwnGuest,
+    shares: []const sandbox.vm_shares.Share,
+) StartError!void {
+    one.child.sendShares(arena, try forGuest(arena, shares)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Broke => {
+            tty.print(
+                .err,
+                "chock run: the guest's own process would not take this session's directories, " ++
+                    "so it is already gone. Its console is at {s}.\n",
+                .{one.console},
+            );
+            return error.Reported;
+        },
+    };
+
+    one.child.waitReady(io, guest_boot_ms) catch |err| {
+        if (one.child.fault()) |said| {
+            if (said.detail.len == 0) {
+                tty.print(.err, "chock run: the guest: {s}.\n", .{said.said});
+            } else {
+                tty.print(.err, "chock run: the guest: {s}: {s}\n", .{ said.said, said.detail });
+            }
+        }
+        tty.print(
+            .err,
+            "chock run: the guest did not come up ({t}), so the session does not start. Its " ++
+                "console is at {s}.\n",
+            .{ err, one.console },
+        );
+        return error.Reported;
+    };
+
+    // **Said only when it is on.** A guest runs in the clear on most machines,
+    // so a line for the ordinary case would be noise, and a line that named the
+    // feature either way would read as a promise on a machine that has none.
+    if (one.child.sev != .off) {
+        tty.print(.dim, "chock run: the guest's memory is encrypted ({s}).\n", .{one.child.sev.text()});
+    }
+}
+
+/// The share set as the guest module of this build names it.
+///
+/// **The identity on a build that runs a guest**, where `vmm.Options.Share` is
+/// `chock-sandbox`'s own shape. A build that runs none states the same three fields
+/// as a type of its own, because it imports no `chock-sandbox`, so the set is
+/// copied field by field there. Nothing reaches this at runtime on that build: it
+/// is reached only so that it compiles.
+fn forGuest(
+    arena: std.mem.Allocator,
+    shares: []const sandbox.vm_shares.Share,
+) std.mem.Allocator.Error![]const vmm.Options.Share {
+    if (comptime vmm.Options.Share == sandbox.vm_shares.Share) return shares;
+
+    const out = try arena.alloc(vmm.Options.Share, shares.len);
+    for (shares, out) |from, *to| to.* = .{
+        .name = from.name,
+        .host_path = from.host_path,
+        .writable = from.writable,
+    };
+    return out;
+}
+
+test "the guest is forked before the provider configuration is read" {
+    // A forked process keeps a copy of this one's memory, so a guest forked after
+    // the credential was read would hold a provider token for as long as it runs.
+    // Source order is the only part of `start` a test can reach: the rest of it
+    // needs a project, a configuration and a provider.
+    const source = @embedFile("run.zig");
+    const forked = std.mem.indexOf(u8, source, "forkOwnGuest(").?;
+    const credential = std.mem.indexOf(u8, source, "chock_auth.config.load(").?;
+    try std.testing.expect(forked < credential);
+
+    // And the project is checked against Chock's own directories before the fork,
+    // because the fork is what puts the grant on.
+    const checked = std.mem.indexOf(u8, source, "try refuseGuestOverChockOwn(").?;
+    try std.testing.expect(checked < forked);
+}
+
+test "a session with no daemon refuses a project that holds one of Chock's own directories" {
+    // Nothing of the daemon is involved here. It answers no socket for such a
+    // project, and this process then forks a guest of its own, so a check on the
+    // daemon alone would hand the grant to the child rather than close it.
+    const gpa = testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const io = testing.io;
+
+    var said: tty.Capture = undefined;
+    said.start(io, gpa);
+    defer said.stop(io);
+
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    var where: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try temp.dir.realPath(io, &where);
+    const base = where[0..length];
+
+    var env = std.process.Environ.Map.init(arena);
+    try env.put("HOME", base);
+
+    // The project is the home directory, which holds all three of Chock's own.
+    try testing.expectError(error.Reported, refuseGuestOverChockOwn(arena, io, &env, base));
+    // The directory itself is named, and not only that something was refused: a
+    // person told a grant was narrowed learns nothing they can act on.
+    const config = try chock_auth.paths.configDir(arena, &env);
+    try testing.expect(std.mem.indexOf(u8, said.err(), config) != null);
+    try testing.expect(std.mem.indexOf(u8, said.err(), base) != null);
+
+    // A project below them holds none, and is refused nothing.
+    said.clear();
+    const project = try std.fs.path.join(arena, &.{ base, "project" });
+    try session_paths.createDirAll(io, project);
+    try refuseGuestOverChockOwn(arena, io, &env, project);
+    try testing.expectEqualStrings("", said.err());
+
+    // The check follows the directory the grant covers and refuses nothing
+    // further. Make the home directory a repository and the grant becomes its
+    // `.git`, which holds none of Chock's own, so the session runs: a guard that
+    // refuses too much costs a person their session for nothing.
+    try session_paths.createDirAll(io, try std.fs.path.join(arena, &.{ base, ".git" }));
+    try refuseGuestOverChockOwn(arena, io, &env, base);
+    try testing.expectEqualStrings("", said.err());
+}
+
+/// How long to wait for a guest to bind its socket. It reads a kernel and lays it
+/// out in guest memory first, which is not instant on a 59MB image.
 const guest_boot_ms: u64 = 30 * std.time.ms_per_s;
-const guest_look_ms: u64 = 100;
 
 /// What the operator's own `config.zon` says about sandboxing.
 ///
@@ -11916,6 +12291,16 @@ fn sandboxChoice(
         );
         return error.Reported;
     }
+
+    // **The file is zeroed here, because the fork comes next.** The same file can
+    // carry a provider token inline, and a guest forked above this arena would
+    // keep a copy of it for as long as the session runs. The block owns its own
+    // `kernel` and `initrd` strings, so nothing left points into these bytes.
+    //
+    // These bytes are not the only copy: the tree `parse` reads holds one of every
+    // string in the file. `parse` is what zeroes that, in every optimize mode, and
+    // its own doc comment says how.
+    std.crypto.secureZero(u8, source);
     return block;
 }
 
@@ -11984,7 +12369,8 @@ fn attachGuest(
     socket_path: []const u8,
     shares: []const sandbox.vm_shares.Share,
 ) StartError!*GuestLink {
-    const reached = vmm.attach(io, socket_path, shares, guest_port) catch |err| {
+    var refused: ?sandbox.vm_shares.Share = null;
+    const reached = vmm.attach(io, socket_path, shares, guest_port, &refused) catch |err| {
         switch (err) {
             error.NoGuest => tty.print(
                 .err,
@@ -11992,7 +12378,22 @@ fn attachGuest(
                     "run its tool calls in one, so it does not run them another way.\n",
                 .{socket_path},
             ),
-            error.ShareRefused => tty.print(
+            // **The path, because the alternative cost a session four tool calls
+            // of guessing.** A guest started by `chock daemon` is granted the
+            // roots a session's directories sit under before it runs, and a
+            // Landlock domain cannot be widened afterwards, so a directory
+            // outside the grant is refused here rather than failing every mount
+            // inside the guest with nothing but `NotPermitted` to read.
+            error.ShareRefused => if (refused) |one| tty.print(
+                .err,
+                "chock run: the guest would not take {s}, which this session needs " ++
+                    "{s}. The guest's own console says why. If this daemon started the " ++
+                    "guest, that directory is outside the set it was granted, and the " ++
+                    "usual cause is a `read_only` or `write` entry in this project's " ++
+                    "`workspace.binds`: a daemon grants none of those. Running `chock run` " ++
+                    "on this project starts a guest with that directory in it.\n",
+                .{ one.host_path, if (one.writable) "to write to" else "to read" },
+            ) else tty.print(
                 .err,
                 "chock run: the guest would not take one of this session's directories, so " ++
                     "the session does not start.\n",

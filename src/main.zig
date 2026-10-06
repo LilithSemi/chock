@@ -65,6 +65,11 @@ const ui = @import("ui.zig");
 
 pub const session = @import("session.zig");
 
+/// Public for `test/docs/claims.zig`, which checks what the documentation says a
+/// guest is granted against `daemon.max_granted_roots`. A number a reader has to
+/// trust is a number that rots.
+pub const daemon = @import("daemon.zig");
+
 /// What the standard library is told about this program.
 ///
 /// **One field, and it changes where no message goes.** `src/ui.zig` needs to

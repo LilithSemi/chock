@@ -292,20 +292,66 @@ fn note(out: ?*?Diagnostic, fault: Diagnostic.Fault) bool {
     return true;
 }
 
+/// An allocator that zeroes a block before it hands it back, and otherwise is
+/// the one it was given.
+///
+/// **`std.mem.Allocator.free` writes over released bytes only where runtime
+/// safety is on**, so a release build leaves them readable for as long as the
+/// memory behind them is unused. `resize` and `remap` both refuse, which makes
+/// the caller allocate, copy and free instead, so a block that grows is zeroed
+/// where it was rather than left behind.
+const Zeroing = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *Zeroing) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = free,
+    };
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Zeroing = @ptrCast(@alignCast(ptr));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Zeroing = @ptrCast(@alignCast(ptr));
+        std.crypto.secureZero(u8, memory);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Read the `sandbox` block out of a whole `config.zon`. A file with no such
 /// block answers a block that names nothing, which is `native`.
+///
+/// **The tree is zeroed as it is freed, and that is not an optimisation.** The
+/// file this reads can carry a provider token inline, and `ZonGen` with
+/// `parse_str_lits` keeps a copy of every string literal in it, so the token is
+/// in two places until the tree goes. A caller that hands this an arena cannot
+/// give that copy back, and plain `free` only overwrites it where runtime safety
+/// is on, which is a credential whose scrubbing depends on the optimize mode. So
+/// the tree is read through `Zeroing` and the paths the block keeps are duped
+/// with `gpa` itself, which is also what makes `Block.deinit` take `gpa`.
 pub fn parse(
     gpa: std.mem.Allocator,
     source: [:0]const u8,
     diag: ?*?Diagnostic,
 ) ParseError!Block {
-    var ast = std.zig.Ast.parse(gpa, source, .zon) catch |err| switch (err) {
+    var zeroing: Zeroing = .{ .child = gpa };
+    const tree = zeroing.allocator();
+
+    var ast = std.zig.Ast.parse(tree, source, .zon) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
-    defer ast.deinit(gpa);
+    defer ast.deinit(tree);
 
-    var zoir = try std.zig.ZonGen.generate(gpa, ast, .{ .parse_str_lits = true });
-    defer zoir.deinit(gpa);
+    var zoir = try std.zig.ZonGen.generate(tree, ast, .{ .parse_str_lits = true });
+    defer zoir.deinit(tree);
     if (zoir.hasCompileErrors()) return .{};
 
     const node = try findBlock(zoir, diag) orelse return .{};

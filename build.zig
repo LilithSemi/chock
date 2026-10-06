@@ -8,6 +8,17 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run all tests");
 
+    // **One step a module, beside the one that runs them all.** The whole suite
+    // does not finish on every machine, and a `--test-filter` is worse than it
+    // looks: a filter drops every non-matching test from **analysis**, so a call
+    // site a change made stale compiles only on the machine that did not run it.
+    // A module's own step analyses and runs all of that module's tests.
+    const module_test_steps = struct {
+        fn add(owner: *std.Build, name: []const u8, what: []const u8, run: *std.Build.Step) void {
+            owner.step(name, what).dependOn(run);
+        }
+    };
+
     const linux_only = target.result.os.tag == .linux;
 
     const version_text = b.option(
@@ -46,6 +57,12 @@ pub fn build(b: *std.Build) void {
     // See `std.Build.Step.Run.skip_foreign_checks`'s own doc comment.
     run_sandbox_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_sandbox_tests.step);
+    // Kept as a local, and not folded into `module_test_steps.add`, because
+    // `test/sandbox/confine.zig` further down adds to this same step: a
+    // top-level step can only be created once, and the helper's own call
+    // would be the second.
+    const test_sandbox_step = b.step("test-sandbox", "Run the chock-sandbox tests only");
+    test_sandbox_step.dependOn(&run_sandbox_tests.step);
 
     // The layer for the small number of primitives std.Io does not have. Like
     // chock-sandbox, it imports no other chock library and has no build.zig of
@@ -564,6 +581,39 @@ pub fn build(b: *std.Build) void {
         const run_escape_tests = b.addRunArtifact(escape_tests);
         run_escape_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_escape_tests.step);
+    }
+
+    // Linux and macOS, and nothing else: every test in test/sandbox/confine.zig
+    // forks, installs the guest's own outer boundary on the child, and asserts
+    // on what the platform refused. On Linux that is a Landlock domain and a
+    // seccomp filter, on macOS a Seatbelt profile, and no other target has
+    // either. It needs no probe binary of its own: the child it forks never
+    // execs successfully, so the test and the boundary it proves live in the
+    // same source file.
+    //
+    // **`skip_foreign_checks` is left off on macOS, and that is deliberate.**
+    // It is the same rule the two Darwin suites below follow: a boundary proved
+    // only by a skipped run step is worth nothing, and a Darwin claim on this
+    // project has been wrong three times because it was cross compiled and
+    // never run. The Linux arm keeps the flag, so a Linux build for a foreign
+    // Linux still compiles the suite.
+    if (linux_only or target.result.os.tag == .macos) {
+        const confine_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/sandbox/confine.zig"),
+                .target = target,
+                .optimize = optimize,
+                // libSystem for the Darwin arm, which reaches `fork`,
+                // `sandbox_init` and `pthread_create` through it. `std.Thread`
+                // has no other way to start a thread on macOS.
+                .link_libc = target.result.os.tag == .macos,
+                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+            }),
+        });
+        const run_confine_tests = b.addRunArtifact(confine_tests);
+        run_confine_tests.skip_foreign_checks = target.result.os.tag != .macos;
+        test_step.dependOn(&run_confine_tests.step);
+        test_sandbox_step.dependOn(&run_confine_tests.step);
     }
 
     // macOS only, and for the same reason the block above is Linux only: every
@@ -1478,18 +1528,44 @@ pub fn build(b: *std.Build) void {
     //   than the one that ships.
     const vulcan = b.dependency("vulcan", .{ .target = target, .optimize = optimize });
 
-    // **Running a guest is Linux on aarch64 and nothing else yet.** Mirage's machine
-    // setup is KVM and the device layout `mirage-arm64` states is that
-    // architecture's.
+    // **Running a guest is every target Mirage has both a machine and an
+    // architecture for.** That is Linux on aarch64 and x86_64, where the setup is
+    // KVM, and macOS on aarch64, where it is Hypervisor.framework. The devices
+    // placed are the architecture's own: arm64 states them in a device tree,
+    // x86_64 in ACPI tables.
+    //
+    // **Compiling is not booting, and this flag only claims the first.** A guest
+    // has been booted by hand on aarch64 Linux and on an Apple Silicon Mac. On
+    // x86_64 nothing in this repository has run one, because the development host
+    // is aarch64 and a hosted CI runner exposes no `/dev/kvm`. `src/vmm.zig`
+    // refuses an architecture it has no layout for rather than guessing one, so
+    // widening this cannot quietly place a guest wrongly.
+    //
+    // **A Mac needs the hypervisor entitlement**, which an ad hoc signature
+    // carries: see `docs/security/microvm.md` for the one command, and for why
+    // an unsigned binary gets `HV_DENIED` rather than a diagnosable fault.
     //
     // Two files behind one module name, so every build compiles: the one that cannot
     // run a guest answers `available = false`, which the daemon reads before it
     // offers a session one. See `src/vmm_absent.zig`.
-    const can_run_a_guest = target.result.os.tag == .linux and target.result.cpu.arch == .aarch64;
+    const can_run_a_guest = switch (target.result.os.tag) {
+        .linux => target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64,
+        .macos => target.result.cpu.arch == .aarch64,
+        else => false,
+    };
     const mirage = if (can_run_a_guest)
         b.dependency("mirage", .{ .target = target, .optimize = optimize })
     else
         null;
+
+    // One architecture under one name, the way Mirage's own build does it: `src/vmm.zig`
+    // names `mirage-arch` and never an architecture, so where the devices sit is chosen
+    // here. A target Mirage has no architecture module for cannot run a guest, so it
+    // never reaches this.
+    const mirage_arch = if (mirage) |dep| dep.module(switch (target.result.cpu.arch) {
+        .x86_64 => "mirage-x86_64",
+        else => "mirage-arm64",
+    }) else null;
 
     const vmm_module = b.createModule(.{
         .root_source_file = b.path(if (can_run_a_guest) "src/vmm.zig" else "src/vmm_absent.zig"),
@@ -1499,7 +1575,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "chock-sandbox", .module = chock_sandbox },
             .{ .name = "mirage-backend", .module = dep.module("mirage-backend") },
             .{ .name = "mirage-core", .module = dep.module("mirage-core") },
-            .{ .name = "mirage-arm64", .module = dep.module("mirage-arm64") },
+            .{ .name = "mirage-arch", .module = mirage_arch.? },
             .{ .name = "mirage-device", .module = dep.module("mirage-device") },
             .{ .name = "mirage-memory", .module = dep.module("mirage-memory") },
             .{ .name = "mirage-attest", .module = dep.module("mirage-attest") },
@@ -1563,6 +1639,38 @@ pub fn build(b: *std.Build) void {
         const run_vmm_tests = b.addRunArtifact(vmm_tests);
         run_vmm_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_vmm_tests.step);
+        // The same drift guard, for the one Mirage declaration whose **body** the
+        // VMM's syscall allow list depends on. `test/sandbox/vmm_allowlist.zig`
+        // reads `mirage-fs`'s own `Export.zig` and fails on a `std.Io` call the
+        // allow list has no row for, which is what a version bump that touches the
+        // filesystem would otherwise leave as a guest that dies with an empty
+        // console.
+        //
+        // The file arrives as an import so it can be embedded, and the embed is
+        // why this cannot live in `chock-sandbox` itself: that module is built for
+        // every target, including the ones Mirage is not built for at all.
+        const fs_export = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("test/sandbox/vmm_allowlist.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "chock-sandbox", .module = chock_sandbox }},
+            }),
+        });
+        fs_export.root_module.addAnonymousImport("mirage-fs-export", .{
+            .root_source_file = mirage.?.path("lib/mirage-fs/Export.zig"),
+        });
+        const run_fs_export = b.addRunArtifact(fs_export);
+        run_fs_export.skip_foreign_checks = true;
+        test_step.dependOn(&run_fs_export.step);
+        test_sandbox_step.dependOn(&run_fs_export.step);
+
+        // Written out rather than through `module_test_steps.add`, for the reason
+        // `test_sandbox_step` is: two runs share this step, and the helper would be
+        // the second call to create it.
+        const test_vmm_step = b.step("test-vmm", "Run the src/vmm.zig tests only");
+        test_vmm_step.dependOn(&run_vmm_tests.step);
+        test_vmm_step.dependOn(&run_fs_export.step);
     }
 
     // **Its own step, and never on `test_step`.** This is not a test that
@@ -1688,6 +1796,7 @@ pub fn build(b: *std.Build) void {
     // Same reasoning as run_sandbox_tests above.
     run_exe_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_exe_tests.step);
+    module_test_steps.add(b, "test-exe", "Run the src/ program tests only", &run_exe_tests.step);
 
     // The two streams of the **built binary**, read apart. Every test in
     // `src/tty.zig` sets the streams itself, so a `main` that never wired them
@@ -1732,6 +1841,78 @@ pub fn build(b: *std.Build) void {
     // machine has nothing it can run.
     run_cli_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_cli_tests.step);
+
+    // **The one test that boots a guest.** Everything else on the microVM path
+    // drives a piece of it: the allow list against Mirage's own exports, the
+    // grant set against the offer set, the fault text. Only this starts the
+    // binary that was just built, speaks the control protocol to it, and reads a
+    // tool result back out of a real guest. Several syscall allow list faults
+    // there were found by running a session by hand, which is exactly the class
+    // of fault a build cannot see.
+    //
+    // **Its own step, and on `test_step` as well.** `test-guest` is for a person
+    // who wants this and not the hour the whole suite takes; being on `test_step`
+    // too is what puts it in front of `nix build`, where it skips, because that
+    // sandbox has no `/dev/kvm` and nobody passes it images. A skip there is the
+    // honest answer and a failure would be a false one: see `whyNoGuest` in
+    // `test/cli/guest.zig`, which names the fact that stopped it.
+    //
+    // **The images are given, never hunted for.** They come out of
+    // `nix build .#guest-kernel .#guest-initrd`, which needs a Linux builder of
+    // the guest's own architecture, so there is no default a build script could
+    // honestly guess. Empty strings when nobody passed them, which the test
+    // reads as a reason to skip.
+    const guest_gate_options = b.addOptions();
+    guest_gate_options.addOptionPath("chock_path", exe.getEmittedBin());
+    guest_gate_options.addOption(
+        []const u8,
+        "git_path",
+        b.findProgram(&.{"git"}, &.{}) catch "",
+    );
+    // The program the one tool call runs. Named here for the reason `git_path`
+    // is: a test binary resolves a bare `argv[0]` against an `environ` it has
+    // not got, and a Nix machine has no `wc` where the fallback looks.
+    guest_gate_options.addOption(
+        []const u8,
+        "wc_path",
+        b.findProgram(&.{"wc"}, &.{}) catch "",
+    );
+    guest_gate_options.addOption(
+        []const u8,
+        "guest_kernel",
+        b.option([]const u8, "guest-kernel", "The kernel test-guest boots. From nix build .#guest-kernel.") orelse "",
+    );
+    guest_gate_options.addOption(
+        []const u8,
+        "guest_initrd",
+        b.option([]const u8, "guest-initrd", "The initrd test-guest boots. From nix build .#guest-initrd.") orelse "",
+    );
+
+    const guest_gate_tests = b.addTest(.{
+        .use_llvm = evaluator_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/cli/guest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "chock-proto", .module = chock_proto },
+                .{ .name = "guest_gate", .module = guest_gate_options.createModule() },
+            },
+        }),
+    });
+    const run_guest_gate_tests = b.addRunArtifact(guest_gate_tests);
+    // It spawns the binary that was just built, so a build for another machine
+    // has nothing it can run.
+    run_guest_gate_tests.skip_foreign_checks = true;
+    test_step.dependOn(&run_guest_gate_tests.step);
+    module_test_steps.add(
+        b,
+        "test-guest",
+        "Boot a guest through chock daemon and run one tool call in it. " ++
+            "Skips unless -Dguest-kernel= and -Dguest-initrd= name readable images " ++
+            "and this user can open /dev/kvm.",
+        &run_guest_gate_tests.step,
+    );
 
     // Every claim in the documentation that a machine can check: see
     // `test/docs/claims.zig`. It reads the pages off the disk and compares

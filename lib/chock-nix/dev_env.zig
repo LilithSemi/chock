@@ -245,6 +245,21 @@ pub const Params = struct {
     cwd: []const u8,
     /// Where `base_keys` are read from.
     host_env: *const std.process.Environ.Map,
+    /// The `TMPDIR` both shells run with, or null to leave it unset.
+    ///
+    /// **It decides where the dev environment puts its own temporary
+    /// directory.** The script `nix print-dev-env` writes ends in
+    /// `mktemp -d -t nix-shell.XXXXXX` and exports the result as `TMPDIR`,
+    /// `TMP`, `TEMP`, `TEMPDIR` and `NIX_BUILD_TOP`, and `mktemp -t` reads
+    /// `TMPDIR`. Unset, every one of those five names a directory under
+    /// `/tmp` that nothing can predict and nothing takes off again. A caller
+    /// that has to know the path beforehand names one here.
+    ///
+    /// It reaches a tool call the way every other base variable does, which
+    /// is not at all: `subtract` drops a record the bare shell already had
+    /// under the same name and value, and the sourced shell's own `TMPDIR` is
+    /// the directory below this one.
+    staging_dir: ?[]const u8 = null,
     /// Where a fault past what `Error` can say is left, and who owns what it
     /// points at. A field of the params and not a parameter, for the reason
     /// `proc.Options` gives, and a `Sink` for the reason it gives too.
@@ -262,6 +277,7 @@ pub fn read(allocator: std.mem.Allocator, io: std.Io, params: Params) Error![][]
     for (base_keys) |key| {
         if (params.host_env.get(key)) |value| try base_env.put(key, value);
     }
+    if (params.staging_dir) |dir| try base_env.put("TMPDIR", dir);
 
     // The two shells differ in one thing: whether they source the dev
     // environment first. Everything else about them, the flags, the base

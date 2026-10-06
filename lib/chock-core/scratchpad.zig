@@ -14,6 +14,7 @@
 //! <temp>/chock/<session id>/scratch/   read and write, the agent's own
 //! <temp>/chock/<session id>/tasks/     read only, the harness writes it
 //! <temp>/chock/<session id>/agents/    one subdirectory per subagent
+//! <temp>/chock/<session id>/stage/     the host's own, mounted nowhere
 //! ```
 //!
 //! Inside the sandbox the same two directories are `sandbox_dir` and
@@ -108,7 +109,8 @@
 //!
 //! **The main agent's files sit in a subdirectory of their own.** Beside the
 //! child directories is one level cheaper and lets a child identifier collide
-//! with a file the main agent wrote; `scratch/`, `tasks/` and `agents/` cannot.
+//! with a file the main agent wrote; `scratch/`, `tasks/`, `agents/` and
+//! `stage/` cannot.
 
 const std = @import("std");
 const sandbox = @import("chock-sandbox");
@@ -157,12 +159,36 @@ pub fn sandboxDirFor(host_dir: []const u8) []const u8 {
 /// names this path: see `tempAreaFor`.
 pub const tmp_sandbox_dir = "/run/chock/tmp";
 
-/// The three directories one session's scratchpad holds, relative to the
-/// session's own directory on the host. `makeLayout` builds them, and nothing
-/// else may build a path below the scratchpad from parts.
+/// The directories one session's scratchpad holds, relative to the session's own
+/// directory on the host. `makeLayout` builds them, and nothing else may build a
+/// path below the scratchpad from parts.
 pub const scratch_leaf = "scratch";
 pub const tasks_leaf = "tasks";
 pub const agents_leaf = "agents";
+
+/// Where the harness stages a file on the host that it binds into one tool call.
+///
+/// **The host side only, and the sandbox mounts none of it.** The other three
+/// appear inside the sandbox; this one is reached by the harness before any
+/// sandbox exists, and by a guest serving the bind. So a staged secret is not a
+/// file the agent can also read out of its own scratchpad.
+///
+/// It is here rather than under the user's `TMPDIR` because a guest has to be
+/// granted the directory holding a staged file, and granting the user's
+/// temporary directory grants every other process's files in it. The dev shell's
+/// own temporary directory is refused for the same reason once removed: it is
+/// per project rather than per session. See `tools.stageContent`, which writes
+/// these, and `toolStagingDir` in `src/run.zig`, which names this for a session.
+pub const stage_leaf = "stage";
+
+/// Where this session stages host files, below `dir_path`. Caller owns the
+/// result.
+pub fn stageDir(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, stage_leaf });
+}
 
 /// Which directory `TMPDIR` names for one tool call.
 ///
@@ -224,6 +250,23 @@ pub fn tempAreaFor(limits: sandbox.Sandbox.Limits) TempArea {
 /// unnamed, an agent would write its notes through `TMPDIR` and find them gone
 /// on the next call, which is the handoff the scratchpad exists for.
 pub const variable_names = [_][]const u8{ "TMPDIR", "CHOCK_SCRATCHPAD" };
+
+/// The other names a temporary directory hides behind, taken out of the
+/// environment and never written back.
+///
+/// **A dev shell exports every one of these as a host path.** `nix print-dev-env`
+/// ends in `mktemp -d -t nix-shell.XXXXXX`, and the shell that sources it exports
+/// `TMPDIR`, `TMP`, `TEMP`, `TEMPDIR` and `NIX_BUILD_TOP` all naming that one
+/// directory. `environment` answers `TMPDIR` itself, and left alone the other four
+/// reached a tool call still naming a host path the sandbox mounts nowhere, so a
+/// program that read `TEMP` instead of `TMPDIR` got `ENOENT`.
+///
+/// **Taken out rather than answered again.** `TMPDIR` is the one name Chock
+/// states, and a program left with none of these falls back to its own default
+/// inside the sandbox instead of following a path that is not there.
+/// `NIX_BUILD_TOP` is not a temporary directory at all: it names the build
+/// directory of a running `nix` build, and a tool call is not one.
+pub const dropped_variable_names = [_][]const u8{ "TMP", "TEMP", "TEMPDIR", "NIX_BUILD_TOP" };
 
 /// What `TMPDIR` names for a call whose scratchpad appears at `dir`.
 ///
@@ -363,8 +406,9 @@ fn isPlainName(name: []const u8) bool {
 }
 
 /// The environment `base` becomes for a call whose scratchpad appears at `dir`
-/// inside the sandbox: every entry of `base` that does not name one of
-/// `variable_names`, and then the two `area` decides.
+/// inside the sandbox: every entry of `base` that names neither one of
+/// `variable_names` nor one of `dropped_variable_names`, and then the two `area`
+/// decides.
 ///
 /// **Every entry of the result is owned by `allocator`**, for the reason
 /// `cache.environment` gives, and `cache.freeEnvironment` releases it.
@@ -400,11 +444,12 @@ pub fn environment(
 /// these results reaches the release beside the builder that made it.
 pub const freeEnvironment = cache.freeEnvironment;
 
-/// True when this `KEY=VALUE` entry names one of `variable_names`.
+/// True when this `KEY=VALUE` entry names one of `variable_names` or one of
+/// `dropped_variable_names`.
 fn namesAScratchVariable(entry: []const u8) bool {
     const equals = std.mem.indexOfScalar(u8, entry, '=') orelse return false;
     const key = entry[0..equals];
-    for (variable_names) |name| {
+    for (variable_names ++ dropped_variable_names) |name| {
         if (std.mem.eql(u8, key, name)) return true;
     }
     return false;
@@ -417,7 +462,7 @@ pub const LayoutError = error{
     ScratchpadDirectoryUnwritable,
 };
 
-/// Build `dir_path` and the three directories inside it.
+/// Build `dir_path` and the directories inside it.
 ///
 /// **One owner of the layout.** `src/session.zig` decides where a session's
 /// scratchpad lives, and this decides what is in it, so a directory the
@@ -426,7 +471,7 @@ pub const LayoutError = error{
 /// whole file exists to end.
 pub fn makeLayout(io: std.Io, dir_path: []const u8, diag: ?Sink) LayoutError!void {
     try makeDirAll(io, dir_path, diag);
-    inline for (.{ scratch_leaf, tasks_leaf, agents_leaf }) |leaf| {
+    inline for (.{ scratch_leaf, tasks_leaf, agents_leaf, stage_leaf }) |leaf| {
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ dir_path, leaf }) catch
             return error.ScratchpadDirectoryUnwritable;
@@ -707,6 +752,33 @@ test "a TMPDIR the dev shell states is replaced and never left beside Chock's ow
     }
 }
 
+test "the other four names a dev shell exports for a temporary directory reach no tool call" {
+    // A dev shell's own `mktemp -d` answer is exported five times over, and only
+    // `TMPDIR` has an answer of Chock's. The other four named a host path nothing
+    // mounts, so a program that read one of them got `ENOENT` inside a sandbox
+    // that had a perfectly good temporary directory.
+    const allocator = testing.allocator;
+
+    const base = [_][]const u8{
+        "TMP=/tmp/nix-shell.qHnEsN",
+        "TEMP=/tmp/nix-shell.qHnEsN",
+        "TEMPDIR=/tmp/nix-shell.qHnEsN",
+        "NIX_BUILD_TOP=/tmp/nix-shell.qHnEsN",
+        "KEEP=me",
+    };
+    const built = try environment(allocator, &base, .capped, sandbox_dir);
+    defer freeEnvironment(allocator, built);
+
+    for (built) |entry| {
+        const equals = std.mem.indexOfScalar(u8, entry, '=').?;
+        for (dropped_variable_names) |name| {
+            try testing.expect(!std.mem.eql(u8, entry[0..equals], name));
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), built.len);
+    try testing.expectEqualStrings("KEEP=me", built[0]);
+}
+
 test "the scratchpad and the task directory are siblings, both inside Chock's own runtime prefix" {
     // The rule this whole split rests on: the scratchpad is agent writable by
     // definition, so a `tasks` directory inside it would be writable whatever
@@ -763,7 +835,7 @@ test "a child identifier that is not a plain name never reaches a path" {
     try testing.expect(!std.mem.eql(u8, main, agents_leaf));
 }
 
-test "the layout holds the directory the environment names, and the two beside it" {
+test "the layout holds the directory the environment names, and the three beside it" {
     // A `make` given a `TMPDIR` that does not exist fails the same way as one
     // given the dev shell's, which is the fault this file exists to end.
     const allocator = testing.allocator;
@@ -779,11 +851,17 @@ test "the layout holds the directory the environment names, and the two beside i
     try makeLayout(testing.io, session_dir, null);
     try testing.expect(exists(testing.io, session_dir));
 
-    inline for (.{ scratch_leaf, tasks_leaf, agents_leaf }) |leaf| {
+    inline for (.{ scratch_leaf, tasks_leaf, agents_leaf, stage_leaf }) |leaf| {
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ session_dir, leaf });
         defer allocator.free(path);
         try testing.expect(exists(testing.io, path));
     }
+
+    // The staging directory is named by `stageDir` and built here, so a caller
+    // cannot name one the layout does not make.
+    const staging = try stageDir(allocator, session_dir);
+    defer allocator.free(staging);
+    try testing.expect(exists(testing.io, staging));
 
     // Called a second time on a directory that already exists, because a
     // session that resumes calls it exactly that way.

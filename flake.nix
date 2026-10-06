@@ -87,6 +87,11 @@
           # closure without a Linux builder. Offering them there had a macOS runner
           # try and fail on exactly that.
           #
+          # **And on a machine of the guest's own architecture.** `guestPkgs` is this
+          # system's own, so `packages.x86_64-linux.guest-kernel` is a derivation for
+          # x86_64: an aarch64 machine needs an x86_64 remote builder, or the x86 CI
+          # runner, to produce it. See `docs/security/microvm.md`.
+          #
           # A Mac takes the images from a release, or from a Linux builder it is
           # configured with. See `docs/security/microvm.md`.
           onLinux = lib.hasSuffix "-linux" system;

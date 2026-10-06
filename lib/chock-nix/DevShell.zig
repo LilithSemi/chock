@@ -116,6 +116,10 @@ pub const Options = struct {
     /// Called once, before a slow evaluation starts, and never on a cache
     /// hit.
     on_evaluate: ?*const fn (project_root: []const u8) void = null,
+    /// The `TMPDIR` the evaluation runs with, which is where the dev
+    /// environment makes its own temporary directory. **It must already
+    /// exist.** See `dev_env.Params.staging_dir`.
+    staging_dir: ?[]const u8 = null,
     /// Where a fault past what `Error` can say is left, **and where the
     /// notices go**: a toolchain that could not be rooted, a cache that could
     /// not be written, and store paths left out of the mount set all leave a
@@ -144,7 +148,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
     // is what this sink exists to state.
     const sink = diagnostic.sinkOf(gpa, options.diag);
 
-    const stamp = try stampOf(gpa, io, options.project_root, options.shell_name);
+    const stamp = try stampOf(gpa, io, options.project_root, options.shell_name, options.staging_dir);
 
     const arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
@@ -189,6 +193,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
         .script_path = script_path,
         .cwd = options.project_root,
         .host_env = options.host_env,
+        .staging_dir = options.staging_dir,
     });
 
     const roots = try store.pathsIn(allocator, io, variables);
@@ -209,12 +214,77 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: Options) Error!?DevShel
         diagnostic.noteNamed(sink, .cache_not_written, options.cache_dir, err) catch {};
     };
 
+    removeOldStaging(allocator, io, options.staging_dir, variables);
+
     return .{
         .arena = arena,
         .variables = variables,
         .store_paths = store_paths,
         .evaluated = true,
     };
+}
+
+/// Take off the temporary directories earlier evaluations of this project left
+/// in the staging directory, keeping the one this evaluation named.
+///
+/// **Nothing else ever removes them.** A dev environment ends in `mktemp -d -t
+/// nix-shell.XXXXXX`, so each evaluation makes one, and they used to land in
+/// `/tmp` and go at a reboot. They now sit in the state directory, which nothing
+/// empties, so they are taken off where they are made. Best effort, like the
+/// roots below: one that will not come off costs disk and breaks nothing.
+///
+/// The one the new environment names is kept, because the cached environment
+/// every later session reads back is the thing that names it.
+///
+/// **It takes off a directory another session may still name.** That session read
+/// its own name from the cache and is not re-evaluating, so only a re-evaluation
+/// under a running older session meets it, and what goes is scratch space a tool
+/// call cannot reach anyway.
+fn removeOldStaging(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    staging_dir: ?[]const u8,
+    variables: []const []const u8,
+) void {
+    const where = staging_dir orelse return;
+    const keep = std.fs.path.basename(valueOf(variables, "NIX_BUILD_TOP") orelse return);
+
+    var dir = std.Io.Dir.openDirAbsolute(io, where, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, staging_prefix)) continue;
+        if (std.mem.eql(u8, entry.name, keep)) continue;
+        const copy = allocator.dupe(u8, entry.name) catch return;
+        names.append(allocator, copy) catch {
+            allocator.free(copy);
+            return;
+        };
+    }
+
+    // Removed after the walk, never during it, for the reason `removeOldRoots`
+    // gives.
+    for (names.items) |name| dir.deleteTree(io, name) catch continue;
+}
+
+/// What `mktemp -d -t nix-shell.XXXXXX` calls what it makes.
+const staging_prefix = "nix-shell.";
+
+/// The value of one `KEY=VALUE` record, or null when the set holds no such key.
+fn valueOf(variables: []const []const u8, key: []const u8) ?[]const u8 {
+    for (variables) |record| {
+        const split = std.mem.indexOfScalar(u8, record, '=') orelse continue;
+        if (!std.mem.eql(u8, record[0..split], key)) continue;
+        return record[split + 1 ..];
+    }
+    return null;
 }
 
 /// Make the garbage collector roots, replacing whatever an earlier
@@ -285,7 +355,12 @@ const paths_name = "store-paths";
 
 const stamp_hex_length = 2 * std.crypto.hash.sha2.Sha256.digest_length;
 
-fn hasFlake(io: std.Io, project_root: []const u8) Error!bool {
+/// Whether this project has a `flake.nix` at all.
+///
+/// **Public because `chock daemon` asks the same question.** A guest's grant
+/// holds the staging directory of a dev shell, and a project with no flake
+/// stages nothing there, so the two ask it through one function.
+pub fn hasFlake(io: std.Io, project_root: []const u8) Error!bool {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&buffer, "{s}/flake.nix", .{project_root}) catch return false;
     _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
@@ -299,17 +374,25 @@ fn stampOf(
     io: std.Io,
     project_root: []const u8,
     shell_name: ?[]const u8,
+    staging_dir: ?[]const u8,
 ) Error![stamp_hex_length]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     // A version of this file's own format. A stamp written by an older
     // Chock, whose cache holds fields this one does not read, must not
     // read as current.
-    hash.update("chock dev shell 2\n");
+    hash.update("chock dev shell 3\n");
 
     // The attribute belongs in the stamp. Two names over one flake are two
     // different environments, and without this the second one reads the
     // first one's cache.
     hash.update(shell_name orelse "");
+    hash.update("\n");
+
+    // **So does the staging directory.** It is what the evaluation's own
+    // `TMPDIR` is set to, and the environment it answers names a directory
+    // under it, so a cache written with a different one hands a session five
+    // variables naming a directory that is gone. See `Options.staging_dir`.
+    hash.update(staging_dir orelse "");
     hash.update("\n");
 
     for ([_][]const u8{ "flake.nix", "flake.lock" }) |name| {
@@ -569,10 +652,10 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: {}; }\n");
     }
-    const first = try stampOf(allocator, std.testing.io, dir_path, null);
+    const first = try stampOf(allocator, std.testing.io, dir_path, null, null);
 
     // The same tree hashes the same, or a cache would never hit at all.
-    const again = try stampOf(allocator, std.testing.io, dir_path, null);
+    const again = try stampOf(allocator, std.testing.io, dir_path, null, null);
     try std.testing.expectEqualStrings(&first, &again);
 
     // A lock file that appears is a different dev shell: it pins different
@@ -582,7 +665,7 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ \"nodes\": {} }\n");
     }
-    const with_lock = try stampOf(allocator, std.testing.io, dir_path, null);
+    const with_lock = try stampOf(allocator, std.testing.io, dir_path, null, null);
     try std.testing.expect(!std.mem.eql(u8, &first, &with_lock));
 
     {
@@ -590,7 +673,7 @@ test "the stamp follows both flake files" {
         defer file.close(std.testing.io);
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: { changed = true; }; }\n");
     }
-    const changed = try stampOf(allocator, std.testing.io, dir_path, null);
+    const changed = try stampOf(allocator, std.testing.io, dir_path, null, null);
     try std.testing.expect(!std.mem.eql(u8, &with_lock, &changed));
 }
 
@@ -610,15 +693,21 @@ test "the dev shell name is part of the stamp, so two names never share a cache"
         try file.writeStreamingAll(std.testing.io, "{ outputs = _: {}; }\n");
     }
 
-    const unnamed = try stampOf(allocator, std.testing.io, dir_path, null);
-    const named = try stampOf(allocator, std.testing.io, dir_path, "ci");
-    const other = try stampOf(allocator, std.testing.io, dir_path, "release");
+    const unnamed = try stampOf(allocator, std.testing.io, dir_path, null, null);
+    const named = try stampOf(allocator, std.testing.io, dir_path, "ci", null);
+    const other = try stampOf(allocator, std.testing.io, dir_path, "release", null);
 
     try std.testing.expect(!std.mem.eql(u8, &unnamed, &named));
     try std.testing.expect(!std.mem.eql(u8, &named, &other));
 
-    const again = try stampOf(allocator, std.testing.io, dir_path, "ci");
+    const again = try stampOf(allocator, std.testing.io, dir_path, "ci", null);
     try std.testing.expectEqualStrings(&named, &again);
+
+    // The staging directory is an input to the evaluation, so it is an input to
+    // the stamp. A cache read back under a different one would hand a session
+    // variables naming a directory another one owns.
+    const staged = try stampOf(allocator, std.testing.io, dir_path, "ci", "/var/chock/tmp");
+    try std.testing.expect(!std.mem.eql(u8, &named, &staged));
 }
 
 test "a cache is read back whole, and a stamp that does not match is not read at all" {
@@ -685,4 +774,47 @@ test "a cache whose paths are gone is not used" {
         @as(?Cached, null),
         try readCache(arena, std.testing.io, dir_path, &stamp),
     );
+}
+
+test "an evaluation takes off the staging directories the ones before it left" {
+    const allocator = std.testing.allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &buffer);
+    const staging = buffer[0..len];
+
+    try tmp.dir.createDirPath(io, "nix-shell.old111");
+    try tmp.dir.createDirPath(io, "nix-shell.old222/inside");
+    try tmp.dir.createDirPath(io, "nix-shell.new333");
+    // Nothing an evaluation made, so nothing this takes off.
+    try tmp.dir.createDirPath(io, "stamp.d");
+
+    const kept = try std.fs.path.join(arena, &.{ staging, "nix-shell.new333" });
+    const variables = [_][]const u8{
+        try std.fmt.allocPrint(arena, "NIX_BUILD_TOP={s}", .{kept}),
+        "PATH=/usr/bin",
+    };
+
+    removeOldStaging(allocator, io, staging, &variables);
+
+    try std.testing.expect(exists(io, kept));
+    try std.testing.expect(exists(io, try std.fs.path.join(arena, &.{ staging, "stamp.d" })));
+    for ([_][]const u8{ "nix-shell.old111", "nix-shell.old222" }) |gone| {
+        try std.testing.expect(!exists(io, try std.fs.path.join(arena, &.{ staging, gone })));
+    }
+}
+
+fn exists(io: std.Io, path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }

@@ -266,6 +266,60 @@ pub fn createDevShellDir(io: std.Io, path: []const u8) CreateError!void {
     try makeDirAll(io, path);
 }
 
+/// Where a dev shell evaluation makes its own temporary directory:
+/// `<state dir>/dev-shell/<project key>/tmp`. Caller owns the result.
+///
+/// **A path Chock names, because `nix` names one nothing can predict.** A dev
+/// environment ends in `mktemp -d -t nix-shell.XXXXXX`, so left alone each
+/// evaluation leaves a `/tmp/nix-shell.uZTT5l` that nothing can find again and
+/// nothing takes off. Giving the evaluation a `TMPDIR` of Chock's own puts
+/// whatever it makes under one root that `DevShell.removeOldStaging` can sweep.
+///
+/// **No guest is granted this, and a tool call stages nowhere near it.** Staging
+/// goes in the session scratchpad instead: see `toolStagingDir` in
+/// `src/run.zig`. The evaluation runs on the host before any guest exists, and
+/// the five temporary variables it exports reach a tool call as host paths the
+/// sandbox binds nowhere.
+///
+/// **Beside the cache and never under the session, and the cost of getting that
+/// wrong is an evaluation.** `DevShell.stampOf` hashes this path, so a directory
+/// named after the session would change the stamp every session and buy a full
+/// `nix print-dev-env` with it, which is the slowest thing a session starts. The
+/// evaluation is also read back by every later session, so a path named after
+/// one session is a path the next ones stage their files in.
+pub fn devShellStagingDir(
+    gpa: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    project_root: []const u8,
+) Error![]u8 {
+    const dir = try devShellDir(gpa, env, project_root);
+    defer gpa.free(dir);
+
+    return std.fs.path.join(gpa, &.{ dir, staging_leaf });
+}
+
+/// The name of the staging directory inside the dev shell directory.
+pub const staging_leaf = "tmp";
+
+pub fn createDevShellStagingDir(io: std.Io, path: []const u8) CreateError!void {
+    try makeDirAll(io, path);
+}
+
+/// Make `path` and every directory above it that is missing. For a caller that
+/// holds a path one of the helpers above built and needs it to be there.
+pub fn createDirAll(io: std.Io, path: []const u8) CreateError!void {
+    try makeDirAll(io, path);
+}
+
+/// The directory holding every container image tree: `<state dir>/images`.
+/// Caller owns the result. See `imageDir` for one image's own.
+pub fn imagesDir(gpa: std.mem.Allocator, env: *const std.process.Environ.Map) Error![]u8 {
+    const state = try chock_auth.paths.stateDir(gpa, env);
+    defer gpa.free(state);
+
+    return std.fs.path.join(gpa, &.{ state, "images" });
+}
+
 /// Where the tree of one container image is kept:
 /// `<state dir>/images/<image directory name>`. Caller owns the result.
 ///

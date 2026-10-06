@@ -25,8 +25,8 @@
             .hash = "dbus-0.1.0-8F4MwHAvBACyrhHqEeT4UwRn9cHvu5N3mwS7e_hqDyGF",
         },
         .mirage = .{
-            .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#529d61e0790fb908a9dddd8d70a722c5eec68506",
-            .hash = "mirage-0.16.0-ORLT6FDOEQBszWkCukNRagv63o_urldXHFcj6jNP0HSw",
+            .url = "git+https://git.lilithsemi.com/LilithSemi/mirage#9f75a9289568c9459f44f359087b510c7a3314db",
+            .hash = "mirage-0.16.0-ORLT6MdKFgBv8RJ4XMtOOfvN9UujgbfihLWni0UIQSxd",
         },
     },
     .paths = .{
