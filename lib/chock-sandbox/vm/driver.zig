@@ -71,8 +71,9 @@ pub const expresses: iface.Expresses = .{
 /// one request at a time, so two tool calls writing at once would interleave two
 /// requests into one line. A background task therefore waits for a foreground call
 /// here where it would have run beside it under the native driver. That is a real
-/// difference and not a detail: a guest that answered several at once would need a
-/// stream each, which `Client.channel` can give and this does not yet ask for.
+/// difference and not a detail. Answering several at once is a change at both
+/// ends: the host would ask for a stream for each call, and `chock guest` dials
+/// exactly one and serves it in order, so it would have to serve several.
 pub const Guest = struct {
     /// The stream `chock guest` opened. Read and written in order, one request
     /// and one answer a call.

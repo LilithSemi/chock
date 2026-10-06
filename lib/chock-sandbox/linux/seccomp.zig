@@ -836,6 +836,213 @@ pub fn buildRouter(allocator: std.mem.Allocator) ![]bpf.Insn {
     return buildAllowlist(allocator, router_calls);
 }
 
+/// Every call the VMM may make once its machine is built, and the only ones it
+/// may make.
+///
+/// **An allowlist, because the VMM answers bytes the guest wrote.** Mirage's
+/// device models and `Export.answer` parse ring descriptors and filesystem
+/// requests from inside the guest, and one of them ended the host process
+/// through an assert on 2026-10-04. So what this process may do is written
+/// down completely.
+///
+/// **No call that opens a socket, runs a program or changes a namespace.**
+/// `/dev/kvm`, the guest's memory, the session socket and the console are all
+/// descriptors the process holds before the filter goes on, and a connected
+/// descriptor for the network arrives over `SCM_RIGHTS`. So the VMM never has
+/// a caller for `socket`, `connect`, `execve` or `unshare`.
+///
+/// The filesystem half is wide because this process is a filesystem server.
+/// Landlock is what bounds it: see `lib/chock-sandbox/vm/confine.zig`.
+pub const vmm_calls = blk: {
+    var list: []const linux.SYS = &.{
+        // KVM, and every virtio device model.
+        .ioctl,
+        // The session socket, and the connected descriptor handed over it.
+        .accept4,
+        .recvmsg,
+        .sendmsg,
+        // **A pair and never a socket.** Every stream the session hands out is one
+        // end of a `socketpair`, made when the harness asks for a port, so a filter
+        // without this kills the guest as its first tool call is reached for. It is
+        // not a way out: a pair has no name and no address, both ends start inside
+        // this process, and `socket`, `connect` and `bind` stay refused, so it
+        // reaches nothing the `sendmsg` above does not already reach.
+        .socketpair,
+        .read,
+        .write,
+        .ppoll,
+        .close,
+        .fcntl,
+        .shutdown,
+        // What virtiofs answers a guest's filesystem request with, plus the
+        // console. `fs_callers` below names the caller behind each one, and
+        // `test/sandbox/vmm_allowlist.zig` reads `Export`'s own source, so a
+        // caller that appears there with no row fails a test.
+        .openat,
+        // **The vectored pair and not the scalar one.** `std.Io.Threaded` reaches
+        // the scalar `pread` and `pwrite` from one place, the read and the
+        // write-back of a `File.MemoryMap`, and nothing in this process maps a
+        // file. The guest's own console is a positional write too, so a filter
+        // without these kills the process on its first flush and leaves the
+        // console that would have said why empty.
+        .preadv,
+        .pwritev,
+        // **The streaming pair, for a console that is not a file.** `File.Writer`
+        // starts positional and falls back to `writev` on `error.Unseekable`, which
+        // is what a pipe or a terminal answers a `pwritev` with. A session's own
+        // guest writes to a file and never reaches it; the daemon's console is
+        // whatever it was started with, so a filter without these would kill a
+        // guest the moment the daemon's output was piped.
+        .readv,
+        .writev,
+        .statx,
+        .getdents64,
+        .mkdirat,
+        .unlinkat,
+        // `renameat` and not `renameat2`: `std.Io.Dir.renameAbsolute` issues the
+        // plain call, and only `renamePreserve` asks for the flags one.
+        .renameat,
+        .symlinkat,
+        .linkat,
+        .readlinkat,
+        .ftruncate,
+        .utimensat,
+        // A guest's own `chmod` on a writable share, through `setPermissions`.
+        .fchmod,
+        .lseek,
+        // The vCPU threads and the ticker that interrupts one of them.
+        .clone,
+        // A thread spawn with no libc: `mprotect`s the new stack, guard page
+        // excepted, and `sigaltstack` sets up its alternate signal stack.
+        .mprotect,
+        .sigaltstack,
+        .futex,
+        .tgkill,
+        .gettid,
+        .getpid,
+        .rt_sigaction,
+        .rt_sigprocmask,
+        .rt_sigreturn,
+        .restart_syscall,
+        // The allocator, and the guest's own memory.
+        .mmap,
+        .munmap,
+        .madvise,
+        .brk,
+        .mremap,
+        // The deadline and the tick.
+        .clock_gettime,
+        .clock_nanosleep,
+        .nanosleep,
+        .exit_group,
+        .exit,
+    };
+    // `poll` exists on x86_64 and not on aarch64, the same case `router_calls`
+    // names. A member the table does not have would not build.
+    if (@hasField(linux.SYS, "poll")) list = list ++ &[_]linux.SYS{.poll};
+    break :blk list;
+};
+
+comptime {
+    // **A built machine has no caller for any of these.** One added to the list
+    // above without reading this comment stops the build, because each is a way
+    // out from under the Landlock grant or a way to start something new.
+    for (vmm_calls) |call| {
+        const refused = switch (call) {
+            .socket,
+            .connect,
+            .bind,
+            .listen,
+            .execve,
+            .execveat,
+            .ptrace,
+            .process_vm_readv,
+            .process_vm_writev,
+            .io_uring_setup,
+            .io_uring_enter,
+            .io_uring_register,
+            .bpf,
+            .keyctl,
+            .add_key,
+            .mount,
+            .umount2,
+            .pivot_root,
+            .init_module,
+            .finit_module,
+            .userfaultfd,
+            .perf_event_open,
+            .kexec_load,
+            .setuid,
+            .setgid,
+            .capset,
+            .unshare,
+            .setns,
+            .name_to_handle_at,
+            .open_by_handle_at,
+            => true,
+            else => false,
+        };
+        if (refused) @compileError(
+            "the VMM may not open a socket, start a program, change a namespace " ++
+                "or resolve a file without naming it. See vmm_calls.",
+        );
+    }
+}
+
+/// One `std.Io` call a guest's filesystem server makes, and what the kernel sees
+/// when it does.
+pub const FilesystemCaller = struct {
+    /// The call's own names, spelled as `mirage-fs`'s `Export` spells them.
+    names: []const []const u8,
+    /// What it reaches, or null for a caller `Export` makes only in its own
+    /// tests. A null row grants nothing and exists so that such a caller is
+    /// accounted for rather than unnoticed.
+    call: ?linux.SYS,
+    /// Why, where the name alone does not say it.
+    note: []const u8 = "",
+};
+
+/// **One row per `std.Io` call `mirage-fs`'s `Export` makes**, named by the
+/// caller and not by the syscall, because an earlier version of this listed a set
+/// somebody assumed and stayed green through two dead-guest bugs.
+///
+/// Public because `test/sandbox/vmm_allowlist.zig` reads `Export`'s own source
+/// out of the dependency and fails on a caller with no row here. That is what
+/// keeps the two in step across a version bump, which a list written by hand
+/// cannot do.
+pub const fs_callers = [_]FilesystemCaller{
+    .{ .names = &.{ "openFileAbsolute", "openDirAbsolute", "createFileAbsolute" }, .call = .openat },
+    .{ .names = &.{"readPositionalAll"}, .call = .preadv },
+    .{ .names = &.{"writePositionalAll"}, .call = .pwritev },
+    .{ .names = &.{"statFile"}, .call = .statx, .note = "and a file's own length" },
+    .{ .names = &.{"next"}, .call = .getdents64, .note = "a directory walk" },
+    .{ .names = &.{"next"}, .call = .lseek, .note = "a walk rewinding a directory" },
+    .{ .names = &.{"createDirAbsolute"}, .call = .mkdirat },
+    .{ .names = &.{ "deleteFile", "deleteDirAbsolute" }, .call = .unlinkat },
+    .{ .names = &.{"renameAbsolute"}, .call = .renameat },
+    .{ .names = &.{"symLink"}, .call = .symlinkat },
+    .{ .names = &.{"hardLink"}, .call = .linkat },
+    .{ .names = &.{"readLink"}, .call = .readlinkat },
+    .{ .names = &.{"setLength"}, .call = .ftruncate },
+    .{ .names = &.{"setTimestamps"}, .call = .utimensat },
+    .{ .names = &.{"setPermissions"}, .call = .fchmod },
+    .{ .names = &.{"close"}, .call = .close },
+    .{
+        .names = &.{"deleteTree"},
+        .call = null,
+        .note = "`Export`'s own test harness takes its directory down with this. " ++
+            "A served filesystem has no caller for it, so it earns no grant.",
+    },
+};
+
+/// The filter the VMM runs under. **An allowlist**: every call not in
+/// `vmm_calls` kills the process.
+///
+/// The caller owns the memory.
+pub fn buildVmm(allocator: std.mem.Allocator) ![]bpf.Insn {
+    return buildAllowlist(allocator, vmm_calls);
+}
+
 /// Every call the device helper may make, and the only ones it may make.
 ///
 /// **An allowlist, and the same shape `router_calls` has, for the same
@@ -2271,4 +2478,103 @@ test "the device helper may not open a path or make a new channel" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "the VMM allow list holds every call a guest's filesystem answers with" {
+    // The rows are `fs_callers`, and `test/sandbox/vmm_allowlist.zig` is what
+    // holds them against `Export`'s own source. This test is the other half: that
+    // every call a row names is one the filter permits. It runs on every target,
+    // including one no guest boots on, which the derivation cannot.
+    const allocator = std.testing.allocator;
+    var wrong: std.ArrayList(u8) = .empty;
+    defer wrong.deinit(allocator);
+
+    for (fs_callers) |each| {
+        const call = each.call orelse continue;
+        var found = false;
+        for (vmm_calls) |permitted| {
+            if (permitted == call) found = true;
+        }
+        if (!found) try wrong.print(
+            allocator,
+            "`Export` reaches {t} through {s}, and the VMM allow list does not hold it\n",
+            .{ call, each.names[0] },
+        );
+    }
+
+    // **The scalar and flag-taking twins stay out.** `std.Io` reaches the scalar
+    // `pread` and `pwrite` only from a `File.MemoryMap`, which nothing in this
+    // process makes, and `renameat2` only through `renamePreserve`, which `Export`
+    // never calls. An entry nothing reaches is a grant nothing justifies.
+    for ([_]linux.SYS{ .pread64, .pwrite64, .renameat2 }) |call| {
+        for (vmm_calls) |permitted| {
+            if (permitted == call) try wrong.print(allocator, "the VMM allow list holds {t}, which nothing reaches\n", .{call});
+        }
+    }
+
+    try std.testing.expectEqualStrings("", wrong.items);
+}
+
+test "the VMM allow list holds the hypervisor and the channels it was handed" {
+    // `ioctl` is every `KVM_RUN` and every virtio device model, so a list without
+    // it is a guest that never starts.
+    //
+    // Then two more sets. The descriptors the fork handed over, which are the
+    // session socket, the control channel, and the pair a tool call's stream is
+    // one end of. And the vCPU threads: `clone` starts one, `sigaltstack` gives it
+    // an alternate signal stack, `futex` is how the threads wait on each other,
+    // `tgkill` is the tick that interrupts a blocked hypervisor call, and `mmap`
+    // is both the allocator and the guest's own memory.
+    const allocator = std.testing.allocator;
+    var missing: std.ArrayList(u8) = .empty;
+    defer missing.deinit(allocator);
+
+    for ([_]linux.SYS{
+        .ioctl, .accept4,     .recvmsg, .sendmsg, .socketpair,
+        .fcntl, .read,        .write,   .ppoll,   .shutdown,
+        .clone, .sigaltstack, .futex,   .tgkill,  .mmap,
+    }) |call| {
+        var found = false;
+        for (vmm_calls) |permitted| {
+            if (permitted == call) found = true;
+        }
+        if (!found) try missing.print(allocator, "the VMM allow list does not hold {t}\n", .{call});
+    }
+
+    try std.testing.expectEqualStrings("", missing.items);
+}
+
+test "the VMM allow list holds the streaming pair a console that is not a file needs" {
+    // **Present on purpose, and nothing reaches them in a session today.** A
+    // forked guest's console is a seekable file, so `File.Writer` stays on the
+    // positional path and never falls back. The daemon's console is whatever it
+    // was started with, and a pipe answers `pwritev` with `error.Unseekable`,
+    // which is what sends the writer to `writev`. This test is here so a sweep
+    // that removes an entry nothing reaches does not take these two with it and
+    // break a piped daemon.
+    const allocator = std.testing.allocator;
+    var missing: std.ArrayList(u8) = .empty;
+    defer missing.deinit(allocator);
+
+    for ([_]linux.SYS{ .readv, .writev }) |call| {
+        var found = false;
+        for (vmm_calls) |permitted| {
+            if (permitted == call) found = true;
+        }
+        if (!found) try missing.print(
+            allocator,
+            "the VMM allow list does not hold {t}, so a console that is a pipe kills the guest\n",
+            .{call},
+        );
+    }
+
+    try std.testing.expectEqualStrings("", missing.items);
+}
+
+test "the VMM filter is an allowlist that ends in a kill" {
+    const insns = try buildVmm(std.testing.allocator);
+    defer std.testing.allocator.free(insns);
+
+    try std.testing.expect(insns.len > vmm_calls.len);
+    try std.testing.expectEqual(RET_KILL_PROCESS, insns[insns.len - 1].k);
 }

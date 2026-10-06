@@ -1450,7 +1450,14 @@ fn pinBindSource(source: [*:0]const u8, diag: ?*?Diagnostic) MountError!PinnedSo
             notePath(diag, .mount_source_open, err, source);
             return error.SourceMissing;
         },
-        .PERM, .ACCES => return error.NotPermitted,
+        // The path is kept here for the reason it is kept above. A guest serves
+        // its shares over virtiofs, and a directory outside the host side's own
+        // grant answers `EACCES` here: without the path, that reached a tool call
+        // as `NotPermitted` and named nothing at all.
+        .PERM, .ACCES => |err| {
+            notePath(diag, .mount_source_open, err, source);
+            return error.NotPermitted;
+        },
         else => |err| {
             note(diag, .mount_source_open, err);
             return error.Unexpected;

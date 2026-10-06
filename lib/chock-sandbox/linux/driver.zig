@@ -17,6 +17,7 @@ const netbroker = @import("netbroker.zig");
 const routerlink = @import("routerlink.zig");
 const router = @import("router.zig");
 const devicelink = @import("devicelink.zig");
+const afterfork = @import("afterfork.zig");
 const netns = @import("netns.zig");
 const nftables = @import("nftables.zig");
 const iface = @import("../Sandbox.zig");
@@ -2702,27 +2703,13 @@ fn runReader(
 }
 
 /// Before the filter goes on, because `close_range` is not on the reader's
-/// allowlist.
+/// allowlist. The close itself has one spelling, in `afterfork.zig`, which
+/// `src/vmm.zig`'s own forked guest uses too.
 fn keepOnlyDescriptors(first: i32, second: i32) void {
     keepOnlyTheseDescriptors(&.{ first, second });
 }
 
-fn keepOnlyTheseDescriptors(keep: []const i32) void {
-    std.debug.assert(keep.len > 0 and keep.len <= 8);
-    var sorted: [8]i32 = undefined;
-    @memcpy(sorted[0..keep.len], keep);
-    const held = sorted[0..keep.len];
-    std.mem.sort(i32, held, {}, std.sort.asc(i32));
-
-    const all: u32 = std.math.maxInt(u32);
-    if (held[0] > 0) _ = linux.syscall3(.close_range, 0, @intCast(held[0] - 1), 0);
-    for (held[1..], held[0 .. held.len - 1]) |high, low| {
-        if (high > low + 1) {
-            _ = linux.syscall3(.close_range, @intCast(low + 1), @intCast(high - 1), 0);
-        }
-    }
-    _ = linux.syscall3(.close_range, @intCast(held[held.len - 1] + 1), all, 0);
-}
+const keepOnlyTheseDescriptors = afterfork.keepOnlyDescriptors;
 
 /// What A holds while it waits for B: an empty Landlock ruleset and the same
 /// seccomp filter B runs under. Best effort and never fatal, because killing A
@@ -2828,33 +2815,9 @@ pub fn joinFreshSessionKeyring(stderr_fd: i32) error{JoinFailed}!void {
     }
 }
 
-const last_reset_signal: u32 = 31;
-
-/// Put every signal back to its default action with an empty mask. A child of
-/// `fork` keeps the caller's own handlers: `chock run`'s `SIGTERM` handler was
-/// inherited here, so the signal a deadline sent to cancel a call was caught,
-/// this process did not die, and the timeout cancelled nothing. A blocked
-/// signal defeats the same cancellation as a caught one.
-fn resetSignalState() void {
-    // **Every type here is `linux`'s, because every call here is.** `std.posix`
-    // carries the POSIX shapes and the raw calls below carry the kernel's, and the
-    // two differ: a `sigset_t` is one word to the kernel and sixteen to POSIX, so
-    // a mask built by one and passed to the other is the wrong size.
-    const to_default = linux.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.mem.zeroes(linux.sigset_t),
-        .flags = 0,
-    };
-    var number: u32 = 1;
-    while (number <= last_reset_signal) : (number += 1) {
-        const sig: std.posix.SIG = @enumFromInt(number);
-        if (sig == .KILL or sig == .STOP) continue;
-        _ = linux.sigaction(sig, &to_default, null);
-    }
-
-    const empty = std.mem.zeroes(linux.sigset_t);
-    _ = linux.sigprocmask(std.posix.SIG.SETMASK, &empty, null);
-}
+/// See `afterfork.resetSignalState`. A fault this one found is written down
+/// there: `chock run`'s own `SIGTERM` handler was inherited here.
+const resetSignalState = afterfork.resetSignalState;
 
 /// Put this process, and everything it goes on to make, in a process group of
 /// its own. A process group is not isolated by a PID namespace: `kill(0, sig)`

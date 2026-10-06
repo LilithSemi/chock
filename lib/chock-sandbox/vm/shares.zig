@@ -146,6 +146,13 @@ pub const Error = std.mem.Allocator.Error || error{
 
 /// The most a guest takes. `mirage-fs.Export`'s own bound, and a set past it is
 /// refused here rather than by a guest that has already booted.
+///
+/// **A session does not have all of them.** A guest a daemon started is offered
+/// the roots of its own grant before the session says anything, up to sixteen of
+/// these, and a session's offer of the same directory replaces one of those
+/// rather than taking another. So this bound is the whole budget and the check
+/// below is of one spender. The other spender names the number it took when a
+/// guest runs out: see `offerShare` in `src/vmm.zig`.
 pub const max_offers: usize = 32;
 
 /// The name the store folds into. Every path under `store_root` is read only, so
@@ -261,7 +268,7 @@ fn offer(
 /// A name for a directory that no other offer has taken. The basename where it
 /// reads as one, so a rewritten path in a mount error still says where it came
 /// from, and a number after it when two directories share a basename.
-fn nameFor(
+pub fn nameFor(
     allocator: std.mem.Allocator,
     taken: []const Share,
     directory: []const u8,
@@ -365,7 +372,7 @@ fn place(
 
 /// Whether `path` is `root` itself or something under it. A prefix alone is not
 /// enough: `/worktree` starts with `/work` and is not in it.
-fn underneath(path: []const u8, root: []const u8) bool {
+pub fn underneath(path: []const u8, root: []const u8) bool {
     if (root.len == 0) return false;
     if (!std.mem.startsWith(u8, path, root)) return false;
     if (path.len == root.len) return true;

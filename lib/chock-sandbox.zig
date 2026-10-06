@@ -28,6 +28,9 @@
 //! undivided Sandbox.zig once did, which is exactly the false negative
 //! `tools/lint_linux_only.zig` exists to catch on the files that do carry
 //! real Linux syscalls behind a portable looking name.
+
+const builtin = @import("builtin");
+
 pub const landlock = @import("chock-sandbox/linux/landlock.zig");
 pub const bpf = @import("chock-sandbox/linux/bpf.zig");
 pub const seccomp = @import("chock-sandbox/linux/seccomp.zig");
@@ -83,6 +86,17 @@ pub const net_router = @import("chock-sandbox/linux/routerlink.zig");
 /// `devicelink.DeviceSeam` and drives `devicelink.serveOne` without reaching a
 /// driver file directly. See its own top comment for the whole design.
 pub const devicelink = @import("chock-sandbox/linux/devicelink.zig");
+/// What a forked child puts right before it takes a boundary: the descriptors it
+/// keeps and the signal state it resets. Re-exported beside the modules above
+/// because `src/vmm.zig` forks a guest of its own and needs the same two calls
+/// the Linux driver's forked helpers make. See its own top comment.
+/// Two files behind one name, because the calls differ: macOS has no
+/// `close_range`, and a `sigset_t` is one word to the Linux kernel and sixteen
+/// to POSIX.
+pub const after_fork = switch (builtin.os.tag) {
+    .macos => @import("chock-sandbox/darwin/afterfork.zig"),
+    else => @import("chock-sandbox/linux/afterfork.zig"),
+};
 pub const Sandbox = @import("chock-sandbox/Sandbox.zig");
 pub const spawn = Sandbox.spawn;
 pub const Config = Sandbox.Config;
@@ -138,6 +152,12 @@ pub const vm_wire = @import("chock-sandbox/vm/wire.zig");
 /// read its own top comment for why, and for the two things a wrong answer here
 /// breaks.
 pub const vm_shares = @import("chock-sandbox/vm/shares.zig");
+
+/// The other side of a guest's own boundary: confines the process that runs it
+/// to the shares it serves. Re-exported beside `vm_shares`, which gives it the
+/// set, for the same reason every module here is re-exported: a caller outside
+/// this library never reaches a file under `chock-sandbox/` by path.
+pub const vm_confine = @import("chock-sandbox/vm/confine.zig");
 
 /// The host half of the microVM driver: one `Sandbox.Driver` over a stream into a
 /// guest. It builds no boundary of its own, which is the whole design: read its
